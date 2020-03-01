@@ -1,0 +1,2495 @@
+	.TITLE	USRDOS2 - XOS user level DOS kernel routines
+
+;++++
+; This software is in the public domain.  It may be freely copied and used
+; for whatever purpose you see fit, including commerical uses.  Anyone
+; modifying this software may claim ownership of the modifications, but not
+; the complete derived code.  It would be appreciated if the authors were
+; told what this software is being used for, but this is not a requirement.
+
+;   THIS SOFTWARE IS PROVIDED BY THE AUTHORS "AS IS" AND ANY EXPRESS OR
+;   IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
+;   OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+;   IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+;   INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+;   BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS
+;   OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+;   ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR
+;   TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
+;   USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+;----
+
+	.PROC	80486
+	.INCLUD	XOSINC:\XMAC\XOS.PAR
+	.INCLUD	XOSINC:\XMAC\XOSX.PAR
+	.INCLUD	XOSINC:\XMAC\XOSDOS.PAR
+	.INCLUD	XOSINC:\XMAC\XOSDPMI.PAR
+	.INCLUD XOSINC:\XMAC\XOSERR.PAR
+	.INCLUD	XOSINC:\XMAC\XOSTRM.PAR
+
+	USERCODE
+
+	.SBTTL	umkdir - INT 21 function 39 - Create directory
+
+;Here for INT 21 function 39 - Create directory
+;	c(AH) = 39h
+;	c[DS:DX] = Address of path specificaton
+;	INT	21h
+;	C:set = Error
+;	  c[AX] = Error code
+;	C:clr = Normal
+;	  Nothing is returned!
+
+$$$=!0
+FRM mkd_qab , qab_SIZE		;QAB
+FRM mkd_name, 68t		;File name buffer
+mkd_SIZE=!$$$
+
+umkdir::SUBL	ESP, #mkd_SIZE.B
+	CALL	getDSEDXaddr#		;Get address of file specification (we
+					;  must copy it so we can add a back-		
+	LEAL	EDI, mkd_name[EBP]	;  slash at the end)
+	MOVL	mkd_qab+qab_buffer1+0.B[EBP], EDI
+	MOVL	mkd_qab+qab_buffer1+4.B[EBP], SS
+	PUSHL	SS
+	POPL	ES
+	MOVL	ECX, #64t
+	CLD
+2$:	LODSB	FS:[ESI]		;Get character
+	TESTB	AL, AL			;End?
+	JE	6$.S			;Yes
+	STOSB	[EDI]			;No - store it
+	LOOP	ECX, 2$			;Continue if room for more
+	MOVL	EAX, #ER_BDSPC
+4$:	JMP	doserr
+
+;Here with end of specification
+
+6$:	MOVW	AX, #'\'		;Add a back-slash and null at the end
+	STOSW	[EDI]
+	MOVW	mkd_qab+qab_func.B[EBP], #QFNC$WAIT|QFNC$DIO|QFNC_DEVPARM
+	MOVL	mkd_qab+qab_option.B[EBP], #O$ODF|O$CREATE|O$USEDOS
+	CLRL	EAX
+	MOVL	mkd_qab+qab_parm.B[EBP], EAX
+	LEAL	EAX, mkd_qab.B[EBP]
+	MOVW	qab_vector.B[EAX], #0	;Make sure no vector specified
+	PUSHL	SS
+	PUSHL	EAX
+	CALLF	svcIoQueue#
+	TESTL	EAX, EAX
+	JS	4$.S			;If error
+	ORL	EAX, opn_qab+qab_error.B[EBP]
+	JS	4$.S
+	ANDB	dff_EFR.B[EBP], #~01h	;Clear his C bit
+	MOVL	ESP, EBP
+	POPAL				;Restore general registers
+	CALLF	svcSchDismiss#		;Return to user
+.PAGE
+	.SBTTL	urmdir - INT 21 function 3A - Remove directory
+
+;Here for INT 21 function 3A - Remove directory
+;	c(AH) = 3Ah
+;	c[DS:DX] = Address of path specificaton
+;	INT	21h
+;	C:set = Error
+;	  c[AX] = Error code
+;	C:clr = Normal
+;	  Nothing is returned!
+
+$$$=!0
+FRM del_qab , qab_SIZE
+FRM del_parm, 8t
+del_SIZE=!$$$
+
+urmdir::SUBL	ESP, #del_SIZE.B
+	MOVW	del_qab+qab_func.B[EBP], #QFNC$WAIT|QFNC$DIO|QFNC_DELETE
+	MOVL	del_parm+0t.B[EBP], -
+		  #{PAR$SET|REP_HEXV}|{1<8}|{IOPAR_SRCATTR<16t}
+	MOVB	del_parm+4t.B[EBP], #A$NORMAL|A$DIRECT|A$SYSTEM|A$HIDDEN
+	MOVB	del_parm+5t.B[EBP], #0
+	LEAL	EAX, del_parm.B[EBP]
+	MOVL	del_qab+qab_parm+4.B[EBP], SS
+	JMP	4$.S			;Continue with common code
+
+	.SBTTL	udelete - INT 21 function 41 - Delete file
+
+;Here for INT 21 function 41 - Delete file
+;	c(AH) = 41h
+;	c[DS:DX] = Address of file specification
+;	INT	21h
+;	C:set = Error
+;	  c{AX} = Error code
+;	C:clr = Normal
+;	  Nothing returned!
+
+udelete::
+	SUBL	ESP, #del_SIZE.B
+	MOVW	del_qab+qab_func.B[EBP], #QFNC$WAIT|QFNC$DIO|QFNC_DELETE
+	JMP	2$.S
+
+	.SBTTL	urename - INT 21 function 56 - Rename file
+
+;Here for INT 21 function 56 - Rename file
+;	c(AH) = 56h
+;	c[DS:DX] = Address of file specification of file to rename
+;	c[ES:DI] = Address of new file name
+;	INT	21h
+;	C:set = Error
+;	  c{AX} = Error code
+;	C:clr = Normal
+;	  Nothing returned!
+
+urename::
+	SUBL	ESP, #del_SIZE.B
+	MOVW	del_qab+qab_func.B[EBP], #QFNC$WAIT|QFNC$DIO|QFNC_RENAME
+	CALL	getESEDIaddr#		;Get address of new file specification
+	MOVL	del_qab+qab_buffer2+0.B[EBP], ESI ;And store it in the QAB
+	MOVL	del_qab+qab_buffer2+4.B[EBP], FS
+2$:	CLRL	EAX
+4$:	MOVL	del_qab+qab_parm+0.B[EBP], EAX
+	MOVL	del_qab+qab_option.B[EBP], #O$CRIT|O$USEDOS
+	CALL	getDSEDXaddr#		;Get address of file specification
+	MOVL	del_qab+qab_buffer1+0.B[EBP], ESI
+	MOVL	del_qab+qab_buffer1+4.B[EBP], FS
+	LEAL	EAX, del_qab.B[EBP]
+	MOVW	del_qab+qab_vector.B[EBP], #0 ;Make sure no vector specified
+	PUSHL	SS
+	PUSHL	EAX
+	CALLF	svcIoQueue#
+	TESTL	EAX, EAX
+	JS	8$.S			;If error
+	ORL	EAX, del_qab+qab_error.B[EBP]
+8$:	JS	doserr
+	ANDB	dff_EFR.B[EBP], #~01h	;Clear his C bit
+	MOVL	ESP, EBP
+	POPAL				;Restore general registers
+	CALLF	svcSchDismiss#		;Return to user
+.PAGE
+	.SBTTL	ustcdir - INT 21 function 3B - Set current directory
+
+;Here for INT 21 function 3B - Set current directory
+;	c(AH)    = 3Bh
+;	c[DS:DX] = Address of path specification
+;	INT	21h
+;	C:set = Error
+;	  c[AX] = Error code (always = 3)
+;	C:clr = Normal
+;	  c[AX] = 0 (setting AX to 0 here is mostly undocumented but many
+;		    programs count on it!)
+
+$$$=!0
+FRM scd_qab   , qab_SIZE
+FRM scd_buffer, 68t
+scd_SIZE=!$$$
+
+ustcdir::
+	SUBL	ESP, #scd_SIZE.B
+	MOVW	scd_qab+qab_func.B[EBP], #QFNC$WAIT|QFNC$DIO|QFNC_PATH
+	CALL	getDSEDXaddr#		;Get address of the user's string
+	LEAL	EDI, scd_buffer[EBP]	;Store address of path string
+	MOVL	scd_qab+qab_buffer1+0.B[EBP], EDI
+	MOVW	scd_qab+qab_buffer1+4.B[EBP], SS
+	PUSHL	SS
+	POPL	ES
+	MOVL	ECX, #64t		;Allow up to 64 characters
+	CLD
+2$:	LODSB	FS:[ESI]
+	CMPB	AL, #0
+	JE	8$.S
+	STOSB	[EDI]
+	LOOP 	ECX, 2$
+	MOVL	EAX, #ER_BDSPC
+	JMP	16$.S
+
+;Here at end of string
+
+8$:	CMPL	ECX, #64t.B		;Null string?
+	JE	10$.S			;Yes
+	CMPB	ES:-1.B[EDI], #'\'	;No - was last character a back-slash?
+	JE	12$.S			;Yes
+	CMPB	ES:-1.B[EDI], #'/'	;Or a slash?
+	JE	12$.S			;Yes
+10$:	MOVB	AL, #'\'		;No - add a backslash
+	STOSB	[EDI]
+12$:	CLRL	EAX			;Put a null at the end
+	STOSB	[EDI]
+	MOVL	scd_qab+qab_option.B[EBP], EAX ;No option bits
+	MOVL	scd_qab+qab_parm+0.B[EBP], EAX ;No parameter list
+	MOVW	scd_qab+qab_vector.B[EBP], AX ;Make sure no vector specified
+	MOVW	dff_EAX.B[EBP], AX	;Clear his AX for the normal return
+	LEAL	EAX, scd_qab.B[EBP]
+	PUSHL	SS
+	PUSHL	EAX
+	CALLF	svcIoQueue#
+	TESTL	EAX, EAX
+	JS	14$.S
+	ORL	EAX, scd_qab+qab_error.B[EBP]
+	JS	14$.S
+	ANDB	dff_EFR.B[EBP], #~01h	;Clear his C bit
+	MOVL	ESP, EBP
+	POPAL				;Restore general registers
+	CALLF	svcSchDismiss#		;Return to user
+
+;Here if error
+
+14$:	MOVL	EAX, #ER_DIRNF		;Get the error code DOS always uses here
+16$:	JMP	doserr
+.PAGE
+	.SBTTL	ucrtemp - INT 21 function 5A - Create temporary file
+
+;Here for INT 21 function 5A - Create temporary file
+;	c(AH) = 5Ah
+;	c[CX] = File attributes
+;	c[DS:DX] = Address of path specification
+;	INT	21h
+;	C:set = Error
+;	  c[AX] = Error code
+;	C:clr = Normal
+;	  c[AX] = File handle, name has been added to path specification
+
+$$$=!0
+FRM opn_qab , qab_SIZE
+FRM opn_parm, 32t
+opn_SIZE=!$$$
+
+TMPBITS=!O$CRIT|O$COMPAT|O$CREATE|O$TRUNCA|O$UNQNAME|O$USEDOS|O$IN|O$OUT
+
+ucrtemp::
+	SUBL	ESP, #opn_SIZE.B
+	MOVL	opn_qab+qab_option.B[EBP], #TMPBITS
+	JMP	4$.S			;Indicate create new file, truncate
+					;  existing file, create unique name,
+					;  allow input and output
+
+	.SBTTL	ucreate - INT 21 function 3C - Create or truncate file
+
+;Here for INT 21 function 3C - Create or truncate file
+;	c(AH) = 3Ch
+;	c[CX] = File attributes
+;	c[DS:DX] = Address of file specification
+;	INT	21h
+;	C:set = Error
+;	  c[AX] = Error code
+;	C:clr = Normal
+;	  c[AX] = File handle
+
+CRTBITS=!O$CRIT|O$COMPAT|O$CREATE|O$TRUNCA|O$USEDOS|O$IN|O$OUT
+
+ucreate::
+	SUBL	ESP, #opn_SIZE.B
+	MOVL	opn_qab+qab_option.B[EBP], #CRTBITS
+					;Indicate create new file, truncate
+					;  existing file, allow input and output
+	JMP	4$.S			;Continue
+
+	.SBTTL	ucrnew - INT 21 function 5B - Create new file
+
+;Here for INT 21 function 5B - Create new file
+;	c(AH) = 5Bh
+;	c[CX] = File attributes
+;	c[DS:DX] = Address of file specification
+;	INT	21h
+;	C:set = Error
+;	  c[AX] = Error code
+;	C:clr = Normal
+;	  c[AX] = File handle
+
+NEWBITS=!O$CRIT|O$COMPAT|O$CREATE|O$FAILEX|O$USEDOS|O$IN|O$OUT
+
+ucrnew::SUBL	ESP, #opn_SIZE.B
+	MOVL	opn_qab+qab_option.B[EBP], #NEWBITS
+					;Indicate create file (no superceed),
+					;  input, output
+4$:	ANDB	CL, #A$NORMAL|A$DIRECT|A$SYSTEM|A$HIDDEN|A$LABEL
+	JNE	6$.S			;Make sure at least the "NORMAL" bit
+	MOVB	CL, #A$NORMAL		;  is set
+6$:	MOVL	opn_qab+qab_parm+4.B[EBP], SS
+	MOVL	opn_parm+0t.B[EBP], -
+			#{PAR$GET|REP_HEXV}|{1<8}|{IOPAR_FILATTR<16t}
+	MOVB	opn_parm+4t.B[EBP], CL
+	MOVB	opn_parm+5t.B[EBP], #0
+	CALL	getDSEDXaddr#
+	LEAL	EDI, opn_parm.B[EBP]
+	JMP	24$
+
+	.SBTTL	uextopen - INT 21 function 6C - Extended open file
+
+;Here for INT 21 function 6C - Extended open file
+;	c(AH) = 6Ch
+;	c[BX] = Open mode
+;	c[CX] = File attributes
+;	c[DX] = Open flags
+;	c[DS:SI] = Address of file specification
+;	INT	21h
+;	C:set = Error
+;	  c[AX] = Error code
+;	C:clr = Normal
+;	  c[AX] = File handle
+
+uextopen::
+	SUBL	ESP, #opn_SIZE.B
+	ANDB	CL, #A$NORMAL|A$DIRECT|A$SYSTEM|A$HIDDEN|A$LABEL
+	JNE	8$.S			;Make sure at least the "NORMAL" bit
+	MOVB	CL, #A$NORMAL		;  is set
+8$:	MOVL	opn_qab+qab_parm+4.B[EBP], SS
+	MOVL	opn_parm+0t.B[EBP], -
+		  #{PAR$GET|REP_HEXV}|{1<8}|{IOPAR_FILATTR<16t}
+	MOVB	opn_parm+4t.B[EBP], CL
+	MOVB	opn_parm+5t.B[EBP], #0
+	CLRL	EAX
+	MOVB	DH, DL			;Get file exists bits
+	ANDB	DH, #0Fh		;Want to fail if file exists?
+	JNE	10$.S			;No
+	BTSL	EAX, #O%FAILEX		;Yes
+10$:	CMPB	DH, #02			;Want to replace existing file?
+	JNE	12$.S			;No
+	BTSL	EAX, #O%TRUNCA		;Yes
+12$:	TESTB	DL, #10h		;Want to create a new file?
+	JE	14$.S			;No
+	BTSL	EAX, #O%CREATE		;Yes
+14$:	TESTB	BH, #40h		;Want to force immediate writes?
+	JE	16$.S			;No
+	BTSL	EAX, #O%NODFWR		;Yes
+16$:	TESTB	BH, #20h		;Want critical error handling?
+	JNE	18$.S			;No
+	BTSL	EAX, #O%CRIT		;Yes
+18$:	MOVB	CL, BL
+	CALL	getDSESIaddr#
+	LEAL	EDI, opn_parm.B[EBP]
+	JMP	20$.S
+
+	.SBTTL	uopen - INT 21 function 3D - Open file
+
+;Here for INT 21 function 3D - Open file
+;	c(AL) = Access and file sharing modes
+;	c(AH) = 3Dh
+;	c[DS:DX] = Address of file specification
+;	INT	21h
+;	C:set = Error
+;	  c[AX] = Error code
+;	C:clr = Normal
+;	  c[AX] = File handle
+
+uopen::	SUBL	ESP, #opn_SIZE.B
+	CLRL	EDI
+	MOVB	CL, dff_EAX.B[EBP]	;Get access mode bits
+	CALL	getDSEDXaddr#		;Get address of file specification
+	CLRL	EDI
+	MOVL	EAX, #O$CRIT|O$USEDOS
+20$:	MOVZBL	EDX, CL
+	ANDB	DL, #07h
+	ORB	AL, CS:rwbits[EDX]
+	MOVB	DL, CL			;Get file sharing bits
+	SHRL	EDX, #4
+	ANDB	DL, #07h
+	ORL	EAX, CS:fsbits[EDX*4]
+	TESTB	CL, CL			;Should file be inherited?
+	JNS	22$.S			;Yes
+	BTSL	EAX, #O%NOINH		;No
+22$:	MOVL	opn_qab+qab_option.B[EBP], EAX
+24$:	MOVL	opn_qab+qab_parm+0.B[EBP], EDI
+	MOVW	opn_qab+qab_func.B[EBP], #QFNC$WAIT|QFNC$DIO|QFNC_OPEN
+	MOVL	opn_qab+qab_buffer1+0.B[EBP], ESI ;Store address of file
+	MOVL	opn_qab+qab_buffer1+4.B[EBP], FS  ;  specification
+	CALL	ualocdoshandle#		;Get DOS handle to use
+	JC	doserr.S		;If error
+	MOVW	opn_qab+qab_vector.B[EBP], #0
+	LEAL	EAX, opn_qab.B[EBP]
+	PUSHL	SS
+	PUSHL	EAX
+	CALLF	svcIoQueue#		;Open the file
+	TESTL	EAX, EAX
+	JS	doserr.S		;If error
+	ORL	EAX, opn_qab+qab_error.B[EBP]
+	JS	doserr.S
+	MOVL	EAX, opn_qab+qab_handle.B[EBP] ;Get system handle
+	MOVB	[EDI], AL		;Store in DOS handle table
+	INCB	dxd_syshctbl[EAX]	;Increment the corresponding system
+					;  handle count table entry
+	MOVW	dff_EAX.B[EBP], DX	;Give him the DOS handle
+	ANDB	dff_EFR.B[EBP], #~01h	;Clear his C bit
+	JMP	29$.S
+
+;Here if error which should return with C set and with standard error code
+;  in AX
+
+doserr::CMPL	EAX, #SYSMAXERR#	;Make sure valid error code
+	JB	30$.S
+	MOVL	EAX, CS:knlDosErrTbl#[EAX*4] ;OK - get DOS error data
+28$:	MOVL	dxd_lasterr, EAX	;Store it for later
+	MOVB	AH, #0			;Give the user just the error code in
+	MOVW	dff_EAX.B[EBP], AX	;  his AX
+	ORB	dff_EFR.B[EBP], #01h
+29$:	MOVL	ESP, EBP
+	POPAL				;Restore general registers
+	CALLF	svcSchDismiss#		;Return to user
+
+;Here if have bad error code
+
+30$:	CMPL	EAX, #ER_NIYT		;Not implemented yet?
+	JNE	32$.S			;No
+	MOVL	EAX, #0105041Fh		;Yes - report as general failure,
+	JMP	28$.S			;  class = internal error, action =
+					;  immediate exit, locus = unknown
+
+;Here for illegal error code - terminate the process!
+
+32$:	MOVB	DL, #21h
+	PUSHL	#TC_DOSBADE<24t
+	JMP	pbadint2#
+.PAGE
+;Table of read/write access bits
+
+	.MOD	4
+rwbits:	.BYTE	O$IN		; 000 - Read access
+	.BYTE	O$OUT		; 001 - Write access
+	.BYTE	O$IN|O$OUT	; 010 - Read/write access
+	.BYTE	O$IN		; 011
+	.BYTE	O$IN		; 100
+	.BYTE	O$IN		; 101
+	.BYTE	O$IN		; 110
+	.BYTE	O$IN		; 111
+
+;Table of file sharing bits
+
+	.MOD	4
+fsbits:	.LONG	O$COMPAT	; 000 - Compatability
+	.LONG	O$XREAD|O$XWRITE; 001 - Deny read or write access
+	.LONG	O$XWRITE	; 010 - Deny write access
+	.LONG	O$XREAD		; 011 - Deny read access
+	.LONG	0		; 100 - Deny none
+	.LONG	0		; 101
+	.LONG	0		; 110
+	.LONG	0		; 111
+.PAGE
+	.SBTTL	uread - INT 21 function 3F - Read from file
+
+;Here for INT 21 function 3F - Read from file
+;	c(AH)    = 3Fh
+;	c[BX]    = DOS device handle
+;	c[CX]    = Amount to read
+;	c[DS:DX] = Address of buffer
+;	INT	21h
+;	C:set = Error
+;	  c[AX] = Error code
+;	C:clr = Normal
+;	  c[AX] = Amount actually read
+
+$$$=!0
+FRM xfr_qab , qab_SIZE
+FRM xfr_parm, 20t
+xfr_SIZE=!$$$
+
+uread::	SUBL	ESP, #xfr_SIZE.B
+	MOVW	xfr_qab+qab_func.B[EBP], -
+		  #QFNC$WAIT|QFNC$DIO|QFNC_INBLOCK
+	JMP	2$.S
+
+	.SBTTL	uwrite - INT 21 function 40 - Write to file
+
+;Here for INT 21 function 40 - Write to file
+;	c(AH)    = 40h
+;	c[BX]    = DOS device handle
+;	c[CX]    = Amount to write
+;	c[DS:DX] = Address of buffer
+;	INT	21h
+;	C:set = Error
+;	  c[AX] = Error code
+;	C:clr = Normal
+;	  c[AX] = Amount actually output
+
+uwrite::SUBL	ESP, #xfr_SIZE.B
+	MOVW	xfr_qab+qab_func.B[EBP], -
+		  #QFNC$WAIT|QFNC$DIO|QFNC_OUTBLOCK
+2$:	MOVZWL	EAX, dff_ECX[EBP]	;Get the count
+	MOVL	xfr_qab+qab_count.B[EBP], EAX
+	CALL	getDSEDXaddr#		;Get the buffer address
+	MOVL	xfr_qab+qab_buffer1+0.B[EBP], ESI
+	MOVL	xfr_qab+qab_buffer1+4.B[EBP], FS
+	CALL	ugetsyshandle#		;Get the system device handle
+	MOVL	xfr_qab+qab_handle.B[EBP], EAX
+	CLRL	EAX			;No option bits or vector
+	MOVL	xfr_qab+qab_option.B[EBP], EAX
+	MOVW	xfr_qab+qab_vector.B[EBP], AX
+	MOVB	xfr_parm+8t.B[EBP], AL
+	MOVL	xfr_parm+0t.B[EBP], -
+		  #{PAR$SET|REP_DECV}|{4<8}|{IOPAR_SHRPARMS<16t}
+	MOVL	xfr_parm+4t.B[EBP], #-1
+	CMPL	xfr_qab+qab_count.B[EBP], #0.B ;Want to truncate here?
+	JNE	4$.S			;No
+	CMPB	xfr_qab+qab_func.B[EBP], #QFNC_OUTBLOCK ;Maybe
+	JNE	4$.S			;No
+	MOVL	xfr_parm+8t.B[EBP], -
+		  #{PAR$SET|REP_DECV}|{4<8}|{IOPAR_LENGTH<16t}
+	MOVL	xfr_parm+12t.B[EBP], #-1
+	MOVB	xfr_parm+16t.B[EBP], #0
+4$:	LEAL	EAX, xfr_parm.B[EBP]
+	MOVL	xfr_qab+qab_parm+0.B[EBP], EAX
+	MOVL	xfr_qab+qab_parm+4.B[EBP], SS
+	LEAL	EAX, xfr_qab.B[EBP]
+	PUSHL	SS
+	PUSHL	EAX
+	CALLF	svcIoQueue#
+	TESTL	EAX, EAX
+	JS	12$.S			;If error
+	ORL	EAX, xfr_qab+qab_error.B[EBP]
+	JS	12$.S
+	MOVL	EAX, xfr_qab+qab_amount.B[EBP]
+6$:	CMPB	dda_dpmitype, #DPMIT_32B ;Have a 32-bit client?
+	JE	8$.S			;Yes
+	MOVW	dff_EAX.B[EBP], AX	;No - just return 16 bits
+	JMP	10$.S
+
+;Here if have a 32-bit DPMI client
+
+8$:	MOVL	dff_EAX.B[EBP], EAX	;Return all 32 bits
+10$:	ANDB	dff_EFR.B[EBP], #~01h	;Clear his C bit
+	MOVL	ESP, EBP
+	POPAL				;Restore general registers
+	CALLF	svcSchDismiss#		;Return to user
+
+;Here if error
+
+12$:	CMPL	EAX, #ER_EOF.B		;Is it EOF?
+	JNE	doserr			;No - return the error
+	CLRL	EAX			;Yes - just say 0 bytes transfered
+	JMP	6$.S
+.PAGE
+	.SBTTL	usetpos - INT 21 function 42 - Set file position
+
+;Here for INT 21 function 42 - Set file position
+;	c(AL)    = Method code
+;		     0 = Absolute byte offset from beginning of file
+;		     1 = Relative byte offset from current position in file
+;		     2 = Relative byte offset from end of file
+;	c(AH)    = 42h
+;	c[BX]    = File handle
+;	c{CX,DX} = Offset in file
+;	INT	21h
+;	C:set = Error
+;	  c[AX] = Error code
+;	C:clr = Normal
+;	  c{DX,AX} = New absolute position in file
+
+$$$=!0
+FRM pos_qab , qab_SIZE
+FRM pos_parm, 32t
+pos_SIZE=!$$$
+
+usetpos::
+	SUBL	ESP, #pos_SIZE.B
+	MOVW	pos_qab+qab_func.B[EBP], #QFNC$WAIT|QFNC$DIO|QFNC_INBLOCK
+	LEAL	EDI, pos_parm.B[EBP]	;Point to place for parameter list
+	MOVL	pos_qab+qab_parm+0.B[EBP], EDI
+	MOVW	pos_qab+qab_parm+4.B[EBP], SS
+	MOVZBL	EAX, dff_EAX.B[EBP]	;Get method code
+	CMPL	EAX, #2.B		;Valid code?
+	JA	8$.S			;No - fail
+	MOVL	EAX, CS:method[EAX*4]	;Yes - get parameter index to use
+	MOVL	pos_parm+0t.B[EBP], EAX
+	SHLL	ECX, #16t		;Get position
+	MOVW	CX, DX
+	MOVL	pos_parm+4t.B[EBP], ECX
+	CLRL	EAX
+	MOVB	pos_parm+8t.B[EBP], AL
+	MOVL	pos_qab+qab_buffer1+0.B[EBP], EAX
+	MOVL	pos_qab+qab_count.B[EBP], EAX
+	MOVW	pos_qab+qab_vector.B[EBP], AX
+	CALL	ugetsyshandle#		;Get the system device handle
+	MOVL	pos_qab+qab_handle.B[EBP], EAX
+	PUSHL	SS
+	LEAL	EAX, pos_qab.B[EBP]
+	PUSHL	EAX
+	CALLF	svcIoQueue#
+	TESTL	EAX, EAX
+	JS	10$.S			;If error
+	ORL	EAX, pos_qab+qab_error.B[EBP]
+	JS	10$.S
+	MOVL	EAX, pos_parm+4t.B[EBP]	;Get returned position value
+	MOVW	dff_EAX.B[EBP], AX
+	SHRL	EAX, #16t
+	MOVW	dff_EDX.B[EBP], AX
+	ANDB	dff_EFR.B[EBP], #~01h	;Clear his C bit
+	MOVL	ESP, EBP
+	POPAL				;Restore general registers
+	CALLF	svcSchDismiss#		;Return to user
+
+;;;;; HOW SHOULD THIS BE RETURNED FOR 32-BIT MODE???
+
+;Here if bad method code
+
+8$:	MOVL	EAX, #ER_IFDEV
+10$:	JMP	doserr
+
+	.MOD	4
+method:	.LONG	{PAR$SET|PAR$GET|REP_DECV}|{4<8}|{IOPAR_ABSPOS<16t}
+	.LONG	{PAR$SET|PAR$GET|REP_DECV}|{4<8}|{IOPAR_RELPOS<16t}
+	.LONG	{PAR$SET|PAR$GET|REP_DECV}|{4<8}|{IOPAR_EOFPOS<16t}
+.PAGE
+	.SBTTL	uclose - INT 21 function 3E - Close file
+
+;Here for INT 21 function 3E - Close file
+;	c(AH) = 3Eh
+;	c[BX] = DOS device handle
+;	INT	21h
+;	C:set = Error
+;	  c[AX] = Error code
+;	C:clr = Normal
+
+$$$=!0
+FRM cls_qab, qab_SIZE
+cls_SIZE=!$$$
+
+uclose::SUBL	ESP, #cls_SIZE.B
+	CALL	ugetsyshandle#		;Get the system device handle
+	JC	4$.S
+	MOVB	[EDI], #0FFh		;Clear the DOS handle
+	MOVL	cls_qab+qab_handle.B[EBP], EAX
+	CMPB	dxd_syshctbl[EAX], #0.B	;Is the system handle count non-zero?
+	JE	2$.S			;No (this should not be possible!)
+	DECB	dxd_syshctbl[EAX]	;Yes - reduce it
+	JNE	2$.S			;If still non-zero
+	CLRL	EAX			;Zero - need to close the system handle
+	MOVL	cls_qab+qab_option.B[EBP], EAX ;No option bits or parameter
+	MOVL	cls_qab+qab_parm+0.B[EBP], EAX ;  list
+	MOVW	cls_qab+qab_vector.B[EBP], AX ;Make sure no vector specified
+	MOVW	cls_qab+qab_func.B[EBP], #QFNC$WAIT|QFNC$DIO|QFNC_CLOSE
+	LEAL	EAX, cls_qab.B[EBP]
+	PUSHL	SS
+	PUSHL	EAX
+	CALLF	svcIoQueue#
+	TESTL	EAX, EAX
+	JS	4$.S			;If error
+	ORL	EAX, opn_qab+qab_error.B[EBP]
+	JS	4$.S
+2$:	ANDB	dff_EFR.B[EBP], #~01h	;Clear his C bit
+	MOVL	ESP, EBP
+	POPAL				;Restore general registers
+	CALLF	svcSchDismiss#		;Return to user
+
+;Here if error
+
+4$:	JMP	doserr
+.PAGE
+	.SBTTL	ufattr - INT 21 function 43 - Get or set file attributes
+
+;Here for INT 21 function 43 - Get or set file attributes
+;	c(AL)    = Sub-function:
+;		     0 = Get file attribute
+;		     1 = Set file attribute
+;	c(AH)    = 43h
+;	c[CX]    = New attributes if c(AL) = 1
+;	c[DS:DX] = Address of file specification
+;	INT	21h
+;	C:set = Error
+;	  c[AX] = Error code
+;	C:clr = Normal
+;	  c[CX] = Attribute (if called with c(AL) = 0) (also stored in AX for
+;		    compatibility with DOS (undocumentated)
+
+$$$=!0
+FRM fatr_qab , qab_SIZE
+FRM fatr_parm, 32t
+fatr_SIZE=!$$$
+
+ufattr::SUBL	ESP, #fatr_SIZE.B
+	MOVW	fatr_qab+qab_func.B[EBP], #QFNC$WAIT|QFNC$DIO|QFNC_DEVPARM
+	MOVL	fatr_qab+qab_option.B[EBP], #O$CRIT|O$USEDOS
+	CALL	getDSEDXaddr		;Get address of file specification
+	MOVL	fatr_qab+qab_buffer1+0.B[EBP], ESI
+	MOVW	fatr_qab+qab_buffer1+4.B[EBP], FS
+	LEAL	EAX, fatr_parm.B[EBP]
+	MOVL	fatr_qab+qab_parm+0.B[EBP], EAX
+	MOVW	fatr_qab+qab_parm+4.B[EBP], SS
+	MOVL	fatr_parm+0t.B[EBP], -
+		  #{PAR$SET|REP_HEXV}|{1<8}|{IOPAR_SRCATTR<16t}
+	MOVB	fatr_parm+4t.B[EBP], #A$NORMAL|A$DIRECT|A$SYSTEM|A$HIDDEN
+	MOVL	fatr_parm+5t.B[EBP], -
+		  #{PAR$GET|REP_HEXV}|{1<8}|{IOPAR_FILATTR<16t}
+	CMPB	dff_EAX.B[EBP], #0	;Want to get attributes?
+	JE	4$.S			;Yes
+	XORB	fatr_parm+5t.B[EBP], #PAR$GET|PAR$SET ;No - fix up the function
+	TESTB	CL, #A$DIRECT|A$SYSTEM|A$HIDDEN|A$LABEL
+	JNE	2$.S
+	ORB	CL, #A$NORMAL
+2$:	MOVB	fatr_parm+9t.B[EBP], CL		;And store the new value
+4$:	MOVB	fatr_parm+10t.B[EBP], #0
+	MOVW	fatr_qab+qab_vector.B[EBP], #0
+	PUSHL	SS
+	LEAL	EAX, fatr_qab.B[EBP]
+	PUSHL	EAX
+	CALLF	svcIoQueue#
+	TESTL	EAX, EAX
+	JS	6$.S
+	ORL	EAX, fatr_qab+qab_error.B[EBP]
+6$:	JS	doserr
+	CMPB	dff_EAX.B[EBP], #0	;Does he want a value returned?
+	JNE	8$.S			;No - finished now
+	MOVZBL	EAX, fatr_parm+9t.B[EBP] ;Yes - give him the attribute value
+	ANDB	AL, #3Fh
+	MOVW	dff_ECX.B[EBP], AX
+	MOVW	dff_EAX.B[EBP], AX
+8$:	ANDB	dff_EFR.B[EBP], #~01h	;Clear his C bit
+	MOVL	ESP, EBP
+	POPAL				;Restore general registers
+	CALLF	svcSchDismiss#		;Return to user
+.PAGE
+	.SBTTL	INT 21 function 44 - Device driver control
+
+;Here for INT 21 function 44 - Device driver control
+;	c(AL)    = Sub-function
+;	c(AH)    = 44h
+;	c[BX]    = Handle or drive code (BL only) depending on sub-function
+;	c[CX]    = Byte count for read or write
+;	c[DS:DX] = Address of buffer for read or write
+;	c[DX]    = Device information
+;	INT	21h
+;	C:set = Error
+;	  c[AX] = Error code
+;	C:clr = Nornal
+;	  c[AX] = Returned data (depends on sub-function)
+;	  c[DX] = Returned data (depends on sub-function)
+
+uioctl::MOVZBL	EAX, dff_EAX+0.B[EBP]	;Get function
+	CMPB	AL, #IOCTLMAX		;Legal value?
+	JA	ioctlerr.S		;No
+	JMPIL	CS:ioctldsp[EAX*4]	;Yes - dispatch to routine for function
+
+;IOCTL function dispatch table
+
+	.MOD	4
+ioctldsp:
+	.LONG	ioctlgdi	; 00 - Get device information
+	.LONG	ioctlsdi	; 01 - Set device information
+	.LONG	ioctlerr	; 02 - Read device control channel
+	.LONG	ioctlerr	; 03 - Write device control channel
+	.LONG	ioctlerr	; 04 - Read disk drive control channel
+	.LONG	ioctlerr	; 05 - Write disk drive control channel
+	.LONG	ioctlgis	; 06 - Get input status
+	.LONG	ioctlgos	; 07 - Get output status
+	.LONG	ioctlcmnt	; 08 - Check if mountable device
+	.LONG	ioctlcdrv	; 09 - Check if remote disk drive
+	.LONG	ioctlcrd	; 0A - Check if remote device
+	.LONG	ioctlretry	; 0B - Change sharing retry count
+	.LONG	ioctlerr	; 0C - Generic character device request
+	.LONG	ioctlerr	; 0D - Generic block device request
+	.LONG	ioctlerr	; 0E - Get logical drive map
+	.LONG	ioctlerr	; 0F - Set logical drive map
+	.LONG	ioctlerr	; 10 - Query generic IOCTL capability (handle)
+	.LONG	ioctlerr	; 11 - Query generic IOCTL capability (drive)
+IOCTLMAX=!{$-ioctldsp}/4-1
+
+ioctlerr:
+	MOVL	EAX, #ER_FUNC
+	JMP	doserr
+.PAGE
+;Here for IOCTL function 00h - Get device information
+
+$$$=!0
+FRM gdi_qab , qab_SIZE
+FRM gdi_parm, 76t
+FRM gdi_spec, 12t
+gdi_SIZE=!$$$
+
+ioctlgdi:
+	SUBL	ESP, #gdi_SIZE
+	MOVW	gdi_qab+qab_func.B[EBP], #QFNC$WAIT|QFNC$DIO|QFNC_INBLOCK
+	CALL	ugetsyshandle#
+	JC	2$.S
+	MOVL	gdi_qab+qab_handle.B[EBP], EAX
+	LEAL	EAX, gdi_parm[EBP]
+	MOVL	gdi_qab+qab_parm+0.B[EBP], EAX
+	MOVL	gdi_qab+qab_parm+4.B[EBP], SS
+	MOVL	gdi_parm+0t[EBP], #{PAR$GET|REP_TEXT}|{8<8t}|{IOPAR_CLASS<16t}
+	MOVL	gdi_parm+12t.B[EBP], #{PAR$GET|REP_HEXV} | {4<8t} | -
+		  {IOPAR_DEVSTS<16t}
+	MOVL	gdi_parm+20t.B[EBP], #{PAR$GET|REP_HEXV} | {4<8t} | -
+		  {IOPAR_TRMSINPMODE<16t}
+	MOVL	gdi_parm+28t.B[EBP], #{PAR$SET|REP_HEXV} | {4<8t} | -
+		  {IOPAR_FILOPTN<16t}
+	MOVL	gdi_parm+32t.B[EBP], #FO$NOPREFIX|FO$DOSNAME
+	MOVL	gdi_parm+36t.B[EBP], #{PAR$GET|REP_STR} | {IOPAR_FILSPEC<16t}
+	LEAL	ESI, gdi_spec[EBP]
+	MOVL	gdi_parm+40t.B[EBP], ESI
+	MOVL	gdi_parm+44t.B[EBP], SS
+	MOVL	gdi_parm+48t.B[EBP], #12t
+	MOVL	gdi_parm+52t.B[EBP], #{PAR$GET|REP_HEXV} | {16t<8t} | -
+		  {IOPAR_GLBID<16t}
+	CLRL	EAX
+	MOVB	gdi_parm+72t.B[EBP], AL
+	MOVL	gdi_qab+qab_count.B[EBP], EAX
+	MOVW	gdi_qab+qab_vector.B[EBP], AX
+	PUSHL	SS
+	LEAL	EAX, gdi_qab.B[EBP]
+	PUSHL	EAX
+	CALLF	svcIoQueue#
+	TESTL	EAX, EAX
+	JS	2$.S
+	ORL	EAX, gdi_qab+qab_error.B[EBP]
+	JNS	4$.S
+2$:	JMP	doserr
+
+;Here if no errors
+
+4$:	CMPL	gdi_parm+4t[EBP], #'TRM' ;Is it a terminal?
+	JE	10$.S			;Yes
+	MOVL	EAX, #0084h		;No - assume null device
+	CMPL	gdi_parm+4t[EBP], #'NULL' ;Right?
+	JNE	6$.S			;No
+	CMPL	gdi_parm+8t[EBP], #0.B
+	JE	14$.S			;Yes
+6$:	MOVB	AL, #0C0h		;No - assume physical printer
+	CMPL	gdi_parm+4t[EBP], #'LPT' ;Right?
+	JE	14$.S			;Yes
+	BTL	gdi_parm+16t.B[EBP], #DS%FILE ;Is this a file structured device?
+	JC	16$.S			;Yes
+	CLRL	EAX			;No - just return 0!
+	JMP	14$.S
+
+;Here if device is a terminal
+
+10$:	MOVL	EAX, #80D3h
+	TESTB	gdi_parm+24t.B[EBP], #TIM$XIMAGE|TIM$IMAGE ;Image mode?
+	JE	14$.S			;No
+	ORB	AL, #20h		;Yes
+14$:
+
+;NEED CODE HERE TO SEE IF THIS IS DOS STANDARD IN OR OUT!!!!!
+
+	JMP	22$.S
+
+;Here if device is a disk
+
+16$:	CLRL	EAX
+	CMPB	gdi_spec+1[EBP], #':'	;Did we get a single letter device name?
+	JNE	18$.S			;No
+	MOVB	AL, gdi_spec+0[EBP]	;Yes - get the letter
+	CMPB	AL, #'A'		;Really a letter?
+	JB	18$.S
+	CMPB	AL, #'Z'
+	JA	18$.S
+	SUBB	AL, #'A'		;Yes - change to DOS drive index
+	JMP	20$.S
+
+18$:	MOVB	AL, #'Z'-'A'
+20$:
+
+;NEED CODE TO SEE IF FILE HAS BEEN WRITTEN TO!!!!!!!
+
+22$:	MOVW	dff_EDX.B[EBP], AX	;Give user bits in his DX
+	MOVW	dff_EAX.B[EBP], AX	;Also give it to him in his AX
+	ANDB	dff_EFR.B[EBP], #~01h	;Clear his C bit
+	MOVL	ESP, EBP
+	POPAL				;Restore general registers
+	CALLF	svcSchDismiss#		;Return to user
+.PAGE
+;Here for IOCTL function 01h - Set device information - this function is only
+;  useful for setting or clearing "raw" mode for terminals
+
+$$$=!0
+FRM sdi_qab , qab_SIZE
+FRM sdi_parm, 16t
+sdi_SIZE=!$$$
+
+ioctlsdi:
+	SUBL	ESP, #sdi_SIZE.B
+	MOVW	sdi_qab+qab_func.B[EBP], #QFNC$WAIT|QFNC$DIO|QFNC_INBLOCK
+	CALL	ugetsyshandle#
+	JC	4$.S
+	MOVL	sdi_qab+qab_handle.B[EBP], EAX
+	LEAL	EAX, sdi_parm.B[EBP]
+	MOVL	sdi_qab+qab_parm+0.B[EBP], EAX
+	MOVL	sdi_qab+qab_parm+4.B[EBP], SS
+	MOVL	sdi_parm.B[EBP], #{PAR$SET|REP_HEXV} | {4t<8t} | -
+		  {IOPAR_TRMCINPMODE<16t}
+	TESTB	DL, #20h		;Want to set raw mode?
+	JE	2$.S			;No
+	ADDW	sdi_parm+2t.B[EBP], #IOPAR_TRMSINPMODE-IOPAR_TRMCINPMODE.B ;Yes
+2$:	MOVL	sdi_parm+4t.B[EBP], #TIM$IMAGE
+	CLRL	EAX
+	MOVB	sdi_parm+8t.B[EBP], AL
+	MOVL	sdi_qab+qab_count.B[EBP], EAX
+	MOVW	sdi_qab+qab_vector.B[EBP], AX
+	LEAL	EAX, sdi_qab.B[EBP]
+	PUSHL	SS
+	PUSHL	EAX
+	CALLF	svcIoQueue#
+	TESTL	EAX, EAX
+	JS	4$.S			;If error
+	ORL	EAX, opn_qab+qab_error.B[EBP]
+	JS	4$.S
+	ANDB	dff_EFR.B[EBP], #~01h	;Clear his C bit
+	MOVL	ESP, EBP
+	POPAL				;Restore general registers
+	CALLF	svcSchDismiss#		;Return to user
+
+;Here if error
+
+4$:	JMP	doserr
+.PAGE
+;Here for IOCTL function 06h - Get input status
+
+$$$=!0
+FRM iosts_qab , qab_SIZE
+FRM iosts_parm, 8t
+iosts_SIZE=!$$$
+
+ioctlgis::
+	MOVL	EAX, #{PAR$GET|REP_HEXV}|{1<8t}|{IOPAR_INPSTS<16t}
+	JMP	2$.S
+
+;Here for IOCTL function 07h - Get output status
+
+ioctlgos:
+	MOVL	EAX, #{PAR$GET|REP_HEXV}|{1<8t}|{IOPAR_OUTSTS<16t}
+2$:	SUBL	ESP, #iosts_SIZE.B
+	MOVW	iosts_qab+qab_func.B[EBP], #QFNC$WAIT|QFNC$DIO|QFNC_INBLOCK
+	MOVL	iosts_parm+0t.B[EBP], EAX
+	LEAL	EAX, iosts_parm.B[EBP]
+	MOVL	iosts_qab+qab_parm+0.B[EBP], EAX
+	MOVL	iosts_qab+qab_parm+4.B[EBP], SS
+	CLRL	EAX
+	MOVB	iosts_parm+5t.B[EBP], AL
+	MOVL	sdi_qab+qab_count.B[EBP], EAX
+	MOVL	sdi_qab+qab_buffer1.B[EBP], EAX
+	MOVW	sdi_qab+qab_vector.B[EBP], AX
+	CALL	ugetsyshandle#
+	JC	8$.S
+	MOVL	iosts_qab+qab_handle.B[EBP], EAX
+	PUSHL	SS
+	LEAL	EAX, sdi_qab.B[EBP]
+	PUSHL	EAX
+	CALLF	svcIoQueue#
+	TESTL	EAX, EAX
+	JS	8$.S
+	ORL	EAX, iosts_qab+qab_error.B[EBP]
+	JS	8$.S
+	MOVB	AL, iosts_parm+4t.B[EBP] ;Get ready status
+	NEGB	AL			;0 = not ready, 0FFh = ready
+	MOVB	dff_EAX.B[EBP], AL	;Give him the status value
+	ANDB	dff_EFR.B[EBP], #~01h	;Clear his C bit
+	MOVL	ESP, EBP
+	POPAL				;Restore general registers
+	CALLF	svcSchDismiss#		;Return to user
+
+;Here if error
+
+8$:	JMP	doserr
+.PAGE
+;Here for IOCTL function 08h - Check if mountable device
+
+$$$=!0				;WARNING:  MUST MATCH DEFINITIONS IN USRDOS1!
+FRM gfds_qab , qab_SIZE		;QAB
+FRM gfds_name, 16t		;File name buffer
+FRM gfds_parm, 64t		;Characteristics list buffer
+gfds_SIZE=!$$$
+
+ioctlcmnt:
+	SUBL	ESP, #gfds_SIZE
+	MOVL	EDX, EBX		;Get disk index in right register
+	MOVL	ESI, #cmntparm		;Get the device status value
+	MOVL	ECX, #{CMNTCSIZE+3}/4
+	CALL	getdparms
+	JC	doserr			;If error
+	BTL	gfds_parm+mnt_devsts[EBP], #DS%REMOVE
+	SETNC	dff_EAX+0.B[EBP]	;Set to 1 if not removable
+	MOVB	dff_EAX+1.B[EBP], #0
+	ANDB	dff_EFR.B[EBP], #~01h	;Clear his C bit
+	MOVL	ESP, EBP
+	POPAL				;Restore general registers
+	CALLF	svcSchDismiss#		;Return to user
+
+	.MOD	4
+cmntparm:
+	.BYTE	PAR$GET|REP_HEXV, 4
+	.WORD	IOPAR_DEVSTS
+mnt_devsts=!$-cmntparm
+	.LONG	0
+	.BYTE	0
+CMNTCSIZE=!$-cmntparm
+.PAGE
+;Here for IOCTL function 09h - Check if remote disk drive
+
+ioctlcdrv:
+	MOVW	dff_EDX.B[EBP], #0	;For now, never remote!
+	JMP	2$.S
+
+;Here for IOCTL function 0Ah - Check if remote device
+
+ioctlcrd:
+	MOVW	dff_EDX.B[EBP], #0	;For now, never remote!
+2$:	ANDB	dff_EFR.B[EBP], #~01h	;Clear his C bit
+	POPAL				;Restore general registers
+	CALLF	svcSchDismiss#		;Return to user
+
+;Here for IOCTL function 0Bh - Set file sharing retry parameters
+;	c[AX] = 440Bh
+;	c[CX] = Amount to delay (in multiples of 20ms)
+;	c[DX] = Number of times to retry
+;	INT	21h
+;	C:set = Error
+;	  c[AX] = DOS error code
+;	C:clr = Normal
+
+$$$=!0
+FRM shr_qab , qab_SIZE		;QAB
+FRM shr_parm, 28t		;Characteristics list buffer
+shr_SIZE=!$$$
+
+ioctlretry:
+	SUBL	ESP, #shr_SIZE.B
+	MOVW	shr_qab+qab_func.B[EBP], #QFNC$WAIT|QFNC_CLASSFUNC
+	MOVL	shr_qab+qab_option.B[EBP], #DCF_VALUES
+	MOVL	shr_qab+qab_vector.B[EBP], #0
+	MOVL	shr_qab+qab_buffer1+0.B[EBP], #procname#
+	MOVL	shr_qab+qab_buffer1+4.B[EBP], CS
+	LEAL	EAX, shr_parm.B[EBP]
+	MOVL	shr_qab+qab_buffer2+0.B[EBP], EAX
+	MOVL	shr_qab+qab_buffer2+4.B[EBP], SS
+	MOVW	shr_parm+0t.B[EBP], #PAR$SET|REP_DECV+{2<8t}
+	MOVL	shr_parm+2t.B[EBP], #'SHRD'
+	MOVL	shr_parm+6t.B[EBP], #'ELAY'
+	MOVZWL	EAX, dff_ECX.B[EBP]	;Store retry delay value
+	IMULL	EAX, #20t.B
+	MOVW	shr_parm+10t.B[EBP], AX
+	MOVZWL	EAX, dff_EDX.B[EBP]	;Get retry count value
+	MOVL	shr_parm+12t.B[EBP], EAX ;Store in case its 0!
+	TESTL	EAX, EAX		;Don't change count if 0 here
+	JE	4$.S
+	MOVW	shr_parm+12t.B[EBP], #PAR$SET|REP_DECV+{2<8t}
+	MOVL	shr_parm+14t.B[EBP], #'SHRR'
+	MOVL	shr_parm+18t.B[EBP], #'ETRY'
+	MOVW	shr_parm+22t.B[EBP], AX
+	MOVB	shr_parm+24t.B[EBP], #0
+4$:	PUSHL	SS
+	LEAL	EAX, shr_qab.B[EBP]
+	PUSHL	EAX
+	CALLF	svcIoQueue#
+	TESTL	EAX, EAX
+	JS	8$.S
+	ORL	EAX, shr_qab+qab_error.B[EBP]
+8$:	JS	doserr
+	ANDB	dff_EFR.B[EBP], #~01h	;Clear his C bit
+	MOVL	ESP, EBP
+	POPAL				;Restore general registers
+	CALLF	svcSchDismiss#		;Return to user
+.PAGE
+	.SBTTL	uduphndl - INT 21 function 45 - Duplicate handle
+
+;Here for INT 21 function 45 - Duplicate handle
+;	c(AH) = 45h
+;	c[BX] = File handle
+;	INT	21h
+;	C:set = Error
+;	  c[AX] = Error code
+;	C:clr = Normal
+;	  c[AX] = New file handle
+
+uduphndl::
+	CALL	ugetsyshandle#		;Get the system handle
+	JC	8$.S			;If error
+	CMPB	dxd_syshctbl[EAX], #0FEh ;Can we increase the handle count?
+	JAE	6$.S			;No!
+	PUSHL	EAX			;Yes
+2$:	CALL	ualocdoshandle#		;Allocate another DOS handle
+	JC	10$.S			;If error
+	POPL	EAX
+4$:	INCB	dxd_syshctbl[EAX]	;Increase the systemhandle count
+	MOVB	[EDI], AL		;Store system handle in the DOS handle
+					;  table
+	MOVW	dff_EAX.B[EBP], DX	;Store new DOS handle for user
+	ANDB	dff_EFR.B[EBP], #~01h	;Clear his C bit
+	MOVL	ESP, EBP
+	POPAL				;Restore general registers
+	CALLF	svcSchDismiss#		;Return to user
+
+6$:	MOVL	EAX, #ER_BDDVH
+8$:	JMP	doserr
+
+10$:	POPL	ECX
+	JMP	8$.S
+
+11$:	POPL	ECX
+	JMP	6$.S
+
+	.SBTTL	ufdphndl - INT 21 function 46 - Force duplicate of handle
+
+;Here for INT 21 function 46 - Force duplicate of handle
+;	c(AH) = 46h
+;	c[BX] = First file handle
+;	c[CX] = Second file handle
+;	INT	21h
+;	C:set = Error
+;	  c[AX] = Error code
+;	C:clr = Normal
+;	  c[AX] = New file handle (undocumented)
+
+$$$=!0
+FRM fdph_qab, qab_SIZE
+fdph_SIZE=!$$$
+
+ufdphndl::
+	SUBL	ESP, #fdph_SIZE.B
+	CALL	ugetsyshandle#		;Get the system handle
+	JC	8$.S			;If error
+	CMPB	dxd_syshctbl[EAX], #0FEh ;Can we increase the handle count?
+	JAE	6$.S			;No!
+	MOVL	fdph_qab+qab_handle.B[EBP], EAX
+	MOVZWL	EBX, dff_ECX.B[EBP]	;Get new DOS handle
+	MOVL	EDI, dda_curpsp		;Point to current PSP
+	SHLL	EDI, #4
+	CMPW	psp_hcnt.B[EDI], BX	;Valid device handle?
+	JBE	11$.S			;No - fail
+	CALL	ugetsyshndl4#		;Yes - get corresponding system handle
+	JNC	12$.S			;Error here means not in use
+	DECB	dxd_syshctbl[EAX]	;In use - reduce system handle count
+	JNE	12$.S
+	MOVW	fdph_qab+qab_func.B[EBP], #QFNC$WAIT|QFNC$DIO|QFNC_CLOSE
+	CLRL	EAX
+	MOVL	fdph_qab+qab_option.B[EBP], EAX
+	MOVL	fdph_qab+qab_parm+0.B[EBP], EAX
+	MOVW	fdph_qab+qab_vector.B[EBP], AX
+	PUSHL	SS
+	LEAL	EAX, fdph_qab.B[EBP]
+	PUSHL	EAX			;Close it (ignore errors!)
+	CALLF	svcIoQueue#
+12$:	MOVL	EAX, fdph_qab+qab_handle.B[EBP]
+	JMP	4$
+.PAGE
+	.SBTTL	ugtcdir - INT 21 function 47 - Get current directory
+
+;Here for INT 21 function 47 - Get current directory
+;	c(AH)    = 47h
+;	c(DL)    = Drive code (0 = default, 1 = A:, etc)
+;	c[DS:SI] = Address of 64 byte scratch buffer
+;	INT	21h
+;	C:set = Error
+;	  c[AX] = Error code (always = 0Fh)
+;	C:clr = Normal
+;	  c[AX] = 0100h (undocumented feature)
+;	  Buffer is filled in, nothing else is returned
+
+$$$=!0
+FRM gcd_qab    , qab_SIZE
+FRM gcd_parm   , 28t
+FRM gcd_devname, 8t
+FRM gcd_filspec, 68t
+gcd_SIZE=!$$$
+
+ugtcdir::
+	SUBL	ESP, #gcd_SIZE
+	MOVW	gcd_qab+qab_func.B[EBP], #QFNC$WAIT|QFNC$DIO|QFNC_PATH
+	MOVZBL	EAX, DL			;Get drive number
+	TESTL	EAX, EAX		;Want default drive?
+	JE	2$.S			;Yes
+	ADDB	AL, #'A'-1		;No - change to drive name
+	MOVB	AH, #':'
+	JMP	4$.S
+
+2$:	MOVL	EAX, #'Z:'
+	MOVB	gcd_devname+4.B[EBP], #0
+4$:	MOVL	gcd_devname+0.B[EBP], EAX
+	LEAL	EAX, gcd_devname.B[EBP] ;Store address of device name
+	MOVL	gcd_qab+qab_buffer1+0.B[EBP], EAX
+	MOVL	gcd_qab+qab_buffer1+4.B[EBP], SS
+	CLRL	EAX			;No option bits
+	MOVL	gcd_qab+qab_option.B[EBP], EAX
+	LEAL	EAX, gcd_parm.B[EBP]	;Store address of parameter list
+	MOVL	gcd_qab+qab_parm+0.B[EBP], EAX
+	MOVL	gcd_qab+qab_parm+4.B[EBP], SS	;Build the parameter list
+	MOVL	gcd_parm+0.B[EBP], #{PAR$SET|REP_HEXV} | {4<8} | -
+		  {IOPAR_FILOPTN<16t}
+
+;;;;;	MOVL	gcd_parm+4.B[EBP], #FO$PATHDOS
+
+	MOVL	gcd_parm+4.B[EBP], #FO$PATHNAME
+
+	MOVL	gcd_parm+8.B[EBP], #{PAR$GET|REP_STR} | {IOPAR_FILSPEC<16t}
+	LEAL	EAX, gcd_filspec[EBP]
+	MOVL	gcd_parm+12t.B[EBP], EAX
+	MOVL	gcd_parm+16t.B[EBP], SS
+	MOVL	gcd_parm+20t.B[EBP], #64t
+	MOVB	gcd_parm+24t.B[EBP], #0
+	MOVW	gcd_qab+qab_vector.B[EBP], #0
+	LEAL	EAX, gcd_qab.B[EBP]
+	PUSHL	SS
+	PUSHL	EAX
+	CALLF	svcIoQueue#
+	ORL	EAX, opn_qab+qab_error.B[EBP]
+	JS	14$.S			;If error
+	CALL	getDSESIaddr#		;OK - get address of his buffer
+	MOVL	EDI, ESI
+	PUSHL	FS
+	POPL	ES
+	CLD
+	LEAL	ESI, gcd_filspec+1[EBP] ;Point to start of returned name
+	MOVZWL	ECX, gcd_parm+22t.B[EBP] ;Get length of returned name
+	DECL	ECX
+	JLE	12$.S			;If nothing returrned
+	CMPB	SS:[ESI], #'\'		;Is the first character a back-slash?
+	JNE	8$.S			;No
+	INCL	ESI			;Yes - skip it
+	DECL	ECX
+	JLE	12$.S			;If entire path was "\"
+8$:	CMPB	SS:-1.B[ESI+ECX], #'\'	;Is last character a back-slash?
+	JNE	10$.S			;No
+	DECL	ECX			;Yes - remove it
+10$:	RMOVSB	[EDI], SS:[ESI]		;Give him the path
+12$:	MOVB	AL, #0			;Give him a final null
+	STOSB	[EDI]			;Set his AX to 0100h (which is a mostly
+	MOVW	dff_EAX.B[EBP], #0100h	;  undocumneted DOS "feature" which many
+					;  DOS programs count on!
+	ANDB	dff_EFR.B[EBP], #~01h	;Clear his C bit
+	MOVL	ESP, EBP
+	POPAL				;Restore general registers
+	CALLF	svcSchDismiss#		;Return to user
+
+;Here if error - force the error to ER_NSDEV which translates to DE_DSKI which
+;  is what DOS always returns for this (many DOS programs check for this value!)
+
+14$:	MOVL	EAX, #ER_NSDEV
+	JMP	doserr
+.PAGE
+	.SBTTL	uexec - INT 21 function 4B - Execute program
+
+;Here for INT 21 function 4B - Execute program
+;	c(AL) = Function:
+;		  0 = Load and execute program
+;		  1 = Load program but do not execute
+;		  3 = Load overlay
+;	c(AH) = 4Bh
+;	c[ES:BX] = Address of parameter block
+;	c[DS:DX] = Address of name of program to run
+;	INT	21h
+;	C:set = Error
+;	  c[AX] = Error code
+;	C:clr = Normal
+;	  Nothing is returned (unlike under some version of DOS, all registers
+;	    ARE preserved!)
+
+;Format of the parameter block for real mode and 16-bit protected mode:
+;	Offset Size    Use
+;	   0    2    Segment pointer to environment block
+;	   2    4    Address of command tail
+;	   6    4    Address of first FCB
+;	  10    4    Address of second FCB
+
+;A DOS program (especially with a DPMI environment active) as quite a bit more
+;  state than will fit in the PSP.  We always allocate an EXEC data block (DEB)
+;  (from the DIOB pool) to hold this additional state, which consits mostly of
+;  stack state.
+
+$$$=!0
+FRM exec_debug, 12t
+FRM exec_qab  , qab_SIZE
+FRM exec_pblk , 8t		;Address of user's parameter block
+FRM exec_parm , 96t
+exec_SIZE=!$$$
+
+uexec::	SUBL	ESP, #exec_SIZE
+	MOVZBL	EAX, dff_EAX+0.B[EBP]	;Get function
+	CMPB	AL, #3			;Valid?
+	JA	execill.S		;No - fail
+	JMPIL	CS:execdsp[EAX*4]	;Yes - dispatch on function
+
+	.MOD	4
+execdsp:.LONG	runchild	; 0 - Run program
+	.LONG	loadchild	; 1 - Load program
+	.LONG	execill		; 2 - Illegal
+	.LONG	overlay		; 3 - Load overlay
+
+;Here if have illegal function
+
+execill:MOVL	EAX, #ER_FUNC
+	JMP	doserr
+.PAGE
+;Here for EXEC function 0 - Run program
+
+runchild:
+	MOVL	exec_qab+qab_option.B[EBP], -
+		  #R$DOSEXEC|R$ALLDEV|R$ACSENV|R$CHGENV
+	JMP	2$.S
+
+;Here for EXEC function 1 - Load program
+
+loadchild:
+	MOVL	exec_qab+qab_option.B[EBP], #R$DOSEXEC|R$ALLDEV|R$DEBUG
+2$:	CMPL	dda_execproc, #0.B	;Are we trying to EXEC more than once?
+	JNE	execill.S		;Yes - fail!
+	ORB	dda_intrstate, #DIS$HLDINTR ;Indicate should hold interrupts
+	MOVW	exec_qab+qab_func.B[EBP], #RFNC$WAIT|RFNC_RUN
+	CALL	getDSEDXaddr#		;Get address of file specification
+	MOVL	exec_qab+qab_buffer1+0.B[EBP], ESI ;Store it in the QAB
+	MOVW	exec_qab+qab_buffer1+4.B[EBP], FS
+	LEAL	EDI, exec_parm[EBP]	;Store address of parameter list
+	MOVL	exec_qab+qab_parm+0.B[EBP], EDI
+	MOVW	exec_qab+qab_parm+4.B[EBP], SS
+	PUSHL	SS
+	POPL	ES
+	CALL	getESEBXaddr#		;Get address of the parameter block
+	MOVL	exec_pblk+0.B[EBP], ESI
+	MOVL	exec_pblk+4.B[EBP], FS
+	MOVL	EBX, #2t		;Yes - get address of command tail
+	CALL	getexecaddr
+	TESTL	EBX, EBX		;Have a command tail?
+	JE	4$.S			;No
+	CMPB	GS:[EBX], #0		;Is it zero length?
+	JE	4$.S			;Yes
+	MOVL	EAX, #{PAR$SET|REP_STR}|{IOPAR_RUNCMDTAIL<16t} ;No
+	STOSL	[EDI]
+	LEAL	EAX, 1.B[EBX]
+	STOSL	[EDI]
+	MOVL	EAX, GS
+	STOSL	[EDI]
+	MOVZBL	EAX, GS:[EBX]		;Get length of command tail
+	STOSL	[EDI]
+4$:	CMPW	FS:[ESI], #0.B		;Have an environment block specified?
+	JE	12$.S			;No
+	MOVZWL	EDX, FS:[ESI]		;Yes
+	SHLL	EDX, #4t
+	PUSHL	DS
+	POPL	GS
+	CMPL	EDX, #0FFFF0h		;qqqqqq Another way to specify none
+	JE	12$.S
+	MOVL	EAX, #{PAR$SET|REP_STR}|{IOPAR_RUNENVLIST<16t}
+	STOSL	[EDI]
+	MOVL	EAX, EDX
+	STOSL	[EDI]
+	MOVL	EAX, GS
+	STOSL	[EDI]
+	PUSHL	ES
+	PUSHL	EDI			;Must determine the length of the
+	PUSHL	ECX			;  new environment block
+	MOVL	EDI, EDX
+	PUSHL	GS
+	POPL	ES
+	CLRL	ECX
+	DECL	ECX
+	MOVB	AL, #0
+10$:	RNSCASB	[EDI]			;Find end of environment string
+	SCASB	[EDI]			;Double null?
+	JNE	10$.S			;No - not end of environment block	
+	SUBL	EDI, EDX
+	DECL	EDI
+	MOVL	EAX, EDI
+	POPL	ECX
+	POPL	EDI
+	POPL	ES
+	STOSL	[EDI]			;Store length of environment block
+12$:	MOVL	EBX, #6t		;Get address of first FCB
+	CALL	getexecaddr
+	TESTL	EBX, EBX
+	JE	14$.S
+	MOVL	EAX, #{PAR$SET|REP_STR}|{IOPAR_RUNFCB1<16t}
+	STOSL	[EDI]
+	MOVL	EAX, EBX
+	STOSL	[EDI]
+	MOVL	EAX, GS
+	STOSL	[EDI]
+	MOVL	EAX, #16t
+	STOSL	[EDI]
+14$:	MOVL	EBX, #10t		;Get address of second FCB
+	CALL	getexecaddr
+	TESTL	EBX, EBX
+	JE	16$.S
+	MOVL	EAX, #{PAR$SET|REP_STR}|{IOPAR_RUNFCB2<16t}
+	STOSL	[EDI]
+	MOVL	EAX, EBX
+	STOSL	[EDI]
+	MOVL	EAX, GS
+	STOSL	[EDI]
+	MOVL	EAX, #16t
+	STOSL	[EDI]
+16$:	MOVL	EAX, #{PAR$GET|REP_STR}|{IOPAR_RUNDEBUGBFR<16t}
+	STOSL	[EDI]
+	LEAL	EAX, exec_debug.B[EBP]	;Get address for returned data
+	STOSL	[EDI]
+	MOVL	EAX, SS
+	STOSL	[EDI]
+	MOVL	EAX, #12t
+	STOSL	[EDI]
+	MOVB	AL, #0
+	STOSB	[EDI]			;Fall into exec2 on next page
+.PAGE
+;We are now ready to load and/or run the program.  If the program is another
+;  DOS program, it is loaded only, even if this is a run function.  In this
+;  case, we must change around the return addresses and save registers in the
+;  right way so we execute the program before actually returning from this
+;  call.  A new DOS sub-task has been created by the svcIoRun SVC.  If the
+;  program is an XOS program, the load function is illegal and will fail.
+;  For the run function, the svcIoRun SVC will not return until the process
+;  created for the program terminates.
+
+exec2:	PUSHL	SS
+	LEAL	EAX, exec_qab.B[EBP]
+	PUSHL	EAX
+	CALLF	svcIoRun#
+	TESTL	EAX, EAX		;Error?
+	JS	execerr.S
+	ORL	EAX, exec_qab+qab_error.B[EBP]
+	JS	execerr.S		;Yes
+	CMPB	dff_EAX.B[EBP], #0	;No - run function?
+	JE	4$.S			;Yes
+	LESL	ESI, exec_pblk.B[EBP]	;No - get address of parameter block
+	MOVL	EAX, exec_debug+0.B[EBP] ;Store debug register values
+	MOVL	ES:14t.B[ESI], EAX
+	MOVL	EAX, exec_debug+4.B[EBP]
+	MOVL	ES:18t.B[ESI], EAX
+	JMP	12$
+
+;Here if error
+
+execerr:PUSHL	EAX
+	CLRL	EAX			;Indicate no EXEC process now
+	MOVL	dda_execproc, EAX
+	CALL	chkhldintr		;Check for held process interrupt
+	POPL	EAX
+	JMP	doserr
+
+;Here if run function
+
+4$:	MOVL	EAX, exec_qab+qab_amount.B[EBP] ;Get termination code
+	TESTL	EAX, EAX		;Did we just load a DOS program?
+	JE	dosrun			;Yes
+	MOVL	dda_execproc, EAX	;No - save the process ID
+	PUSHL	EAX
+	CALL	chkhldintr		;Check for held process interrupt
+	PUSHL	#44h.B			;Don't allow signals now
+	CALLF	svcSchSetLevel#
+	PUSHL	#-1.B			;Wait for the child to terminate
+	CALLF	svcSchWaitProc#
+	ORB	dda_intrstate, #DIS$HLDINTR ;Hold interrupts now
+	PUSHL	#8.B
+	CALLF	svcSchSetLevel#		;No more signals at all now
+	MOVL	EAX, dda_execterm	;Get the termination status
+	MOVB	dda_tcode+0, AL
+	SHRL	EAX, #24t		;Store the termination data
+	CMPB	AL, #MAXTRM
+	JB	10$.S
+	CLRL	EAX
+10$:	MOVB	AL, CS:trmtbl[EAX]
+	MOVB	dda_tcode+1, AL
+	CLRL	EAX			;Indicate no EXEC process now
+	MOVL	dda_execproc, EAX
+12$:	CALL	chkhldintr
+	ANDB	dff_EFR.B[EBP], #~01h	;Clear his C bit
+	MOVL	ESP, EBP
+	POPAL				;Restore general registers
+	CALLF	svcSchDismiss#		;Return to user
+
+chkhldintr:
+	ANDB	dda_intrstate, #~DIS$HLDINTR ;Don't hold interrupt requests now
+	TESTB	dda_intrstate, #DIS$REQINTR ;Do we have a held request?
+	JE	16$.S			;No
+	PUSHL	#0.B			;Yes - interrupt this process
+	PUSHL	#1.B
+	PUSHL	#0.B
+	CALLF	svcSchIntrProc#
+16$:	RET
+.PAGE
+;Here if just loaded a DOS program for a run function.  We put the 16-bit
+;  register values on the user's real mode stack just like DOS does.  This
+;  maintains compatibility with programs which fiddle with the PSP saved
+;  stack offset.  We do not save ANY state on the protected mode stack!  This
+;  means that we do NOT preserve the high halves of the general registers or
+;  the values of FS or GS!
+;	c[[SP]+22] = AX
+;	c[[SP]+20] = BX
+;	c[[SP]+18] = CX
+;	c[[SP]+16] = DX
+;	c[[SP]+14] = SI
+;	c[[SP]+12] = DI
+;	c[[SP]+10] = BP
+;	c[[SP]+8]  = DS
+;	c[[SP]+6]  = ES
+;	c[[SP]+4]  = CS
+;	c[[SP]+2]  = IP
+;	c[[SP]+0]  = FR
+
+;When we get here, the stack is set up as follows (offsets are relative to EBP):
+
+;Name        Size Offset Description
+;dff_SS      4    80
+;dff_ESP     4    76
+;dff_dcnt    4    72
+;dff_EFR     4    68
+;dff_CS      4    64
+;dff_EIP     4    60
+;dff_DS      4    56
+;dff_ES      4    52
+;dff_FS      4    48
+;dff_GS      4    44
+;dff_EAX     4    40
+;dff_ECX     4    36
+;dff_EDX     4    32
+;dff_EBX     4    28
+;dff_EBP     4    20
+;dff_ESI     4    16
+;dff_EDI     4    12
+;dff_pntEFR  8    4	Address of location where caller's {E}FR value is stored
+;dff_type    4    0	Call type bits (one byte)
+;dff_return  4   -4	Return offset for DOS function routine
+;exec_debug  12  -16	Returned debug data
+;exec_qab    52  -68	QAB for IO
+;exec_pblk   8   -76	Address of user's parameter block
+;exec_parm   96  -172	Parameter list
+
+dosrun:	MOVL	EBX, dda_curpsp		;Get PSP selector
+	SHLL	EBX, #4t		;Get PSP offset
+	MOVL	EAX, 23h*4		;Save the current INT 23 vector in
+	MOVL	psp_break.B[EBX], EAX	;  the PSP
+	MOVL	EAX, 24h*4		;Save the current INT 24 vector in
+	MOVL	psp_error.B[EBX], EAX	;  the PSP
+	CALL	chkhldintr
+	MOVZWL	EDX, psp_parent.B[EBX]	;Point to the parent PSP
+	SHLL	EDX, #4t
+	MOVL	ESI, dff_SS.B[EBP]	;Get his stack pointer
+	SHLL	ESI, #16t
+	MOVW	SI, dff_ESP.B[EBP]
+	SUBL	ESI, #24t.B		;Adjust it
+	MOVL	psp_stack.B[EBX], ESI	;Store it in the new PSP
+	MOVL	psp_stack.B[EDX], ESI	;Also store stack pointer in the
+	MOVL	dda_dpmicurrSSSP, ESI	;  parent PSP
+	MOVZWL	EAX, dff_SS.B[EBP]
+	SHLL	EAX, #4t
+	MOVZWL	EDI, SI
+	ADDL	EDI, EAX
+	PUSHL	DS
+	POPL	ES
+	CLD
+	MOVL	EAX, dff_EAX.B[EBP]	;Store data on his real mode stack
+	STOSW	[EDI]
+	MOVL	EAX, dff_EBX.B[EBP]
+	STOSW	[EDI]
+	MOVL	EAX, dff_ECX.B[EBP]
+	STOSW	[EDI]
+	MOVL	EAX, dff_EDX.B[EBP]
+	STOSW	[EDI]
+	MOVL	EAX, dff_ESI.B[EBP]
+	STOSW	[EDI]
+	MOVL	EAX, dff_EDI.B[EBP]
+	STOSW	[EDI]
+	MOVL	EAX, dff_EBP.B[EBP]
+	STOSW	[EDI]
+	MOVL	EAX, dff_DS.B[EBP]
+	STOSW	[EDI]
+	MOVL	EAX, dff_ES.B[EBP]
+	STOSW	[EDI]
+	MOVL	EAX, dff_EIP.B[EBP]
+	STOSW	[EDI]
+	MOVL	EAX, dff_CS.B[EBP]
+	STOSW	[EDI]
+	MOVL	EAX, dff_EFR.B[EBP]
+	STOSW	[EDI]
+	PUSHL	#08h.B			;No more signals now
+	CALLF	svcSchSetLevel#
+	MOVL	EAX, dff_CS.B[EBP]	;Set his termination vector
+	SHLL	EAX, #16t
+	MOVW	AX, dff_EIP.B[EBP]
+	MOVL	psp_term.B[EBX], EAX
+	MOVL	22h*4, EAX
+	CMPB	dda_dpmiactive, #0	;Is DPMI active now?
+	JE	4$.S			;No
+	MOVL	EAX, dda_dpmilckpESP	;Yes - save its state
+	MOVL	hda_lckpESP.B[EDX], EAX
+	MOVL	EAX, dda_dpmilckpSS
+	MOVL	hda_lckpSS.B[EDX], EAX
+	MOVL	EAX, dda_dpmicurpESP
+	MOVL	hda_curpESP.B[EDX], EAX
+	MOVL	EAX, dda_dpmicurpSS
+	MOVL	hda_curpSS.B[EDX], EAX
+	MOVL	EAX, dda_dpmilckrSSSP
+	MOVL	hda_lckrSSSP.B[EDX], EAX
+	MOVL	EAX, dda_dpmicurrSSSP
+	MOVL	hda_currSSSP.B[EDX], EAX
+	MOVB	AL, dda_dpmitype
+	MOVB	hda_type.B[EDX], AL
+	MOVB	AL, dda_dpmilckpsflg
+	MOVB	hda_lckpsflg.B[EDX], AL
+	MOVW	dda_dpmilckpsflg, #0	;Indicate not using locked stacks now
+	MOVB	dda_dpmiactive, #0	;And that DPMI is not active
+4$:	MOVZWL	ESI, exec_debug+0.B[EBP] ;Get his new SP
+	MOVZWL	EBX, exec_debug+2.B[EBP] ;Get his new SS
+	MOVZWL	ECX, exec_debug+4.B[EBP] ;Get his new IP
+	MOVZWL	EDX, exec_debug+6.B[EBP] ;Get his new CS
+	MOVL	EAX, exec_debug+12t.B[EBP] ;Get his new EAX
+	ADDL	ESP, #exec_SIZE+dff_arg ;Clean up the stack
+	PUSHL	EBX			;Stack SS
+	PUSHL	ESI			;Stack SP
+	CLRL	EBX
+	PUSHL	EBX			;Stack vector number/count value
+	PUSHL	#20200h			;Stack EFR
+	PUSHL	EDX			;Stack CS
+	PUSHL	ECX			;Stack IP
+	MOVZWL	EDX, dda_curpsp
+	PUSHL	EDX			;Stack DS
+	PUSHL	EDX			;Stack ES
+	PUSHL	EBX			;Stack FS
+	PUSHL	EBX			;Stack GS
+	CLRL	EDX			;Clear all user registers except EAX
+	CLRL	ECX
+	CLRL	ESI
+	CLRL	EDI
+	CLRL	EBP
+	CALLF	svcSchDismiss#		;Start the program
+
+trmtbl:	.BYTE	2		;         = 0  - Illegal
+	.BYTE	0		;TC_EXIT  = 1  - Normal exit
+	.BYTE	1		;TC_KILL  = 2  - Killed
+	.BYTE	2		;TC_PIPE  = 3  - No input available from pipe
+	.BYTE	2		;TC_NOVECT= 4  - No user vector setup for condition
+	.BYTE	2		;TC_BDUSTK= 5  - Bad user stack address
+	.BYTE	2		;TC_NOMEM = 6  - No memory available
+	.BYTE	2		;TC_UNIMOP= 7  - Unimplemented operation
+	.BYTE	2		;TC_RUNP  = 8  - RUN failure (same process)
+	.BYTE	2		;TC_RUNC  = 9  - RUN failure (new process)
+	.BYTE	2		;TC_ILLMDC= 10 - Illegal mode change
+	.BYTE	2		;TC_SUBTSK= 11 - Sub-task error
+MAXTRM=!$-trmtbl
+.PAGE
+;Here for EXEC function 3 - load overlay
+
+overlay:MOVW	exec_qab+qab_func.B[EBP], #RFNC$WAIT|RFNC_LOAD
+	MOVL	exec_qab+qab_option.B[EBP], #R$DOSEXEC ;Store option bits
+	CALL	getDSEDXaddr		;Get address of file specification
+	MOVL	exec_qab+qab_buffer1+0.B[EBP], ESI ;Store it in the IORB
+	MOVW	exec_qab+qab_buffer1+4.B[EBP], FS
+	LEAL	EDI, exec_parm[EBP]	;Store address of parameter list
+	MOVL	exec_qab+qab_parm+0.B[EBP], EDI
+	MOVW	exec_qab+qab_parm+4.B[EBP], SS
+	CALL	getESEBXaddr		;Get address of the parameter block
+	PUSHL	SS
+	POPL	ES
+	MOVL	EAX, #{PAR$SET|REP_HEXV}|{8<8}|{IOPAR_RUNADDRESS<16t}
+	STOSL	[EDI]
+	MOVZWL	EAX, FS:[ESI]		;Get address for the overlay
+	SHLL	EAX, #4t
+	STOSL	[EDI]
+	MOVL	EAX, DS
+	STOSL	[EDI]
+	MOVL	EAX, #{PAR$SET|REP_HEXV}|{8<8}|{IOPAR_RUNRELOCVAL<16t}
+	STOSL	[EDI]
+	MOVZWL	EAX, FS:2.B[ESI]	;Get relocation value
+	SHLL	EAX, #16t
+	STOSL	[EDI]
+	CLRL	EAX
+	STOSL	[EDI]
+	STOSB	[EDI]
+	PUSHL	SS
+	LEAL	EAX, exec_qab.B[EBP]
+	PUSHL	EAX
+	CALLF	svcIoRun#
+	TESTL	EAX, EAX		;Error?
+	JS	4$.S			;Yes
+	ORL	EAX, exec_qab+qab_error.B[EBP]
+4$:	JS	doserr
+	ANDB	dff_EFR.B[EBP], #~01h	;Clear his C bit
+	MOVL	ESP, EBP
+	POPAL				;Restore general registers
+	CALLF	svcSchDismiss#		;Return to user
+.PAGE
+;Subroutine to get address for DOS exec function
+;	c{FS:ESI} = Address of parameter block
+;	c{EBX}    = Offset in 16-bit parameter block
+;	CALL	getexecaddr
+;	c{GS:EBX} = Address obtained
+
+getexecaddr:
+	TESTB	dff_EFR+2.B[EBP], #02h	;From real mode?
+	JE	4$.S			;No
+	CMPB	dda_protaddr, #0	;Yes - have protected addresses anyway?
+	JNE	4$.S			;Yes
+	MOVZWL	EAX, FS:2.B[ESI+EBX]	;No - have real mode addresses
+	MOVZWL	EBX, FS:[ESI+EBX]
+	SHLL	EAX, #4t
+	ADDL	EBX, EAX
+	PUSHL	DS
+	POPL	GS
+	RET
+
+;Here if called from protected mode or if have protected adresses
+
+4$:	CMPB	dda_dpmitype, #DPMIT_32B ;32-bit client?
+	JE	6$.S			;Yes
+	LGSW	BX, FS:[ESI+EBX]	;No - get 16-bit value
+	MOVZWL	EBX, BX			;Extend offset to 32 bits
+	RET
+
+;Here if called from 32-bit client
+
+6$:	LGSL	EBX, FS:[ESI+EBX*2]
+	RET
+.PAGE
+	.SBTTL	usffm - INT 21 function 4E - Search for first match
+
+;Here for INT 21 function 4E - Search for first match
+;	c(AH)    = 4Eh
+;	c[CX]    = Attribute for search
+;	c[DS:DX] = Address of specification of file to search for
+;	INT	21h
+;	C:set = Error
+;	  c[AX] = Error code
+;	C:clr = Normal
+;	  Information about file filed in in current disk buffer
+;  Format of the information stored in the first 21. bytes of the current disk
+;    buffer:
+;	0-7   Next directory entry
+;	8     Attribute byte for search
+;	9-20  File specification
+;    If byte 9 contains 0:
+;	10-13 Offset of DIOB containing file specification
+;	14-20 Not used
+;  Format of the information stored in the DIOB
+;	0-3   Offset of next file specification DIOB
+;	4-7   Use count
+;	8     Length of file specification
+;	9-    File specification
+
+$$$=!0
+FRM dir_qab    , qab_SIZE
+FRM dir_parm   , 64t
+FRM dir_speclen, 4t		;File specification length
+FRM dir_specadr, 8t
+FRM dir_dtaa   , 8t
+dir_SIZE=!$$$
+
+usffm::	SUBL	ESP, #dir_SIZE
+	CALL	dosgetdtaa
+	PUSHL	FS
+	POPL	ES
+	MOVL	dir_dtaa+0[EBP], EDX
+	MOVL	dir_dtaa+4[EBP], ES
+	CLRL	EAX
+	MOVL	ES:[EDX], EAX		;Clear directory offset
+	MOVB	AL, dff_ECX.B[EBP]
+	CMPB	AL, #A$LABEL		;Want labels only?
+	JE	2$.S			;Yes - don't include normal files
+	ORB	AL, #A$NORMAL		;No - include normal files
+2$:	MOVB	ES:8t.B[EDX], AL	;Store attribute byte in his DTA
+	CALL	getDSEDXaddr#		;Get address of file specification
+	MOVL	dir_specadr+0[EBP], ESI
+	MOVL	dir_specadr+4[EBP], FS
+	CLD
+4$:	LODSB	FS:[ESI]
+	CMPB	AL, #0
+	JE	22$
+	CMPB	AL, #'*'
+	JE	6$.S
+	CMPB	AL, #'?'
+	JNE	4$.S
+6$:	LODSB	FS:[ESI]
+	CMPB	AL, #0
+	JNE	6$.S
+	SUBL	ESI, dir_specadr+0[EBP]	;Get length of file specification
+	MOVL	ECX, ESI
+	CMPL	ECX, #1
+	JBE	usfer2
+	MOVL	dir_speclen[EBP], ECX
+	MOVL	ESI, dir_specadr+0[EBP]
+	CMPL	ECX, #12t.B		;Will it fit in the DTA block?
+	JA	10$.S			;No
+	LEAL	EDI, 9.B[EDX]		;Yes - copy the file specification
+	JMP	20$.S			;  to the DTA block
+
+;Here if file specification is too long to fit in the DTA block
+
+10$:	CMPL	ECX, #246t		;Is it too long?
+	JA	usfer2			;Yes - fail
+	MOVB	ES:9t.B[EDX], #0
+	MOVL	EDI, dxd_fnstr		;No - see if we already have it
+12$:	TESTL	EDI, EDI
+	JE	18$.S
+	CMPB	8t.B[EDI], CL
+	JNE	14$.S
+	PUSHL	ECX
+	PUSHL	EDI
+	PUSHL	ESI
+	RECMPSB	[EDI], FS:[ESI]
+	POPL	ESI
+	POPL	EDI
+	POPL	ECX
+	JE	16$.S
+14$:	MOVL	EDI, [EDI]
+	JMP	12$.S
+
+;Here with an existing file specification block which we can use
+
+16$:	INCL	4t.B[EDI]		;Increment the use count
+	MOVL	ES:4t.B[EDX], EDI
+	PUSHL	DS
+	POPL	ES
+	ADDL	EDI, #9t.B
+	JMP	usfnm2.S
+
+;Here if must allocate a new file specification block
+
+18$:	CALL	ugetdiob#		;Get a DIOB
+	JC	usfer2
+	MOVL	EAX, dxd_fnstr		;Link into list of name string blocks
+	MOVL	[EDI], EAX
+	MOVL	dxd_fnstr, EDI
+	MOVL	ES:10t.B[EDX], EDI	;Store offset of the DIOB in the DTA
+	MOVL	4t.B[EDI], #1		;Initialize the use count
+	MOVB	8t.B[EDI], CL		;Store length of file specification
+	PUSHL	DS
+	POPL	ES
+	ADDL	EDI, #9t.B
+	CLD
+20$:	PUSHL	EDI
+	RMOVSB	[EDI], FS:[ESI]		;Copy the file specification
+	POPL	EDI
+	JMP	usfnm2.S
+
+;Here if file specification is fully specified (no wild card characters).  In
+;  this case there is no need to save the file specification for additional
+;  calls.
+
+22$:	CLRL	EAX
+	MOVB	ES:9t.B[EDX], AL
+	MOVL	ES:10t.B[EDX], EAX
+	LESL	EDI, dir_specadr[EBP]
+	JMP	usfnm2.S
+.PAGE
+	.SBTTL	INT 21 function 4F - Search for next match
+
+;Here for INT 21 function 4F - Search for next match
+;	c(AH) = 4Fh
+;	INT	21h
+;	C:set = Error
+;	  c[AX] = Error code
+;	C:clr = Normal
+;	  Information about file filed in in current disk buffer
+
+usfnm::	SUBL	ESP, #dir_SIZE
+	CALL	dosgetdtaa		;Get address of his DTA
+	MOVL	dir_dtaa+0[EBP], EDX
+	MOVL	dir_dtaa+4[EBP], FS
+	CMPB	FS:9.B[EDX], #0		;Is the file spec in the DTA?
+	JE	2$.S			;No
+	LEAL	EDI, 9t.B[EDX]		;Yes
+	PUSHL	FS
+	JMP	4$.S
+
+;Here if file specification is not in the DTA
+
+2$:	MOVL	EDI, FS:10t.B[EDX]	;Get offset of the file spec DIOB
+	TESTL	EDI, EDI
+	JE	usfer2			;Error if none
+	ADDL	EDI, #9t.B
+	PUSHL	DS
+4$:	POPL	ES
+
+;Here when ready to do search
+;	c{ES:EDI} = Address of file specification
+;	c{FS:EDX} = Address of his DTA
+
+usfnm2:	MOVL	dir_qab+qab_buffer1+0.B[EBP], EDI ;Store address of file spec
+	MOVW	dir_qab+qab_buffer1+4.B[EBP], ES
+	MOVW	dir_qab+qab_func.B[EBP], #QFNC$WAIT|QFNC$DIO|QFNC_DEVPARM
+	MOVL	dir_qab+qab_option.B[EBP], #O$CRIT|O$USEDOS
+					;Store option bits
+	LEAL	EAX, dir_parm.B[EBP]	;Store address of parameter list
+	MOVL	dir_qab+qab_parm+0.B[EBP], EAX
+	MOVL	dir_qab+qab_parm+4.B[EBP], SS	;Build the parameter list
+	MOVL	dir_parm+0.B[EBP], #{PAR$SET|REP_HEXV}|{4<8}|{IOPAR_FILOPTN<16t}
+	MOVL	dir_parm+4.B[EBP], #FO$FILEDOS|FO$NOPREFIX
+	MOVL	dir_parm+8.B[EBP], #{PAR$GET|REP_STR}|{IOPAR_FILSPEC<16t}
+	LESL	EDX, dir_dtaa[EBP]
+	LEAL	EAX, 30t.B[EDX]
+	MOVL	dir_parm+12t.B[EBP], EAX
+	MOVL	dir_parm+16t.B[EBP], ES
+	MOVL	dir_parm+20t.B[EBP], #13t
+	MOVL	dir_parm+24t.B[EBP], #{PAR$GET|PAR$SET|REP_DECV} | {8<8} | -
+		  {IOPAR_DIROFS<16t}
+	MOVL	EAX, ES:[EDX]
+	MOVL	dir_parm+28t.B[EBP], EAX
+	MOVL	EAX, ES:4.B[EDX]
+	MOVL	dir_parm+32t.B[EBP], EAX
+	MOVL	dir_parm+36t.B[EBP], #{PAR$GET|REP_DECV} | {4<8} | -
+		  {IOPAR_LENGTH<16t}
+	MOVL	dir_parm+44t.B[EBP], #{PAR$GET|REP_HEXV} | {4<8} | -
+		  {IOPAR_MDATE<16t}
+	MOVL	dir_parm+52t.B[EBP], #{PAR$GET|REP_HEXV} | {2<8} | -
+		  {IOPAR_FILATTR<16t}
+	MOVL	dir_parm+58t.B[EBP], #{PAR$SET|REP_HEXV} | {1<8} | -
+		  {IOPAR_SRCATTR<16t}
+	MOVB	AL, ES:8t.B[EDX]
+	MOVB	dir_parm+62t.B[EBP], AL
+	MOVB	dir_parm+63t.B[EBP], #0
+	MOVW	dir_qab+qab_vector.B[EBP], #0
+	PUSHL	SS
+	LEAL	EAX, dir_qab.B[EBP]
+	PUSHL	EAX
+	CALLF	svcIoQueue#
+	TESTL	EAX, EAX		;Error?
+	JS	usferr.S		;Yes
+	ORL	EAX, dir_qab+qab_error.B[EBP] ;Maybe
+	JS	usferr.S		;Yes
+	MOVL	EAX, dir_parm+28t.B[EBP] ;Put current directory offset in
+	MOVL	ES:[EDX], EAX	 	 ;  his DTA
+	MOVL	EAX, dir_parm+32t.B[EBP]
+	MOVL	ES:4.B[EDX], EAX
+	MOVB	AL, dir_parm+56t.B[EBP] ;Give him the file attributes
+	ANDB	AL, #3Fh
+	MOVB	ES:21t.B[EDX], AL
+	MOVL	EAX, dir_parm+48t.B[EBP] ;Get file time and date
+	MOVL	ES:22t.B[EDX], EAX
+	MOVL	EAX, dir_parm+40t.B[EBP] ;Get file length
+	TESTB	dir_parm+52t.B[EBP], #A$DIRECT ;Is it a directory?
+	JE	6$.S			;No
+	CLRL	EAX			;Yes - return 0 for the length
+6$:	MOVL	ES:26t.B[EDX], EAX
+	ANDB	dff_EFR.B[EBP], #~01h	;Clear his C bit
+	MOVL	ESP, EBP
+	POPAL				;Restore general registers
+	CALLF	svcSchDismiss#		;Return to user
+
+;Here if error on directory search
+
+usferr:	CMPB	ES:9t.B[EDX], #0	;Do we have a DIOB?
+	JNE	16$.S			;No
+	MOVL	EDI, ES:10t.B[EDX]	;Yes - get its offset
+	TESTL	EDI, EDI
+	JE	usfer2.S
+	DECL	4t.B[EDI]		;Reduce the use count
+	JG	16$.S			;If still in use
+	MOVL	EBX, #dxd_fnstr		;Idle now - search the list to find
+10$:	CMPL	EDI, [EBX]		;  the predecessor
+	JE	12$.S
+	MOVL	EBX, [EBX]
+	TESTL	EBX, EBX
+	JNE	10$.S
+	JMP	14$.S			;If not in list (just give it up)!
+
+;Here with predecessor in list of file specification blocks
+
+12$:	MOVL	EAX, [EDI]		;Unlink this block
+	MOVL	[EBX], EAX
+14$:	CALL	ugivediob#		;Give up this block
+16$:	CLRL	EAX			;Clear DIOB offset in his DTA
+	MOVB	ES:9t.B[EDX], AL
+	MOVL	ES:10t.B[EDX], EAX
+usfer2:	MOVL	EAX, #ER_DIRFL		;Get error code (always "directory
+	JMP	doserr			;  full", which DOS takes as "no more
+					;  files"!)
+.PAGE
+	.SBTTL	INT 21 function 57 - Get or set file date and time
+
+;Here for INT 21 function 57 - Get or set file date and time
+;	c(AL) = Function:
+;		  0 = Get file date and time
+;		  1 = Set file date and time
+;	c(AH) = 57h
+;	c[BX] = File handle
+;	c[CX] = Time (if c(AL) = 1)
+;	c[DX] = Date (if c(AL) = 1)
+;	INT	21h
+;	C:set = Error
+;	  c[AX] = Error code
+;	C:clr = Normal
+;	  If c(AL) = 0 on call:
+;	    c[CX] = Time
+;	    c[DX] = Date
+;	  If c(AL) = 1 on call, nothing returned!
+
+$$$=!0
+FRM fdt_qab , qab_SIZE
+FRM fdt_parm, 32t
+fdt_SIZE=!$$$
+
+ufdttm::SUBL	ESP, #fdt_SIZE.B
+	LEAL	EAX, fdt_parm.B[EBP]
+	MOVL	fdt_qab+qab_parm+0.B[EBP], EAX
+	MOVW	fdt_qab+qab_parm+4.B[EBP], SS
+	MOVL	fdt_parm+0t.B[EBP], #{PAR$GET|REP_DECV} | {4<8} | -
+		  {IOPAR_MDATE<16t}
+	MOVB	fdt_parm+8t.B[EBP], #0	;Assume getting date and time
+	CMPB	dff_EAX+0.B[EBP], #0	;Right?
+	JE	2$.S			;Yes
+	XORB	fdt_parm+0t.B[EBP], #PAR$GET|PAR$SET ;No - setting date and time
+	MOVW	fdt_parm+4t.B[EBP], CX	;Store new time
+	MOVW	fdt_parm+6t.B[EBP], DX	;Store new date
+	MOVL	fdt_parm+8t.B[EBP], #{PAR$SET|REP_DECV} | {4<8} | -
+		  {IOPAR_CDATE<16t}
+	MOVW	fdt_parm+12t.B[EBP], CX	;Store new time
+	MOVW	fdt_parm+14t.B[EBP], DX	;Store new date
+	MOVB	fdt_parm+16t.B[EBP], #0
+2$:	CALL	ugetsyshandle#		;Get system handle
+	JC	10$.S			;If error
+	MOVL	fdt_qab+qab_handle.B[EBP], EAX
+	CLRL	EAX
+	MOVL	fdt_qab+qab_count.B[EBP], EAX
+	MOVW	fdt_qab+qab_vector.B[EBP], AX
+	MOVW	fdt_qab+qab_func.B[EBP], #QFNC$WAIT|QFNC$DIO|QFNC_INBLOCK
+	PUSHL	SS
+	LEAL	EAX, fdt_qab.B[EBP]
+	PUSHL	EAX
+	CALLF	svcIoQueue#
+	TESTL	EAX, EAX
+	JS	10$.S
+	ORL	EAX, fdt_qab+qab_error.B[EBP]
+	JS	10$.S
+	CMPB	dff_EAX.B[EBP], #0	;Getting the date and time?
+	JNE	6$.S			;No
+	MOVL	EAX, fdt_parm+4.B[EBP]	;Yes - give him the value
+	MOVW	dff_ECX.B[EBP], AX
+	SHRL	EAX, #16t
+	MOVW	dff_EDX.B[EBP], AX
+6$:	ANDB	dff_EFR.B[EBP], #~01h	;Clear his C bit
+	MOVL	ESP, EBP
+	POPAL				;Restore general registers
+	CALLF	svcSchDismiss#		;Return to user
+
+;Here if error
+
+10$:	JMP	doserr
+.PAGE
+	.SBTTL	urlock - INT 21 function 5C - Record locking
+
+;Here for INT 21 function 5C - Record locking
+;	c(AH) = 5Ch
+;	c(AL) = 00 (lock)
+;		01 (unlock)
+;	c[BX] = Handle
+;	c{CX:DX} = 4 byte integer specifying the beginning of region to lock
+;	c{SI:DI} = 4 byte integer specifying length of region
+;	INT	21h
+;	C:set = Error
+;	c[AX] = Error code (1, 6, 21, 24)
+;	C:clr = Normal
+
+$$$=!0
+FRM flsc_qab , qab_SIZE
+FRM flsc_parm, 32t
+flsc_SIZE=!$$$
+
+urlock::SUBL	ESP, #flsc_SIZE.B
+	SHLL	ESI, #16t		;Move high 16 bits in proper place
+	MOVW	SI, DI			;Place entire length in ESI
+	SHLL	ECX, #16t		;Move high 16 bits in proper place
+	MOVW	CX, DX			;Place entire offset in ECX
+	LEAL	EAX, flsc_parm.B[EBP]
+	MOVL	flsc_qab+qab_parm+0.B[EBP], EAX
+	MOVW	flsc_qab+qab_parm+4.B[EBP], SS
+	CMPB	dff_EAX+0.B[EBP], #1	;Are we setting the lock?
+	JB	4$.S			;Yes
+	JE	6$.S			;If we are clearing the lock
+	MOVL	EAX, #ER_FUNC		;Bad function - fail
+2$:	JMP	doserr
+
+;Here if setting the lock
+
+4$:	MOVL	flsc_parm+0t.B[EBP], -
+		  #{PAR$SET|REP_HEXV}|{4<8}|{IOPAR_SHRPARMS<16t}
+	MOVL	flsc_parm+4t.B[EBP], #-1
+	MOVL	flsc_parm+8t.B[EBP], #{PAR$SET|REP_HEXV} | {8<8} | -
+		  {IOPAR_SETLOCK<16t}
+	MOVL	flsc_parm+12t.B[EBP], ECX ;Store offset of region
+	MOVL	flsc_parm+16t.B[EBP], ESI ;Store size of region
+	MOVB	flsc_parm+20t.B[EBP], #0.B
+	JMP	8$.S
+
+;Here if clearing the lock
+
+6$:	MOVL	flsc_parm+0t.B[EBP], #{PAR$SET|REP_HEXV} | {8<8} | -
+		  {IOPAR_CLRLOCK<16t}
+	MOVL	flsc_parm+4t.B[EBP], ECX ;Store offset of region
+	MOVL	flsc_parm+8t.B[EBP], ESI ;Store size of region
+	MOVB	flsc_parm+12t.B[EBP], #0.B
+8$:	CALL	ugetsyshandle#		;Get system handle
+	JC	2$.S			;If error
+	MOVL	flsc_qab+qab_handle.B[EBP], EAX
+	CLRL	EAX
+	MOVL	flsc_qab+qab_count.B[EBP], EAX
+	MOVW	flsc_qab+qab_vector.B[EBP], AX
+	MOVW	flsc_qab+qab_func.B[EBP], #QFNC$WAIT|QFNC_INBLOCK
+	PUSHL	SS
+	LEAL	EAX, flsc_qab.B[EBP]
+	PUSHL	EAX
+	CALLF	svcIoQueue#
+	TESTL	EAX, EAX
+	JS	2$.S
+	ORL	EAX, flsc_qab+qab_error.B[EBP]
+	JS	2$.S
+	ANDB	dff_EFR.B[EBP], #~01h	;Clear his C bit
+	MOVL	ESP, EBP
+	POPAL				;Restore general registers
+	CALLF	svcSchDismiss#		;Return to user
+.PAGE
+	.SBTTL	ucanonical - INT 21 function 60 - Resolve path string to canonical path string 
+
+;Here for INT 21 function 60 - Resolve path string to canonical path string
+;	c(AH)  = 60h
+;	c[DS:SI] = Address of relative path string or directory name
+;	c[ES:DI] = Address of 128 byte buffer for result
+;	INT	21
+;	C:set = Error
+;	  c[AX] = Error code
+;	C:clr = Normal
+;	  c[AX] = 0
+
+$$$=!0
+FRM can_spec  , 8t
+FRM can_name  , 8t		;Address of name specified
+FRM can_left  , 4t		;Space left
+FRM can_dev   , 12t		;Device name buffer for svcIoPath
+FRM can_buffer, 128t		;Buffer for building string to return
+can_SIZE=!$$$
+
+ucanonical::
+	SUBL	ESP, #can_SIZE
+	CALL	getDSESIaddr#		;Get address of relative path string
+	MOVL	can_spec+0.B[EBP], ESI
+	MOVL	can_spec+4.B[EBP], FS
+	MOVL	EBX, ESI
+	MOVL	EDX, ESI
+	CLD
+2$:	LODSB	FS:[ESI]		;Find end of device name in string
+	CMPB	AL, #0
+	JE	4$.S
+	CMPB	AL, #':'
+	JNE	2$.S
+	MOVL	EDX, ESI
+4$:	MOVL	can_name+0.B[EBP], EDX
+	MOVL	can_name+4.B[EBP], FS
+	PUSHL	#TNB$DOSNAME.B		;Expand the device name
+	PUSHL	FS
+	PUSHL	EBX
+	PUSHL	SS
+	LEAL	EDI, can_buffer[EBP]
+	PUSHL	EDI
+	PUSHL	#128t
+	CALLF	svcIoTransName#
+	TESTL	EAX, EAX
+	JS	canpnf
+	MOVL	ESI, EDI
+	MOVL	EAX, SS
+	MOVL	FS, EAX
+	MOVL	ES, EAX
+	MOVL	can_left.B[EBP], #127t
+	CALL	canon2			;Fix up the expanded device name
+	JC	8$.S
+	LFSL	ESI, can_name.B[EBP]
+	CMPB	FS:[ESI], #'\'		;Want current path?
+	JE	10$.S			;Yes
+	CMPB	FS:[ESI], #'/'
+	JE	10$.S
+	LEAL	EAX, can_dev.B[EBP]
+	MOVL	ECX, can_name+0.B[EBP]	;Get length of device name
+	SUBL	ECX, can_spec+0.B[EBP]
+	CMPL	ECX, #8t.B		;Too long?
+	JA	canfnf			;Yes - fail
+	JREGZ	ECX, 6$			;No - do we have a name?
+	PUSHL	ESI			;Yes - copy it to our name buffer
+	PUSHL	EDI
+	PUSHL	ES
+	MOVL	ESI, can_spec+0.B[EBP]
+	MOVL	EDI, EAX
+	PUSHL	SS
+	POPL	ES
+	RMOVSB	[EDI], FS:[ESI]
+	MOVB	ES:[EDI], #0
+	POPL	ES
+	POPL	EDI
+	POPL	ESI
+	JMP	7$.S
+
+6$:	MOVL	SS:[EAX], #'Z:'
+7$:	PUSHL	SS
+	PUSHL	EAX
+	PUSHL	#FO$PATHDOS|FO$FILEDOS|FO$NOPREFIX
+	PUSHL	SS
+	PUSHL	EDI
+	PUSHL	can_left.B[EBP]
+	CALLF	svcIoPath#
+	TESTL	EAX, EAX
+	JS	canfnf.S
+	MOVL	ESI, EDI
+	CALL	canon2
+8$:	JC	canfnf.S
+10$:	LFSL	ESI, can_name.B[EBP]	;Fix up the given path and name
+	CALL	canon2
+	JC	canfnf.S
+	CMPB	ES:-1.B[EDI], #':'	;Have a null path?
+	JNE	12$.S			;No
+	MOVB	AL, #'\'		;Yes - add a backslash
+	STOSB	[EDI]
+12$:	CLRL	EAX			;Give him a final null
+	STOSB	[EDI]
+	MOVW	dff_EAX.B[EBP], AX	;Return 0 in EAX
+	LEAL	ECX, can_buffer[EBP]
+	SUBL	ECX, EDI		;Get length of string generated
+	NEGL	ECX
+	CALL	getESEDIaddr#		;Get address of his buffer
+	MOVL	EDI, ESI
+	PUSHL	FS
+	POPL	ES
+	LEAL	ESI, can_buffer[EBP]	;Copy the string to his buffer
+	RMOVSL	[EDI], SS:[ESI]
+	ANDB	dff_EFR.B[EBP], #~01h	;Clear his C bit
+	MOVL	ESP, EBP
+	POPAL				;Restore general registers
+	CALLF	svcSchDismiss#		;Return to user
+
+;Here if error
+
+canpnf:	MOVL	EAX, #ER_DIRNF
+	JMP	18$.S
+
+canfnf:	MOVL	EAX, #ER_FILNF
+18$:	JMP	doserr
+.PAGE
+;Subroutine to fix up the path/name string.  This subroutine converts lower
+;  case to upper case, truncates names to 8 characters and extensions to 3
+;  characters, converts * to ?s, and removes . and .. atoms.
+;	c{FS:ESI} = Address of source string
+;	c{SS:EDI} = Address of destination string
+;	CALL	canon2
+
+canon2:	LODSB	FS:[ESI]		;Get character
+	CMPB	AL, #0			;End?
+	JE	4$.S			;Yes
+	mOVB	AH, #0			;No - indicate not extension yet
+	MOVL	ECX, #8			;Allow 8 characters in name
+	CMPB	AL, #'.'		;Period?
+	JNE	22$.S			;No
+	LODSB	FS:[ESI]		;Yes - get next character
+	CMPB	AL, #'.'		;Another period?
+	JE	10$.S			;Yes
+	CMPB	AL, #0			;No - must have end of atom next
+	JE	6$.S
+	DECL	ESI
+	CMPB	AL, #'\'
+	JE	6$.S
+	CMPB	AL, #'/'
+	JE	canon2.S
+2$:	STC
+4$:	RET
+
+;Here if have an atom consisting of a single period - this is basically
+;  a no-op so we just remove it and the preceeding backslash.
+
+6$:	CMPB	SS:-1.B[EDI], #'\'	;Was preceeding character a \?
+	JNE	canon2.S		;No
+8$:	DECL	EDI			;Yes - remove it
+	JMP	canon2.S		;Continue
+
+;Here if have 2 periods at beginning of an atom
+
+10$:	MOVB	AL, FS:[ESI]
+	CMPB	AL, #0			;Must have end of atom next
+	JE	12$.S
+	CMPB	AL, #'\'
+	JE	12$.S
+	CMPB	AL, #'/'
+	JNE	2$.S
+12$:	CMPB	SS:-1.B[EDI], #'\'	;Was preceeding character a \?
+	JNE	2$.S			;No - fail!
+	CMPB	SS:-2.B[EDI], #':'	;Was this the first level directory?
+	JE	2$.S			;Yes - fail!
+14$:	DECL	EDI			;No - backup over previous atom
+	CMPB	SS:-1.B[EDI], #'\'
+	JNE	14$.S
+	JMP	8$.S
+
+;Here to get next character
+
+20$:	LODSB	FS:[ESI]
+	INCL	EBX
+	CMPB	AL, #0
+	JE	4$.S
+22$:	CMPB	AL, #'\'
+	JE	27$.S
+	CMPB	AL, #'/'
+	JE	26$.S
+	CMPB	AL, #'.'
+	JE	28$.S
+	CMPB	AL, #'*'
+	JE	30$.S
+	CMPB	AL, #'a'		;Lower case letter?
+	JB	24$.S			;No
+	CMPB	AL, #'z'		;Maybe
+	JA	24$.S			;No
+	ADDB	AL, #'A'-'a'		;Yes - change to upper case
+24$:	DECL	ECX
+	JS	20$.S
+	STOSB	[EDI]
+	JMP	20$.S
+
+;Here if have \ or /
+
+26$:	MOVB	AL, #'\'
+27$:	STOSB	[EDI]
+	JMP	canon2
+
+;Here if have period
+
+28$:	CMPB	AH, #0			;First period?
+	JNE	2$.S			;No - say bad name
+	MOVB	AH, #1			;Yes - indicate have period
+	STOSB	[EDI]			;Store it
+	MOVL	ECX, #3t		;Allow 3 characters in extension
+	JMP	20$.S			;Continue
+
+;Here if have * in atom - fill out the atom with ?s
+
+30$:	DECL	ECX
+	JS	20$.S
+	MOVB	AL, #'?'
+	STOSB	[EDI]
+	JMP	30$.S
+.PAGE
+	.SBTTL	usethndl - INT 21 function 67 - Set handle table size
+
+;Here for INT 21 function 67 - Set handle table size
+;	c(AH) = 67h
+;	c[BX] = Desired number of handles
+;	INT	21h
+;	C:set = Error
+;	  c[AX] = Error code
+;	C:clr = Normal
+
+usethndl::
+	MOVL	EDX, dda_curpsp		;Point to current PSP
+	SHLL	EDX, #4
+	CMPW	psp_hcnt.B[EDX], BX	;Really trying to expand the table?
+	JAE	4$.S			;No - nothing to do here
+	MOVZWL	EBX, BX			;Yes - get amount to allocate
+	MOVL	EAX, EBX		;Calculate extra handles being made
+	SUBW	AX, psp_hcnt.B[EDX]
+	ADDL	EBX, #15t		;Change to number of paragraphs
+	SHRL	EBX, #4t
+	PUSHL	EAX
+	PUSHL	EDX
+	CALL	ugetmem#		;Allocate memory if can
+	POPL	EDX
+	JC	doserr			;If error
+	PUSHL	DS
+	POPL	ES
+	MOVZWL	EAX, psp_hpnt+0.B[EDX]	;Get offset of current table
+	MOVZWL	ESI, psp_hpnt+2.B[EDX]
+	SHLL	ESI, #4
+	ADDL	ESI, EAX
+	MOVL	EAX, EDI		;OK - get store real mode address
+	SHLL	EAX, #12t
+	MOVL	psp_hpnt.B[EDX], EAX
+	MOVZWL	ECX, psp_hcnt.B[EDX]	;Get size of current table
+	CLD
+	RMOVSB	[EDI], [ESI]		;Copy the handle table
+	POPL	ECX			;Restore number of new handles
+	ADDW	psp_hcnt.B[EDX], CX	;Increase his handle number value
+	MOVB	AL, #0FFh
+	RSTOSB	[EDI]			;Indicate new handles are free	
+4$:	ANDB	dff_EFR.B[EBP], #~01h	;Clear his C bit
+	POPAL				;Restore general registers
+	CALLF	svcSchDismiss#		;Return to user
+.PAGE
+	.SBTTL	ucommitf - INT 21 function 68 - Commit file
+
+;Here for INT 21 function 68 - Commit file
+;	c(AH) = 68h
+;	c[BX] = Handle
+;	INT	21h
+;	C:set = Error
+;	  c[AX] = Error code
+;	C:clr = Normal
+
+$$$=!0
+FRM cmt_qab , qab_SIZE
+cmt_SIZE=!$$$
+
+ucommitf::
+	SUBL	ESP, #cmt_SIZE.B
+	CALL	ugetsyshandle#		;Get system handle
+	JC	4$.S			;If error
+	MOVL	cmt_qab+qab_handle.B[EBP], EAX
+	CLRL	EAX
+	MOVL	cmt_qab+qab_count.B[EBP], EAX
+	MOVW	cmt_qab+qab_vector.B[EBP], AX
+	MOVW	cmt_qab+qab_func.B[EBP], #QFNC$WAIT|QFNC_COMMIT
+	PUSHL	SS
+	LEAL	EAX, cmt_qab.B[EBP]
+	PUSHL	EAX
+	CALLF	svcIoQueue#
+	TESTL	EAX, EAX
+	JS	4$.S
+	ORL	EAX, cmt_qab+qab_error.B[EBP]
+	JS	4$.S
+	ANDB	dff_EFR.B[EBP], #~01h	;Clear his C bit
+	MOVL	ESP, EBP
+	POPAL				;Restore general registers
+	CALLF	svcSchDismiss#		;Return to user
+
+;Here if error
+
+4$:	JMP	doserr
+.PAGE
+	.SBTTL	getdparms - Subroutine to get disk parameters
+
+;Subroutine to get disk parameters for INT 21 functions 1B, 1C, 36, and
+;  44 (subfunction 8)
+;	c(DL)  = DOS disk number
+;	c{ECX} = Length of parameter list (number of longs)
+;	c{ESI} = Offset in code segment for parameter list
+;	CALL	getdparms
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+
+getdparms::
+	MOVZBL	EAX, DL			;Get drive number
+	TESTL	EAX, EAX		;Want default drive?
+	JE	2$.S			;Yes
+	ADDB	AL, #'A'-1		;No
+	MOVB	AH, #':'
+	JMP	4$.S
+
+2$:	MOVL	EAX, #'Z:'		;Use default drive
+4$:	MOVL	gfds_name+0.B[EBP], EAX	;Store device name
+	LEAL	EDI, gfds_parm[EBP]	;Copy the parameter list to our stack
+	PUSHL	SS			;  frame
+	POPL	ES
+	CLD
+	RMOVSL	[EDI], CS:[ESI]
+	PUSHL	#O$PHYS|O$CRIT
+	PUSHL	SS
+	LEAL	EAX, gfds_name.B[EBP]
+	PUSHL	EAX
+	PUSHL	SS
+	LEAL	EAX, gfds_parm[EBP]
+	PUSHL	EAX
+	CALLF	svcIoDevParm#
+	BTL	EAX, #31t		;Set C if error
+	RET
+.PAGE
+;Subroutine to get disk transfer address (DTAA) for caller's mode
+;	CALL	dosgetdtaa
+;	c{FS:EDX} = Current disk transfer address
+
+dosgetdtaa::
+	TESTB	dff_EFR+2.B[EBP], #02h	;Called from protected mode?
+	JE	4$.S			;Yes
+	PUSHL	EAX			;No
+	MOVZWL	EAX, dda_dtaa+2
+	SHLL	EAX, #4
+	MOVZWL	EDX, dda_dtaa+0
+	ADDL	EDX, EAX
+	POPL	EAX
+	PUSHL	DS
+	POPL	FS
+	RET
+
+;Here if called from protected mode
+
+	IFFAULT	6$
+4$:	LFSL	EDX, dxd_protdtaa
+	RET
+
+;Here if memory error when loading address
+
+	FAULTHDR
+6$:	CLRL	EDX			;Just return a null address (which
+	MOVL	FS, EDX			;  will fault when we try to use it!)
+	RET
+
+	END

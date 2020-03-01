@@ -1,0 +1,907 @@
+	.TITLE	VGAADRV2 - Loadable driver for basic VGA display
+
+;++++
+; This software is in the public domain.  It may be freely copied and used
+; for whatever purpose you see fit, including commerical uses.  Anyone
+; modifying this software may claim ownership of the modifications, but not
+; the complete derived code.  It would be appreciated if the authors were
+; told what this software is being used for, but this is not a requirement.
+
+;   THIS SOFTWARE IS PROVIDED BY THE AUTHORS "AS IS" AND ANY EXPRESS OR
+;   IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
+;   OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+;   IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+;   INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+;   BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS
+;   OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+;   ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR
+;   TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
+;   USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+;----
+
+	.PROC	80486
+	.INCLUD	XOSINC:\XMAC\XOS.PAR
+	.INCLUD	XOSINC:\XMAC\XOSX.PAR
+	.INCLUD	XOSINC:\XMAC\XOSERR.PAR
+	.INCLUD	XOSINC:\XMAC\XOSTRM.PAR
+	.INCLUD	XOSINC:\XMAC\XOSXTRM.PAR
+	.INCLUD	XOSINC:\XMAC\XOSDOS.PAR
+	.INCLUD	XOSINC:\XMAC\PCAT.PAR
+	.INCLUD	XOSINC:\XMAC\XOSLKE.PAR
+	.INCLUD	XOSINC:\XMAC\XOSXLKE.PAR
+
+	LKECONT
+
+	.EXPORT	xosvgaSetDhs4
+	.EXPORT	xosvgaDspMode
+
+	CODE
+
+	.SBTTL	vgadspmode - Function to get and set display mode
+
+;Function to get and set display mode
+;	c{EAX}    = Display mode bits
+;	c{ES:EBX} = Address of data block
+;	c{ESI}    = Offset of TDB
+;	CALL	vgadspmode
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  c{EAX} = Current display mode
+;  Stack frame offsets are defined in XOSXTRM.PAR so they will also be
+;    available to the extension driver
+
+4$:	LEAVE
+	RET
+
+xosvgaDspMode:
+vgadspmode::
+	ENTER	dm_SIZE, 0
+	CALL	xosconChkBiosMd##	;Convert BIOS mode requests
+	JC	4$.S			;If error
+	MOVL	adm_bits.B[EBP], EAX
+	MOVL	adm_dataadr+0.B[EBP], EBX ;Store address of caller's data block
+	MOVL	adm_dataadr+4.B[EBP], ES
+	CMPB	AL, #0			;Changing the mode?
+	JE	rtnonly			;No - just return the current values
+	PUSHL	ESI			;Yes - copy new data values
+	PUSHL	EDI
+	MOVL	ESI, EDX
+	LEAL	EDI, adm_dv.B[EBP]
+	PUSHL	SS
+	POPL	ES
+	CLD
+	MOVL	ECX, #5
+	IFFAULT	knlRtnAdrErLv##
+	RMOVSL	[EDI], FS:[ESI]
+	POPL	EDI
+	POPL	ESI
+	TESTB	tdb_stsdsp+1.B[ESI], #TSD$ACTDSP>8 ;Is this the active display?
+	JE	8$.S			;No
+	MOVL	EAX, tdb_dhdb.B[ESI]	;Yes - is the session menu on screen?
+	TESTB	dhdb_keysts.B[EAX], #~KS$SYSSHFT
+	JE	8$.S			;No - go on
+	MOVL	EAX, #05h		;Yes - tell the screen symbiont about
+	CALL	ssdialog		;  this
+8$:	CMPB	adm_bits.B[EBP], #1	;Text mode?
+	JNE	vgagraphic		;No - graphics mode
+					;Yes - fall into vgatext on next page
+.PAGE
+;Here for mode 1 - In mode 1 we must determine the table which most closely
+;  matches the parameters specified by the user.  The only parameters which
+;  are considered are the character rows and character columns values.  Only
+;  12 combinations are supported:
+;	Cols  Rows  Horiz  Vert  Font
+;	 80    25    720    400  9x16
+;	 80    30    720    480  9x16
+;	 80    50    720    400  9x8
+;	 80    60    720    480  9x8
+;	100    25    800    400  8x16
+;	100    30    800    480  8x16
+;	100    50    800    400  8x8
+;	100    60    800    480  8x8
+;	132    25   1056    400  8x16
+;	132    30   1056    480  8x16
+;	132    50   1056    400  8x8
+;	132    60   1056    480  8x8
+;  The 80 column configurations are supported on all VGAs.  The others are only
+;  available on VGAs which can generate the necessary clock frequencies.
+
+;  The configuration is selected based on the column and row values specified.
+;  The lowest resolution which is at least equal to both the specified
+;  column and row values is used.  If a column value is not given 80 is used.
+;  If a row value is not given, 25 is used.
+
+vgatext:CMPL	adm_dv+dm_columns.B[EBP], #0.B ;Columns value given?
+	JNE	2$.S			;Yes
+	MOVB	adm_dv+dm_columns.B[EBP], #80t ;No - use default
+2$:	CMPL	adm_dv+dm_rows.B[EBP], #0.B ;Rows value given?
+	JNE	4$.S			;Yes
+	MOVB	adm_dv+dm_rows.B[EBP], #25t ;No - use default
+4$:	CMPL	adm_dv+dm_columns.B[EBP], #80t.B ;Can we use 80 columns?
+	JA	6$.S			;No
+	MOVL	EBX, #vgatable0#
+	CMPL	adm_dv+dm_rows.B[EBP], #25t.B ;Yes - can we use 25 rows?
+	JBE	havetbl			;Yes
+	MOVL	EBX, #vgatable1#	;No
+	CMPL	adm_dv+dm_rows.B[EBP], #30t.B ;Can we use 30 rows?
+	JBE	havetbl			;Yes
+	MOVL	EBX, #vgatable2#	;No
+	CMPL	adm_dv+dm_rows.B[EBP], #50t.B ;Can we use 50 rows?
+	JBE	havetbl			;Yes
+	MOVL	EBX, #vgatable3#	;No - use 60 rows
+	JMP	havetbl
+
+;Here if need more than 80 columns
+
+6$:	CMPL	adm_dv+dm_columns.B[EBP], #100t.B ;Can we use 100 columns?
+	JA	8$.S			;No
+	MOVL	EBX, #vgatable4#
+	CMPL	adm_dv+dm_rows.B[EBP], #25t.B ;Yes - can we use 25 rows?
+	JBE	havetbl			;Yes
+	MOVL	EBX, #vgatable5#	;No
+	CMPL	adm_dv+dm_rows.B[EBP], #30t.B ;Can we use 30 rows?
+	JBE	havetbl			;Yes
+	MOVL	EBX, #vgatable6#		;No
+	CMPL	adm_dv+dm_rows.B[EBP], #50t.B ;Can we use 50 rows?
+	JBE	havetbl.S		;Yes
+	MOVL	EBX, #vgatable7#	;No - use 60 rows
+	JMP	havetbl.S
+
+;Here if need more than 100 columns
+
+8$:	MOVL	EBX, #vgatable8#
+	CMPL	adm_dv+dm_rows.B[EBP], #25t.B ;Yes - can we use 25 rows?
+	JBE	havetbl.S		;Yes
+	MOVL	EBX, #vgatable9#	;No
+	CMPL	adm_dv+dm_rows.B[EBP], #30t.B ;Can we use 30 rows?
+	JBE	havetbl.S		;Yes
+	MOVL	EBX, #vgatable10#	;No
+	CMPL	adm_dv+dm_rows.B[EBP], #50t.B ;Can we use 50 rows?
+	JBE	havetbl.S		;Yes
+	MOVL	EBX, #vgatable11#	;No - use 60 rows
+	JMP	havetbl.S
+.PAGE
+;Here with the table for the requested mode and configuration
+
+havetbl:MOVL	tdb_table.B[ESI], EBX	;Store offset of new table
+	MOVL	EAX, adm_bits.B[EBP]
+	MOVZBL	ECX, tdb_mode[ESI]	;Get current display mode
+	MOVB	tdb_mode[ESI], AL	;Store new mode
+	CLRL	EAX
+	MOVB	tdb_chrsetGL.B[ESI], AL
+	MOVB	tdb_chrsetGR.B[ESI], #1
+	MOVL	tdb_chrsetG0.B[ESI], #CHRX_SGS<8t
+	BTZL	tdb_omode.B[ESI], #TOM%ANSICM
+	MOVW	tdb_sattrval[ESI], AX	;Clear saved attribute values
+	MOVB	tdb_dsppage[ESI], AL	;Set to page 0
+	MOVL	EAX, tbl_pgsize.B[EBX]	;Get page size
+	MOVL	tdb_pgsize[ESI], EAX
+	MOVL	EAX, tbl_horiz.B[EBX]
+	MOVL	tdb_horiz[ESI], EAX
+	MOVL	EAX, tbl_vert.B[EBX]
+	MOVL	tdb_vert[ESI], EAX
+	MOVL	EAX, tbl_columns.B[EBX]
+	MOVL	tdb_columns[ESI], EAX
+	MOVL	EAX, tbl_rows.B[EBX]
+	MOVL	tdb_rows[ESI], EAX
+	MOVZBL	EAX, tbl_font.B[EBX]
+	MOVB	AL, vgafontsize#[EAX*2]
+	MOVB	tdb_charch[ESI], AL
+	MOVW	AX, tbl_crtregs+0Ah.B[EBX]
+	XCHGB	AL, AH
+	MOVW	tdb_dcurmode[ESI], AX
+	MOVB	AH, tbl_crtregs+07h.B[EBX]
+	SHRB	AH, #1
+	MOVB	AL, AH
+	SHRB	AH, #3
+	ANDB	AL, #01h
+	ANDB	AH, #02h
+	ORB	AL, AH
+	MOVB	tdb_dvertend+1[ESI], AL
+	MOVB	AL, tbl_crtregs+12h.B[EBX]
+	MOVB	tdb_dvertend+0[ESI], AL
+	MOVB	AL, tbl_seqregs+3h.B[EBX]
+	MOVB	tdb_dfontsel.B[ESI], AL
+	MOVL	tdb_dstart[ESI], #0
+	PUSHL	EDI			;Free up another register
+	LEAL	EDI, tdb_dacdata[ESI]	;Initialize the palette data
+	PUSHL	DS
+	POPL	ES
+	PUSHL	ESI
+	MOVL	ESI, #colcol#
+	MOVL	ECX, #256t*3/4		;Get number of values to copy
+	CLD
+	RMOVSL	[EDI], [ESI]		;Copy the DAC values to the TDB
+	POPL	ESI
+	POPL	EDI
+	JMP	10$.S
+
+8$:	LEAVE
+	RET
+
+;Here when setting to graphics mode - this is only available when an
+;  extension driver is loaded
+
+vgagraphic:
+	CALLI	xosvgaSetGraphic#
+	JC	8$.S
+	MOVL	tdb_table.B[ESI], EBX	;Store mode table offset (Note: The
+					;  format of this table is determined
+					;  by the graphics extension driver -
+					;  it must not be accessed here!)
+	MOVB	AL, adm_bits.B[EBP]	;Store mode
+	MOVB	tdb_mode[ESI], AL
+10$:	TESTB	tdb_stsdsp+1.B[ESI], #TSD$ACTDSP>8 ;Is this the active display?
+	JE	22$.S			;No
+	CALL	vgasetdhs2		;Yes - set up state of the display
+					;  hardware
+22$:	BTL	adm_bits.B[EBP], #DM%NOCLEAR ;Are we clearing the screen?
+	JC	23$.S			;No
+	CLRL	EAX			;Yes - reset all cursor positions
+	MOVL	tdb_curpos+0.B[ESI], EAX
+	MOVL	tdb_curpos+4.B[ESI], EAX
+	MOVL	tdb_curpos+8.B[ESI], EAX
+	MOVL	tdb_curpos+12t.B[ESI], EAX
+23$:	CMPB	knlCrashed##, #0	;Have we crashed?
+	JNE	28$.S			;Yes
+	CMPB	knlForkLvl##, #FORK_XFF	;No - in extended fork context?
+	JAE	24$.S			;Yes - go handle that case
+	CALL	xosconDosChk##		;No - is this the terminal for a DOS
+	JMP	26$.S			;  process?
+
+24$:	CALL	xosconDosChkXf##	;Is this the terminal for a DOS process?
+26$:	JE	28$.S			;No
+	MOVL	GS:pdaRMPage0##+bda_vcurpos+0, EAX ;Yes - also reset cursor
+	MOVL	GS:pdaRMPage0##+bda_vcurpos+4, EAX ;  position data on page 0
+	MOVL	GS:pdaRMPage0##+bda_vcurpos+8, EAX
+	MOVL	GS:pdaRMPage0##+bda_vcurpos+12t, EAX
+	MOVB	GS:pdaRMPage0##+bda_vdsppage, AL ;Reset display page number
+	MOVW	GS:pdaRMPage0##+bda_vvidstart, AX ;Reset display page offset
+	MOVB	AL, tdb_rows[ESI]	;Store number of rows on screen
+	MOVB	GS:pdaRMPage0##+bda_vrows, AL
+	MOVZBL	EAX, tdb_charch[ESI]	;Store scan rows per character
+	MOVW	GS:pdaRMPage0##+bda_vpoints, AX
+28$:	CMPB	tdb_dcurmode+1[ESI], #0 ;Have cursor ending value?
+	JE	30$.S			;No
+	MOVB	AL, #118t		;Yes
+30$:	MOVW	tdb_curmode[ESI], AX
+	MOVW	AX, tdb_battrval[ESI]	;Initialize text mode attributes
+	MOVW	tdb_tattrval[ESI], AX
+	MOVB	tdb_scntop[ESI], #1	;Initialize scrolling region to entire
+	MOVB	AL, tdb_rows[ESI]	;  screen
+	MOVB	tdb_scnbtm[ESI], AL
+	CMPB	tdb_mode[ESI], #DM_TEXT ;Graphic mode?
+	JNE	42$			;Yes
+	BTL	adm_bits.B[EBP], #DM%NOCLEAR ;No - want to clear the buffer?
+	JC	34$.S			;No
+	CLRL	EDX			;Yes
+32$:	MOVL	EAX, #' '		;Get value for clearing text screen
+	MOVB	AH, tdb_tattrfil[ESI]
+	PUSHL	EDX
+	CALL	vgaclrbfrpage#
+	POPL	EDX
+	INCL	EDX
+	CMPL	EDX, #16t.B
+	JB	32$.S
+	CALL	xosconClrPgChng##
+34$:	CALL	vgawrtchargen#
+	MOVL	EDX, #16t
+	MOVL	EAX, #0FEh
+	CALL	vgaclrbfrpage#
+	MOVL	EDX, #17t
+	MOVL	EAX, #0FFh
+	CALL	vgaclrbfrpage#
+	MOVL	EDX, #18t
+36$:	CLRL	EAX
+	PUSHL	EDX
+	CALL	vgaclrbfrpage#
+	POPL	EDX
+	INCL	EDX
+	CMPL	EDX, #32t.B
+	JB	36$.S
+	CALL	vgarestore#
+	TESTB	tdb_stsdsp+1.B[ESI], #TSD$ACTDSP>8 ;Is this the active display?
+	JNE	46$			;Yes - go on
+	MOVL	EAX, #02h		;Assume cleared everything
+	BTL	adm_bits.B[EBP], #DM%NOCLEAR ;Right?
+	JNC	38$.S			;Yes
+	INCL	EAX			;No - just clear the character generator
+38$:	CALL	ssdialog
+	JMP	46$.S
+
+;Here if in a graphic mode
+
+42$:	MOVL	EAX, #4t		;Tell the screen symbiont about this
+	CALL	vgasndsts#
+	BTL	adm_bits.B[EBP], #DM%NOCLEAR ;Want to clear the buffer?
+	JC	46$.S			;No
+	TESTB	tdb_stsdsp+1.B[ESI], #TSD$ACTDSP>8 ;Yes - is this the active
+						   ;  display?
+	JE	46$.S			;No
+	CALLI	xosvgaClrBuffer#	;Yes
+46$:	CALL	vgaenable		;And enable display
+	JMP	rtnmode.S
+
+;Here to return current values only
+
+rtnonly:MOVZBL	EAX, tdb_mode[ESI]
+	JMP	52$.S
+
+rtnmode:MOVZBL	EAX, tdb_mode[ESI]
+52$:	BTL	adm_bits.B[EBP], #DM%RTNDATA ;Want data values returned?
+	JNC	54$.S			;No
+	LESL	EBX, adm_dataadr.B[EBP]	;Yes - get address of his data block
+	MOVL	EDX, tdb_disptype.B[ESI]
+	IFFAULT	knlRtnAdrErLv##
+	MOVL	ES:dm_disptype.B[EBX], EDX
+	MOVB	DL, tdb_dsppage[ESI]
+	IFFAULT	knlRtnAdrErLv##
+	MOVB	ES:dm_actpage.B[EBX], DL
+	MOVL	EDX, tdb_pgsize[ESI]
+	IFFAULT	knlRtnAdrErLv##
+	MOVL	ES:dm_pagesize.B[EBX], EDX
+	MOVL	EDX, tdb_columns[ESI]
+	IFFAULT	knlRtnAdrErLv##
+	MOVL	ES:dm_columns.B[EBX], EDX
+	MOVZBL	EDX, tdb_rows[ESI]
+	IFFAULT	knlRtnAdrErLv##
+	MOVL	ES:dm_rows.B[EBX], EDX
+	MOVL	EDX, tdb_horiz[ESI]
+	IFFAULT	knlRtnAdrErLv##
+	MOVL	ES:dm_horiz.B[EBX], EDX
+;;;;;;	IFFAULT	knlRtnAdrErLv##
+;;;;;;	MOVL	ES:dm_span.B[EBX], EDX
+	MOVL	EDX, tdb_vert[ESI]
+	IFFAULT	knlRtnAdrErLv##
+	MOVL	ES:dm_vert.B[EBX], EDX
+54$:	TESTB	AH, #DM$BIOSMODE/100h	;Want BIOS value?
+	JE	56$.S			;No
+	CALL	xosconGetBiosMd##	;Yes - get equivalent BIOS mode
+56$:	ANDL	EAX, #~{DM$BIOSMODE|DM$RTNDATA}
+	LEAVE
+	RET
+
+;Data array for vgaclrbfr
+
+	DATA
+
+clrbytes::.BLKL	65t
+
+	CODE
+.PAGE
+	.SBTTL	ssdialog - Subroutine to do dialog with the screen symbiont
+
+;Subroutine to do dialog with the screen symbiont
+;	c{EAX} = Data for for the MT_SSSTATUS message
+;	CALL	ssdialog
+
+ssdialog:
+	CMPB	knlForkLvl##, #FORK_XFF	;No - in extended fork context?
+	JAE	4$.S			;No
+	CALL	vgasndsts#		;Tell the screen symbiont
+	JC	2$.S			;Don't wait if error sending message
+	LEAL	EAX, 1.B[ESI]
+	CALL	knlSetWait##		;Set up to wait using the TDB offset
+	PUSHL	SS			;  + 1 as the wait index
+	POPL	ES
+	MOVB	AL, #knlQX_DW2##
+	CALL	knlWRequeue##		;Requeue to an IO wait queue
+	FROMFORK
+	CALLF	schedule		;Call the scheduler (this is an
+	TOFORK				;  uninterruptable wait!)
+2$:	RET				;Continue after the screen symbiont
+					;  has updated the state of its virtual
+					;  buffers
+
+;Here if not the active display and are in extended fork context
+
+4$:	MOVL	EDX, SS			;Get our selector
+	SHLL	EDX, #16t
+	ORL	EAX, EDX
+	CALL	vgasndsts#		;Tell the screen symbiont
+	JNC	knlXfWaitNTO##		;Wait for response from screen symbiont
+ret004:	RET				;  unless error (We will get an error
+					;  here during set up of the screen
+					;  symbiont!)
+.PAGE
+	.SBTTL	vgasetdhs - Subroutine to set up state of the display hardware
+
+;Subroutine to set up state of the display hardware
+;	c{ESI} = Offset of TDB
+;	CALL	vgasetdhs
+;  The display has been blanked upon return by clearing bit 5 in the attribute
+;    controller register 0
+
+vgasetdhs::
+	MOVL	EBX, tdb_table[ESI]
+vgasetdhs2:				;Enter here if EBX already set up
+	CALLI	xosvgaSetDHS#		;Set up extended chip registers
+	CMPB	tdb_mode[ESI], #DM_TEXT	;Text mode?
+	JNE	ret004.S		;No - finished now
+xosvgaSetDhs4:
+	PUSHL	EDI
+	PUSHF
+	CLI
+	MOVL	EDX, tdb_bioreg[ESI]	;Get port for the CRT controller index
+	ADDL	EDX, #P_EGACCRTINDX-P_EGABASE.B
+	MOVB	AL, #03h		;Make sure can change vertical retrace
+	OUTB	[DX]			;  registers
+	IOPAUSE
+	INCL	EDX
+	INB	[DX]
+	IOPAUSE
+	ORB	AL, #80h
+	OUTB	[DX]
+	IOPAUSE
+	DECL	EDX
+	MOVB	AL, #11h		;Make sure CRT controller is unprotected
+	OUTB	[DX]
+	IOPAUSE
+	INCL	EDX
+	INB	[DX]
+	IOPAUSE
+	ANDB	AL, #7Fh
+	OUTB	[DX]
+	ADDL	EDX, #P_EGACSTS1-P_EGACCRTDATA.B
+	INB	[DX]			;Read input status 1 register to reset
+	IOPAUSE				;  attribute port to the index register
+	MOVL	EDX, tdb_bioreg[ESI]	;Point to attribute controller port
+	MOVB	AL, #0			;Disable video
+	OUTB	[DX]
+
+;Now program the sequencer registers
+
+	ADDL	EDX, #P_EGASEQINDX-P_EGAATTRIB.B
+	MOVB	AH, #0			;Start with register 0
+	LEAL	EDI, tbl_seqregs.B[EBX] ;Point to the sequencer data
+	MOVB	AL, tdb_dfontsel.B[ESI]
+	MOVB	3.B[EDI], AL
+	MOVL	ECX, #5
+6$:	MOVB	AL, AH			;Set sequencer index register
+	OUTB	[DX]
+	IOPAUSE
+	INCL	EDX			;Point to data register
+	MOVB	AL, [EDI]		;Get data byte
+	OUTB	[DX]			;Output it
+	DECL	EDX			;Point back to the index register
+	INCB	AH			;Bump register number
+	INCL	EDI			;Bump pointer
+	LOOP	ECX, 6$
+	MOVL	EDX, tdb_bioreg[ESI]	;Point to miscellaneous output register
+	ADDL	EDX, #P_EGAMISC-P_EGABASE.B
+	MOVB	AL, tbl_miscoutput.B[EBX] ;Get value
+	OUTB	[DX]			;Set it
+	IOPAUSE				       ;Point back to the sequencer
+	ADDL	EDX, #P_EGASEQINDX-P_EGAMISC.B ;  registers
+	MOVB	AL, #0			;Access register 0
+	OUTB	[DX]
+	IOPAUSE
+	MOVB	AL, #3			;Enable the sequencer
+	INCL	EDX
+	OUTB	[DX]
+	IOPAUSE
+
+;Now program the graphics chips
+
+	MOVL	EDX, tdb_bioreg[ESI]	      ;Point to graphics controller
+	ADDL	EDX, #P_EGAGCINDX-P_EGABASE.B ;  index register
+	MOVB	CL, #9
+	MOVB	AH, #0
+	LEAL	EDI, tbl_gcregs.B[EBX]
+10$:	MOVB	AL, AH			;Set graphics controller index register
+	OUTB	[DX]
+	IOPAUSE
+	INCL	EDX			;Point to data register
+	MOVB	AL, [EDI]		;Get data byte
+	OUTB	[DX]			;Output it
+	DECL	EDX
+	INCB	AH			;Bump register number
+	INCL	EDI
+	LOOP	ECX, 10$
+
+;Now program the CRT controller registers
+
+	MOVL	EDX, tdb_bioreg[ESI]	;Get port for the CRT controller index
+	ADDL	EDX, #P_EGACCRTINDX-P_EGABASE.B
+	LEAL	EDI, tbl_crtregs.B[EBX]
+	MOVL	EAX, tdb_dstart[ESI]	;Use current value for the start
+	XCHGB	AL, AH			;  display position
+	MOVW	0Ch.B[EDI], AX
+	CMPB	tdb_mode[ESI], #DM_TEXT ;Text mode?
+	JNE	12$.S			;No
+	MOVB	AL, tdb_charch[ESI]	;Yes
+	DECB	AL
+	ANDB	09.B[EDI], #0E0h
+	ORB	09.B[EDI], AL
+	MOVW	AX, tdb_dcurmode[ESI]	;Use current value for the cursor
+	XCHGB	AL, AH			;  mode (start and end values)
+	MOVW	0Ah.B[EDI], AX
+	MOVW	AX, tdb_dcurpos[ESI]	;Use current value for the cursor
+	XCHGB	AL, AH			;  position
+	MOVW	0Eh.B[EDI], AX
+	MOVW	AX, tdb_dvertend[ESI]
+	MOVB	12h.B[EDI], AL
+	ANDB	07h.B[EDI], #0DDh
+	ADDB	AH, AH
+	MOVB	AL, AH
+	SHLB	AL, #3t
+	ANDB	AH, #02h
+	ANDB	AL, #20h
+	ORB	AL, AH
+	ORB	07h.B[EDI], AL
+12$:	MOVB	AH, #0
+	MOVB	CL, #25t
+14$:	MOVB	AL, AH			;Set CRT controller index register
+	OUTB	[DX]
+	IOPAUSE
+	INCL	EDX			;Point to data register
+	MOVB	AL, [EDI]		;Get data byte
+	OUTB	[DX]			;Output it
+	DECL	EDX			;Point back to the index register
+	INCB	AH			;Bump register number
+	INCL	EDI
+	LOOP	ECX, 14$
+
+;Now program the attribute chip
+
+	MOVL	EDX, tdb_bioreg[ESI]
+	ADDL	EDX, #P_EGACSTS1-P_EGABASE.B
+	INB	[DX]			;Read input status 1 register to reset
+	IOPAUSE				;  attribute port to the index register
+	MOVL	EDX, tdb_bioreg[ESI]	;Point to the attribute controller port
+	MOVB	AH, #0
+	LEAL	EDI, tbl_atrregs.B[EBX]
+	MOVB	CL, #21t
+16$:	MOVB	AL, AH			;Set attribute controller index register
+	OUTB	[DX]
+	IOPAUSE
+	MOVB	AL, [EDI]		;Get data byte
+	OUTB	[DX]			;Output it
+	INCB	AH			;Bump register number
+	INCL	EDI
+	LOOP	ECX, 16$
+	POPF
+
+;Finally, set up the DAC registers
+
+	ADDL	EDX, #P_EGADACPMASK-P_EGABASE.B ;Point to pixel mask register
+	MOVB	AL, #0FFh		;Make sure it has the right value
+	OUTB	[DX]
+	IOPAUSE
+	INCL	EDX
+	INCL	EDX
+	MOVB	AL, #0
+	OUTB	[DX]
+	INCL	EDX
+	PUSHL	ESI
+	ADDL	ESI, #tdb_dacdata
+	MOVL	ECX, #256t*3
+	CLD
+18$:	LODSB	[ESI]			;Get DAC register value
+	OUTB	[DX]
+	LOOP	ECX, 18$
+	POPL	ESI
+	POPL	EDI
+	RET
+.PAGE
+	.SBTTL	vgaenable - Subroutine to enable the display
+
+;Subroutine to enable the display after setting the mode or clearing the
+;  display buffer
+;	c{ESI} = Offset of TDB for terminal
+;	CALL	vgaenable
+
+vgaenable::
+	CMPB	tdb_mode[ESI], #DM_TEXT ;Graphic mode?
+	JNE	ret006.S		;Yes - nothing to do here
+	MOVL	EDX, tdb_bioreg[ESI]	;No - point to status 1 register
+	ADDL	EDX, #P_EGACSTS1-P_EGABASE.B
+	INB	[DX]			;Read status 1 register to reset
+	IOPAUSE				;  attribute port to the index register
+	ADDL	EDX, #P_EGAATTRIB-P_EGACSTS1.B ;Point to attribute controller
+					       ;  port
+	MOVB	AL, #20h		;Set the index value to enable the
+	OUTB	[DX]			;  display
+	ADDL	EDX, #P_EGASEQINDX-P_EGAATTRIB.B
+	MOVB	AL, #1
+	OUTB	[DX]
+	IOPAUSE
+	INCL	EDX
+	MOVL	EAX, tdb_table[ESI]
+	MOVB	AL, tbl_seqregs.B[EAX]
+	ANDB	AL, #01h
+	OUTB	[DX]
+ret006:	RET
+.PAGE
+
+	.SBTTL	vgacurtype - Function to set cursor type (INT 10, function 1)
+
+;Function to set cursor type (INT 10, function 1)
+;	c(CL) = Ending scan line for cursor (0 - 1Fh)
+;	c(CH) = Starting scan line for cursor (0 - 1Fh), bit 5 set to indicate
+;		  invisible cursor, bit 7 set to indicate no cursor emulation
+;		Both c(CL) and c(CH) = 0FFh means don't change type
+;	CALL	vgacurtype
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  c(AL) = Previous ending line for cursor
+;	  c(AH) = Previous starting scan line for cursor
+;	  High 16 bits of EAX are 0
+
+vgacurtype::
+	MOVZWL	EAX, tdb_curmode[ESI]	;Get previous value to return
+	CMPW	CX, #0FFFFFFFFh.B	;Want to change value?
+	JE	ret006.S		;No - just return value
+	PUSHL	EAX			;Yes
+	ANDL	ECX, #0BF1Fh		;Remove possible junk
+	MOVW	tdb_curmode[ESI], CX
+	ANDB	CH, #~20h
+	BTZL	ECX, #15t		;Want to do cursor emulation?
+	JC	8$.S			;No
+	CMPB	CL, #7			;Yes - check ending value
+	JBE	2$.S			;If OK
+	MOVB	CL, #7			;Too big - use maximum
+2$:	CMPB	CL, #4			;Need to adjust it?
+	JBE	4$.S			;No
+	SUBB	CL, #8			;Yes
+	ADDB	CL, tdb_charch[ESI]
+4$:	CMPB	CH, #7			;Check starting value
+	JBE	6$.S			;If OK
+	MOVB	CH, #7			;Too big - use maximum
+6$:	CMPB	CH, #4			;Need to adjust it?
+	JBE	8$.S			;No
+	SUBB	CH, #8			;Yes
+	ADDB	CH, tdb_charch[ESI]
+8$:	MOVB	AL, tdb_curmode+1[ESI]
+	ANDB	AL, #20h
+	ORB	CH, AL			;Put back the cursor off bit
+	MOVW	tdb_dcurmode[ESI], CX
+	POPL	EAX			;Restore previous value
+	TESTB	tdb_stsdsp+1.B[ESI], #TSD$ACTDSP>8 ;Is this the active display?
+	JE	12$.S			;No - nothing more needed here
+	TOFORK	14$.S			;Yes
+	CALL	14$
+	FROMFORK
+	CLC
+12$:	RET
+
+14$:	PUSHL	EAX
+	MOVL	EDX, tdb_bioreg[ESI]	;Get port for the CRT controller index
+	ADDL	EDX, #P_EGACCRTINDX-P_EGABASE.B
+	MOVB	AL, #10t		;Point to cursor position register
+	OUTB	[DX]			;  in CRTC
+	MOVB	AL, CH			;Get cursor start value
+	INCL	EDX
+	OUTB	[DX]
+	MOVB	AL, #11t
+	DECL	EDX
+	OUTB	[DX]
+	MOVB	AL, CL
+	INCL	EDX
+	OUTB	[DX]
+	POPL	EAX			;Restore previous value
+	CLC
+	RET
+.PAGE
+	.SBTTL	vgacurpos - Func. to set and get cursor pos. (INT 10, func. 02)
+
+;Function to set and get cursor position (INT 10, function 02)
+;	c{EBX} = Page number
+;	c{ECX} = Character number
+;	c{EDX} = Line number
+;	CALL	vgacurpos
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  c(AL) = Previous character number
+;	  c(AH) = Previous line number
+
+vgacurpos::
+	REQUIREFORK
+	PUSHL	EDX
+	CALL	xosconDosUpdCP##	;Update cursor position for DOS
+	POPL	EDX
+	JC	20$.S			;If error
+	SETNE	AL
+	PUSHL	EAX			;Remember if DOS process
+	MOVW	AX, tdb_curpos.B[ESI+EBX*2]
+	CMPL	ECX, #-1.B		;Want to change character position
+	JE	8$.S			;No
+	TESTL	ECX, ECX		;Yes - relative?
+	JNS	6$.S			;No
+	ADDB	tdb_curpos+0.B[ESI+EBX*2], CL ;Yes
+	JMP	8$.S
+
+6$:	MOVB	tdb_curpos+0.B[ESI+EBX*2], CL
+8$:	CMPL	EDX, #-1.B		;Want to change line position?
+	JE	12$.S			;No
+	TESTL	EDX, EDX		;Yes - relative?
+	JNS	10$.S			;No
+	ADDB	tdb_curpos+1.B[ESI+EBX*2], DL ;Yes
+	JMP	12$.S
+
+10$:	MOVB	tdb_curpos+1.B[ESI+EBX*2], DL
+12$:	POPL	EDX
+	CMPB	DL, #0			;Is this terminal for a DOS process?
+	JE	14$.S			;No
+	MOVW	CX, tdb_curpos.B[ESI+EBX*2]	    ;Yes - update cursor
+	MOVW	SS:pdaRMPage0#+bda_vcurpos[EBX*2], CX ;  position on real mode
+						    ;  page 0
+14$:	CMPB	tdb_dsppage[ESI], BL	;Is this for the current page?
+	JNE	16$.S			;No
+	PUSHL	EAX			;Yes
+	CALL	vgadspcur#		;Set value into the hardware
+	POPL	EAX
+16$:	CLC
+20$:	RET
+.PAGE
+	.SBTTL	vgadsppage - Function to select display page (INT 10, func. 05)
+
+;Function to select display page (INT 10, function 05)
+;	c{EBX} = Display page number
+;	CALL	vgadsppage
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  c{EAX} = Previous display page number
+;	  High 16 bits of EAX are 0
+
+2$:	MOVL	EAX, #ER_PARMV
+	STC
+4$:	RET
+
+vgadsppage::
+	REQUIREFORK
+	MOVZBL	EAX, tdb_dsppage[ESI]	;Get current page number
+	CMPL	EBX, #-1.B		;Want to change page number?
+	JE	4$.S			;No
+	CMPB	BL, #8t.B		;Yes - valid page number?
+	JAE	2$.S			;No
+	PUSHL	EAX			;Yes - save current value
+	MOVB	tdb_dsppage[ESI], BL	;Store new value
+	MOVZBL	EBX, BL
+	IMULL	EBX, tdb_pgsize[ESI]	;Get offset of start of page
+	CMPB	tdb_mode[ESI], #DM_TEXT ;Graphic mode?
+	JBE	8$.S			;No
+	MOVL	tdb_dstart[ESI], EBX	;Yes
+	TESTB	tdb_stsdsp+1.B[ESI], #TSD$ACTDSP>8 ;Is this the active display?
+	JE	14$.S			;No
+	CALLI	xosvgaSetPage#		;Yes - set the hardware
+	JMP	10$.S
+
+;Here for text mode
+
+8$:	SHRL	EBX, #1
+	MOVL	tdb_dstart[ESI], EBX
+	TESTB	tdb_stsdsp+1.B[ESI], #TSD$ACTDSP>8 ;Is this the active display?
+	JE	10$.S			;No
+	MOVL	EDX, tdb_bioreg[ESI]	;Yes - point to register
+	ADDL	EDX, #P_EGACCRTINDX-P_EGABASE.B
+	MOVB	AL, #0Ch		;Update the display start registers
+	OUTB	[DX]
+	IOPAUSE
+	INCL	EDX
+	MOVB	AL, BH
+	OUTB	[DX]
+	IOPAUSE
+	DECL	EDX
+	MOVB	AL, #0Dh
+	OUTB	[DX]
+	IOPAUSE
+	INCL	EDX
+	MOVB	AL, BL
+	OUTB	[DX]
+10$:	CALL	vgadspcur#		;Display cursor at correct position
+	CALL	xosconDosChk##		;Is this terminal for a DOS process?
+	JE	14$.S			;No
+	MOVZBL	EDX, tdb_dsppage[ESI]	   ;Yes - update cursor position in
+	MOVW	AX, tdb_curpos.B[ESI+EDX*2] ;  real mode page 0
+	MOVW	GS:pdaRMPage0##+bda_vcurpos[EDX*2], AX
+	MOVB	GS:pdaRMPage0##+bda_vdsppage, DL
+14$:	POPL	EAX			;Restore previous page number
+	CLC
+	RET
+.PAGE
+	.SBTTL	vgagetatrchr - Func. to get attrib. and char. (INT 10, func. 08)
+
+;Function to get attributes and character at cursor (INT 10, function 08)
+;	c{EBX} = Display page
+;	CALL	vgagetatrchr
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  c(AL) = Character
+;	  c(AH) = Attribute byte
+;	  High 16 bits of EAX are 0
+
+vgagetatrchr::
+	CMPB	tdb_mode[ESI], #DM_TEXT ;Text mode?
+	JNE	gferr.S
+	REQUIREFORK
+	CALL	xosconDosUpdCP##	;Yes - update cursor for DOS
+	JC	2$.S			;If error
+	MOVL	ECX, EBX		;Calculate offset of start of page
+	IMULL	ECX, tdb_pgsize[ESI]
+	MOVZBL	EAX, tdb_curpos+1.B[ESI+EBX*2] ;Calculate offset on screen for
+	IMULL	EAX, tdb_columns[ESI]
+	ADDL	EAX, EAX
+	ADDL	ECX, EAX
+	MOVZBL	EAX, tdb_curpos+0.B[ESI+EBX*2] ;Add in position in line
+	ADDL	EAX, EAX
+	ADDL	ECX, EAX
+	ADDL	ECX, tdb_vtaddr.B[ESI]	;Add in offset of screen
+	MOVZWL	EAX, [ECX]		;Get character and attribute from screen
+2$:	RET				;Finished
+
+4$:	MOVL	EAX, #ER_VALUE
+	STC
+	RET
+
+gferr:	MOVL	EAX, #ER_FUNCM
+	STC
+	RET
+.PAGE
+	.SBTTL	vgasetchr - Function to set character (INT 10, function 0A)
+
+;Function to set character only at cursor (INT 10, function 0A)
+;	c(AL)  = ASCII character
+;	c(AH)  = Color (graphics modes only)
+;	c{EBX} = Display page
+;	c{ECX} = Count
+;	CALL	vgasetchr
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  c{EAX} = 0
+
+vgasetchr::
+	CMPB	tdb_mode[ESI], #DM_TEXT ;Text mode?
+	JNE	gferr.S
+	REQUIREFORK
+	PUSHL	#vgachr#		;Save offset of routine to call
+	JMP	2$.S
+
+	.SBTTL	vgasetatrchr - Function to set attr. & char. (INT 10, func. 09)
+
+;Function to set attributes and character at cursor (INT 10, function 09)
+;	c(AL)  = ASCII character
+;	c(AH)  = Attribute byte
+;	c{EBX} = Display page
+;	c{ECX} = Repeat count
+;	CALL	vgasetatrchr
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  c{EAX} = 0
+
+vgasetatrchr::
+	CMPB	tdb_mode[ESI], #DM_TEXT ;Text mode?
+	JNE	gferr.S
+	REQUIREFORK
+	PUSHL	#vgachratr#		;Save offset of routine to call
+2$:	PUSHL	EAX			;Save character and attributes
+	CALL	xosconDosUpdCP##	;Update cursor position for DOS
+	JC	10$.S
+	MOVW	DX, tdb_curpos.B[ESI+EBX*2] ;Get current position
+6$:	MOVL	EAX, [ESP]		;Get character and attributes
+	PUSHL	ECX
+	PUSHL	EDX
+	CALLI	12t.B[ESP]		;Put character and attribute on screen
+	POPL	EDX
+	POPL	ECX
+	INCL	EDX			;Advance position
+	LOOP	ECX, 6$			;Continue if more to do
+	POPL	EAX			;Discard stack data
+	POPL	EAX
+	CLRL	EAX
+	RET
+
+;Here if have illegal display page number
+
+10$:	POPL	EDX
+	POPL	EDX
+	RET
+
+	END

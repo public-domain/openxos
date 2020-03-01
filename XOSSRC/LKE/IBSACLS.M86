@@ -1,0 +1,1740 @@
+	.TITLE	IBSACLS - GPIB interface (slave) class driver for XOS
+
+;++++
+; This software is in the public domain.  It may be freely copied and used
+; for whatever purpose you see fit, including commerical uses.  Anyone
+; modifying this software may claim ownership of the modifications, but not
+; the complete derived code.  It would be appreciated if the authors were
+; told what this software is being used for, but this is not a requirement.
+
+;   THIS SOFTWARE IS PROVIDED BY THE AUTHORS "AS IS" AND ANY EXPRESS OR
+;   IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
+;   OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+;   IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+;   INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+;   BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS
+;   OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+;   ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR
+;   TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
+;   USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+;----
+
+	.PROC	80486
+	.INCLUD	XOSINC:\XMAC\XOS.PAR
+	.INCLUD	XOSINC:\XMAC\XOSX.PAR
+	.INCLUD	XOSINC:\XMAC\XOSERR.PAR
+	.INCLUD	XOSINC:\XMAC\XOSTIME.PAR
+	.INCLUD	XOSINC:\XMAC\PCAT.PAR
+	.INCLUD	XOSINC:\XMAC\XOSLKE.PAR
+	.INCLUD	XOSINC:\XMAC\XOSXLKE.PAR
+	.INCLUD	XOSINC:\XMAC\XOSGPIB.PAR
+
+MAJV   =!2t
+MINV   =!0t
+EDITNUM=!2t
+
+;2.0.0 - 27-Nov-91
+;	Modified for XOS version 1.6
+
+	LKEHEAD	IBSACLS, MAJV, MINV, EDITNUM, LKETYPE_CLASS
+
+;This driver uses the IBM/National Instruments PC-IIA GPIB interface as a
+;  slave device.  It supports the use of both the major and minor addresses
+;  as provided by the 7220.  It provides a fairly complex mechanism for
+;  setting and clearing the serial poll bits and for interlocking transfers
+;  using the two addresses.  Masks can be specified for automatically setting
+;  serial poll bits when input or output is started and for clearing serial
+;  poll bits when input or output is done (total of 4 masks).  Also, an
+;  interface flag byte allows interlocking transfers.  It is intended to
+;  prevent the starting of a transfer on one address after the CIC has
+;  begun transferring data on the other address.  In one application, the
+;  major address is used for commands and responses and the minor address
+;  is used for data transfers.  An input request is normally left active
+;  on the major address to allow data transfers to be interrupted if desired.
+;  A race exists in that the CIC could send a command to interrupt a
+;  transfer just as data input or output was started.  If this were allowed,
+;  the serial poll bits would be placed in the wrong state (input or output
+;  bits would be set after the command to terminate the transfer was given)
+;  for a short time.  This can confuse some controlling software on the CIC
+;  side.  Proper use of the interface flag bits result in a data input or
+;  output operation failing with an ER_XFRBK error if issued after command
+;  input has been received but not processed.  In this case, the serial poll
+;  bits would not be changed as a result of the failed operation.
+
+;Define offsets in the IBSA interface DCB
+
+$$$=!4
+BLK dcb_ibsicb    , 4t	;Offset of ICB for interface
+BLK dcb_ibsmmmask , 1t	;Bit for setting or clearing the icb_inuse bits
+BLK dcb_ibssts    , 1t	;Status
+BLK dcb_ibslstbyte, 1t	;Last byte to output
+BLK               , 1t
+BLK dcb_ibsbusaddr, 1t	;GBIP address
+BLK dcb_ibsmode   , 1t	;Mode
+BLK dcb_ibseos    , 1t	;Value for EOS
+BLK               , 1t
+BLK dcb_ibsspseti , 1t	;Mask for setting serial poll bits to start read (1
+			;  bits are set)
+BLK dcb_ibsspclri , 1t	;Mask for clearing serial poll bits when input
+			;  is received (0 bits are cleared)
+BLK dcb_ibsspseto , 1t	;Mask for setting serial poll bits to start output (1
+			;  bits are set)
+BLK dcb_ibsspclro , 1t	;Mask for clearing serial poll bits when output
+			;  is started (0 bits are cleared)
+BLK dcb_ibsifflag , 0
+BLK dcb_ibsifialw , 1t	;Interface flags mask for allowing input
+BLK dcb_ibsifoalw , 1t	;Interface flags mask for allowing output
+BLK dcb_ibsificlr , 1t	;Mask for clearing interface flags on input (0 bits
+			;  are cleared)
+BLK dcb_ibsifoclr , 1t	;Mask for clearing interface flags on output (0 bits
+			;  are cleared)
+BLK dcb_ibsinprec , 4t	;Total input records
+BLK dcb_ibsinpbyte, 4t	;Total input bytes
+BLK dcb_ibsoutrec , 4t	;Total output records
+BLK dcb_ibsoutbyte, 4t	;Total output bytes
+BLK dcb_ibserrcnt , 4t	;Number of errors
+dcb_ibsSIZE=!$$$
+
+;Define values for dcb_ibssts
+
+IBS$INACT =!80h		;Input transfer is active
+IBS$OUTACT=!40h		;Output transfer is active
+IBS$ILOOP =!01h
+
+;Define offsets in the interface control block (ICB)
+
+icb_mSIZE=!12t		;WARNING:  Next 3 offsets MUST match corresponding
+$$$=!-icb_mSIZE		;	   offsets in DCBs!
+BLK icb_dmachnl , 1	;DMA channel number
+BLK             , 3
+BLK icb_fdisp   , 4	;Offset of fork routine
+BLK icb_fnext   , 4	;Offset of next DCB in fork request list
+BLK icb_next   , 4t	;Offset of next ICB
+.IF NE icb_next
+	.IRP	q, >icb_next
+	.ERROR	ICB starting offset is wrong, icb_next = q'h
+	.ENDR
+.ENDC
+BLK icb_dcba    , 4t	;Offset of DCB for major address device
+BLK icb_dcbb    , 4t	;Offset of DCB for minor address device
+BLK icb_ioreg   , 4t	;Base IO register for interface
+BLK icb_xsize   , 4t	;Size of current transfer
+BLK icb_curdcb  , 4t	;Current DCB
+BLK icb_intcnt  , 4t	;Interrupt counter
+
+BLK icb_unit    , 1t	;Unit number
+BLK             , 3
+
+BLK icb_isr1    , 1t	;Bits from ISR1 (must be long alligned)
+BLK icb_isr2    , 1t	;Bits from ISR2 (must be icb_isr1 + 1)
+BLK icb_ppcfg   , 1t	;Parallel poll configuration
+BLK icb_istate  , 1t	;Interrupt state
+
+BLK icb_dmasts  , 1t	;Interface DMA status (must be long alligned)
+BLK icb_inpsts  , 1t	;Interface input status
+BLK icb_inuse   , 1t	;In use bits: bit 0 set if major device in use, bit 1
+			;  set if minor device in use
+BLK icb_flags   , 1t	;Interface flags
+BLK icb_siidlei , 4t	;Spurious interrupt count - no input request
+BLK icb_siidleo , 4t	;Spurious interrupt count - no output request
+BLK icb_siinput , 4t	;Spurious interrupt count - input state
+BLK icb_sioutput, 4t	;Spurious interrupt count - output state
+BLK icb_sidmaout, 4t	;Spurious interrupt count - DMA output state
+BLK icb_sichrout, 4t	;Spurious interrupt count - character output state
+icb_SIZE=!$$$
+
+;Define bits for icb_dmasts
+
+DMA$INUSE =!40h		;DMA channel is in use (allocated)
+  DMA%ACTIVE=!6t
+DMA$DONE  =!20h		;DMA transfer is complete
+  DMA%DONE  =!5t
+
+;Define bits for icb_inpsts
+
+INP$TRUNC =!40h		;Input has been truncated
+
+;Define interrupt state values
+
+IS_IDLE  =!0		;Idle
+IS_INPUT =!1		;Input in progress
+IS_OUTPUT=!2		;Output is ready
+IS_DMAOUT=!3		;DMA output in progress
+IS_CHROUT=!4		;Character output in progress
+
+.PAGE
+	.SBTTL	SVC dispatch table for IBSA interface class devices
+
+	CODE
+
+;SVC dispatch table for IBSA interface class devices
+
+ibsadsp:.LONG	rtnzero		;sd_mount	=  0. - Mount
+	.LONG	rtnzero		;sd_cleardev	=  4. - Clear device
+	.LONG	rtnzero		;sd_cleardcb	=  8. - Clear DCB
+	.LONG	rtnzero		;sd_commit	= 12. - Commit data to disk
+	.LONG	rtnzero		;sd_transold    = 16. - Transfer device/old
+	.LONG	rtnzero		;sd_transnew    = 20. - Transfer device/new
+	.LONG	ibsaopen	;sd_opena	= 24. - Open additional
+	.LONG	ibsaopen	;sd_open1	= 28. - Open device/file
+	.LONG	ibsaopen	;sd_devparm     = 32. - Device parameters
+	.LONG	knlIFnDev##	;sd_delete	= 36. - Delete file
+	.LONG	knlIFnDev##	;sd_rename	= 40. - Rename file
+	.LONG	ibsainpblk	;sd_inblock	= 44. - Input block
+	.LONG	ibsaoutblk	;sd_outblock	= 48. - Output block
+	.LONG	knlIllOut##	;sd_outblockq	= 52. - Output block (XFF)
+	.LONG	knlIFnDevGQ##	;sd_outstring	= 66. - Output string
+	.LONG	knlRtnMOne##	;sd_getiosts	= 60. - Get input/output status
+	.LONG	knlIFnDevGQ##	;sd_special     = 64. - Special device function
+	.LONG	ibsaclose	;sd_close	= 68. - Close file
+	.LONG	knlNullLabel##	;sd_getlabel    = 72. - Get device label
+	.LONG	knlNullQioGQ##	;sd_commitfunc	= 76. - Commit data to disk
+	.LONG	knlInfoNone##	;sd_devinfo     = 80. - Get device info
+IBSADSPSZ=!{$-ibsadsp}/4
+.PAGE
+;Class function dispatch table for IBC class devices
+
+	.LONG	CLSFMX
+ibsacls:.LONG	ibsaaddunit	;CF_ADDUNIT = 1. - Add unit
+	.LONG	ibsaunitinfo	;CF_PUNITS  = 2. - Get information about
+				;		     physical units
+	.LONG	knlIFnDev##	;CF_AUNITS  = 3. - Get information about active
+				;		     units
+CLSFMX=!{$-ibsacls}/4
+
+;Class characteristics table for the IBC device class
+
+ibsacctbl:
+ DCHARBGN  1, knlDCharValCom##
+.PAGE
+;Device parameter table for IBSA IO operations
+
+	.LONG	PARMMAX		;Size of table
+ibsaioparms:
+	.LONG	ibsaiogenparms	 ;IOPAR_xxxxxx = 00xx - Generic IO parameters
+	.LONG	knlNullFilParms##;IOPAR_FILxxx = 01xx - File system IO
+				 ;			  parameters
+	.LONG	knlNullTrmParms##;IOPAR_TRMxxx = 02xx - Terminal IO parameters
+PARMMAX=!{$-ibsaioparms}/4
+
+	.LONG	PARMGENMAX	;Size of table
+ibsaiogenparms:
+	.LONG	0		;		   = 0000h
+	.LONG	knlIopFilOptn##	;IOPAR_FILOPTN     = 0001h
+	.LONG	knlIopFilSpec##	;IOPAR_FILSPEC     = 0002h
+	.LONG	knlIopDevSts##	;IOPAR_DEVSTS      = 0003h
+	.LONG	knlIopUnitNum##	;IOPAR_UNITNUM     = 0004h
+	.LONG	knlIopGlbId##	;IOPAR_GLBID       = 0005h
+	.LONG	knlIopDelay##	;IOPAR_DELAY       = 0006h
+	.LONG	knlIopTimeOut##	;IOPAR_TIMEOUT     = 0007h
+	.LONG	knlIopIoSts##	;IOPAR_INPSTS      = 0008h
+	.LONG	knlIopIoSts##	;IOPAR_OUTSTS      = 0009h
+	.LONG	knlIopInpQLmt##	;IOPAR_INPQLMT     = 000Ah
+	.LONG	knlIopOutQLmt##	;IOPAR_OUTQLMT     = 000Bh
+	.LONG	0		;IOPAR_SIVECT1     = 000Ch
+	.LONG	0		;IOPAR_SIVECT2     = 000Dh
+	.LONG	0		;IOPAR_SIDATA      = 000Eh
+	.LONG	knlIopNumOpen##	;IOPAR_NUMOPEN     = 000Fh
+	.LONG	0		;IOPAR_BUFRLMT	   = 0010h
+PARMGENMAX=!{$-ibsaiogenparms}/4
+
+	.LONG	1
+ibsadvparms:
+	.LONG	ibsadv0parms
+
+	.LONG	IBSAPMAX
+ibsadv0parms:
+	.LONG	knlIoparClass##	; IOPAR_CLASS  = 8000h - Device class
+	.LONG	ibsaparaddr	;IBSPAR_ADDR   = 8001h - GPIB address
+	.LONG	ibsapareoschr	;IBSPAR_EOSCHR = 8002h - EOS character
+	.LONG	ibsaparinmode	;IBSPAR_INMODE = 8003h - Input mode
+	.LONG	ibsaparppcfg	;IBSPAR_PPCFG  = 8004h - Parallel poll config.
+	.LONG	ibsaparsetsp	;IBSPAR_SETSP  = 8005h - Set serial poll bits
+	.LONG	ibsaparclrsp	;IBSPAR_CLRSP  = 8006h - Clear serial poll bits
+	.LONG	ibsaparsetif	;IBSPAR_SETIF  = 8007h - Set interface flag bits
+	.LONG	ibsaparclrif	;IBSPAR_CLRIF  = 8008h - Clear interface flag
+				;			   bits
+	.LONG	ibsaparsetsim	;IBSPAR_SETSIM = 8009h - Set serial poll input
+				;			   masks
+	.LONG	ibsaparsetsom	;IBSPAR_SETSOM = 800Ah - Set serial poll output
+				;			   masks
+	.LONG	ibsaparsetiam	;IBSPAR_SETIAM = 800Bh - Set input allow masks
+	.LONG	ibsaparsetoam	;IBSPAR_SETOAM = 800Ch - Set output allow masks
+IBSAPMAX=!{$-ibsadv0parms}/4
+.PAGE
+;Device characteristics table for IBSA devices
+
+	DATA
+
+	.MOD	4
+ibsadctbl:
+ DCHARBGN  2, knlDCharValCom##
+ DCHARENT  CLASS   , TEXT, , 8, knlDcMsgClass##, knlDcGetClass##, knlDcSetClass##, 0
+ DCHARENT  IOREG   , HEXV, , 4, knlDcMsgIoReg##, geticbval      , 0              , icb_ioreg
+ DCHARENT  INT     , DECV, , 1, knlDcMsgInt##  , knlGetSysVal## , 0              , intlevel
+ DCHARENT  DMA     , DECV, , 1, knlDcMsgDma##  , knlDcGet1Byte##, 0              , dcb_dmachnl
+ DCHARENT  INPREC  , DECV, , 4, msginprec      , knlDcGet4Byte##, knlDcSet4Byte##, dcb_ibsinprec
+ DCHARENT  INPBYTE , DECV, , 4, msginpbyte     , knlDcGet4Byte##, knlDcSet4Byte##, dcb_ibsinpbyte
+ DCHARENT  OUTREC  , DECV, , 4, msgoutrec      , knlDcGet4Byte##, knlDcSet4Byte##, dcb_ibsoutrec
+ DCHARENT  OUTBYTE , DECV, , 4, msgoutbyte     , knlDcGet4Byte##, knlDcSet4Byte##, dcb_ibsoutbyte
+ DCHARENT  ERRCNT  , DECV, , 4, msgerrcnt      , knlDcGet4Byte##, knlDcSet4Byte##, dcb_ibserrcnt
+ DCHARENT  SIIDLEI , DECV, , 4, msgsiidlei     , geticbval      , seticbval      , icb_siidlei
+ DCHARENT  SIIDLEO , DECV, , 4, msgsiidleo     , geticbval      , seticbval      , icb_siidleo
+ DCHARENT  SIINPUT , DECV, , 4, msgsiinput     , geticbval      , seticbval      , icb_siinput
+ DCHARENT  SIOUTPUT, DECV, , 4, msgsioutput    , geticbval      , seticbval      , icb_sioutput
+ DCHARENT  SIDMAOUT, DECV, , 4, msgsidmaout    , geticbval      , seticbval      , icb_sidmaout
+ DCHARENT  SICHROUT, DECV, , 4, msgsichrout    , geticbval      , seticbval      , icb_sichrout
+
+	CODE
+
+msginprec:  DCHARINFO  {Total input records}
+msginpbyte: DCHARINFO  {Total input bytes}
+msgoutrec:  DCHARINFO  {Total output records}
+msgoutbyte: DCHARINFO  {Total output bytes}
+msgerrcnt:  DCHARINFO  {Total errors}
+msgsiidlei: DCHARINFO  {Spurious interrupt - no input request}
+msgsiidleo: DCHARINFO  {Spurious interrupt - no output request}
+msgsiinput: DCHARINFO  {Spurious interrupt - input state}
+msgsioutput:DCHARINFO  {Spurious interrupt - output state}
+msgsidmaout:DCHARINFO  {Spurious interrupt - DMA output state}
+msgsichrout:DCHARINFO  {Spurious interrupt - character output state}
+.PAGE
+	.SBTTL	Initialization routine
+
+	INITSUB	ibsainit
+
+ibsainit:
+	MOVL	EDI, #ibsachk		;Install our class
+	MOVL	EBX, #ibsacls		;Offset of class function dispatch table
+	MOVL	EAX, #'IBSA'
+	CLRL	EDX
+	MOVL	ECX, #ibsacctbl
+	MOVL	ESI, #ibsaccb
+	CALL	knlNewClass##
+	JC	10$.S			;This should not fail!
+	MOVL	ECX, #codetop
+	CLRL	EDX
+	CLRL	EAX
+10$:	MOVL	EBX, #QSTS$DONE
+	RET
+
+	CODE
+.PAGE
+	.SBTTL	ibsachk - Device check routine for IBSA interfaces
+
+;Device check routine for IBSA interfaces
+;	c{SS:EBX} = Address of device name (16 bytes)
+;	c(CL)      = Function:
+;		       0 = Find device
+;		       1 = Find class
+;	CALL	ibsachk
+;	C:set = Error (match found)
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  Z:set = Match found
+;	    c{EDI} = Offset of DCB
+;	  Z:clr = Not found
+;  EBX and ESI are preserved
+
+ibsachk:CMPL	SS:[EBX], #'IBSA'	;Is this IBSA*?
+	JNE	10$.S			;No
+	MOVL	EDI, ibsaccb+ccb_dcbhead ;Yes - get first IBSA DCB
+	TESTL	EDI, EDI
+	JE	8$.S
+4$:	MOVL	EAX, dcb_name+4.B[EDI]	;Does name match?
+	CMPL	SS:4.B[EBX], EAX
+	JNE	6$.S
+	MOVL	EAX, dcb_name+8.B[EDI]
+	CMPL	SS:8.B[EBX], EAX
+	JNE	6$.S
+	MOVL	EAX, dcb_name+12t.B[EDI]
+	CMPL	SS:12t.B[EBX], EAX
+	JE	ret002.S		;Yes - this is it!
+6$:	MOVL	EDI, dcb_next.B[EDI]	;Not this one - try next
+	TESTL	EDI, EDI
+	JNE	4$.S			;Continue if another
+8$:	INCL	EDI			;No more - clear Z
+10$:	CLC
+ret002:	RET
+.PAGE
+	.SBTTL	ibsaaddunit - Class function to add unit
+
+;Here for the CL_ADDUNIT function
+;	c{ES:EDI} = Address of parameter block
+;	CALL	ibsaaddu
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  c{EAX}  = 0
+
+$$$=!0
+FRM au_unit , 4t	;Unit number
+FRM au_ioreg, 4t	;Base IO register number
+FRM au_int  , 4t	;Interrupt number
+FRM au_dma  , 4t	;DMA channel
+au_SIZE=!$$$
+
+;Description block for addunitchar
+
+	DATA
+
+	.MOD	4
+ibsaaublk:
+ DCHARBGN  3, knlDCharValCom##
+ DCHARENT  UNIT , DECV, , 1, 0, 0, ibsaauunit , 0
+ DCHARENT  IOREG, HEXV, , 4, 0, 0, ibsaauioreg, 0
+ DCHARENT  INT  , DECV, , 1, 0, 0, ibsaauint  , 0
+ DCHARENT  DMA  , DECV, , 1, 0, 0, ibsaaudma  , 0
+
+	CODE
+
+ibsaaddunit:
+	ENTER	au_SIZE, 0		;Set up and initialize our stack frame
+	CLRL	EAX
+	DECL	EAX
+	MOVL	au_unit.B[EBP], EAX
+	MOVL	au_ioreg.B[EBP], EAX
+	MOVL	au_int.B[EBP], EAX
+	MOVL	au_dma.B[EBP], EAX
+	IFFAULT	6$
+	LFSL	EDX, iorb_buffer2.B[ESI] ;Get address of add-unit
+					 ;  characteristics
+	CALL	knlGiveQel##		;Give up the IORB
+	MOVL	EBX, #ibsaaublk		;Process the characteristics
+	MOVB	AL, #0			;Fail on bad names here
+	CALL	knlAddUnitChar##
+	JNC	8$.S			;If no error
+4$:	CLRL	ECX			;Fail
+	MOVL	EBX, #QSTS$DONE
+	LEAVE
+	STC
+	RET
+
+;Here if address error with IORB
+
+	FAULTHDR
+6$:	CALL	knlGiveQel##
+	MOVL	EAX, #ER_ADRER
+	JMP	4$.S
+
+;Here with all parameters processed - make sure we got everything we need
+
+8$:	MOVL	EAX, au_unit.B[EBP]
+	ORL	EAX, au_ioreg.B[EBP]
+	ORL	EAX, au_int.B[EBP]
+	ORL	EAX, au_dma.B[EBP]
+	TESTL	EAX, EAX
+	JNS	16$.S			;If have everything
+	MOVL	EAX, #ER_CHARM
+	JMP	4$.S
+
+;Here if IBC is already defined
+
+12$:	MOVL	EAX, #ER_DUADF
+	JMP	4$.S
+
+;Here if requested physical device is already in use
+
+14$:	MOVL	EAX, #ER_PDADF
+	JMP	4$.S
+
+;Here with all needed characteristics found
+
+16$:	MOVL	EAX, au_unit.B[EBP]	;Get unit number
+	MOVL	EDX, au_ioreg.B[EBP]	;And get IO register number
+	MOVL	EDI, ibsaficb		;Point to first IBSA ICB
+18$:	TESTL	EDI, EDI
+	JE	22$.S			;If no more DCBs
+	CMPB	icb_unit.B[EDI], AL	;Same unit?
+	JE	12$.S			;Yes - fail
+	CMPL	icb_ioreg.B[EDI], EDX	;No - same device?
+	JE	14$.S			;Yes - fail
+20$:	MOVL	EDI, [EDI]		;Not this one - try next
+	JMP	18$.S			;Continue
+
+;Here if unit and device are not defined now
+
+22$:	ADDB	DH, #GPIB_SPR		;Point to the serial poll status
+	MOVB	AL, #83h		;  register
+	OUTB	[DX]			;Try to set some bits
+	JMP	$+2.S
+	MOVL	EBX, EDX		;Now write to a different register
+	ADDB	DH, #GPIB_EOSR-GPIB_SPR	;  - this is done to discharge the bus
+	MOVB	AL, #0FFh		;  - if there is no device, we can get
+	OUTB	[DX]			;  back the same value because of bus
+	JMP	$+2.S			;  capacitance retaining the signal
+	XCHGL	EDX, EBX		;  levels!!
+	INB	[DX]			;Read the bits back
+	JMP	$+2.S
+	CMPB	AL, #83h		;Are they right?
+	JNE	24$.S			;No
+	MOVB	AL, #0			;Yes - try to set it to 0
+	OUTB	[DX]
+	JMP	$+2.S
+	XCHGL	EDX, EBX
+	MOVB	AL, #0FFh
+	OUTB	[DX]
+	JMP	$+2.S
+	MOVL	EDX, EBX
+	INB	[DX]			;Read it
+	TESTB	AL, AL			;Is it right?
+	JE	30$.S			;Yes
+24$:	MOVL	EAX, #ER_PDNAV		;No - device does not exist
+26$:	JMP	4$
+
+;Here if error when have exec memory resource
+
+28$:	CALL	knlGiveXRes##		;Give up the exec memory resource
+	JMP	26$.S
+
+;Here if interface exists
+
+30$:	CALL	knlGetXRes##		;Get exec memory resource
+	CMPB	intlevel, #0		;Do we already have an interrupt set up?
+	JNE	32$.S			;Yes - skip this stuff
+	MOVL	ECX, au_int.B[EBP]	;No - get interrupt number
+	CALL	knlChkIRqAvl##		;See if the vector is available
+	JC	28$.S			;If not available
+32$:	MOVL	ECX, #icb_SIZE+icb_mSIZE ;Create an ICB
+	CALL	knlGetXMem##
+	JC	28$.S
+	LEAL	ESI, icb_mSIZE.B[EDI]	;Point to "start" of the ICB
+	MOVL	EAX, ibsaficb		;Link into chain of ICBs
+	MOVL	ibsaficb, ESI
+	MOVL	[ESI], EAX
+	MOVL	icb_fdisp.B[ESI], #ibsafork ;Store offset of our fork routine
+	DECL	icb_fnext.B[ESI]
+	MOVL	EAX, au_dma.B[EBP]	;Store DMA channel
+	MOVB	icb_dmachnl.B[ESI], AL
+	MOVB	AL, au_unit.B[EBP]	;Store unit number
+	MOVB	icb_unit.B[ESI], AL
+	MOVL	EAX, au_ioreg.B[EBP]
+	MOVL	icb_ioreg.B[ESI], EAX	;Save base IO register number
+	MOVB	AL, #'A'		;Create major address DCB
+	CALL	ibsadcb
+	JC	28$.S
+	MOVL	icb_dcba.B[ESI], EDI	;Store offset of DCB in the ICB
+	MOVB	dcb_ibsmmmask.B[EDI], #01h ;Store bit for icb_inuse
+	MOVB	dcb_ibsbusaddr.B[EDI], #60h ;Store bus address byte
+	MOVB	AL, #'B'		;Create minor address DCB
+	CALL	ibsadcb
+	JC	28$.S
+	MOVL	icb_dcbb.B[ESI], EDI	;Store offset of DCB in the ICB
+	MOVB	dcb_ibsmmmask.B[EDI], #02h ;Store bit for icb_inuse
+	MOVB	dcb_ibsbusaddr.B[EDI], #0E0h ;Store bus address byte
+	MOVL	icb_intcnt.B[ESI], #50t	;Initialize interrupt counter
+	CMPL	intlevel, #0.B		;Already have interrupt set up?
+	JNE	38$.S			;Yes
+	MOVL	EAX, #'IBSA'
+	CLRL	EDX
+	MOVL	EBX, #ibsaint		;Get offset of interrupt routine
+	MOVL	ECX, au_int.B[EBP]	;Get interrupt number
+	MOVL	intlevel, ECX		;Remember it
+	MOVL	EAX, ECX
+	CMPL	EAX, #9.B		;Interrupt 2?
+	JNE	34$.S			;No
+	MOVB	AL, #2			;Yes
+34$:	ORL	rearmreg, EAX		;Also set up re-arm register address
+	MOVB	CH, #DT_INT+PL_0	;Set up our interrupt vector
+	CALL	knlSetIRq##
+	JC	40$.S			;This cannot fail!
+	MOVL	ECX, au_int.B[EBP]	;Enable our interrupt
+	CALL	knlEnableInt##
+38$:	CALL	ibsareset		;Reset the interface
+	CALL	knlGiveXRes##		;Give up the exec memory resource
+	LEAVE
+	MOVL	ECX, #1
+	MOVL	EBX, #QSTS$DONE
+rtnzero:CLRL	EAX			;Return 0
+	RET
+
+40$:	CRASH	IVCT
+.PAGE
+	.SBTTL	ibsadcb - Subroutine to create IBSA DCB
+
+;Subroutine to create IBSA DCB
+;	c(AL)  = Last character for device name (A or B)
+;	c{ESI} = Offset of ICB
+;	CALL	ibsadcb
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  c{EDI} = Offset of DCB
+
+ibsadcb:PUSHL	EAX
+	PUSHL	ESI
+	MOVL	ECX, #dcb_ibsSIZE+dcb_cSIZE ;Create a DCB
+	MOVL	EBX, #DS$PHYS|DS$DUPLEX|DS$QOUT|DS$QIN
+	MOVL	EDI, #ibsadsp
+	CALL	knlMakeDcb##
+	JC	4$.S
+	MOVL	ESI, #ibsaccb
+	CALL	knlLinkDcb##
+	MOVL	dcb_name+0.B[EDI], #'IBSA' ;Set up device name
+	POPL	ESI
+	MOVZBL	EAX, icb_unit.B[ESI]	;Put in unit number
+	LEAL	EBX, dcb_name+4.B[EDI]
+	CALL	knlPutDecNmbr##
+	POPL	EAX			;Put in last character
+	MOVB	[EBX], AL		       ;Store offset of device
+	MOVL	dcb_devchar.B[EDI], #ibsadctbl ;  characteristics table
+	MOVL	dcb_ibsicb.B[EDI], ESI	;Store offset of ICB
+	MOVL	EAX, au_dma.B[EBP]	;Store DMA channel
+	MOVB	dcb_dmachnl.B[EDI], AL
+	CLC
+	RET
+
+;Here if cannot allocate memory for the DCB
+
+4$:	POPL	EBX
+	POPL	EBX
+	RET
+.PAGE
+;Subroutine called by adduchars when "UNIT" characteristic found
+
+ibsaauunit:
+	CMPL	EAX, #99t
+	JAE	6$.S
+	MOVL	au_unit.B[EBP], EAX
+	CLC
+	RET
+
+;Subroutine called by adduchars when "INT" characteristic found
+
+ibsaauint:
+	CMPL	EAX, #9t.B		;Valid interrupt level?
+	JE	2$.S			;Yes
+	CMPL	EAX, #7t.B		;Maybe
+	JA	6$.S			;No - fail
+	CMPB	AL, #2			;Maybe
+	JB	6$.S			;No - fail
+	JNE	2$.S			;Yes
+	MOVB	AL, #9			;Fix up request for level 2
+2$:	CMPL	intlevel, #0.B		;Already have an interrupt number?
+	JE	4$.S			;No
+	CMPL	intlevel, EAX		;Yes - is this one the same?
+	JNE	6$.S			;No - fail
+4$:	MOVL	au_int.B[EBP], EAX	;Yes - store it
+	RET
+
+;Here if bad characteristic value
+
+6$:	MOVL	EAX, #ER_CHARV		;Get error code
+	STC				;Fail
+	RET
+
+;Subroutine called by adduchars when "IOREG" characteristic found
+
+ibsaauioreg:
+	MOVL	au_ioreg.B[EBP], EAX
+	RET
+
+;Subroutine called by adduchars when "DMA" characterisstic found
+
+ibsaaudma:
+	CMPL	EAX, #3.B		;Valid value?
+	JA	6$.S			;No
+	TESTL	EAX, EAX		;Maybe
+	JE	6$.S			;No
+	MOVL	au_dma.B[EBP], EAX	;Yes - store it
+	RET
+.PAGE
+	.SBTTL	ibcunitinfo - IBSA class get physical unit information function
+
+;Here for the get physical unit information class function (CL_PUNITS) for the
+;  IBSA class
+;	c{EBX} = Offset of CCB
+;	c{ESI} = Offset of IORB
+;	CALL	ibsaunitinfo
+;	c{EAX} = Error code
+;	c{EBX} = Status bits
+;	c{ECX} = Item count
+;  A zero count (iorb_count) requests that the number of units only be returned
+;    in qab_amount.  A non-zero count indicates that a buffer is available for
+;    that many unit names (8 characters each, null padded).
+
+ibsaunitinfo:
+	CLRL	ECX
+	MOVL	EBX, #QSTS$DONE
+	MOVL	EAX, #ER_NIYT
+	RET
+.PAGE
+	.SBTTL	geticbval - Subroutine to get value from ICB
+
+;Subroutine to get value from ICB
+;	CALL	geticbval
+
+geticbval:
+	ADDL	EBX, dcb_ibsicb.B[EDI]	;Get offset of value
+	MOVL	EAX, [EBX]		;Get value
+	CLRL	EDX
+	RET
+
+	.SBTTL	seticbval - Subroutine to set value in ICB
+
+;Subroutine to set value in ICB
+;	CALL	seticbval
+
+seticbval:
+	MOVL	EBX, dcb_ibsicb.B[EDI]	;Get offset of value
+	MOVL	[EBX], EAX		;Store new value
+	RET
+.PAGE
+	.SBTTL	sd_open - Open device
+
+;Here for the open device entry
+;	c{EDI} = Offset of DCB
+
+ibsaopen:
+	TESTL	SS:xffCmd##, #O$ODF
+	JNE	10$.S			;If illegal options
+	CMPL	dcb_opencnt.B[EDI], #1.B ;First open?
+	JNE	8$.S			;No
+	MOVL	ESI, dcb_ibsicb.B[EDI]	;Yes - get offset of the ICB
+	MOVL	dcb_ibsifflag.B[EDI], #0FFFF0000h
+	TESTB	dcb_ibsmmmask.B[EDI], #01h ;Is this the major address device?
+	JE	2$.S			;No
+	MOVB	icb_ppcfg.B[ESI], #0	;Yes - reset parallel poll configuration
+2$:	CMPB	icb_inuse.B[ESI], #0	;Is the interface in use now?
+	JNE	4$.S			;Yes
+	CALL	ibsareset		;No - reset the interface
+	MOVB	icb_istate.B[ESI], #IS_IDLE ;Make sure interrupt state is right
+	MOVL	EDX, icb_ioreg.B[ESI]
+	ADDB	DH, #GPIB_IMR1
+	MOVB	AL, #IMR1$DIIE|IMR1$DOIE ;Enable input and output interrupts
+	OUTB	[DX]
+	JMP	$+2.S
+	ADDB	DH, #GPIB_IMR2-GPIB_IMR1
+	MOVB	AL, #0
+	OUTB	[DX]
+	MOVL	EDX, rearmreg		;Point to the rearm register
+	OUTB	[DX]			;Rearm interrupts
+	JMP	6$.S
+
+;Here if interface is in use - just set our bus address
+
+4$:	MOVL	EDX, icb_ioreg.B[ESI]
+	ADDB	DH, #GPIB_ADR
+	MOVB	AL, dcb_ibsbusaddr.B[EDI]
+	OUTB	[DX]
+6$:	MOVB	AL, dcb_ibsmmmask.B[EDI] ;Set in-use bit in the ICB
+	ORB	icb_inuse.B[ESI], AL
+8$:	CLRL	EAX
+	RET
+
+;Here if illegal options specified
+
+10$:	MOVL	EAX, #ER_NTFIL
+	STC
+	RET
+.PAGE
+	.SBTTL	sd_close - Close device
+
+;Here for the close device entry
+;	c{ECX} = Close option bits
+;	c{EDI} = Offset of DCB
+;	c{ESI} = Offset of device table entry
+;	CALL	ibsaclose
+;	C:set = Error or not ready
+;	  c{EAX} = Error code (0 means not ready)
+;	C:clr = Normal
+
+ibsaclose:
+	CMPL	dcb_opencnt.B[EDI], #1.B ;Is this last close?
+	JNE	10$.S			;No
+	MOVB	AL, dcb_ibsmmmask.B[EDI] ;Yes - clear in-use bit in the ICB
+	NOTB	AL
+	MOVL	ESI, dcb_ibsicb.B[EDI]
+	ANDB	icb_inuse.B[ESI], AL
+10$:	CLRL	EAX			;No
+	RET
+.PAGE
+	.SBTTL	sd_outblock - Output block
+
+;Here for the output block entry
+;	c{ESI} = Offset of IORB
+;	c{EDI} = Offset of DCB
+;	CALL	ibsaoutblk
+;	c{EAX} = Error code
+;	c{EBX} = Status bits
+;	c{ECX} = Amount transfered
+
+ibsaoutblk:
+	CALL	knlIoQabLock##		;Lock the QAB
+	JC	1$.S			;If error
+	CALL	knlIoWriteLock##	;Lock the buffer
+	JC	1$.S			;If error
+	MOVB	iorb_queue.B[ESI], #dcb_outframe
+	MOVL	iorb_routine.B[ESI], #ibsaoutblk1
+	JMP	knlXfQueue##		;Switch to extended fork context
+
+1$:	TOFORK
+	RET
+
+2$:	MOVL	EAX, #ER_IOSAT
+4$:	CLRL	ECX
+	MOVL	EBX, #QSTS$DONE
+	RET
+
+8$:	MOVL	EAX, #ER_XFRBK
+	JMP	4$.S
+
+;Here in extended fork context
+
+ibsaoutblk1:
+	TESTB	dcb_ibssts.B[EDI], #IBS$ILOOP ;Have interrupt loop?
+	JNE	2$.S			;Yes - fail!
+	MOVL	SS:xffTimeOut##, #-1	;Default is no time-out
+	CMPL	SS:xffParm##, #0.B	;Have any device parameters?
+	JE	10$.S			;No
+	MOVL	EBX, #ibsaioparms	;Yes - process parameters
+	MOVL	ECX, #ibsadvparms
+	IFFAULT	knlQAdrErr0##
+	LFSL	EDX, SS:xffParm##
+	CALL	knlProcDevParm##
+	JC	4$.S
+10$:	CLRL	EAX
+	CMPL	SS:xffCount##, #0.B	;Really have any output to do?
+	JE	4$.S			;No - finished now
+	MOVL	ESI, dcb_ibsicb.B[EDI]	;Get offset of our ICB
+	MOVB	AL, dcb_ibsifoalw.B[EDI] ;Get output allow mask
+	TESTB	AL, AL			;Any bits set?
+	JE	12$.S			;No - don't check the interface flags
+	TESTB	icb_flags.B[ESI], AL	;Yes - can we go on?
+	JE	8$.S			;No - fail
+12$:	MOVL	EDX, icb_ioreg.B[ESI]	;Yes - get base IO port
+	ADDB	DH, #GPIB_SPR		;Point to serial poll register
+	CLI				;No interrupts here
+	INB	[DX]			;Get current bits
+	JMP	$+2.S
+	ORB	AL, dcb_ibsspseto.B[EDI] ;Add any bits we want
+	OUTB	[DX]
+	STI				;Interrupts OK now
+	MOVL	EAX, SS:xffTimeOut##
+	CALL	knlXfWait##		;Wait for output to start
+	JC	outerr0			;If error
+	CMPB	icb_istate.B[ESI], #IS_OUTPUT ;Make sure state is right!
+	JNE	14$.S
+	IFFAULT	adrero2
+	LESL	EBX, SS:xffBuffer1##	;Get address of buffer
+	MOVL	ECX, SS:xffCount##	;Get length of message
+	DECL	ECX			;Have single character message?
+	JNE	16$.S			;No
+	ADDB	DH, #GPIB_AUXR-GPIB_SPR	;Yes
+	MOVB	AL, #AUXR$SNEOI		;Issue the send EOI command
+	OUTB	[DX]
+	JMP	$+2.S
+	IFFAULT	adrero2
+	MOVB	AL, ES:[EBX]		;Get the data byte
+	ADDB	DH, #GPIB_DATA-GPIB_AUXR
+	OUTB	[DX]			;Output it
+	MOVL	ECX, #1
+	CLRL	EAX
+	JMP	outdon2			;Go finish up
+
+14$:	CRASH	IBOS			;[IBSA - bad Output State]
+
+;Here if have multiple character message to output
+
+16$:	DECL	ECX			;Have 2 character message?
+	JNE	22$.S			;No
+	MOVL	icb_xsize.B[ESI], #2	;Yes
+	IFFAULT	adrero2
+	LESL	EBX, SS:xffBuffer1##	;Get address of buffer
+	IFFAULT	adrero2
+	MOVB	AL, ES:1.B[EBX]		;Get last byte to output
+	MOVB	dcb_ibslstbyte.B[EDI], AL ;Save it for later
+	MOVB	icb_istate.B[ESI], #IS_CHROUT ;Advance state
+	IFFAULT	adrero2
+	MOVB	AH, ES:[EBX]		;Get first character
+	ADDB	DH, #GPIB_IMR1-GPIB_SPR
+	MOVB	AL, #IMR1$DOIE|IMR1$ERRIE ;Enable data output and error
+	OUTB	[DX]			  ;  interrupts
+	JMP	$+2.S
+	ADDB	DH, #GPIB_IMR2-GPIB_IMR1
+	MOVB	AL, #0
+	OUTB	[DX]
+	ADDB	DH, #GPIB_DATA-GPIB_IMR2
+	MOVB	AL, AH
+	OUTB	[DX]			;Output the character
+	JMP	$+2.S
+	MOVL	EAX, #2*XT_SECOND	;Wait until transfer is complete
+	CALL	knlXfWait##
+	JNC	outdone			;If OK
+20$:	JMP	outerr2			;If error
+
+;Here if message is longer than 2 characters
+
+22$:	MOVL	EAX, #-1
+	CALL	knlXfDmaGetChn##
+	JC	20$.S
+	ORB	icb_dmasts.B[ESI], #DMA$INUSE ;Indicate DMA channel allocated
+	MOVL	EDX, icb_ioreg.B[ESI]	;Enable error interrupt only
+	ADDB	DH, #GPIB_IMR1
+	MOVB	AL, #IMR1$ERRIE
+	OUTB	[DX]
+	JMP	$+2.S
+	ADDB	DH, #GPIB_IMR2-GPIB_IMR1
+	MOVB	AL, #IMR2$DMAOE		;Enable DMA output
+	OUTB	[DX]
+	IFFAULT	adrerod
+	LESL	EBX, SS:xffBuffer1##	;Get address of buffer
+	MOVW	FS, SS:xffPda##		;Get selector of PDA for process
+	MOVL	ECX, SS:xffCount##	;Get amount to output
+	MOVL	icb_xsize.B[ESI], ECX	;Save it for later
+	DECL	ECX
+	IFFAULT	adrerod
+	MOVB	AL, ES:[EBX+ECX]	;Get last byte to output
+	MOVB	dcb_ibslstbyte.B[EDI], AL ;Save it for later
+	CALL	knlDmaSetVir##		;Set up for transfer
+	JC	outerrd.S		;If error
+	MOVB	icb_istate.B[ESI], #IS_DMAOUT ;OK - advance state
+	CALL	knlDmaOutput##		;Start it up
+	MOVL	EAX, #2*XT_SECOND	;Wait until transfer is complete
+	CALL	knlXfWait##
+	JC	outerrd.S		;If error
+outdone:MOVL	ECX, icb_xsize.B[ESI]	;Get amount output
+outdon2:ADDL	dcb_ibsoutbyte.B[EDI], ECX ;Update total output byte count
+	INCL	dcb_ibsoutrec.B[EDI]	;Update total output record count
+	MOVB	icb_istate.B[ESI], #IS_IDLE ;Reset state
+	MOVL	EDX, icb_ioreg.B[ESI]
+	ADDB	DH, #GPIB_IMR1		;Enable input and output interrupts
+	PUSHL	EAX
+	MOVB	AL, #IMR1$DOIE|IMR1$DIIE
+	OUTB	[DX]
+	POPL	EAX
+	MOVL	EBX, #QSTS$DONE
+	RET
+.PAGE
+;Here with error while waiting for output to start - the only possible error
+;  at this point is abort or timeout - we just quietly give up on the output
+;  and return the error
+
+outerr0:PUSHL	EAX			;Save error code
+	MOVL	EDX, icb_ioreg.B[ESI]	;Get base IO port
+	ADDB	DH, #GPIB_SPR		;Point to serial poll register
+	CLI				;No interrupts here
+	INB	[DX]			;Get current bits
+	JMP	$+2.S
+	ANDB	AL, dcb_ibsspclro.B[EDI] ;Clear the output bits
+	OUTB	[DX]
+	STI				;Interrupts OK now
+2$:	POPL	EAX
+	INCL	dcb_ibserrcnt.B[EDI]	;Bump total error count
+	CLRL	ECX
+	JMP	outdon2.S
+
+;Here if have memory address error while have DMA channel but before the
+;  transfer is started
+
+	FAULTHDR
+adrerod:CLRL	ECX
+	MOVB	icb_dmasts.B[ESI], CL
+	CALL	knlDmaGiveChn##		;Give up the DMA channel
+	FAULTHDR
+adrero2:PUSHL	#ER_ADRER.B
+	JMP	4$.S
+
+;Here with error doing output while have DMA channel
+
+outerrd:TESTB	icb_dmasts.B[ESI], #DMA$INUSE ;Still have the DMA channel?
+	JE	outerr2.S		;No
+	CALL	knlDmaDisable##		;Yes - disable DMA channel
+	MOVL	EDX, icb_ioreg.B[ESI]
+	ADDB	DH, #GPIB_IMR2
+	MOVB	AL, #0			;Disable DMA interface transfer
+	OUTB	[DX]
+	CLRL	ECX
+	MOVB	icb_dmasts.B[ESI], CL
+	CALL	knlDmaGiveChn##		;Give up the DMA channel
+outerr2:PUSHL	EAX
+4$:	CALL	ibsaclear
+	JMP	2$.S
+.PAGE
+	.SBTTL	sd_inblock - Input block entry
+
+;Here for the input block entry
+;	c{ESI} = Offset of IORB
+;	c{EDI} = Offset of DCB
+;	CALL	ibsainpblk
+;	c{EAX} = Error code
+;	c{EBX} = Status bits
+;	c{ECX} = Amount transfered
+
+ibsainpblk:
+	CALL	knlIoQabLock##		;Lock the QAB
+	JC	4$.S			;If error
+	CALL	knlIoReadLock##		;Lock the buffer
+	JC	4$.S			;If error
+	MOVB	iorb_queue.B[ESI], #dcb_inpframe
+	MOVL	iorb_routine.B[ESI], #ibsainpblk1
+	JMP	knlXfQueue##		;Switch to extended fork context
+
+4$:	TOFORK
+	RET
+
+6$:	MOVL	EAX, #ER_IOSAT
+8$:	CLRL	ECX
+	MOVL	EBX, #QSTS$DONE
+	RET
+
+10$:	MOVL	EAX, #ER_XFRBK
+	JMP	8$.S
+
+;Here in extended fork context
+
+ibsainpblk1:
+	TESTB	dcb_ibssts.B[EDI], #IBS$ILOOP ;Have interrupt loop?
+	JNE	6$.S			;Yes - fail!
+	MOVL	SS:xffTimeOut##, #-1	;Default is no time-out
+	CMPL	SS:xffParm##, #0.B	;Have any device parameters?
+	JE	12$.S			;No
+	MOVL	EBX, #ibsaioparms	;Yes - process parameters
+	MOVL	ECX, #ibsadvparms
+	IFFAULT	knlQAdrErr0##
+	LFSL	EDX, SS:xffParm##
+	CALL	knlProcDevParm##
+	JC	8$.S
+12$:	CLRL	EAX
+	CMPL	SS:xffCount##, #0.B	;Really doing IO here?
+	JE	8$.S			;No - finished now
+	MOVL	ESI, dcb_ibsicb.B[EDI]	;Get offset of our ICB
+	MOVB	AL, dcb_ibsifialw.B[EDI] ;Get input allow mask
+	TESTB	AL, AL			;Any bits set?
+	JE	14$.S			;No - don't check the interface flags
+	TESTB	icb_flags.B[ESI], AL	;Yes - can we go on?
+	JE	10$.S			;No
+14$:	MOVL	EDX, icb_ioreg.B[ESI]	;Yes - get base IO port
+	ADDB	DH, #GPIB_SPR		;Point to serial poll register
+	CLI				;No interrupts here
+	INB	[DX]			;Get current serial poll bits
+	JMP	$+2.S
+	ORB	AL, dcb_ibsspseti.B[EDI] ;Add any bits we want
+	OUTB	[DX]
+	STI				;Interrupts OK now
+	MOVL	EAX, SS:xffTimeOut##	;Get time-out value
+	CALL	knlXfWait##		;Wait for input
+	JC	inperr0			;If error
+	ADDB	DH, #GPIB_ISR1-GPIB_SPR
+	CLI
+	INB	[DX]			;Make sure have latest value for the
+	ORB	icb_isr1.B[ESI], AL	;  ISR1$ENDRX bit
+	STI
+	BTZL	icb_isr1.B[ESI], #ISR1%ENDRX ;Have single character message?
+	JNC	16$.S			;No
+	ADDB	DH, #GPIB_DATA-GPIB_ISR1 ;Yes - get the data byte
+	INB	[DX]
+	IFFAULT	adrerim
+	LESL	EBX, SS:xffBuffer1##	;Get address of buffer
+	IFFAULT	adrerim
+	MOVB	ES:[EBX], AL		;Store byte
+	MOVL	ECX, #1			;Get amount input
+	JMP	inpdone			;Go finish up
+
+;Here if have multiple character message
+
+16$:	MOVL	EAX, #-1
+	CALL	knlXfDmaGetChn##	;Get DMA channel
+	JC	inperr0
+	ORB	icb_dmasts.B[ESI], #DMA$INUSE ;Indicate DMA channel allocated
+	MOVL	EDX, icb_ioreg.B[ESI]	;Enable end of input interrupt
+	ADDB	DH, #GPIB_IMR1
+	MOVB	AL, #IMR1$ENDIE
+	OUTB	[DX]
+	JMP	$+2.S
+	ADDB	DH, #GPIB_IMR2-GPIB_IMR1 ;Enable DMA input
+	MOVB	AL, #IMR2$DMAIE
+	OUTB	[DX]
+	IFFAULT	adrerid
+	LESL	EBX, SS:xffBuffer1##	;Get address of buffer
+	MOVL	ECX, SS:xffCount##	;Get size of buffer
+	MOVL	icb_xsize.B[ESI], ECX	;Save it for later
+	MOVW	FS, SS:xffPda##
+	CALL	knlDmaSetVir##		;Set up DMA controller for transfer
+	JC	18$.S			;If error
+	CALL	knlDmaInput##		;Start the transfer
+18$:	JC	inperrd
+	MOVL	EAX, SS:xffTimeOut##
+	CALL	knlXfWait##		;Wait for input to finish
+	JC	inperrq.S
+	CALL	knlDmaDisable##		;Disable DMA channel
+	MOVL	EDX, icb_ioreg.B[ESI]
+	ADDB	DH, #GPIB_IMR2
+	MOVB	AL, #0			;Disable DMA interface transfer
+	OUTB	[DX]
+	CALL	knlDmaGetCnt##		;Get current count from DMA controller
+	CLRL	ECX
+	MOVB	icb_dmasts.B[ESI], CL
+	CALL	knlDmaGiveChn##		;Give up the DMA channel
+	MOVL	ECX, icb_xsize.B[ESI]	;Calculate amount transfered
+	SUBL	ECX, EAX
+inpdone:PUSHL	#0.B			;Save error code
+inpdon2:MOVB	icb_istate.B[ESI], #IS_IDLE ;Indicate idle now
+	CLRL	EAX
+	MOVB	dcb_ibssts.B[EDI], AL	;Indicate no transfer active
+	MOVL	icb_curdcb.B[ESI], EAX	;No current DCB
+	MOVL	EDX, icb_ioreg.B[ESI]
+	ADDB	DH, #GPIB_IMR1		;Enable input and output interrupts
+	MOVB	AL, #IMR1$DIIE|IMR1$DOIE
+	OUTB	[DX]
+inpdon4:POPL	EAX			;Restore error code
+	ADDL	dcb_ibsinpbyte.B[EDI], ECX ;Update total input byte count
+	INCL	dcb_ibsinprec.B[EDI]	;Update total input record count
+	MOVL	EBX, #QSTS$DONE
+	RET				;All done
+.PAGE
+;Here with error while waiting for input to start - the only possible error
+;  at this point is abort or timeout - we just quietly give up on the input
+;  and return the error
+
+inperr0:PUSHL	EAX			;Save error code
+	MOVL	EDX, icb_ioreg.B[ESI]	;Get base IO port
+	ADDB	DH, #GPIB_SPR		;Point to serial poll register
+	CLI				;No interrupts here
+	INB	[DX]			;Get current serial poll bits
+	JMP	$+2.S
+	ANDB	AL, dcb_ibsspclri.B[EDI] ;Clear the input serial poll bits
+	OUTB	[DX]
+	STI				;Interrupts OK now
+	CLRL	ECX
+	CMPB	icb_istate.B[ESI], #IS_INPUT ;Has input been started?
+	JNE	inpdon4.S		;No
+	JMP	inpdon2.S		;Yes
+
+;Here if have memory address error while have DMA channel
+
+	FAULTHDR
+adrerid:CLRL	ECX
+	MOVB	icb_dmasts.B[ESI], CL
+	CALL	knlDmaGiveChn##		;Give up the DMA channel
+	FAULTHDR
+adrerim:MOVL	EAX, #ER_ADRER
+	JMP	inperr2.S
+
+;Here with error doing input while may have DMA channel
+
+inperrq:TESTB	icb_dmasts.B[ESI], #DMA$INUSE ;Have DMA channel now?
+	JE	inperr2.S		;No
+inperrd:CALL	knlDmaDisable##		;Disable DMA channel
+	MOVL	EDX, icb_ioreg.B[ESI]
+	ADDB	DH, #GPIB_IMR2
+	MOVB	AL, #0			;Disable DMA interface transfer
+	OUTB	[DX]
+	CLRL	ECX
+	MOVB	icb_dmasts.B[ESI], CL
+	CALL	knlDmaGiveChn##		;Give up the DMA channel
+inperr2:INCL	dcb_ibserrcnt.B[EDI]	;Bump total error count
+	PUSHL	EAX
+	CALL	ibsaclear
+	CLRL	ECX
+	JMP	inpdon2.S
+.PAGE
+	.SBTTL	ibsaparaddr - IBSPAR_ADDR IO parameter
+
+;Here for the IBSPAR_ADDR IO parameter - GBIP bus address
+
+	DPARMHDR  BOTH, HEXV
+ibsaparaddr:
+	TESTB	AH, #PAR$SET		;Want to set the value?
+	JE	4$.S			;No
+	PUSHL	EAX			;Yes
+	CALL	knlGetParm##		;Get value
+	JC	8$.S
+	MOVL	ESI, dcb_ibsicb.B[EDI]
+	ANDB	AL, #7Fh
+	ANDB	dcb_ibsbusaddr.B[EDI], #80h
+	ORB	dcb_ibsbusaddr.B[EDI], AL
+	MOVB	AL, dcb_ibsbusaddr.B[EDI]
+	MOVL	EDX, icb_ioreg.B[ESI]	;Also set it in the hardware
+	ADDB	DH, #GPIB_ADR
+	OUTB	[DX]
+	POPL	EAX			;Yes
+4$:	TESTB	AH, #PAR$GET		;Want a value returned?
+	JE	8$.S			;No
+	MOVZBL	EAX, dcb_ibsbusaddr.B[EDI]
+	JMP	knlStrParm4##
+
+8$:	RET
+
+	.SBTTL	ibspareoschr - IBSPAR_EOSCHR IO parameter
+
+;Here for the IBSPAR_EOSCHR IO parameter - EOS character
+
+	DPARMHDR  BOTH, DECV
+ibsapareoschr:
+	TESTB	AH, #PAR$SET		;Want to set the value?
+	JE	10$.S			;No
+	PUSHL	EAX			;Yes
+	CALL	knlGetParm##		;Get value
+	JC	8$.S
+	MOVB	dcb_ibseos.B[EDI], AL
+	POPL	EAX
+10$:	TESTB	AH, #PAR$GET		;Want a value returned?
+	JE	8$.S			;No
+	MOVZBL	EAX, dcb_ibseos.B[EDI]
+	JMP	knlStrParm4##
+
+	.SBTTL	ibsaparinmode - IBSPAR_INMODE IO parameter
+
+;Here for the IBSPAR_INMODE IO parameter - input mode
+
+	DPARMHDR  BOTH, DECV
+ibsaparinmode:
+	TESTB	AH, #PAR$SET		;Want to set the value?
+	JE	12$.S			;No
+	PUSHL	EAX			;Yes
+	CALL	knlGetParm##		;Get value
+	JC	8$.S
+	MOVB	dcb_ibsmode.B[EDI], AL
+	POPL	EAX
+12$:	TESTB	AH, #PAR$GET		;Want a value returned?
+	JE	8$.S			;No
+	MOVZBL	EAX, dcb_ibsmode.B[EDI]
+	JMP	knlStrParm4##
+.PAGE
+	.SBTTL	ibsaparppcfg - IBSPAR_PPCFG IO parameter
+
+;Here for the IBSPAR_PPCFG IO parameter - parallel poll configuration
+
+	DPARMHDR  BOTH, HEXV
+ibsaparppcfg:
+	TESTB	AH, #PAR$SET		;Want to set the value?
+	JE	4$.S			;No
+	PUSHL	EAX			;Yes
+	CALL	knlGetParm##		;Get value
+	JC	8$.S
+	MOVL	ESI, dcb_ibsicb.B[EDI]
+	ANDB	AL, #1Fh
+	MOVB	icb_ppcfg.B[ESI], AL
+	MOVL	EDX, icb_ioreg.B[ESI]	;Also set it in the hardware
+	ADDB	DH, #GPIB_AUXR
+	ORB	AL, #AUXR$PPR
+	OUTB	[DX]
+	POPL	EAX
+4$:	TESTB	AH, #PAR$GET		;Want a value returned?
+	JE	8$.S			;No
+	MOVL	ESI, dcb_ibsicb.B[EDI]
+	MOVZBL	EAX, icb_ppcfg.B[ESI]
+	JMP	knlStrParm4##
+
+8$:	RET
+
+	.SBTTL	ibsaparsetsp - IBSPAR_SETSP IO parameter
+
+;Here for the IBSPAR_SETSP IO parameter - set serial poll bits
+
+	DPARMHDR  BOTH, HEXV
+ibsaparsetsp:
+	TESTB	AH, #PAR$SET		;Want to "set" the value?
+	JE	12$.S			;No
+	PUSHL	EAX			;Yes
+	CALL	knlGetParm##		;Get value
+	JC	8$.S
+	MOVB	AH, AL
+	MOVL	ESI, dcb_ibsicb.B[EDI]
+	MOVL	EDX, icb_ioreg.B[ESI]	;Point to the serial poll register
+	ADDB	DH, #GPIB_SPR
+	INB	[DX]
+	ORB	AL, AH			;Set his bits
+	JMP	10$.S
+
+	.SBTTL	ibsaparclrsp - IBSPAR_CLRSP IO parameter
+
+;Here for the IBSPAR_CLRSP IO parameter - clear serial poll bits
+
+	DPARMHDR  BOTH, HEXV
+ibsaparclrsp:
+	TESTB	AH, #PAR$SET		;Want to "set" the value?
+	JE	12$.S			;No
+	PUSHL	EAX			;Yes
+	CALL	knlGetParm##		;Get value
+	JC	8$.S
+	MOVB	AH, AL
+	MOVL	ESI, dcb_ibsicb.B[EDI]
+	MOVL	EDX, icb_ioreg.B[ESI]	;Point to the serial poll register
+	ADDB	DH, #GPIB_SPR
+	INB	[DX]
+	NOTB	AH
+	ANDB	AL, AH			;Clear his bits
+10$:	OUTB	[DX]
+	POPL	EAX
+12$:	TESTB	AH, #PAR$GET		;Want a value returned?
+	JE	8$.S			;No
+	MOVL	ESI, dcb_ibsicb.B[EDI]	;Yes
+	MOVL	EDX, icb_ioreg.B[ESI]	;Point to the serial poll register
+	ADDB	DH, #GPIB_SPR
+	CLRL	EAX
+	INB	[DX]			;Get current value
+	JMP	knlStrParm4##
+.PAGE
+	.SBTTL	ibsaparsetif - IBSPAR_SETIF IO parameter
+
+;Here for the IBSPAR_SETIF IO parameter - set interface flag bits
+
+	DPARMHDR  BOTH, HEXV
+ibsaparsetif:
+	TESTB	AH, #PAR$SET		;Want to "set" the value?
+	JE	6$.S			;No
+	PUSHL	EAX			;Yes
+	CALL	knlGetParm##		;Get value
+	JC	8$.S
+	MOVL	ESI, dcb_ibsicb.B[EDI]
+	ORB	icb_flags.B[ESI], AL	;Set bits in the flag byte
+	JMP	4$.S
+
+	.SBTTL	ibsaparclrif - IBSPAR_CLRIF IO parameter
+
+;Here for the IBSPAR_CLRIF IO parameter - clear interface flag bits
+
+	DPARMHDR  BOTH, HEXV
+ibsaparclrif:
+	TESTB	AH, #PAR$SET		;Want to "set" the value?
+	JE	6$.S			;No
+	PUSHL	EAX			;Yes
+	CALL	knlGetParm##		;Get value
+	JC	8$.S
+	MOVL	ESI, dcb_ibsicb.B[EDI]
+	NOTB	AL
+	ANDB	icb_flags.B[ESI], AL	;Clear bits in the flag byte
+4$:	POPL	EAX
+6$:	TESTB	AH, #PAR$GET		;Want a value returned?
+	JE	8$.S			;No
+	MOVL	ESI, dcb_ibsicb.B[EDI]	;Yes
+	MOVB	AL, icb_flags.B[ESI]
+	JMP	knlStrParm4##
+
+8$:	RET
+.PAGE
+	.SBTTL	ibsaparsetsim - IBSPAR_SETSIM IO parameter
+
+;Here for the IBSPAR_SETSIM IO parameter - serial poll input masks
+
+	DPARMHDR  BOTH, HEXV
+ibsaparsetsim:
+	TESTB	AH, #PAR$SET		;Want to set the value?
+	JE	4$.S			;No
+	PUSHL	EAX			;Yes
+	CALL	knlGetParm##		;Get value
+	JC	8$.S
+	MOVB	dcb_ibsspseti.B[EDI], AL
+	MOVB	dcb_ibsspclri.B[EDI], AH
+	POPL	EAX
+4$:	TESTB	AH, #PAR$GET		;Want a value returned?
+	JE	8$.S			;No
+	MOVZBL	EAX, dcb_ibsspseti.B[EDI]
+	MOVB	AH, dcb_ibsspclri.B[EDI]
+	JMP	knlStrParm4##
+
+8$:	RET
+
+	.SBTTL	ibsaparsetsom - IBSPAR_SETSOM IO parameter
+
+;Here for the IBSPAR_SETSOM IO parameter - serial poll output mask
+
+	DPARMHDR  BOTH, HEXV
+ibsaparsetsom:
+	TESTB	AH, #PAR$SET		;Want to set the value?
+	JE	10$.S			;No
+	PUSHL	EAX			;Yes
+	CALL	knlGetParm##		;Get value
+	JC	8$.S
+	MOVB	dcb_ibsspseto.B[EDI], AL
+	MOVB	dcb_ibsspclro.B[EDI], AH
+	POPL	EAX
+10$:	TESTB	AH, #PAR$GET		;Want a value returned?
+	JE	8$.S			;No
+	MOVZBL	EAX, dcb_ibsspseto.B[EDI]
+	MOVB	AH, dcb_ibsspclro.B[EDI]
+	JMP	knlStrParm4##
+.PAGE
+	.SBTTL	ibsaparsetiam - IBSPAR_SETIAM IO parameter
+
+;Here for the IBSPAR_SETIAM IO parameter - input allow masks
+
+	DPARMHDR  BOTH, HEXV
+ibsaparsetiam:
+	TESTB	AH, #PAR$SET		;Want to set the value?
+	JE	4$.S			;No
+	PUSHL	EAX			;Yes
+	CALL	knlGetParm##		;Get value
+	JC	8$.S
+	MOVB	dcb_ibsifialw.B[EDI], AL
+	MOVB	dcb_ibsificlr.B[EDI], AH
+	POPL	EAX
+4$:	TESTB	AH, #PAR$GET		;Want a value returned?
+	JE	8$.S			;No
+	MOVZBL	EAX, dcb_ibsifialw.B[EDI]
+	MOVB	AH, dcb_ibsificlr.B[EDI]
+	JMP	knlStrParm4##
+
+8$:	RET
+
+	.SBTTL	ibsaparsetoam - IBSPAR_SETOAM IO parameter
+
+;Here for the IBSPAR_SETOAM IO parameter - output allow masks
+
+	DPARMHDR  BOTH, HEXV
+ibsaparsetoam:
+	TESTB	AH, #PAR$SET		;Want to set the value?
+	JE	10$.S			;No
+	PUSHL	EAX			;Yes
+	CALL	knlGetParm##		;Get value
+	JC	8$.S
+	MOVB	dcb_ibsifoalw.B[EDI], AL
+	MOVB	dcb_ibsifoclr.B[EDI], AH
+	POPL	EAX
+10$:	TESTB	AH, #PAR$GET		;Want a value returned?
+	JE	8$.S			;No
+	MOVZBL	EAX, dcb_ibsifoalw.B[EDI]
+	MOVB	AH, dcb_ibsifoclr.B[EDI]
+	JMP	knlStrParm4##
+.PAGE
+	.SBTTL	ibsaclear - Subroutine to reset 7210 and keep serial poll bits
+
+;Subroutine to reset the 7210 when have unusual condition - the state of the
+;  serial poll bits is retained
+;	c{ESI} = Offset of ICB
+;	CALL	ibsaclear
+
+ibsaclear:
+	MOVL	EDX, icb_ioreg.B[ESI]	;Point to the serial poll register
+	ADDB	DH, #GPIB_SPR
+	INB	[DX]			;Get current serial poll bits
+	PUSHL	EAX			;Save them
+	PUSHL	EDX			;Save pointer too
+	CALL	ibsareset		;Reset the 7210 (clears the serial
+	POPL	EDX			;  poll register)
+	POPL	EAX			;Restore serial poll bits
+	OUTB	[DX]
+	ADDB	DH, #GPIB_IMR1-GPIB_SPR
+	MOVB	AL, #IMR1$DIIE|IMR1$DOIE ;Enable input and output interrupts
+	OUTB	[DX]			 ;  only
+	JMP	$+2.S
+	ADDB	DH, #GPIB_IMR2-GPIB_IMR1
+	MOVB	AL, #0
+	OUTB	[DX]
+	MOVB	icb_istate.B[ESI], #IS_IDLE ;Reset interrupt state
+	RET				;Finished
+
+	.SBTTL	ibsareset - Subroutine to reset 7210
+
+;Subroutine to reset the 7210
+;	c{ESI} = Offset of ICB
+;	CALL	ibsareset
+
+ibsareset:
+	TESTB	icb_dmasts.B[ESI], #DMA$INUSE ;Do we have the DMA channel?
+	JE	4$.S			;No
+	MOVL	EDI, icb_curdcb.B[ESI]	;Yes - get offset of DCB
+	CALL	knlDmaDisable##		;Disable DMA channel
+	MOVL	EDX, icb_ioreg.B[ESI]
+	ADDB	DH, #GPIB_IMR2
+	MOVB	AL, #0			;Disable DMA interface transfer
+	OUTB	[DX]
+	CLRL	ECX
+	CALL	knlDmaGiveChn##		;Give up the DMA channel
+4$:	MOVL	EDX, icb_ioreg.B[ESI]
+	ADDB	DH, #GPIB_AUXR		;Reset the chip
+	MOVB	AL, #AUXR$RESET
+	OUTB	[DX]
+	JMP	$+2.S
+	ADDB	DH, #GPIB_ADMR-GPIB_AUXR
+	MOVB	AL, #31h
+	OUTB	[DX]
+	JMP	$+2.S
+	ADDB	DH, #GPIB_ADR-GPIB_ADMR
+	MOVL	EBX, icb_dcba.B[ESI]	;Set major address
+	MOVB	AL, dcb_ibsbusaddr.B[EBX]
+	OUTB	[DX]
+	JMP	$+2.S
+	MOVL	EBX, icb_dcbb.B[ESI]	;Set minor address
+	MOVB	AL, dcb_ibsbusaddr.B[EBX]
+	OUTB	[DX]
+	JMP	$+2.S
+	ADDB	DH, #GPIB_AUXR-GPIB_ADR	;Point to aux register
+	MOVB	AL, #AUXR$ICR|8		;Set internal counter register to 8
+	OUTB	[DX]
+	JMP	$+2.S
+	MOVB	AL, #AUXR$AUXRA|0	;Clear aux register A
+	OUTB	[DX]
+	JMP	$+2.S
+	MOVB	AL, #AUXR$AUXRB|AUXB$ISS ;Set aux register B
+	OUTB	[DX]
+	JMP	$+2.S
+	ORB	AL, #AUXR$AUXRE|0	;Clear aux register E
+	OUTB	[DX]
+	JMP	$+2.S
+	MOVB	AL, #AUXR$PPR|0
+	OUTB	[DX]
+	JMP	$+2.S
+	MOVB	AL, #AUXR$IEPON		;Release PON state to bring online
+	OUTB	[DX]
+	JMP	$+2.S
+	MOVB	AL, icb_ppcfg.B[ESI]	;Set parallel poll state
+	ORB	AL, #AUXR$PPR
+	OUTB	[DX]
+	JMP	$+2.S
+	MOVL	EDX, rearmreg
+	OUTB	[DX]
+	MOVB	icb_isr1.B[ESI], #0
+	MOVB	icb_isr2.B[ESI], #0
+	MOVB	icb_dmasts.B[ESI], #0
+	RET
+.PAGE
+	.SBTTL	Fork routine
+
+;Get here at fork level for each GPIB interrupt - ISR1, ISR2, and the DMA
+;  done status have been saved in the DCB, otherwise, the state of the
+;  hardware is the same as when it interrupted
+;	c{EDI} = Offset of ICB for interface
+
+ibsafork:
+	MOVL	ESI, EDI
+	MOVZBL	EAX, icb_istate.B[ESI]	;Dispatch on the interrupt state
+	JMPIL	istdsp[EAX*4]
+
+	DATA
+
+istdsp:	.LONG	forkidle	;IS_IDLE   - Idle
+	.LONG	forkinput	;IS_INPUT  - Input in progress
+	.LONG	isoutput	;IS_OUTPUT - Output is ready
+	.LONG	forkdmaout	;IS_DMAOUT - DMA output in progress
+	.LONG	forkchrout	;IS_CHROUT - Character output in progress
+
+	CODE
+
+;Here if spurious interrupt
+
+isoutput:
+	INCL	icb_sioutput.B[ESI]
+	RET
+
+;Here if state is IS_IDLE - idle
+
+forkidle:
+	MOVL	EDX, icb_ioreg.B[ESI]	;Get address status from interface
+	ADDB	DH, #GPIB_ADSR
+	INB	[DX]
+	MOVL	EDI, icb_dcba.B[ESI]	;Assume major address
+	TESTB	AL, #ADSR$MJMN		;Right?
+	JE	2$.S			;Yes
+	MOVL	EDI, icb_dcbb.B[ESI]	;No - its the minor address
+2$:	BTZL	icb_isr1.B[ESI], #ISR1%DI ;Input data ready interrupt?
+	JNC	idle2			;No
+	CMPW	dcb_inpframe.B[EDI], #0.B ;Yes - have input request?
+	JE	10$			;No - error
+	MOVL	icb_curdcb.B[ESI], EDI	;Yes - make this the current DCB
+	ADDB	DH, #GPIB_IMR1-GPIB_ADSR ;Disable data interrupts
+	MOVB	AL, #0
+	OUTB	[DX]
+	JMP	$+2.S
+	ADDB	DH, #GPIB_SPR-GPIB_IMR1 ;Clear serial poll bits
+	INB	[DX]
+	JMP	$+2.S
+	ANDB	AL, dcb_ibsspclri.B[EDI]
+	OUTB	[DX]
+	JMP	$+2.S
+	MOVB	AL, dcb_ibsificlr.B[EDI] ;Clear interface flags
+	ANDB	icb_flags.B[ESI], AL
+	ORB	dcb_ibssts.B[EDI], #IBS$INACT ;Indicate input transfer is active
+	MOVB	icb_istate.B[ESI], #IS_INPUT ;Set new interrupt state
+	ADDB	DH, #GPIB_AUXR-GPIB_SPR
+	MOVZBL	EAX, dcb_ibsmode.B[EDI]	;Get current mode
+	MOVB	AL, auxraval[EAX]	;Get value for AUXRA
+	OUTB	[DX]			;Output it
+	JMP	$+2.S
+	ADDB	DH, #GPIB_EOSR-GPIB_AUXR
+	MOVB	AL, dcb_ibseos.B[EDI]	;Get current EOS character
+	OUTB	[DX]			;Output it
+	JMP	$+2.S
+	CLRL	EAX
+	JMP	knlResumeInput##	;Wake up the input routine
+
+;Here if spurious interrupt
+
+10$:	INCL	icb_siidlei.B[ESI]
+	RET
+.PAGE
+;Here if not input data ready
+
+idle2:	BTZL	icb_isr1.B[ESI], #ISR1%DO ;Output ready interrupt?
+	JNC	10$.S			;No - error
+	CMPW	dcb_outframe.B[EDI], #0.B ;Yes - have output request?
+	JE	10$.S			;No - error
+	MOVL	icb_curdcb.B[ESI], EDI	;Yes - make this the current DCB
+	ADDB	DH, #GPIB_IMR1-GPIB_ADSR ;Disable data interrupts
+	MOVB	AL, #0
+	OUTB	[DX]
+	JMP	$+2.S
+	ADDB	DH, #GPIB_SPR-GPIB_IMR1 ;Clear serial poll bits
+	INB	[DX]
+	JMP	$+2.S
+	ANDB	AL, dcb_ibsspclro.B[EDI]
+	OUTB	[DX]
+	MOVB	AL, dcb_ibsifoclr.B[EDI] ;Clear interface flags
+	ANDB	icb_flags.B[ESI], AL
+	ORB	dcb_ibssts.B[EDI], #IBS$OUTACT ;Indicate output transfer is active
+	MOVB	icb_istate.B[ESI], #IS_OUTPUT ;Advance state
+	CLRL	EAX
+	JMP	knlResumeOutput##
+
+10$:	INCL	icb_siidleo.B[ESI]
+	RET
+.PAGE
+;Here if state is IS_INPUT - input in progress
+
+forkinput:
+	BTZL	icb_isr1.B[ESI], #ISR1%ENDRX ;Have we received end of input?
+	JC	4$.S			;Yes
+	BTZL	icb_dmasts.B[ESI], #DMA%DONE ;No - is DMA complete now?
+	JNC	8$.S			;No - error
+	ORB	icb_inpsts.B[ESI], #INP$TRUNC ;Yes - remember input incomplete
+4$:	MOVL	EDI, icb_curdcb.B[ESI]	;Get current DCB
+	CMPW	dcb_inpframe.B[EDI], #0.B ;Have input?
+	JE	10$.S			;No - this is not possible!
+	JMP	knlResumeInput##	;Yes - let him continue
+
+8$:	INCL	icb_siinput.B[ESI]
+	RET
+
+10$:	CRASH	IBNI			;[IBSA - No Input]
+.PAGE
+;Here if state is IS_DMAOUT - DMA output in progress
+
+forkdmaout:
+	BTZL	icb_dmasts.B[ESI], #DMA%DONE ;Is DMA complete now?
+	JNC	2$.S			;No - error
+	MOVL	EDI, icb_curdcb.B[ESI]	;Yes - get current DCB
+	CALL	knlDmaDisable##		;Disable the DMA channel
+	MOVL	EDX, icb_ioreg.B[ESI]
+	ADDB	DH, #GPIB_IMR2
+	MOVB	AL, #0			;Disable DMA at the interface
+	OUTB	[DX]
+	JMP	$+2.S
+	MOVB	icb_istate.B[ESI], #IS_CHROUT ;Advance state
+	ADDB	DH, #GPIB_IMR1-GPIB_IMR2 ;Enable output ready interrupt
+	MOVB	AL, #IMR1$DOIE|IMR1$ERRIE
+	OUTB	[DX]
+	CLRL	ECX
+	MOVB	icb_dmasts.B[ESI], CL	;Give up the DMA channel and wait for
+	JMP	knlDmaGiveChn##		;  the output done interrupt
+
+2$:	INCL	icb_sidmaout.B[ESI]
+	RET
+.PAGE
+;Here if state is IS_CHROUT - character output in progress - we next want to
+;  output the last character with EOS
+
+forkchrout:
+	BTZL	icb_isr1.B[ESI], #ISR1%ERR ;Error?
+	JC	4$.S			;Yes
+	BTZL	icb_isr1.B[ESI], #ISR1%DO ;No - Is output ready?
+	JNC	6$.S			;No - ignore interrupt
+	MOVL	EDI, icb_curdcb.B[ESI]	;Yes - get current DCB
+	MOVL	EDX, icb_ioreg.B[ESI]
+	ADDB	DH, #GPIB_AUXR
+	MOVB	AL, #AUXR$SNEOI		;Issue the send EOI command
+	OUTB	[DX]
+	JMP	$+2.S
+	ADDB	DH, #GPIB_DATA-GPIB_AUXR
+	MOVB	AL, dcb_ibslstbyte.B[EDI] ;Output the last data byte
+	OUTB	[DX]
+	CLRL	EAX			;Yes - indicate OK
+2$:	MOVL	EDI, icb_curdcb.B[ESI]	;Get current DCB
+	JMP	knlResumeOutput##	;Wake up the extended fork context
+
+;Here if error indicated
+
+4$:	MOVL	EAX, #ER_DEVER		;Indicate device error
+	JMP	2$.S
+
+;Here if spurious interrupt
+
+6$:	INCL	icb_sichrout.B[ESI]
+	RET
+.PAGE
+	.SBTTL	Interrupt service routine
+
+;Interrupt service for the GPIB interface - all GPIB interfaces in the system
+;  are chained on the same interrupt vector
+
+ibsaint:PUSHAL				;Save registers
+	PUSHL	DS
+	PUSHL	ES
+	PUSHL	FS
+	PUSHL	GS
+	PUSHL	#GS_DATA.B		;Make normal data addressable
+	POPL	DS
+	MOVL	EDI, ibsaficb		;Point to first GPIB interface ICB
+	TESTL	EDI, EDI		;Make sure really have one!
+	JE	12$.S
+2$:	MOVL	EDX, icb_ioreg.B[EDI]	;Get base IO port
+	ADDB	DH, #GPIB_ISR2		;Point to ISR2
+	INB	[DX]			;Get ISR2
+	TESTB	AL, AL			;Does this interface need service?
+	JNS	4$.S			;No - go on
+	ORB	icb_isr2.B[EDI], AL	;Yes - save ISR2 bits
+	ADDB	DH, #GPIB_ISR1-GPIB_ISR2
+	INB	[DX]			;Get ISR1 bits too
+	ORB	icb_isr1.B[EDI], AL	;And save them
+	TESTB	icb_dmasts.B[EDI], #DMA$INUSE ;Is DMA active for interface?
+	JE	8$.S			;No
+	CALL	knlDmaChkDone##		;Yes - is this channel finished?
+	JE	8$.S			;No - nothing to do here
+	JMP	6$.S			;Yes
+
+;Here if do not have interrupt request indicated - check to see if this is
+;  a DMA complete interrupt
+
+4$:	TESTB	icb_dmasts.B[EDI], #DMA$INUSE ;Is DMA active for interface?
+	JE	10$.S			;No - nothing for this one
+	CALL	knlDmaChkDone##		;Yes - is this channel finished?
+	JE	10$.S			;No
+6$:	ORB	icb_dmasts.B[EDI], #DMA$DONE ;Yes - remember DMA status
+8$:	CALL	knlReqFork##		;Request fork
+10$:	MOVL	EDI, [EDI]		;Advance to next ICB
+	TESTL	EDI, EDI		;Have another one?
+	JNE	2$.S			;Yes - continue
+12$:	MOVB	AL, #INT_EOI		;No - release interrupt controller
+	CLI
+	CMPB	intlevel, #7		;High interrupt?
+	JBE	14$.S			;No
+	OUTB	P_INC2P0		;Yes - release 2nd interrupt controller
+14$:	OUTB	P_INC1P0		;Always release 1st interrupt controller
+	MOVL	EDX, rearmreg		;Point to the rearm register
+	OUTB	[DX]			;Rearm interrupts
+	JMP	knlDismissInt2##	;Check for scheduling and dismiss
+.PAGE
+	.SBTTL	IBSA interface class driver data
+
+	DATA
+
+auxraval: .BYTE	AUXR$AUXRA|AUXA$REOS
+				;Mode 0 value for AUXRA - 7 bit alpha
+	  .BYTE	AUXR$AUXRA|AUXA$REOS|AUXA$8BIT
+				;Mode 1 value for AUXRA - 8 bit alpha
+	  .BYTE	AUXR$AUXRA	;Mode 2 value for AUXRA - binary
+	  .BYTE	0
+
+	.MOD	4
+ibsaccb:  .BLKB	ccb_SIZE	;IBSA CCB
+	.MOD	4
+ibsaficb: .LONG	0		;Offset of first IBSA interface ICB
+rearmreg: .LONG	2F0h		;IO register used to rearm GPIB interrupts
+intlevel: .LONG 0		;Interrupt level
+CNTisoutput::
+	.LONG	0
+CNTforkidle::
+	.LONG	0
+CNTidle2::
+	.LONG	0
+CNTforkinput::
+	.LONG	0
+CNTforkdmaout::
+	.LONG	0
+CNTforkchrout::
+	.LONG	0
+CNTforkfinout::
+	.LONG	0
+
+	LKEEND

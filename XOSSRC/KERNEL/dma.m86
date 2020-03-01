@@ -1,0 +1,673 @@
+	.TITLE	DMA - Routines for scheduling DMA controller use for Allegro
+
+;++++
+; This software is in the public domain.  It may be freely copied and used
+; for whatever purpose you see fit, including commerical uses.  Anyone
+; modifying this software may claim ownership of the modifications, but not
+; the complete derived code.  It would be appreciated if the authors were
+; told what this software is being used for, but this is not a requirement.
+
+;   THIS SOFTWARE IS PROVIDED BY THE AUTHORS "AS IS" AND ANY EXPRESS OR
+;   IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
+;   OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+;   IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+;   INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+;   BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS
+;   OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+;   ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR
+;   TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
+;   USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+;----
+
+	.PROC	80486
+	.INCLUD	XOSINC:\XMAC\XOS.PAR
+	.INCLUD	XOSINC:\XMAC\XOSX.PAR
+	.INCLUD	XOSINC:\XMAC\XOSERR.PAR
+	.INCLUD	XOSINC:\XMAC\XOSDISK.PAR
+	.INCLUD	XOSINC:\XMAC\XOSXDISK.PAR
+	.INCLUD	XOSINC:\XMAC\PCAT.PAR
+
+;Define offsets in the DMA channel data block
+
+$$$=!0
+BLK dma_stsbyte, 4		;Offset of status byte in memory
+BLK dma_stsbit , 1		;Bit mask for done status
+BLK dma_chnnum , 1		;Channel number
+BLK dma_config , 1		;Configuration bits
+BLK            , 1
+BLK dma_page   , 4		;IO port for extra page bits
+BLK dma_caddr  , 4 		;IO port to access current address register
+BLK dma_icnt   , 4 		;IO port to access item count register
+BLK dma_stscmd , 4 		;IO port to access status and command registers
+BLK dma_wreq   , 4 		;IO port to write request register
+BLK dma_wsmb   , 4 		;IO port to write single mask register bit
+BLK dma_mode   , 4 		;IO port to write mode register
+BLK dma_cbpl   , 4 		;IO port to clear byte pointer latch register
+BLK dma_temp   , 4 		;IO port to read temporary register
+BLK dma_mclr   , 4 		;IO port to cause master clear
+BLK dma_cmr    , 4 		;IO port to clear mask register
+BLK dma_wamb   , 4 		;IO port to write all mask register bits
+BLK dma_clndsp , 4		;Offset of clean-up subroutine
+BLK dma_clnEDI , 4		;Value of EDI for calling clean-up subroutine
+BLK dma_curdcb , 4		;Offset of DCB now using DMA controller
+BLK dma_dcbhead, 4		;Head pointer for wait list
+BLK dma_dcbtail, 4		;Tail pointer for wait list
+BLK dma_wcnt   , 4		;Wait count for channel
+dma_SIZE=!$$$
+
+;Define bits for dma_config
+
+DMA$16BIT=!40h			;16 bit channel
+  DMA%16BIT=!6t
+
+	DATA
+
+hidmalmt::.LONG 07FFFFFFFh	 ;Highest physical address for DMA
+dmatable::.LONG 0		 ;Table of pointers to DMA controller control
+	  .LONG dmacdb1		 ;  blocks
+	  .LONG dmacdb2
+	  .LONG dmacdb3
+	  .LONG 0
+	  .LONG dmacdb5
+	  .LONG dmacdb6
+	  .LONG dmacdb7
+
+;Create the DMA channel data blocks
+
+	DATA
+
+	.MACRO	DMACDB  n, c, d, b
+	.LONG	status'n	;dma_stsbyte
+	.BYTE	1<c		;dma_stsbit
+	.BYTE	c		;dma_chnnum
+	.BYTE	b		;dma_config
+	.BYTE	0
+	.LONG	P_DMA'n'PG'c	;dma_page
+	.LONG	P_DMA'n'ADR'c	;dma_caddr
+	.LONG	P_DMA'n'CNT'c	;dma_icnt
+	.LONG	P_DMA'n'STS	;dma_stscmd
+	.LONG	P_DMA'n'REQ	;dma_wreq
+	.LONG	P_DMA'n'WSMB	;dma_wsmb
+	.LONG	P_DMA'n'MODE	;dma_mode
+	.LONG	P_DMA'n'CBPL	;dma_cbpl
+	.LONG	P_DMA'n'TEMP	;dma_temp
+	.LONG	P_DMA'n'MCLR	;dma_mclr
+	.LONG	P_DMA'n'CMR	;dma_cmr
+	.LONG	P_DMA'n'WAMB	;dma_wamb
+	.LONG	0		;dma_clndsp
+	.LONG	0		;dma_clnEDI
+	.LONG	0		;dma_curdcb
+	.LONG	0		;dma_dcbhead
+	.LONG	0		;dma_dcbtail
+	.LONG	0		;dma_wcnt
+	.ENDM
+
+dmacdb1::DMACDB	1, 1, 1, 0
+
+dmacdb2::DMACDB	1, 2, 2, 0
+
+dmacdb3::DMACDB	1, 3, 3, 0
+
+dmacdb5::DMACDB	2, 1, 5, DMA$16BIT
+
+dmacdb6::DMACDB	2, 2, 6, DMA$16BIT
+
+dmacdb7::DMACDB	2, 3, 7, DMA$16BIT
+
+status1:.BYTE	0
+status2:.BYTE	0
+	.MOD	4
+dmawaitcnt::
+	.LONG	0
+dmainpcnt::
+	.LONG	0
+dmaoutcnt::
+	.LONG	0
+.PAGE
+	.SBTTL	DMA controller initialization routine
+
+	INITSUB	initdma
+
+;DMA controller initialization routine
+
+initdma::
+	NOP
+	RET
+
+	CODE
+.PAGE
+	.SBTTL	knlXfDmaGetChn - Subroutine to get use of DMA channel at extended fork level
+
+;Subroutine to get use of a DMA channel at extended fork level
+;	c{EAX} = Maximum time to wait, 0 means no wait, -1 means forever
+;	c{EDI} = Offset of DCB
+;	CALL	knlXfDmaGetChn
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+
+knlXfDmaGetChn::
+	REQUIREXFF
+	PUSHL	ECX
+	PUSHL	EAX			;Save time-out value
+	MOVL	ECX, #havechnout	;Place to go when available (assume
+					;  output operation)
+	CMPB	SS:xffQueue#, #dcb_outframe ;Really output operation?
+	JE	2$.S			;Yes
+	ADDL	ECX, #havechninp-havechnout.B ;No - really input
+2$:	CALL	knlDmaGetChn		;Try to get the channel
+	POPL	EAX			;Restore time-out value
+	POPL	ECX
+	JE	10$.S			;If we got the channel
+	INCL	dmawaitcnt		;Count this
+	TESTL	EAX, EAX		;Not available - should we wait?
+	JE	14$.S			;No - give right error message
+	CALL	knlXfWait#		;Wait and then return
+	JNC	10$.S			;If OK
+	MOVZBL	EBX, dcb_dmachnl.B[EDI]	;Error - get DMA channel
+	MOVL	EBX, dmatable[EBX*4]	;Get offset of DMA channel data block
+	CMPL	dma_curdcb.B[EBX], EDI	;Did we really get it? (This is possible
+					;  if it times out or is aborted just as
+					;  it is allocated!)
+	JE	10$.S			;Yes - ignore the error!
+	PUSHL	EAX			;No - remove this DCB from the DMA wait
+	LEAL	ECX, dma_dcbhead.B[EBX]	;  list
+4$:	CMPL	[ECX], EDI
+	JE	6$.S
+	MOVL	ECX, [ECX]
+	TESTL	ECX, ECX
+	JNE	4$.S
+	CRASH	RNDL			;[Request Not in DMA List]
+
+6$:	MOVL	EAX, dcb_fnext.B[EDI]
+	MOVL	[ECX], EAX
+	TESTL	EAX, EAX
+	JNE	8$.S
+	MOVL	dma_dcbtail.B[EBX], ECX	;Assume list not empty
+	CMPL	dma_dcbhead.B[EBX], #0.B ;Right?
+	JNE	8$.S			;Yes
+	MOVL	dma_dcbtail.B[EBX], EAX	;No - clear the tail pointer
+8$:	MOVL	dcb_fnext.B[EDI], #-1
+	POPL	EAX			;Restore error code
+	STC
+10$:	RET
+
+;Here if channel not available and we do not want to wait
+
+14$:	MOVL	EAX, #ER_CHNNA		;Error = CHaNnel Not Available
+	STC				;Indicate error
+	RET				;Return
+
+;Here when we finally get the DMA channel for input (get here at normal fork
+;  level or in extended fork context)
+
+havechninp:
+	INCL	dmainpcnt
+	CLRL	EAX			;Indicate normal
+	JMP	knlResumeInput#		;Resume extended fork level routine
+
+;Here when we finally get the DMA channel for output (get here at normal fork
+;  level or in extended fork context)
+
+havechnout:
+	INCL	dmaoutcnt
+	CLRL	EAX			;Indicate normal
+	JMP	knlResumeOutput#	;Resume extended fork level routine
+.PAGE
+	.SBTTL	knlDmaGetChn - Subroutine to get use of a DMA channel
+
+;Subroutine to get use of a DMA channel - must be called at fork level
+;	c{ECX} = Offset of subroutine to call when channel becomes available
+;	c{EDI} = Offset of DCB
+;	CALL	knlDmaGetChn
+;	Z:set = Have channel
+;	Z:clr = Channel not available now
+
+knlDmaGetChn::
+	PUSHL	EBX
+	MOVZBL	EBX, dcb_dmachnl.B[EDI]	;Get DMA channel
+	MOVL	EBX, dmatable[EBX*4]	;Get offset of DMA channel data block
+	CMPL	dma_curdcb.B[EBX], #0.B	;Is this DMA channel in use?
+	JNE	4$.S			;Yes
+	CMPL	dma_clndsp.B[EBX], #0.B	;No - do we need to do clean-up?
+	JE	2$.S			;No
+	CMPL	dma_clnEDI.B[EBX], EDI	;Yes - are we giving it to the same
+					;  device that had it last time?
+	JE	2$.S			;Yes - no clean-up is needed
+	PUSHAL				;No - save all registers
+	PUSHL	ES
+	PUSHL	FS
+	PUSHL	GS
+	MOVL	EDI, dma_clnEDI.B[EBX]	;Call clean-up subroutine
+	CALLI	dma_clndsp.B[EBX]
+	POPL	GS			;Restore registers
+	POPL	FS
+	POPL	ES
+	POPAL
+2$:	CLRL	EAX			;Clear clean-up dispatch
+	MOVL	dma_clndsp.B[EBX], EAX
+	MOVL	dma_curdcb.B[EBX], EDI	;Grab the channel
+	POPL	EBX
+	RET				;Return with Z set
+
+;Here if DMA channel is in use
+
+4$:	CMPL	dma_curdcb.B[EBX], EDI	;Are we using it?
+	JE	10$.S			;Yes - serious problem!
+	CMPL	dcb_fnext.B[EDI], #0FFFFFFFFh.B ;No - are we in a list?
+	JNE	12$.S			;Yes - another serious problem!
+	PUSHL	EAX			;No
+	INCL	dma_wcnt.B[EBX]		;Bump wait count for channel
+	MOVL	EAX, dma_dcbtail.B[EBX]	;Link this DCB to tail of the wait
+	TESTL	EAX, EAX		;  list for the channel
+	JNE	6$.S
+	MOVL	dma_dcbhead.B[EBX], EDI
+	JMP	8$.S
+
+6$:	MOVL	dcb_fnext.B[EAX], EDI
+8$:	MOVL	dma_dcbtail.B[EBX], EDI
+	CLRL	EAX
+	MOVL	dcb_fnext.B[EDI], EAX
+	POPL	EAX
+	MOVL	dcb_fdisp.B[EDI], ECX	;Store offset of routine to call
+	INCL	EBX			;Clear Z
+	POPL	EBX
+	RET				;And return
+
+10$:	CRASH	DMAD			;[DMA Dead-lock]
+
+12$:	CRASH	BDWL			;[Bad Dma Wait List]
+.PAGE
+	.SBTTL	knlDmaGiveChn - Subroutine to give up use of a DMA channel
+
+;Subroutine to give up use of a DMA channel
+;	c{EDI} = Offset of DCB
+;	c{ECX} = Offset of clean-up subroutine
+;	CALL	knlDmaGiveChn
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+
+knlDmaGiveChn::
+	PUSHL	EBX
+	MOVZBL	EBX, dcb_dmachnl.B[EDI]	;Get DMA channel
+	MOVL	EBX, dmatable[EBX*4]	;Get offset of DMA channel data block
+	CMPL	dma_curdcb.B[EBX], EDI	;Do we really have the channel?
+	JNE	10$.S			;No - fail big!
+	PUSHL	dma_dcbhead.B[EBX]	;Yes - get DCB which is waiting
+	POPL	dma_curdcb.B[EBX]	;Give it the channel
+	CMPL	dma_curdcb.B[EBX], #0.B	;Was there really someone waiting?
+	JNE	2$.S			;Yes
+	MOVL	dma_clndsp.B[EBX], ECX	;No - store clean-up offset
+	MOVL	dma_clnEDI.B[EBX], EDI	;Store EDI value
+	POPL	EBX
+	RET
+
+;Here if someone was waiting for the channel
+
+2$:	PUSHAL				;Save all registers
+	PUSHL	ES
+	PUSHL	FS
+	PUSHL	GS
+	CLRL	EAX			;Clear clean-up offset
+	MOVL	dma_clndsp.B[EBX], EAX
+	TESTL	ECX, ECX		;Was a clean-up subroutine given?
+	JE	4$.S			;No
+	CALLI	ECX			;Yes - call it now
+4$:	MOVL	EDI, dma_curdcb.B[EBX]
+	MOVL	EAX, dcb_fnext.B[EDI]	;Remove DCB from the wait list
+	MOVL	dma_dcbhead.B[EBX], EAX
+	TESTL	EAX, EAX
+	JNE	6$.S
+	MOVL	dma_dcbtail.B[EBX], EAX
+6$:	MOVL	dcb_fnext.B[EDI], #0FFFFFFFFh
+	CALLI	dcb_fdisp.B[EDI]	;Call routine
+	POPL	GS			;Restore registers
+	POPL	FS
+	POPL	ES
+	POPAL
+	POPL	EBX
+	RET				;And return
+
+;Here if trying to give up DMA channel which we don't have allocated
+
+10$:	CRASH	DCNA			;[DMA Channel Not Allocated]
+.PAGE
+	.SBTTL	knlDmaCascade - Subroutine to set up DMA channel for cascade mode
+
+;Subroutine to set up DMA channel for cascade mode operation
+;	c{EDI} = Offset of DCB
+;	CALL	knlDmaCascade
+
+knlDmaCascade::
+	MOVZBL	EAX, dcb_dmachnl.B[EDI]	;Get DMA channel number
+	MOVL	EBX, dmatable[EAX*4]	;Get offset of DMA channel data block
+	ANDB	AL, #03h
+	ORB	AL, #0C0h
+	MOVL	EDX, dma_mode.B[EBX]	;Set channel to cascade mode
+	OUTB	[DX]
+	IOPAUSE
+	ANDB	AL, #03h
+	MOVL	EDX, dma_wsmb.B[EBX]	;Enable the channel
+	OUTB	[DX]
+	IOPAUSE
+	RET				;Thats all
+.PAGE
+	.SBTTL	knlDmaClrDone - Subroutine to clear DMA done status
+
+;Subroutine to clear DMA done status for a DMA channel
+;	c{EBX} = Offset of DDB
+;	CALL	knlDmaClrDone
+
+knlDmaClrDone::
+	MOVZBL	EBX, dcb_dmachnl.B[EDI]	;Get DMA channel
+	MOVL	EBX, dmatable[EBX*4]	;Get offset of DMA channel data block
+	MOVL	EDX, dma_stscmd.B[EBX]	;Point to DMA controller status register
+	CLI
+	INB	[DX]			;Get completion bits to make sure don't
+	IOPAUSE				;  have done indication in the hardware
+	MOVL	EDX, dma_stsbyte.B[EBX]	;Get offset of status byte
+	MOVB	AL, dma_stsbit.B[EBX]	;Get mask for our status bit
+	NOTB	AL			;Clear that bit
+	ANDB	[EDX], AL
+	STI
+	RET
+.PAGE
+	.SBTTL	knlDmaChkDone - Subroutine to get DMA done status
+
+;Subroutine to get DMA done status for a DMA channel
+;	c{EBX} = Offset of DDB
+;	CALL	knlDmaChkDone
+;	Z:set = Not complete
+;	  c(AL) = 0
+;	Z:clr = Complete
+;	  c(AL) = Non-0
+
+knlDmaChkDone::
+	MOVZBL	EBX, dcb_dmachnl.B[EDI]	;Get DMA channel
+	MOVL	EBX, dmatable[EBX*4]	;Get offset of DMA channel data block
+	MOVL	EDX, dma_stscmd.B[EBX]	;Point to DMA controller status register
+	CLI
+	INB	[DX]			;Get completion bits
+	IOPAUSE
+	MOVL	EDX, dma_stsbyte.B[EBX]	;Get offset of status byte
+	ORB	[EDX], AL		;Merge in the new bits
+	MOVB	AL, dma_stsbit.B[EBX]	;Get mask for our status bit
+	MOVB	AH, AL
+	ANDB	AL, [EDX]		;See if its set
+	NOTB	AH
+	ANDB	[EDX], AH
+	STI
+	TESTB	AL, AL
+	RET
+.PAGE
+	.SBTTL	knlDmaSetPhy - Subroutine to setup DMA channel for transfer
+
+;Subroutine to setup DMA channel for transfer given physical address
+;	c{ECX} = Size of buffer
+;	c{EBX} = Physical buffer address
+;	CALL	knlDmaSetPhy
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+
+knlDmaSetPhy::
+	MOVL	EAX, EBX		;Get address in right register
+	JMP	6$.S			;Continue
+
+	.SBTTL	knlDmaSetVir - Subroutine to setup DMA channel for transfer
+
+;Subroutine to setup DMA channel for transfer given virtual address
+;	c{ECX}    = Size of buffer
+;	c{ES:EBX} = Virtual buffer address
+;	c[FS]     = Selector for PDA for process doing IO (only needed if
+;		      ES:EBX contains a local address)
+;	CALL	knlDmaSetVir
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+
+knlDmaSetVir::
+	TESTL	ECX, ECX		;Make sure count is valid
+	JG	2$.S
+	MOVL	EAX, #ER_ICDEV
+	STC
+	RET
+
+;Here with non-zero buffer size
+
+2$:	LEAL	EAX, -1.B[EBX+ECX]	;See if buffer fits in a single page
+	XORL	EAX, EBX
+	TESTL	EAX, #0FFFFF000h
+	JE	4$.S			;OK - go on
+	MOVL	EAX, #ER_IADEV		;No - error
+	STC
+	RET
+
+;Here if buffer fits within a single memory page
+
+4$:	CALL	knlGetPhyAddr#		;Get physical address
+	JC	14$.S
+6$:	CALL	knlForceLowMem#		;Make sure this is a valid page
+	JC	14$.S
+	DECL	ECX			;Adjust the count
+	PUSHL	ESI
+	MOVZBL	ESI, dcb_dmachnl.B[EDI]	;Get DMA channel
+	MOVL	ESI, dmatable[ESI*4]	;Get offset of DMA channel data block
+	MOVL	EDX, dma_cbpl.B[ESI]
+	OUTB	[DX]
+	IOPAUSE
+	MOVL	EDX, dma_caddr.B[ESI]	;Get port for current address register
+	CLI
+	OUTB	[DX]			;Output low byte
+	IOPAUSE
+	SHRL	EAX, #8			;Output high address byte
+	OUTB	[DX]
+	IOPAUSE
+	STI
+	SHRL	EAX, #8			;Output the page bits
+	MOVL	EDX, dma_page.B[ESI]
+	OUTB	[DX]
+	MOVL	EDX, dma_icnt.B[ESI]	;Store item count
+	TESTB	dma_config.B[ESI], #DMA$16BIT ;16 bit channel?
+	JE	10$.S			;No
+	SHRL	ECX, #1			;Yes - fix up the count
+10$:	MOVB	AL, CL
+	CLI
+	OUTB	[DX]
+	IOPAUSE
+	MOVB	AL, CH
+	OUTB	[DX]
+	IOPAUSE
+	STI
+	CLC				;Make sure C is clear
+	POPL	ESI
+14$:	RET				;Finished
+.PAGE
+	.SBTTL	knlDmaInput - Subroutine to start DMA input transfer
+
+;Subroutine to start DMA input transfer
+;	CALL	knlDmaInput
+
+knlDmaInput::
+	PUSHL	EAX
+	MOVB	AL, #44h		;Get value for the mode register
+	JMP	2$.S			;Continue
+
+	.SBTTL	knlDmaOutput - Subroutine to start DMA output transfer
+
+;Subroutine to start DMA output transfer
+;	CALL	knlDmaOutput
+
+knlDmaOutput::
+	PUSHL	EAX
+	MOVB	AL, #48h		;Get value for the mode register
+2$:	PUSHL	EBX
+	PUSHL	EDX
+	MOVZBL	EBX, dcb_dmachnl.B[EDI]	;Get DMA channel
+	MOVL	EBX, dmatable[EBX*4]	;Get offset of DMA channel data block
+	ORB	AL, dma_chnnum.B[EBX]
+	MOVL	EDX, dma_mode.B[EBX]	;Get port for mode register
+	OUTB	[DX]			;Set mode register value
+	IOPAUSE
+
+;Read the status register to be sure don't have completion flag for this
+;  channel left over from a previous transfer
+
+	MOVL	EDX, dma_stscmd.B[EBX]	;Point to DMA controller status register
+	INB	[DX]			;Get completion bits
+	IOPAUSE
+	MOVB	AH, dma_stsbit.B[EBX]	;Mask out bit for this channel
+	NOTB	AH
+	ANDB	AL, AH
+	MOVL	EDX, dma_stsbyte.B[EBX]	;Get offset of status byte
+	ORB	[EDX], AL		;Merge in the new bits
+
+;Now start this channel
+
+	MOVB	AL, dma_chnnum.B[EBX]	;Get channel number
+	MOVL	EDX, dma_wsmb.B[EBX]	;Get address of WSMB register
+	OUTB	[DX]			;Clear the mask bit to start channel
+	IOPAUSE
+	POPL	EDX
+	POPL	EBX
+	POPL	EAX
+	RET
+.PAGE
+	.SBTTL	knlDmaAbort - Subroutine to abort use of DMA channel
+
+;Subroutine to abort use of DMA channel - this subroutine is normally
+;  called when a device which has requested a DMA channel times out - if
+;  the device is still waiting for the channel, the request is removed -
+;  if the device has the channel, the channel channel is disabled, the
+;  transfer count is obtained, and the channel is given up
+;	CALL	knlDmaAbort
+;	c{EAX} = Amount transfered
+
+knlDmaAbort::
+	PUSHL	EBX
+	MOVZBL	EBX, dcb_dmachnl.B[EDI]	;Get DMA channel
+	MOVL	EBX, dmatable[EBX*4]	;Get offset of DMA channel data block
+	CMPL	dma_curdcb.B[EBX], EDI	;Do we have the channel now?
+	JE	14$.S			;Yes - go handle that case
+	PUSHL	EDX			;No
+	LEAL	EDX, dma_dcbhead.B[EBX]	;Point to head pointer for DCB list
+2$:	CMPL	[EDX], EDI		;Are we next in the list?
+	JE	6$.S			;Yes
+	MOVL	EDX, [EDX]		;No - get next DCB in list
+	TESTL	EDX, EDX		;Is there another
+	JE	4$.S			;No - big problem!
+	ADDL	EDX, #dcb_fnext.B	;Point to link pointer
+	JMP	2$.S			;Continue
+
+;Here if cannot find DCB in the DMA channel wait list
+
+4$:	CRASH	BDWL			;[Bad DMA Wait List]
+
+;Here with DCB in wait list
+
+6$:	MOVL	EAX, dcb_fnext.B[EDI]	;Remove our DCB from the list
+	MOVL	[EDX], EAX
+	TESTL	EAX, EAX		;Were the last in the list?
+	JNE	10$.S			;No
+	CMPL	dma_dcbhead.B[EBX], #0.B ;Yes - also first in list?
+	JNE	8$.S			;No
+	CLRL	EDX			;Yes - clear tail pointer
+8$:	MOVL	dma_dcbtail.B[EBX], EDX	;Update tail pointer
+10$:	POPL	EDX
+	POPL	EBX
+	CLRL	EAX			;Return 0 for amount transferred
+	RET
+
+;Here if this DCB has the DMA channel
+
+14$:	POPL	EBX
+	CALL	knlDmaDisable
+	CALL	knlDmaGetCnt		;Get the transfer count
+	JMP	knlDmaGiveChn		;Give up the channel and return
+.PAGE
+	.SBTTL	knlDmaDisable - Subroutine to disable DMA channel
+
+;Subroutine to disable DMA channel
+;	CALL	knlDmaDisable
+
+knlDmaDisable::
+	PUSHL	EAX
+	PUSHL	EDX
+	MOVZBL	EDX, dcb_dmachnl.B[EDI]	;Get DMA channel
+	MOVL	EDX, dmatable[EDX*4]	;Get offset of DMA channel data block
+	MOVB	AL, dma_chnnum.B[EDX]	;Get mask bit number
+	MOVL	EDX, dma_wsmb.B[EDX]	;Get address of WSMB register
+	ORB	AL, #04			;Indicate should set mask bit
+	OUTB	[DX]			;Set the mask bit
+	IOPAUSE
+	POPL	EDX
+	POPL	EAX
+	RET
+.PAGE
+	.SBTTL	knlDmaGetCnt - Subroutine to get current count from DMA channel
+
+;Subroutine to get current count from DMA channel
+;	c{EDI} = Offset of DCB
+;	CALL	knlDmaGetCnt
+;	c{EAX} = Count value
+
+knlDmaGetCnt::
+	PUSHL	EDX
+	MOVZBL	EDX, dcb_dmachnl.B[EDI]	;Get DMA channel
+	MOVL	EAX, dmatable[EDX*4]	;Get offset of DMA channel data block
+	MOVL	EDX, dma_cbpl.B[EAX]
+	OUTB	[DX]
+	IOPAUSE
+	MOVL	EDX, dma_icnt.B[EAX]	;Get item count register port
+	CLI
+	INB	[DX]			;Get low byte
+	IOPAUSE
+	MOVB	AH, AL
+	INB	[DX]			;Get high byte
+	IOPAUSE
+	STI
+	XCHGB	AL, AH
+	CWL
+	INCL	EAX
+	MOVZBL	EDX, dcb_dmachnl.B[EDI]	;Get DMA channel
+	MOVL	EDX, dmatable[EDX*4]	;Get offset of DMA channel data block
+	TESTB	dma_config.B[EDX], #DMA$16BIT ;Is this a 16 bit channel?
+	JE	4$.S			;No
+	ADDL	EAX, EAX		;Yes - fix up the count
+4$:	POPL	EDX
+	RET
+.PAGE
+	.SBTTL	knlDmaGetAddr - Subroutine to get current address from DMA channel
+
+;Subroutine to get current address from DMA channel
+;	c{EDI} = Offset of DCB
+;	CALL	knlDmaGetAddr
+;	c{EAX} = Count value
+
+knlDmaGetAddr::
+	PUSHL	EDX
+	MOVZBL	EDX, dcb_dmachnl.B[EDI]	;Get DMA channel
+	MOVL	EAX, dmatable[EDX*4]	;Get offset of DMA channel data block
+	MOVL	EDX, dma_cbpl.B[EAX]
+	OUTB	[DX]
+	IOPAUSE
+	MOVL	EDX, dma_caddr.B[EAX]	;Get current address register port
+	CLRL	EAX
+	CLI
+	INB	[DX]			;Get low byte
+	IOPAUSE
+	MOVB	AH, AL
+	INB	[DX]			;Get high byte
+	IOPAUSE
+	STI
+	XCHGB	AL, AH
+	MOVZBL	EDX, dcb_dmachnl.B[EDI]	;Get DMA channel
+	MOVL	EDX, dmatable[EDX*4]	;Get offset of DMA channel data block
+	TESTB	dma_config.B[EDX], #DMA$16BIT ;Is this a 16 bit channel?
+	JE	4$.S			;No
+	ADDL	EAX, EAX		;Yes - fix up the address
+4$:	POPL	EDX
+	RET
+
+	END

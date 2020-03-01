@@ -1,0 +1,1340 @@
+	.TITLE	LOGNAME - Logical name routines for XOS
+
+;++++
+; This software is in the public domain.  It may be freely copied and used
+; for whatever purpose you see fit, including commerical uses.  Anyone
+; modifying this software may claim ownership of the modifications, but not
+; the complete derived code.  It would be appreciated if the authors were
+; told what this software is being used for, but this is not a requirement.
+
+;   THIS SOFTWARE IS PROVIDED BY THE AUTHORS "AS IS" AND ANY EXPRESS OR
+;   IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
+;   OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+;   IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+;   INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+;   BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS
+;   OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+;   ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR
+;   TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
+;   USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+;----
+
+	.PROC	80486
+	.INCLUD	XOSINC:\XMAC\XOS.PAR
+	.INCLUD	XOSINC:\XMAC\XOSX.PAR
+	.INCLUD	XOSINC:\XMAC\XOSERR.PAR
+	.INCLUD	XOSINC:\XMAC\XOSXDISK.PAR
+
+	DATA
+
+;A substituted logical name appears to create a new disk-like device.  A path
+;  can be associated with it.  When resolving a logical name, if there is
+;  more than one subsituted logical in the definition chain, the path from
+;  the first subsituted name encountered is used.  Paths for any additional
+;  subsituted names, and the path for the final physical disk, are ignored.
+;  This implies that if a subsituted logical name has no path associated with
+;  it, any subsiquent paths encountered are not used.  When applying the path,
+;  it is always appended to the final expanded definition.
+
+;A non-subsituted logical name provides a simple name mapping.  A path cannot
+;  be associated with it.  Non-subsituted logical names can have multiple
+;  definitions (usually refered to as search-list logical names).
+
+;It should be noted that while the behavior of nested subsituted logical names
+;  is well defined, it will often not be the behavior which is naturally
+;  exptected!  It is generally not advisable to use nested subsituted logical
+;  names.
+
+;For example, if the following definitions exist:
+;	H: = J:\AAA\BBB\    path = FOO\BAZ
+;	J: = K:\XXX\YYY\    path = WWW
+;	Q: = H:\NNN\        not subsituted
+;  The reference Q:QQQ\FILE.EXT would expand to:
+;	K:\XXX\YYY\AAA\BBB\NNN\FOO\BAZ\QQQ\FILE.EXT
+;  The reference Q:\QQQ\FILE.EXT would expand to:
+;	K:\XXX\YYY\AAA\BBB\NNN\QQQ\FILE.EXT
+
+;Note that the \ following the Q: suppresses the use of the path, just as it
+;  does when a real disk name is specified.
+
+;The final reference in the chain does NOT have to be a real disk.  However,
+;  if a path is to be associated with the logical device it must be a file
+;  structured device.  In partictular, network devices work fine, and network
+;  addresses can be included in the definitions if desired.
+
+;Assigning a path to a non-substituted logical name assigns the path to the
+;  first substituted logical name in the definition chain or to the final
+;  physical device in the chain except that a path definition cannot pass
+;  through a search-list definition.
+
+;A rooted logical name is one which hides the underlying definition.  When a
+;  rooted logical name is specified, the returned file specification string
+;  contains the logical name as specified instead of its expansion.  Also, the
+;  .. convention CANNOT be used to specify the parent of the last directory
+;  in the definition of the logical name.
+
+;Logical names are stored in the dynamic part of each PDA.  The null process
+;  PDA contains the system-wide logical names.  Each logical is defined in
+;  in a memory block which has the following format:
+;        Offset      Length       Use
+;    ln_size   = 0.  1 long   Size of this block in bytes (rounded up to words)
+;    ln_next   = 4.  1 long   Offset to next logical name block
+;    ln_pntr   = 8.  1 long   Offset to pointer to this block
+;		 12. 1 long   Not used
+;    ln_num    = 16. 1 byte   Number of definitions
+;    ln_flags  = 17. 1 byte   Flags bits
+;    ln_path   = 18. 1 word   Offset (relative to start of block) of path string
+;    ln_log    = 20. 8 bytes  Logical name
+;    ln_def    = 28. 8 bytes  Defined name
+;    ln_exsize = 36. 1 byte   Number of bytes in extended name
+;    ln_exdef  = 37. n bytes  Extended name (null terminated, rounded up to
+;				a long boundry)
+;For a search-list logical (ln_num > 1), items ln_log through ln_exdef are
+;  repeated ln_num times.  Each occurence of ln_log is long aligned.  If a
+;  path is defined, it is long aligned after the last definition.  It
+;  consists of a single count byte followed by the path string.  If no path
+;  is specified, ln_path contains 0.
+;The following bits are used in ln_flags:
+;  LNF$SUBST =!40h		;Substitued name
+;  LNF$ROOTED=!20h		;Rooted name
+
+;Define stack offsets for routines which use the open stack frame
+
+$$$=!-opn_stkdata
+FRM lns_lname, 16t	;Logical name
+FRM lns_bpnt , 8t	;Buffer pointer
+FRM lns_bcnt , 4t	;Buffer count
+FRM lns_dcnt , 4t	;Definition count
+FRM lns_npnt , 8t	;Name pointer
+FRM lns_pda  , 4t	;PDA selector
+FRM lns_count, 4t
+FRM lns_skip , 4t
+FRM lns_flags, 1t	;Value for ln_flags
+FRM lns_bits , 1t
+FRM lns_first, 1t
+FRM          , 1t
+FRM lns_sbufr, 36t	;Search string buffer
+FRM lns_name , 20t
+FRM lns_xbufr, 28t
+lns_SIZE=!$$$
+FRM lns_iname, 48t	;Name buffer used by initlogn
+
+	.INTERN	lns_xbufr
+.PAGE
+	.SBTTL	lognameinit - Subroutine to setup initial system-wide logical names
+
+	ONCE
+
+;Subroutine to setup initial system-wide logical names - all names defined here
+;  are non-subsituted logical names
+;	c(DH) = Boot device partition
+;	c(DL) = Boot device type and unit
+;		  High bit is 0 if floppy disk, 1 if hard disk
+;		  Low 7 bits contain the unit number as follows:
+;		    0 - 3 = Floppy, IDE hard disk or known IDE CDROM
+;		    9     = Unknown IDE CDROM
+;		    10+   = SCSI disk (offset by 10)
+;	CALL	lognameinit
+
+lognameinit::
+	CMPL	pagezero+600h, #'XOS*'	;Did the loader give us a directory?
+	JE	2$.S			;Yes - use it
+	MOVL	pagezero+604h, #'XOS'	;No - use the default name
+	MOVL	pagezero+608h, #0
+2$:	ENTER	opn_SIZE, 1		;Set up open-type stack frame
+	LEAL	EBX, lns_iname[EBP]	;Point to place to build physical name
+	MOVB	SS:[EBX], #'_'
+	INCL	EBX
+	MOVB	SS:[EBX], #'D'		;Assume hard disk
+	TESTB	DL, DL			;Right?
+	JS	6$.S			;Yes
+	MOVB	SS:[EBX], #'F'		;No - its a floppy disk
+6$:	ANDB	DL, #7Fh
+	CMPB	DL, #10t		;Is it a SCSI disk?
+	JB	8$.S			;No
+	MOVB	SS:[EBX], #'S'		;Yes
+	SUBB	DL, #10t
+8$:	INCL	EBX
+	MOVB	AL, DL
+	ADDB	AL, #'0'		;Change unit number to ASCII
+	MOVB	SS:[EBX], AL		;Store it
+	INCL	EBX
+	CMPB	DH, #0			;Is the disk partitioned?
+	JE	10$.S			;No
+	MOVB	SS:[EBX], #'P'		;Yes
+	INCL	EBX
+	ADDB	DH, #'0'		;Change partition number to ASCII
+	MOVB	SS:[EBX], DH
+	INCL	EBX
+10$:	MOVW	SS:[EBX], #':'		;Put colon and null at end
+	INCL	EBX
+	MOVB	SS:[EBX], #'\'		;Add the system directory name
+	INCL	EBX
+	MOVL	ESI, #pagezero+604h	;Point to the directory name left by
+	CLD				;  the bootstrap
+	MOVL	ECX, #32t		;Allow up to 32 characters
+12$:	LODSB	[ESI]			;Get a character
+	CMPB	AL, #0			;End of name?
+	JE	14$.S			;Yes
+	MOVB	SS:[EBX], AL		;No - store the character
+	INCL	EBX
+	LOOP	ECX, 12$		;Continue if more possible
+14$:	MOVW	SS:[EBX], #'\'		;Store final slash
+	MOVL	EBX, #xosdir		;Define XOSDIR:
+	MOVB	AL, #LNF$SUBST
+	LEAL	ESI, lns_iname[EBP]
+	PUSHL	SS
+	POPL	FS
+	PUSHL	CS
+	POPL	ES
+	MOVL	GS, knlProcTable#+2
+	CALL	deflogical
+	JC	logfail.S
+	LEAVE				;Give up our stack frame
+	RET				;Finished
+
+logfail:CRASH	CDLN			;[Can't Defined Logical Names]
+
+xosdir:	.ASCIZ "XOSDIR:"
+
+	CODE
+.PAGE
+	.SBTTL	svcIoFindLog - SVC to search for logical name
+
+;Here for the svcIoFindLog SVC - Search for logical name
+;	long func;		// Function:
+;				//   Bit 0 = Return single name
+;				//   Bit 1 = Fully resolved search
+;				//   Bit 2 = Return DOS name if available
+;				//   Bit 3 = Return volume name if available
+;	long level;		// Level: (bits 14 and 15 determine format)
+;				//   00 = Process ID (all 0 means own session
+;				//	    process, must indicate sesson
+;				//	    level process)
+;				//   01 = Illegal
+;				//   10 = Session level process (low 8 bits
+;				//	    must be 0)
+;				//   11 = System level (rest ignored)
+;	char far *string;	// Address of name to search for
+;	char far *name;		// Address of buffer to receive name matched
+;	char far *defin;	// Address of buffer to receive definition
+;				//   found
+;	long length;		// Length of buffer
+;	long far *skip;		// Address of skip count value (may be NULL)
+;	rtn = svcIoFindLog(func, level, string, name, defin, length, skip);
+;  Value returned is length of logical name ored with the flag bits from the
+;    definition (as specified by the svcIoDefLog function) if normal or a
+;    negative error code if error.  The skip count value is updated to the
+;    value needed to find the next name if normal.  The name to search for
+;    may contain wild-card characters.  The name matched is returned in the
+;    "name" buffer (with final colon, null terminated), which must be at least
+;    10 bytes long.  The definitition is returned in the "defin" buffer.  If
+;    it is too long for the buffer, it is truncated.  This may be detected by
+;    comparing the returned length (which always indicates the actual length,
+;    not the length stored) with the length of the buffer.
+
+$$$=!0
+FRM fln_defnsz, 4	;Length of definition
+FRM fln_bufrsz, 4	;Length of users buffer
+FRM fln_count , 4	;Number of definitions
+fln_SIZE=!$$$
+
+rsvcIoFindLog::
+	MOVL	EBP, #pdaArg3#
+	CALL	vfixaddr#
+	SUBL	EBP, #8.B
+	CALL	vfixaddr#
+	SUBL	EBP, #8.B
+	CALL	vfixaddr#
+	SUBL	EBP, #12t.B
+	CALL	vfixaddr#
+	JMP	2$.S
+
+psvcIoFindLog::
+	SVCENTR	CNTIoFindLog#
+	ORB	SS:pdaArg2#, #03
+	ORB	SS:pdaArg4#, #03
+	ORB	SS:pdaArg6#, #03
+	ORB	SS:pdaArg9#, #03
+2$:	ENTER	opn_SIZE, 1
+	IFFAULT	knlRtnAdrErLv#
+	LFSL	ESI, SS:pdaArg3#	;Get address of name to search for
+	CALL	setuplog		;Get level
+	JC	6$.S
+	CLRL	ECX
+	CMPL	SS:pdaArg10#, #0.B	;Did he give us a skip count?
+	JE	4$.S			;No
+	IFFAULT	knlRtnAdrErLv#
+	LESL	ECX, SS:pdaArg10#	;Yes - get address of the skip count
+	IFFAULT	knlRtnAdrErLv#
+	MOVL	ECX, ES:[ECX]		;Get the skip count
+4$:	CALL	srchlvl			;Search a single level
+	JC	6$.S			;If error
+	JE	8$.S			;If found it
+	MOVL	EAX, #ER_NSDEV
+	STC
+6$:	LEAVE
+	RET
+
+;Here with match found
+
+8$:	LEAVE
+	CMPL	SS:pdaArg10#, #0.B	;Did he give us a skip count?
+	JE	10$.S			;No
+	LESL	EAX, SS:pdaArg10#	;Yes - get address of the skip count
+	IFFAULT	knlRtnAdrEr#
+	MOVL	ES:[EAX], ECX		;Update his skip count
+	IFFAULT	knlRtnAdrEr#
+10$:	LEAL	ESI, ln_log.B[EBX]
+	MOVL	ECX, #16t
+	CMPL	SS:pdaArg5#, #0.B	;Does he want the found name?
+	JE	15$.S			;No
+	LESL	EDI, SS:pdaArg5#	;Yes - get address of user's name buffer
+	CLD
+12$:	LODSB	GS:[ESI]		;Copy logical name
+	CMPB	AL, #0
+	JE	14$.S
+	IFFAULT	knlRtnAdrEr#
+	STOSB	[EDI]
+	LOOP	ECX, 12$
+	INCL	ECX
+	IFFAULT	knlRtnAdrEr#
+14$:	MOVW	ES:[EDI], #':'		;Put colon and null at end
+	DECL	ECX
+15$:	ADDL	ESI, ECX		;Advance to start of defined name
+	IFFAULT	knlRtnAdrEr#
+	LESL	EDI, SS:pdaArg7#	;Get address of user's definition buffer
+	MOVL	EAX, SS:pdaArg8#	;Get length of user's definition buffer
+	ENTER	fln_SIZE, 0
+	MOVL	fln_bufrsz.B[EBP], EAX	;Store buffer length
+	MOVZBL	EAX, GS:ln_num.B[EBX]	;Get number of definitions
+	MOVL	fln_count.B[EBP], EAX
+	CLRL	EAX
+	MOVL	fln_defnsz.B[EBP], EAX
+16$:	LODSB	GS:[ESI]		;Get first byte of defined name
+	BTZL	EAX, #7			;Physical only name?
+	JNC	18$.S			;No
+	PUSHL	EAX
+	MOVB	AL, #'_'		;Yes - start it with an underscore
+	CALL	givlnchr
+	JC	30$.S
+	POPL	EAX
+18$:	CALL	givlnchr
+	JC	30$.S
+	MOVL	ECX, #15t
+20$:	LODSB	GS:[ESI]		;Give him rest of the defined name
+	CMPB	AL, #0
+	JE	22$.S			;If end
+	CALL	givlnchr
+	JC	30$.S
+	LOOP	ECX, 20$
+	INCL	ECX
+22$:	DECL	ECX
+	ADDL	ESI, ECX		;Advance to start of extended part
+	MOVB	AL, #':'
+	CALL	givlnchr
+	JC	30$.S
+	LODSB	GS:[ESI]		;Get length of extended part
+	MOVZBL	ECX, AL
+	JREGZ	ECX, 26$		;If no extended part
+24$:	LODSB	GS:[ESI]		;Copy extended part
+	CALL	givlnchr
+	JC	30$.S
+	LOOP	ECX, 24$
+26$:	DECL	fln_count.B[EBP]	;Have another definition?
+	JLE	28$.S			;No
+	ADDL	ESI, #3.B		;Yes - round up to next definition
+	ANDL	ESI, #0FFFFFFFCh.B
+	MOVB	AL, #','		;Give him a comma
+	CALL	givlnchr
+	JNC	16$.S			;Continue
+	LEAVE
+	RET
+
+;Here when finished
+
+28$:	MOVB	AL, #0			;Put null at end
+	CALL	givlnchr
+	JC	30$.S
+	MOVB	AL, GS:ln_flags.B[EBX]	;Get the flag bits
+	SHLL	EAX, #24t		;Get in right place in register
+	ORL	EAX, fln_defnsz.B[EBP]	;Merge in the count
+	DECL	EAX			;Don't count the final null
+30$:	LEAVE
+	RET				;And return to user
+.PAGE
+;Subroutine to store logical name definition character
+;	c(AL) = Character
+;	CALL	givlnchr
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+
+givlnchr:
+	MOVL	EDX, fln_defnsz.B[EBP]	;Will another character fit?
+	CMPL	EDX, fln_bufrsz.B[EBP]
+	JAE	4$.S			;No
+	IFFAULT	knlRtnAdrEr#
+	STOSB	[EDI]			;Yes - store it
+4$:	INCL	fln_defnsz.B[EBP]	;Increase size
+	CLC
+	RET
+.PAGE
+	.SBTTL	svcIoDefLog - SVC to define logical name
+
+;Here for the svcIoDefLog SVC - Define logical name
+;	long level;		// Level: (bits 14 and 15 determine format)
+;				//   00 = Process ID (all 0 means own session
+;				//	    process, must indicate sesson
+;				//	    level process)
+;				//   01 = Illegal
+;				//   10 = Session level process (low 8 bits
+;				//	    must be 0)
+;				//   11 = System level (rest ignored)
+;				//  Bits 12 and 13 specify type of logical
+;				//    name:
+;	long type;		// Logical name type:
+;				//   Bit 30 = 1 - Substituted
+;				//   Bit 29 = 1 - Rooted
+;				//   All other bits are reserved & must be 0
+;	char far *string;	// Address of name to define
+;	char far *defin;	// Address of definition
+;	rtn = svcIoDefLog(level, type, string, defin);
+;  Value returned is 0 if normal or negative error code if error - substituted
+;    logical names are always defined with no path - the path must be added
+;    using the svcIoPath call
+
+rsvcIoDefLog::
+	MOVL	EBP, #pdaArg4#
+	CALL	vfixaddr#
+	SUBL	EBP, #8.B
+	CALL	vfixaddr#
+	JMP	2$.S
+
+psvcIoDefLog::
+	SVCENTR	CNTIoDefLog#
+	ORB	SS:pdaArg3#, #03
+	ORB	SS:pdaArg5#, #03
+2$:	ENTER	opn_SIZE, 1
+	IFFAULT	knlRtnAdrErLv#
+	LFSL	ESI, SS:pdaArg4#	;Get address of name to search for
+	CALL	setuplog		;Get level
+	JC	6$.S
+	MOVW	ES:[EDI], #':'		;Put colon at end of name
+	PUSHL	SS
+	POPL	ES
+	IFFAULT	knlRtnAdrErLv#
+	LFSL	ESI, SS:pdaArg6#
+	LEAL	EBX, lns_sbufr.B[EBP]
+	MOVB	AL, SS:pdaArg2#+3
+	ANDB	AL, #LNF$SUBST|LNF$ROOTED
+	CALL	deflogical
+	JC	6$.S
+	CLRL	EAX
+6$:	LEAVE
+	RET
+.PAGE
+	.SBTTL	svcIoTransName - SVC to translate logical name
+
+;Here for the svcIoTransName SVC - translate logical name
+;	long func;		// Function bits:
+;				//   TNB$NOFINALBS = 20 - Suppress final \ in
+;				//			  directory names
+;				//   TNB$SEMICOLON = 10 - Use semi-colon instead
+;				//			  of comma
+;				//			  comma to separate
+;				//			  names
+;				//   TNB$FLAG      = 08 - Flag returned
+;				//			  logical names
+;				//   TNB$VOLNAME   = 04 - Return volume names
+;				//   TNB$DOSNAME   = 02 - Return DOS names
+;				//   TNB$ALLDEF    = 01 - Return all definitions
+;	char far *name;		// Name to translate
+;	char far *buffer;	// Buffer to receive translation
+;	long      size;		// Size of buffer
+;	(long)rtn = svcIoTransName(func, name, buffer, size);
+;  Value returned is number of characters in translated name (positive) if
+;    normal or a negative error code if error.  Value may be greater than the
+;    buffer size, which indicates that the string was truncated to the length
+;    of the buffer.  A size of 0 and a null buffer pointer may be specified
+;    to determine the length of the string without obtaining the string.
+
+rsvcIoTransName::
+	MOVL	EBP, #pdaArg3#
+	CALL	vfixaddr#
+	SUBL	EBP, #8.B
+	CALL	vfixaddr#
+	JMP	2$.S
+
+psvcIoTransName::
+	SVCENTR	CNTIoTransName#
+	ORB	SS:pdaArg2#, #03
+	ORB	SS:pdaArg4#, #03
+2$:	CLRL	EBX			;Set up a stack frame
+	ENTER	lns_SIZE, 1
+	MOVL	EAX, SS:pdaArg1#	;Get function bits
+	IFFAULT	knlRtnAdrErLv#
+	LESL	EBX, SS:pdaArg3#	;Get address of name string
+	IFFAULT	knlRtnAdrErLv#
+	LFSL	EDI, SS:pdaArg5#	;Get address of buffer
+	MOVL	ECX, SS:pdaArg6#	;Get size of buffer
+	MOVZBL	EDX, SS:pdaSesProc#	;Get PDA for session process
+	MOVW	GS, knlProcTable#[EDX*2]
+	CALL	transname		;Do the work
+	LEAVE
+	RET
+.PAGE
+	.SBTTL	transname - Subroutine to translate logical name
+
+;Subroutine to translate logical name to underlying names - This is either a
+;  substituted logical name or a physical device name or a list of these.  Can
+;  be called at main program level or in extended fork context.
+;	c(AL)     = Function bits:
+;		      TNB$NOBINALBS = 20 - Suppress final \ in directory names
+;		      TNB$SEMICOLON = 10 - Use semi-colon instead of comma to
+;					   separate names
+;		      TNB$FLAG      = 08 - Flag returned logical names
+;		      TNB$VOLNAME   = 04 - Return volume names if availble
+;		      TNB$DOSNAME   = 02 - Return DOS names if available
+;		      TNB$ALLDEF    = 01 - Return all definitions
+;	c{ES:EBX} = Address of ASCIZ name string
+;	c{FS:EDI} = Address of buffer to receive string
+;	c{ECX}    = Size of buffer
+;	c[GS]     = Selector for PDA
+;	CALL	transname
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  c{EAX}    = Number of characters stored
+;	  c{ES:EBX} = Address of first character after given device name
+;	  c{GS:ESI} = Address of last logical name definition referenced
+
+$$$=!0
+FRM tn_frame1  , 4t
+FRM tn_frame2  , 4t
+FRM tn_pntr    , 4t		;Offset of extended defintion string
+FRM tn_def     , 8t		;Definition name
+FRM tn_num     , 4t		;Number of definitions
+FRM tn_string  , FILESPCSIZE+4
+tn_SIZE=!$$$-8t
+
+transname::
+	MOVB	lns_bits.B[EBP], AL	;Store function bits
+	MOVL	lns_bpnt+0.B[EBP], EDI	;Store buffer address
+	MOVL	lns_bpnt+4.B[EBP], FS
+	MOVL	lns_bcnt.B[EBP], ECX	;Store buffer size
+	CLRL	EAX
+	MOVB	lns_first.B[EBP], AL
+	MOVL	lns_count.B[EBP], EAX
+	CALL	knlSetName#		;Setup the name
+	JC	18$			;If error
+	MOVL	lns_npnt+0.B[EBP], EBX
+	MOVL	lns_npnt+4.B[EBP], ES
+	LEAL	EDX, lns_sbufr.B[EBP]
+	MOVB	lns_sbufr.B[EBP], #0
+	MOVZBL	EAX, GS:pdaSesProc#	;Get selector for session level PDA
+	MOVW	FS, knlProcTable#[EAX*2]
+transn:	MOVL	EBX, tn_frame1.B[EBP]	;Get name
+	ADDL	EBX, #opn_devname.B
+	BTZL	SS:[EBX], #7t		;Physical only name?
+	JC	4$.S			;Yes
+	PUSHL	EDX			;No
+	CALL	chklogical		;See if this is a logical name
+	POPL	EDX
+	JNE	6$.S			;Not logical name, so just store name
+	TESTB	FS:ln_flags.B[ESI], #LNF$SUBST ;Substituted logical name?
+	JE	20$			;No
+	MOVB	AL, #'!'		;Yes - get flag character
+2$:	JMP	tnstore			;Go store name
+
+;Here if a physical only name
+
+4$:	PUSHL	#'_'.B			;Get physical name flag character
+	JMP	8$.S
+
+;Here if not a logical name
+
+6$:	PUSHL	#'#'.B			;Get non-logical name flag character
+8$:	MOVL	ECX, tn_frame1.B[EBP]	;Want DOS or volume name?
+	TESTB	SS:lns_bits.B[ECX], #TNB$DOSNAME|TNB$VOLNAME
+	JE	14$.S			;No - just store the name
+	MOVL	ECX, knlDskCcb#		;Yes - do we have a disk class?
+	TESTL	ECX, ECX
+	JE	14$.S			;No
+	MOVL	ECX, ccb_fdsp.B[ECX]	;Yes - see if we can find the disk
+	TOFORK
+	PUSHL	EDX
+	CALLI	CS:{CF_DEVSRCH-CF_ADDUNIT}*4.B[ECX]
+	POPL	EDX
+	JC	13$.S
+	JNE	13$.S			;If not a disk, just store the name
+	MOVL	ECX, tn_frame1.B[EBP]	;If disk
+	TESTB	SS:lns_bits.B[ECX], #TNB$DOSNAME ;Want DOS name?
+	JE	10$.S			;No
+	CMPB	ucb_dosname.B[EDI], #0.B ;Yes - have a DOS name?
+	JE	10$.S			;No
+	MOVL	EAX, ucb_dosname+0.B[EDI] ;Yes - get it
+	MOVL	EBX, ucb_dosname+4.B[EDI]
+	JMP	12$.S
+
+10$:	TESTB	SS:lns_bits.B[ECX], #TNB$VOLNAME ;Want volume name?
+	JE	13$.S			;No
+	CMPB	ucb_volname.B[EDI], #0.B ;Yes - have a volume name?
+	JE	13$.S			;No
+	MOVL	EAX, ucb_volname+0.B[EDI] ;Yes - get it
+	MOVL	EBX, ucb_volname+4.B[EDI]
+12$:	MOVL	SS:opn_devname+0.B[ECX], EAX
+	MOVL	SS:opn_devname+4.B[ECX], EBX
+13$:	FROMFORK
+14$:	POPL	EAX			;Restore flag character
+	JMP	tnstore			;Continue
+
+;Here if have too many levels of definitons
+
+16$:	MOVL	EAX, #ER_BDLNM		;Get error code
+	STC				;Indicate error
+18$:	RET
+
+;Here if this is an assigned logical name
+
+20$:	CMPL	ESP, #300h		;Too deep on the stack?
+	JBE	16$.S			;Yes - fail!
+	ENTER	tn_SIZE, 2		;No - get a stack frame
+	MOVL	tn_pntr.B[EBP], EDX	;Save pointer to string
+	MOVL	EDX, temp
+	MOVL	tn_def+4.B[EBP], FS
+	MOVZBL	EDX, FS:ln_num.B[ESI]
+	MOVL	tn_num.B[EBP], EDX
+	ADDL	ESI, #ln_def.B
+24$:	MOVL	EAX, FS:[ESI]		;Save definition
+	MOVL	EDX, FS:4.B[ESI]
+	MOVL	ECX, opn_frame1.B[EBP]
+	MOVL	SS:opn_devname+0.B[ECX], EAX
+	MOVL	SS:opn_devname+4.B[ECX], EDX
+	MOVZBL	ECX, FS:ln_exsize-ln_def.B[ESI] ;Get length of extended part
+	ADDL	ESI, #ln_exdef-ln_def.B	;Point to extended part of definition
+	MOVL	EDX, #FILESPCSIZE
+	SUBL	EDX, ECX
+	LEAL	EDI, tn_string[EBP]	;Copy it to our buffer
+	PUSHL	SS
+	POPL	ES
+	CLD
+26$:	RMOVSB	[EDI], FS:[ESI]
+
+;Here with definition from this level copied
+
+	ADDL	ESI, #3.B		;Bump to next definition
+	ANDL	ESI, #0FFFFFFFCh.B
+	MOVL	tn_def+0.B[EBP], ESI
+	MOVL	ESI, tn_pntr.B[EBP]	;Get offset of caller's string
+	MOVL	ECX, EDX
+28$:	LODSB	SS:[ESI]		;Finally, copy the caller's string!
+	STOSB	[EDI]
+	CMPB	AL, #0
+	JE	32$.S
+	LOOP	ECX, 28$
+30$:	MOVL	EAX, #ER_BDLNM		;If expanded name is too long
+	STC				;Indicate error
+	LEAVE
+	RET
+
+;Here with strings copied
+
+32$:	LEAL	EDX, tn_string[EBP]
+	CALL	transn			;Recur
+	JC	34$.S
+	MOVL	ECX, tn_frame1.B[EBP]
+	TESTB	SS:lns_bits.B[ECX], #TNB$ALLDEF ;Want all definitions?
+	JE	34$.S			;No - stop now
+	DECL	tn_num.B[EBP]		;Yes - do we have another name?
+	JLE	34$.S			;No - finished now
+	LFSL	ESI, tn_def.B[EBP]	;Yes - point to next definition
+	JMP	24$			;Continue
+
+34$:	LEAVE
+	RET
+.PAGE
+;Here to store name in the caller's buffer
+;	c(AL)          = Flag character
+;	c{opn_devname} = Device name
+;	c{SS:EDX}      = Address of rest of name
+;	c{FS:ESI}      = Address of definition block if logical name
+
+tnstore:MOVL	EBX, opn_frame1.B[EBP]
+	MOVL	SS:lns_lname.B[EBX], ESI ;Store offset of logical name block
+	IFFAULT	knlRtnAdrEr#
+	LESL	EDI, SS:lns_bpnt.B[EBX]	;Get pointer to user's buffer
+	CLD
+	CMPB	SS:lns_first.B[EBX], #0	;First time here?
+	JE	6$.S			;Yes
+	MOVB	AH, AL			;No - store comma or semi-colon
+	MOVB	AL, #','
+	TESTB	SS:lns_bits.B[EBX], #TNB$SEMICOLON
+	JE	4$.S
+	MOVB	AL, #';'
+4$:	CALL	tnsput
+	MOVB	AL, AH
+6$:	MOVB	SS:lns_first.B[EBX], #1
+	TESTB	SS:lns_bits.B[EBX], #TNB$FLAG ;Want flag character?
+	JE	8$.S			;No
+	CALL	tnsput			;Yes - store it
+8$:	LEAL	ESI, SS:opn_devname.B[EBX] ;Point to the device name
+	MOVL	ECX, #16t
+10$:	LODSB	SS:[ESI]		;Copy it to the user's buffer
+	ANDB	AL, #7Fh
+	JE	12$.S
+	CALL	tnsput
+	LOOPNE	ECX, 10$
+12$:	MOVB	AL, #':'		;Follow the device name with a colon
+	CALL	tnsput
+14$:	MOVB	AL, SS:[EDX]		;Copy rest of definition to the user's
+	INCL	EDX			;  buffer
+	CMPB	AL, #0
+	JE	16$.S
+	CALL	tnsput
+	JMP	14$.S
+
+;Here with name completely stored
+
+16$:	TESTB	SS:lns_bits.B[EBX], #TNB$NOFINALBS ;No - want to suppress \?
+	JE	18$.S			;No
+	CMPB	ES:-1.B[EDI], #'\'	;Yes - was previous character \?
+	JNE	18$.S			;No
+	CMPB	ES:-2.B[EDI], #':'	;Yes - does it mean the root?
+	JE	18$.S			;Yes - leave it along
+	DECL	EDI			;No - put the final null over the \
+	INCL	SS:lns_bcnt.B[EBX]
+	DECL	SS:lns_count.B[EBX]
+	JMP	20$.S
+
+18$:	CMPL	SS:lns_bcnt.B[EBX], #0	;Need a final null?
+	JLE	22$.S			;No - buffer is full
+	IFFAULT	knlRtnAdrEr#		;Yes - store final null but don't
+20$:	MOVB	ES:[EDI], #0		;  advance the pointer
+22$:	MOVL	SS:lns_bpnt+0.B[EBX], EDI ;Store updated pointer
+	MOVL	EAX, SS:lns_count.B[EBX] ;Return total amount stored
+	MOVL	ESI, SS:lns_lname.B[EBX] ;Get offset of logical name definition
+	MOVL	ES, SS:lns_npnt+4.B[EBX]  ;Get address of rest of string user
+	MOVL	EBX, SS:lns_npnt+0.B[EBX] ;  specified
+	CLC
+	RET
+
+;Subroutine to store character for tnstore
+;  NOTE: If an address error occures, this subroutine discards the return
+;	 address and returns ER_ADRER with C set up one level!
+;	c(AL) = Character to store
+;	CALL	tnsput
+
+tnsput:	DECL	SS:lns_bcnt.B[EBX]	;Yes - have room for the character?
+	JS	24$.S			;No
+	IFFAULT	26$			;Yes
+	STOSB	[EDI]			;Store character
+24$:	INCL	SS:lns_count.B[EBX]	;Count it
+	RET
+
+;Here if address error
+
+	FAULTHDR
+26$:	POPL	EAX			;Discard return address
+	JMP	knlRtnAdrEr#		;Return address error up one level
+.PAGE
+;Subroutine to do wild-card search for logical name at single level
+;	c{ECX}    = Skip count
+;	c[GS]     = Selector for PDA to search
+;	c{SS:ESI} = Address of string to search for
+;	CALL	srchlvl
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  Z:set = Final match
+;	    c{ECX} = Number of next definition
+;	    c{EBX} = Offset of definition block
+;	  Z:clr = Not enough definitions
+
+srchlvl:MOVB	lns_name+16t.B[EBP], #0	;Make sure have null at end of name
+					;  field for knlWildCmp8
+	TESTL	ECX, ECX		;Make sure have good count
+	JNS	2$.S
+	CLRL	ECX
+2$:	MOVL	lns_skip.B[EBP], ECX	;Store skip count
+	MOVL	lns_count.B[EBP], ECX	;Initialize the count
+	MOVL	EBX, GS:pdaLogName#	;Get offset of first definition
+4$:	TESTL	EBX, EBX		;Have another?
+	JE	12$.S			;No
+	DECL	lns_skip.B[EBP]		;Yes - should we skip it?
+	JNS	6$.S			;Yes
+	MOVL	EAX, GS:ln_log+0.B[EBX]	;No - get logical name
+	MOVL	lns_name+0[EBP], EAX
+	MOVL	EAX, GS:ln_log+4.B[EBX]
+	MOVL	lns_name+4.B[EBP], EAX
+	MOVL	EAX, GS:ln_log+8.B[EBX]
+	MOVL	lns_name+8.B[EBP], EAX
+	MOVL	EAX, GS:ln_log+12t.B[EBX]
+	MOVL	lns_name+12t.B[EBP], EAX
+	PUSHL	ECX
+	PUSHL	EBX
+	LEAL	ESI, lns_sbufr.B[EBP]
+	MOVL	EDI, SS
+	MOVL	ES, EDI
+	LEAL	EDI, lns_name[EBP]
+	LEAL	EBX, lns_xbufr[EBP]
+	CLRL	EAX			;Allow wild-card lists
+	CALL	knlWildCmp8#		;Compare the names
+	POPL	EBX
+	POPL	ECX
+	JC	10$.S			;If error
+	JE	8$.S			;If match
+	INCL	lns_count.B[EBP]	;No match - count it
+6$:	MOVL	EBX, GS:ln_next.B[EBX]	;Get offset of next block
+	JMP	4$.S			;Continue
+
+;Here with match
+
+8$:	MOVL	ECX, lns_count.B[EBP]	;Get count
+	INCL	ECX
+	CLRL	EAX			;Set Z
+10$:	RET				;And return
+
+;Here if no match found
+
+12$:	INCL	EBX			;Clear Z
+ret010:	RET
+.PAGE
+	.SBTTL	deflogical - Subroutine to define logical name
+
+;Subroutine to define logical name
+;	c(AL)     = Value for ln_flags
+;	c{ES:EBX} = Address of logical name
+;	c[GS]     = Selector for PDA
+;	c{FS:ESI} = Address of physical name
+;	CALL	deflogical
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+
+deflogical::
+	MOVB	lns_flags.B[EBP], AL
+	MOVL	lns_npnt+0.B[EBP], ESI
+	MOVL	lns_npnt+4.B[EBP], FS
+	CLRL	EAX
+	MOVL	lns_dcnt.B[EBP], EAX
+	LEAL	EAX, opn_namebfr[EBP]
+	MOVL	lns_bpnt+0.B[EBP], EAX
+	MOVL	lns_bpnt+4.B[EBP], SS
+	MOVL	lns_bcnt.B[EBP], #FILESPCSIZE
+	MOVL	lns_pda.B[EBP], GS	;Save PDA selector
+	CLRL	EDX
+	CALL	setnam2#		;Setup logical name
+	JC	ret010.S
+	IFFAULT	knlRtnAdrEr#
+	CMPB	ES:[EBX], #0		;Was a file name given too?
+	JNE	10$			;Yes  - fail
+	MOVL	EAX, opn_devname+0.B[EBP] ;Save logical name
+	MOVL	lns_lname+0.B[EBP], EAX
+	MOVL	EAX, opn_devname+4.B[EBP]
+	MOVL	lns_lname+4.B[EBP], EAX
+	MOVL	EAX, opn_devname+8.B[EBP]
+	MOVL	lns_lname+8.B[EBP], EAX
+	MOVL	EAX, opn_devname+12t.B[EBP]
+	MOVL	lns_lname+12t.B[EBP], EAX
+	CMPL	lns_npnt+0.B[EBP], #0.B	;Deleting definition?
+	JE	20$			;Yes
+2$:	INCL	lns_dcnt.B[EBP]		;No
+	LESL	EBX, lns_npnt.B[EBP]
+	CALL	knlSetName#		;Set up device name part
+	JC	ret010.S		;If error
+	SUBL	lns_bcnt.B[EBP], #16t.B	;Store name
+	JC	10$.S
+	MOVL	ESI, EBX
+	PUSHL	ES
+	POPL	FS
+	LESL	EDI, lns_bpnt.B[EBP]
+	CLD
+	MOVL	EAX, opn_devname+0.B[EBP]
+	STOSL	[EDI]
+	MOVL	EAX, opn_devname+4.B[EBP]
+	STOSL	[EDI]
+	MOVL	EAX, opn_devname+8.B[EBP]
+	STOSL	[EDI]
+	MOVL	EAX, opn_devname+12t.B[EBP]
+	STOSL	[EDI]
+	MOVL	EBX, EDI		;Remember where the count goes
+	INCL	EDI
+	DECL	lns_bcnt.B[EBP]		;More space there?
+	JLE	10$.S			;No - fail
+	IFFAULT	knlRtnAdrEr#
+	LODSB	FS:[ESI]		;Get first character
+	CMPB	AL, #0			;End of string?
+	JE	14$.S			;Yes
+	CMPB	AL, #','		;Comma?
+	JE	14$.S			;Yes - end of definition
+	CMPB	AL, #';'		;Also accept semi-colon as end
+	JE	14$.S
+	JMP	6$.S
+
+	IFFAULT	knlRtnAdrEr#
+4$:	LODSB	FS:[ESI]		;Get character
+	CMPB	AL, #0			;End of string?
+	JE	12$.S			;Yes
+	CMPB	AL, #','		;Comma?
+	JE	12$.S			;Yes - end of definition
+	CMPB	AL, #';'		;Also accept semi-colon as end
+	JE	12$.S
+6$:	CMPB	AL, #'/'		;Slash?
+	JNE	8$.S			;No
+	MOVB	AL, #'\'		;Yes - change to back-slash
+8$:	STOSB	[EDI]			;Store character
+	DECL	lns_bcnt.B[EBP]		;More space there?
+	JNE	4$.S			;Yes - continue
+10$:	MOVL	EAX, #ER_BDSPC		;No - fail
+	STC
+	RET
+
+;Here at end of definition
+
+12$:	MOVB	AH, ES:-1.B[EDI]	;Do we have \, :, or ] at end of
+	CMPB	AH, #'\'		;  the string?
+	JE	14$.S
+	CMPB	AH, #':'
+	JE	14$.S
+	CMPB	AH, #']'
+	JE	14$.S			;Yes
+	MOVB	ES:[EDI], #'\'		;No - add \
+	INCL	EDI
+	DECL	lns_bcnt.B[EBP]		;More space there?
+	JE	10$.S			;No - fail
+14$:	MOVL	ECX, EDI		;Calculate length of definition
+	SUBL	ECX, EBX
+	DECL	ECX
+	MOVB	SS:[EBX], CL		;Store it
+16$:	TESTL	EDI, #3			;Fill it out up to a long boundry
+	JE	18$.S
+	MOVB	ES:[EDI], #0
+	INCL	EDI
+	JMP	16$.S
+
+18$:	DECL	lns_bcnt.B[EBP]
+	ANDB	lns_bcnt.B[EBP], #0FCh
+	MOVL	lns_bpnt+0.B[EBP], EDI
+	MOVL	lns_npnt+0.B[EBP], ESI
+	CMPB	AL, #0			;Have another definition?
+	JE	20$.S			;No
+	TESTB	lns_flags.B[EBP], #LNF$SUBST ;Yes - substituted name?
+	JNE	10$.S			;Yes - error
+	JMP	2$			;No - continue
+
+;Here at end of definition
+
+20$:	LEAL	EBX, lns_lname.B[EBP]
+	MOVL	FS, lns_pda.B[EBP]
+	CALL	chklogical		;See if this name is defined now
+	JNE	28$.S			;If not defined
+	CMPL	lns_npnt+0.B[EBP], #0.B	;Deleting definition?
+	JNE	22$.S			;No
+	PUSHL	FS			;Yes
+	POPL	ES
+	TOFORK
+	CALL	knlRmvPdaMemP#		;Give up the block
+	FROMFORK
+	CLRL	EAX			;Return 0
+	RET
+
+;Here if logical name already defined and we are not deleting it
+
+22$:	MOVL	ECX, #FILESPCSIZE+ln_def-mb_data ;Get space needed
+	SUBL	ECX, lns_bcnt.B[EBP]
+	PUSHL	FS
+	POPL	ES
+	TOFORK
+	CALL	knlChngPdaMemP#		;Adjust size of memory block
+	JC	26$.S			;If error
+	FROMFORK
+	JMP	34$.S			;Continue
+
+;Here if logical name is not defined and we are trying to delete it
+
+24$:	MOVL	EAX, #ER_NTDEF		;Error = NoT DEFined
+	STC
+	RET
+
+;Here if error at fork level
+
+26$:	FROMFORK
+	STC
+	RET
+
+;Here if logical name is not now defined
+
+28$:	CMPW	lns_npnt+4.B[EBP], #3.B	;Deleting definition?
+	JBE	24$.S			;Yes - error
+30$:	MOVL	ECX, #FILESPCSIZE+ln_def-mb_data ;No - calculate space needed
+	SUBL	ECX, lns_bcnt.B[EBP]
+	MOVL	ES, lns_pda.B[EBP]	;Get selector for PDA
+	TOFORK
+	CALL	knlGetPdaMemP#		;Get memory block
+	JC	26$.S			;If error
+	FROMFORK
+	MOVL	EAX, ES:pdaLogName#	;Link this block to our logical name
+	TESTL	EAX, EAX		;  list
+	JE	32$.S
+	LEAL	EBX, ln_next.B[ESI]
+	MOVL	ES:ln_pntr.B[EAX], EBX
+32$:	MOVL	ES:pdaLogName#, ESI
+	MOVL	ES:ln_pntr.B[ESI], #pdaLogName#
+	MOVL	ES:ln_next.B[ESI], EAX
+34$:	MOVB	AL, lns_flags.B[EBP]	;Store flags bits
+	MOVB	ES:ln_flags.B[ESI], AL
+	MOVL	EAX, lns_lname+0.B[EBP]	;Store logical name
+	MOVL	ES:ln_log+0.B[ESI], EAX
+	MOVL	EAX, lns_lname+4.B[EBP]
+	MOVL	ES:ln_log+4.B[ESI], EAX
+	MOVL	EAX, lns_lname+8.B[EBP]
+	MOVL	ES:ln_log+8.B[ESI], EAX
+	MOVL	EAX, lns_lname+12t.B[EBP]
+	MOVL	ES:ln_log+12t.B[ESI], EAX
+	MOVL	EAX, lns_dcnt.B[EBP]	;Store number of definitions
+	MOVB	ES:ln_num.B[ESI], AL
+	MOVW	ES:ln_path.B[ESI], #0	;Clear offset of path string
+	MOVL	ECX, ES:[ESI]		;Get amount we need to store
+	SUBL	ECX, #ln_def.B
+	SHRL	ECX, #2
+	LEAL	EDI, ln_def.B[ESI]
+	LEAL	ESI, opn_namebfr[EBP]
+	CLD
+	RMOVSL	[EDI], SS:[ESI]		;Store definition
+	CLRL	EAX			;Return 0
+ret014:	RET
+.PAGE
+	.SBTTL	setuplog - Subroutine to do set up for logical name functions
+
+;Subroutine to do set up for logical name functions
+;	CALL	setuplog
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  c[GS]  = Selector for PDA for logical name
+
+2$:	MOVL	EAX, #ER_NSLP
+	STC
+	RET
+
+setuplog:
+	TESTB	SS:pdaArg1#+1, #0C0h
+	JNE	4$.S
+	ORB	SS:pdaArg1#+1, #FLN$SESSION>8
+4$:	CALL	getlevel#		;Get selector for PDA to search
+	JC	20$.S			;If error
+	MOVZBL	EAX, GS:pdaSesProc#	;Is this a session level process?
+	CMPW	AX, GS:pdaPid#
+	JNE	2$.S			;No - fail
+	PUSHL	SS			;Yes - copy search string to our buffer
+	POPL	ES
+	LEAL	EDI, lns_sbufr.B[EBP]
+	MOVL	ECX, #32t
+	CLD
+	IFFAULT	knlRtnAdrEr#
+12$:	LODSB	FS:[ESI]		;Get character
+	CMPB	AL, #0			;End of string?
+	JE	16$.S			;Yes - error
+	CMPB	AL, #':'		;End of device name?
+	JE	18$.S			;Yes
+	CMPB	AL, #'*'		;Wild-cards are OK here
+	JE	14$.S
+	CMPB	AL, #'?'
+	JE	14$.S
+	CMPB	AL, #'{'
+	JE	14$.S
+	CMPB	AL, #'}'
+	JE	14$.S
+	CALL	chkdnchr		;Check for valid device name character
+	JC	20$.S
+14$:	STOSB	[EDI]			;Store character
+	LOOP	ECX, 12$
+16$:	JMP	knlIllSpc#		;Logical name is too long
+
+;Here with colon (end of logical name)
+
+	IFFAULT	knlRtnAdrEr#
+18$:	CMPB	FS:[ESI], #0		;Next character must be end of string
+	JNE	16$.S
+	MOVB	ES:[EDI], #0		;Put null at end of our buffer
+20$:	RET				;Finished here
+.PAGE
+	.SBTTL	knlLogNameExpand - Subroutine to expand logical name
+
+;Subroutine to expand logical name - handles nested mulitple definitions - may
+;  be called in extended fork context or at main program level - subroutine
+;  pointed to by ESI is called in the same context
+;	c{SS:EBX} = Addrss of logical name (16 characters)
+;	c{ECX}    = Open command bits
+;	c{SS:EDX} = Pointer to extended name
+;	c{EDI}    = Data value
+;	c{ESI}    = Offset of subroutine to call with complete name
+;	c[FS]     = Selector for PDA for session process
+;	CALL	knlLogNameExpand
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;  The subroutine pointed to by ESI is called for each complete file
+;    specification until a normal return is obtained.  If all calls fail,
+;    the last error returned is returned as an error from knlLogNameExpnd.
+;    This subroutine will call itself recursively to expand nested definitions.
+;    When the subroutine pointed to by ESI is called, registers are set up
+;    as follows:
+;	c{SS:EBX} = Address of physical name (16 characters)
+;	c{ECX}    = Open command bits
+;	c{SS:EDX} = Pointer to full extended name
+;	c{EDI}    = Data value
+;	CALLI	ESI
+;	C:set = Error
+;	  c{EAX} = Error code (error is returned only from last definition
+;		     if there is more than one definition for the logical
+;		     name, unless O$CREATE is set, in which case errors are
+;		     returned immediately)
+;	C:clr = Normal
+
+$$$=!0
+FRM lx_frame1  , 4t
+FRM lx_frame2  , 4t
+FRM lx_pntr    , 4t		;Offset of extended defintion string
+FRM lx_name    , 16t		;Logical name
+FRM lx_def     , 16t		;Definition name
+FRM lx_path    , 4t		;Offset of path string
+FRM lx_data    , 4t		;Data value
+FRM lx_num     , 4t		;Number of definitions
+FRM lx_call    , 4t		;Offset of subroutine to call for definition
+FRM lx_cmdbts  , 4t		;Command bits
+FRM lx_pcfilspc, 4t		;Count for file spec
+FRM            , 3t
+FRM lx_flags   , 1t		;Value from ln_flags
+FRM lx_string  , FILESPCSIZE+4
+lx_SIZE=!$$$-8t
+
+knlLogNameExpand::
+	PUSHL	ESI
+	BTZL	EAX, #7t		;Physical only name?
+	JC	2$.S			;Yes
+	PUSHL	EDX
+	PUSHL	ECX
+	CALL	chklogical		;No - see if this is a logical name
+	POPL	ECX
+	POPL	EDX
+	JE	4$.S			;If logical name
+2$:	RET				;Not logical - call the action routine
+
+;Here if have too many levels of definitons
+
+3$:	MOVL	EAX, #ER_BDLNM		;Get error code
+	STC				;Indicate error
+	RET
+
+;Here if this is a logical name
+
+4$:	POPL	temp			;Restore offset of subroutine
+	CMPL	ESP, #300h		;Too deep on the stack?
+	JBE	3$.S			;Yes - fail!
+	ENTER	lx_SIZE, 2		;No - get a stack frame
+	MOVL	lx_data.B[EBP], EDI	;Save data value
+	MOVL	lx_cmdbts.B[EBP], ECX	;Save open command bits
+	MOVL	lx_pntr.B[EBP], EDX	;Save pointer to string
+	MOVL	EDX, temp
+	MOVL	lx_call.B[EBP], EDX	;Save offset of subroutine
+	MOVZBL	EDX, FS:ln_num.B[ESI]
+	MOVL	lx_num.B[EBP], EDX
+	MOVZWL	EDX, FS:ln_path.B[ESI]	;Save offset of path string
+	TESTL	EDX, EDX
+	JE	45$.S
+	ADDL	EDX, ESI
+45$:	MOVL	lx_path.B[EBP], EDX
+	MOVB	DL, FS:ln_flags.B[ESI]
+	MOVB	lx_flags.B[EBP], DL
+	ADDL	ESI, #ln_def.B
+6$:	MOVL	EAX, FS:[ESI]		;Save definition
+	MOVL	lx_name+0.B[EBP], EAX
+	MOVL	EAX, FS:4.B[ESI]
+	MOVL	lx_name+4.B[EBP], EAX
+	MOVL	EAX, FS:8.B[ESI]
+	MOVL	lx_name+8.B[EBP], EAX
+	MOVL	EAX, FS:12t.B[ESI]
+	MOVL	lx_name+12t.B[EBP], EAX
+	MOVZBL	ECX, FS:ln_exsize-ln_def.B[ESI] ;Get length of extended part
+	ADDL	ESI, #ln_exdef-ln_def.B	;Point to extended part of definition
+	MOVL	EDX, #FILESPCSIZE
+	SUBL	EDX, ECX
+	LEAL	EDI, lx_string[EBP]	;Copy it to our buffer
+	PUSHL	SS
+	POPL	ES
+	CLD
+12$:	RMOVSB	[EDI], FS:[ESI]
+
+;Here with definition from this level copied
+
+	ADDL	ESI, #3.B		;Bump to next definition
+	ANDL	ESI, #0FFFFFFFCh.B
+	MOVL	lx_def+0.B[EBP], ESI
+	MOVL	lx_def+4.B[EBP], FS
+	MOVL	ESI, lx_pntr.B[EBP]	;Get offset of caller's string
+	MOVL	ECX, EDX
+	CMPB	SS:[ESI], #'\'		;Does it start with \?
+	JE	22$.S			;Yes
+	CMPL	lx_path.B[EBP], #0.B	;No - have a path string?
+	JE	22$.S			;No
+	MOVL	ESI, lx_path.B[EBP]	;Yes - copy it
+18$:	LODSB	FS:[ESI]
+	CMPB	AL, #0
+	JE	20$.S
+	STOSB	[EDI]
+	LOOP	ECX, 18$
+	JMP	28$.S
+
+20$:	MOVL	ESI, lx_pntr.B[EBP]
+22$:	LODSB	SS:[ESI]		;Finally, copy the caller's string!
+	STOSB	[EDI]
+	CMPB	AL, #0
+	JE	30$.S
+	LOOP	ECX, 22$
+28$:	MOVL	EAX, #ER_BDLNM		;If expanded name is too long
+	STC				;Indicate error
+	LEAVE
+	RET
+
+;Here with strings copied
+
+30$:	MOVL	EAX, SS:xffPCFilSpc#	;Save file spec string count - this is
+	MOVL	lx_pcfilspc.B[EBP], EAX	;  only correct if in extended fork
+					;  context, but it does not harm
+					;  otherwise!
+	LEAL	EBX, lx_name.B[EBP]	;Get offset of name
+	MOVL	ECX, lx_cmdbts.B[EBP]	;Get command bits
+	MOVL	ESI, lx_call.B[EBP]
+	LEAL	EDX, lx_string[EBP]
+	MOVL	EDI, lx_data.B[EBP]
+	PUSHL	EBP
+	MOVL	EBP, 0.B[EBP]
+	CALL	knlLogNameExpand
+	POPL	EBP
+	JNC	38$.S			;Return if this worked
+	BTL	lx_cmdbts.B[EBP],  #O%CREATE ;Error - was create indicated?
+	JC	38$.S			;Yes - return the error
+	DECL	lx_num.B[EBP]		;No - do we have another name?
+	JLE	36$.S			;No - return with the error
+	LFSL	ESI, lx_def.B[EBP]	;Yes - point to next definition
+	CMPB	knlForkLvl#, #FORK_XFF	;In extended fork context?
+	JB	6$			;No
+	MOVL	EAX, lx_pcfilspc.B[EBP]	;Yes - restore file spec count
+	MOVL	SS:xffPCFilSpc#, EAX
+	JMP	6$			;Continue
+
+36$:	STC				;Indicate error
+38$:	LEAVE
+	RET
+
+	DATA
+
+temp:	.LONG	0
+
+	CODE
+.PAGE
+	.SBTTL	chklogical - Subroutine to check for logical name
+
+;Subroutine to check for logical name
+;	c{SS:EBX} = Address of device name (16 characters)
+;	c[FS]     = Selector for PDA for session process
+;	CALL	chklogical
+;	Z:clr = No match
+;	  c{EAX} = Unchanged
+;	  c{EBX} = Unchanged
+;	Z:set = Match
+;	  c{FS:ESI} = Address of definition block
+
+chklogical:
+	MOVZWL	ESI, FS:pdaLogName#	;Get offset for first logical name block
+2$:	TESTL	ESI, ESI
+	JE	6$.S			;If no logical name defined
+	MOVL	EAX, SS:[EBX]		;This one?
+	CMPL	FS:ln_log+0.B[ESI], EAX
+	JNE	4$.S			;No
+	MOVL	EAX, SS:4.B[EBX]
+	CMPL	FS:ln_log+4.B[ESI], EAX
+	JNE	4$.S
+	MOVL	EAX, SS:8.B[EBX]
+	CMPL	FS:ln_log+8.B[ESI], EAX
+	JNE	4$.S
+	MOVL	EAX, SS:12t.B[EBX]
+	CMPL	FS:ln_log+12t.B[ESI], EAX
+	JE	8$.S			;Yes
+4$:	MOVL	ESI, FS:ln_next.B[ESI]	;No - advance to next block
+	JMP	2$.S			;Continue if more
+
+;Here if no match found
+
+6$:	INCL	ESI			;No more - clear Z
+8$:	RET				;Return
+.PAGE
+	.SBTTL	chkdnchr - Subroutine to check for valid device name character
+
+;Subroutine to check for valid device name character
+;	c(AL) = Charcter
+;	CALL	chkdnchr
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  c(AL) = Character (forced to upper case)
+
+chkdnchr::
+	CMPB	AL, #'a'		;Lower case?
+	JB	2$.S			;No
+	SUBB	AL, #20h		;Yes - force to upper case
+2$:	CMPB	AL, #'0'		;Digit?
+	JB	6$.S			;No
+	CMPB	AL, #'9'
+	JBE	4$.S			;Yes
+	CMPB	AL, #'A'		;Letter?
+	JB	6$.S			;No
+	CMPB	AL, #'Z'
+	JA	6$.S			;No
+4$:	CLC				;OK - make sure C is clear
+ret020:	RET				;And return
+
+;Here if bad character
+
+6$:	JMP	knlIllSpc#
+.PAGE
+	.SBTTL	copylognames - Subroutine to copy logical names to child process
+
+;Subroutine to copy logical names to child process - must be called after child
+;  process has been created but before it has been put in a run queue
+;	c[ES] = Selector of PDA for child process
+;	CALL	copylognames
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+
+copylognames::
+	CLD
+	MOVZBL	EAX, SS:pdaSesProc#	;Get selector for our session PDA
+	MOVW	FS, knlProcTable#[EAX*2]
+	MOVL	EDX, #pdaLogName#
+	MOVL	EDI, FS:[EDX]		;Get offset of first logical name block
+2$:	TESTL	EDI, EDI
+	JE	ret020.S
+	MOVZWL	ECX, FS:[EDI]		;Get length of block
+	SUBL	ECX, #ln_num.B
+	PUSHL	ECX
+	CALL	knlGetPdaMemP#		;Allocate PDA block for the child
+	POPL	ECX
+	JC	ret020.S		;If error
+	MOVL	ES:[EDX], ESI		;Link it in to our list
+	MOVL	ES:ln_pntr.B[ESI], EDX
+	LEAL	EDX, ln_next.B[ESI]
+	PUSHL	EDI			;Copy the block
+	SHRL	ECX, #2
+	XCHGL	EDI, ESI
+	ADDL	EDI, #ln_num.B
+	ADDL	ESI, #ln_num.B
+	RMOVSL	[EDI], FS:[ESI]
+	POPL	EDI
+	MOVL	EDI, FS:ln_next.B[EDI]	;Advance to next block
+	JMP	2$.S
+
+	END

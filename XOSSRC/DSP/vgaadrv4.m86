@@ -1,0 +1,1338 @@
+	.TITLE	VGAADRV4 - Loadable driver for basic VGA display
+
+;++++
+; This software is in the public domain.  It may be freely copied and used
+; for whatever purpose you see fit, including commerical uses.  Anyone
+; modifying this software may claim ownership of the modifications, but not
+; the complete derived code.  It would be appreciated if the authors were
+; told what this software is being used for, but this is not a requirement.
+
+;   THIS SOFTWARE IS PROVIDED BY THE AUTHORS "AS IS" AND ANY EXPRESS OR
+;   IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
+;   OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+;   IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+;   INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+;   BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS
+;   OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+;   ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR
+;   TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
+;   USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+;----
+
+	.PROC	80486
+	.INCLUD	XOSINC:\XMAC\XOS.PAR
+	.INCLUD	XOSINC:\XMAC\XOSX.PAR
+	.INCLUD	XOSINC:\XMAC\XOSERR.PAR
+	.INCLUD	XOSINC:\XMAC\XOSTRM.PAR
+	.INCLUD	XOSINC:\XMAC\XOSXTRM.PAR
+	.INCLUD	XOSINC:\XMAC\PCAT.PAR
+	.INCLUD	XOSINC:\XMAC\XOSLKE.PAR
+	.INCLUD	XOSINC:\XMAC\XOSXLKE.PAR
+
+	LKECONT
+	CODE
+
+
+; NOTE:	Need to change buffer mapping so can directly access C.G. pages
+;	when they are virtualized.  Could use an extra 64K in each map to
+;	map the C.G. pages.  When not virtualized, these would map the same
+;	as the first 64K.  When virtualized, these would map to the virtual
+;	C.G. pages.  This would allow writing arbitrary data to the C.G.
+;	pages when virtualized.  (IS THIS WORTH IT?)
+
+
+	.SBTTL	vgassstatus - Send current status to symbiont
+
+;Subroutine to send current virtual screen status to symbiont - must be called
+;  at fork level
+;	c(AL)  = Status:
+;		   0 = Idle
+;		   1 = In use
+;	c{ESI} = Offset of TDB
+;	CALL	vgassstatus
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  c{EAX} = 0
+
+;**********************************************************************
+;* THIS FUNCTION IS INTENDED FOR THE USE OF THE SCREEN SYMBIONT ONLY. *
+;* ITS SPECIFICATION IS SUBJECT TO CHANGE WITHOUT NOTICE.  It IS VERY *
+;* LIKELY THAT IT WILL BE CHANGED TO REFLECT ANY NEW VERSION OF THE   *
+;* SCREEN SYMBIONT.  ANY OTHER USE OF THIS FUNCTION SHOULD BE AVOIDED *
+;**********************************************************************
+
+$$$=!0
+FRM msg_msg, sss_cSIZE		;Message buffer
+FRM msg_dst, 12t		;Destination string buffer
+msg_SIZE=!$$$
+
+vgassstatus::
+	REQUIREFORK
+vgasndsts::
+	MOVB	DL, #MT_SSSTATUS
+sndmsg:	ENTER	msg_SIZE, 0		;Allocate a stack frame
+	PUSHL	EDI
+	PUSHL	ESI
+	MOVL	msg_msg+sss_status.B[EBP], EAX ;Store data value (status or
+					       ;  page fault offset
+	MOVB	msg_msg+sss_func.B[EBP], DL ;Store function
+
+	MOVZBL	EAX, tdb_mode[ESI]	;Store display mode
+	MOVL	msg_msg+sss_dspmode.B[EBP], EAX
+	MOVW	AX, tdb_pnum.B[ESI]	    ;Store primary unit and secondary
+	MOVW	msg_msg+sss_pnum.B[EBP], AX ;  unit numbers
+	MOVL	msg_msg+sss_xtdb.B[EBP], ESI ;Store offset of TDB
+	MOVL	msg_dst+0.B[EBP], #'SYS^' ;Build destination string
+	MOVL	msg_dst+4.B[EBP], #'TRM'
+	MOVZBL	EAX, tdb_pnum.B[ESI]
+	PUSHL	DS
+	PUSHL	SS
+	POPL	DS
+	LEAL	EBX, msg_dst+7.B[EBP]
+	CALL	knlPutDecNmbr##
+	MOVB	[EBX], #0
+	POPL	DS
+	PUSHL	SS
+	POPL	ES
+	LEAL	EBX, msg_dst.B[EBP]
+	PUSHL	DS			;Get source string for message
+	POPL	GS
+	MOVL	EDX, #knlTrmMsgSrc##
+	PUSHL	SS			;Get address of the message buffer in
+	POPL	FS			;  the right registers
+	LEAL	ESI, msg_msg.B[EBP]
+	MOVL	ECX, #sss_cSIZE
+	CALL	knlIpmSendMsg##		;Send the message
+	POPL	ESI			;Restore registers
+	POPL	EDI
+	LEAVE				;Remove the stack frame
+	RET				;Finished
+.PAGE
+	.SBTTL	vgasspageflt - Subroutine to handle page fault for blocked display page
+
+;Subroutine to handle page fault for blocked display page - This subroutine is
+;  called with the tf_pageflt dispatch.
+;	CALL	vgasspageflt
+
+;This subroutine must be called at main program level raised to fork level.
+;  It returns at main program level.  It will execute an uninterruptable wait
+;  until the screen symbiont responds to the message we send to it.
+
+vgasspageflt::
+	MOVL	EAX, 34h.B[ESP]		;Get the page fault linear address
+	MOVL	EDX, tdb_vtaddr.B[ESI]	;Get linear address of the exec mapping
+	ADDL	EDX, #la_data		;  of our display buffer
+	CMPL	EAX, EDX		;This mapping?
+	JB	4$.S			;No
+	LEAL	ECX, 20000h[EDX]	;Maybe
+	CMPL	EAX, ECX
+	JB	12$.S			;Yes
+4$:	MOVL	EBX, tdb_mdb.B[ESI]	;No - get first MDB which mapps the
+					;  display buffer
+	TESTL	EBX, EBX		;Mapped at all?
+	JE	10$.S			;No - serious problem!
+	MOVL	EBP, CR3		;Get our current map pointer
+6$:	MOVL	ES, mdb_pda.B[EBX]	;Get PDA selector for msect
+	CMPL	EBP, ES:pdaCR3##	;Is the mapping the same?
+	JNE	8$.S			;No - can't be this one
+	MOVL	EDX, mdb_la.B[EBX]	;Get linear address of msect
+	CMPL	EAX, EDX
+	JB	8$.S
+	MOVL	ECX, mdb_size.B[EBX]
+	SHLL	ECX, #12t
+	ADDL	ECX, EDX
+	CMPL	EAX, ECX
+	JB	12$.S			;Found it
+8$:	MOVL	EBX, mdb_devnext.B[EBX]	;Advance to next MDB for buffer
+	TESTL	EBX, EBX		;More to check?
+	JNE	6$.S			;Yes - continue
+10$:	CRASH	CFFP			;[Can't Find page Fault Page
+
+;Here with the mapping of the display buffer which contains the page fault
+
+12$:	SUBL	EAX, EDX		;Get offset in the buffer
+	MOVB	DL, #MT_SSPAGEFLT	;Get screen symbiont function
+	CALL	sndmsg			;Send message to the screen symbiont
+	MOVL	EAX, ESI
+	CALL	knlSetWait##		;OK - set up to wait using the TDB
+	PUSHL	SS			;  offset as the wait index
+	POPL	ES
+	MOVB	AL, #knlQX_DW2##
+	CALL	knlWRequeue##		;Requeue to an IO wait queue
+	FROMFORK
+	CALLF	schedule		;Call the scheduler (this is an
+	RET				;  uninterruptable wait!)
+.PAGE
+	.SBTTL	vgassutil - Screen symbiont utility functions
+
+;General utility functions for the screen symbiont
+;	c{EDX} = Data value
+;		   -1 = Remove cursor from physical screen
+;		    0 = Wake up screen using TDB offset + 1 as wait index
+;		   >0 = Wake up extented fork context with this selector
+;	c{ESI} = Offset of TDB or handle for terminal
+;	CALL	vgassutil
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  c{EAX} = 0
+
+;If the extended fork frame index is non-zero, it means that the screen
+;  is waiting in extended fork context and knlResumeXf is called.  If the
+;  extended fork frame index is zero, it means that the screen is waiting
+;  at main program level and knlEndWaitOne is called with a wait index equal
+;  to the TDB offset + 1.  Note that while it is possible (but very unlikely)
+;  that more than one process will be waiting, we will get exactly one call
+;  for each process, so knlEndWaitOne is the right routine to call.)
+
+;**********************************************************************
+;* THIS FUNCTION IS INTENDED FOR THE USE OF THE SCREEN SYMBIONT ONLY. *
+;* ITS SPECIFICATION IS SUBJECT TO CHANGE WITHOUT NOTICE.  It IS VERY *
+;* LIKELY THAT IT WILL BE CHANGED TO REFLECT ANY NEW VERSION OF THE   *
+;* SCREEN SYMBIONT.  ANY OTHER USE OF THIS FUNCTION SHOULD BE AVOIDED *
+;**********************************************************************
+
+vgassutil::
+	CMPL	EDX, #-1.B		;Want to remove cursor?
+	JNE	8$.S			;No
+	MOVL	ECX, #0FF00h		;Yes
+	CALL	setcurpos
+	CLRL	EAX
+	RET
+
+;Here if not removing cursor - wake someone up somehow
+
+8$:	TOFORK
+	TESTL	EDX, EDX		;Do we have a selector?
+	JE	10$.S			;No
+	CLRL	EAX			;Yes - wake up the extended fork
+	MOVL	ES, EDX			;  frame
+	CALL	knlResumeXf##
+	FROMFORK
+	RET
+	
+;Here if screen is waiting at main program level
+
+10$:	LEAL	EAX, 1.B[ESI]
+	CALL	knlEndWaitOne##
+	FROMFORK
+	RET
+.PAGE
+	.SBTTL	vgassmapbufr - Function to map buffer for screen symbiont
+
+;Function to map physical buffer for screen symbiont
+;	c{ECX}     = Maximum amount to map
+;	c{EBP:EDX} = Address for msect to map buffer
+;	c{ESI}    = Offset of TDB for terminal
+;	CALL	vgassmapbufr
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  c{EAX} = Size of msect created
+
+;This function maps the physical text mode display buffer for use by the
+;  screen symbiont.  This mapping is NOT affected by any screen symbtiont
+;  functions and always directly maps the physical buffer.
+
+;**********************************************************************
+;* THIS FUNCTION IS INTENDED FOR THE USE OF THE SCREEN SYMBIONT ONLY. *
+;* ITS SPECIFICATION IS SUBJECT TO CHANGE WITHOUT NOTICE.  It IS VERY *
+;* LIKELY THAT IT WILL BE CHANGED TO REFLECT ANY NEW VERSION OF THE   *
+;* SCREEN SYMBIONT.  ANY OTHER USE OF THIS FUNCTION SHOULD BE AVOIDED *
+;**********************************************************************
+
+vgassmapbufr::
+	MOVL	EBX, tdb_dhdb.B[ESI]
+	MOVL	EAX, dhdb_npages.B[EBX]
+	SHLL	EAX, #12t
+	CMPL	ECX, EAX
+	JBE	4$.S
+	MOVL	ECX, EAX
+4$:	MOVL	ESI, dhdb_ptaddr.B[EBX]	;Get physical address of buffer
+	MOVL	EBX, #PG$READ|PG$WRITE
+	MOVL	EDI, #0FFFFFFFFh
+	JMP	knlMapPhysMem##
+.PAGE
+	.SBTTL	vgasstrans - Function to transfer data to or from screen symbiont
+
+;Function to transfer data to or from screen symbiont - see vgasswrite and
+;  vgassread for details
+
+vgasstrans::
+	BTL	EDX, #31t		;Read function?
+	JC	vgasswrite		;No
+					;Yes - fall into vgassread
+
+	.SBTTL	vgassread - Function to read and virualitize buffer pages
+
+;Function to read and virtualizte buffer pages for the screen symbiont
+;	c{EAX}    = First page to write
+;	c{FS:EBX} = Address of buffer
+;	c{ECX}    = Number of pages to write
+;	c{ES:EDI} = Address of page list
+;	c{EDX}    = Function bits:
+;		      Bit 31: 0 = Read function
+;		      Bit  4: SSR$FCURSOR
+;			      1 = Freeze cursor position
+;		      Bit  1: SSR$BLKVIRT
+;			      0 = Do not block access to virtualized pages
+;			      1 = Block access to virtualized pages
+;		      Bit  0: SSR$VIRTALL
+;			      0 = Only virtualize modified pages
+;			      1 = Virtualize all pages
+;	c{ESI}    = Offset of TDB for terminal
+;	CALL	vgassread
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  c{EAX} = Raw hardware cursor position
+
+;The page list is an array of longs, with one long for each page to read.
+;  Each long has the following format:
+;	Bit 31: PL$MODIFIED
+;		 0 = Page has been cleared (bits 15-0 give contents)
+;		 1 = Page has been modified
+;	Bit 30: PL$VIRTUAL
+;		 0 = Page maps to physical display buffer
+;		 1 = Page has been virtualized
+;	Bit 29: PL$BLOCKED
+;		 0 = Access to page is allowed
+;		 1 = Access to page is blocked
+;	Bit 28: PL$INCMOD
+;		 0 = Page has not been modified since last check
+;		 1 = Page has been modified since last check
+;	Bits 15-0  = If bit 31 is 0, gives contents for page - For pages
+;		       0 - 15 this is the 16-bit attribute/character value
+;		       for each character position.  For pages 16 - 31 this
+;		       is 2 * F + h where F is the font index and h is 0 for
+;		       the first half of the character set and 1 for the
+;		       second half.
+
+;All modified pages are read and virualized.  If function bit 0 is set all
+;  pages not already virtualized are read and virualized.  Access is blocked
+;  to all pages which are not virtualized and all pages which are virtualized
+;  are unblocked.  If function bit 1 is set, access is blocked to all pages.
+;  If a page is not read, the corresponding buffer page is not touched.  If
+;  the buffer address is null, no pages are read, virtualized, or unblocked.
+;  The page list entry is stored for all pages in all cases.
+
+;This function is used by the screen symbiont in several ways.
+;	1. When placing the session menu on the screen, it is used to
+;	   virtualize any modified visible pages and block access to all
+;	   visible pages.
+;	2. When switching screens, it is used to virtualize all modified pages
+;	   and block access to all unmodified pages.
+;	3. When a blocked unmodified page is touched, it is used to virtualize
+;	   and unblock the touched page.
+
+;This function is only valid for text mode screens
+
+;**********************************************************************
+;* THIS FUNCTION IS INTENDED FOR THE USE OF THE SCREEN SYMBIONT ONLY. *
+;* ITS SPECIFICATION IS SUBJECT TO CHANGE WITHOUT NOTICE.  It IS VERY *
+;* LIKELY THAT IT WILL BE CHANGED TO REFLECT ANY NEW VERSION OF THE   *
+;* SCREEN SYMBIONT.  ANY OTHER USE OF THIS FUNCTION SHOULD BE AVOIDED *
+;**********************************************************************
+
+$$$=!0
+FRM sr_pglist , 8t		;Address of user page list
+FRM sr_buffer , 8t		;Address of user page buffer
+FRM sr_pgtable, 4t		;Offset in page table for buffer
+FRM sr_pgnum  , 4t		;Page number
+FRM sr_pgcnt  , 4t		;Page count
+FRM           , 1t
+FRM sr_pgtcnt , 1t		;Number of page table entries to change
+FRM sr_func   , 1t		;Function bits
+FRM sr_regset , 1t		;Non-zero if VGA registers set to access				;  character generator pages
+FRM sr_pgarray, 32t*4		;Page table entry array
+sr_SIZE=!$$$
+
+vgassread::
+	CMPB	tdb_mode[ESI], #DM_TEXT ;Text mode?
+	JE	2$.S			;Yes
+	MOVL	EAX, #ER_FUNCM		;No - fail
+	STC
+	RET
+
+;Here if in text mode
+
+2$:	ENTER	sr_SIZE, 0		;Set up a stack frame
+	MOVL	sr_pgnum.B[EBP], EAX
+	MOVL	sr_pgcnt.B[EBP], ECX
+	MOVB	sr_func.B[EBP], DL
+	MOVL	sr_pglist+0.B[EBP], EDI	;Store page list address
+	MOVL	sr_pglist+4.B[EBP], ES
+	MOVL	sr_buffer+0.B[EBP], EBX	;Store buffer address
+	MOVL	sr_buffer+4.B[EBP], FS
+	LEAL	EDI, sr_pgarray[EBP]	;Clear the page table entry array
+	PUSHL	SS
+	POPL	ES
+	MOVL	ECX, #32t
+	CLD
+	CLRL	EAX
+	RSTOSL	[EDI]
+	MOVL	EAX, FS			;Get selector for user segment
+	ANDL	EAX, #0FFF8h
+	ADDL	EAX, SS:pdaLdtPnt##
+	MOVB	CH, SS:mb_data+7.B[EAX]	;Get linear address of start of segment
+	MOVB	CL, SS:mb_data+4.B[EAX]	;Now we get the page table entries for
+	SHLL	ECX, #16t		;  each user buffer page and save them
+	MOVW	CX, SS:mb_data+2.B[EAX]	;  in a table on our stack so they will
+					;  be available when we switch address
+					;  spaces
+	ADDL	EBX, ECX		;Get linear address of his buffer
+	SHRL	EBX, #10t		;Change to page table offset
+	MOVL	sr_pgtable.B[EBP], EBX
+	MOVB	sr_pgtcnt.B[EBP], #0
+	MOVB	sr_regset.B[EBP], #0
+	CALL	xosconUpdPgList##	;Update the page list to match the
+	PUSHL	DS			;  current display buffer state
+	POPL	ES
+	CLD
+8$:	MOVL	EDX, sr_pgnum.B[EBP]	;Get page number
+	ANDB	tdb_pglist+3[ESI+EDX*4], #~{PL$INCMOD>24t}
+					;Clear the incremental change bit
+	MOVL	EAX, tdb_pglist[ESI+EDX*4] ;Get page list value
+	LESL	EBX, sr_pglist.B[EBP]	;Store it in his page table list
+	MOVL	ES:[EBX+EDX*4], EAX
+	CMPL	sr_buffer+0.B[EBP], #0.B ;Do we have a buffer?
+	JE	20$			;No - can't virtualizing anything
+	BTL	EAX, #PL%VIRTUAL	;Yes - has this page been virtualized?
+	JC	20$			;Yes
+	TESTB	sr_func.B[EBP], #SSR$VIRTALL ;No - virtualizing all pages?
+	JNE	10$.S			;Yes
+	BTL	EAX, #PL%MODIFIED	;No - has the page been modified?
+	JNC	16$			;No
+
+;Here to read and virtualize a display page
+
+10$:	ORB	tdb_pglist+3[ESI+EDX*4], #PL$VIRTUAL>24t
+					;Indicate page has been virtualized
+	ORB	ES:3.B[EBX+EDX*4], #PL$VIRTUAL>24t
+	CMPL	EDX, #16t.B		;Yes - character generator page?
+	JB	12$.S			;No
+	CMPB	sr_regset.B[EBP], #0	;Yes - have we set up to read it yet?
+	JNE	12$.S			;Yes
+	MOVL	EDX, tdb_bioreg[ESI]	;No - do it now
+	ADDL	EDX, #P_EGASEQINDX-P_EGABASE.B ;Point to sequencer index
+	MOVB	AL, #4			       ;  register
+	OUTB	[DX]			;Change register 4 (memory mode)
+	MOVB	AL, #02h
+	INCL	EDX			;Point to data register
+	OUTB	[DX]			;Change value
+	ADDL	EDX, #P_EGAGCINDX-P_EGASEQDATA.B ;Point to graphics controller
+	MOVB	AL, #3				 ;  index register
+	OUTB	[DX]			;Change register 3 (data rotate)
+	IOPAUSE
+	MOVB	AL, #00h		;Clear all bits
+	INCL	EDX
+	OUTB	[DX]
+	IOPAUSE
+	DECL	EDX
+	MOVB	AL, #5			;Change register 5 (mode)
+	OUTB	[DX]
+	INCL	EDX
+	MOVB	AL, #00h
+	OUTB	[DX]
+	DECL	EDX
+	MOVB	AL, #6			;Change register 6 (miscellaneous)
+	OUTB	[DX]
+	INCL	EDX
+	MOVB	AL, #00h
+	OUTB	[DX]
+	DECL	EDX
+	MOVB	AL, #4			;Change graphics controller register 4
+	OUTB	[DX]			;   (read plane select)
+	IOPAUSE
+	MOVB	AL, #2
+	INCL	EDX
+	OUTB	[DX]
+	MOVB	sr_regset.B[EBP], #1	;Indicate registers changed
+12$:	MOVL	EDX, sr_pgnum.B[EBP]
+	MOVL	EDI, EDX
+	SHLL	EDI, #12t
+	ADDL	EDI, sr_buffer+0.B[EBP]
+	MOVL	ES, sr_buffer+4.B[EBP]
+	ANDL	EDX, #0Fh
+	SHLL	EDX, #12t
+	PUSHL	ESI
+	MOVL	ESI, tdb_dhdb.B[ESI]
+	MOVL	ESI, dhdb_vtaddr.B[ESI]
+	ADDL	ESI, EDX
+	MOVL	ECX, #1024t
+	RMOVSL	[EDI], [ESI]
+	POPL	ESI
+	MOVL	EDX, sr_pgnum.B[EBP]
+	TESTB	sr_func.B[EBP], #SSR$BLKVIRT ;Want to block access to it?
+	JNE	16$.S			;Yes
+	LEAL	EAX, pgtable[EDX*4]
+	ADDL	EAX, sr_pgtable.B[EBP]	;No - get page table entry for the
+	MOVL	EAX, [EAX]		;  buffer page
+	ANDB	tdb_pglist+3[ESI+EDX*4], #~{PL$BLOCKED>24t}
+	LESL	EBX, sr_pglist.B[EBP]
+	ANDB	ES:3.B[EBX+EDX*4], #~{PL$BLOCKED>24t}
+	JMP	18$.S
+
+;Here if want to block access to the page
+
+16$:	MOVL	EAX, ESI		;Get new contents for the map entry
+	SHLL	EAX, #6t
+	ORB	AL, #PT_DISP*4h+2h
+	ORB	tdb_pglist+3[ESI+EDX*4], #PL$BLOCKED>24t
+	LESL	EBX, sr_pglist.B[EBP]
+	ORB	ES:3.B[EBX+EDX*4], #PL$BLOCKED>24t
+18$:	INCB	sr_pgtcnt.B[EBP]
+	MOVL	sr_pgarray[EBP+EDX*4], EAX
+	JMP	22$.S
+
+;Here if no buffer
+
+20$:	TESTB	sr_func.B[EBP], #SSR$BLKVIRT ;Want to block page?
+	JNE	16$.S			;Yes
+22$:	INCL	sr_pgnum.B[EBP]		;Increment page number
+	DECL	sr_pgcnt.B[EBP]		;More to do?
+	JNE	8$			;Yes - continue
+	CMPB	sr_regset.B[EBP], #0	;No - did we change the reigsters?
+	JE	26$.S			;No
+	CALL	vgarestore		;Yes - restore registers
+26$:	CMPB	sr_pgtcnt.B[EBP], #0	;Need to change any page tables?
+	JE	34$.S			;No
+	TOFORK
+	LEAL	EDX, sr_pgarray[EBP]
+	CALL	setbfrmapping
+	FROMFORK
+34$:	TESTB	sr_func.B[EBP], #SSR$FCURSOR ;Want to freeze cursor position?
+	JE	36$.S			;No
+	ORB	tdb_stsdsp+1.B[ESI], #TSD$FCURSOR>8 ;Yes
+	ANDB	tdb_stsdsp+1.B[ESI], #~{TSD$MCURSOR>8}
+36$:	LEAVE
+	MOVZWL	EAX, tdb_dcurpos[ESI]
+	RET
+.PAGE
+;	c{EDX} = Offset of the page table entry array
+;	CALL	setbfrmapping
+
+setbfrmapping:
+	MOVL	EBX, tdb_vtaddr.B[ESI]	;Get linear address of start of exec
+	ADDL	EBX, #la_data		;  screen buffer
+	SHRL	EBX, #10t		;Change to offset in page table
+	MOVL	ECX, #32t
+	PUSHL	EDX
+2$:	MOVL	EAX, SS:[EDX]		;Get map entry for this buffer page
+	TESTL	EAX, EAX		;Want to virtualize this display page?
+	JE	8$.S			;No
+	MOVL	pgtable[EBX], EAX	;Yes - store in terminal map
+8$:	ADDL	EDX, #4.B
+	ADDL	EBX, #4.B
+	LOOP	ECX, 2$
+	POPL	EBX			;Restore offset of map entry list
+	MOVL	ECX, #setbfrmap		;Now change all user maps
+	JMP	xosconScanMs##
+
+	.SBTTL	setvbfr - Subroutine to setup virtual buffer for read
+
+;Subroutine to setup virtual buffer for read
+;	c{EBX} = Offset of page table entry table
+;	c{EDX} = Offset of MDB for msect
+;	c{ESI} = Offset of terminal TDB
+;	CALL	setbfrmap
+
+setbfrmap:
+	PUSHL	EDX
+	PUSHL	EBX
+	MOVL	ECX, mdb_size.B[EDX]	;Get number of pages in msect
+	CMPL	ECX, #16t.B		;Too many pages?
+	JBE	10$.S			;No
+	MOVL	ECX, #16t		;Yes - reduce number to what is there
+10$:	MOVL	EDX, mdb_la.B[EDX]	;Get linear address of msect
+	SHRL	EDX, #10t		;Change to address of page table entry
+	ADDL	EDX, #pgtable
+14$:	MOVL	EAX, SS:[EBX]		;Get mapping for this page
+	TESTL	EAX, EAX		;Want to virtualize this page?
+	JE	16$.S			;No
+	MOVL	[EDX], EAX		;Yes - store in page map
+16$:	ADDL	EBX, #4.B		;Bump pointers
+	ADDL	EDX, #4.B
+	LOOP	ECX, 14$		;Loop back if more to do
+	POPL	EBX			;Finished - restore registers
+	POPL	EDX
+	RET				;And return
+.PAGE
+	.SBTTL	vgasswrite - Function to do buffer write for screen symbiont
+
+;Function to do buffer write for screen symbiont
+;	c{EAX}    = First page to write
+;	c{FS:EBX} = Address of buffer
+;	c{ECX}    = Number of pages to write
+;	c{EDX}    = Function bits:
+;		      Bit 31: 1 = Write function
+;		      Bit  3: SSW$SWITCH
+;			      0 = Do not switch screens
+;			      1 = Make screen pointed to by ESI the current
+;				   screen
+;		      Bit  2: SSW$UNBLKONLY
+;			      0 = Normal
+;			      1 = Unblock pages only
+;		      Bit  1: SSW$CLRSSS
+;			      0 = Do not change keyboard system-shift state
+;			      1 = Clear keyboard system-shift state when done
+;	c{ES:EDI} = Address of page list
+;	c{ESI}    = Offset of TDB for terminal
+;	CALL	vgasswrite
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  c{EAX} = 0
+
+;If the screen specified is not the current screen for the display, it is
+;  first made the current screen.
+
+;The page list format is described for the vgassread function.  The page list
+;  is set up by the caller.  Display pages marked as modified (bit 31 = 1) are
+;  written from the corresponding buffer page.  Display pages marked as
+;  unmodified (bit 31 = 0) are cleared to the value given in bits 15-0.  All
+;  pages are unvirtualized and unblocked.  If function bit 2 = 1, pages are
+;  unblocked only.  In this case the buffer address must be specified to
+;  provide the access for mapping virtualized pages, but the buffer is not
+;  accessed.
+
+;If this function is issued when the display is not in text mode, the only
+;  thing done is to clear the system-shift state.  Everything else is
+;  ignored.
+
+;**********************************************************************
+;* THIS FUNCTION IS INTENDED FOR THE USE OF THE SCREEN SYMBIONT ONLY. *
+;* ITS SPECIFICATION IS SUBJECT TO CHANGE WITHOUT NOTICE.  It IS VERY *
+;* LIKELY THAT IT WILL BE CHANGED TO REFLECT ANY NEW VERSION OF THE   *
+;* SCREEN SYMBIONT.  ANY OTHER USE OF THIS FUNCTION SHOULD BE AVOIDED *
+;**********************************************************************
+
+$$$=!0
+FRM sw_pglist , 8t		;Address of user page list
+FRM sw_buffer , 8t		;Address of user page buffer
+FRM sw_pgnum  , 4t		;Page number
+FRM sw_pgcnt  , 4t		;Page count
+FRM           , 2t
+FRM sw_func   , 1t		;Function bits
+FRM sw_regset , 1t		;Non-zero if VGA registers set to access
+				;  character generator pages
+FRM sw_pgarray, 32t*4		;Page table entry array
+sw_SIZE=!$$$
+
+vgasswrite::
+	ENTER	sw_SIZE, 0		;Set up a stack frame
+	MOVL	sw_pglist+0.B[EBP], EDI	;Yes - store page list address
+	MOVL	sw_pglist+4.B[EBP], ES
+	MOVL	sw_buffer+0.B[EBP], EBX	;Store buffer address
+	MOVL	sw_buffer+4.B[EBP], FS
+	MOVL	sw_pgnum.B[EBP], EAX	;Store beginning page number
+	MOVL	sw_pgcnt.B[EBP], ECX	;Store number of pages to write
+	MOVB	sw_func.B[EBP], DL
+	MOVB	sw_regset.B[EBP], #0	;Indicate register not set yet for
+					;  access to character generator pages
+	LEAL	EDI, sw_pgarray[EBP]	;Clear the page table entry array
+	PUSHL	SS
+	POPL	ES
+	MOVL	ECX, #32t
+	CLRL	EAX
+	RSTOSL	[EDI]
+	TOFORK
+	TESTB	sw_func.B[EBP], #SSW$SWITCH ;Switch screens if need to?
+	JE	6$.S			;No
+	MOVL	EDX, tdb_dhdb.B[ESI]	;Yes - get offset of DHDB
+	CMPL	dhdb_curtdb.B[EDX], ESI	;Is this the current TDB?
+	JE	6$.S			;Yes - go on
+	MOVL	EBX, dhdb_curtdb.B[EDX]	;No
+
+;Here if this is not the current TDB - switch screens
+
+	ANDB	tdb_stsdsp+1.B[EBX], #~{TSD$ACTDSP>8} ;This is not the active
+						      ;  display
+	MOVL	ECX, tdb_keysts0.B[EBX]	;Save keyboard status bits
+	MOVL	EDI, tdb_keysts1.B[EBX]
+	MOVL	tdb_keysts0.B[ESI], ECX	;Store keyboard status bits
+	MOVL	tdb_keysts1.B[ESI], EDI
+	MOVL	dhdb_curtdb.B[EDX], ESI	;Make this the new current TDB
+	ORB	tdb_stsdsp+1.B[ESI], #TSD$ACTDSP>8 ;This is now the active
+						   ;  display
+	CALL	vgasetdhs#		;Set up the hardware state (this also
+					;  disables (blanks) the display)
+6$:	CMPB	tdb_mode[ESI], #DM_TEXT ;In text mode?
+	JNE	20$			;No
+	TESTB	sw_func.B[EBP], #SSW$UNBLKONLY ;Yes - are we unblocking only?
+	JNE	unblock			;Yes
+8$:	MOVL	EDX, sw_pgnum.B[EBP]
+	LESL	EBX, sw_pglist.B[EBP]
+	MOVL	EAX, ES:[EBX+EDX*4]
+	CMPL	sw_pgnum.B[EBP], #16t.B	;Text page?
+	JB	10$.S			;Yes
+	CMPB	sw_regset.B[EBP], #0	;No - have we set up the registers yet?
+	JNE	10$.S			;Yes
+	MOVB	sw_regset.B[EBP], #1
+	PUSHL	EAX
+	CALL	vgawrtchargen		;Set up to access character generator
+	POPL	EAX			;  memory
+	MOVL	EDX, sw_pgnum.B[EBP]
+10$:	MOVL	EBX, tdb_dhdb.B[ESI]	;Construct and save map entry for this
+	MOVL	EDI, EDX		;  page
+	ANDL	EDX, #0Fh.B
+	SHLL	EDX, #12t
+	ADDL	EDX, dhdb_ptaddr.B[EBX]
+	ORB	DL, #27h
+	MOVL	sw_pgarray[EBP+EDI*4], EDX
+	ANDB	tdb_pglist+3[ESI+EDI*4], #~{{PL$VIRTUAL|PL$BLOCKED}>24t}
+	BTL	EAX, #PL%MODIFIED	;Need to write from the buffer?
+	JNC	14$.S			;No
+	ORB	tdb_pglist+3[ESI+EDI*4], #{PL$MODIFIED|PL$INCMOD}>24t ;Yes
+	PUSHL	ESI
+	MOVL	ESI, EDI
+	ANDL	EDI, #0Fh.B
+	SHLL	EDI, #12t
+	ADDL	EDI, dhdb_vtaddr.B[EBX]
+	PUSHL	DS
+	POPL	ES
+	SHLL	ESI, #12t
+	ADDL	ESI, sw_buffer+0.B[EBP]
+	MOVL	FS, sw_buffer+4.B[EBP]
+	MOVL	ECX, #1024t
+	CLD
+	RMOVSL	[EDI], FS:[ESI]
+	POPL	ESI
+	JMP	16$.S
+
+;Here to clear a display page
+
+14$:	MOVL	EDX, sw_pgnum.B[EBP]	;Get page number
+	ANDL	EAX, #0FFFFh
+	MOVL	tdb_pglist[ESI+EDX*4], EAX
+	CALL	vgaclrbfrpage		;Clear the page
+16$:	MOVL	EDX, sw_pgnum.B[EBP]
+	LESL	EBX, sw_pglist.B[EBP]
+	MOVL	EAX, tdb_pglist[ESI+EDX*4]
+	MOVL	ES:[EBX+EDX*4], EAX
+	INCL	sw_pgnum.B[EBP]
+	DECL	sw_pgcnt.B[EBP]
+	JNE	8$
+	CMPB	sw_regset.B[EBP], #0	;Need to restore registers?
+	JE	18$.S			;No
+	CALL	vgarestore		;Yes
+18$:	LEAL	EDX, sw_pgarray[EBP]
+	CALL	setbfrmapping
+20$:	CALL	vgaenable#		;Make sure the display is enabled
+	TESTB	sw_func.B[EBP], #SSW$CLRSSS ;Want to clear the system-shift
+					    ;  state?
+	JE	22$.S			;No
+	MOVL	EBX, tdb_dhdb.B[ESI]	;Yes - do that
+	ANDB	dhdb_keysts.B[EBX], #~KS$SYSSHFT
+	ANDB	tdb_stsdsp+1.B[ESI], #~{TSD$FCURSOR>8} ;Also unfreeze the cursor
+	MOVZWL	ECX, tdb_dcurpos[ESI]	;Make sure cursor is on the screen
+	CALL	setcurpos
+22$:	FROMFORK
+	LEAVE
+	CLRL	EAX
+	RET
+.PAGE
+;Here to unblock all pages only - This option is used to unblock the virtualized
+;  visible pages when the session menu is on the screen and when a virtualized
+;  page is realized for other than the current screen.  The page list is not
+;  read but it is updated.
+
+unblock:CALL	xosconUpdPgList##	;Update the page list
+	MOVL	EAX, sw_buffer+4.B[EBP]	;Get selector for buffer segment
+	ANDL	EAX, #0FFF8h
+	ADDL	EAX, SS:pdaLdtPnt##
+	MOVB	BH, SS:mb_data+7.B[EAX]	;Get linear address of start of segment
+	MOVB	BL, SS:mb_data+4.B[EAX]	;Now we get the page table entries for
+	SHLL	EBX, #16t		;  each user buffer page and save them
+	MOVW	BX, SS:mb_data+2.B[EAX]	;  in a table on our stack so they will
+	MOVL	EDX, sw_pgnum.B[EBP]	;  be available when we switch address
+	SHLL	EDX, #12t		;  spaces
+	ADDL	EBX, sw_buffer+0.B[EBP]	;Get linear address of his buffer
+	ADDL	EBX, EDX
+	SHRL	EBX, #10t		;Change to page table offset
+	ADDL	EBX, #pgtable
+	LESL	EDI, sw_pglist.B[EBP]
+	MOVZBL	EDX, sw_pgnum.B[EBP]
+	MOVL	ECX, sw_pgcnt.B[EBP]
+4$:	MOVL	EAX, [EBX]		;Get page table entry
+	TESTB	AL, #01h		;Is this page already virtual or
+					;  blocked?
+	JE	8$.S			;Yes
+	ANDB	AL, #~40h		;No - clear the modified bit
+	MOVL	sw_pgarray[EBP+EDX*4], EAX
+	ANDB	tdb_pglist+3[ESI+EDX*4], #~{{PL$BLOCKED|PL$INCMOD}>24t}
+	ORB	tdb_pglist+3[ESI+EDX*4], #PL$MODIFIED>24t
+	MOVL	EAX, tdb_pglist[ESI+EDX*4]
+	MOVL	ES:[EDI+EDX*4], EAX
+8$:	ADDL	EBX, #4t.B
+	INCL	EDX
+	LOOP	ECX, 4$
+	LEAL	EDX, sw_pgarray[EBP]
+	CALL	setbfrmapping
+	MOVL	EAX, ESI		;Wake up anyone who is waiting
+	CALL	knlEndWaitAll##
+	FROMFORK
+	LEAVE
+	CLRL	EAX
+	RET
+.PAGE
+	.SBTTL	vgassmaskwrt - Function to do masked buffer write for screen symbiont
+
+;Function to do masked buffer write for screen symbiont
+;	c{EAX}    = First page to write
+;	c{ES:EDI} = Address of buffer
+;	c{ECX}    = Number of pages to write
+;	c{EDX}    = Offset of beginning of visible area of buffer
+;	c{EBX}    = Width of menu + 10000h * Height of menu
+;	c{ESI}    = Offset of TDB for terminal
+;	CALL	vgassmaskwrt
+;	C:set = Error
+;	  c{EAX} = Negative error code
+;	C:clr = Normal
+;	  c{EAX} = 0 if nothing written (all indicated pages have been blocked)
+;		     or 1 if something written (all indicated pages left
+;		     unblocked)
+
+;This function is used by the screen symbiont to update the physical display
+;  buffer when the session menu is on the screen.  It must be called for text
+;  (not character generator) pages only.  It actually does a number of seperate
+;  operations required here:
+;	1. The page modified status is updated from all mappings of the display
+;	   buffer
+;	2. If none of the indicated pages have been modified, all the indicated
+;	   pages are blocked and a value of 0 is returned.
+;	3. Otherwise, the indicated pages are written to the physical buffer
+;	   with the area for the menu in the upper right hand corner of the
+;	   display masked out and a value of 1 is returned.
+
+;This function is used even though the screen has mapped the physical buffer.
+;  This is because it combines several operations and eliminates several
+;  seperate system calls and because it ensures that the updating of the
+;  buffer is atomic.
+
+;This function is only valid when the display is in text mode.
+
+;**********************************************************************
+;* THIS FUNCTION IS INTENDED FOR THE USE OF THE SCREEN SYMBIONT ONLY. *
+;* ITS SPECIFICATION IS SUBJECT TO CHANGE WITHOUT NOTICE.  It IS VERY *
+;* LIKELY THAT IT WILL BE CHANGED TO REFLECT ANY NEW VERSION OF THE   *
+;* SCREEN SYMBIONT.  ANY OTHER USE OF THIS FUNCTION SHOULD BE AVOIDED *
+;**********************************************************************
+
+$$$=!0
+
+FRM sm_buffer , 8t		;Address of user page buffer
+FRM sm_pgnum  , 4t		;Page number
+FRM sm_pgcnt  , 4t		;Page count
+FRM sm_top    , 4t
+FRM sm_width  , 4t		;Width of menu in character
+FRM sm_height , 4t		;Height of menu
+FRM sm_skip   , 4t		;Width of menu in butes
+FRM sm_before , 4t		;Number of longs to left of menu
+FRM sm_above  , 4t		;Bytes to copy above the menu
+FRM sm_within , 4t		;Bytes to copy within the menu
+FRM sm_scnwid , 4t		;Screen width in bytes
+FRM sm_inpage , 4t
+FRM sm_pgarray, 32t*4		;Page table entry array
+sm_SIZE=!$$$
+
+vgassmaskwrt::
+	ENTER	sm_SIZE, 0		;Set up a stack frame
+	MOVL	sm_pgnum.B[EBP], EAX	;Store beginning page number
+	MOVL	sm_pgcnt.B[EBP], ECX	;Store number of pages to write
+	SHLL	EAX, #12t
+	ADDL	EDI, EAX
+	MOVL	sm_buffer+0.B[EBP], EDI	;Store buffer address
+	MOVL	sm_buffer+4.B[EBP], ES
+	MOVL	sm_top.B[EBP], EDX	;Store offset top of visible area
+	MOVZWL	EAX, BX			;Store menu width
+	MOVL	sm_width.B[EBP], EAX
+	ADDL	EAX, EAX
+	MOVL	sm_skip.B[EBP], EAX
+	SHRL	EBX, #16t
+	MOVL	sm_height.B[EBP], EBX	;Store menu height
+	TOFORK
+	CALL	xosconUpdPgList##	;Update the page list entries
+	MOVL	EDX, sm_pgnum.B[EBP]	;Scan the page table and see if any
+	MOVL	ECX, sm_pgcnt.B[EBP]	;  pages have been modified and clear
+	CLRL	EAX			;  the incremental change bits
+4$:	BTL	tdb_pglist[ESI+EDX*4], #PL%INCMOD
+	ADCL	EAX, #0.B
+	INCL	EDX
+	LOOP	ECX, 4$
+	TESTL	EAX, EAX		;Was any page modified?
+	JNE	10$.S			;Yes
+	TESTB	tdb_stsdsp.B[ESI], #TSD$MCURSOR>8 ;No - has cursor been moved?
+	JNE	30$			;Yes
+	LEAL	EDI, sm_pgarray[EBP]	;No - clear the page table entry array
+	PUSHL	SS
+	POPL	ES
+	MOVL	ECX, #32t
+	CLRL	EAX
+	CLD
+	RSTOSL	[EDI]
+	MOVL	EDX, sm_pgnum.B[EBP]	;Construct blocked page table entries
+	MOVL	ECX, sm_pgcnt.B[EBP]	;  for each page
+	MOVL	EAX, ESI		;Get new contents for the map entry
+	SHLL	EAX, #6t
+	ORB	AL, #PT_DISP*4h+2h
+8$:	ORB	tdb_pglist+3[ESI+EDX*4], #PL$BLOCKED>24t
+	MOVL	sm_pgarray[EBP+EDX*4], EAX
+	INCL	EDX
+	LOOP	ECX, 8$
+	LEAL	EDX, sm_pgarray[EBP]	;Update the page maps
+	CALL	setbfrmapping
+	FROMFORK
+	LEAVE
+	CLRL	EAX			;Return 0 to indicate nothing written
+	RET
+
+;Here if one or more pages have been modified
+
+10$:	MOVL	EAX, tdb_columns[ESI]	;Get the number of longs to store
+	MOVL	EBX, sm_width.B[EBP]	;  to the left of the menu
+	SUBL	EAX, EBX
+	SHRL	EAX, #1t
+	MOVL	sm_before.B[EBP], EAX
+	ADDL	EBX, EBX		;Get the number of bytes to skip
+	MOVL	EAX, tdb_columns[ESI]	;Calculate total size of area where
+	LEAL	EDX, [EAX+EAX]		;  menu is
+	MOVL	sm_scnwid.B[EBP], EDX
+	IMULL	EAX, sm_height.B[EBP]
+	ADDL	EAX, EAX
+	MOVL	sm_within.B[EBP], EAX
+	MOVL	EDX, sm_pgnum.B[EBP]	;Get offset of start of area to write
+	SHLL	EDX, #12t
+	MOVL	ECX, sm_top.B[EBP]	;Get offset of start of visible area
+	SUBL	ECX, EDX		;Get number of bytes to write above
+	MOVL	sm_above.B[EBP], ECX	;  the menu
+	MOVL	EDI, tdb_dhdb.B[ESI]
+	MOVL	EDI, dhdb_vtaddr.B[EDI]
+	PUSHL	DS
+	POPL	ES
+	MOVL	EBX, ESI
+	PUSHL	ESI
+	LFSL	ESI, sm_buffer.B[EBP]
+12$:	MOVL	EDX, sm_pgnum.B[EBP]
+	TESTB	tdb_pglist+3[EBX+EDX*4], #PL$INCMOD>24t
+	JNE	16$.S
+	ADDL	ESI, #1000h
+	ADDL	EDI, #1000h
+	CMPL	sm_above.B[EBP], #0
+	JLE	14$.S
+	SUBL	sm_above.B[EBP], #1000h
+	JGE	28$.S
+	MOVL	EAX, sm_above.B[EBP]
+	ADDL	sm_within.B[EBP], EAX
+	JMP	28$.S
+
+14$:	SUBL	sm_within.B[EBP], #1000h
+	JMP	28$.S
+
+;Here if the page has been modified
+
+16$:	ANDB	tdb_pglist+3[EBX+EDX*4], #~{PL$INCMOD>24t}
+	MOVL	sm_inpage.B[EBP], #1000h
+	MOVL	ECX, sm_above.B[EBP]	;Any space above the menu?
+	TESTL	ECX, ECX
+	JLE	20$.S			;No
+	CMPL	ECX, sm_inpage.B[EBP]	;Yes
+	JLE	18$.S
+	MOVL	ECX, sm_inpage.B[EBP]
+18$:	SUBL	sm_above.B[EBP], ECX
+	SHRL	ECX, #2t
+	RMOVSL	[EDI], FS:[ESI]
+	SUBL	sm_inpage.B[EBP], ECX
+	JLE	28$.S
+20$:	MOVL	EDX, sm_within.B[EBP]	;Any space within the menu?
+	TESTL	EDX, EDX
+	JLE	26$.S			;No
+	CMPL	EDX, sm_inpage.B[EBP]
+	JLE	22$.S
+	MOVL	EDX, sm_inpage.B[EBP]
+22$:	SUBL	sm_within.B[EBP], EDX
+	SUBL	sm_inpage.B[EBP], EDX
+24$:	MOVL	ECX, sm_before.B[EBP]	;Copy area to left of the menu
+	RMOVSL	[EDI], FS:[ESI]
+	ADDL	EDI, sm_skip.B[EBP]
+	ADDL	ESI, sm_skip.B[EBP]
+	SUBL	EDX, sm_scnwid.B[EBP]
+	JG	24$.S
+	CMPL	sm_inpage.B[EBP], #0.B
+	JLE	28$.S
+26$:	MOVL	ECX, sm_inpage.B[EBP]
+	SHRL	ECX, #2t
+	RMOVSL	[EDI], FS:[ESI]		;Copy the rest
+28$:	INCL	sm_pgnum.B[EBP]
+	DECL	sm_pgcnt.B[EBP]
+	JNE	12$
+	POPL	ESI
+30$:	ANDB	tdb_stsdsp+1.B[ESI], #~{TSD$MCURSOR>8}
+	MOVZWL	EAX, tdb_dcurpos[ESI]	;Get current intended cursor position
+	MOVL	ECX, EAX
+	MOVL	EDX, sm_top.B[EBP]
+	SHRL	EDX, #1t
+	SUBL	EAX, EDX
+	JLE	32$.S			;If cursor is above displayed area
+	CLRL	EDX
+	IDIVL	tdb_columns[ESI]	;Get row and column for cursor
+	CMPL	EAX, sm_height.B[EBP]
+	JGE	32$.S			;If below menu
+	MOVL	EAX, sm_before.B[EBP]
+	ADDL	EAX, EAX
+	CMPL	EDX, EAX
+	JB	32$.S			;If to left of menu
+	MOVB	CH, #0FFh		;Under menu - put it off the screen
+32$:	CALL	setcurpos
+	FROMFORK
+	LEAVE
+	CLRL	EAX			;Return 1 to indicate something done
+	INCL	EAX
+ret008:	RET
+.PAGE
+setcurpos:
+	MOVL	EDX, tdb_bioreg[ESI]	;Update hardware cursor position
+	ADDL	EDX, #P_EGACCRTINDX-P_EGABASE.B
+	MOVB	AL, #15t		;Point to cursor register in CRTC
+	OUTB	[DX]
+	IOPAUSE
+	INCL	EDX
+	MOVB	AL, CL
+	OUTB	[DX]
+	IOPAUSE
+	DECL	EDX
+	MOVB	AL, #14t
+	OUTB	[DX]
+	IOPAUSE
+	INCL	EDX
+	MOVB	AL, CH
+	OUTB	[DX]
+	RET
+.PAGE
+vgarestore::
+	TESTB	tdb_stsdsp+1.B[ESI], #TSD$ACTDSP>8 ;Is this the active display?
+	JE	ret008.S		;No
+	MOVL	EDX, tdb_bioreg[ESI]	      ;Yes - point to graphics
+	ADDL	EDX, #P_EGAGCINDX-P_EGABASE.B ;  controller index register
+	MOVB	AL, #6			;Restore register 6 (miscellaneous)
+	OUTB	[DX]
+	IOPAUSE
+	INCL	EDX
+	MOVB	AL, #06h
+	OUTB	[DX]
+	IOPAUSE
+	DECL	EDX
+	MOVB	AL, #5			;Restore register 5 (mode)
+	OUTB	[DX]
+	IOPAUSE
+	INCL	EDX
+	MOVB	AL, #10h
+	OUTB	[DX]
+	IOPAUSE
+	DECL	EDX
+	MOVB	AL, #4			;Restore register 4 (read plane select)
+	OUTB	[DX]
+	IOPAUSE
+	INCL	EDX
+	MOVB	AL, #00h
+	OUTB	[DX]
+	IOPAUSE
+	ADDL	EDX, #P_EGASEQINDX-P_EGAGCDATA.B ;Now restore sequencer regs
+	MOVB	AL, #2			;Restore register 2 (write plane mask)
+	OUTB	[DX]
+	IOPAUSE
+	INCL	EDX
+	MOVB	AL, #03h
+	OUTB	[DX]
+	IOPAUSE
+	DECL	EDX
+	MOVB	AL, #3			;Restore register 3 (data rotate)
+	OUTB	[DX]
+	IOPAUSE
+	INCL	EDX
+	MOVB	AL, #00h
+	OUTB	[DX]
+	IOPAUSE
+	DECL	EDX
+	MOVB	AL, #4			;Restore register 4 (Memory mode)
+	OUTB	[DX]
+	IOPAUSE
+	INCL	EDX
+	MOVB	AL, #02h
+	OUTB	[DX]
+
+.IF NE 0
+
+	MOVL	EDX, tdb_bioreg[ESI]	;Point to port for status 1 register
+	ADDL	EDX, #P_EGACSTS1-P_EGABASE.B
+	INB	[DX]			;Read input status 1 register to reset
+	IOPAUSE				;  attribute port to the index register
+	ADDL	EDX, #P_EGAATTRIB-P_EGACSTS1.B ;Point to attribute controller
+					       ;  port
+	MOVB	AL, #10h		;Address the mode control register
+	OUTB	[DX]
+	IOPAUSE
+	MOVZBL	EAX, tdb_mode.B[ESI]
+	IMULL	EAX, #VGATBLSIZE#.B
+	ADDL	EAX, #vgatable0#
+	MOVB	AL, tbl_atrregs+10.B[EAX]
+	OUTB	[DX]
+	IOPAUSE
+	MOVB	AL, #20h		;Enable video
+	OUTB	[DX]
+
+.ENDC
+
+	CLRL	EAX			;Return 0
+ret010:	RET
+.PAGE
+	.SBTTL	vgawrtchargen - Subroutine to set up registers for write access
+
+;Subroutine to set up VGA registers for write access to the display buffer
+;	CALL	vgawrtchargen
+;	c[DX] = P_EGAGCDATA
+
+vgawrtchargen::
+	TESTB	tdb_stsdsp+1.B[ESI], #TSD$ACTDSP>8 ;Is this the active display?
+	JE	ret010.S		;No
+	MOVL	EDX, tdb_bioreg[ESI]	;Yes - point to sequencer index register
+	ADDL	EDX, #P_EGASEQINDX-P_EGABASE.B
+	MOVB	AL, #2			;Change register 2 (write mask) to
+	OUTB	[DX]			;  write both planes 2 and 3
+	IOPAUSE
+	INCL	EDX
+	MOVB	AL, #0Ch
+	OUTB	[DX]
+	IOPAUSE
+	DECL	EDX
+	MOVB	AL, #4
+	OUTB	[DX]			;Change register 4 (memory mode) for
+	IOPAUSE				;  non-interleaved access
+	INCL	EDX
+	MOVB	AL, #06h
+	OUTB	[DX]
+	IOPAUSE
+	ADDL	EDX, #P_EGAGCINDX-P_EGASEQDATA.B ;Point to graphics controller
+	MOVB	AL, #5				 ;  index register
+	OUTB	[DX]			;Change register 5 (mode)
+	IOPAUSE
+	INCL	EDX
+	MOVB	AL, #00h
+	OUTB	[DX]
+	IOPAUSE
+	DECL	EDX
+	MOVB	AL, #6			;Change register 6 (miscellaneous)
+	OUTB	[DX]
+	IOPAUSE
+	INCL	EDX
+	MOVB	AL, #00h
+	OUTB	[DX]
+
+.IF NE 0
+
+	MOVL	EDX, tdb_bioreg[ESI]	;Point to port for status 1 register
+	ADDL	EDX, #P_EGACSTS1-P_EGABASE.B
+	INB	[DX]			;Read input status 1 register to reset
+	IOPAUSE				;  attribute port to the index register
+	ADDL	EDX, #P_EGAATTRIB-P_EGACSTS1.B ;Point to attribute controller
+					       ;  port
+	MOVB	AL, #10h		;Address the mode control register
+	OUTB	[DX]
+	IOPAUSE
+	MOVB	AL, #01
+	OUTB	[DX]
+
+.ENDC
+
+	RET
+.PAGE
+;Subroutine to clear a single display page
+;	c{EAX} = Contents for page
+;	c{EDX} = Page to clear
+;	CALL	vgaclrbfrpage
+
+;  The page list is an array of longs.  
+;  If the contents value is -1, the page is not changed.  Otherwise the page
+;  is initialized according to the value.  For text pages (pages 1-15) the
+;  contents is the 16-bit attribute/character value.  For character generator
+;  pages (pages 16-31) the value gives character set to load into plane as
+;  follows (note that the low half value is 2 X the font index value, the high
+;  half value is 2 X the font index value plus 1):
+;	00h - No font, page cleared to all 0s
+;	02h - 8x8, low half
+;	03h - 8x8, high half
+;	04h - 8x14, low half
+;	05h - 8x14, high half
+;	06h - 8x16, low half
+;	07h - 8x16, high half
+;	0Ah - 9x8, low half
+;	0Bh - 9x8, high half
+;	0Ch - 9x14, low half
+;	0Dh - 9x14, high half
+;	0Eh - 9x16, low half
+;	0Fh - 9x16, high half
+;	FEh - Low half of current font
+;	FFh - High half of current font
+;  Any value not given above is treated as if it were 0
+
+vgaclrbfrpage::
+	ANDB	tdb_pglist+3[ESI+EDX*4], #{~{PL$MODIFIED|PL$INCMOD}>24t}&0FFh
+	CMPL	EDX, #16t.B		;Character generator page?
+	JAE	4$.S			;Yes - go handle that
+	MOVW	tdb_pglist[ESI+EDX*4], AX ;No - update the page list
+	TESTB	tdb_stsdsp+1.B[ESI], #TSD$ACTDSP>8 ;Is this the active display?
+	JE	2$.S			;No
+	SHLL	EDX, #12t		;Yes - get base address for plane
+	PUSHL	EDI
+	MOVL	EDI, tdb_dhdb.B[ESI]
+	MOVL	EDI, dhdb_vtaddr.B[EDI]
+	ADDL	EDI, EDX
+	PUSHL	DS
+	POPL	ES
+	MOVL	ECX, EAX		;Get a 32-bit value
+	SHLL	EAX, #16t
+	MOVW	AX, CX
+	MOVL	ECX, #1024t		;Get number of longs to set
+	CLD
+	RSTOSL	[EDI]			;Clear the page
+	POPL	EDI
+2$:	RET
+
+;Here to clear a character generator page
+
+4$:	MOVL	ECX, EDX
+	ANDL	EDX, #0Fh.B
+	SHLL	EDX, #12t		;Get base address for plane
+	PUSHL	EDI
+	MOVL	EDI, tdb_dhdb.B[ESI]
+	MOVL	EDI, dhdb_vtaddr.B[EDI]
+	ADDL	EDI, EDX
+	PUSHL	DS
+	POPL	ES
+	CLD
+	MOVZBL	EAX, AL
+	CMPL	EAX, #VGAFONTMAXX2#.B	;Legal value?
+	JB	8$.S			;Yes - go on
+	CMPB	AL, #0FE		;No - want current font?
+	JB	14$.S			;No - just clear the page!
+	MOVL	EAX, tdb_table.B[ESI]
+	MOVZBL	EAX, tbl_font.B[EAX]
+	JE	6$.S
+	ADDL	EAX, EAX
+	INCL	EAX
+	JMP	8$.S
+
+6$:	ADDL	EAX, EAX
+8$:	MOVW	tdb_pglist[ESI+ECX*4], AX ;Update the page list
+	CMPL	vgafonttbl#[EAX*4], #0.B ;Valid font?
+	JNE	18$.S			;Yes - go on
+14$:	CLRL	EAX			;No - clear the page
+	MOVW	tdb_pglist[ESI+ECX*4], AX ;Update the page list
+	TESTB	tdb_stsdsp+1.B[ESI], #TSD$ACTDSP>8 ;Is this the active display?
+	JE	16$.S			;No
+	MOVL	ECX, #1024t		;Get number of longs to set
+	RSTOSL	[EDI]			;Clear the page
+16$:	POPL	EDI
+	RET
+
+;Here to clear (really initialize) character generator page
+
+18$:	TESTB	tdb_stsdsp+1.B[ESI], #TSD$ACTDSP>8 ;Is this the active display?
+	JE	16$.S			;No
+	MOVB	DL, #128t		;Yes - initialize the entire page
+	MOVB	DH, #0
+	MOVZBL	EBX, vgafontsize#[EAX]	;Get height of the font
+	PUSHL	ESI
+	MOVL	ESI, vgafonttbl#[EAX*4]	;Get offset of font data
+	PUSHL	DS
+	POPL	FS
+	CALL	vgainitchargen
+	POPL	ESI
+	POPL	EDI
+ret020:	RET
+.PAGE
+	.SBTTL	vgainitchargen - Subroutine to initialize a character generator page
+
+;Subroutine to initialize a character generator page
+;	c{EAX}    = Font index * 2 + N
+;	c{EBX}    = Height of font
+;	c(DL)     = Number of characters to load
+;	c(DH)     = First character to load
+;	c{EDI}    = Offset of display buffer
+;	c{FS:ESI} = Address of font table
+;	CALL	vgainitchargen
+
+;Caller must have verified that EAX contains a valid value.
+
+vgainitchargen::
+	MOVB	CL, #128t		;Get maximum number we can load
+	SUBB	CL, DH
+	JB	ret020.S
+	CMPB	DL, CL
+	JBE	2$.S
+	MOVB	DL, CL
+2$:	PUSHL	EBX
+	MOVZBL	ECX, DH
+	SHLL	ECX, #5t
+	ADDL	EDI, ECX
+	MOVB	DH, #128t
+4$:	MOVL	ECX, EBX		;Copy a character
+	PUSHL	DS
+	POPL	ES
+	CLD
+	RMOVSB	[EDI], FS:[ESI]
+	MOVL	ECX, #32t		;Clear space above character
+	SUBB	CL, BL
+	JE	12$.S			;If nothing to fill
+	BTL	EDI, #12t		;High font page?
+	JNC	6$.S			;No
+	CMPB	DH, #30h		;Yes - in the special range?
+	JB	6$.S			;No
+	CMPB	DH, #5Fh		;Maybe
+	JBE	8$.S			;Yes
+6$:	MOVB	AL, #0			;Not special - just fill with 0 bytes
+	JMP	10$.S
+
+;Here if have special graphics character - fill the remaining font bytes by
+;  copying the last two bytes from the font definition
+
+8$:	MOVW	AX, -2.B[ESI]
+	PUSHL	ECX
+	SHRL	ECX, #1
+	RSTOSW	[EDI]
+	POPL	ECX
+	ANDL	ECX, #1
+10$:	RSTOSB	[EDI]
+12$:	INCB	DH
+	DECB	DL			;More characters to copy?
+	JNE	4$.S			;Yes - continue
+	POPL	EBX			;No - finished here
+
+;CODE GOES HERE TO APPLY FIXUP TABLE
+
+	RET
+.PAGE
+	.SBTTL	Data
+
+	CODE
+
+	.MOD	4
+vgaintcode::			;Place to allocate KB interrupt routine if
+	.BLKB	64t		;  booting (must be at top of code msect)
+
+	DATA
+
+$$$=!0
+BLK bc_tl, 1		;Character for top left corner
+BLK bc_tr, 1		;Character for top right corner
+BLK bc_bl, 1		;Character for bottom left corner
+BLK bc_br, 1		;Character for bottom right corner
+BLK bc_h , 1		;Character for horizontal line
+BLK bc_v , 1		;Character for vertical line
+
+sngbrdr:.BYTE	0DAh, 0BFh, 0C0h, 0D9h, 0C4h, 0B3h
+dblbrdr:.BYTE	0C9h, 0BBh, 0C8h, 0BCh, 0CDh, 0BAh
+mixbrdr:.BYTE	0D5h, 0B8h, 0D4h, 0BEh, 0CDH, 0B3h
+
+	END

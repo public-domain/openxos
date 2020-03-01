@@ -1,0 +1,1420 @@
+	.TITLE	UDPCLS - UDP routines for XOS
+
+;++++
+; This software is in the public domain.  It may be freely copied and used
+; for whatever purpose you see fit, including commerical uses.  Anyone
+; modifying this software may claim ownership of the modifications, but not
+; the complete derived code.  It would be appreciated if the authors were
+; told what this software is being used for, but this is not a requirement.
+
+;   THIS SOFTWARE IS PROVIDED BY THE AUTHORS "AS IS" AND ANY EXPRESS OR
+;   IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
+;   OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+;   IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+;   INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+;   BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS
+;   OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+;   ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR
+;   TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
+;   USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+;----
+
+	.PROC	80486
+	.INCLUD	XOSINC:\XMAC\XOS.PAR
+	.INCLUD	XOSINC:\XMAC\XOSX.PAR
+	.INCLUD	XOSINC:\XMAC\XOSTIME.PAR
+	.INCLUD	XOSINC:\XMAC\XOSERR.PAR
+	.INCLUD	XOSINC:\XMAC\XOSNET.PAR
+	.INCLUD	XOSINC:\XMAC\XOSXNET.PAR
+	.INCLUD	XOSINC:\XMAC\XOSXIPS.PAR
+	.INCLUD	XOSINC:\XMAC\XOSXUDP.PAR
+	.INCLUD	XOSINC:\XMAC\XOSLKE.PAR
+	.INCLUD	XOSINC:\XMAC\XOSXLKE.PAR
+
+MAJV   =!2t
+MINV   =!0t
+EDITNUM=!0t
+
+	LKEHEAD	UDPCLS, MAJV, MINV, EDITNUM, LKETYPE_CLASS
+
+	.EXPORT	xosudpAuUdpDev
+	.EXPORT	xosudpChkSum
+	.EXPORT	xosudpChkSumCnt
+	.EXPORT	xosudpHashClr
+	.EXPORT	xosudpHashSet
+	.EXPORT	xosudpSetPkt
+	.EXPORT	xosudpTpdbHead
+
+	CODE
+
+;NOTE:	The IOPAR_NETRMTNETAS, IOPAR_NETRMTNETAR, IOPAR_NETRMPORTS, and
+;	IOPAR_NETRMTPORTR parameters are used as follows:
+;		Input:	IOPAR_NETRMTNETAS, IOPAR_NETRMTPORTS
+;			  The send values are set or read, but do not effect
+;			  the input operation.  They will effect subsiquent
+;			  output operations.
+;			IOPAR_NETRMTNETAR, IOPAR_NETRMTPORTR
+;			  The values read are those from the received packet.
+;			  The values cannot be set.
+;		Output:	IOPAR_NETRMTNETAS, IOPAR_NETRMTPORTS
+;			  The values set are used when sending the packet.
+;			  The values read are the values in effect when the
+;			  parameter is processed before the output is done.
+;			IOPAR_NETRMTNETAR, IOPAR_NETRMTPORTR
+;			  The values read are the actual remote address and
+;			  port values used to send the packet that was
+;			  received.  The values cannot be set.
+
+	.SBTTL	SVC dispatch table for UDP devices
+
+;SVC dispatch table for UDP devices
+
+udpdsp:	.LONG	knlRtnZero##	;sd_mount	=  0. - Mount
+	.LONG	knlRtnZero##	;sd_cleardev	=  4. - Clear device
+	.LONG	udpgivedcb	;sd_cleardcb	=  8. - Clear DCB
+	.LONG	knlRtnZero##	;sd_commit	= 12. - Commit data to disk
+	.LONG	knlRtnZero##	;sd_transold    = 16. - Transfer device/old
+	.LONG	knlRtnZero##	;sd_transnew    = 20. - Transfer device/new
+	.LONG	knlNullQio##	;sd_opena	= 24. - Open additinal
+	.LONG	udpopen		;sd_open1	= 28. - Open device/file
+	.LONG	udpopen		;sd_devparm     = 32. - Device parameters
+	.LONG	knlIFnDev##	;sd_delete	= 36. - Delete file
+	.LONG	knlIFnDev##	;sd_rename	= 40. - Rename file
+	.LONG	udpinpblk	;sd_inblock	= 44. - Input block
+	.LONG	udpoutblk	;sd_outblock	= 48. - Output block
+	.LONG	knlIFnDev##	;sd_outblockq	= 52. - Output block (XFF)
+	.LONG	knlIFnDevGQ##	;sd_outstring	= 56. - Output string
+	.LONG	knlRtnMOne##	;sd_getiosts	= 60. - Get input/output status
+	.LONG	knlIFnDevGQ##	;sd_special     = 64. - Special device function
+	.LONG	udpclose	;sd_close	= 68. - Close file
+	.LONG	knlNullLabel##	;sd_label       = 72. - Get device label
+	.LONG	knlNullQioGQ##	;sd_commitfunc	= 76. - Commit data to disk
+	.LONG	udpdevinfo	;sd_devinfo     = 80. - Get device info
+UDPDSPSZ=!{$-udpdsp}/4
+
+;Class function dispatch table for Ethernet class devices
+
+	.LONG	UDPCLSFMX
+udpcls:	.LONG	udpaddunit	;CF_ADDUNIT =  8. - Add unit
+	.LONG	udpunitinfo	;CF_PUNITS  =  9. - Get information about
+				;		      physical units
+	.LONG	knlIFnDevGQ##	;CF_AUNITS  = 10. - Get information about active
+				;		      units
+UDPCLSFMX==!{$-udpcls}/4
+.PAGE
+;Device characteristics tables for the UDP devices
+
+	DATA
+
+	.MOD	4
+udpdctbl:
+ DCHARBGN  1, knlDCharValCom##
+ DCHARENT  CLASS   , TEXT, ,  8, knlDcMsgClass##    , knlDcGetClass##    , knlDcSetClass##    , 0
+ DCHARENT  IPSDEV  , TEXT, , 16, xosipsMsgIpsDev##  , xosipsGetIpsDev##  , 0                  , 0
+ DCHARENT  IPPROT  , DECV, ,  1, xosipsMsgIpProt##  , xosipsGetTpdbByte##, xosipsSetIpProt##  , tpdb_ipprot
+ DCHARENT  RTREMOVE, DECV, ,  4, xosipsMsgRtRemove##, xosipsGetNdbData## , xosipsSetRtRemove##, ndb_rtpurge
+ DCHARENT  PKTIN   , DECV, ,  4, xosnetMsgPktIn##   , xosipsGetTpdbData##, xosipsSetTpdbData##, tpdb_udpcntpktin
+ DCHARENT  BYTEIN  , DECV, ,  4, knlDcMsgByteIn##   , xosipsGetTpdbData##, xosipsSetTpdbData##, tpdb_udpcntbytein
+ DCHARENT  PKTOUT  , DECV, ,  4, xosnetMsgPktOut##  , xosipsGetTpdbData##, xosipsSetTpdbData##, tpdb_udpcntpktout
+ DCHARENT  BYTEOUT , DECV, ,  4, knlDcMsgByteOut##  , xosipsGetTpdbData##, xosipsSetTpdbData##, tpdb_udpcntbyteout
+ DCHARENT  CHKSUM  , DECV, ,  4, xosipsMsgChkSum##  , xosipsGetTpdbData##, xosipsSetTpdbData##, tpdb_udpcntchksum
+ DCHARENT  NODST   , DECV, ,  4, xosipsMsgNoDst##   , xosipsGetTpdbData##, xosipsSetTpdbData##, tpdb_udpcntnodst
+ DCHARENT  IBLXCD  , DECV, ,  4, xosipsMsgIBLXcd##  , xosipsGetTpdbData##, xosipsSetTpdbData##, tpdb_udpcntiblxcd
+ DCHARENT  BADHDR  , DECV, ,  4, xosipsMsgBadHdr##  , xosipsGetTpdbData##, xosipsSetTpdbData##, tpdb_udpcntbadhdr
+ DCHARENT  PSLTMN  , DECV, ,  4, xosipsMsgPSLtMn##  , xosipsGetTpdbData##, xosipsSetTpdbData##, tpdb_udpcntpsltmn
+ DCHARENT  PSLTDL  , DECV, ,  4, xosipsMsgPSLtDL##  , xosipsGetTpdbData##, xosipsSetTpdbData##, tpdb_udpcntpsltdl
+
+	CODE
+.PAGE
+;Device parameter table for UDP: open
+
+	.MOD	4
+
+	.LONG	OPARMMAX
+udpopnparms:
+	.LONG	udpopngenparms	 ;IOPAR_xxxxxx = 00xx - Generic IO parameters
+	.LONG	knlNullFilParms##;IOPAR_FILxxx = 01xx - File system IO
+				 ;			  parameters
+	.LONG	knlNullTrmParms##;IOPAR_TRMxxx = 02xx - Terminal IO parameters
+	.LONG	0		 ;IOPAR_DSKxxx = 03xx - Disk IO parameters
+	.LONG	0		 ;IOPAR_TAPxxx = 04xx - Tape IO parameters
+	.LONG	udpnetparms	 ;IOPAR_NETxxx = 05xx - Network IO parameters
+	.LONG	0		 ;IOPAR_IPMxxx = 06xx - IPM IO parameters
+	.LONG	udpmsgparms	 ;IOPAR_MSGxxx = 07xx - Message IO parameters
+OPARMMAX=!{$-udpopnparms}/4
+
+	.LONG	OPARMGENMAX	;Size of table
+udpopngenparms:
+	.LONG	0		;		   = 0000h
+	.LONG	knlIopDummyN##	;IOPAR_FILOPTN     = 0001h
+	.LONG	knlIopDummyS##	;IOPAR_FILSPEC     = 0002h
+	.LONG	knlIopDevSts##	;IOPAR_DEVSTS      = 0003h
+	.LONG	knlIopUnitNum##	;IOPAR_UNITNUM     = 0004h
+	.LONG	knlIopGlbId##	;IOPAR_GLBID       = 0005h
+	.LONG	knlIopDelay##	;IOPAR_DELAY       = 0006h
+	.LONG	knlIopTimeOut##	;IOPAR_TIMEOUT     = 0007h
+	.LONG	0		;IOPAR_INPSTS      = 0008h
+	.LONG	0		;IOPAR_OUTSTS      = 0009h
+	.LONG	knlIopInpQLmt##	;IOPAR_INPQLMT     = 000Ah
+	.LONG	knlIopOutQLmt##	;IOPAR_OUTQLMT     = 000Bh
+	.LONG	0		;IOPAR_SIVECT1     = 000Ch
+	.LONG	0		;IOPAR_SIVECT2     = 000Dh
+	.LONG	0		;IOPAR_SIDATA      = 000Eh
+	.LONG	knlIopNumOpen##	;IOPAR_NUMOPEN     = 000Fh
+	.LONG	knlIopBufrLmt##	;IOPAR_BUFRLMT	   = 0010h
+OPARMGENMAX=!{$-udpopngenparms}/4
+.PAGE
+;Device parameter table for UDP: IO operations
+
+	.LONG	PARMMAX
+udpioparms:
+	.LONG	udpiogenparms	 ;IOPAR_xxxxxx = 00xx - Generic IO parameters
+	.LONG	knlNullFilParms##;IOPAR_FILxxx = 01xx - File system IO
+				 ;			  parameters
+	.LONG	knlNullTrmParms##;IOPAR_TRMxxx = 02xx - Terminal IO parameters
+	.LONG	0		 ;IOPAR_DSKxxx = 03xx - Disk IO parameters
+	.LONG	0		 ;IOPAR_TAPxxx = 04xx - Tape IO parameters
+	.LONG	udpnetparms	 ;IOPAR_NETxxx = 05xx - Network IO parameters
+	.LONG	0		 ;IOPAR_IPMxxx = 06xx - IPM IO parameters
+	.LONG	udpmsgparms	 ;IOPAR_MSGxxx = 07xx - Message IO parameters
+PARMMAX=!{$-udpioparms}/4
+
+	.LONG	PARMGENMAX	;Size of table
+udpiogenparms:
+	.LONG	0		;		   = 0000h
+	.LONG	knlIopFilOptn##	;IOPAR_FILOPTN     = 0001h
+	.LONG	knlIopFilSpec##	;IOPAR_FILSPEC     = 0002h
+	.LONG	knlIopDevSts##	;IOPAR_DEVSTS      = 0003h
+	.LONG	knlIopUnitNum##	;IOPAR_UNITNUM     = 0004h
+	.LONG	knlIopGlbId##	;IOPAR_GLBID       = 0005h
+	.LONG	knlIopDelay##	;IOPAR_DELAY       = 0006h
+	.LONG	knlIopTimeOut##	;IOPAR_TIMEOUT     = 0007h
+	.LONG	0		;IOPAR_INPSTS      = 0008h
+	.LONG	0		;IOPAR_OUTSTS      = 0009h
+	.LONG	knlIopInpQLmt##	;IOPAR_INPQLMT     = 000Ah
+	.LONG	knlIopOutQLmt##	;IOPAR_OUTQLMT     = 000Bh
+	.LONG	0		;IOPAR_SIVECT1     = 000Ch
+	.LONG	0		;IOPAR_SIVECT2     = 000Dh
+	.LONG	0		;IOPAR_SIDATA      = 000Eh
+	.LONG	knlIopNumOpen##	;IOPAR_NUMOPEN     = 000Fh
+	.LONG	knlIopBufrLmt##	;IOPAR_BUFRLMT	   = 0010h
+PARMGENMAX=!{$-udpiogenparms}/4
+
+	.LONG	PARMNETMAX
+udpnetparms:
+	.LONG	0		;		   = 0500h
+	.LONG	0		;IOPAR_NETSUBUMASK = 0501h
+	.LONG	0		;IOPAR_NETPROTOCOL = 0502h
+	.LONG	xfrlclport	;IOPAR_NETLCLPORT  = 0503h
+	.LONG	0		;IOPAR_NETRMTHWAS  = 0504h
+	.LONG	0		;IOPAR_NETRMTHWAR  = 0505h
+	.LONG	xfrrmtnetas	;IOPAR_NETRMTNETAS = 0506h
+	.LONG	xfrrmtnetar	;IOPAR_NETRMTNETAR = 0507h
+	.LONG	xfrrmtports	;IOPAR_NETRMTPORTS = 0508h
+	.LONG	xfrrmtportr	;IOPAR_NETRMTPORTR = 0509h
+	.LONG	xfrrmtaddr	;IOPAR_NETDSTNAME  = 050Ah
+	.LONG	0		;IOPAR_NETSMODE    = 050Bh
+	.LONG	0		;IOPAR_NETCMODE    = 050Ch
+	.LONG	0		;IOPAR_NETRCVWIN   = 050Dh
+	.LONG	xfrlclneta	;IOPAR_NETLCLNETA  = 050Eh
+PARMNETMAX=!{$-udpnetparms}/4
+
+	.LONG	PARMSGMAX
+udpmsgparms:
+	.LONG	0		;		   = 0700h
+	.LONG	0		;IOPAR_MSGLCLADDR  = 0701h
+	.LONG	rmtaddrs	;IOPAR_MSGRMTADDRS = 0702h
+	.LONG	rmtaddrr	;IOPAR_MSGRMTADDRR = 0703h
+PARMSGMAX=!{$-udpmsgparms}/4
+.PAGE
+	.SBTTL	udpinit - Initialization routine
+
+	INITSUB	udpinit
+
+;The command for installing UDPCLS is:
+;	LKELOAD UDPCLS
+
+udpinit:MOVL	EDI, #udpchk		;Install the IPS class
+	MOVL	EBX, #udpcls		;Offset of class function dispatch table
+	MOVL	EAX, #'UDP'
+	CLRL	EDX
+	MOVL	ESI, #udpccb
+	CALL	knlNewClass##		;Install the IPS device class
+	JC	4$.S			;If error
+	MOVL	ECX, #xcodetop		;OK
+	CLRL	EDX
+	CLRL	EAX
+4$:	MOVL	EBX, #QSTS$DONE
+	RET
+
+	CODE
+.PAGE
+	.SBTTL	udpaddunit - Subroutine to add UDP unit
+
+;Subroutine to add UDP unit - this implements a UDP protocol device for a
+;  single IPS device.  Multiple UDP units with different IP protocol may be
+;  set up for each IPS device if desired.
+;	c{ESI} = Offset of IORB
+;	CALL	udpaddunit
+;	c{EAX} = Error code
+;	c{EBX} = Status bits
+;	c{ECX} = Item count
+
+$$$=!0
+FRM udpau_snapnum , 4t		;Number of SNAP devices specified
+FRM udpau_unit    , 4t		;Unit number
+FRM udpau_netnum  , 4t
+FRM udpau_count   , 4t
+FRM udpau_pdb     , 4t		;Offset of PDB
+udpau_SIZE=!$$$
+
+	DATA
+
+	.MOD	4
+udpaublk:				;Parameter description block for
+ DCHARBGN  3, knlDCharValCom##		;  adduparms
+ DCHARENT  UNIT  , DECV, ,  1, 0, 0, udpauunit  , 0
+ DCHARENT  IPSDEV, TEXT, , 16, 0, 0, udpauipsdev, 0
+
+	CODE
+
+	IFFAULT	8$
+udpaddunit:
+	LFSL	EDX, iorb_buffer2.B[ESI]
+	CALL	knlGiveQel##		;Give up the IORB
+	ENTER	udpau_SIZE, 0		;Allocate our stack frame
+	CLRL	EAX
+	LEAL	EDI, -udpau_SIZE[EBP]	;Clear our stack frame
+	MOVL	ECX, #udpau_SIZE/4
+	PUSHL	SS
+	POPL	ES
+	CLD
+	RSTOSL	[EDI]
+	DECL	udpau_unit.B[EBP]	;Indicate illegal unit number
+	MOVL	EBX, #udpaublk
+	MOVB	AL, #0			;Fail on bad names
+	CALL	knlAddUnitChar##	;Process the characteristics
+	JC	4$.S			;If error
+	CMPL	udpau_pdb.B[EBP], #0.B	;Was a IPS device specified?
+	JE	2$.S			;No
+	CMPL	udpau_unit.B[EBP], #0.B	;Yes - was a unit number specified?
+	JGE	10$.S			;Yes
+2$:	MOVL	EAX, #ER_CHARM		;No - fail
+4$:	CLRL	ECX
+6$:	MOVL	EBX, #QSTS$DONE
+	LEAVE
+	TOFORK
+	RET
+		
+;Here if address error with the IORB
+
+	FAULTHDR
+8$:	CALL	knlGiveQel##
+	MOVL	EAX, #ER_ADRER
+	JMP	4$.S
+
+;Here with characteristics processed
+
+10$:	PUSHL	udpau_unit.B[EBP]
+	PUSHL	#tpdb_udpSIZE
+	PUSHL	#'UDP'
+	PUSHL	#dcb_udpINDEX.B
+	PUSHL	#256t*4
+	PUSHL	#tpdb_udprcvhash.B
+	PUSHL	#udprcv
+	PUSHL	#udpccb
+	PUSHL	udpau_pdb.B[EBP]
+	PUSHL	#xosudpTpdbHead
+	CALL	xosipsNewTransProt##	;Set up the new transport protocol
+	JC	4$.S			;If error
+12$:	MOVL	tpdb_dstunr.B[EDI], #udpdstunr
+	MOVL	EDI, tpdb_nextd.B[EDI]
+	ORL	EDI, EDI
+	JNE	12$.S
+	MOVL	ECX, #1			;OK
+	JMP	6$.S
+
+	CODE
+.PAGE
+;Subroutine called by adduparms for the "UNIT" parameter
+
+udpauunit:
+	CMPL	EAX, #99t.B		;Valid value?
+	JA	knlBadCharV##		;No - fail
+	MOVL	udpau_unit.B[EBP], EAX	;Yes - store it
+	CLC
+	RET
+
+;Subroutine called by adduparms for the "IPSDEV" parameter
+
+udpauipsdev:
+	MOVL	EAX, udpau_pdb.B[EBP]	;Get current IPS PDB offset
+	CALL	xosipsAuIpsDev##	;Get IPS PDB offset
+	JC	2$.S			;If error
+	MOVL	udpau_pdb.B[EBP], EDI	;OK - store IPS PDB offset
+2$:	RET
+.PAGE
+	.SBTTL	xosudpAuUdpDev - Subroutine to process UDPDEV addunit characteristic
+
+;Subroutine to process UDPDEV addunit characteristic for devices which use UDP
+;  as their underlying protocol
+;	c{EAX} = Current UDP TPDB offset
+;	CALL	xosudpAuUdpDev
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  c{EDI} = Offset of UDP TPDB
+
+xosudpAuUdpDev:
+	ORL	EAX, EAX		;Alreay have a UDP TPDB?
+	JNE	2$.S			;Yes - fail
+	MOVL	EBX, #knlDcValue##	;No
+	PUSHL	12t.B[EBX]
+	PUSHL	8.B[EBX]
+	PUSHL	4.B[EBX]
+	MOVL	EAX, [EBX]
+	PUSHL	EAX
+	ANDL	EAX, #0FFFFFFh
+	CMPL	EAX, #'UDP'
+	JNE	4$.S
+	LEAL	ECX, 3.B[ESP]
+	MOVL	EDI, xosudpTpdbHead	;Get offset of first TPDB
+	CALL	xosnetSrchBlock##	;Find the correct TPDB
+	JNE	4$.S			;If can't find it
+	CMPB	SS:[ECX], #0		;Did he specify a specific network?
+	JNE	4$.S			;Yes - fail
+	ADDL	ESP, #16t.B
+	RET
+
+;Here if more than one UDP device specified
+
+2$:	MOVL	EAX, #ER_TMDDV
+	STC
+	RET
+
+;Here if cannot find requested UDP device
+
+4$:	ADDL	ESP, #16t.B
+	JMP	knlBadCharV##
+.PAGE
+	.SBTTL	udpunitinfo - UDP get phyical unit information function
+
+;Here for the get physical unit information class function (CL_PUNITS) for the
+;  UDP class
+;	c{EBX} = Offset of CCB
+;	c{ESI} = Offset of IORB
+;	CALL	udpunitinfo
+;	c{EAX} = Error code
+;	c{EBX} = Status bits
+;	c{ECX} = Item count
+;  A zero count (iorb_count) requests that the number of units only be returned
+;    in qab_amount.  A non-zero count indicates that a buffer is available for
+;    that many unit names (8 characters each, null padded).
+
+udpunitinfo:
+	CALL	knlGiveQel##
+	MOVL	EAX, #ER_NIYT
+	MOVL	EBX, #QSTS$DONE
+	CLRL	ECX
+	TOFORK
+	RET
+.PAGE
+	.SBTTL	udpchk - Device check routine for UDP class devices
+
+;Device check routine for UDP class devices
+;	c{SS:EBX} = Device name (16 characters)
+;	CALL	udpchk
+;	C:set = Error (match found)
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  Z:set = Match found
+;	    c{EDI} = Offset of DCB
+;	  Z:clr = Not found
+;  EBX and ESI are preserved
+
+udpchk:	MOVL	EAX, SS:[EBX]
+	ANDL	EAX, #0FFFFFFh
+	CMPL	EAX, #'UDP'		;Is this UDP*?
+	JNE	4$.S			;No
+	MOVL	EDI, xosudpTpdbHead	;Yes - get offset first UDP TPDB
+	LEAL	ECX, 3.B[EBX]		;Get offset of 1st unit number character
+	MOVL	EDX, #DS$DUPLEX		;Get description bits
+	CALL	xosipsFindDev##		;Find matching network device
+	JC	2$.S			;If error
+	JNE	2$.S			;Or if not a match
+	MOVL	dcb_sdisp.B[EDI], #udpdsp ;Store offset of SVC dispatch table
+	MOVL	dcb_udprcvdisp.B[EDI], #udpdevrcv ;Store offset of receive
+						  ;  routine
+	MOVB	dcb_ipsprot.B[EDI], #IPP_UDP ;Store protocol value
+	MOVL	dcb_devchar.B[EDI], #udpdctbl ;Use our device characteristics
+	MOVL	ECX, #80000401h		;Assign default port number
+	CALL	xosipsGetPort##
+	JC	10$.S			;If error
+	MOVZBL	EBX, dcb_ipslclport+0.B[EDI] ;Get hash index
+	CALL	xosudpHashSet		;Put DCB in the hash table
+	CLRL	EAX			;Set Z
+2$:	RET				;And return
+
+4$:	CLC
+	RET
+
+;Here if can't allocate default port number
+
+10$:	PUSHL	EAX
+	CALL	xosipsGiveDcb##
+	POPL	EAX
+	STC
+	RET
+.PAGE
+	.SBTTL	sd_cleardcb - Clear DCB
+
+;Here for the clear DCB entry
+
+udpgivedcb:
+	MOVL	EBX, dcb_udprcvhead.B[EDI] ;Have any received packets?
+	TESTL	EBX, EBX
+	JE	4$.S			;No
+2$:	PUSHL	npb_next.B[EBX]		;Yes - save offst of next one
+	CALL	xosnetGiveBufr##	;Give up this one
+	POPL	EBX			;Restore offset of next
+	TESTL	EBX, EBX		;More?
+	JNE	2$.S			;Yes
+4$:	CMPL	dcb_ipsportnext[EDI], #-1.B ;Have a port now?
+	JE	6$.S			;No
+	MOVZBL	EBX, dcb_ipslclport+0.B[EDI] ;Yes - get hash index
+	CALL	xosudpHashClr		;Remove from hash table
+	CALL	xosipsGivePort##	;Give up the port
+6$:	JMP	xosipsGiveDcb##		;Give up the DCB					;  when this timer goes off)
+.PAGE
+	.SBTTL	sd_devinfo - Get device information
+
+;Here for the get device information entry
+;	c{ECX}    = Length of user buffer
+;	c{ES:EDI} = Address of user buffer
+;	c{ESI}    = Offset of DCB
+;	CALL	udpdevinfo
+
+$$$=!0
+FRM info_left  , 4t
+FRM info_amount, 4t
+info_SIZE=!$$$
+
+udpdevinfo:
+	ENTER	info_SIZE, 0
+	MOVL	info_left.B[EBP], ECX
+	CLRL	EAX
+	MOVL	info_amount.B[EBP], EAX
+	JMP	xosipsDevInfoLcl##
+.PAGE
+	.SBTTL	sd_open - Open device
+
+;Here for the open device entry
+;	CALL	udpopen
+;	C:set = Error
+;	  c{EAX} = Error code 
+;	C:clr = Normal
+
+udpopen:MOVL	EAX, opn_frame1.B[EBP]	;Get buffer limit
+	MOVB	AL, SS:opn_bufrlmt.B[EAX]
+	CMPB	AL, #0			;Was a value specified?
+	JNE	6$.S			;Yes - use it
+	MOVB	AL, #4t			;No - default is 4
+6$:	MOVB	dcb_bufrlmt.B[EDI], AL
+	CMPL	SS:xffParm##, #0.B	;Have a parameter list?
+	JE	8$.S			;No
+	MOVL	EBX, #udpopnparms	;Yes - process device parameters
+	MOVL	ECX, #knlComDPParms##
+	LFSL	EDX, SS:xffParm##
+	CALL	knlProcDevParm##
+	JC	10$.S
+8$:	MOVL	ECX, #1			;Finished
+	CLRL	EAX
+	RET
+
+;Here if error processing parameters
+
+10$:	CLRL	ECX
+	STC
+	RET
+.PAGE
+	.SBTTL	sd_close - Close device
+
+	FAULTHDR
+2$:	MOVL	[ESP], #ER_ADRER
+	JMP	4$.S
+
+;Here for the close device entry
+;	c{ECX} = Close option bits
+;	c{EDI} = Offset of DCB
+;	c{ESI} = Offset of IORB
+;	CALL	udpclose
+;	C:set = Error
+;	  c{EAX} = Error code 
+;	C:clr = Normal
+
+udpclose:
+	PUSHL	#0.B
+	CMPL	iorb_parm.B[ESI], #0.B	;Have any device parameters?
+	JE	4$			;No
+	MOVL	EBX, #udpioparms	;Yes - process parameters
+	MOVL	ECX, #knlComDPParms##
+	IFFAULT	2$
+	LFSL	EDX, iorb_parm.B[ESI]
+	CALL	knlProcDevParm##
+	JNC	4$.S
+	MOVL	[ESP], EAX
+4$:	TOFORK
+	CMPL	dcb_opencnt.B[EDI], #1.B ;Last close?
+	JNE	8$.S			;No - nothing needed here
+	PUSHL	ESI
+	MOVL	ESI, dcb_netsdb.B[EDI]	;Yes - get offset of our SDB
+	MOVL	EBX, dcb_udprcvhead.B[EDI] ;Do we have any receive packets?
+	TESTL	EBX, EBX
+	JE	6$.S			;No
+	CALL	xosnetGiveList##	;Yes - give them up
+6$:	CLRL	EAX
+	MOVL	dcb_udprcvhead.B[EDI], EAX
+8$:	POPL	ESI
+	POPL	EAX
+	JMP	knlCloseFin##
+.PAGE
+	.SBTTL	sd_inblock - Input block
+
+;Here for the input block entry
+;	c{ESI} = Offset of IORB
+;	c{EDI} = Offset of DCB
+;	CALL	udpinpblk
+;	c{EAX} = Error code
+;	c{EBX} = Status bits
+;	c{ECX} = Amount transfered
+
+$$$=!0
+FRM udpio_rmtaddr, 8	;Address of remote address buffer
+FRM udpio_rmtlen , 4	;Length of remote address buffer
+FRM udpio_rmtsize, 8	;Address of remote address length value
+FRM udpio_msgaddr, 8	;Address of message remote address buffer
+FRM udpio_msglen , 4	;Length of message remote address buffer
+FRM udpio_msgsize, 8	;Address of message remote address length value
+FRM udpio_rppnt  , 8	;Address of remote port value item
+FRM udpio_rapnt  , 8	;Address of remote address value item
+udpio_SIZE=!$$$
+
+udpinpblk:
+	CALL	knlIoQabLock##		;Lock the QAB
+	JC	2$.S			;If error
+	CALL	knlIoReadLock##		;Lock the buffer pages
+	JC	2$.S
+	MOVB	iorb_queue.B[ESI], #dcb_inpframe
+	MOVL	iorb_routine.B[ESI], #udpinpblk1
+	JMP	knlXfQueue##		;Switch to extended fork context
+
+2$:	TOFORK
+	RET
+
+;Here in extended fork context
+
+udpinpblk1:
+	ENTER	udpio_SIZE, 0		;Yes - set up our stack frame
+	CLRL	EAX
+	MOVL	udpio_rmtlen.B[EBP], EAX
+	MOVL	udpio_msglen.B[EBP], EAX
+	MOVL	udpio_rapnt.B[EBP], EAX
+	MOVL	udpio_rppnt.B[EBP], EAX
+	DECL	EAX
+	MOVL	SS:xffTimeOut##, EAX
+	CMPL	SS:xffParm##+0, #0.B	;Have a parameter list?
+	JE	4$.S			;No
+	LFSL	EDX, SS:xffParm##	;Yes
+	MOVL	EBX, #udpioparms	;Process parameters
+	MOVL	ECX, #knlComDPParms##
+	CALL	knlProcDevParm##
+	JC	6$.S			;If error
+4$:	MOVL	EAX, SS:xffCount##	;Really want to do input?
+	TESTL	EAX, EAX
+	JE	6$.S			;No - finished here
+	TESTB	SS:xffCmd##, #O$IN	;Yes - is input allowed?
+	JNE	10$.S			;Yes - go on
+	JMP	knlIllInpLv##		;No - fail
+
+;Here if error in extended fork context
+
+6$:	LEAVE
+	CLRL	ECX
+	MOVL	EBX, #QSTS$DONE
+	RET
+
+8$:	CRASH	BRPC			;[Bad Received Packet Count]
+
+10$:	CMPL	dcb_udprcvhead.B[EDI], #0.B ;Have a received packet now?
+	JNE	12$.S			;Yes
+	MOVL	EAX, SS:xffTimeOut##	;No - get timeout value
+	CALL	xosnetRspWait##		;Wait until have a packet
+	JC	6$.S			;If error
+12$:	MOVL	EBX, dcb_udprcvhead.B[EDI] ;Get next received packet
+	MOVL	EAX, npb_next.B[EBX]	;Remove it from the receive list
+	MOVL	dcb_udprcvhead.B[EDI], EAX
+	TESTL	EAX, EAX
+	JNE	14$.S
+	MOVL	dcb_udprcvtail.B[EDI], EAX
+14$:	CMPB	dcb_udprcvcnt.B[EDI], #0 ;Valid received packet count value?
+	JE	8$.S			;No!
+	DECB	dcb_udprcvcnt.B[EDI]	;Yes - reduce it
+	MOVZBL	EDX, npb_tpofs.B[EBX]
+	ADDL	EDX, #udp_data.B
+	MOVL	ECX, npb_count.B[EBX]	;Get amount of data
+	SUBL	ECX, EDX
+	LESL	EDX, SS:xffBuffer1##	;Get address of his buffer
+	PUSHL	#QSTS$DONE		;Get final status bits
+	CMPL	ECX, SS:xffCount##	;Will it all fit in his buffer?
+	JBE	16$.S			;Yes
+	MOVL	ECX, SS:xffCount##	;No - just give him what will fit
+	BTSL	[ESP], #QSTS%TRUNC	;Indicate truncation
+16$:	PUSHL	ECX			;Save the amount we are giving him
+	PUSHL	EDI
+	MOVZBL	ESI, npb_tpofs.B[EBX]
+	LEAL	ESI, 8.B[EBX+ESI]
+	MOVL	EDI, EDX
+	CMPL	ECX, #4.B		;4 bytes or fewer?
+	JBE	18$.S			;Yes
+	MOVL	EAX, ECX		;No
+	CLRL	ECX			;Get destination long aligned
+	SUBL	ECX, EDI
+	ANDL	ECX, #03.B
+	SUBL	EAX, ECX
+	RMOVSB	[EDI], [ESI]
+	MOVL	ECX, EAX
+	SHRL	ECX, #2
+	RMOVSL	[EDI], [ESI]		;Copy most of the data 4 bytes at a time
+	MOVL	ECX, EAX
+	ANDL	ECX, #03.B
+18$:	RMOVSB	[EDI], [ESI]		;Copy anything left over
+	POPL	EDI
+	PUSHL	#0.B			;Save value to return
+
+;Give him the "remote address" if he asked for it
+
+xfrfin:	CMPL	udpio_rmtlen.B[EBP], #0.B ;Does he want the remote address?
+	JE	24$.S			;No
+	LESL	EDX, udpio_rmtaddr.B[EBP] ;Yes - get address of his buffer
+	CLRL	ECX
+	CMPL	udpio_rmtlen.B[EBP], #7.B ;Will the source fit in his buffer?
+	JAE	20$.S			;Yes
+	CMPL	udpio_rmtlen.B[EBP], #1.B ;No - any buffer at all?
+	JB	22$.S			;No
+	MOVB	ES:[EBX], #0		;Yes - indicate null string
+	JMP	22$.S
+
+;Here if source will fit in his buffer
+
+20$:	MOVB	ES:[EDX], #0FFh		;Store header byte
+	CALL	getaddr
+	MOVL	ES:1.B[EDX], EAX
+	CALL	getport
+	MOVW	ES:5.B[EDX], AX
+	MOVL	ECX, #7
+22$:	LESL	EDX, udpio_rmtsize.B[EBP] ;Give him the length of the string
+	MOVW	ES:[EDX], CX
+
+;Give him the "remote message address" if he asked for it
+
+24$:	CMPL	udpio_msglen.B[EBP], #0.B ;Does he want the message address?
+	JE	26$.S			;No
+	CALL	getaddr
+	MOVL	EDX, EAX
+	CALL	getport
+	PUSHL	EBX
+	LESL	EBX, udpio_msgaddr.B[EBP] ;Yes - get address of his buffer
+	MOVL	ECX, udpio_msglen.B[EBP] ;Get length of his buffer
+	CALL	xosipsStoreAddress##	;Store the address
+	POPL	EBX
+	LESL	EDX, udpio_rmtsize.B[EBP] ;Give him the length of the string
+	MOVW	ES:[EDX], CX
+
+;Give him the remote IP address if he asked for it
+
+26$:	CMPL	udpio_rapnt+0.B[EBP], #0.B ;Does he want the remote IP address?
+	JE	28$.S			;No
+	LESL	EDX, udpio_rapnt.B[EBP]	;Yes
+	CALL	getaddr
+	MOVL	ES:[EDX], EAX
+
+;Give him the remove UDP port if he asked for it
+
+28$:	CMPL	udpio_rppnt+0.B[EBP], #0.B ;Does he want the remote UDP port?
+	JE	30$.S			;No
+	LESL	EDX, udpio_rppnt.B[EBP]	;Yes
+	CALL	getport
+	MOVW	ES:[EDX], AX
+30$:	CALL	xosnetGiveBufr##	;Give up the packet buffer
+	POPL	EAX
+	POPL	ECX
+	POPL	EBX
+	LEAVE
+	RET				;Finished here
+
+;Subroutine to get IP address from a packet
+;	c{EBX} = Offset of packet
+;	CALL	getaddr
+;	c{EAX} = IP address
+
+getaddr:MOVZBL	ECX, npb_npofs.B[EBX]	;Point to the IP header
+	MOVL	EAX, ip_srcipaddr.B[EBX+ECX] ;Get IP address if input
+	CMPB	SS:xffFunc##, #QFNC_INBLOCK ;Really input?
+	JE	40$.S			;Yes
+	MOVL	EAX, ip_dstipaddr.B[EBX+ECX] ;No get IP address for output
+40$:	RET
+
+;Subroutine to get UDP port number from a packet
+;	c{EBX} = Offset of packet
+;	CALL	getport
+;	c{EAX} = Port number
+
+getport:MOVZBL	ECX, npb_tpofs.B[EBX]	;Point to the UDP header
+	MOVZWL	EAX, udp_srcport.B[EBX+ECX] ;Get the port number if input
+	CMPB	SS:xffFunc##, #QFNC_INBLOCK ;Really input?
+	JE	42$.S			;Yes
+	MOVZWL	EAX, udp_dstport.B[EBX+ECX] ;Get the port number for output
+42$:	XCHGB	AL, AH			;Fix up the byte order
+	RET
+.PAGE
+;Subroutine called when scanning parameters for the IOPAR_NETDSTNAME parameter
+;	c{ES:EBX} = Address of buffer for string
+;	c{ECX}    = Length of the buffer
+;	c{FS:EDX} = Address of word to receive length of string
+;	CALL	srcname
+
+	DPARMHDR  GET, STR
+xfrrmtaddr:
+	MOVL	udpio_rmtaddr+0.B[EBP], EBX ;Store address of the buffer
+	MOVL	udpio_rmtaddr+4.B[EBP], ES
+	MOVL	udpio_rmtsize+0.B[EBP], EDX ;Store address of the length value
+	MOVL	udpio_rmtsize+4.B[EBP], FS
+	MOVL	udpio_rmtlen.B[EBP], ECX ;Store length of the buffer
+	CLC
+	RET
+
+;Subroutine called when scanning parameters for the IOPAR_NETLCLPORT parameter
+;  for data transfer
+
+	DPARMHDR  BOTH, HEXV
+xfrlclport:
+	TESTB	AH, #PAR$SET		;Want to change it?
+	JE	6$.S			;No
+	PUSHL	EAX			;Yes
+	CMPL	dcb_ipsportnext[EDI], #-1.B ;Have a port now?
+	JE	2$.S			;No
+	PUSHL	ES			;Yes - save parameter address and size
+	PUSHL	EBX
+	PUSHL	ECX
+	MOVZBL	EBX, dcb_ipslclport+0.B[EDI] ;Get hash index
+	CALL	xosudpHashClr		;Remove from hash table
+	CALL	xosipsGivePort##	;Give up the port
+	POPL	ECX			;Restore parameter address and size
+	POPL	EBX
+	POPL	ES
+2$:	CALL	knlGetParm##		;Get parameter value
+	JC	rmp8.S
+	TESTL	EAX, EAX
+	JE	4$.S
+	PUSHL	ECX
+	MOVL	ECX, EAX
+	CALL	xosipsGetPort##
+	POPL	ECX
+	JC	10$.S
+	MOVZBL	EBX, dcb_ipslclport+0.B[EDI] ;Get hash index
+	CALL	xosudpHashSet		;Put our DCB in the hash table
+4$:	POPL	EAX
+6$:	TESTB	AH, #PAR$GET		;Want the value returned?
+	JE	12$.S			;No
+	MOVZWL	EAX, dcb_ipslclport.B[EDI] ;Yes - get the value
+	JMP	knlStrParm4##		;Give it to him and return
+
+;Here if error setting local port number
+
+10$:	POPL	ECX			;Fix up the stack
+12$:	RET				;Return
+
+;Subroutine called when scanning parameters for the IOPAR_NETLCLNETA parameter
+
+	DPARMHDR  GET, HEXV
+xfrlclneta:
+	MOVL	EAX, dcb_netpdb.B[EDI]
+	MOVL	EAX, pdb_ipaddr.B[EAX]
+	JMP	knlStrParm4##
+.PAGE
+;Subroutine called for the IOPAR_NETRMTPORTS parameter
+
+	DPARMHDR  BOTH, HEXV
+xfrrmtports:
+	TESTB	AH, #PAR$SET		;Want to change the value?
+	JE	4$.S			;No
+	PUSHL	EAX			;Yes
+	CALL	knlGetParm##		;Get parameter value
+	JC	rmp8.S
+	XCHGB	AL, AH			;Change to network byte order
+	MOVW	dcb_ipsrmtport.B[EDI], AX ;Store value
+	POPL	EAX
+4$:	TESTB	AH, #PAR$GET		;Does he want the value returned?
+	JE	ret004.S		;No - finishd here
+	MOVZWL	EAX, dcb_ipsrmtport.B[EDI] ;Yes - get port number
+	XCHGB	AL, AH			;Fix up the byte order
+	JMP	knlStrParm4##
+
+rmp8:	POPL	EDX
+ret004:	RET
+
+;Subroutine called for the IOPAR_NETRMTPORTR parameter
+
+	DPARMHDR  GET, HEXV
+xfrrmtportr:
+	CMPL	ECX, #2.B		;Is his value long enough?
+	JB	rmpts.S			;No
+	MOVL	udpio_rppnt+0.B[EBP], EBX ;Yes - save the address of the value
+	MOVL	udpio_rppnt+4.B[EBP], ES
+	CLRL	EAX			;Clear the field for now
+	JMP	knlStrParm4##
+
+rmpts:	MOVL	EAX, #ER_PARMS
+	STC
+	RET
+.PAGE
+;Subroutine called when scanning parameters for the IOPAR_NETRMTNETAS parameter
+
+	DPARMHDR  BOTH, HEXV
+xfrrmtnetas:
+	TESTB	AH, #PAR$SET		;Want to change the value?
+	JE	4$.S			;No
+	PUSHL	EAX			;Yes
+	CALL	knlGetParm##		;Get parameter value
+	JC	rmp8.S
+	MOVL	dcb_ipsrmtaddr.B[EDI], EAX
+	POPL	EAX
+4$:	TESTB	AH, #PAR$GET		;Want value returned?
+	JE	ret004.S		;No
+	MOVL	EAX, dcb_ipsrmtaddr.B[EDI] ;Yes - get value
+	JMP	knlStrParm4##
+
+;Subroutine called for the IOPAR_NETRMTNETAS parameter
+
+	DPARMHDR  GET, HEXV
+xfrrmtnetar:
+	CMPL	ECX, #4.B		;Is his value long enough?
+	JB	rmpts.S			;No
+	MOVL	udpio_rapnt+0.B[EBP], EBX ;Yes - save address for value
+	MOVL	udpio_rapnt+4.B[EBP], ES
+	RET
+.PAGE
+;Subroutine called for the IOPAR_MSGRMTADDRS parameter
+;	c{ES:EBX} = Address of buffer for string
+;	c{ECX}    = Length of the buffer
+;	c{FS:EDX} = Address of word to receive length of string
+;	CALL	rmtaddrs
+
+	DPARMHDR  BOTH, STR
+rmtaddrs:
+	TESTB	AH, #PAR$SET		;Want to change the value?
+	JE	4$.S			;No
+	PUSHL	EAX			;Yes
+	PUSHL	FS
+	PUSHL	EDX
+	PUSHL	ECX
+	CALL	xosipsParseAddress##
+	JC	8$.S
+	POPL	ECX
+	POPL	EDX
+	POPL	FS
+	POPL	EAX
+4$:	TESTB	AH, #PAR$GET		;Want value returned?
+	JE	6$.S			;No
+	PUSHL	FS
+	PUSHL	EDX
+	MOVL	EAX, dcb_ipsrmtaddr.B[EDI]
+	MOVZWL	EDX, dcb_ipsrmtport.B[EDI]
+	CALL	xosipsStoreAddress##
+	POPL	EDX
+	POPL	FS
+	JC	6$.S
+	MOVW	FS:[EDX], CX
+6$:	RET
+
+8$:	POPL	ECX
+	RET
+
+;Subroutine called for the IOPAR_MSGRMTADDRR parameter
+;	c{ES:EBX} = Address of buffer for string
+;	c{ECX}    = Length of the buffer
+;	c{FS:EDX} = Address of word to receive length of string
+;	CALL	rmtaddrr
+
+	DPARMHDR  GET, STR
+rmtaddrr:
+	MOVL	udpio_msgaddr+0.B[EBP], EBX ;Store address of the buffer
+	MOVL	udpio_msgaddr+4.B[EBP], ES
+	MOVL	udpio_msgsize+0.B[EBP], EDX ;Store address of the length value
+	MOVL	udpio_msgsize+4.B[EBP], FS
+	MOVL	udpio_msglen.B[EBP], ECX ;Store length of the buffer
+	CLC
+	RET
+.PAGE
+	.SBTTL	sd_outblock - Output block
+
+;Here for the queued output block entry
+;	c{ESI} = Offset of IORB
+;	c{EDI} = Offset of DCB
+;	CALL	udpoutblk
+;	c{EAX} = Error code
+;	c{EBX} = Status bits
+;	c{ECX} = Amount transfered
+
+;The datagram destination string has the following format (length is 7 bytes):
+;    Offset   Length         Description
+;       0       1       Numeric format indication = 0FFh
+;       1       4       Destination network address (high byte first)
+;       5       2       Destination port number (low byte first)
+
+udpoutblk:
+	CALL	knlIoQabLock##		;Lock the QAB
+	JC	4$.S			;If error
+	CALL	knlIoWriteLock##	;Lock the buffer pages
+	JC	4$.S			;If error
+	CMPL	iorb_buffer2.B[ESI], #0.B ;Do we have an address string?
+	JE	2$.S			;No
+	MOVL	ECX, #7			;Yes
+	CALL	knlIoDgALock##		;Lock it
+	JC	4$.S			;If error
+2$:	MOVB	iorb_queue.B[ESI], #dcb_outframe
+	MOVL	iorb_routine.B[ESI], #udpoutblk1
+	JMP	knlXfQueue#		;Switch to extended fork context
+
+4$:	TOFORK
+	RET
+
+;Here in extended fork context
+
+udpoutblk1:
+	ENTER	udpio_SIZE, 0		;Yes - set up our stack frame
+	CLRL	EAX
+	MOVL	udpio_rmtlen.B[EBP], EAX
+	MOVL	udpio_msglen.B[EBP], EAX
+	MOVL	udpio_rapnt.B[EBP], EAX
+	MOVL	udpio_rppnt.B[EBP], EAX
+	MOVW	dcb_ipsrmtport.B[EDI], AX
+	DECL	EAX
+	MOVL	SS:xffTimeOut##, EAX
+	CMPL	SS:xffParm##+0, #0.B
+	JE	6$.S
+	LFSL	EDX, SS:xffParm##
+	MOVL	EBX, #udpioparms	;Process parameters
+	MOVL	ECX, #knlComDPParms##
+	CALL	knlProcDevParm##
+	JC	12$.S			;If error
+6$:	MOVL	EAX, SS:xffCount##	;Get amount to output
+	TESTL	EAX, EAX
+	JE	12$.S			;Finished if nothing to output
+	TESTB	SS:xffCmd##, #O$OUT	;Is output allowed?
+	JE	knlIllOutLv##		;No - fail
+	CMPL	EAX, #LBFRSIZE-npb_data+4 ;Yes - can we take this much data?
+	JBE	18$.S			;Yes
+10$:	MOVL	EAX, #ER_ICDEV
+12$:	CLRL	ECX
+	MOVL	EBX, #QSTS$DONE
+	LEAVE
+	RET
+
+16$:	MOVL	EAX, #ER_NILAD
+	JMP	12$.S
+
+;Here if can take the specified amount of data
+
+18$:	MOVL	EBX, SS:xffBuffer2##+0	;Have a destination string?
+	TESTL	EBX, EBX
+	JE	20$.S			;No
+	MOVL	ES, SS:xffBuffer2##+4	;Yes - get address of destination string
+	CMPB	ES:[EBX], #0FFh		;Is the format byte right?
+	JNE	12$.S			;No - fail
+	MOVL	EAX, ES:1.B[EBX]	;Yes - get destination address
+	TESTL	EAX, EAX		;Was it given at all?
+	JNE	22$.S			;Yes
+20$:	MOVL	EAX, dcb_ipsrmtaddr.B[EDI]
+22$:	TESTL	EAX, EAX		;Have an address at all?
+	JE	16$.S			;No - fail
+	MOVL	EDX, dcb_netpdb.B[EDI]	;Yes - get offset of the PDB
+	TESTL	EAX, pdb_ipsubnetmask.B[EDX] ;Did he specify the network part?
+	JNE	24$.S			;Yes
+	MOVL	ECX, pdb_ipaddr.B[EDX]	;No - use our network address
+	ANDL	ECX, pdb_ipsubnetmask.B[EDX]
+	ORL	EAX, ECX
+24$:	MOVL	dcb_ipsrmtaddr.B[EDI], EAX ;Store new address
+	TESTL	EBX, EBX		;Have destination string?
+	JE	28$.S			;No
+	MOVZWL	EDX, ES:5.B[EBX]	;Yes - get destination port number
+	XCHGB	DL, DH			;Swap bytes
+	MOVW	dcb_ipsrmtport.B[EDI], DX ;Store remote port number
+28$:	MOVL	ESI, dcb_netidb.B[EDI]	;Make sure have IDB offset
+	MOVL	ECX, idb_hwhdrsz.B[ESI]	;Get space needed
+	ADDL	ECX, #40t.B
+	ADDL	ECX, SS:xffCount##
+	CALL	xosnetGetBufr##		;Get a network buffer
+	JC	12$.S			;If error
+	MOVL	ESI, dcb_netsdb.B[EDI]
+	MOVL	ECX, SS:xffCount##	;Get length of user data
+	CALL	xosudpSetPkt		;Set up the UDP packet
+	JC	42$
+	PUSHL	EDI			;Save registers we need here
+	PUSHL	ESI
+	LFSL	ESI, SS:xffBuffer1##	;Point to user's buffer
+	MOVL	EDI, EDX		;Point to place in packet to put data
+	PUSHL	DS
+	POPL	ES
+	CLD
+	CMPL	ECX, #4.B		;Need more than 4 bytes?
+	JA	30$.S			;Yes - go optimize it
+	RMOVSB	[EDI], FS:[ESI]		;No - just do it the easy way!
+	JMP	38$.S
+
+;Here if transferring more than 4 bytes - make sure alligned and then copy
+;  longs
+
+30$:	BTL	EDI, #0			;Need byte first?
+	JNC	32$.S			;No
+	MOVSB	[EDI], FS:[ESI]		;Yes
+	DECL	ECX
+32$:	BTL	EDI, #1			;Need word first?
+	JNC	34$.S			;No
+	DECL	ECX
+	DECL	ECX
+	MOVSW	[EDI], FS:[ESI]		;Yes
+34$:	MOVL	EAX, ECX		;Remember low order count bits
+	SHRL	ECX, #2			;Change to number of longs
+	RMOVSL	[EDI], FS:[ESI]		;Transfer most of the block
+	TESTB	AL, #02			;Need final word?
+	JE	36$.S			;No
+	MOVSW	[EDI], FS:[ESI]		;Yes
+36$:	TESTB	AL, #01			;Need final byte?
+	JE	38$.S			;No
+	MOVSB	[EDI], FS:[ESI]		;Yes
+38$:	POPL	ESI
+	POPL	EDI
+	MOVL	EDX, dcb_ipstpdb.B[EDI]
+	CALL	xosudpChkSumCnt		;Calculate the UDP checksum
+	CALL	xosipsSendSetup##	;Finish setting up the ip header
+	MOVL	EAX, #xosnetOutDone##
+	CALL	xossnpSendPkt##		;Output the packet 
+	JC	42$.S			;If error
+	PUSHL	ESI
+	MOVL	ESI, dcb_netidb.B[EDI]
+	MOVL	EAX, #-1		;Wait until output is done
+	CALL	xosnetWaitPkt##
+	POPL	ESI
+	JC	42$.S			;If error
+	PUSHL	#QSTS$DONE
+	PUSHL	SS:xffCount##
+	PUSHL	#0.B
+	JMP	xfrfin
+
+;Here if error while transfering data
+
+42$:	PUSHL	#QSTS$DONE
+	PUSHL	#0.B
+	PUSHL	EAX
+	JMP	xfrfin
+.PAGE
+	.SBTTL	xosudpSetPkt - Subroutine to set up the UDP packet
+
+;Subroutine to set up the UDP packet
+;	c{EBX} = Offset of packet buffer
+;	c{ECX} = Length of UDP data area
+;	c{EDI} = Offset of DCB
+;	c{ESI} = Offset of SDB
+;	CALL	xosudpSetPkt
+;	c{EBX} = Unchanged
+;	c{ECX} = Unchanged
+;	c{EDX} = Offset of start of UDP data in packet
+
+xosudpSetPkt:
+	PUSHL	ECX			;Save UDP data length
+	CLRL	EAX			;Yes
+	MOVL	EDX, #IPP_UDP<8t	;Get transport protocol type
+	CALL	xosipsSetPkt##		;Set up the IP level packet header
+	POPL	ECX
+	JC	4$.S			;If error
+	MOVL	EAX, dcb_ipslclport.B[EDI] ;Get local and remote port numbers
+	XCHGB	AL, AH
+	MOVL	[EDX], EAX		;Store in packet
+	MOVL	EAX, ECX		;Restore data length
+	MOVL	npb_apcnt.B[EBX], EAX
+	ADDL	EAX, #8t.B		;Plus UDP header length
+	ADDL	npb_count.B[EBX], EAX	;Add into total for packet
+	XCHGB	AL, AH			;Swap bytes
+	MOVL	4.B[EDX], EAX		;Store in packet (this also clears the
+					;  checksum field)
+	ADDL	EDX, #8.B		;Point to start of data area
+4$:	RET				;Finished
+.PAGE
+	.SBTTL	xosudpChkSumCnt - Subroutine to calculate UDP checksum
+
+;Subroutine to calculate UDP checksum - also maintains the output packet and
+;  byte counts in the TPDB
+;	c{EBX} = Offset of packet buffer
+;	c{EDX] = Offset of UDP TPDB (not preserved)
+;	CALL	xosudpChkSumcnt
+
+xosudpChkSumCnt:
+	INCL	tpdb_udpcntpktout.B[EDX] ;Count the packet
+	MOVZBL	ECX, npb_tpofs.B[EBX]
+	NEGL	ECX
+	ADDL	ECX, npb_count.B[EBX]
+	ADDL	tpdb_udpcntbyteout.B[EDX], ECX
+
+	.SBTTL	xosudpChkSum - Subroutine to calculate UDP checksum
+
+;Subroutine to calculate UDP checksum
+;	c{EBX} = Offset of packet buffer
+;	c{EDX] = Offset of UDP TPDB (not preserved)
+;	CALL	xosudpChkSum
+
+xosudpChkSum:
+	MOVL	EAX, tpdb_pdb.B[EDX]	;Need to calculate the checksum value?
+	TESTB	pdb_ipchksumh[EAX], #PCSH$GEN
+	JE	ret008.S		;No
+	PUSHL	ESI			;Yes - the first 2 longs for the
+					;  pseudo-header are found in the IP
+					;  header
+	MOVZBL	ESI, npb_npofs.B[EBX]	;Get offset of the IP header
+	LEAL	ESI, npb_data+ip_srcipaddr.B[ESI+EBX]
+	CLD
+	LODSL	[ESI]			;Get word
+	ADDL	EAX, [ESI]
+	ADCL	EAX, #0.B
+	MOVZBL	ESI, npb_tpofs.B[EBX]	;Point to first UDP header byte
+	ADDL	ESI, EBX
+	MOVL	EDX, npb_apcnt.B[EBX]	;Get total length of UDP part
+	ADDL	EDX, #8.B
+	MOVL	ECX, EDX	
+	XCHGB	DL, DH
+	SHLL	EDX, #16t
+	MOVB	DH, #IPP_UDP		;Include the protocol value
+	ADDL	EAX, EDX		;Add into checksum value
+	ADCL	EAX, #0.B
+	CALL	xosipsChkSumFin##	;Finish it up
+	NOTL	EAX	
+	MOVZBL	ECX, npb_tpofs.B[EBX]	;Store final checksum value
+	MOVW	npb_data+udp_checksum.B[EBX+ECX], AX
+	POPL	ESI
+ret008:	RET
+.PAGE
+	.SBTTL	udpdstunr - Subroutine to process ICMP destination unreachable packet
+
+;Subroutine to process ICMP destination unreachable packets for UDP
+;	c{EBX} = Offset of packet buffer
+;	c{EDX} = Offset of start of ICMP data in packet
+;	c{EDI} = Offset of PDB
+;	c{ESI} = Offset of TPDB
+;	CALL	udpdstunr
+;	c{EBX} = Unchanged
+
+udpdstunr:
+	MOVB	CL, icmp_data+0.B[EDX]	;Get length of the IP header
+	ANDL	ECX, #0Fh.B
+	SHLL	ECX, #2t
+	MOVZWL	ECX, icmp_data+udp_srcport.B[EDX+ECX] ;Get UDP source port
+	XCHGB	CL, CH
+	MOVZBL	EAX, CL			;Get low byte as hash index
+	MOVL	EDI, tpdb_udprcvhash[ESI] ;Get first DCB in hash chain
+	MOVL	EDI, [EDI+EAX*4]
+4$:	TESTL	EDI, EDI		;More to check?
+	JE	ret008.S		;No - forget it
+	CMPW	dcb_ipslclport.B[EDI], CX ;Same destination port
+	JE	6$.S			;Yes - we found it!
+	MOVL	EDI, dcb_ipshashnext[EDI] ;No - advance to next DCB
+	JMP	4$.S			;Continue
+
+;Here with the matching DCB
+
+6$:	MOVL	ECX, dcb_udpdstunr.B[EDI]
+	JREGZ	ECX, ret008
+	JMPIL	ECX
+.PAGE
+	.SBTTL	udprcv - Subroutine to process received UDP packet
+
+;Subroutine to process received UDP packet
+;	c{EAX} = Offset of IDB
+;	c{EBX} = Offset of packet buffer
+;	c{ECX} = Number of UDP bytes (including UDP header)
+;	c{EDX} = Offset of start of UDP header
+;	c{EDI} = Offset of PDB
+;	c{ESI} = Offset of TPDB
+;	CALL	udprcv
+
+2$:	INCL	tpdb_udpcntpsltmn.B[ESI] ;Count the error
+	CALL	xosnetGiveBufr##
+	RET
+
+6$:	INCL	tpdb_udpcntpsltdl.B[ESI] ;Count the error
+	CALL	xosnetGiveBufr##
+	RET
+
+udprcv:	CMPB	idb_state.B[EAX], #LNKS_ESTAB ;Is the link up?
+	JNE	xosipsLinkDown##	;No
+	CMPL	npb_count.B[EBX], #8t.B	;Yes - is there enough data?
+	JS	2$.S			;No - ignore the packet
+	MOVZWL	ECX, udp_length.B[EDX]	;Maybe
+	XCHGB	CL, CH
+	SUBL	ECX, #8.B
+	JS	6$.S
+	MOVL	EAX, npb_count.B[EBX]
+	SUBL	EAX, #8.B
+	CMPL	EAX, ECX
+	JB	6$.S			;No - ignore the packet
+	PUSHL	ECX
+	TESTB	pdb_ipchksumh[EDI], #PCSH$CHK ;Should we check checksums?
+	JE	8$.S			;No - go on
+	CMPW	udp_checksum.B[EDX], #0.B ;Yes - does datagram have a checksum?
+	JE	8$.S			;No - nothing to check!
+	PUSHL	ESI			;Yes - the first 8 bytes for the
+					;  pseudo-header are found in the IP
+					;  header
+	MOVZBL	ESI, npb_npofs.B[EBX]	;Get offset of the IP header
+	LEAL	ESI, npb_data+ip_srcipaddr.B[ESI+EBX]
+	CLD
+	LODSL	[ESI]			;Get first 4 bytes
+	ADDL	EAX, [ESI]		;Add in next 4 bytes of pseudo-header
+	ADCL	EAX, #0.B
+	MOVL	ESI, EDX		;Point to start of UDP header
+	ADDL	ECX, #8.B		;Get total length of UDP part, including
+	PUSHL	EDX			;  the UDP header
+	MOVL	EDX, ECX
+	XCHGB	DL, DH
+	SHLL	EDX, #16t
+	MOVB	DH, #IPP_UDP		;Include the protocol value
+	ADDL	EAX, EDX		;Add into checksum value
+	ADCL	EAX, #0.B
+	POPL	EDX
+	CALL	xosipsChkSumFin##
+	POPL	ESI
+	CMPW	AX, #0FFFFFFFFh.B	;Is the checksum value correct?
+	JNE	30$.S			;No
+8$:	MOVZWL	ECX, 2.B[EDX]		;Yes - get destination port
+	XCHGB	CL, CH
+	MOVZBL	EAX, CL			;Get low byte as hash index
+	MOVL	EDI, tpdb_udprcvhash[ESI] ;Get first DCB in hash chain
+	MOVL	EDI, [EDI+EAX*4]
+24$:	TESTL	EDI, EDI		;More to check?
+	JE	28$.S			;No - discard the packet
+	CMPW	dcb_ipslclport.B[EDI], CX ;Same destination port
+	JE	32$.S			;Yes - we found it!
+	MOVL	EDI, dcb_ipshashnext[EDI] ;No - advance to next DCB
+	JMP	24$.S			;Continue
+
+;Here if no destination
+
+28$:	POPL	ECX			;Discard the count
+	MOVL	EDI, tpdb_pdb.B[ESI]	;Get offset of our PDB
+	MOVL	EAX, #0303h		;Get ICMP type and code
+;;;;;;	CALL	xosipsSendDstUnr##
+	INCL	tpdb_udpcntnodst.B[ESI] ;Count the error
+ignore:	CALL	xosnetGiveBufr##
+	RET
+
+;Here if check-sum value is bad
+
+30$:	POPL	ECX			;Discard the count
+	INCL	tpdb_udpcntchksum.B[ESI] ;Count the error
+	JMP	ignore.S		;And discard the input packet
+
+;Here with DCB for this packet
+
+32$:	POPL	ECX			;Restore count
+	JMPIL	dcb_udprcvdisp.B[EDI]	;Dispatch to process the packet
+
+;Here on received UDP packet for UDP devices
+
+udpdevrcv:
+	MOVB	AL, dcb_udprcvcnt.B[EDI] ;Get number of packets in list
+	CMPB	AL, dcb_bufrlmt.B[EDI]	;Have too many?
+	JAE	40$.S			;Yes - ignore this one!
+	MOVL	EAX, dcb_udprcvtail.B[EDI] ;Get tail of the receive list
+	TESTL	EAX, EAX		;Do we have a list now?
+	JNE	34$.S			;Yes
+	MOVL	dcb_udprcvhead.B[EDI], EBX ;No - store new head pointer
+	JMP	36$.S
+
+34$:	MOVL	npb_next.B[EAX], EBX	;Update forward link
+36$:	MOVL	dcb_udprcvtail.B[EDI], EBX ;Update tail pointer
+	CLRL	EAX			;Clear forward link in this packet
+	MOVL	npb_next.B[EBX], EAX
+	INCB	dcb_udprcvcnt.B[EDI]	;Bump the received packet count
+	MOVL	EAX, dcb_ipstpdb.B[EDI]	;Count the packet
+	INCL	tpdb_udpcntpktin.B[EAX]
+	MOVL	ECX, npb_count.B[EBX]
+	ADDL	tpdb_udpcntbytein.B[EAX], ECX
+	CLRL	EAX			;Indicate all is OK
+	JMP	xosnetRspDone##		;Let him continue if he's waiting
+
+;Here with packet when user has already reached his buffer limit
+
+40$:	MOVL	EAX, dcb_ipstpdb.B[EDI]	;Count the excess packet
+	INCL	tpdb_udpcntiblxcd.B[EAX]
+	JMP	ignore			;Otherwise ignore the packet
+.PAGE
+	.SBTTL	xosudpHashSet - Subroutine to place DCB in the UDP hash table
+
+;Subroutine to place DCB in the UDP hash table
+;	c{EBX} = Hash index
+;	c{EDI} = Offset of DCB
+;	CALL	xosudpHashSet
+
+xosudpHashSet:
+	CMPL	dcb_ipshashnext[EDI], #-1.B
+	JNE	4$.S
+	MOVL	EAX, dcb_ipstpdb.B[EDI]
+	MOVL	EAX, tpdb_udprcvhash.B[EAX]
+	PUSHL	[EAX+EBX*4]
+	POPL	dcb_ipshashnext[EDI]
+	MOVL	[EAX+EBX*4], EDI
+	RET
+
+4$:	CRASH	IPHE			;[IP Hash Error]
+.PAGE
+	.SBTTL	xosudpHashClr - Subroutine to remove DCB from the IP hash table
+
+;Subroutine to remove DCB from the IP hash table
+;	c{EBX} = Hash index
+;	c{EDI} = Offset of DCB
+;	CALL	xosudpHashClr
+
+xosudpHashClr:
+	CMPL	dcb_ipshashnext.B[EDI], #-1.B ;In a hash list now?
+	JE	4$.S			;No!
+	MOVL	EAX, dcb_ipstpdb.B[EDI]	;Yes - OK
+	MOVL	EAX, tpdb_udprcvhash.B[EAX]	   ;Get address of hash table
+	LEAL	EBX, -dcb_ipshashnext.B[EAX+EBX*4] ;  entry minus offset of
+						   ;  link in the DCB
+2$:	CMPL	dcb_ipshashnext.B[EBX], EDI ;Is it the next one?
+	JE	6$.S			;Yes
+	MOVL	EBX, dcb_ipshashnext.B[EBX] ;No - advance to next
+	TESTL	EBX, EBX		;Have another one to check?
+	JNE	2$.S			;Yes - continue
+	CRASH	BNHL			;[Bad Network Hash List]
+
+4$:	CRASH	NIHL			;[Not In Hash List]
+
+;Here with our DCB
+
+6$:	PUSHL	dcb_ipshashnext.B[EDI]	;Remove from list
+	POPL	dcb_ipshashnext.B[EBX]
+	MOVL	dcb_ipshashnext.B[EDI], #-1
+	RET
+.PAGE
+	.SBTTL	Data
+
+	DATA
+
+udpccb:        .BLKB ccb_SIZE	;UDP CCB
+xosudpTpdbHead:.LONG 0
+
+	CODE
+
+xcodetop:
+
+	LKEEND

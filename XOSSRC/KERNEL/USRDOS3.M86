@@ -1,0 +1,664 @@
+	.TITLE	USRDOS3 - XOS user level DOS kernel routines
+
+;++++
+; This software is in the public domain.  It may be freely copied and used
+; for whatever purpose you see fit, including commerical uses.  Anyone
+; modifying this software may claim ownership of the modifications, but not
+; the complete derived code.  It would be appreciated if the authors were
+; told what this software is being used for, but this is not a requirement.
+
+;   THIS SOFTWARE IS PROVIDED BY THE AUTHORS "AS IS" AND ANY EXPRESS OR
+;   IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
+;   OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+;   IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+;   INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+;   BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS
+;   OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+;   ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR
+;   TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
+;   USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+;----
+
+	.PROC	80486
+	.INCLUD	XOSINC:\XMAC\XOS.PAR
+	.INCLUD	XOSINC:\XMAC\XOSX.PAR
+	.INCLUD	XOSINC:\XMAC\XOSDOS.PAR
+	.INCLUD XOSINC:\XMAC\XOSERR.PAR
+	.INCLUD	XOSINC:\XMAC\XOSTRM.PAR
+
+	USERCODE
+
+;The routines in this module implement various DOS INT 21 functions.  They
+;  are executed in protected 32 bit user mode.
+
+	.SBTTL	INT 20 and INT 21 function 0 - Terminate program
+
+;Here for INT 20 and INT 21 function 0 - Terminate program - This is version
+;  1 style program terminate function.  It requires that CS point to the PSP
+;  to terminate.  This does not have to be the current PSP.  If it is not the
+;  current PSP, memory is NOT deallocated and no handles are closed!  If CS
+;  DOES point to the current PSP, the behavior is the same as for INT 21h
+;  function 4C with c(AL) = 0.
+;	c[CS] = Selector for PSP
+;	INT	20h
+;  or
+;	c(AH) = 0h
+;	c[CS] = Selector for PSP
+;	INT	21h
+
+uterm20::
+	MOVZWL	EDX, dff_CS.B[EBP]	;Get caller's CS
+	MOVL	EBX, EDX
+	SHLL	EBX, #4
+	MOVZWL	ECX, psp_parent.B[EBX]	;Get parent PSP
+	CLRL	EAX			;Get 0 in case must terminate sub-task
+	CMPW	CX, dda_curpsp		;Want to really terminate sub-task?
+	JE	4$.S			;No
+	CMPW	DX, dda_curpsp		;Maybe
+	JE	term2.S			;Yes
+4$:	MOVL	EAX, psp_term.B[EBX]	;Get saved termination vector
+	MOVL	22h*4, EAX		;Restore it
+	MOVZWL	EDX, AX
+	MOVL	dff_EIP.B[EBP], EDX	;Also put in in his CS:IP
+	SHRL	EAX, #15t
+	MOVL	dff_CS.B[EBP], EAX
+	MOVL	EAX, psp_break.B[EBX]	;Get saved ^C vector
+	MOVL	23h*4, EAX		;Restore it
+	MOVL	EAX, psp_error.B[EBX]	;Get saved critical error vector
+	MOVL	24h*4, EAX		;Restore it
+	POPAL				;Restore general registers
+	CALLF	svcSchDismiss#		;Return to user
+.PAGE
+	.SBTTL	INT 21 function 31 - Terminate and stay resident
+
+;Here for INT 21 function 31 - Terminate and stay resident
+;	c(AL) = Return code
+;	c(AH) = 31h
+;	c[DX] = New size for base memory block
+;	INT	21h
+
+utermsr::
+	MOVXBL	EAX, dff_EAX+0.B[EBP]	;Get return code
+	MOVB	DL, #3			;Get terminaion type
+	JMP	2$.S			;Continue
+
+	.SBTTL	INT 21 function 4C - Terminate with return code
+
+;Here for INT 21 function 4C - Terminate with return code
+;	c(AL) = Return code
+;	c(AH) = 4Ch
+;	INT	21h
+
+utermc::MOVXBL	EAX, dff_EAX+0.B[EBP]	;Get return code
+term2:	MOVB	DL, #0			;Get termination type
+2$:	MOVL	EBX, dda_curpsp
+	SHLL	EBX, #4			;Point to the current PSP
+	CMPW	psp_parent.B[EBX], #0.B	;Is this the bottom PSP?
+	JNE	4$.S			;No
+	ANDL	EAX, #0FFFFFFh		;Yes
+	ORL	EAX, #TC_EXIT<24t
+	PUSHL	EAX			;Terminate the system process
+	CALLF	svcSchExit#
+
+;Here to terminate DOS sub-task
+
+4$:	MOVB	dda_tcode+0, AL		;Store exit status
+	MOVB	dda_tcode+1, DL		;Store termination type
+	MOVL	EAX, psp_term.B[EBX]	;Get saved termination vector
+	MOVL	22h*4, EAX		;Restore it
+	MOVL	EAX, psp_break.B[EBX]	;Get saved ^C vector
+	MOVL	23h*4, EAX		;Restore it
+	MOVL	EAX, psp_error.B[EBX]	;Get saved critical error vector
+	MOVL	24h*4, EAX		;Restore it
+	CMPB	dff_EAX+1.B[EBP], #31h	;Terminate and stay resident?
+	JE	18$			;Yes - go handle that
+
+;Here if really terminating the DOS sub-task (not terminate-and-stay-resident).
+;  First scan the directory search file specification blocks and give up any
+;  used by this sub-task.
+
+	MOVL	EAX, dda_curpsp
+	LEAL	EDX, dxd_fnstr		;Point to file name list head pointer
+6$:	MOVL	EDI, [EDX]		;Get next block
+8$:	TESTL	EDI, EDI
+	JE	12$.S
+	CMPW	8t.B[EDI], AX		;Is this one for this sub-task?
+	JE	10$.S			;Yes
+	MOVL	EDX, EDI		;No
+	JMP	6$.S
+
+10$:	PUSHL	[EDI]
+	CALL	ugivediob#		;Give up the block
+	POPL	EDI
+	MOVL	[EDX], EDI
+	JMP	8$.S
+
+;Here with all file specification blocks given up
+
+12$:	MOVZWL	ECX, psp_hcnt.B[EBX]	;Get size of the handle table
+	MOVZWL	EAX, psp_hpnt+2.B[EBX]	;Get offset of the handle table
+	SHLL	EAX, #4
+	MOVZWL	EDX, psp_hpnt+0.B[EBX]
+	ADDL	EDX, EAX
+14$:	MOVZBL	EAX, [EDX]		;Get system handle
+	CMPB	AL, #0FEh		;Is it in use?
+	JAE	16$.S			;No
+	CMPB	dxd_syshctbl[EAX], #0	;Yes - is the system handle count zero?
+	JE	16$.S			;Yes (should not be possible!)
+	DECB	dxd_syshctbl[EAX]	;No -  reduce it
+	JNE	16$.S			;If not zero yet
+	PUSHL	EAX			;Zero - close the system device
+	PUSHL	#0.B
+	CALLF	svcIoClose#
+16$:	INCL	EDX			;Bump pointer
+	LOOP	ECX, 14$		;Continue if more to close
+	JMP	term4.S
+
+;Here if this is a terminate and stay resident call
+
+18$:	MOVL	ESI, EBX		;Change size of the base memory block
+	SHRL	ESI, #4t
+	MOVZWL	EBX, dff_EDX.B[EBP]
+	CALL	umodm1
+	MOVL	EBX, dda_curpsp
+	SHLL	EBX, #4t		;Fall into term4 on next page
+.PAGE
+;Here with all handles closed - now unlink the PSP and then give up all DOS
+;  memory blocks belonging to the PSP - we virtualize as many pages as we
+;  can here
+
+term4:	MOVZWL	EAX, psp_parent.B[EBX]	;Get selector of previous PSP
+	MOVL	dda_curpsp, EAX		;Update current PSP selector
+	CMPB	dff_EAX+1.B[EBP], #31h	;Terminate and stay resident?
+	JE	term6			;Yes - keep our memory
+	SHRL	EBX, #4t		;No - recover paragraph number
+	MOVZWL	EDX, dda_lolfmcb	;Point to first memory header
+	SHLL	EDX, #4t
+	MOVL	EDI, EDX
+2$:	MOVB	AL, [EDI]		;Get block type
+	CMPB	AL, #'M'		;Valid block type?
+	JE	4$.S			;Yes
+	CMPB	AL, #'Z'		;Maybe
+	JNE	10$.S			;No - fail
+4$:	CMPW	mh_psp.B[EDI], BX	;Does block belong to this PSP?
+	JNE	8$.S			;No
+	PUSHL	EBX			;Yes - first virtualize the block
+	MOVZWL	ECX, mh_size.B[EDI]	;Get size of block
+	SHLL	ECX, #4			;Change to bytes
+	LEAL	EAX, 10h.B[EDI]		;Get first location to give up
+	ADDL	EAX, #0FFFh		;Round up to page boundry
+	ANDL	EAX, #0FFFFF000h
+	ADDL	ECX, EDI		;Get first page to keep
+	ANDL	ECX, #0FFFFF000h
+	CMPL	ECX, EAX
+	JLE	6$.S			;If nothing to give up
+	PUSHL	#0FFFFh
+	PUSHL	#0.B
+	PUSHL	EAX
+	PUSHL	ECX
+	PUSHL	#PG$VIRTUAL|PG$WRITE|PG$READ.B
+	CALLF	svcMemPageType#
+6$:	CLRL	EBX			;Now give up the block
+	MOVB	AL, [EDI]
+	CALL	umodm2
+	POPL	EBX
+8$:	CMPB	[EDI], #'Z'		;Have another block?
+	JE	term6.S			;No - finished
+	MOVZWL	EAX, mh_size.B[EDI]	;Yes - advance to next
+	INCL	EAX
+	SHLL	EAX, #4
+	MOVL	EDX, EDI		;Remember previous block
+	ADDL	EDI, EAX
+	JMP	2$.S
+
+;Here if have bad block type - this is a serious error that the DOS memory
+;  allocation routines cannot recover from - all we can do is terminate the
+;  system process - also get here if the DOS task number has been corrupted
+
+10$:	PUSHL	#TC_MEMCRPD<24t		;Get termination code
+	CALLF	svcSchExit#		;Terminate the process
+.PAGE
+;Here with all memory given up if necessary
+
+term6:	MOVL	EBX, dda_curpsp		;Point to the PSP
+	SHLL	EBX, #4t
+	MOVL	EAX, psp_stack.B[EBX]	;Get the caller's real mode stack
+	MOVZWL	EDX, AX
+	ADDL	EDX, #24t.B		;Adjust the value
+	MOVZWL	EBX, AX			;Convert the stack pointer to an offset
+	SHRL	EAX, #12t
+	ANDB	AL, #0F0h
+	ADDL	EBX, EAX
+	PUSHL	DS
+	POPL	FS
+	MOVL	dff_ESP.B[EBP], EDX
+	SHRL	EAX, #4t
+	MOVL	dff_SS.B[EBP], EAX
+	MOVL	EAX, 22h*4		;Restore his return address
+	MOVZWL	EDX, AX
+	MOVL	dff_EIP.B[EBP], EDX
+	SHRL	EAX, #16t
+	MOVL	dff_CS.B[EBP], EAX
+	MOVL	dff_EFR.B[EBP], #820200h ;Store EFR value (note that we always
+					 ;  enable interrupts here)
+	MOVZWL	EAX, 14t.B[EBX]		;Restore DS
+	MOVL	dff_DS.B[EBP], EAX
+	MOVZWL	EAX, 16t.B[EBX]		;Restore ES
+	MOVL	dff_ES.B[EBP], EAX
+	MOVW	AX, [EBX]		;Restore his saved 16-bit registers
+	MOVW	dff_EAX.B[EBP], AX	;  from his real mode stack
+	MOVW	AX, 2t.B[EBX]
+	MOVW	dff_EBX.B[EBP], AX
+	MOVW	AX, 4t.B[EBX]
+	MOVW	dff_ECX.B[EBP], AX
+	MOVW	AX, 6t.B[EBX]
+	MOVW	dff_EDX.B[EBP], AX
+	MOVW	AX, 8t.B[EBX]
+	MOVW	dff_ESI.B[EBP], AX
+	MOVW	AX, 10t.B[EBX]
+	MOVW	dff_EDI.B[EBP], AX
+	MOVW	AX, 12t.B[EBX]
+	MOVW	dff_EBP.B[EBP], AX
+done02:	POPAL				;Restore general registers
+	CALLF	svcSchDismiss#		;Return to user
+.PAGE
+	.SBTTL	INT 21 function 4D - Get return code
+
+;Here for INT 21 function 4D - Get return code from last child process
+;	c(AH) = 4Dh
+;	INT	21h
+;	c(AL) = Return code
+;	c(AH) = Exit type:
+;		  0 = Normal termination
+;		  1 = Termination by Ctrl-C
+;		  2 = Termination by critical device error
+;		  3 = Termination by call to function 31h
+
+ugtrtnc::
+	MOVW	AX, dda_tcode		;Get the termination code
+	CMPB	AH, #0FFh		;Do we have a value?
+	JE	done02.S		;No - return nothing!
+	MOVW	dff_EAX.B[EBP], AX	;Yes - give him the return code
+	MOVW	dda_tcode, #0FF00h	;Clear the saved return code
+	JMP	done02.S
+.PAGE
+	.SBTTL	INT 21 function 48 - Allocate memory
+
+;Here for INT 21 function 48 - Allocate memory
+;	c(AH) = 48h
+;	c[BX] = Number of paragraphs to allocate
+;	INT	21h
+;	C:set = Error
+;	  c[AX] = Error code
+;	  c[BX] = Size of largest available block
+;	C:clr = Normal
+;	  c[AX] = Initial segment of allocated block
+
+uallocm::
+	MOVZWL	EBX, BX			;Get amount to allocate
+	CALL	ugetmem			;Allocate memory if can
+	JC	4$.S			;If error
+	SHRL	EDI, #4			;OK - get selector
+	MOVW	dff_EAX.B[EBP], DI	;Give it to the caller
+	
+;;;;;;;	CALL	chkmem
+
+	ANDB	dff_EFR.B[EBP], #~01h	;Clear his C bit
+	POPAL				;Restore general registers
+	CALLF	svcSchDismiss#		;Return to user
+
+;Here if error
+
+4$:	MOVW	dff_EBX.B[EBP], CX	;Return amount available
+	JMP	doserr#
+.PAGE
+	.SBTTL	INT 21 function 49 - Release memory
+
+;Here for INT 21 function 49 - Release memory
+;	c(AH) = 49h
+;	c[ES] = Segment of block to be released
+;	INT	21h
+;	C:set = Error
+;	  c[AX] = Error code
+;	C:clr = Normal
+;	  Nothing is returned!
+
+urelsm::CLRL	EBX			;Indicate should release memory
+	MOVZWL	ESI, dff_ES.B[EBP]	;Get his selector
+	CALL	umodm1			;Go change memory allocation (don't
+	JC	6$.S			;  return anything except an error
+	JMP	2$.S
+
+	.SBTTL	INT 21 function 4A - Modify memory allocation
+
+;Here for INT 21 function 4A - Modify memory allocation
+;	c(AH) = 4Ah
+;	c[BX] = New block size in paragraphs
+;	c[ES] = Selector of block to be modified
+;	INT	21h
+;	C:set = Error
+;	  c[AX] = Error code
+;	  c[BX] = Amount available (and allocated, if AX = 8!)
+;	C:clr = Normal
+;	  Nothing is returned!
+;  WARNING:  If there is not enough memory available to expand the block
+;            (error code = 8), the maximum amount available IS ALLOCATED,
+;            even though an ERROR IS RETURNED!
+
+umodm::	MOVZWL	EBX, BX			;Get size wanted
+	MOVZWL	ESI, dff_ES.B[EBP]	;Get his selector
+	CALL	umodm1			;Change memory allocation
+	JC	4$.S			;If error
+	SHRL	EDI, #4t		;OK Give him the selector in AX
+	INCL	EDI
+	MOVW	dff_EAX.B[EBP], AX
+2$:
+
+;;;;;;;	CALL	chkmem
+
+	ANDB	dff_EFR.B[EBP], #~01h	;Clear his C bit
+	POPAL				;Restore general registers
+	CALLF	svcSchDismiss#		;Return to user
+
+;Here if error
+
+4$:	CMPL	EAX, #ER_NEMA.B		;Was the error not enough memory?
+	JNE	6$.S			;No
+	MOVW	dff_EBX.B[EBP], CX	;Yes - tell him how much he has now
+6$:	JMP	doserr
+.PAGE
+.IF NE 0
+chkmem:	MOVZWL	EDI, dda_lolfmcb
+	SHLL	EDI, #4t
+2$:	MOVB	DL, [EDI]
+	CMPB	DL, #'M'
+	JE	4$.S
+	CMPB	DL, #'Z'
+	JNE	$$$$mem.S
+4$:	MOVZWL	EAX, 3.B[EDI]
+	INCL	EAX
+	SHLL	EAX, #4t
+	LEAL	ECX, [EDI+EAX]
+	CMPB	DL, #'Z'
+	JE	6$.S
+	CMPL	ECX, #0A0000h
+	JAE	$$$$mem.S
+	MOVL	EDI, ECX
+	JMP	2$.S
+
+6$:	CMPL	ECX, #0A0000h
+	JNE	$$$$mem.S
+	RET
+
+$$$$mem::NOP
+	CLC
+	RET
+.ENDC
+.PAGE
+;Subroutine to allocate DOS memory
+;	c{EBX} = Number of paragraphs to allocate
+;	CALL	ugetmem
+;	C:set = Error
+;	  c{EAX} = Error code
+;	  c{ECX} = Maximum amount (paragraphs) available
+;	C:clr = Normal
+;	  c{EDI} = Offset of block allocated (points to actual data area, not
+;		     to the header)
+
+$$$=!0
+FRM ugm_first, 4t		;Offset of first fit
+FRM ugm_best , 4t		;Offset of best fit
+FRM ugm_last , 4t		;Offset of last fit
+FRM ugm_bsize, 4t		;Size of best fit
+FRM ugm_big  , 4t		;Size of biggest block found
+ugm_SIZE=!$$$
+
+ugetmem::
+	ENTER	ugm_SIZE, 0
+	CLRL	EAX
+	MOVL	ugm_first.B[EBP], EAX
+	MOVL	ugm_best.B[EBP], EAX
+	MOVL	ugm_last.B[EBP], EAX
+	MOVL	ugm_bsize.B[EBP], EAX
+	MOVL	ugm_big.B[EBP], EAX
+	MOVZWL	EDI, dda_lolfmcb	;Point to first memory header
+	SHLL	EDI, #4t
+2$:	MOVB	AL, [EDI]		;Get block type
+	CMPB	AL, #'M'		;Valid block type?
+	JE	4$.S			;Yes
+	CMPB	AL, #'Z'		;Maybe
+	JNE	10$.S			;No - fail
+4$:	CMPW	mh_psp.B[EDI], #0.B	;Yes - is this block available?
+	JNE	14$.S			;No
+6$:	CMPB	AL, #'Z'		;Yes - last block?
+	JE	12$.S			;Yes
+	MOVZWL	EDX, mh_size.B[EDI]	;No - get its size
+	INCL	EDX
+	MOVL	ECX, EDX		;Get offset of next header
+	SHLL	ECX, #4t
+	ADDL	ECX, EDI
+	CMPL	ECX, #9FFE0h		;Is it possible?
+	JA	10$.S			;No - fail!
+	MOVB	AL, [ECX]		;Yes - get type of next block
+	CMPB	AL, #'M'		;Is it valid?
+	JE	8$.S			;Yes
+	CMPB	AL, #'Z'		;Maybe
+	JNE	10$.S			;No!
+8$:	CMPW	mh_psp.B[ECX], #0.B	;Yes - is it also free?
+	JNE	12$.S			;No
+	MOVZWL	EDX, mh_size.B[ECX]	;Yes
+	INCL	EDX
+	ADDW	mh_size.B[EDI], DX	;Merge the block
+	MOVB	[EDI], AL		;Update block type
+	JMP	6$.S			;Continue
+
+;Here if memory chain is bad
+
+10$:	MOVL	EAX, #ER_MAERR		;Indicate invalid memory block list
+	CLRL	ECX			;Nothing available here
+	LEAVE
+	STC				;Indicate error
+	RET				;And return
+
+;Here if can't merge next block
+
+12$:	MOVZWL	EDX, mh_size.B[EDI]
+	CMPL	EDX, EBX		;Is this one big enough?
+	JAE	16$.S			;Yes
+	CMPL	ugm_big.B[EBP], EDX	;No - is it bigger than current biggest?
+	JA	14$.S			;No
+	MOVL	ugm_big.B[EBP], EDX	;Yes - remember its size
+14$:	CMPB	[EDI], #'Z'		;No - have another?
+	JE	20$.S			;No - fail
+	MOVZWL	EAX, mh_size.B[EDI]	;Yes - advance to next
+	INCL	EAX
+	SHLL	EAX, #4
+	ADDL	EDI, EAX
+	JMP	2$.S
+
+;Here with memory block big enough to satisfy this request
+
+16$:	MOVL	ugm_last.B[EBP], EDI
+	CMPL	ugm_first.B[EBP], #0.B	;Is this the first?
+	JNE	18$.S			;No
+	MOVL	ugm_first.B[EBP], EDI	;Yes - remember it
+18$:	CMPL	ugm_bsize.B[EBP], EDX	;Is this the best so far?
+	JA	14$.S			;No
+	MOVL	ugm_best.B[EBP], EDI	;Yes - remember it
+	MOVL	ugm_bsize.B[EBP], EDX
+	JMP	14$.S
+
+;Here at end of memory chain
+
+20$:	MOVL	EDI, ugm_first.B[EBP]	;Did we find anything?
+	TESTL	EDI, EDI
+	JE	24$.S			;No - fail!
+	CMPB	dxd_mstrat, #1		;Want first fit?
+	JB	26$.S			;Yes
+	JE	18$.S			;No - if want best fit
+	MOVL	EDI, ugm_last.B[EBP]	;Want last fit
+	JMP	26$.S
+
+;Here if want best fit
+
+22$:	MOVL	EDI, ugm_best.B[EBP]
+	JMP	26$.S
+
+;Here if we didn't find enough
+
+24$:	MOVL	ECX, ugm_big.B[EBP]
+	MOVL	EAX, #ER_NEMA
+	LEAVE
+	STC
+	RET
+
+;Here with memory block to use
+
+26$:	MOVZWL	EAX, mh_size.B[EDI]	;Get size of this block
+	SUBL	EAX, EBX		;Calculate amount left
+	JE	28$.S			;If exact fit
+	CMPB	dxd_mstrat, #2		;Want to use top of block?
+	JAE	32$.S			;Yes
+	MOVL	ESI, EBX		;No - calculate address of new block to
+	INCL	ESI			;  make
+	SHLL	ESI, #4
+	ADDL	ESI, EDI
+	DECL	EAX			;Get size for new block
+	MOVW	mh_size.B[ESI], AX	;Store size
+	MOVW	mh_psp.B[ESI], #0	;Indicate available
+	MOVB	AL, [EDI]
+	MOVB	[ESI], AL
+	MOVB	[EDI], #'M'
+	MOVW	mh_size.B[EDI], BX	;Store new size for block we will use
+28$:	MOVL	EAX, dda_curpsp		;Get selector for current PSP
+	TESTL	EAX, EAX
+	JNE	30$.S			;If have one
+	DECL	EAX			;No PSP - use 0FFFFh to indicate in use
+30$:	MOVW	mh_psp.B[EDI], AX	;Indicate this block is in use
+	ADDL	EDI, #10h.B		;Point to space allocated (this
+	LEAVE				;  clears C)
+	RET
+
+;Here if want to use the high part of the block
+
+32$:	MOVL	ESI, EAX		;Calculate address of new block to make
+	SHLL	ESI, #4
+	ADDL	ESI, EDI
+	MOVW	mh_size.B[ESI], BX	;Store new size for block we will use
+	DECL	EAX
+	MOVW	mh_size.B[EDI], AX	;Store new size for free block
+	MOVW	mh_psp.B[EDI], #0	;Indicate available
+	MOVB	AL, [EDI]
+	MOVB	[ESI], AL
+	MOVB	[EDI], #'M'
+	MOVL	EDI, ESI
+	JMP	28$.S
+.PAGE
+;Subroutine to modify memory allocation
+;	c{EBX} = New size in paragraphs
+;	c{ESI} = Selector for block to be modified (points to start of data)
+;	CALL	umodm1
+;	C:set = Error
+;	  c{EAX} = Error code
+;	  c{ECX} = Maximum amount (paragraphs) available (this amount is
+;		     allocated!)
+;	C:clr = Normal
+;	  c{EDI} = Offset of header of block modified
+
+umodm1::DECL	ESI			;Get protected mode offset of memory
+	SHLL	ESI, #4			;  header
+	MOVZWL	EDX, dda_lolfmcb	;Point to first memory header
+	SHLL	EDX, #4t
+	MOVL	EDI, EDX
+2$:	MOVB	AL, [EDI]		;Get block type
+	CMPB	AL, #'M'		;Valid block type?
+	JE	4$.S			;Yes
+	CMPB	AL, #'Z'		;Maybe
+	JNE	8$.S			;No - fail
+4$:	CMPL	EDI, ESI		;Is this it?
+	JE	14$.S			;Yes
+	CMPB	AL, #'Z'		;No - have another?
+	JE	6$.S			;No - fail
+	MOVZWL	EAX, mh_size.B[EDI]	;Yes - advance to next
+	INCL	EAX
+	SHLL	EAX, #4
+	ADDL	EDI, EAX
+	JMP	2$.S
+
+;Here if can't find the requested memory block or if it belongs to a different
+;  DOS task
+
+6$:	MOVL	EAX, #ER_MACFT		;Indicate bad memory block
+	JMP	10$.S			;Go fail
+
+;Here if memory block list is invalid
+
+8$:	MOVL	EAX, #ER_MAERR		;Indicate invalid memory block list
+10$:	CLRL	ECX			;Nothing available here
+	STC				;Indicate error
+12$:	RET				;And return
+
+;Here with header for memory block
+
+14$:	MOVL	ECX, dda_curpsp		;Does it belong to the current sub-task?
+	CMPW	mh_psp.B[EDI], CX
+	JNE	6$.S			;No - fail
+	CMPW	mh_size.b[EDI], BX	;Really changing size?
+	JE	12$.S			;No - nothing to do!
+umodm2:	MOVZWL	ECX, mh_size.B[EDI]	;Yes - get current size
+	TESTL	EBX, EBX		;Removing block?
+	JNE	16$.S			;No
+	MOVW	mh_psp.B[EDI], #0	;Yes - just indicate available
+	RET				;Thats all!
+
+;Here if not removing block
+
+16$:	CMPL	ECX, EBX		;Reducing size of the block?
+	JB	18$.S			;No
+	MOVW	mh_size.B[EDI], BX	;Yes - change size of block
+	MOVL	EAX, ECX
+	SUBL	EAX, EBX
+	JE	12$.S			;Finished if just fits
+	DECL	EAX			;c{EAX} = size of new block to create
+	MOVB	DL, [EDI]		;Remember block type
+	MOVB	[EDI], #'M'		;Indicate not last block now
+	INCL	EBX			;Calculate address of new block
+	SHLL	EBX, #4
+	ADDL	EDI, EBX
+	JC	8$.S
+	MOVB	[EDI], DL		;Store last block indicator
+	MOVW	mh_size.B[EDI], AX	;Store size
+	MOVW	mh_psp.B[EDI], #0	;Indicate block is free
+	RET				;All done
+
+;Here if increasing size of the block
+
+18$:	CMPB	AL, #'Z'		;Is this the last block?
+	JE	24$.S			;Yes - fail
+	INCL	ECX			;No
+	MOVL	EDX, ECX		;Get offset of next block
+	SHLL	EDX, #4t
+	ADDL	EDX, EDI
+	CMPL	EDX, #9FFE0h		;Is it possible?
+	JA	8$.S			;No - fail!
+	MOVB	AL, [EDX]		;Yes - get type of next block
+	CMPB	AL, #'M'		;Is it valid?
+	JE	20$.S			;Yes
+	CMPB	AL, #'Z'		;Maybe
+	JNE	8$.S			;No
+20$:	CMPW	mh_psp.B[EDX], #0.B	;Yes - is the next block free?
+	JNE	22$.S			;No - fail
+	MOVZWL	EDX, mh_size.B[EDX]	;Yes - get size of next block (we have
+	ADDL	ECX, EDX		;  already added 1 to ECX!)
+	MOVW	mh_size.B[EDI], CX	;Merge it with this block
+	MOVB	[EDI], AL		;Update block type
+	JMP	16$.S
+
+;Here if cannot expand the block as requested
+
+22$:	DECL	ECX			;Fix up the current size
+24$:	MOVL	EAX, #ER_NEMA		;Get error code
+	STC				;Indicate failure
+	RET
+
+	END

@@ -1,0 +1,4295 @@
+        .TITLE  FTPSRV - Internet FTP server for XOS
+
+;++++
+; This software is in the public domain.  It may be freely copied and used
+; for whatever purpose you see fit, including commerical uses.  Anyone
+; modifying this software may claim ownership of the modifications, but not
+; the complete derived code.  It would be appreciated if the authors were
+; told what this software is being used for, but this is not a requirement.
+
+;   THIS SOFTWARE IS PROVIDED BY THE AUTHORS "AS IS" AND ANY EXPRESS OR
+;   IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
+;   OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+;   IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+;   INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+;   BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS
+;   OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+;   ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR
+;   TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
+;   USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+;----
+
+	.PROC	80386
+
+	.INCLUD	XOSINC:\XMAC\STDIO.PAR
+	.INCLUD	XOSINC:\XMAC\PROCARG.PAR
+	.INCLUD	XOSINC:\XMAC\CTYPE.PAR
+	.INCLUD	XOSINC:\XMAC\XOS.PAR
+	.INCLUD	XOSINC:\XMAC\XOSERR.PAR
+	.INCLUD	XOSINC:\XMAC\XOSNET.PAR
+	.INCLUD	XOSINC:\XMAC\XOSTIME.PAR
+	.INCLUD XOSINC:\XMAC\XOSGETUSER.PAR
+	.INCLUD	XOSINC:\XMAC\XOSUDF.PAR
+
+	.STDSEGS
+
+;This program is the IP FTP server.
+
+;  It is initialized as a symbiont with the following command:
+;	SYMBIONT FTPSRV keyword1=value1 keyword2=value2 ...
+;	  Where the valid keywords are:
+;		FTPOPEN  = Maximum number of open requests to queue
+;		FTPCON   = Maximum number of open data/command connections
+;		FTPDEV   = Name of TCP device for FTP
+;		LOGLEVEL = Log level:
+;			     0 = No local logging (default)
+;			     1 = Log major events
+;			     2 = Log all network messages
+;		LOGFILE  = Log file specification (default is to use DH_STDERR)
+
+;Note that this program will support any number of different devices.  Each
+;  occurence of the FTPDEV command line keywords causes another device stream
+;  to be created.  Each stream is set up using the most recently specfied
+;  NUMOPEN and NUMCON values.  If no FTPDEV keywords are specified, nothing
+;  will be done.
+
+VERSION=!2t
+EDITNO =!0t
+
+; v1.1 - 27-Nov-94 (JRG)
+;	Fixed bug in sending response messages to SYMBIONT.
+; v1.2 - 15-Apr-95 (JRG & SAO)
+;	Added LIST command, fixed to do DELAY right.
+; v1.3 - 07-Jun-95 (SAO)
+;	Added MKD and RMD commands.  Added user authentification.
+;	Added PASSWORD switch to command line.
+; v1.4 - 03-Aug-95 (SAO)
+;	Added support for -l option on NLST
+; v1.5 - 04-Aug-95 (SAO)
+;	Finished rooted directory access limits for passworded users
+; v2.0 - 1-Jul-99
+;	Changed to use UDFSRV for user verification, added all-file mode,
+;	numerious bug fixes.
+.PAGE
+VECT_CMDOPEN   =!22t		;TCP command open done signal
+VECT_CMDINPUT  =!23t		;TCP command input available signal
+VECT_CMDOUTPUT =!24t		;TCP command output complete signal
+VECT_CMDCLOSE  =!25t		;TCP command close done signal
+VECT_DATAOPEN  =!26t		;TCP data open done signal
+VECT_DATAINPUT =!27t		;TCP data input available signal
+VECT_DATAOUTPUT=!28t		;TCP data output complete signal
+VECT_DATACLOSE =!29t		;TCP data close done signal
+VECT_DISK      =!30t		;Disk IO done signal
+VECT_ALARM     =!31t		;Alarm vector signal
+VECT_UDF       =!32t		;First vectory used by getusersig (33 is
+				;  also used)
+
+CMDINSIZE =!512t
+CMDLBSIZE =!256t
+CMDOUTSIZE=!512t
+DATASIZE  =!1024t
+
+;Define input state values
+
+IS_NORM=!0t			;Normal input
+IS_TN1 =!1t			;Expecting 1st character after FF
+IS_TN2 =!2t			;Expecting 2nd character after FF
+
+;Define offsets in the NDBs (Network Data Blocks)
+
+$$$=!0
+BLK ndb_next    , 4t		;Offset of next NDB
+BLK ndb_fodb    , 4t		;Offset of first ODB
+BLK ndb_fcdb    , 4t		;Offset of first CDB
+BLK ndb_maxfiles, 4t		;Maximum number of open files
+BLK ndb_opens   , 4t		;Number of opens to queue
+BLK ndb_tcpname , 16t		;Name of the TCP device
+ndb_SIZE=!$$$
+
+;Define offsets in the ODBs (Open Data Blocks)
+
+$$$=!0
+BLK odb_qab  , qab_SIZE		;QAB for open function
+BLK odb_next , 4t		;Offset of next ODB
+BLK odb_ndb  , 4t		;Offset of NDB
+BLK odb_parms, 32t		;Parameter list for open
+odb_SIZE=!$$$
+
+;Define offsets in the CDBs (Connection Data Block)
+
+cdb_MSIZE=!128t
+$$$=!-cdb_MSIZE
+BLK cdb_dirrtn    , 4t		;Return offset for director search
+BLK cdb_dirECX    , 4t		;Save ECX for directory search
+BLK cdb_dirinpnt  , 4t		;Input pointer for directory search
+BLK cdb_dirincnt  , 4t		;Input pointer for directory search
+BLK cdb_diroutpnt , 4t		;Output pointer for directory search
+BLK cdb_diroutcnt , 4t		;Output pointer for directory search
+BLK cdb_tcperr    , 4t		;TCP error code
+BLK cdb_diskerr   , 4t		;Disk error code
+BLK cdb_diskdsp   , 4t		;Dispatch for disk IO done
+BLK cdb_cmdipaddr , 4t		;Remote command IP address
+BLK cdb_dataipaddr, 4t		;Remote data IP address
+BLK cdb_rcmdport  , 4t		;Remote command port
+BLK cdb_rdataport , 4t		;Remote data port
+BLK cdb_lcmdport  , 4t		;Local command port
+BLK cdb_ldataport , 4t		;Local data port
+BLK cdb_cmdlnbpnt , 4t		;Command line buffer pointer
+BLK cdb_cmdlnbcnt , 4t		;Command line buffer count
+BLK cdb_cmdpnt    , 4t
+BLK cdb_cmdoutcnt , 4t		;Command output pointer
+BLK cdb_cmdoutpnt , 4t		;Command output count
+BLK cdb_homdirstr , 4t		;Home directory pointer
+BLK cdb_homdirlen , 4t
+BLK cdb_wrkdirstr , 4t		;Working directory pointer
+BLK cdb_wrkdirlen , 4t		;Working directory count
+BLK cdb_tcpinparms, 12t		;Parameter list for TCP command input
+BLK cdb_istate    , 1t		;Input state
+BLK cdb_telnet1   , 1t		;First Telnet command byte
+BLK cdb_status1   , 1t		;Status bits
+BLK cdb_status2   , 1t
+BLK cdb_command   , 1t		;Current transfer command
+BLK cdb_stkcnt    , 1t		;Number of stack items saved
+BLK cdb_listcmd   , 1t		;Command for LIST or NLST command
+BLK cdb_direct    , 1t          ;LIST directory flag
+BLK cdb_rdonly    , 1t          ;LIST readonly flag
+BLK cdb_allflsok  , 1t		;All-files mode state
+BLK               , 2t
+BLK cdb_ndb       , 4t		;Offset of NDB
+BLK cdb_next      , 4t		;Offset of next CDB for NDB
+BLK cdb_cmdinqab  , qab_SIZE	;TCP command input QAB
+.IF NE cdb_cmdinqab
+	.IRP	q, >cdb_cmdinqab
+	.ERROR	CDB starting offset is wrong, cdb_cmdinqab = q'h
+	.ENDR
+.ENDC
+BLK cdb_cmdoutqab , qab_SIZE	;TCP command output QAB
+BLK cdb_dataqab   , qab_SIZE	;TCP data QAB
+BLK cdb_diskqab   , qab_SIZE	;QAB for disk IO
+BLK cdb_parms     , 64t		;Space for parameter list
+BLK cdb_stksave   , 64t		;Place to save stack when waiting
+BLK cdb_cmdlnbufr , CMDLBSIZE	;Command line buffer
+BLK cdb_cmdinbufr , CMDINSIZE	;Command input buffer
+BLK cdb_cmdoutbufr, CMDOUTSIZE	;Command output buffer
+BLK cdb_databuf1  , DATASIZE	;First data buffer
+BLK cdb_databuf2  , DATASIZE	;Second data buffer
+BLK cdb_listoutb  , DATASIZE    ;Buffer to build output record for LIST
+BLK cdb_listdate  , 32t         ;Buffer for date string
+BLK cdb_username  , 64t		;Buffer for user name
+BLK cdb_password  , 60t		;Buffer for password
+BLK cdb_pswdlen   , 4t		;Length of the password
+BLK cdb_uvdata	  , ud_SIZE	;User data block, for pwd verification
+cdb_SIZE=!$$$
+
+;Define values for cdb_status1
+
+S1$CLOSE   =!80h		;Closing command connection
+S1$USER    =!40h		;User name specified
+S1$LOGGEDIN=!20h		;User is logged in
+S1$RNFR    =!10h		;Have rename from name specified
+S1$OPEN    =!08h		;Data connection is active
+S1$DONE    =!04h		;Transfer is complete
+S1$QUIT    =!02h		;QUIT has been requested
+S1$ABORT   =!01h		;ABOR has been requested
+
+;Define values for cdb_status2
+
+S2$GETUSER =!40h		;getusersig is active
+
+;Define values for cdb_command
+
+CMD_IDLE=!0t			;Data connection is idle
+CMD_STOR=!1t			;STOR command active
+CMD_RETR=!2t			;RETR command active
+CMD_LIST=!3t			;LIST command active
+CMD_NLST=!4t			;NLST command active
+
+.PAGE
+	.PSECT	_DATA_p
+
+argmsect:.LONG	0
+
+kwftpopen: .ASCIZ "FTPOPEN"
+kwftpnum:  .ASCIZ "FTPNUM"
+kwftpdev:  .ASCIZ "FTPDEV"
+kwdelay1:  .ASCIZ "DELAY"
+kwdelay2:  .ASCIZ "DEL"
+kwloglevel:.ASCIZ "LOGLEVEL"
+kwlogfile: .ASCIZ "LOGFILE"
+kwpwdenabl:.ASCIZ "PASSWORD"
+kwnohelp:  .ASCIZ ""
+
+keyword:.LONG	kwftpopen , ASF$VALREQ|ASF$NVAL , 0, fncftpopen , 0
+	.LONG	kwftpnum  , ASF$VALREQ|ASF$NVAL , 0, fncftpnum  , 0
+	.LONG	kwftpdev  , ASF$VALREQ|ASF$LSVAL, 0, fncftpdev  , 0
+	.LONG	kwdelay1  , ASF$VALREQ|ASF$NVAL , 0, fncfdelay  , 0
+	.LONG	kwdelay2  , ASF$VALREQ|ASF$NVAL , 0, fncfdelay  , 0
+	.LONG	kwloglevel, ASF$VALREQ|ASF$NVAL , 0, fncloglevel, 0
+	.LONG	kwlogfile , ASF$VALREQ|ASF$LSVAL, 0, fnclogfile , 0
+	.LONG	kwpwdenabl, 0			, 0, fncpwdreq  , 0
+	.LONG	0	  , 0			, 0, 0		, 0
+
+	.SBTTL	Start of program
+
+	.PSECT	_TEXT_p
+
+mainalt::
+	PUSHL	DS			;Change our process name
+	PUSHL	#ourname
+	CALLF	svcSysSetPName##
+	MOVL	ESI, 4.B[ESP]		;Get offset of argument msect
+	MOVL	argmsect, ESI
+	PUSHL	#reqname
+	PUSHL	ESI
+	CALL	getreqname#		;Process requestor PID argument
+	ADDL	ESP, #8.B
+	MOVL	EBX, #badpidmsg
+	TESTL	EAX, EAX		;Error?
+	JE	fail1			;Yes
+	MOVL	argpntr, EAX		;No - store argument offset for procarg
+	MOVL	EBX, #sivfmsg
+	PUSHL	#VECT_CMDOPEN.B		;Set the TCP command open done vector
+	PUSHL	#84h+{VT_XOSS<8t}
+	PUSHL	CS
+	PUSHL	#tcpcmdopen
+	CALLF	svcSchSetVector##
+	TESTL	EAX, EAX
+	JS	4$.S
+	PUSHL	#VECT_CMDINPUT.B	;Set the TCP command input done vector
+	PUSHL	#84h+{VT_XOSS<8t}
+	PUSHL	CS
+	PUSHL	#tcpcmdinput
+	CALLF	svcSchSetVector##
+	TESTL	EAX, EAX
+	JS	4$.S
+	PUSHL	#VECT_CMDOUTPUT.B	;Set the TCP command output done vector
+	PUSHL	#84h+{VT_XOSS<8t}
+	PUSHL	CS
+	PUSHL	#tcpcmdoutput
+	CALLF	svcSchSetVector##
+	TESTL	EAX, EAX
+	JS	4$.S
+	PUSHL	#VECT_CMDCLOSE.B	;Set the TCP command close done vector
+	PUSHL	#84h+{VT_XOSS<8t}
+	PUSHL	CS
+	PUSHL	#tcpcmdclose
+	CALLF	svcSchSetVector##
+	TESTL	EAX, EAX
+	JS	4$.S
+	PUSHL	#VECT_DATAOPEN.B	;Set the TCP data open done vector
+	PUSHL	#84h+{VT_XOSS<8t}
+	PUSHL	CS
+	PUSHL	#tcpdataopen
+	CALLF	svcSchSetVector##
+	TESTL	EAX, EAX
+	JS	4$.S
+	PUSHL	#VECT_DATAINPUT.B	;Set the TCP data input done vector
+	PUSHL	#84h+{VT_XOSS<8t}
+	PUSHL	CS
+	PUSHL	#tcpdatainput
+	CALLF	svcSchSetVector##
+	TESTL	EAX, EAX
+4$:	JS	fail2
+	PUSHL	#VECT_DATAOUTPUT.B	;Set the TCP data output done vector
+	PUSHL	#84h+{VT_XOSS<8t}
+	PUSHL	CS
+	PUSHL	#tcpdataoutput
+	CALLF	svcSchSetVector##
+	TESTL	EAX, EAX
+	JS	4$.S
+	PUSHL	#VECT_DATACLOSE.B	;Set the TCP data close done vector
+	PUSHL	#84h+{VT_XOSS<8t}
+	PUSHL	CS
+	PUSHL	#tcpdataclose
+	CALLF	svcSchSetVector##
+	TESTL	EAX, EAX
+	JS	4$.S
+	PUSHL	#VECT_DISK.B		;Set the disk done vector
+	PUSHL	#84h+{VT_XOSS<8t}
+	PUSHL	CS
+	PUSHL	#diskdone
+	CALLF	svcSchSetVector##
+	TESTL	EAX, EAX
+	JS	4$.S			;If error
+	PUSHL	#VECT_ALARM.B		;Set the alarm vector
+	PUSHL	#84h+{VT_XOSS<8t}
+	PUSHL	CS
+	PUSHL	#alarm
+	CALLF	svcSchSetVector##
+	TESTL	EAX, EAX
+	JS	4$.S			;If error
+	PUSHL	#4t.B
+	PUSHL	#VECT_UDF.B
+	CALL	getuserinit#
+	ADDL	ESP, #8t.B
+	MOVL	EBX, #badvuimsg
+	TESTL	EAX, EAX
+	JS	4$.S
+	PUSHL	#0.B			;No default extension for indirect file
+	PUSHL	#0.B			;No next line function
+	PUSHL	#argerr			;Error function
+	PUSHL	#0.B			;Function called for non-keyword args
+	PUSHL	#keyword		;Offset of keyword table
+	PUSHL	#0.B			;Offset of option table
+	PUSHL	#PAF$INDIRECT|PAF$EATQUOTE ;Flag bits
+	PUSHL	#argpntr		;Offset of arg string pointer
+	CALL	procarg#		;Process arguments
+	ADDL	ESP, #32t.B
+	PUSHL	DS			;Give up the argument data
+	PUSHL	argmsect
+	PUSHL	#0.B
+	PUSHL	#0.B
+	CALLF	svcMemChange##
+	MOVL	EBX, #no2domsg
+	CMPL	ftpcnt, #0.B		;Was at least one function requested?
+	JE	fail1			;No - fail!
+	CMPL	logname, #0.B		;Have a log file specified?
+	JE	cmddone.S		;No - go on
+	PUSHL	#O$TRUNCA|O$CREATE|O$OUT ;Yes - open the log file
+	PUSHL	DS
+	PUSHL	logname
+	PUSHL	#0.B
+	PUSHL	#0.B
+	CALLF	svcIoOpen##
+	MOVL	debughndl, EAX		;Store handle
+	MOVL	EBX, #nologmsg
+	TESTL	EAX, EAX		;Error?
+10$:	JS	fail1			;Yes
+					;No - fall into cmddone on next page
+.PAGE
+;Here with all command line processing done
+
+cmddone:PUSHL	#0			;Give up the argument msect
+	PUSHL	#0
+	PUSHL	argmsect
+	PUSHL	DS
+	CALLF	svcMemChange##
+	MOVL	EDI, #finmsg1		;Send final response message
+	MOVL	ECX, #finsz1
+	CALL	response
+	PUSHL	DS
+	PUSHL	#cfgqab			;Get the name of the system
+	CALLF	svcIoQueue##
+	MOVZWL	EAX, sysnlen
+	TESTL	EAX, EAX		;Did we get a name?
+	JNE	2$.S			;Yes
+	MOVB	sysname-2, #0		;No
+2$:	MOVB	sysname[EAX], #')'
+	PUSHL	#O$RAW
+	PUSHL	DS
+	PUSHL	#xosdevstr
+	PUSHL	DS
+	PUSHL	#xdparms
+	CALLF	svcIoDevParm##
+	MOVZWL	EAX, xosrtsz
+	INCL	xosrtsz
+	MOVW	xosroot[EAX], #'/'
+	CALLF	svcSchSetLevel##	;Allow signals signals
+	JMP	mainloop		;All ready - go to the main loop
+.PAGE
+;Here if have fatal error during set up
+;	c{EBX} = Offset of first message string
+;	c{EAX} = Offset of second message string or negative error code
+
+fail1:	CLRL	EAX
+fail2:	SUBL	ESP, #500t		;Allocate a buffer
+	PUSHL	DS
+	POPL	ES
+	MOVL	EDI, ESP
+	PUSHL	EAX			;Save second item
+	MOVL	ESI, #failmsg1
+	MOVL	ECX, #failsz1
+	CLD
+	RMOVSB	[EDI], [ESI]
+	MOVL	ESI, EBX
+2$:	LODSB	[ESI]
+	STOSB	[EDI]
+	ORB	AL, AL
+	JNE	2$.S
+	DECL	EDI
+	POPL	EAX
+	TESTL	EAX, EAX		;Have a second message line?
+	JE	8$.S			;No
+	MOVL	ESI, #failmsg2		;Yes
+	MOVL	ECX, #failsz2
+	RMOVSB	[EDI], [ESI]
+	TESTL	EAX, EAX		;Is second line a string?
+	JNS	4$.S			;Yes - go on
+	PUSHL	EAX			;No - its an error code - get message
+	PUSHL	#3.B
+	PUSHL	DS
+	PUSHL	EDI
+	CALLF	svcSysErrMsg##
+	ADDL	EDI, EAX
+	JMP	8$.S
+
+;Here if second line specified as a string
+
+4$:	MOVL	ESI, EAX
+6$:	LODSB	[ESI]
+	STOSB	[EDI]
+	ORB	AL, AL
+	JNE	6$.S
+	DECL	EDI
+8$:	MOVL	ESI, #failmsg3
+	MOVL	ECX, #failsz3
+	RMOVSB	[EDI], [ESI]
+	MOVL	ECX, EDI
+	SUBL	ECX, ESP
+	MOVL	EDI, ESP
+	CALL	response
+	PUSHL	#1.B
+	CALLF	svcSchExit##
+
+;Here if can't get memory during set up
+
+nema:	MOVL	EBX, #nemamsg
+	JMP	fail1.S
+.PAGE
+	.SBTTL	argerr - Function called by procarg on errors
+
+;Function called by procarg on errors
+
+argerr:	POPL	EAX			;Discard return address
+	POPL	EBX			;Get offset of first message string
+	POPL	EAX			;Get offset of second message string
+	JMP	fail2.S
+.PAGE
+	.SBTTL	fncftpopen - Function to process the FTPOPEN keyword
+
+;Function to process the FTPOPEN keyword - this specifies the number of FTP
+;  opens to queuefiles allowed
+
+fncftpopen:
+	MOVL	EAX, 4.B[ESP]		;Get offset of the argument data
+	MOVL	EAX, argdata_value.B[EAX] ;Get value
+	TESTL	EAX, EAX		;Is it 0?
+	JNE	2$.S			;No
+	MOVB	AL, #4			;Yes - use default
+2$:	MOVL	ftpopen, EAX		;Store value
+	JMP	6$.S
+
+	.SBTTL	fncftpnum - Function to process the FTPNUM keyword
+
+;Function to process the FTPNUM keyword - this specifies the number of FTP
+;  open files allowed
+
+fncftpnum:
+	MOVL	EAX, 4.B[ESP]		;Get offset of the argument data
+	MOVL	EAX, argdata_value.B[EAX] ;Get value
+	TESTL	EAX, EAX		;Is it 0?
+	JNE	4$.S			;No
+	MOVB	AL, #4			;Yes - use default
+4$:	MOVL	ftpnum, EAX		;Store value
+6$:	JMP	rtnone
+.PAGE
+	.SBTTL	fncftpdev - Subroutine to process FTPDEV keyword for procarg
+
+;Subroutine process the FTPDEV keyword for procarg
+;	result = fncftpdev(arg_spec *arg);
+;  result = TRUE if OK, FALSE if error
+
+fncftpdev:
+	PUSHL	ESI
+	PUSHL	EDI
+	MOVL	EAX, #ndb_SIZE		;Allocate memory for the NDB
+	CALL	getimem
+	MOVL	ESI, 12t.B[ESP]		;Get offset of argument data structure
+	MOVL	EDX, argdata_value.B[ESI] ;Get offset of name string
+	MOVL	EBX, #devname
+	MOVL	ECX, #8t
+2$:	MOVB	AL, [EDX]		;Get name character
+	CMPB	AL, #0			;End?
+	JE	10$.S			;Yes
+	INCL	EDX			;No
+	CMPB	AL, #'a'		;Lower case?
+	JB	4$.S			;No
+	ADDB	AL, #'A'-'a'		;Yes - change to upper case
+4$:	MOVB	[EBX], AL		;Store in buffer
+	INCL	EBX
+	CMPB	AL, #':'		;Colon?
+	JE	8$.S			;Yes
+	LOOP	ECX, 2$			;No - loop if can take more
+6$:	MOVL	EAX, #ER_BDSPC		;Bad name
+	JMP	14$.S
+
+;Here with colon in name
+
+8$:	CMPB	[EDX], #0		;Is it the last character?
+	JNE	6$.S			;No - bad name
+	JMP	12$.S			;Yes
+
+;Here with end of name (no colon seen)
+
+10$:	MOVB	[EBX], #':'		;Store colon
+	INCL	EBX
+12$:	MOVL	[EBX], #'*::'		;Store *:: and null at end
+	PUSHL	#0
+	PUSHL	DS
+	PUSHL	#devname
+	PUSHL	DS
+	PUSHL	#openparms
+	CALLF	svcIoDevParm##
+14$:	MOVL	EBX, #opnemsg
+	BTL	EAX, #31t		;Set C if error
+	JC	fail2
+	MOVL	EBX, #ntcpmsg
+	CMPL	openclass, #'TCP'	;Is it really a TCP device?
+	JNE	fail1
+	MOVL	EAX, ftpnum		;Get maximum number of files
+	MOVL	ndb_maxfiles.B[EDI], EAX ;Store it
+	MOVL	EAX, ftpopen		;Get number of opens to queue
+	MOVL	ndb_opens.B[EDI], EAX	;Store it
+	MOVL	ECX, EAX
+	MOVL	EAX, tcpname+0		;Copy the device name to the NDB
+	MOVL	ndb_tcpname+0.B[EDI], EAX
+	MOVL	EAX, tcpname+4
+	MOVL	ndb_tcpname+4.B[EDI], EAX
+	MOVL	EAX, tcpname+8
+	MOVL	ndb_tcpname+8.B[EDI], EAX
+	MOVL	EAX, tcpname+12t
+	MOVL	ndb_tcpname+12t.B[EDI], EAX
+	MOVZWL	EBX, tcpnsize
+	MOVL	ndb_tcpname.B[EDI+EBX], #'*::'
+	MOVL	EDX, EDI
+	LEAL	ESI, ndb_fodb.B[EDI]
+20$:	PUSHL	ECX
+	PUSHL	EDX
+	MOVL	EAX, #odb_SIZE		;Allocate memory for a ODB
+	CALL	getimem
+	POPL	EDX
+	MOVL	[ESI], EDI		;Link into our list of ODBs
+	LEAL	ESI, odb_next.B[EDI]
+	CLRL	EAX
+	MOVL	odb_next.B[EDI], EAX
+	MOVL	odb_ndb.B[EDI], EDX
+	PUSHL	ESI			;Set up the parameter list
+	PUSHL	EDI
+	MOVL	ESI, #opnparms
+	ADDL	EDI, #odb_parms.B
+	PUSHL	DS
+	POPL	ES
+	MOVL	ECX, #{OPNPSIZE+3}/4
+	CLD
+	RMOVSL	[EDI], CS:[ESI]
+	POPL	EDI
+	POPL	ESI
+	MOVW	odb_qab+qab_func.B[EDI], #QFNC_OPEN
+	MOVL	odb_qab+qab_option.B[EDI], #O$IN|O$OUT|O$PARTIAL
+	MOVW	odb_qab+qab_vector.B[EDI], #VECT_CMDOPEN
+	LEAL	EAX, ndb_tcpname.B[EDX]
+	MOVL	odb_qab+qab_buffer1+0.B[EDI], EAX
+	MOVL	odb_qab+qab_buffer1+4.B[EDI], CS
+	LEAL	EAX, odb_parms.B[EDI]
+	MOVL	odb_qab+qab_parm+0.B[EDI], EAX
+	MOVL	odb_qab+qab_parm+4.B[EDI], DS
+	PUSHL	DS			;Queue an initial TCP open
+	PUSHL	EDI
+	CALLF	svcIoQueue##
+	MOVL	EBX, #cnqimsg
+	TESTL	EAX, EAX
+22$:	JS	fail2
+	MOVL	EAX, odb_qab+qab_error.B[EDI] ;Have immediate error?
+	TESTL	EAX, EAX
+	JS	22$.S			;Yes - fail
+	POPL	ECX			;No
+	LOOP	ECX, 20$
+	INCL	ftpcnt
+	MOVL	EDI, #initmsg		;All finished with the unit - tell the
+	MOVL	ECX, #INITMSGSIZE	;  user about this
+	CALL	response
+	CLRL	EAX			;Return TRUE
+	INCL	EAX
+	POPL	EDI
+	POPL	ESI
+	RET
+
+	  .MOD   4
+opnparms: .BYTE  PAR$SET|REP_HEXV, 4t
+	  .WORD  IOPAR_NETLCLPORT
+	  .LONG  40000000+TCPP_FTPCMD
+	  .BYTE  PAR$GET|REP_HEXV, 4t
+	  .WORD  IOPAR_NETRMTNETAR
+ipaddr=!$-opnparms
+	  .LONG  0
+	  .BYTE  PAR$GET|REP_HEXV, 4t
+	  .WORD  IOPAR_NETRMTPORTR
+tcpport=!$-opnparms
+	  .LONG  0
+	  .BYTE  0
+OPNPSIZE=!$-opnparms
+.PAGE
+	.SBTTL	fncftpdelay - Function to process the DELAY keyword
+
+;Function to process the DELAY keyword - this specifies a delay factor for
+;  responses
+
+fncfdelay:
+	MOVL	EAX, 4.B[ESP]		;Get offset of the argument data
+	MOVL	EAX, argdata_value.B[EAX] ;Get value
+	IMULL	EAX, #XT_MILLISEC	;Convert to fractional days
+	MOVL	respdelay, EAX		;Store value
+	JMP	rtnone
+.PAGE
+	.SBTTL	fnclogfile - Function to process the LOGFILE keyword
+
+;Function to process the LOGFILE keyword - this specifies the logging file
+
+fnclogfile:
+	PUSHL	EDI
+	MOVL	EDI, #logname
+	PUSHL	ESI
+	MOVL	ESI, 12t.B[ESP]
+	MOVL	EAX, argdata_length.B[ESI]
+	ADDL	EAX, #4t.B		;Allocate enough memory to hold the
+	PUSHL	EAX			;  string plus a little more to hold
+	CALL	sbrk#			;  any characters we append to it
+	POPL	ECX
+	CMPL	EAX, #-1.B
+	JE	nema			;If can't allocate the memory
+	MOVL	[EDI], EAX		;OK - store offset of memory allocated
+	MOVL	EDI, EAX
+strit:	MOVL	ECX, argdata_length.B[ESI] ;Get length of string
+	MOVL	ESI, argdata_value.B[ESI] ;Get offset of string
+	PUSHL	DS
+	POPL	ES
+	CLD
+	INCL	ECX			;Include the final null
+	RMOVSB	[EDI], [ESI]		;Copy the string
+	MOVL	EAX, #1
+10$:	POPL	ESI
+	POPL	EDI
+	RET
+.PAGE
+	.SBTTL	fncloglevel - Function to process the LOGLEVEL keyword
+
+;Function to process the LOGLEVEL keyword - this specifies the number logging
+;  level
+
+fncloglevel:
+	MOVL	EAX, 4.B[ESP]
+	MOVL	EAX, argdata_value.B[EAX]
+	MOVB	loglevel, AL
+rtnone:	MOVL	EAX, #1
+	RET
+
+.PAGE
+	.SBTTL	fncpwdreq - Function to process the PASSWORD keyword
+
+;Function to process the PASSWORD keyword - this specifies that password
+;  checking should be turned ON.
+
+fncpwdreq:
+	MOVB	pwdreq, #1
+	JMP	rtnone.S
+
+.PAGE
+	.SBTTL	getimem - Subroutine to allocate memory during set up
+
+;Subroutine to allocate memory during set up
+;	c{EAX} = Amount needed
+;	CALL	getimem
+;	c{EDI} = Offset of memory obtained
+
+getimem:PUSHL	EAX
+	CALL	sbrk#
+	POPL	EDI
+	CMPL	EAX, #-1.B
+	JE	4$.S
+	MOVL	EDI, EAX
+	RET
+
+4$:	MOVL	EBX, #nemamsg
+	JMP	fail1
+.PAGE
+	.SBTTL	response - Subroutine to generate response message
+
+;Subroutine to generate response message
+;	c{EDI} = Offset of message
+;	c{ECX} = Length of message
+;	CALL	response
+
+response:
+	CMPB	reqname, #0.B		;Running from a terminal?
+	JNE	2$.S			;No - go on
+	INCL	EDI			;Yes - output message to the terminal
+	DECL	ECX
+	PUSHL	#DH_STDERR.B
+	PUSHL	DS
+	PUSHL	EDI
+	PUSHL	ECX
+	CALLF	svcIoOutBlock##
+	PUSHL	#DH_STDERR.B
+	PUSHL	DS
+	PUSHL	#crlfmsg
+	PUSHL	#0.B
+	CALLF	svcIoOutString##
+	RET
+
+;Here if not running from a terminal - send response message to requestor
+
+2$:	CMPL	msgqab+qab_handle, #0.B	;Is the message device open?
+	JNE	4$.S			;Yes - us it
+	PUSHL	#O$IN|O$OUT		;No - must open it now
+	PUSHL	DS
+	PUSHL	#msgname
+	PUSHL	#0.B
+	PUSHL	#0.B
+	CALLF	svcIoOpen##
+	TESTL	EAX, EAX
+	JS	ret010.S
+	MOVL	msgqab+qab_handle, EAX
+4$:	MOVL	msgqab+qab_buffer1, EDI	;Store offset of message
+	MOVL	msgqab+qab_count, ECX	;Store length of message
+	PUSHL	DS
+	PUSHL	#msgqab
+	CALLF	svcIoQueue##
+ret010:	RET
+.PAGE
+	.SBTTL	Main program loop
+
+;Main program loop
+
+mainloop:
+	PUSHL	#0.B			;Wait for signal
+	PUSHL	#0.B
+	PUSHL	#-1.B
+	CALLF	svcSchSuspend##
+.PAGE
+	.SBTTL	tcpcmdopen - Signal routine for TCP command open done
+
+;Signal routine for TCP command open done.  When get here we have a new command
+;  connection.  We allocate a CDB, set it up and queue another open.
+
+tcpcmdopen:
+	PUSHAL
+	MOVL	intESP, ESP
+	MOVL	ESI, 64t.B[ESP]		;Get offset of the ODB
+	CALL	docmdopen
+	POPAL
+	CALLF	svcSchDismiss##
+
+docmdopen:
+	MOVL	intESP, ESP
+	CMPB	loglevel, #1		;Should we log this?
+	JB	2$.S			;No
+	MOVL	EBX, #strcsi		;Yes - display initial string
+	MOVL	EAX, odb_qab+qab_handle.B[ESI] ;Display TCP handle
+	CALL	debugbgn
+	CALL	debugspace
+	MOVL	EAX, odb_parms+ipaddr.B[ESI] ;Display remote IP address
+	CALL	debugipaddr
+	CALL	debugspace
+	MOVL	EAX, odb_parms+tcpport.B[ESI] ;Display remote TCP port number
+	CALL	debugdecvalv
+	CALL	debugout
+2$:	MOVL	EAX, #cdb_SIZE+cdb_MSIZE ;Allocate a CDB
+	CALL	getmem
+	JNC	6$.S			;Go on if OK
+	MOVL	ESI, #errncdb		;Can't get memory - log the error (We
+4$:	CALL	logerror		;  are probably in serious trouble
+					;  if we can't get memory, but we try
+					;  to continue anyway!)
+	MOVL	EAX, odb_qab+qab_handle.B[ESI]
+	MOVL	clsqab+qab_handle, EAX	;Close the network connection (This uses
+	PUSHL	DS			;  a special QAB which we do not wait
+	PUSHL	#clsqab			;  on - if we have to use it again
+	CALLF	svcIoQueue##		;  before this close finishes, no harm
+					;  is done!)
+	JMP	8$			;Try to continue
+
+;Here with memory allocated for a CDB
+
+6$:	LEAL	EDI, cdb_MSIZE[EAX]	;Clear the CDB
+	PUSHL	DS
+	POPL	ES
+	MOVL	ECX, #{cdb_MSIZE+cdb_SIZE}/4
+	PUSHL	EDI
+	SUBL	EDI, #cdb_MSIZE
+	CLRL	EAX
+	CLD
+	RSTOSL	[EDI]
+	POPL	EDI
+	MOVL	EDX, odb_ndb.B[ESI]	;Link into the list of CDBs for the NDB
+	MOVL	cdb_ndb.B[EDI], EDX
+	MOVL	EAX, ndb_fcdb.B[EDX]
+	MOVL	cdb_next.B[EDI], EAX
+	MOVL	ndb_fcdb.B[EDX], EDI
+	MOVL	EAX, odb_parms+ipaddr.B[ESI] ;Store remote IP address
+	MOVL	cdb_cmdipaddr.B[EDI], EAX
+	MOVL	cdb_dataipaddr.B[EDI], EAX
+	MOVL	EAX, odb_parms+tcpport.B[ESI] ;Store default remote ports
+	MOVL	cdb_rdataport.B[EDI], EAX
+	MOVL	cdb_rcmdport.B[EDI], EAX
+	MOVL	cdb_ldataport.B[EDI], #TCPP_FTPDATA
+	MOVL	cdb_lcmdport.B[EDI], #TCPP_FTPCMD
+	MOVB	cdb_command.B[EDI], #CMD_IDLE
+	LEAL	EAX, cdb_cmdlnbufr[EDI]	  ;Initialize the command line buffer
+	MOVL	cdb_cmdlnbpnt.B[EDI], EAX ;  pointer
+	MOVL	cdb_cmdlnbcnt.B[EDI], #CMDLBSIZE ;And count
+	MOVB	cdb_istate.B[EDI], #IS_NORM
+	MOVB	cdb_status1.B[EDI], #0
+	MOVL	cdb_cmdoutcnt.B[EDI], #0
+	LEAL	EAX, cdb_cmdoutbufr[EDI]
+	MOVL	cdb_cmdoutpnt.B[EDI], EAX
+	MOVL	EAX, odb_qab+qab_handle.B[ESI] ;Store TCP handle
+	MOVL	cdb_cmdinqab+qab_handle.B[EDI], EAX
+	MOVL	cdb_cmdoutqab+qab_handle.B[EDI], EAX
+	MOVL	cdb_cmdinqab+qab_func.B[EDI], #QFNC_INBLOCK
+	MOVW	cdb_cmdinqab+qab_vector.B[EDI], #VECT_CMDINPUT
+	MOVL	cdb_cmdinqab+qab_count.B[EDI], #CMDINSIZE
+	LEAL	EAX, cdb_cmdinbufr[EDI]
+	MOVL	cdb_cmdinqab+qab_buffer1+0.B[EDI], EAX
+	MOVL	cdb_cmdinqab+qab_buffer1+4.B[EDI], DS
+	LEAL	EAX, cdb_tcpinparms.B[EDI]
+	MOVL	cdb_cmdinqab+qab_parm+0.B[EDI], EAX
+	MOVL	cdb_cmdinqab+qab_parm+4.B[EDI], DS
+	MOVL	[EAX], #{PAR$SET|REP_DECV}+{4<8t}+{IOPAR_TIMEOUT<16t}
+	MOVL	4.B[EAX], #-1
+	MOVB	8.B[EAX], #0
+	MOVL	cdb_cmdoutqab+qab_func.B[EDI], #QFNC_OUTBLOCK
+	LEAL	EAX, cdb_cmdoutbufr[EDI]
+	MOVL	cdb_cmdoutqab+qab_buffer1+0.B[EDI], EAX
+	MOVL	cdb_cmdoutqab+qab_buffer1+4.B[EDI], DS
+	LEAL	EAX, cdb_databuf1[EDI]
+	MOVL	cdb_diskqab+qab_buffer1+0[EDI], EAX
+	MOVL	cdb_diskqab+qab_buffer1+4[EDI], DS
+	MOVL	cdb_diskqab+qab_buffer2+4[EDI], DS
+	MOVW	cdb_diskqab+qab_vector[EDI], #VECT_DISK
+	MOVL	cdb_diskdsp.B[EDI], #waitdone
+	CLRL	EAX
+	MOVL	cdb_cmdoutqab+qab_parm+0.B[EDI], EAX
+	PUSHL	DS			;The CDB is now set up - queue an
+	PUSHL	EDI			;  initial input for the TCP command
+	CALLF	svcIoQueue##		;  connection
+	TESTL	EAX, EAX
+	JNS	8$.S			;If OK
+	MOVL	ESI, #erriine		;If error (This can happen if the client
+	JMP	4$			;  closes the connection immediately
+					;  - it is probably not a serious
+					;  problem)
+
+;Here with initial TCP input queued
+
+8$:	PUSHL	EDI
+	PUSHL	ESI
+	MOVL	ESI, #inilmsg
+	ADDL	EDI, #cdb_cmdoutbufr
+	MOVL	ECX, #INILSIZE+3/4
+	RMOVSL	[EDI], [ESI]
+	POPL	ESI
+	POPL	EDI
+	MOVL	cdb_cmdoutcnt.B[EDI], #INILSIZE
+	CALL	cmddoout		;Output the initial message
+	JNC	10$.S			;If OK
+	MOVL	ESI, #errioue		;If error (This can happen if the client
+	JMP	4$			;  closes the connection immediately
+					;  - it is probably not a serious
+					;  problem)
+
+;Here with new connection set up - now queue another open
+
+10$:	PUSHL	DS
+	PUSHL	ESI
+	CALLF	svcIoQueue##
+	TESTL	EAX, EAX
+	JNS	14$.S			;If OK
+	MOVL	ESI, #errqopn		;If error, log it and try to go on (if
+	CALL	logerror		;  have an error here, we are probably
+					;  in serious trouble)
+14$:	RET				;All finished here
+
+
+	.MOD	4
+inilmsg:.ASCII	"220 FTP (XOS) ready for new user"{CR,LF}
+INILSIZE=!$-inilmsg
+.PAGE
+	.SBTTL	tcpcmdinput - Signal routine for TCP command input done
+
+;Signal routine for TCP command input done
+
+tcpcmdinput:
+	PUSHAL
+	MOVL	EDI, 64t.B[ESP]		;Get offset of the CDB
+	CALL	docmdinput
+	POPAL
+	CALLF	svcSchDismiss##
+
+docmdinput:
+	MOVL	intESP, ESP
+	CMPL	cdb_cmdinqab+qab_error.B[EDI], #0.B ;Error on input?
+	JS	10$.S			;Yes
+	CMPB	loglevel, #1		;No - should we log this?
+	JB	2$.S			;No
+	MOVL	EBX, #strcdi		;Yes
+	MOVL	ECX, cdb_cmdinqab+qab_amount.B[EDI]
+	LEAL	EDX, cdb_cmdinbufr[EDI]
+	MOVL	EAX, cdb_cmdinqab+qab_handle.B[EDI]
+	CALL	debugtext
+2$:	LEAL	EAX, cdb_cmdinbufr[EDI]	;Initialize input buffer pointer
+	MOVL	cdb_cmdpnt.B[EDI], EAX
+inplp:	DECL	cdb_cmdinqab+qab_amount.B[EDI] ;Have another character?
+	JS	4$.S			;No - finished here
+	MOVL	EBX, cdb_cmdpnt.B[EDI]	;Yes - get pointer
+	MOVB	AL, [EBX]		;Get character
+	INCL	cdb_cmdpnt.B[EDI]	;Bump pointer
+	MOVZBL	EDX, cdb_istate.B[EDI]	;Dispatch on the input state
+	JMPIL	inpdsp[EDX*4]
+
+;Here when finished processing input
+
+4$:	TESTB	cdb_status1.B[EDI], #S1$CLOSE ;Closing the command connection?
+	JNE	8$.S			;Yes
+	CMPL	cdb_cmdoutcnt.B[EDI], #0.B ;No - have any output to do now?
+	JE	6$.S			;No
+	CALL	cmddoout		;Yes do it now
+	JC	cmdoerr.S		;If error
+6$:	PUSHL	DS			;Queue another input request
+	PUSHL	EDI
+	CALLF	svcIoQueue##
+	TESTL	EAX, EAX
+	JS	8$.S			;If error
+	RET				;OK - finished here
+
+;Here if error queueing command input
+
+8$:	MOVL	ESI, #errcmdq
+	JMP	16$.S
+
+;Here if error on command input
+
+10$:	MOVL	EAX, cdb_cmdinqab+qab_error.B[EDI] ;Get error code
+	MOVL	ESI, #errcmdi
+	JMP	14$.S
+
+;Here if error on command output
+
+cmdoerr:MOVL	ESI, #errcmdo
+14$:	CMPL	EAX, #ER_NCCLR.B
+	JE	18$.S
+	CMPL	EAX, #ER_NCLST.B
+	JE	18$.S
+16$:	CALL	logerror
+18$:	JMP	quit2
+.PAGE
+	.MOD	4
+inpdsp:	.LONG	inpnorm		;IS_NORM = 0 - Normal input
+	.LONG	inptelnet1	;IS_TN1  = 1 - Expecting 1st character after FF
+	.LONG	inptelnet2	;IS_TN2  = 2 - Expecting 2nd character after FF
+
+;Here for normal input character (input state = IS_NORM)
+
+inpnorm:CMPB	AL, #0FFh		;Is this a Telnet prefix?
+	JE	havetelnet		;Yes - go handle that
+inpchar:CMPL	cdb_cmdlnbcnt.B[EDI], #0.B ;No - will this character fit in the
+					   ;  command line buffer?
+	JLE	2$.S			;No
+	MOVL	EBX, cdb_cmdlnbpnt.B[EDI] ;Yes - store character
+	MOVB	[EBX], AL
+	INCL	cdb_cmdlnbpnt.B[EDI]	;Bump pointer
+	DECL	cdb_cmdlnbcnt.B[EDI]	;Reduce count
+2$:	CMPB	AL, #LF			;Line feed character?
+	JNE	inplp			;No - continue
+	CMPL	cdb_cmdlnbcnt.B[EDI], #0.B ;Yes - did we overflow the buffer?
+	JLE	16$			;Yes
+	LEAL	EAX, cdb_cmdlnbufr[EDI]	;No - reset buffer pointers
+	MOVL	cdb_cmdlnbpnt.B[EDI], EAX
+	MOVL	EAX, #CMDLBSIZE
+	SUBL	EAX, cdb_cmdlnbcnt.B[EDI]
+	MOVL	cdb_cmdlnbcnt.B[EDI], EAX
+	CALL	skipws			;Skip any leading whitespace
+	PUSHL	#0.B
+	MOVL	EBX, ESP
+	MOVL	ECX, #4
+	CALL	cmdatom			;Collect the command atom
+	POPL	EAX
+	JC	badcmd.S		;If too long
+	MOVL	EBX, #cmdtbl		;OK - search the command table
+	MOVL	ECX, #CMDTSZ
+4$:	CMPL	[EBX], EAX
+	JE	8$.S
+	ADDL	EBX, #8.B
+	LOOP	ECX, 4$
+badcmd:	MOVL	EBX, #bdcmsg		;If not found
+	JMP	cmddon0
+
+;Here with match on command
+
+8$:	CMPL	EBX, #lginreq		;Need to be logged in for this?
+	JB	10$.S			;No
+	TESTB	cdb_status1.B[EDI], #S1$LOGGEDIN ;Yes - is he?
+	JE	18$.S			;No
+10$:	CMPB	cdb_command.B[EDI], #CMD_IDLE ;Is a data transfer active?
+	JE	12$.S			;No
+	CMPL	EBX, cmdquit		;Yes - is this command OK?
+	JE	12$.S
+	CMPL	EBX, cmdabor
+	JNE	14$.S			;No
+12$:	JMPIL	4.B[EBX]		;Yes - dispatch to routine for command
+
+;Here if a data transfer is active
+
+14$:	MOVL	EBX, #dtamsg
+
+;Here when finished with command
+
+cmddon0:CALL	cmdresp			;Output command response
+	JC	cmdoerr			;If error
+cmddon2:LEAL	EAX, cdb_cmdlnbufr[EDI]
+	MOVL	cdb_cmdlnbpnt.B[EDI], EAX
+	MOVL	cdb_cmdlnbcnt.B[EDI], #CMDLBSIZE
+	JMP	inplp
+
+;Here if command line is too long
+
+16$:	MOVL	EBX, #cltlmsg
+	JMP	cmddon0.S
+
+;Here if not logged in
+
+18$:	MOVL	EBX, #nlgimsg
+	JMP	cmddon0.S
+.PAGE
+;Command table
+
+	.MOD	4
+cmdtbl:	.LONG	'USER', cmduser
+	.LONG	'PASS', cmdpass
+	.LONG	'ACCT', cmdacct
+	.LONG	'QUIT', cmdquit
+	.LONG	'HELP', cmdhelp
+	.LONG	'NOOP', cmdnoop
+lginreq:.LONG	'CWD' , cmdcwd
+	.LONG	'CDUP', cmdcdup
+	.LONG	'SMNT', cmdsmnt
+	.LONG	'REIN', cmdrein
+	.LONG	'PORT', cmdport
+	.LONG	'PASV', cmdpasv
+	.LONG	'TYPE', cmdtype
+	.LONG	'STRU', cmdstru
+	.LONG	'MODE', cmdmode
+	.LONG	'RETR', cmdretr
+	.LONG	'STOR', cmdstor
+	.LONG	'STOU', cmdstou
+	.LONG	'APPE', cmdappe
+	.LONG	'ALLO', cmdallo
+	.LONG	'REST', cmdrest
+	.LONG	'RNFR', cmdrnfr
+	.LONG	'RNTO', cmdrnto
+	.LONG	'ABOR', cmdabor
+	.LONG	'DELE', cmddele
+	.LONG	'RMD' , cmdrmd
+	.LONG	'MKD' , cmdmkd
+	.LONG	'PWD' , cmdpwd
+	.LONG	'LIST', cmdlist
+        .LONG   'NLST', cmdnlst
+	.LONG	'SITE', cmdsite
+	.LONG	'SYST', cmdsyst
+	.LONG	'STAT', cmdstat
+	.LONG	'XAFL', cmdxafl
+CMDTSZ=!{$-cmdtbl}/8
+.PAGE
+;Here if have 1st character after a Telnet prefix character (input state
+;  = IS_TN1)
+
+inptelnet1:
+	CMPB	AL, #0F0h		;Valid telnet code?
+	JB	tlndone			;No - ignore it
+	ANDL	EAX, #0FFh		;Yes
+	JMPIL	tlndsp-{0F0h*4}[EAX*4]
+
+	.MOD	4
+tlndsp:	.LONG	tlndone		;TNC_SE   = 0F0 - End of subnegotiation
+	.LONG	tlndone		;TNC_NOP  = 0F1 - No operation
+	.LONG	tlndone		;TNC_DM   = 0F2 - Data mark
+	.LONG	tlndone		;TNC_BRK  = 0F3 - Out-of-band break character
+	.LONG	tlndone		;TNC_IP   = 0F4 - Interrupt process function
+	.LONG	tlndone		;TNC_AO   = 0F5 - Abort output function
+	.LONG	tlndone		;TNC_AYT  = 0F6 - Are you there function
+	.LONG	tlndone		;TNC_EC   = 0F7 - Erase character function
+	.LONG	tlndone		;TNC_EL   = 0F8 - Erase line function
+	.LONG	tlndone		;TNC_GA   = 0F9 - Go ahead signal
+	.LONG	tlndone		;TNC_SB   = 0FA - Start of subnegotiation
+	.LONG	tlnfunc		;TNC_WILL = 0FB - Start of option negotiation
+	.LONG	tlnfunc		;TNC_WONT = 0FC - Start of option negotiation
+	.LONG	tlnfunc		;TNC_DO   = 0FD - Start of option negotiation
+	.LONG	tlnfunc		;TNC_DONT = 0FE - Start of option negotiation
+	.LONG	tlnlit		;TNC_FF   = 0FF - Literal 0FFh value
+
+;Here for literal 0FF character
+
+tlnlit:	MOVB	cdb_istate.B[EDI], #IS_NORM ;Reset input state
+	JMP	inpchar			;Go store input character
+
+;Here for Telnet function which we process
+
+tlnfunc:MOVB	cdb_telnet1.B[EDI], AL	;Store character
+					;Fall into havetelnet to advance state
+
+;Here if have a Telnet prefix character
+
+havetelnet:
+	INCL	cdb_istate.B[EDI]	;Advance input state
+	JMP	inplp			;Continue
+
+;Here if have 2nd character after a Telnet prefix character (input state
+;  = IS_TN2).  When get here have either a TNC_WILL, TNC_WONT, TNC_DO or
+;  TNC_DONT command.  We reject attempts to set all options except TNO_SUPGA,
+;  which cannot be cleared!
+
+inptelnet2:
+	MOVZBL	EDX, cdb_telnet1.B[EDI]	;Get command character
+	CMPB	AL, #TNO_SUPGA		;Is this the suppress go-ahead option?
+	JE	10$.S			;Yes
+	MOVB	AH, negresp-0FBh[EDX]	;No - get negative response value
+	JMP	12$.S
+
+10$:	MOVB	AH, posresp-0FBh[EDX]	;Get positive response value
+12$:	CMPB	AH, #0			;Want to send response?
+	JE	tlndone.S		;No
+	PUSHL	EAX			;Yes
+	MOVB	AL, #TNC_IAC
+	CALL	cmdput
+	JC	14$.S
+	MOVB	AL, 1.B[ESP]
+	CALL	cmdput
+	JC	14$.S
+	POPL	EAX
+	CALL	cmdput
+	JC	16$.S
+tlndone:MOVB	cdb_istate.B[EDI], #IS_NORM ;Reset input state
+	JMP	inplp			;Continue
+
+14$:	POPL	EDX
+16$:	JMP	cmdoerr
+
+	.MOD	4
+negresp:.BYTE	TNC_WONT	;TNC_WILL = 0FB
+	.BYTE	0		;TNC_WONT = 0FC
+	.BYTE	TNC_DONT	;TNC_DO   = 0FD
+	.BYTE	0		;TNC_DONT = 0FE
+
+posresp:.BYTE	TNC_WILL	;TNC_WILL = 0FB
+	.BYTE	TNC_WILL	;TNC_WONT = 0FC
+	.BYTE	TNC_DO		;TNC_DO   = 0FD
+	.BYTE	TNC_DO		;TNC_DONT = 0FE
+.PAGE
+	.SBTTL	cmduser - Routine for USER command
+
+;Here for the USER command
+
+cmduser:ANDB	cdb_status1.B[EDI], #~{S1$USER|S1$LOGGEDIN}
+	CMPB	pwdreq, #0.B		;Are we checking names and passwords?
+	JE	4$.S			;No - just accept anything!
+	LEAL	EBX, cdb_username[EDI]	;Yes - save his user name
+	MOVL	ECX, #64t.B
+	CALL	cmdatom
+	JC	badname.S
+
+;Get here if the user verification is off or the name is good
+
+4$:	ORB	cdb_status1.B[EDI], #S1$USER
+	MOVL	EBX, #usermsg
+	JMP	cmddon0
+.PAGE
+	.SBTTL	cmdpass - Routine for PASS command
+
+;Here for the PASS command
+
+cmdpass:TESTB	cdb_status1.B[EDI], #S1$USER
+	JE	6$.S
+	CMPB	pwdreq, #0		;Are we checking names and passwords?
+	JE	2$.S			;No - accept anything!
+	LEAL	EBX, cdb_password[EDI]	;Yes - save his password
+	MOVL	ECX, #58t.B
+	CALL	cmdatom
+	JC	badname.S
+	MOVL	cdb_pswdlen[EDI], ECX
+	LEAL	EAX, cdb_databuf1+ud_SIZE[EDI] ;Yes - get user information
+	PUSHL	EAX			       ;  from the UDF server
+	SUBL	EAX, #ud_SIZE
+	PUSHL	EAX
+	PUSHL	#0.B
+	PUSHL	#0.B
+	PUSHL	#URQ1$PASSWORD|URQ1$HOMEDIR|URQ1$AVLPRIV|URQ1$INLPRIV
+	PUSHL	#ftpacs
+	LEAL	EAX, cdb_username[EDI]
+	PUSHL	EAX
+	CALL	getusersig#
+	ADDL	ESP, #28t.B
+	TESTL	EAX, EAX
+	JE	badname.S		;If error
+	RET				;OK - finished here for now - the
+					;  getuserdone routine will
+					;  eventually be called for this
+					;  CDB
+
+;Here if error accessing the UDF server.  This is like either due to a bad
+;  group name or because there is no UDP device.  In either case we just
+;  say bad user name for security reasons.
+
+badname:MOVL	EBX, #invname
+	JMP	cmddon0
+
+;Here if the password is not required
+
+2$:	MOVB	cdb_allflsok.B[EDI], #03h ;Enable all-files mode
+
+;Here if the password is OK
+
+logdone:MOVL	EBX, #lggdmsg		;Finished here
+	ORB	cdb_status1.B[EDI], #S1$LOGGEDIN ;Indicate logged in
+4$:	JMP	cmddon0
+
+;Here if no user name specified
+
+6$:	MOVL	EBX, #noumsg
+	JMP	4$.S
+
+	.SBTTL	cmdacct - Routine for the ACCT command
+
+;Here for the ACCT command
+
+cmdacct:MOVL	EBX, #acctmsg
+	JMP	4$.S
+
+	.SBTTL	cmdhelp - Routine for the HELP command
+
+;Here for the HELP command
+
+cmdhelp:MOVL	EBX, #helpmsg
+	JMP	4$.S
+
+	.SBTTL	cmdnoop - Routine for the NOOP command
+
+;Here for the NOOP command
+
+cmdnoop:MOVL	EBX, #okmsg
+	JMP	4$.S
+.PAGE
+	.SBTTL	cmdrein - Routine for the REIN command
+
+;Here for the REIN command
+
+cmdrein:MOVL	EBX, #niytmsg
+	JMP	2$.S
+
+	.SBTTL	cmdquit - Routine for the QUIT command
+
+;Here for the QUIT command
+
+cmdquit:CMPB	cdb_command.B[EDI], #CMD_IDLE ;Have an transfer active?
+	JE	4$.S			;No
+	MOVL	EBX, #niytmsg
+2$:	JMP	cmddon0
+
+;Here if there is no transfer active
+
+4$:	TESTB	cdb_status1.B[EDI], #S1$OPEN ;Have a data connection open?
+	JE	10$.S			;No
+	MOVL	EBX, #niytmsg
+	JMP	2$.S
+
+;Here if there is no data connection open
+
+10$:	MOVL	EBX, #quitmsg		;Send response
+	CALL	cmdresp
+	JC	12$.S
+	CALL	cmddoout
+12$:	JC	cmdoerr
+quit2:	CMPB	loglevel, #1		;Should we log this?
+	JB	16$.S			;No
+	MOVL	EBX, #strcco		;Yes - display initial string
+	MOVL	EAX, cdb_cmdinqab+qab_handle.B[EDI]
+	CALL	debugbgn
+	CALL	debugout
+16$:	CLRL	EAX
+	MOVL	cdb_cmdinqab+qab_amount.B[EDI], EAX
+	ORB	cdb_status1.B[EDI], #S1$CLOSE ;Indicating closing connection
+	MOVB	cdb_cmdoutqab+qab_func.B[EDI], #QFNC_CLOSE
+	MOVW	cdb_cmdoutqab+qab_vector.B[EDI], #VECT_CMDCLOSE
+	MOVL	cdb_cmdoutqab+qab_option.B[EDI], EAX
+	PUSHL	DS
+	LEAL	EAX, cdb_cmdoutqab.B[EDI]
+	PUSHL	EAX			;Close the command connection
+	CALLF	svcIoQueue##
+	TESTL	EAX, EAX
+	JNS	24$.S			;If normal
+	MOVL	ESI, #errcccc		;If error queueing the close for the
+	CALL	logerror		;  command connection - this should not
+					;  happen, but if it does we log it and
+					;  continue on as best as we can!
+
+;The following code is also called as a subroutine after the close of the
+;  command connection terminates normalily
+
+cmdcls2:MOVL	ESI, cdb_ndb.B[EDI]	;Unlink this CDB
+	ADDL	ESI, #ndb_fcdb.B
+20$:	CMPL	[ESI], EDI
+	JE	22$.S
+	MOVL	ESI, [ESI]
+	ADDL	ESI, #cdb_next.B
+	JMP	20$.S
+
+22$:	MOVL	EAX, cdb_next.B[EDI]
+	MOVL	[ESI], EAX
+	CALL	freehomdir		;Give up the home directory string
+	CALL	freewrkdir		;Give up the working directory string
+	SUBL	EDI, #cdb_MSIZE		;Give up the CDB's memory
+	PUSHL	EDI
+	CALL	free#
+	POPL	ECX
+24$:	RET
+.PAGE
+	.SBTTL	cmdabor - Routine for the ABOR command
+
+;Here for the ABOR command
+
+cmdabor:MOVL	EBX, #niytmsg
+	JMP	cmddon0
+
+	.SBTTL	cmdport - Routine for the PORT command
+
+;Here for the PORT command
+
+$$$=!0
+FRM cp_ipaddr, 4t
+FRM cp_port  , 4t
+cp_SIZE=!$$$
+
+cmdport:ENTER	cp_SIZE, 0
+	LEAL	EBX, cp_ipaddr.B[EBP]
+	MOVL	ECX, #4
+	CALL	getdecbytes
+	JC	4$.S
+	CMPB	AL, #','
+	JNE	6$.S
+	LEAL	EBX, cp_port.B[EBP]
+	MOVL	ECX, #2
+	CALL	getdecbytes
+	JC	4$.S
+	CALL	cmdchkend
+	JC	4$.S
+	MOVL	EAX, cp_ipaddr.B[EBP]	;Store new remote data IP address
+	MOVL	cdb_dataipaddr.B[EDI], EAX
+	MOVZWL	EAX, cp_port.B[EBP]	;Store new remote data port number
+	XCHGB	AL, AH
+	MOVL	cdb_rdataport.B[EDI], EAX
+	MOVL	EBX, #portmsg		;Finished
+4$:	LEAVE
+	JMP	cmddon0
+
+6$:	MOVL	EBX, #synemsg
+	JMP	4$.S
+.PAGE
+;Subroutine to get decimal byte values
+;	c{EBX} = Offset of location to receive value
+;	c{ECX} = Number of bytes needed
+;	CALL	getdecbytes
+
+getdecbytes:
+2$:	CLRL	EDX
+4$:	CALL	getchr
+	JE	10$.S
+	CMPB	AL, #'0'
+	JB	6$.S
+	CMPB	AL, #'9'
+	JA	8$.S
+	ANDL	EAX, #0Fh
+	IMULL	EDX, #10t
+	ADDL	EDX, EAX
+	JMP	4$.S
+
+;Here with non-digit character
+
+6$:	CMPB	AL, #','		;Comma
+	JE	12$.S
+	CMPB	AL, #' '
+	JE	12$.S
+	CMPB	AL, #HT
+	JE	12$.S
+8$:	MOVL	EBX, #bdnvmsg
+	STC
+	RET
+
+;Here if at end of line
+
+10$:	CMPL	ECX, #1.B		;Is this the last value?
+	JNE	8$.S			;No - error
+12$:	TESTL	EDX, #0FFFFFF00h	;Yes - valid value?
+	JNE	8$.S			;No - fail
+	MOVB	[EBX], DL		;Yes - store value
+	INCL	EBX			;Bump value pointer
+	LOOP	ECX, 2$			;Continue if need more values
+	RET
+.PAGE
+	.SBTTL	cmdpasv - Routine for the PASV command
+
+;Here for the PASV command - this is not supported by this version
+
+cmdpasv:MOVL	EBX, #cnimsg
+	JMP	cmddon0
+.PAGE
+	.SBTTL	cmdtype - Routine for the TYPE command
+
+;Here for the TYPE command - we don't really use file types, since we treat all
+;  files as image files (possible since our internal ASCII format is the same
+;  as the network format).  We allow A, AN, AT, I, and Ln.  We do not check the
+;  value of n.  We do not allow AC, E, EN, ET, or EC.
+
+cmdtype:CALL	cmdparmc		;Get single letter parameter
+	JC	10$.S
+	CMPB	AL, #'A'		;Is it A?
+	JNE	4$.S			;No
+	CALL	cmdparmc		;Yes - get next parameter
+	JC	10$.S
+	CMPB	AL, #0			;Is it missing
+	JE	8$.S			;Yes - thats OK
+	CMPB	AL, #'N'		;Is it N?
+	JE	8$.S			;Yes - finished
+	CMPB	AL, #'T'		;No - is it T?
+	JE	8$.S			;Yes - finished
+2$:	MOVL	EBX, #bpvmsg		;NO - error
+	JMP	10$.S
+
+;Here if type is not A
+
+4$:	CMPB	AL, #'I'		;Is the type I?
+	JE	8$.S			;Yes
+	CMPB	AL, #'L'		;No - is it L
+	JNE	2$.S
+	CALL	cmdparmv
+	JC	10$.S
+8$:	CALL	cmdchkend
+	JC	10$.S
+	MOVL	EBX, #okmsg
+10$:	JMP	cmddon0
+
+	.SBTTL	cmdstru - Routine for the STRU command
+
+;Here for the STRU command - we only support "FILE" structure for transfers
+
+cmdstru:CALL	cmdparmc		;Get parameter
+	JC	10$.S			;If error
+	CMPB	AL, #'F'		;Or if F
+12$:	JE	8$.S
+	CMPB	AL, #0			;OK if no parameter
+	JE	8$.S
+	JMP	2$.S			;Otherwise bad parameter
+
+	.SBTTL	cmdmode - Routine for the MODE command
+
+;Here for the MODE command - we only support stream mode
+
+cmdmode:CALL	cmdparmc		;Get parameter
+	JC	10$.S			;If error
+	CMPB	AL, #'S'		;Or if F
+	JMP	12$.S
+.PAGE
+	.SBTTL	cmdxafl - Routine for the XAFL command
+
+;Here for the XAFL command - toggle the XOS all-files state if allowed
+
+cmdxafl:CALL	cmdchkend
+	JC	cmddon0
+	TESTB	cdb_allflsok.B[EDI], #01h ;Can he do this?
+	JE	badcmd			;No - just say bad command
+	CALL	freewrkdir
+	XORB	cdb_allflsok.B[EDI], #02h
+	TESTB	cdb_allflsok.B[EDI], #02h
+	JNE	4$.S
+	MOVL	EBX, #allfoff
+	JMP	cmddon0
+
+4$:	MOVL	cdb_wrkdirstr[EDI], #xosroot
+	MOVZWL	EAX, xosrtsz
+	MOVL	cdb_wrkdirlen[EDI], EAX
+	MOVL	EBX, #allfon
+	JMP	cmddon0
+.PAGE
+	.SBTTL	cmdele - Routine for the DELE command
+
+;Here for the DELE command.  This command deletes the file specified.
+
+cmddele:LEAL	EBX, cdb_databuf1[EDI]	;Use the data buffer to collect the
+	MOVL	ECX, #DATASIZE-2	;  file specification
+	CALL	getfilespec
+	JC	4$.S
+	CLRL	EDX
+	TESTB	AH, #02h		;Have wild card in name?
+	JE	2$.S			;No
+	BTSL	EDX, #O%REPEAT		;Yes
+2$:	MOVL	cdb_diskqab+qab_option[EDI], EDX
+	MOVW	cdb_diskqab+qab_func[EDI], #QFNC_DELETE
+	LEAL	EAX, cdb_databuf1[EDI]
+	MOVL	cdb_diskqab+qab_buffer1[EDI], EAX
+	CLRL	EAX
+	MOVL	cdb_diskqab+qab_parm+0[EDI], EAX
+	CALL	cmddodisk
+	JC	6$.S
+	MOVL	EBX, #delemsg
+	MOVL	ECX, cdb_diskqab+qab_amount[EDI]
+4$:	CALL	cmddiskok
+	JMP	cmddon2
+
+;Here if error deleting the file
+
+6$:	MOVL	EBX, #dskemsg
+	MOVL	EDX, cdb_diskqab+qab_buffer1[EDI]
+	CALL	cmdxoserr
+	JMP	cmddon2
+.PAGE
+	.SBTTL	cmdcdup - Routine for the CDUP command
+
+;Here for the CDUP command.  This command sets the working directory to the
+;  parent of the current working directory.  It is equivilent to CWD ..
+
+cmdcdup:CALL	cmdchkend		;No parameters allowed
+	JC	4$.S
+	LEAL	EBX, cdb_cmdlnbufr[EDI]
+	MOVL	[EBX], #'..'+{LF<16t}	;Make this look like "CWD .."
+	MOVL	cdb_cmdlnbpnt.B[EDI], EBX
+	MOVL	cdb_cmdlnbcnt.B[EDI], #3 ;Fall into cmdcwd
+
+	.SBTTL	cmdcwd - Routine for the CWD command
+
+;Here for the CWD command.  This command changes the working directory.
+;  The working directory is always stored as an absolute directory path (it
+;  always begins with a backslash).  If in all-files mode, it may begin with
+;  a device name.  If in all-files mode, this string only is prepended to the
+;  file name.  If not in all-files mode, the home directory string is prepended
+;  to this string, skipping the leading slash in this string, and the resulting
+;  string is prepended to the file name.  The .. notation can be used to
+;  remove directory levels from this string.  It is never stored in the string
+;  and is never applied to the home directory string (which is fixed after
+;  login is complete).
+
+cmdcwd:	LEAL	EBX, cdb_databuf1[EDI]	;Use the data buffer to collect the
+	MOVL	ECX, #DATASIZE-2	;  file specification
+	CALL	getdirspec		;Collect the new directory specification
+	JC	4$.S
+	TESTB	AH, #02h		;Have wild card?
+	JNE	14$.S			;Yes - fail!
+	CALL	cmdchkend		;No - must have end of line next
+4$:	JC	cmddon0
+	TESTL	ECX, ECX		;Null file spec?
+	JE	6$.S			;Yes
+	LEAL	EBX, cdb_databuf1[EDI]	;No single /
+	CMPW	[EBX], #'/'
+	JNE	8$.S			;No
+6$:	CLRL	EAX			;Yes - this means no working directory
+	PUSHL	EAX
+	JMP	12$.S
+
+8$:	CMPB	-1.B[EBX+ECX], #'/'	;Have / at end?
+	JE	10$.S			;Yes
+	MOVW	[EBX+ECX], #'/'		;No - add one
+	INCL	ECX
+10$:	PUSHL	ECX
+	LEAL	EAX, 1.B[ECX]
+	CALL	getmem
+	JC	4$.S
+12$:	PUSHL	EAX			;OK - save offset of new name buffer
+	CALL	freewrkdir		;Give up old working directory string
+	POPL	EBX			;Restore offset of new buffer
+	POPL	ECX			;Restore size of new string
+	TESTL	EBX, EBX
+	JE	16$.S
+	LEAL	ESI, cdb_databuf1[EDI]
+	MOVL	cdb_wrkdirstr.B[EDI], EBX ;Save buffer offset and size
+	MOVL	cdb_wrkdirlen.B[EDI], ECX
+	INCL	ECX			;Copy final null
+	CLD
+	PUSHL	EDI
+	MOVL	EDI, EBX
+	RMOVSB	[EDI], [ESI]		;Copy new specification
+	POPL	EDI
+	JMP	16$.S
+
+;Here if have illegal directory specification
+
+14$:	MOVL	EBX, #ildsmsg
+	JMP	26$.S
+
+	.SBTTL	cmdpwd - Routine for the PWD command
+
+;Here for the PWD command
+
+cmdpwd:	CALL	cmdchkend
+	JC	26$.S
+16$:	MOVL	EBX, #cwd1msg
+	CALL	cmdstr
+	JC	cmdoerr
+	TESTB	cdb_allflsok[EDI], #02h
+	JNE	20$.S
+	MOVL	EBX, cdb_homdirstr.B[EDI]
+	TESTL	EBX, EBX
+	JE	18$.S
+	CALL	cmdstr
+18$:	MOVL	EBX, cdb_wrkdirstr.B[EDI]
+	TESTL	EBX, EBX
+	JE	24$.S
+	INCL	EBX
+	JMP	22$.S
+
+20$:	MOVL	EBX, cdb_wrkdirstr.B[EDI]
+	TESTL	EBX, EBX
+	JE	24$.S
+22$:	CALL	cmdstr
+24$:	MOVL	EBX, #cwd2msg
+26$:	JMP	cmddon0
+.PAGE
+	.SBTTL	cmdsmnt - Routine for the SMNT command
+
+;Here for the SMNT command
+
+cmdsmnt:MOVL	EBX, #niytmsg
+	JMP	cmddon0
+.PAGE
+	.SBTTL	cmdmkd - Routine for the MKD command
+
+;Here for the MKD command
+
+cmdmkd: LEAL	EBX, cdb_databuf1[EDI]	;Use the data buffer to collect the
+	MOVL	ECX, #DATASIZE-2	;  file specification
+	CALL	getfilespec
+	JC	4$.S
+	CLRL	EDX
+	TESTB	AH, #02h		;Have wild card in name?
+	JNE	4$.S			;Yes, not allowed
+	MOVL	cdb_diskqab+qab_option[EDI], #O$CREATE|O$ODF|O$FAILEX
+	MOVW	cdb_diskqab+qab_func[EDI], #QFNC_DEVPARM
+	LEAL	EAX, cdb_databuf1[EDI]
+	MOVL	cdb_diskqab+qab_buffer1[EDI], EAX
+
+;Check for a '/' at the end of the directory name (add if missing)
+
+3$:	MOVB	BL, [EAX]
+	INCL	EAX
+	CMPB	BL, #0.B
+	JNE	3$.S
+	DECL	EAX
+	DECL	EAX
+	CMPB	[EAX], #'/'.B
+	JE	3a$.S
+	INCL	EAX
+	MOVB	[EAX], #'/'.B
+	INCL	EAX
+	MOVB	[EAX], #0.B
+3a$:	CLRL	EAX
+	MOVL	cdb_diskqab+qab_parm+0[EDI], EAX
+	CALL	cmddodisk
+	JC	6$.S
+	MOVL	EBX, #mkdmsg
+	MOVL	ECX, cdb_diskqab+qab_amount[EDI]
+4$:	JMP	cmddon0
+
+;Here if error creating the directory
+
+6$:	MOVL	EBX, #mkdemsg
+	MOVL	EDX, cdb_diskqab+qab_buffer1[EDI]
+	CALL	cmdxoserr
+	JMP	cmddon2
+.PAGE
+	.SBTTL	cmdrmd - Routine for the RMD command
+
+;Here for the RMD command
+
+cmdrmd:	LEAL	EBX, cdb_databuf1[EDI]	;Use the data buffer to collect the
+	MOVL	ECX, #DATASIZE-2	;  file specification
+	CALL	getfilespec
+	JC	4$.S
+	CLRL	EDX
+	TESTB	AH, #02h		;Have wild card in name?
+	JNE	4$.S			;Yes, not allowed
+	LEAL	EAX, cdb_databuf1[EDI]
+
+;Check for an '/' at the end of the directory name (remove if present)
+
+3$:	MOVB	BL, [EAX]
+	INCL	EAX
+	CMPB	BL, #0.B
+	JNE	3$.S
+	DECL	EAX
+	DECL	EAX
+	CMPB	[EAX], #'/'.B
+	JNE	3a$.S
+	MOVB	[EAX], #0.B
+3a$:	LEAL	EAX, cdb_databuf1[EDI]
+	LEAL	EBX, cdb_parms[EDI]	;Build parameter list for search
+	MOVL	[EBX], #{PAR$SET|REP_HEXV}|{1<8}|{IOPAR_SRCATTR<16t}
+	MOVB	4t.B[EBX], #A$DIRECT
+	MOVB	5t.B[EBX], #0.B
+	PUSHL	#0.B
+	PUSHL	DS
+	PUSHL	EAX
+	PUSHL	DS
+	PUSHL	EBX
+	CALLF	svcIoDelete##
+	BTL	EAX, #31t		;Set C if error
+	JC	6$.S
+	MOVL	EBX, #rmdmsg
+	MOVL	ECX, EAX
+4$:	CALL	cmddiskok
+	JMP	cmddon2
+
+;Here if error deleting the directory
+
+6$:	MOVL	EBX, #rmdemsg
+	LEAL	EDX, cdb_databuf1[EDI]
+	CALL	cmdxoserr
+	JMP	cmddon2
+.PAGE
+	.SBTTL	cmdretr - Routine for the RETR command
+
+;Here for the RETR command.  This command copies a file from the server to the
+;  client using the data connection.
+
+cmdretr:LEAL	EBX, cdb_databuf1[EDI]	;Use the data buffer to collect the
+	MOVL	ECX, #DATASIZE-2	;  file specification
+	CALL	getfilespec		;Collect the new directory specification
+	JC	2$.S
+	TESTB	AH, #02h		;Have wild card?
+	JNE	4$.S			;Yes - fail!
+	CALL	cmdchkend		;No - must have end of line next
+2$:	JC	cmddon0
+	MOVL	cdb_diskqab+qab_option[EDI], #O$IN
+	MOVW	cdb_diskqab+qab_func[EDI], #QFNC_OPEN
+	LEAL	EAX, cdb_databuf1[EDI]
+	MOVL	cdb_diskqab+qab_buffer1[EDI], EAX
+	CLRL	EAX
+	MOVL	cdb_tcperr.B[EDI], EAX
+	MOVL	cdb_diskerr.B[EDI], EAX
+	MOVL	cdb_diskqab+qab_parm+0[EDI], EAX
+	CALL	cmddodisk		;Open the file
+	JC	6$.S			;If error
+	MOVL	EBX, #fopnmsg
+	CALL	cmdresp			;Send the initial response
+	JC	cmdoerr
+	CALL	opendata		;Open the data connection
+	JC	8$.S			;If error
+	MOVB	cdb_command.B[EDI], #CMD_RETR ;OK
+	JMP	cmddon2
+
+;Here if have illegal file specification
+
+4$:	MOVL	EBX, #ilwcmsg
+	JMP	cmddon0
+
+;Here if error opening the disk file
+
+6$:	MOVL	EBX, #dskemsg
+	MOVL	EDX, cdb_diskqab+qab_buffer1[EDI]
+8$:	CALL	cmdxoserr
+	JMP	cmddon2
+.PAGE
+	.SBTTL	cmdstou - Routine for the STOU command
+
+;Here for the STOU command.  This is the same as the STOR command except that
+;  a unique file name is created.
+
+cmdstou:PUSHL	#O$OUT|O$CREATE|O$TRUNCA|O$UNQNAME
+	JMP	2$.S
+
+	.SBTTL	cmdappe - Routine for the APPE command
+
+;Here for the APPE command.  This command copies a file from the client to the
+;  server and appends the data to the end of an existing server file.  If there
+;  is no existing file, a new file is created.  The transfer uses the data
+;  connection.
+
+cmdappe:PUSHL	#O$OUT|O$CREATE|O$APPEND
+	JMP	2$.S
+
+	.SBTTL	cmdstor - Routine for the STOR command
+
+;Here for the STOR command.  This command copies a file from the client to the
+;  server using the data connection
+
+cmdstor:PUSHL	#O$OUT|O$CREATE|O$TRUNCA
+2$:	LEAL	EBX, cdb_databuf1[EDI]	;Use the data buffer to collect the
+	MOVL	ECX, #DATASIZE-2	;  file specification
+	CALL	getfilespec		;Collect the new directory specification
+	POPL	EDX
+	JC	12$.S
+	TESTB	AH, #02h		;Have wild card?
+	JNE	10$.S			;Yes - fail!
+	CALL	cmdchkend		;No - must have end of line next
+	JC	12$.S
+	MOVL	cdb_diskqab+qab_option[EDI], EDX
+	MOVW	cdb_diskqab+qab_func[EDI], #QFNC_OPEN
+	LEAL	EAX, cdb_databuf1[EDI]
+	MOVL	cdb_diskqab+qab_buffer1[EDI], EAX
+	CLRL	EAX
+	MOVL	cdb_tcperr.B[EDI], EAX
+	MOVL	cdb_diskerr.B[EDI], EAX
+	MOVL	cdb_diskqab+qab_parm+0[EDI], EAX
+	CALL	cmddodisk		;Open the file
+	JC	14$.S			;If error
+	MOVL	EBX, #fopnmsg
+	CALL	cmdresp			;Send the initial response
+	JC	cmdoerr
+	CALL	opendata		;Open the data connection
+	JC	14$.S			;If error
+	MOVB	cdb_command.B[EDI], #CMD_STOR ;OK
+	JMP	cmddon2
+
+;Here if have illegal file specification
+
+10$:	MOVL	EBX, #ilwcmsg
+12$:	JMP	cmddon0
+
+14$:	MOVL	EBX, #dskemsg
+	MOVL	EDX, cdb_diskqab+qab_buffer1[EDI]
+	CALL	cmdxoserr
+	JMP	cmddon2
+.PAGE
+	.SBTTL	cmdallo - Routine for the ALLO command
+
+;Here for the ALLO command - we don't need to allocate space so this command is
+;  not needed
+
+cmdallo:MOVL	EBX, #allomsg
+2$:	JMP	cmddon0
+
+	.SBTTL	cmdrest - Routine for the REST command
+
+;Here for the REST command
+
+cmdrest:MOVL	EBX, #cnimsg
+	JMP	2$.S
+.PAGE
+	.SBTTL	cmdrnfr - Routine for the RNFR command
+
+;Here for the RNFR command
+
+cmdrnfr:LEAL	EBX, cdb_databuf2+1[EDI] ;Collect file specification
+	MOVL	ECX, #DATASIZE-2
+	CALL	getfilespec
+	JC	4$.S
+	CALL	cmdchkend		;Must have end of line next
+	JC	4$.S
+	ORB	cdb_status1.B[EDI], #S1$RNFR ;Indicate have "rename from" name
+	MOVB	cdb_databuf2+0[EDI], AH	;Remember if have wild card
+	MOVL	EBX, #rnfrmsg
+4$:	JMP	cmddon0
+
+	.SBTTL	cmdrnto - Routine for the RNFO command
+
+;Here for the RNFO command
+
+cmdrnto:TESTB	cdb_status1.B[EDI], #S1$RNFR ;Have a "rename from" name?
+	JE	10$.S			;No - fail
+	LEAL	EBX, cdb_databuf1[EDI]	;Yes - collect "rename to" name
+	MOVL	ECX, #DATASIZE-2
+	CALL	getfilespec
+	JC	4$.S
+	CALL	cmdchkend		;Must have end of line next
+	JC	4$.S
+	CLRL	EDX
+	TESTB	cdb_databuf2+0[EDI], #02h ;Have wild card in name?
+	JE	6$.S			;No
+	BTSL	EDX, #O%REPEAT		;Yes
+6$:	MOVL	cdb_diskqab+qab_option[EDI], EDX
+	MOVB	cdb_diskqab+qab_func[EDI], #QFNC_RENAME
+	LEAL	EAX, cdb_databuf2+1[EDI]
+	MOVL	cdb_diskqab+qab_buffer1[EDI], EAX
+	LEAL	EAX, cdb_databuf1[EDI]
+	MOVL	cdb_diskqab+qab_buffer2[EDI], EAX
+	CLRL	EAX
+	MOVL	cdb_diskqab+qab_parm+0[EDI], EAX
+	CALL	cmddodisk
+	JC	12$.S
+	MOVL	EBX, #renmsg
+	MOVL	ECX, cdb_diskqab+qab_amount[EDI]
+8$:	CALL	cmddiskok
+	JMP	cmddon2
+
+;Here if no "rename from" name was specified (previous command was not RNFR)
+
+10$:	MOVL	EBX, #rnnnmsg
+	JMP	cmddon0
+
+;Here if error renaming the file
+
+12$:	MOVL	EBX, #dskemsg
+	MOVL	EDX, cdb_diskqab+qab_buffer1[EDI]
+	CALL	cmdxoserr
+	JMP	cmddon2
+.PAGE
+	.SBTTL	cmdnlst - Routine for the NLST command
+
+;Here for the NLST command
+
+cmdnlst:MOVB	cdb_listcmd.B[EDI], #CMD_NLST
+	JMP	2$.S
+
+	.SBTTL	cmdnlst - Routine for the LIST command
+
+;Here for the LIST command
+
+cmdlist:MOVB	cdb_listcmd.B[EDI], #CMD_LIST
+2$:	LEAL	EBX, cdb_databuf1[EDI]	;Use the data buffer to collect the
+	MOVL	ECX, #DATASIZE-4	;  file specification
+	CALL	getfilespec		;Collect the search specification
+	JC	cmddon0
+	LEAL	EBX, cdb_databuf1[EDI]
+	LEAL	EDX, [EBX+ECX]		;Point to end of name
+	MOVB	AH, #0
+4$:	CMPL	EDX, EBX
+	JBE	10$.S
+	DECL	EDX
+	MOVB	AL, [EDX]
+	CMPB	AL, #'.'
+	JNE	6$.S
+	MOVB	AH, #1
+6$:	CMPB	AL, #'/'
+	JE	8$.S
+	CMPB	AL, #':'
+	JNE	4$.S
+8$:	INCL	EDX
+	CMPB	[EDX], #0
+	JNE	10$.S
+	MOVL	[EDX], #'*.*'
+	ADDL	ECX, #3t.B
+	JMP	12$.S
+
+10$:	CMPB	AH, #0
+	JNE	12$.S
+	MOVW	[EBX+ECX], #'.*'
+	ADDL	ECX, #2.B
+	MOVB	[EBX+ECX], #0
+12$:	CMPL	ECX, #CMDLBSIZE-1
+	JA	14$.S
+	PUSHL	EDI			;Copy search spec to the command line
+	ADDL	EDI, #cdb_cmdlnbufr	;  buffer
+	MOVL	ESI, EBX
+	ADDL	ECX, #4t		;Add 1, round up
+	SHRL	ECX, #2t		;Change to number of longs
+	PUSHL	DS
+	POPL	ES
+	CLD
+	RMOVSL	[EDI], [ESI]
+	POPL	EDI
+	MOVL	cdb_diskqab+qab_option[EDI], #O$ODF
+	MOVW	cdb_diskqab+qab_func[EDI], #QFNC_OPEN
+	LEAL	EAX, cdb_databuf1[EDI]
+	MOVL	cdb_diskqab+qab_buffer1[EDI], EAX
+	CLRL	EAX
+	MOVL	cdb_tcperr.B[EDI], EAX
+	MOVL	cdb_diskerr.B[EDI], EAX
+	MOVL	cdb_diskqab+qab_parm+0[EDI], EAX
+	CALL	cmddodisk		;Open the directory
+	JC	16$.S			;If error
+	MOVL	EBX, #dopnmsg
+	CALL	cmdresp			;Send the initial response
+	JC	cmdoerr
+	CALL	opendata		;OK - open the data connection
+	JC	18$.S			;If error
+	MOVB	AL, cdb_listcmd.B[EDI]
+	MOVB	cdb_command.B[EDI], AL
+	JMP	cmddon2
+
+;Here if the search spec is too long (not too likely!)
+
+14$:	MOVL	EBX, #fstlmsg
+	JMP	cmddon0
+
+;Here if error opening the directory
+
+16$:	MOVL	EBX, #dskemsg
+	MOVL	EDX, cdb_diskqab+qab_buffer1[EDI]
+18$:	CALL	cmdxoserr
+	JMP	cmddon2
+.PAGE
+	.SBTTL	cmdsite - Routine for the SITE command
+
+;Here for the SITE command
+
+cmdsite:MOVL	EBX, #sitemsg
+2$:	JMP	cmddon0
+
+	.SBTTL	cmdstat - Routine for the STAT command
+
+;Here for the STAT command
+
+cmdstat:MOVL	EBX, #niytmsg
+	JMP	2$.S
+
+	.SBTTL	cmdsyst - Routine for the SYST command
+
+;Here for the SYST command
+
+cmdsyst:MOVL	EBX, #systmsg
+	JMP	2$.S
+.PAGE
+	.SBTTL	tcpcmdoutput - Signal routine for TCP command output done
+
+;Signal routine for TCP command outputdone
+
+tcpcmdoutput:
+	PUSHAL
+	MOVL	EDI, 64t.B[ESP]		;Get offset of the output QAB
+	CMPW	qab_vector.B[EDI], #0.B	;Do we still need this interrupt?
+	JE	4$.S			;No - forget it!
+	SUBL	EDI, #cdb_cmdoutqab.B	;Yes - get offset of the CDB
+	CALL	docmdoutput
+4$:	POPAL
+	CALLF	svcSchDismiss##
+
+
+docmdoutput:
+	MOVL	intESP, ESP
+	MOVL	EAX, cdb_cmdoutqab+qab_error.B[EDI]
+waitdone:
+	MOVZBL	ECX, cdb_stkcnt.B[EDI]
+	NEGL	ECX
+	LEAL	ESP, [ESP+ECX*4]
+	LEAL	ESI, cdb_stksave[EDI]
+	MOVL	EDI, ESP
+	NEGL	ECX
+	CLD
+	RMOVSL	[EDI], [ESI]
+	POPL	ESI
+	POPL	EDI
+	POPL	ECX
+	BTL	EAX, #31t		;Set C if error
+	RET
+.PAGE
+	.SBTTL	tcpcmdclose - Signal routine for TCP command close done
+
+;Signal routine for TCP command close done
+
+tcpcmdclose:
+	PUSHAL
+	MOVL	EDI, 64t.B[ESP]		;Get offset of the CDB
+	SUBL	EDI, #cdb_cmdoutqab.B
+	CALL	docmdclose		;Finish up
+	POPAL				;All done here
+	CALLF	svcSchDismiss##
+
+
+docmdclose:
+	MOVL	intESP, ESP
+	JMP	cmdcls2
+.PAGE
+	.SBTTL	tcpdataopen - Signal routine for TCP data open done
+
+;Signal routine for TCP data open done
+
+tcpdataopen:
+	PUSHAL
+	MOVL	EDI, 64t.B[ESP]		;Get offset of the CDB
+	SUBL	EDI, #cdb_dataqab.B
+	CALL	dodataopen
+	POPAL
+	CALLF	svcSchDismiss##
+
+
+dodataopen:
+	MOVL	intESP, ESP
+	MOVL	EAX, cdb_dataqab+qab_error[EDI]
+	TESTL	EAX, EAX		;Any errors?
+	JS	10$.S			;Yes - go handle that
+	CMPB	loglevel, #1		;Should we log this?
+	JB	6$.S			;No
+	MOVL	EBX, #strdod		;Yes
+	MOVL	EAX, cdb_cmdinqab+qab_handle.B[EDI]
+	CALL	debugbgn
+	CALL	debugout
+6$:	LEAL	EBX, cdb_parms[EDI]	;No - build parameter list
+	MOVL	[EBX], #{PAR$SET|REP_HEXV}|{4<8}|{IOPAR_TIMEOUT<16t}
+	MOVL	4.B[EBX], #XT_SECOND*30t
+	MOVB	8.B[EBX], #0
+	MOVZBL	EAX, cdb_command.B[EDI]	;Dispatch on the command
+	JMPIL	dopndsp[EAX*4]
+
+;Here if error on the TCP open for the data connection
+
+10$:	MOVL	EBX, #codcmsg		;Report the error to the user
+	CLRL	EDX
+	CALL	cmdxoserr
+	CALL	cmddoout
+	JC	cmdoerr
+	RET
+
+	.MOD	4
+dopndsp:.LONG	dopnidle	;CMD_IDLE = 0 - Data connection is idle
+	.LONG	dopnstor	;CMD_STOR = 1 - STOR command active
+	.LONG	dopnretr	;CMD_RETR = 2 - RETR command active
+	.LONG	dopnlist	;CMD_LIST = 3 - LIST command active
+	.LONG	dopnnlst	;CMD_NLST = 4 - NLST command active
+
+;Here when TCP data connection open is complete if idle (this is not possible!)
+
+dopnidle:
+	MOVL	ESI, #errdoi
+	CALL	logerror
+	PUSHL	#1.B
+	CALLF	svcSchExit##
+.PAGE
+;Here when TCP data connection open is complete if doing STOR command
+
+dopnstor:
+	MOVW	cdb_dataqab+qab_vector[EDI], #VECT_DATAINPUT ;Yes
+	MOVB	cdb_dataqab+qab_func[EDI], #QFNC_INBLOCK
+	MOVL	cdb_dataqab+qab_count[EDI], #DATASIZE
+	LEAL	EAX, cdb_databuf1[EDI]
+	MOVL	cdb_dataqab+qab_buffer1+0[EDI], EAX
+	LEAL	EAX, cdb_tcpinparms.B[EDI]
+	MOVL	cdb_dataqab+qab_parm+0[EDI], EAX
+	MOVL	cdb_dataqab+qab_parm+4[EDI], DS
+	MOVB	cdb_diskqab+qab_func[EDI], #QFNC_OUTBLOCK
+	MOVL	cdb_diskdsp.B[EDI], #doutdone
+	PUSHL	DS			;Queue an initial TCP input
+	LEAL	EAX, cdb_dataqab[EDI]
+	PUSHL	EAX
+	CALLF	svcIoQueue##
+	TESTL	EAX, EAX
+	JS	tcpfail			;If error
+4$:	RET				;OK - finished here
+
+;Here when TCP data connection open is complete if doing RETR command
+
+dopnretr:
+	MOVW	cdb_dataqab+qab_vector[EDI], #VECT_DATAOUTPUT
+	MOVB	cdb_dataqab+qab_func[EDI], #QFNC_OUTBLOCK
+	LEAL	EAX, cdb_databuf1[EDI]
+	MOVL	cdb_dataqab+qab_buffer1+0[EDI], EAX
+	MOVB	cdb_diskqab+qab_func[EDI], #QFNC_INBLOCK
+	MOVL	cdb_diskqab+qab_count[EDI], #DATASIZE
+	MOVL	cdb_diskdsp.B[EDI], #dinpdone
+	PUSHL	DS			;Queue an initial disk input
+	LEAL	EAX, cdb_diskqab[EDI]
+	PUSHL	EAX
+	CALLF	svcIoQueue##
+	TESTL	EAX, EAX
+	JNS	4$.S			;If OK
+	MOVL	cdb_diskerr.B[EDI], EAX	;If error
+	JMP	finxfr
+.PAGE
+;Here when TCP data connection open is complete if doing LIST command
+;Here when TCP data connection open is complete if doing NLST command
+;  This routine uses cdb_databuf1 as an output buffer and cdb_databuf2
+;  to receive the file names. It expects the file name to search for to be
+;  in cdb_cmdlnbufr.
+
+dopnlist:
+	MOVW	cdb_dataqab+qab_vector[EDI], #VECT_DATAOUTPUT
+	MOVB	cdb_dataqab+qab_func[EDI], #QFNC_OUTBLOCK
+	LEAL	EAX, cdb_databuf1[EDI]
+	MOVL	cdb_dataqab+qab_buffer1+0[EDI], EAX
+	CLRL	EAX
+	MOVL	cdb_dataqab+qab_parm+0[EDI], EAX
+
+;Directory is open, setup info call parameters
+
+	MOVL	cdb_diskqab+qab_count[EDI], #DATASIZE
+	MOVL	cdb_diskdsp.B[EDI], #dlistdone
+	MOVB	cdb_diskqab+qab_func[EDI], #QFNC_DEVPARM
+	MOVL	cdb_diskqab+qab_option[EDI], #0
+	LEAL	EAX, cdb_cmdlnbufr[EDI]
+	MOVL	cdb_diskqab+qab_buffer1[EDI], EAX
+	LEAL	EBX, cdb_parms[EDI]	;Build parameter list for search
+	MOVL	cdb_diskqab+qab_parm+0[EDI], EBX
+	MOVL	cdb_diskqab+qab_parm+4[EDI], DS
+	MOVL	[EBX], #{PAR$SET|REP_DECV}|{4<8}|{IOPAR_DIRHNDL<16t}
+	MOVL	EAX, cdb_diskqab+qab_handle[EDI]
+	MOVL	4.B[EBX], EAX
+	MOVL	8.B[EBX], #{PAR$SET|REP_HEXV}|{4<8}|{IOPAR_FILOPTN<16t}
+        MOVL    12t.B[EBX], #FO$ATTR|FO$FILENAME
+	MOVL	16t.B[EBX], #{PAR$GET|REP_STR}|{IOPAR_FILSPEC<16t}
+	LEAL	EAX, cdb_databuf2[EDI]
+	MOVL	20t.B[EBX], EAX
+	MOVL	24t.B[EBX], DS
+	MOVL	28t.B[EBX], #DATASIZE-2
+	MOVL	32t.B[EBX], #{PAR$SET|REP_HEXV}|{1<8}|{IOPAR_SRCATTR<16t}
+	MOVB	36t.B[EBX], #A$NORMAL|A$DIRECT
+	CLRL	EAX
+	MOVL	37t.B[EBX], #{PAR$GET|REP_HEXV}|{4<8}|{IOPAR_LENGTH<16t}
+	MOVL	41t.B[EBX], EAX
+	MOVL	45t.B[EBX], #{PAR$GET|REP_HEXV}|{8<8}|{IOPAR_CDATE<16t}
+	MOVL	49t.B[EBX], EAX
+	MOVL	53t.B[EBX], EAX
+	MOVB	57t.B[EBX], AL
+	LEAL	EAX, cdb_databuf1[EDI]	;Initialize the output pointer and
+	MOVL	cdb_diroutpnt[EDI], EAX	;  count
+	MOVL	cdb_diroutcnt[EDI], #DATASIZE
+	PUSHL	DS			;Queue first directory search request
+	LEAL	EAX, cdb_diskqab[EDI]
+	PUSHL	EAX
+	CALLF	svcIoQueue##
+	TESTL	EAX, EAX
+	JS	tcpfail			;If error
+	RET
+.PAGE
+;Here when TCP data connection open is complete if doing NLST command
+;  This routine uses cdb_databuf1 as an output buffer and cdb_databuf2
+;  to receive the file name.  It expects the file name to search for to be
+;  in cdb_cmdlnbufr.
+
+dopnnlst:
+	MOVW	cdb_dataqab+qab_vector[EDI], #VECT_DATAOUTPUT
+	MOVB	cdb_dataqab+qab_func[EDI], #QFNC_OUTBLOCK
+	LEAL	EAX, cdb_databuf1[EDI]
+	MOVL	cdb_dataqab+qab_buffer1+0[EDI], EAX
+	CLRL	EAX
+	MOVL	cdb_dataqab+qab_parm+0[EDI], EAX
+	MOVB	cdb_diskqab+qab_func[EDI], #QFNC_INBLOCK
+	MOVL	cdb_diskqab+qab_count[EDI], #DATASIZE
+	MOVL	cdb_diskdsp.B[EDI], #dnlstdone
+	MOVB	cdb_diskqab+qab_func[EDI], #QFNC_DEVPARM
+	MOVL	cdb_diskqab+qab_option[EDI], #O$REPEAT
+	LEAL	EAX, cdb_cmdlnbufr[EDI]
+	MOVL	cdb_diskqab+qab_buffer1[EDI], EAX
+	LEAL	EBX, cdb_parms[EDI]	;Build parameter list for search
+	MOVL	cdb_diskqab+qab_parm+0[EDI], EBX
+	MOVL	cdb_diskqab+qab_parm+4[EDI], DS
+	MOVL	[EBX], #{PAR$SET|REP_DECV}|{4<8}|{IOPAR_DIRHNDL<16t}
+	MOVL	EAX, cdb_diskqab+qab_handle[EDI]
+	MOVL	4.B[EBX], EAX
+	MOVL	8.B[EBX], #{PAR$SET|REP_HEXV}|{4<8}|{IOPAR_FILOPTN<16t}
+	MOVL	12t.B[EBX], #FO$FILENAME|FO$VERSION
+	MOVL	16t.B[EBX], #{PAR$GET|REP_STR}|{IOPAR_FILSPEC<16t}
+	LEAL	EAX, cdb_databuf2[EDI]
+	MOVL	20t.B[EBX], EAX
+	MOVL	24t.B[EBX], DS
+	MOVL	28t.B[EBX], #DATASIZE-2
+	MOVL	32t.B[EBX], #{PAR$SET|REP_HEXV}|{1<8}|{IOPAR_SRCATTR<16t}
+	MOVB	36t.B[EBX], #A$NORMAL|A$DIRECT
+	MOVB	37t.B[EBX], #0
+	LEAL	EAX, cdb_databuf1[EDI]	;Initialize the output pointer and
+	MOVL	cdb_diroutpnt[EDI], EAX	;  count
+	MOVL	cdb_diroutcnt[EDI], #DATASIZE
+	PUSHL	DS			;Queue first directory search request
+	LEAL	EAX, cdb_diskqab[EDI]
+	PUSHL	EAX
+	CALLF	svcIoQueue##
+	TESTL	EAX, EAX
+	JS	tcpfail.S		;If error
+	RET
+.PAGE
+	.SBTTL	tcpdatainput - Signal routine for TCP data input done
+
+;Signal routine for TCP data input done
+
+tcpdatainput:
+	PUSHAL
+	MOVL	EDI, 64t.B[ESP]		;Get offset of the CDB
+	SUBL	EDI, #cdb_dataqab
+	CALL	dodatainput
+	POPAL
+	CALLF	svcSchDismiss##
+
+
+dodatainput:
+	MOVL	intESP, ESP
+	CMPL	cdb_dataqab+qab_error[EDI], #0 ;Any errors?
+	JNE	6$.S			;Yes - go handle that
+2$:	MOVL	EAX, cdb_dataqab+qab_amount[EDI]
+	MOVL	cdb_diskqab+qab_count[EDI], EAX
+	PUSHL	DS			;Output the data we just received
+	LEAL	EAX, cdb_diskqab[EDI]
+	PUSHL	EAX
+	CALLF	svcIoQueue##
+	TESTL	EAX, EAX
+	JS	ddonee			;If error queueing the output
+4$:	RET
+
+;Here if error reading the input data
+
+6$:	MOVL	EAX, cdb_dataqab+qab_error[EDI] ;Get the error code
+	CMPL	EAX, #ER_NCCLR.B	;Is the error "connection closed"?
+	JE	8$.S			;Yes, continue
+	CMPL	EAX, #ER_NCLST.B	;Is the error "connection lost"?
+	JNE	tcpfail.S		;No
+8$:	CMPL	cdb_dataqab+qab_amount[EDI], #0.B ;Yes - do we have any data?
+	JE	finxfr.S		;No
+	ORB	cdb_status1.B[EDI], #S1$DONE ;Yes - remember we are finished
+	JMP	2$.S			;And go output the final data
+
+;Here if have TCP error
+
+tcpfail:MOVL	cdb_tcperr.B[EDI], EAX	;Save the error code
+finxfr:	MOVL	cdb_diskdsp.B[EDI], #datain2 ;Set disk done dispatch
+	MOVB	cdb_diskqab+qab_func[EDI], #QFNC_CLOSE
+	CLRL	EAX
+	MOVL	cdb_diskqab+qab_option[EDI], EAX
+	PUSHL	DS
+	LEAL	EAX, cdb_diskqab[EDI]
+	PUSHL	EAX
+	CALLF	svcIoQueue##		;Close the disk file
+	TESTL	EAX, EAX
+	JNS	4$.S
+	CMPL	cdb_diskerr.B[EDI], #0.B ;If error - save this error if we
+	JNE	datain2.S		 ;  don't already have a disk error
+	MOVL	cdb_diskerr.B[EDI], EAX
+	JMP	datain2.S		;Continue as best as we can!
+
+;Here when the disk file is closed
+
+datain2:MOVB	cdb_dataqab+qab_func[EDI], #QFNC_CLOSE
+	CLRL	EAX
+	MOVL	cdb_dataqab+qab_option[EDI], EAX
+	MOVW	cdb_dataqab+qab_vector[EDI], #VECT_DATACLOSE
+	CMPB	loglevel, #1		;Should we log this?
+	JB	12$.S			;No
+	MOVL	EBX, #strdcb		;Yes
+	MOVL	EAX, cdb_cmdinqab+qab_handle.B[EDI]
+	CALL	debugbgn
+	CALL	debugout
+12$:	PUSHL	DS
+	LEAL	EAX, cdb_dataqab[EDI]
+	PUSHL	EAX
+	CALLF	svcIoQueue##
+	TESTL	EAX, EAX
+	JS	ddonee
+	RET
+.PAGE
+;Here when disk output is finished
+
+doutdone:
+	CMPL	cdb_diskqab+qab_error[EDI], #0.B
+	JS	ddonee
+	PUSHL	DS			;Queue another TCP input
+	LEAL	EAX, cdb_dataqab[EDI]
+	PUSHL	EAX
+	CALLF	svcIoQueue##
+	TESTL	EAX, EAX
+	JS	tcpfail
+	RET
+.PAGE
+	.SBTTL	tcpdataoutput - Signal routine for TCP data output done
+
+;Signal routine for TCP data output done
+
+tcpdataoutput:
+	PUSHAL
+	MOVL	EDI, 64t.B[ESP]		;Get offset of the CDB
+	SUBL	EDI, #cdb_dataqab.B
+	CALL	dodataoutput
+	POPAL
+	CALLF	svcSchDismiss##
+
+
+dodataoutput:
+	MOVL	intESP, ESP
+	MOVL	EAX, cdb_dataqab+qab_error[EDI] ;Any errors?
+	TESTL	EAX, EAX
+	JS	tcpfail			;Yes - go handle that
+	CMPB	cdb_command.B[EDI], #CMD_RETR ;No - doing RETR command?
+	JNE	8$.S			;No
+	PUSHL	DS
+	LEAL	EAX, cdb_diskqab[EDI]	;Queue another disk input
+	PUSHL	EAX
+	CALLF	svcIoQueue##
+	TESTL	EAX, EAX
+	JS	ddonee.S		;If error
+2$:	RET
+
+;Here if not doing RETR command - must be LIST or NLST
+
+8$:	MOVL	ECX, cdb_dirECX[EDI]	;Restore ECX
+	JMPIL	cdb_dirrtn[EDI]		;Return from dirputchr or dirputout
+.PAGE
+;Here when disk input is finished
+
+dinpdone:
+	CMPL	cdb_diskqab+qab_error[EDI], #0.B ;Have error on input?
+	JS	10$.S			;Yes
+	MOVL	EAX, respdelay		;No - need delay?
+	TESTL	EAX, EAX
+	JE	4$.S			;No
+	CALL	dodelay
+4$:	MOVL	EAX, cdb_diskqab+qab_amount[EDI]
+	MOVL	cdb_dataqab+qab_count[EDI], EAX
+	PUSHL	DS
+	LEAL	EAX, cdb_dataqab[EDI]	;Queue TCP output
+	PUSHL	EAX
+	CALLF	svcIoQueue##
+	TESTL	EAX, EAX
+	JS	tcpfail
+	RET
+
+;Here if have error on disk input
+
+10$:	CMPL	EAX, #ER_EOF.B		;Is the error EOF?
+ddonex:	JE	finxfr			;Yes - this is normal finish
+ddonee:	MOVL	cdb_diskerr.B[EDI], EAX	;No - store error code
+	JMP	finxfr			;And go finish up
+.PAGE
+;Here when directory search for LIST is finished
+
+dlistdone:
+	CMPL	cdb_diskqab+qab_error[EDI], #0.B ;Any errors?
+	JNS	2$.S			;No - go on
+	MOVL	EAX, cdb_parms+4[EDI]	;Yes - restore directory handle
+	MOVL	cdb_diskqab+qab_handle[EDI], EAX
+	MOVL	EAX, cdb_diskqab+qab_error[EDI] ;Get error code
+	CMPL	EAX, #ER_FILNF.B	;Is it "file not found"?
+        JE      12$
+        JMP     ddonex
+
+;Here if no errors on the search
+;Input string (databuf2) is FS_FILENAME<b1..bn(name)>FS_ATTR<b1><b2(0)>
+
+2$:     LEAL    EAX, cdb_databuf2[EDI]
+        MOVL    cdb_dirinpnt.B[EDI], EAX
+	MOVZWL	EAX, cdb_parms+30t[EDI]	;Get length of returned file
+	DECL	EAX			;  specification
+        JLE     10$
+	MOVL	cdb_dirincnt.B[EDI], EAX
+3$:     MOVL    EBX, cdb_dirinpnt.B[EDI]
+        MOVB    AL, [EBX]               ; should be FS_FILENAME
+        CMPB    AL, #FS_FILENAME
+        JNE     18$                     ; Bail, there was an error
+        INCL    cdb_dirinpnt.B[EDI]     ; bump to first char
+
+4$:     MOVL    EBX, cdb_dirinpnt.B[EDI] ;get next character
+        MOVB    AL, [EBX]
+        CMPB    AL, #FS_ATTR            ;End of input?
+        JE      4a$.S
+        INCL    cdb_dirinpnt.B[EDI]     ;bump input pointer
+        JMP     4$.S
+
+
+4a$:    MOVB    [EBX], #0.B             ;put NULL in to end string
+        INCL    cdb_dirinpnt.B[EDI]     ;bump past FS_ATTR
+        MOVL    EBX, cdb_dirinpnt.B[EDI]
+        MOVB    AL, [EBX]               ; this is the attribute byte
+        MOVB    cdb_direct.B[EDI], #0.B
+        MOVB    cdb_rdonly.B[EDI], #'w'.B
+        BTL     EAX, #4t                ;should be A%DIRECT
+        JNC     4b$
+        MOVB    cdb_direct.B[EDI], #1.B
+4b$:    BTL     EAX, #0t                ;should be A%RDONLY
+        JNC     spffl
+        MOVB    cdb_rdonly.B[EDI], #'-'.B
+
+;Format the date string for output
+
+spffl:  LEAL    EBX, cdb_parms[EDI]
+        ADDL    EBX, #49t
+        PUSHL   EBX			;Address of time/date
+        PUSHL   #fmtdate		;Date format string
+        LEAL    EAX, cdb_listdate[EDI]
+        PUSHL   EAX			;Target buffer
+        CALL    sdt2str#		;Call the conversion routine
+        ADDL    ESP, #12t.B
+
+;Format the output line
+
+        LEAL    EAX, cdb_databuf2[EDI]
+        INCL    EAX
+        PUSHL   EAX			;Address of filename
+        LEAL    EBX, cdb_parms[EDI]
+        PUSHL   41t.B[EBX]		;File length
+        LEAL    EAX, cdb_listdate[EDI]
+        PUSHL   EAX			;Date string location
+        PUSHL   cdb_rdonly.B[EDI]	;Start of file access values
+        PUSHL   cdb_rdonly.B[EDI]
+        CMPB    cdb_direct.B[EDI], #0.B
+        JE      4c$.S
+        PUSHL   #'-'.B
+        JMP     4d$.S
+
+4c$:    PUSHL   #'x'.B
+4d$:    PUSHL   cdb_rdonly.B[EDI]
+        CMPB    cdb_direct.B[EDI], #0.B
+        JE      4e$.S
+        PUSHL   #'d'.B
+        JMP     4f$.S
+
+4e$:    PUSHL   #'-'.B
+4f$:    PUSHL   #fmtlist		;Format string address
+        LEAL    EAX, cdb_listoutb[EDI]
+        PUSHL   EAX			;Target buffer address
+        CALL    sprintf#
+        ADDL    ESP, #40t.B
+
+        LEAL    ECX, cdb_listoutb[EDI]
+5$:     MOVB    AL, [ECX]
+        CMPB    AL, #0.b
+        JE      10$
+        CALL    dirputchr
+        JC      20$
+        INCL    ECX
+        JMP     5$
+
+10$:    PUSHL   DS			;Queue another search
+        LEAL    EAX, cdb_diskqab[EDI]
+	PUSHL	EAX
+	CALLF	svcIoQueue##
+        ORL     EAX, EAX
+	JS	18$.S
+	RET
+
+;Here when DIR is done processing
+
+12$:    CMPL    cdb_diroutcnt.B[EDI], #0.B ;Anything to output now?
+        JE      14$.S			;No
+	CALL	dirputout		;Yes - output last buffer full
+14$:    MOVL    EAX, cdb_parms+4[EDI]	;Restore directory handle
+	MOVL	cdb_diskqab+qab_handle[EDI], EAX
+	JMP	finxfr			;Go finish up
+
+;Here if error queueing a directory search
+
+18$:	MOVL	EDX, cdb_parms+4[EDI]	;Restore directory handle
+	MOVL	cdb_diskqab+qab_handle[EDI], EDX
+	JMP	ddonee
+
+;Here if an error processing output
+
+20$:    MOVL    EDX, cdb_parms+4[EDI]   ;Error - restore directory handle
+	MOVL	cdb_diskqab+qab_handle[EDI], EDX
+	JMP	tcpfail
+.PAGE
+;Here when directory search for NLST is finished
+
+dnlstdone:
+	CMPL	cdb_diskqab+qab_error[EDI], #0.B ;Any errors?
+	JNS	2$.S			;No - go on
+	MOVL	EAX, cdb_parms+4[EDI]	;Yes - restore directory handle
+	MOVL	cdb_diskqab+qab_handle[EDI], EAX
+	MOVL	EAX, cdb_diskqab+qab_error[EDI] ;Get error code
+	CMPL	EAX, #ER_FILNF.B	;Is it "file not found"?
+	JMP	ddonex
+
+;Here if no errors on the search
+
+2$:	LEAL	EAX, cdb_databuf2+1[EDI]
+	MOVL	cdb_dirinpnt.B[EDI], EAX
+	MOVZWL	EAX, cdb_parms+30t[EDI]
+	DECL	EAX
+	JLE	16$.S
+	MOVL	cdb_dirincnt.B[EDI], EAX
+4$:	DECL	cdb_dirincnt.B[EDI]	;Have more data now?
+	JS	14$.S			;No
+	MOVL	EBX, cdb_dirinpnt.B[EDI] ;Yes - get next character
+	MOVB	AL, [EBX]
+	INCL	cdb_dirinpnt.B[EDI]
+	CMPB	AL, #FS_MIN		;Special character?
+	JB	8$.S			;No - just store it
+	CMPB	AL, #FS_ESC		;Yes - escape?
+	JNE	6$.S			;No
+	DECL	cdb_dirincnt.B[EDI]	;Yes - have more data now?
+	JS	14$.S			;No (should not happen!)
+	MOVL	EBX, cdb_dirinpnt.B[EDI] ;Yes - get next character
+	MOVB	AL, [EBX]
+	JMP	8$.S			;And store it
+
+;Here if special but not escape
+
+6$:	CMPB	AL, #FS_FILENAME	;Start of new name?
+	JE	12$.S			;Yes
+	CMPB	AL, #FS_VERSION		;No - start of version number?
+	JNE	8$.S			;No
+	MOVB	AL, #';'		;Yes
+8$:	CALL	dirputchr		;Output character
+	JNC	4$.S			;OK - continue
+10$:	MOVL	EDX, cdb_parms+4[EDI]	;Error - restore directory handle
+	MOVL	cdb_diskqab+qab_handle[EDI], EDX
+	JMP	tcpfail
+
+;Here at end of name (another name follows)
+
+12$:	MOVB	AL, #CR
+	CALL	dirputchr
+	JC	10$.S
+	MOVB	AL, #LF
+	JMP	8$.S
+
+;Here at end of name (end of list)
+
+14$:	MOVB	AL, #CR
+	CALL	dirputchr
+	JC	10$.S
+	MOVB	AL, #LF
+	CALL	dirputchr
+	JC	10$.S
+	BTL	cdb_diskqab+qab_amount[EDI], #31t ;Have more to get?
+	JNC	20$.S			;No - all finished
+16$:	PUSHL	DS			;Yes - queue another search
+	LEAL	EAX, cdb_diskqab[EDI]
+	PUSHL	EAX
+	CALLF	svcIoQueue##
+	TESTL	EAX, EAX
+	JS	18$.S
+	RET
+
+;Here if error queueing a directory search
+
+18$:	MOVL	EDX, cdb_parms+4[EDI]	;Restore directory handle
+	MOVL	cdb_diskqab+qab_handle[EDI], EDX
+	JMP	ddonee
+
+;Here when completely finished
+
+20$:	CMPL	cdb_diroutcnt.B[EDI], #0.B ;Anything to output now?
+	JE	22$.S			;No
+	CALL	dirputout		;Yes - output last buffer full
+22$:	MOVL	EAX, cdb_parms+4[EDI]	;Restore directory handle
+	MOVL	cdb_diskqab+qab_handle[EDI], EAX
+	JMP	finxfr			;Go finish up
+.PAGE
+;Subroutine to store directory character for output over the data connection
+;	c(AL) = Character
+;	CALL	dirputchr
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+
+dirputchr:
+	CLC
+	MOVL	EBX, cdb_diroutpnt.B[EDI] ;Get pointer
+	MOVB	[EBX], AL		;Store character
+	INCL	cdb_diroutpnt.B[EDI]	;Bump pointer
+	DECL	cdb_diroutcnt.B[EDI]	;Is buffer full now?
+        JNE     4$.S                    ;No - finished
+	LEAL	EAX, cdb_databuf1[EDI]	;Yes - reset pointer and count
+	MOVL	cdb_diroutpnt.B[EDI], EAX
+dirputout:
+        MOVL    EAX, #DATASIZE
+	SUBL	EAX, cdb_diroutcnt.B[EDI]
+	MOVL	cdb_dataqab+qab_count[EDI], EAX
+	MOVL	cdb_diroutcnt.B[EDI], #DATASIZE
+	MOVL	EAX, respdelay
+	TESTL	EAX, EAX
+	JE	2$.S
+	call	dodelay
+2$:	PUSHL	DS
+        LEAL    EAX, cdb_dataqab[EDI]   ;Queue output
+	PUSHL	EAX
+	CALLF	svcIoQueue##
+	BTL	EAX, #31t
+	JC	4$.S			;If error
+        POPL    cdb_dirrtn[EDI]		;OK - save return address
+	MOVL	cdb_dirECX[EDI], ECX	;Save ECX value
+4$:	RET				;Dismiss the signal
+.PAGE
+	.SBTTL	tcpdataclose - Signal routine for TCP data close done
+
+;Signal routine for TCP data close done
+
+tcpdataclose:
+	PUSHAL
+	MOVL	EDI, 64t.B[ESP]		;Get offset of the CDB
+	SUBL	EDI, #cdb_dataqab.B
+	CALL	dodataclose
+	POPAL
+	CALLF	svcSchDismiss##
+
+
+dodataclose:
+	MOVL	intESP, ESP
+	ANDB	cdb_status1.B[EDI], #{~{S1$CLOSE|S1$OPEN|S1$DONE}}&0FFh
+	MOVL	EAX, cdb_diskerr.B[EDI]	;Get disk error code
+	TESTL	EAX, EAX
+	JNE	6$.S			;If have a disk error
+	MOVL	EAX, cdb_tcperr.B[EDI]	;Get TCP error code
+	TESTL	EAX, EAX
+	JNE	8$.S			;If have a TCP error
+	CMPB	loglevel, #1		;Should we log this?
+	JB	1$.S			;No
+	MOVL	EBX, #strdcd		;Yes
+	MOVL	EAX, cdb_cmdinqab+qab_handle.B[EDI]
+	CALL	debugbgn
+	CALL	debugout
+1$:	MOVL	EBX, #xfdnmsg		;Report normal completion
+	CALL	cmdresp
+	JC	4$.S
+2$:	CALL	cmddoout
+4$:	JC	cmdoerr
+	MOVB	cdb_command.B[EDI], #CMD_IDLE
+	RET
+
+;Here if have disk error to report
+
+6$:	MOVL	EBX, #xfdemsg		;Report the disk error
+	JMP	10$.S
+
+;Here if have TCP error to report
+
+8$:	MOVL	EBX, #xfnemsg		;Report the network error
+10$:	CLRL	EDX			;We don't have the name now
+	CALL	cmdxoserr
+	JMP	2$.S
+.PAGE
+	.SBTTL	diskdone - Signal routine for disk done
+
+;Signal routine for disk done
+
+diskdone:
+	PUSHAL
+	MOVL	EDI, 64t.B[ESP]		;Get offset of the disk QAB
+	MOVL	EAX, qab_error.B[EDI]	;Get error code
+	SUBL	EDI, #cdb_diskqab	;Get offset of the CDB
+	CALL	dodiskdone
+	POPAL
+	CALLF	svcSchDismiss##
+
+
+dodiskdone:
+	MOVL	intESP, ESP
+	JMPIL	cdb_diskdsp.B[EDI]
+.PAGE
+	.SBTTL	alarm - Signal routine for alarm
+
+;Signal routine for alarm - This is used to implement the DELAY feature.
+
+alarm:	PUSHAL
+	MOVL	EDI, 64t.B[ESP]		;Get offset of the CDB
+	CALL	doalarm
+	POPAL
+	CALLF	svcSchDismiss##
+
+
+doalarm:
+	MOVL	intESP, ESP
+	JMP	cmddone			;Continue
+.PAGE
+	.SBTTL	opendata - Subroutine to open the data connection
+
+;Subroutine to open the data connection
+;	c{EDI} = Offset of the CDB
+;	CALL	opendata
+;	C:set = Error
+;	  c{EAX} = XOS error code
+;	  c{EBX} = Offset of error message text
+;	  c{EDX} = 0
+;	C:clr = Normal
+
+opendata:
+	MOVW	cdb_dataqab+qab_func.B[EDI], #QFNC_OPEN
+	MOVL	cdb_dataqab+qab_option.B[EDI], #O$IN|O$OUT|O$PARTIAL
+	MOVW	cdb_dataqab+qab_vector.B[EDI], #VECT_DATAOPEN
+	MOVL	EBX, #dataname
+	MOVL	cdb_dataqab+qab_buffer1+0[EDI], EBX
+	MOVL	cdb_dataqab+qab_buffer1+4[EDI], DS
+	LEAL	EDX, cdb_parms[EDI]
+	MOVL	cdb_dataqab+qab_parm+0[EDI], EDX
+	MOVL	cdb_dataqab+qab_parm+4[EDI], DS
+	PUSHL	EDI
+	MOVL	EDI, EDX		;Set up the parameter list
+	MOVL	ESI, #dopnparms
+	MOVL	ECX, #{DOPNPSIZE+3}/4
+	RMOVSL	[EDI], [ESI]
+	POPL	EDI
+	MOVL	EAX, cdb_dataipaddr.B[EDI]
+	MOVL	dipaddr.B[EDX], EAX
+	MOVL	EAX, cdb_rdataport.B[EDI]
+	MOVL	dtcpport.B[EDX], EAX
+	MOVL	ESI, cdb_ndb.B[EDI]
+	ADDL	ESI, #ndb_tcpname.B
+	CLD
+4$:	LODSB	[ESI]
+	MOVB	[EBX], AL
+	INCL	EBX
+	CMPB	AL, #':'
+	JNE	4$.S
+	MOVB	[EBX], #0
+	CMPB	loglevel, #1		;Should we log this?
+	JB	6$.S			;No
+	MOVL	EBX, #strdob		;Yes
+	MOVL	EAX, cdb_cmdinqab+qab_handle.B[EDI]
+	CALL	debugbgn
+	CALL	debugout
+6$:	PUSHL	DS			;Start the TCP open for the data
+	LEAL	EAX, cdb_dataqab[EDI]	;  connection
+	PUSHL	EAX
+	CALLF	svcIoQueue##
+	TESTL	EAX, EAX
+	JNS	10$.S			;If OK
+	MOVL	EBX, #codcmsg		;If error
+	CLRL	EDX
+	STC
+10$:	RET
+
+	  .MOD   4
+dopnparms:.BYTE  PAR$SET|REP_HEXV, 4t
+	  .WORD  IOPAR_NETLCLPORT
+	  .LONG  40000000+TCPP_FTPDATA
+	  .BYTE  PAR$SET|REP_HEXV, 4t
+	  .WORD  IOPAR_NETRMTNETAS
+dipaddr=!$-dopnparms
+	  .LONG  0
+	  .BYTE  PAR$SET|REP_HEXV, 4t
+	  .WORD  IOPAR_NETRMTPORTS
+dtcpport=!$-dopnparms
+	  .LONG  0
+	  .BYTE  0
+DOPNPSIZE=!$-dopnparms
+.PAGE
+	.SBTTL	getfilespec - Subroutine to collect file specification
+
+;Subroutine to collect file specification
+;	c{EBX} = Offset of file specification buffer
+;	c{ECX} = Length of file specification buffer
+;	CALL	getfilespec
+;	C:set = Error
+;	  c{EBX} = Offset of error text string
+;	C:clr = Normal
+;	  c(AH)  = Status bits:
+;		     Bit 0 = 1 if device specified
+;		     Bit 1 = 1 if wild card name
+;	  c{ECX} = Length of file specification
+
+getfilespec:
+	TESTB	cdb_allflsok.B[EDI], #02
+	JNE	getdirspec.S
+	PUSHL	EBX
+	PUSHL	EDI
+	PUSHL	ECX
+	MOVL	ECX, cdb_homdirlen[EDI]
+	JREGZ	ECX, 4$
+	MOVL	ESI, cdb_homdirstr[EDI]
+	SUBL	[ESP], ECX		;Copy home directory string if we
+	JLE	10$.S
+	MOVL	EDI, EBX
+	PUSHL	DS
+	POPL	ES
+	CLD
+	RMOVSB	[EDI], [ESI]
+	LEAL	EBX, -1.B[EDI]
+	MOVB	[EBX], #0
+4$:	POPL	ECX
+	POPL	EDI
+	PUSHL	EBX
+	CALL	getdirspec
+	JC	6$.S
+	POPL	EBX
+	POPL	EDX
+	SUBL	EDX, EBX
+	SUBL	ECX, EDX
+	CLC
+	RET
+
+6$:	POPL	EDX
+	POPL	EDX
+	RET
+
+;Here if buffer is too short
+
+10$:	POPL	ECX
+	POPL	EDI
+	POPL	EBX
+	MOVL	EBX, #fstlmsg		;Get offset of error text string
+	STC
+	RET
+.PAGE
+	.SBTTL	getdirspec - Subroutine to collect directory specification
+
+;Subroutine to collect directory specification
+;	c{EBX} = Offset of file specification buffer
+;	c{ECX} = Length of file specification buffer
+;	CALL	getdirspec
+;	C:set = Error
+;	  c{EBX} = Offset of error text string
+;	C:clr = Normal
+;	  c(AH)  = Status bits:
+;		     Bit 0 = 1 if device specified
+;		     Bit 1 = 1 if wild card name
+;	  c{ECX} = Length of file specification
+
+$$$=!0
+FRM gfs_size , 4t
+FRM gfs_bufr , 4t
+FRM gfs_cpnt , 4t
+FRM gfs_ccnt , 4t
+gfs_SIZE=!$$$
+
+getdirspec:
+	ANDB	cdb_status1.B[EDI], #~S1$RNFR
+	ENTER	gfs_SIZE, 0
+	MOVL	gfs_bufr.B[EBP], EBX
+	MOVL	gfs_size.B[EBP], ECX
+	CALL	skipws
+	MOVB	AH, #0			;Indicate don't have device name yet
+
+;First scan enough of the file specification to see if we have a relative or
+;  absolute specification.  It is absolute if it begins with a \ or if it
+;  contains a device specification.  We do not allow relative specifications
+;  with a device because of the conflict between the FTP and DOS ideas of
+;  working directories.  Note that device names are only allowed when in
+;  all-files mode.
+
+	MOVL	EDX, cdb_cmdlnbpnt.B[EDI] ;Save current command pointer and
+	MOVL	gfs_cpnt.B[EBP], EDX	  ;  and count
+	MOVL	EDX, cdb_cmdlnbcnt.B[EDI]
+	MOVL	gfs_ccnt.B[EBP], EDX
+2$:	CALL	getchr			;Get next character
+	JE	4$.S			;If no more
+	CMPB	AL, #' '		;End of specification?
+	JBE	4$.S			;Yes
+	CMPB	AL, #':'		;No - end of device name?
+	JE	6$.S			;Yes - go handle device name
+	CMPB	AL, #'\'		;No - end of directory name?
+	JE	4$.S			;Yes - don't have a device name
+	CMPB	AL, #'/'		;Maybe
+	JNE	2$.S			;No - continue
+4$:	MOVL	EDX, gfs_cpnt.B[EBP]	  ;Restore command pointer to start of
+	MOVL	cdb_cmdlnbpnt.B[EDI], EDX ;  file specification
+	MOVL	EDX, gfs_ccnt.B[EBP]
+	MOVL	cdb_cmdlnbcnt.B[EDI], EDX
+	JMP	17$.S
+
+;Here if have device name - first make sure this is allowed, then copy the
+;  device name, converting it to upper case
+
+6$:	TESTB	cdb_allflsok.B[EDI], #02h ;In all-files mode?
+	JE	56$			;No - fail
+	MOVL	EDX, gfs_cpnt.B[EBP]	  ;Yes - restore command pointer to
+	MOVL	cdb_cmdlnbpnt.B[EDI], EDX ;  start of device name
+	MOVL	EDX, gfs_ccnt.B[EBP]
+	MOVL	cdb_cmdlnbcnt.B[EDI], EDX
+8$:	CALL	getchr
+	CMPB	AL, #'a'
+	JB	10$.S
+	ADDB	AL, #'A'-'a'
+10$:	DECL	gfs_size.B[EBP]
+	JE	50$
+	MOVB	[EBX], AL
+	INCL	EBX
+	CMPB	AL, #':'
+	JNE	8$.S
+	MOVB	AH, #1			;Remember have device name
+
+;Here with device name copied if we have one
+
+12$:	CALL	peekchr			;Peek at next command character
+	JE	14$.S			;If no more
+	CMPB	AL, #' '
+	JA	18$.S			;If not at end of specification
+	CMPB	AH, #0			;At end - have a device name?
+	JE	20$.S			;No
+14$:	DECL	gfs_size.B[EBP]		;Room for another character?
+	JE	50$			;No - fail
+	MOVB	[EBX], #'/'		;Yes - store /
+	INCL	EBX
+16$:	MOVB	[EBX], #0		;Store null at end
+	MOVL	ECX, EBX		;Calculate length of the specification
+	SUBL	ECX, gfs_bufr.B[EBP]
+	LEAVE				;Finished
+	RET
+
+;Here if don't have a device name
+
+17$:	CALL	peekchr
+	JE	20$.S
+
+;Here if have at least one character beyond a device name
+
+18$:	CMPB	AL, #'\'		;Does path start with \ or /?
+	JE	24$.S			;Yes
+	CMPB	AL, #'/'
+	JE	24$.S			;Yes
+	CMPB	AH, #0			;No - have a device name
+	JE	20$.S
+	DECL	gfs_size.B[EBP]		;Yes
+	JS	50$
+	JMP	22$.S
+
+;Here if have a relative path - first copy the current working directory
+;  string to the file specification buffer
+
+20$:	MOVL	ECX, cdb_wrkdirlen.B[EDI]
+	SUBL	gfs_size.B[EBP], ECX	;Reduce space available
+	JLE	50$			;Fail if it won't fit
+	MOVL	ESI, cdb_wrkdirstr.B[EDI]
+	TESTL	ESI, ESI
+	JE	22$.S
+	PUSHL	EDI
+	MOVL	EDI, EBX
+	CLD
+	RMOVSB	[EDI], [ESI]
+	MOVL	EBX, EDI
+	POPL	EDI
+	JMP	24$.S
+
+;Here if path is relative and have no current directory
+
+22$:	MOVB	[EBX], #'/'		;Always start path with /
+	INCL	EBX
+	DECL	gfs_size.B[EBP]
+24$:	CALL	getchr			;Get next command character
+	JE	16$.S
+	CMPB	AL, #' '
+	JBE	16$.S
+	CMPB	AL, #'.'		;Period?
+	JNE	38$			;No
+	CALL	peekchr			;Yes
+	CMPB	AL, #'.'		;Next character a period too?
+	JNE	36$.S			;No
+	CMPL	cdb_cmdlnbcnt.B[EDI], #1.B ;Yes - have any more input?
+	JE	26$.S			;No - at end of name
+	MOVL	ECX, cdb_cmdlnbpnt.B[EDI]
+	MOVB	AL, 1.B[ECX]		;Get next character
+	CMPB	AL, #' '
+	JE	26$.S
+	CMPB	AL, #CR			;End of line?
+	JE	26$.S			;Yes
+	CMPB	AL, #LF			;Maybe
+	JE	26$.S
+	CMPB	AL, #'\'		;No - at end of path name?
+	JE	26$.S			;Yes
+	CMPB	AL, #'/'
+	JNE	36$.S			;No
+
+;Here with a path name element which is ..
+
+26$:	DECL	EBX			;Point to character before the first
+	INCL	gfs_size.B[EBP]		;  period
+	CMPL	EBX, gfs_bufr.B[EBP]	;Past beginning of buffer?
+	JB	30$.S			;Yes - no parent - fail
+	CMPB	[EBX], #'/'		;Have previous directory name?
+	JNE	30$.S			;No - fail
+28$:	DECL	EBX
+	CMPL	EBX, gfs_bufr.B[EBP]	;Yes - scan to beginning of previous
+	JB	30$.S			;  directory name
+	INCL	gfs_size.B[EBP]
+	CMPB	[EBX], #'/'
+	JE	32$.S
+	CMPB	[EBX], #':'
+	JNE	28$.S
+30$:	MOVL	EBX, #npdmsg		;Fail if no previous directory name
+	JMP	52$.S
+
+;Here at beginning of previous directory name
+
+32$:	INCL	EBX
+	DECL	gfs_size.B[EBP]
+	CALL	getchr			;Consume the second period
+	CALL	peekchr			;Get the next character
+	CMPB	AL, #'\'		;Next character \ or /?
+	JE	34$.S			;Yes
+	CMPB	AL, #'/'
+	JNE	24$			;No
+34$:	INCL	cdb_cmdlnbpnt.B[EDI]	;Yes - consume it too
+	DECL	cdb_cmdlnbcnt.B[EDI]
+	JMP	24$
+
+;Here if don't have . or .. as a name
+
+36$:	MOVB	AL, #'.'
+38$:	CMPB	AL, #'\'		;Convert \ to /
+	JNE	40$.S
+	MOVB	AL, #'/'
+40$:	CMPB	AL, #'*'		;Wild card?
+	JE	42$.S
+	CMPB	AL, #'?'
+	JNE	44$.S
+42$:	ORB	AH, #02h		;Yes - remember that
+44$:	DECL	gfs_size.B[EBP]		;Room for another character?
+	JE	50$.S			;No - fail
+	MOVB	[EBX], AL		;Yes - store the character
+	INCL	EBX
+	JMP	24$			;Continue
+
+;Here if file specification is too long
+
+50$:	MOVL	EBX, #fstlmsg		;Get offset of error text string
+52$:	LEAVE
+	STC				;Indicate error
+	RET
+
+;Here if have device name and are not in all-files mode
+
+56$:	MOVL	EBX, #dnnamsg
+	JMP	52$.S
+.PAGE
+;Subroutine to see if at beginning of a directory name
+;	CALL	chkbgnname
+;	C:set = At beginning of directory name
+;	C:clr = Not at beginning
+;  All registers are preserved
+
+chkbgnname:
+	CMPL	EBX, gfs_bufr.B[EBP]	;At beginning of buffer now
+	JBE	2$.S			;Yes - at beginning of a name
+	CMPB	-1.B[EBX], #'\'		;No - previous character \ or :?
+	JE	2$.S			;Yes - at beginning of a name
+	CMPB	-1.B[EBX], #':'
+	JNE	4$.S			;No - not at beginning of a name
+2$:	STC				;Yes - at beginning of a name
+	RET
+
+;Subroutine to see if at end of a directory name
+;	CALL	chkendname
+;	C:set = At end of directory name
+;	C:clr = Not at end
+;  All registers are preserved
+
+chkendname:
+	PUSHL	EAX
+	CALL	peekchr			;Peed at next character
+	JE	6$.S			;At end of name if end of input
+	CMPB	AL, #'\'		;Have \ or / next?
+	JE	6$.S			;Yes - at end of name
+	CMPB	AL, #'/'
+	JE	6$.S
+	CMPB	AL, #' '		;And end of atom?
+	JBE	6$.S			;Yes - also end of name
+	POPL	EAX
+4$:	CLC				;No - not end of name
+	RET
+
+6$:	POPL	EAX
+	STC
+	RET
+.PAGE
+	.SBTTL	cmdatom - Subroutine to collect command atom
+
+;Subroutine to collect command atom
+;	c{EBX} = Offset of atom buffer
+;	c{ECX} = Length of atom buffer
+;	CALL	cmdatom
+;	C:set = Error
+;	C:clr = Normal
+;	  c{ECX} = Length of atom
+
+cmdatom:PUSHL	EBX
+2$:	CALL	getchr
+	JE	6$.S
+	CMPB	AL, #' '
+	JBE	6$.S
+	DECL	ECX			;Have room for more?
+	JS	10$.S			;No - fail
+	CMPB	AL, #'a'		;Yes - lower case?
+	JB	4$.S			;No
+	ADDB	AL, #'A'-'a'		;Yes - make it upper case
+4$:	MOVB	[EBX], AL		;Store character
+	INCL	EBX			;Bump pointer
+	JMP	2$.S			;Continue
+
+;Here at end of atom
+
+6$:	JREGZ	ECX, 8$			;Did we exactly fill the buffer?
+	MOVB	[EBX], #0		;No - put null at end
+8$:	POPL	ECX
+	SUBL	ECX, EBX		;Calculate length of atom
+	NEGL	ECX
+	CLC
+	RET
+
+;Here if atom is too long
+
+10$:	POPL	EBX			;Fix up the stack
+	STC				;Indicate error
+	RET
+.PAGE
+	.SBTTL	cmdparmc - Subroutine to get single character parameter value
+
+;Subroutine to get single character parameter value
+;	CALL	cmdparmc
+;	C:set = Error
+;	  c{EBX} = Offset of error message
+;	C:clr = Normal
+;	  c(AL) = Character (0 if no parameter)
+
+cmdparmc:
+	CALL	skipws			;Skip leading whitespace
+	CALL	getchr			;Yes - get next character
+	JE	8$.S			;If no more
+	PUSHL	EAX
+	CALL	peekchr
+	JE	2$.S
+	CMPB	AL, #' '
+	JA	10$.S
+2$:	POPL	EAX
+	CMPB	AL, #'a'		;Lower case?
+	JB	4$.S			;No
+	ADDB	AL, #'A'-'a'		;Yes - convert to upper case
+4$:	CLC
+	RET
+
+;Here if no parameter
+
+8$:	CLRL	EAX			;Return 0
+	RET
+
+;Here if don't have whitespace or end of line after the parameter
+
+10$:	POPL	EAX
+	MOVL	EBX, #synemsg
+	STC
+	RET
+.PAGE
+	.SBTTL	cmdparmv - Subroutine to get numeric parameter value
+
+;Subroutine to get numeric parameter value
+;	CALL	cmdparmv
+;	C:set = Error
+;	  c{EBX} = Offset of error message
+;	C:clr = Normal
+;	  c{EAX} = Parameter value
+
+cmdparmv:
+	CALL	skipws			;Skip leading whitespace
+	CLRL	EDX			;Initial value
+2$:	CALL	getchr
+	JE	4$.S
+	CMPB	AL, #'0'
+	JB	4$.S
+	CMPB	AL, #'9'
+	JA	4$.S
+	ANDL	EAX, #0Fh.B
+	IMULL	EDX, #10t.B
+	ADDL	EDX, EAX
+	JMP	2$.S
+
+;Here at end of parameter
+
+4$:	MOVL	EAX, EDX		;Get value in right register
+	CLC
+	RET
+.PAGE
+	.SBTTL	cmdchkend - Subroutine to check for end of command line
+
+;Subroutine to get check for end of command line
+;	CALL	cmdchkend
+;	C:set = Error
+;	  c{EBX} = Offset of error message
+
+cmdchkend:
+	CALL	skipws			;Skip leading whitespace
+	CALL	getchr
+	JE	2$.S			;OK if end of line
+	MOVL	EBX, #synemsg		;Otherwise error
+	STC
+	RET
+
+;Subroutine to get next command character
+;	CALL	getchr
+;	Z:set = No more input available
+;	Z:clr = Normal
+;	  c(AL) = Character
+
+getchr:	CMPL	cdb_cmdlnbcnt.B[EDI], #0.B ;Have any more input?
+	JE	2$.S			;No - return with Z set
+	PUSHL	EBX			;Yes
+	MOVL	EBX, cdb_cmdlnbpnt.B[EDI]
+	MOVB	AL, [EBX]		;Get next character
+	POPL	EBX
+	CMPB	AL, #CR			;End of line?
+	JE	4$.S			;Yes
+	CMPB	AL, #LF			;Maybe
+	JE	4$.S
+	DECL	cdb_cmdlnbcnt.B[EDI]	;No - reduce count
+	INCL	cdb_cmdlnbpnt.B[EDI]	;Bump pointer (this clears Z)
+2$:	RET
+
+;Here if have end of line character
+
+4$:	CLRL	EAX			;Set Z
+	MOVL	cdb_cmdlnbcnt.B[EDI], EAX ;Clear line count
+	RET
+
+;Subroutine to peek at next command line character
+;	CALL	peekchr
+;	Z:set = No more input available
+;	Z:clr = Normal
+;	  c(AL) = Character
+
+peekchr:CMPL	cdb_cmdlnbcnt.B[EDI], #0.B ;Have any more input?
+	JE	2$.S			;No - return with Z set
+	PUSHL	EBX			;Yes
+	MOVL	EBX, cdb_cmdlnbpnt.B[EDI]
+	MOVB	AL, [EBX]		;Get next character
+	POPL	EBX
+	CMPB	AL, #CR			;End of line?
+	JE	4$.S			;Yes
+	CMPB	AL, #LF			;Maybe
+	JE	4$.S
+	TESTL	ESP, ESP		;No - clear Z
+	RET				;And return
+.PAGE
+	.SBTTL	cmdstr - Subroutine to store string in command response
+
+;Subroutine to store string in command response
+;	c{EBX} = Offset of string
+;	CALL	cmdstr
+
+cmdstr:	MOVB	AL, [EBX]
+	INCL	EBX
+	CMPB	AL, #0
+	JE	2$.S
+	CALL	cmdput
+	JNC	cmdstr.S
+2$:	RET
+
+	.SBTTL	cmdresp - Subroutine to output command response
+
+;Subroutine to output command response
+;	c{EBX} = Offset of message string
+;	CALL	cmdresp
+;	C:set = Error
+;	  c{EAX} = XOS error code
+;	C:clr = Normal
+
+cmdresp:CALL	cmdstr			;Store the string
+	JC	2$.S
+	MOVB	AL, #'.'		;Add a period
+	CALL	cmdput
+	JC	2$.S
+	MOVB	AL, #CR			;Add CRLF
+	CALL	cmdput
+	JC	2$.S
+	MOVB	AL, #LF
+
+	.SBTTL	cmdput - Subroutine to output byte on command connection
+
+;Subroutine to output byte on the command connection
+;	c(AL) = Byte to output
+;	CALL	cmdput
+;	C:set = Error
+;	  c:{EAX} = Error code
+;	C:clr = Normal
+
+cmdput:	CMPL	cdb_cmdoutcnt.B[EDI], #CMDOUTSIZE ;Room for more output now?
+	JB	10$.S			;Yes
+	PUSHL	EAX
+	CALL	cmddoout
+	JC	12$.S
+8$:	POPL	EAX
+10$:	PUSHL	EBX
+	MOVL	EBX, cdb_cmdoutpnt.B[EDI]
+	MOVB	[EBX], AL
+	POPL	EBX
+	INCL	cdb_cmdoutpnt.B[EDI]
+	INCL	cdb_cmdoutcnt.B[EDI]
+	CLC
+12$:	RET
+.PAGE
+	.SBTTL	cmddoout - Subroutine to do command output to the network
+
+;Subroutine to do command output to the network
+;	CALL	cmddoout
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+
+cmddoout:
+	CMPB	loglevel, #1		;No - should we log this?
+	JB	2$.S			;No
+	PUSHAL				;Yes
+	MOVL	EBX, #strcdo
+	MOVL	ECX, cdb_cmdoutcnt.B[EDI]
+	LEAL	EDX, cdb_cmdoutbufr[EDI]
+	MOVL	EAX, cdb_cmdoutqab+qab_handle.B[EDI]
+	CALL	debugtext
+	POPAL
+2$:	PUSHL	EBX
+	LEAL	EBX, cdb_cmdoutqab.B[EDI]
+	MOVL	EAX, cdb_cmdoutcnt.B[EDI]
+	MOVL	qab_count.B[EBX], EAX
+	MOVW	qab_vector.B[EBX], #0
+	PUSHL	DS			;Queue the command connection output
+	PUSHL	EBX
+	CALLF	svcIoQueue##
+	BTL	EAX, #31t
+	JC	6$.S			;If error
+	CLRL	EAX			;OK
+	MOVL	cdb_cmdoutcnt.B[EDI], EAX ;Reset the command buffer count and
+	LEAL	EAX, cdb_cmdoutbufr[EDI]  ;  pointer
+	MOVL	cdb_cmdoutpnt.B[EDI], EAX
+	MOVW	qab_vector.B[EBX], #VECT_CMDOUTPUT ;Set output done vector
+	TESTB	qab_status+1.B[EBX], #QSTS$DONE>8
+	JE	10$.S			;If not finished
+	MOVW	qab_vector.B[EBX], #0	;Finished - clear the vector (We use
+6$:	POPL	EBX			;  this as a flag to detect spurious
+	RET				;  interrupts which occure between the
+					;  MOVW and the TESTB above!)
+
+;Here if output did not finish immediately (It usually will since the network
+;  is buffered and the other end should be keeping the pipe empty!)
+
+10$:	POPL	EBX
+cmdwait:PUSHL	ECX
+	PUSHL	EDI
+	PUSHL	ESI
+	MOVL	ECX, intESP		;Calculate how much is on the stack
+	SUBL	ECX, ESP
+	SHRL	ECX, #2
+	MOVB	cdb_stkcnt.B[EDI], CL
+	MOVL	ESI, ESP
+	ADDL	EDI, #cdb_stksave
+	CLD				;Save the stack in our CDB
+	RMOVSL	[EDI], [ESI]
+	MOVL	ESP, ESI
+	RET				;Dismiss the current interrupt
+
+;Subroutine to delay for a specified time
+;	c{EAX} = Amount to delay (fractional days)
+;	CALL	dodelay
+
+dodelay:PUSHL	#2.B			;Yes
+	PUSHL	#0.B
+	PUSHL	#VECT_ALARM.B
+	PUSHL	EDI
+	PUSHL	#0.B
+	PUSHL	EAX
+	CALLF	svcSchAlarm##
+	TESTL	EAX, EAX
+	JNS	cmdwait.S
+	RET
+.PAGE
+	.SBTTL	getuserdone - Suboutine called by getusersig when done
+
+;Subroutine called by getusersig when it is done getting use data from
+;  the UDF server.
+;	void getuserdone(
+;	    struct usrdata *data);	// Points to the user data structure
+;					//   which is at the beginning of
+;					//   cdb_databuf1
+;  Even though this subroutine is called using the C calling conventions, we
+;    know getusersig does not care about any registers across this call,
+;    so we don't bother to save EDI and ESI as we normally would for a C
+;    callable function!
+;  This routine verifies the user password, sets up a logical name for the
+;    user's home directory, and jumps back to the command input processing
+;    loop.  Since there is nothing on the stack at the points we can jump
+;    to, the command input processing will eventually execute a return when
+;    it is idle, which will return to the caller of this function.  This
+;    function is always called at signal level 4.
+
+getuserdone::
+	MOVL	EDI, 4.B[ESP]		;Restore the CDB pointer
+	SUBL	EDI, #cdb_databuf1
+	MOVL	EAX, cdb_databuf1+ud_error1[EDI]
+	TESTL	EAX, EAX
+	JE	4$.S
+	CMPB	[EAX], #0		;Any errors?
+	JNE	badname			;Yes - always just say bad name so we
+					;  don't tell him more about the
+					;  system than he should know
+4$:	LEAL	EAX, cdb_databuf1[EDI]	;No - now verify his password
+	PUSHL	EAX
+	PUSHL	#0.B
+	PUSHL	#0.B
+	PUSHL	cdb_pswdlen[EDI]
+	LEAL	EAX, cdb_password[EDI]
+	PUSHL	EAX
+	CALL	verifypassword#
+	ADDL	ESP, #20t.B
+	TESTL	EAX, EAX
+	JE	badname			;If password is bad
+	MOVL	EBX, #allflsstr		;OK - see if he has the FTPALL priv
+	MOVL	EDX, cdb_databuf1+ud_apvpnt[EDI]
+	CALL	checkpriv
+	JC	6$.S
+	ORB	cdb_allflsok.B[EDI], #01h
+	MOVL	EBX, #allflsstr
+	MOVL	EDX, cdb_databuf1+ud_ipvpnt[EDI]
+	CALL	checkpriv
+	JC	6$.S
+	ORB	cdb_allflsok.B[EDI], #02h
+6$:	MOVL	EAX, cdb_databuf1+ud_dirlen[EDI] ;Now allocate memory for
+	TESTL	EAX, EAX			 ;  his home directory string
+	JNE	8$.S
+	TESTB	cdb_allflsok.B[EDI], #01h ;No home directory - is this allowed?
+	JE	badname			;No - fail
+	MOVL	cdb_homdirstr[EDI], #xosroot ;Yes - make the XOS device root
+	MOVZWL	EAX, xosrtsz		     ;  his home directory
+	MOVL	cdb_homdirlen[EDI], EAX
+	JMP	logdone
+
+;Here if a user home directory is defined
+
+8$:	PUSHL	EAX
+	INCL	EAX
+	CALL	getmem
+	POPL	ECX
+	JC	cmddon0			;If error allocating memory
+	MOVL	cdb_homdirlen[EDI], ECX	;OK - copy his home directory string
+	MOVL	cdb_homdirstr[EDI], EAX
+	MOVL	EBX, cdb_databuf1+ud_dirpnt[EDI]
+10$:	MOVB	DL, [EBX]
+	INCL	EBX
+	CMPB	DL, #'\'
+	JNE	12$.S
+	MOVB	DL, #'/'
+12$:	MOVB	[EAX], DL
+	INCL	EAX
+	CMPB	DL, #0
+	JNE	10$.S
+	JMP	logdone			;All done here - he is a valid user
+.PAGE
+	.SBTTL	cmddodisk - Subroutine to do disk operation and wait
+
+;Subroutine to do disk operation and wait until it is done
+;	CALL	cmddodisk
+;	C:set = Error
+;	  c{EAX} = XOS error code
+;	C:clr = Normal
+
+cmddodisk:
+	MOVL	cdb_diskdsp.B[EDI], #waitdone
+	PUSHL	DS
+	LEAL	EAX, cdb_diskqab[EDI]
+	PUSHL	EAX
+	CALLF	svcIoQueue##		;Queue the disk operation
+	BTL	EAX, #31t
+	JNC	cmdwait			;If OK, go wait
+	RET				;If error
+.PAGE
+	.SBTTL	cmddiskok - Subroutine to report sucessful disk operation
+
+;Subroutine to report sucessful disk operation
+;	c{EBX} = Offset of message
+;	c{ECX} = Item count
+;	CALL	cmddiskok
+
+cmddiskok:
+	PUSHL	EDI
+	PUSHL	ECX
+	ADDL	EDI, #cdb_cmdinbufr	;Copy first part of message
+	MOVL	ESI, #dok1msg
+	CLD
+2$:	LODSB	[ESI]
+	CMPB	AL, #0
+	JE	4$.S
+	STOSB	[EDI]
+	JMP	2$.S
+
+4$:	MOVL	EAX, [ESP]		;Put in the item count
+	CALL	cmddecval
+	MOVL	ESI, #dok2msg
+	CLD
+6$:	LODSB	[ESI]			;Copy second part of message
+	CMPB	AL, #0
+	JE	8$.S
+	STOSB	[EDI]
+	JMP	6$.S
+
+8$:	POPL	ECX			;Have exactly 1?
+	DECL	ECX
+	JE	10$.S			;Yes
+	MOVB	AL, #'s'		;No - add an s
+	STOSB	[EDI]
+10$:	MOVB	AL, #' '		;In any case, add a space
+	STOSB	[EDI]
+	MOVL	ESI, EBX		;Copy final part of message
+12$:	LODSB	[ESI]
+	STOSB	[EDI]
+	CMPB	AL, #0
+	JNE	12$.S
+	POPL	EDI
+	LEAL	EBX, cdb_cmdinbufr[EDI]	;Send as a response
+	CALL	cmdresp
+	JC	cmdoerr
+	RET
+.PAGE
+cmddecval:
+	CLRL	EDX
+	DIVL	lit10
+	PUSHL	EDX
+	TESTL	EAX, EAX
+	JE	4$.S
+	CALL	cmddecval
+4$:	POPL	EAX
+	ADDB	AL, #'0'
+	STOSB	[EDI]
+	RET
+.PAGE
+	.SBTTL	cmdxoserr - Subroutine to report XOS error
+
+;Subroutine to report XOS error
+;	c{EAX} = XOS error code
+;	c{EBX} = Offset of first part of message
+;	c{EDX} = Offset of file specification
+;	CALL	cmdxoserr
+
+cmdxoserr:
+	MOVB	cdb_command.B[EDI], #CMD_IDLE ;Indicate idle now
+	PUSHL	EDI
+	PUSHL	EAX
+	ADDL	EDI, #cdb_cmdlnbufr	;Copy first part of message
+	MOVL	ESI, EBX
+	CLD
+2$:	LODSB	[ESI]
+	CMPB	AL, #0
+	JE	4$.S
+	STOSB	[EDI]
+	JMP	2$.S
+
+;Here with first part of message copied
+
+4$:	TESTL	EDX, EDX		;Have file specification?
+	JE	10$.S			;No
+	MOVL	EAX, #'File'		;Yes - add "File "
+	STOSL	[EDI]
+	MOVL	EAX, #' "'
+	STOSW	[EDI]
+	MOVL	ESI, EDX		;Copy file specification
+6$:	LODSB	[ESI]
+	CMPB	AL, #0
+	JE	8$.S
+	STOSB	[EDI]
+	JMP	6$.S
+
+;Here with file specification copied
+
+8$:	MOVL	EAX, #'", '		;Add double quote, comma and space
+	STOSL	[EDI]
+	DECL	EDI
+10$:	PUSHL	#3.B			;Add the system error message text
+	PUSHL	DS
+	PUSHL	EDI
+	CALLF	svcSysErrMsg##
+	POPL	EDI
+	LEAL	EBX, cdb_cmdlnbufr[EDI]	;Send as a response
+	CALL	cmdresp
+	JC	cmdoerr
+	RET
+.PAGE
+	.SBTTL	skipws - Subroutine to skip whitespace
+
+;Subroutine to skip whitespace
+;	CALL	skipws
+
+2$:	INCL	cdb_cmdlnbpnt.B[EDI]
+	DECL	cdb_cmdlnbcnt.B[EDI]
+skipws:	CALL	peekchr			;Peek at next character
+	JE	4$.S			;Finished if at end of line
+	CMPB	AL, #' '		;Is it whitespace?
+	JE	2$.S			;Yes - skip it
+	CMPB	AL, #HT			;Maybe
+	JE	2$.S			;Yes
+4$:	RET				;No - finished
+.PAGE
+;Subroutine to check for presense of a user privilege
+;	c{EBX} = Offset of privilege name
+;	c{EDX} = Offset of privilege data
+;	CALL	checkpriv
+;	C:set = Not found
+;	C:clr = Found
+
+checkpriv:
+	PUSHL	EBX
+	TESTL	EDX, EDX		;Have any privileges at all?
+	JE	10$.S			;No - so not found
+4$:	MOVL	EBX, [ESP]		;Check next privilege
+6$:	MOVB	AL, [EBX]
+	CMPB	AL, [EDX]
+	JNE	8$.S
+	TESTB	AL, #80h
+	JNE	12$.S
+	INCL	EBX
+	INCL	EDX
+	JMP	6$.S
+
+;Here if no match - scan to end of this privilege name
+
+8$:	MOVB	AL, [EDX]
+	INCL	EDX
+	CMPB	AL, #0
+	JE	10$.S
+	TESTB	AL, #80h
+	JE	8$.S
+	JMP	4$.S
+
+;Here at end of list without a match
+
+10$:	STC
+12$:	POPL	EBX
+	RET
+.PAGE
+	.SBTTL	getmem - Subroutine to allocate memory
+
+;Subroutine to allocate memory
+;	c{EAX} = Amount to allocate
+;	CALL	getmem
+;	C:set = Error
+;	  c:{EAX} = XOS error code
+;	  c:{EBX} = Offset of message string
+;	C:clr = Normal
+;	  c{EAX} = Offset of area allocated
+
+getmem:	PUSHL	EAX
+	CALL	malloc#
+	POPL	ECX
+	TESTL	EAX, EAX
+	JNE	4$.S
+	MOVL	EBX, #camdmsg
+	MOVL	EAX, errno#
+	STC
+4$:	RET
+.PAGE
+	.SBTTL	freewrkdir - Subroutine to give up the working directory string
+
+;Subroutine to give up the working directory string
+;	CALL	freewrkdir
+
+freewrkdir:
+	LEAL	EDX, cdb_wrkdirstr[EDI]
+	JMP	2$.S
+
+	.SBTTL	freehomdir - Subroutine to give up the home directory string
+
+;Subroutine to give up the home directory string
+;	CALL	freehomdir
+
+freehomdir:
+	LEAL	EDX, cdb_homdirstr[EDI]
+2$:	CLRL	EAX
+	MOVL	cdb_wrkdirlen-cdb_wrkdirstr.B[EDX], EAX
+	XCHGL	EAX, [EDX]
+	CMPL	EAX, #xosroot
+	JE	4$.S
+	TESTL	EAX, EAX
+	JE	4$.S
+	PUSHL	EAX
+	CALL	free#
+	ADDL	ESP, #4t.B
+4$:	RET
+.PAGE
+	.SBTTL	logerror - Subroutine to store message in server error log
+
+;Subroutine to store message in the server error log
+;	c{EAX} = XOS error code
+;	c{ESI} = Offset of text string
+;	CALL	logerror
+
+logerror:
+	PUSHL	EDI
+	PUSHL	EAX
+	MOVL	EDI, #logmsgbfr+4
+	CLD
+	MOVL	EAX, #'FTPS'		;Start out with our program name
+	STOSL	[EDI]
+	MOVL	EAX, #'RV  '
+	STOSL	[EDI]
+2$:	LODSB	[ESI]			;Copy his text to the message buffer
+	STOSB	[EDI]
+	CMPB	AL, #0
+	JNE	2$.S
+	POPL	EAX
+	TESTL	EAX, EAX		;Have an error code?
+	JE	4$.S			;No
+	MOVW	-1.B[EDI], #': '	;Yes
+	INCL	EDI
+	PUSHL	EAX			;Get the XOS error string
+	PUSHL	#2.B
+	PUSHL	DS
+	PUSHL	EDI
+	CALLF	svcSysErrMsg##
+	TESTL	EAX, EAX
+	JS	4$.S
+	ADDL	EDI, EAX
+
+;NOTE: We really should not send this to the system log but to a length limited
+;  server log, but that is not implemented yet!
+
+4$:	PUSHL	DS			;Send message to the system log
+	PUSHL	#logmsgbfr
+	SUBL	EDI, #logmsgbfr
+	DECL	EDI
+	PUSHL	EDI
+	CALLF	svcSysLog##
+	POPL	EDI
+	RET
+.PAGE
+;	c{EAX} = TCP handle for command connection
+;	c{EBX} = Offset of initial string
+
+
+debugbgn:
+	PUSHL	EAX
+	CALL	debugstr
+	POPL	EAX
+	MOVL	ECX, #3
+	MOVB	DL, #' '
+	CALL	debugdecval
+	CALL	debugspace
+
+	PUSHL	#T_GTHRDTTM.B		;Get current time
+	PUSHL	DS
+	PUSHL	#datetime
+	CALLF	svcSysDateTime##
+	PUSHL	#datetime
+	PUSHL	#dtfmt
+	PUSHL	#dtbufr
+	CALL	sdt2str#
+	ADDL	ESP, #12t.B
+	MOVL	EBX, #dtbufr
+	JMP	debugstr
+.PAGE
+	.SBTTL	debugtext - Subroutine to store text message in debug record
+
+;Subroutine to store text message in debug record
+;	c{EBX} = Offset of initial string
+;	c{ECX} = Length of text message
+;	c{EDX} = Offset of text message
+;	c{EDI} = Offset of CDB
+;	CALL	debugtext
+
+$$$=!0
+FRM lt_textcnt, 4t
+FRM lt_textpnt, 4t
+FRM lt_begincnt, 4t
+FRM lt_beginpnt, 4t
+lt_SIZE=!$$$
+
+debugtext:
+	ENTER	lt_SIZE, 0
+	MOVL	lt_textcnt.B[EBP], ECX
+	MOVL	lt_textpnt.B[EBP], EDX
+	CALL	debugbgn
+	MOVL	EBX, #nlspc4
+	CALL	debugstr
+	MOVL	EAX, lt_textcnt.B[EBP]
+	MOVL	ECX, #4
+	MOVB	DL, #' '
+	CALL	debugdecval
+4$:	MOVL	EBX, lt_textpnt.B[EBP]
+	MOVL	lt_beginpnt.B[EBP], EBX	;Remember beginning of line
+	MOVL	EAX, lt_textcnt.B[EBP]
+	MOVL	lt_begincnt.B[EBP], EAX
+	MOVL	ESI, #16t		;Get number of bytes in this line
+	CMPL	ESI, EAX
+	JBE	6$.S
+	MOVL	ESI, EAX
+6$:	CALL	debugspace
+	MOVZBL	EAX, [EBX]		;Get byte
+	INCL	EBX
+	MOVL	ECX, #2
+	MOVB	DL, #'0'
+	CALL	debughexval
+	DECL	ESI
+	JNE	6$.S
+	MOVL	ECX, #16t
+	SUBL	ECX, lt_begincnt.B[EBP]
+	JNS	8$.S
+	CLRL	ECX
+8$:	IMULL	ECX, #3t.B
+	JREGZ	ECX, 12$
+10$:	CALL	debugspace
+	LOOP	ECX, 10$
+12$:	MOVL	EBX, #strsep
+	CALL	debugstr
+	MOVL	EBX, lt_beginpnt.B[EBP]
+	MOVL	ECX, lt_begincnt.B[EBP]
+	CMPL	ECX, #16t
+	JLE	14$.S
+	MOVL	ECX, #16t
+14$:	MOVB	AL, [EBX]
+	INCL	EBX
+	CMPB	AL, #CR
+	JE	16$.S
+	CMPB	AL, #LF
+	JE	16$.S
+	CMPB	AL, #HT
+	JE	16$.S
+	CMPB	AL, #BEL
+	JNE	18$.S
+16$:	MOVB	AL, #'.'
+18$:	CALL	debugchr
+	LOOP	ECX, 14$
+	MOVL	EBX, #strend
+	CALL	debugstr
+	CALL	debugout
+	ADDL	lt_textpnt.B[EBP], #16t.B
+	SUBL	lt_textcnt.B[EBP], #16t.B
+	JLE	20$.S
+	MOVL	EBX, #space8
+	CALL	debugstr
+	JMP	4$
+
+20$:	LEAVE
+	RET
+.PAGE
+	.SBTTL	debugipaddr - Subroutine to store IP address in debug record
+
+;Subroutine to store IP address in debug record
+;	c{EAX} = IP address
+;	CALL	debugipaddr
+
+debugipaddr:
+	PUSHL	EAX
+	MOVZBL	EAX, AL
+	CALL	debugdecvalv
+	MOVB	AL, #'.'
+	CALL	debugchr
+	MOVZBL	EAX, 1.B[ESP]
+	CALL	debugdecvalv
+	MOVB	AL, #'.'
+	CALL	debugchr
+	MOVZBL	EAX, 2.B[ESP]
+	CALL	debugdecvalv
+	MOVB	AL, #'.'
+	CALL	debugchr
+	POPL	EAX
+	SHRL	EAX, #24t
+	JMP	debugdecvalv
+.PAGE
+	.SBTTL	debugout - Subroutine to output a debug record
+
+;Subroutine to output a debug record
+;	CALL	debugout
+
+debugout:
+	MOVL	EAX, debugpnt
+	MOVB	[EAX], #CR
+	MOVB	1.B[EAX], #LF
+	SUBL	EAX, #msgbfr-2
+	PUSHL	debughndl
+	PUSHL	DS
+	PUSHL	#msgbfr
+	PUSHL	EAX
+	CALLF	svcIoOutBlock##
+	MOVL	debugpnt, #msgbfr
+	RET
+.PAGE
+	.SBTTL	debugstr - Subroutine to put string in a debug record
+
+;Subroutine to put string in a debug record
+;	c{EBX} = Offset of string
+;	CALL	debugstr
+
+debugstr:
+	PUSHL	EDI			;Save register we need
+	PUSHL	ESI
+	MOVL	EDI, debugpnt		;Get log message pointer
+	MOVL	ESI, EBX
+2$:	LODSB	[ESI]			;Get character
+	CMPB	AL, #0			;End?
+	JE	4$.S			;Yes
+	STOSB	[EDI]			;No - store character
+	JMP	2$.S			;Continue
+
+;Here at end of string
+
+4$:	MOVL	debugpnt, EDI		;Save log message pointer
+	POPL	ESI			;Restore registers
+	POPL	EDI
+	RET				;Finished
+
+debugspace:
+	MOVB	AL, #' '
+
+;Subroutine to store single character into a debug message
+;	c(AL) = Character
+;	CALL	debugchr
+
+debugchr:
+	PUSHL	EDI			;Save register we need
+	MOVL	EDI, debugpnt		;Get log message pointer
+	STOSB	[EDI]			;Store character
+	MOVL	debugpnt, EDI		;Update pointer
+	POPL	EDI
+	RET
+.PAGE
+	.SBTTL	debughexval - Subroutine to put hex value in a debug record
+
+;Subroutine to put hex value in a debug record
+;	c{EAX} = Value
+;	c{ECX} = Field width
+;	CALL	debughexval		;Enter at loghexvalv for minimum field
+;					;  width
+
+debughexvalv:
+	CLRL	ECX
+debughexval:
+	MOVL	radix, #16t
+	JMP	2$.S
+
+	.SBTTL	debugdecval - Subroutine to put decimal value in a debug record
+
+;Subroutine to put decimal value in a log record
+;	c{EAX} = Value
+;	c{ECX} = Field width
+;	c(DL)  = Fill character
+;	CALL	debugdecval		;Enter at logdecvalv for minimum field
+;					;  width
+
+debugdecvalv:
+	CLRL	ECX
+debugdecval:
+	MOVL	radix, #10t
+2$:	PUSHL	EDI			;Save register we need
+	PUSHL	ESI
+	MOVL	ESI, EDX		;Save fill character
+	MOVL	EDI, debugpnt		;Get log message pointer
+	MOVL	digits, #0		;Clear digit counter
+4$:	CLRL	EDX			;Get next digit
+	IDIVL	radix
+	PUSHL	EDX			;Save it
+	INCL	digits			;Count it
+	TESTL	EAX, EAX		;More?
+	JNE	4$.S			;Yes - continue
+	MOVL	EAX, ESI		;Get fill character
+	SUBL	ECX, digits		;Calculate number of leading characters
+	JLE	6$.S			;If none
+	RSTOSB	[EDI]
+6$:	POPL	EAX			;Get digit value
+	CMPB	AL, #9
+	JBE	8$.S
+	ADDB	AL, #'A'-'0'-10t
+8$:	ADDB	AL, #'0'		;Change to digit
+	STOSB	[EDI]			;Store it
+	DECL	digits			;Continue if more
+	JNE	6$.S
+	MOVL	debugpnt, EDI		;Restore log message pointer
+	POPL	ESI			;Restore registers
+	POPL	EDI
+	RET				;Finished
+.PAGE
+	.SBTTL	Data
+
+	.PSECT	_DATA_p
+
+strcsi:	.ASCIZ	"CSI"
+strcdi:	.ASCIZ	"CDI"
+strcdo:	.ASCIZ	"CDO"
+strcco:	.ASCIZ	"CCO"
+strdob: .ASCIZ  "DOB"
+strdod: .ASCIZ  "DOD"
+strdcb: .ASCIZ  "DCB"
+strdcd: .ASCIZ  "DCD"
+nlspc4:	.ASCIZ	{CR,LF}"    "
+space8: .ASCIZ	"        "
+
+strsep:	.ASCIZ	"  "{ESC}"[7m"
+strend:	.ASCIZ	{ESC}"[0m"
+dtfmt:	.ASCIZ	"%H:%m:%s.%f"
+
+;Messages for the server error log
+
+errncdb:.ASCIZ	"Error allocating memory for CDB"
+erriine:.ASCIZ	"Error queueing initial TCP input"
+errioue:.ASCIZ	"Error queueing initial TCP output"
+errqopn:.ASCIZ	"Error queueing open for TCP command connection"
+errdoi:	.ASCIZ	"FATAL ERROR: Illegal command interrupt state"
+errcmdi:.ASCIZ	"Error reading command input"
+errcmdo:.ASCIZ	"Error writting command output"
+errcmdq:.ASCIZ	"Error queueing command input"
+errcccc:.ASCIZ	"Error queueing command connection close"
+
+;Long directory output format, long dir date output format
+fmtlist:.ASCIZ  "%cr%c%cr%c-r%c- 1  XOS  XOS  %s %8ld %s"{CR,LF}
+fmtdate:.ASCIZ  "%r/%d/%y %H:%m"
+lnfmt:  .ASCIZ  "FTPU%X:"	;Logical name format string
+
+;Messages returned to the user
+
+fopnmsg:.ASCIZ	"150 File status OK, opening data connection"
+dopnmsg:.ASCIZ	"150 Directory status OK, opening data connection"
+
+okmsg:	.ASCIZ	"200 Command OK"
+portmsg:.ASCIZ	"200 PORT command OK"
+rnfrmsg:.ASCIZ	"200 RNFR command OK"
+cwd1msg:.ASCIZ	'200 "'
+cwd2msg:.ASCIZ	'" is the working directory'
+allfon: .ASCIZ  "200 All-files mode enabled, working directory reset"
+allfoff:.ASCIZ  "200 All-files mode disabled, working directory reset"
+acctmsg:.ASCIZ	"202 User account not needed, command ignored"
+allomsg:.ASCIZ	"202 Allocation not needed, command ignored"
+mkdmsg: .ASCIZ  "257 MKD command successful"
+rmdmsg: .ASCIZ  "(directory) deleted.  RMD command successful"
+mkdemsg:.ASCIZ  "550 "
+rmdemsg:.ASCIZ  "550 "
+helpmsg:.ASCII	"214-Valid commands are: (* means valid without login)"{CR,LF}
+	.ASCII	"  USER* PASS* ACCT* QUIT* HELP* NOOP* CWD   CDUP  SMNT  REIN"
+	.ASCII	"  PORT"{CR,LF}
+	.ASCII	"  PASV  TYPE  STRU  MODE  RETR  STOR  STOU  APPE  ALLO  REST"
+	.ASCII	"  RNFR"{CR,LF}
+	.ASCII	"  RNTO  ABOR  DELE  RMD   MKD   PWD   LIST  NLST  SITE  SYST"
+	.ASCII	"  STAT"{CR,LF}
+	.ASCII  "  XAFL"{CR,LF}
+	.ASCIZ	"214 End of help message"
+systmsg:.ASCII	"215 XOS ("
+sysname:.BLKB	40t
+quitmsg:.ASCIZ	"221 FTP closing Telnet connection"
+lggdmsg:.ASCIZ	"230 User logged in, proceed"
+dok1msg:.ASCIZ	"250 "
+dok2msg:.ASCIZ	" file"
+delemsg:.ASCIZ	"deleted"
+renmsg:	.ASCIZ	"renamed"
+xfdnmsg:.ASCIZ	"250 Data transfer complete, data connection closed"
+
+usermsg:.ASCIZ	"331 User name OK, need password"
+
+dtamsg: .ASCIZ	"424 Not done: Data transfer already active"
+codcmsg:.ASCIZ	"425 Cannot open data connection: "
+camdmsg:.ASCIZ  "452 Not done: Not enough memory available"
+bdcmsg:	.ASCIZ	"500 Illegal command"
+synemsg:.ASCIZ	"500 Syntax error"
+cltlmsg:.ASCIZ	"500 Command line is too long"
+niytmsg:.ASCIZ	"502 This command is not implemented yet"
+sitemsg:.ASCIZ	"502 SITE command not used"
+cnimsg:	.ASCIZ	"502 Command not supported"
+noumsg: .ASCIZ  "503 Password specified without user"
+invname:.ASCIZ  "503 Invalid user name or password"
+rnnnmsg:.ASCIZ	"503 Not done: RNFR did not immediately preceed RNTO"
+bpvmsg:	.ASCIZ	"504 Bad parameter value for command"
+bdnvmsg:.ASCIZ	"504 Bad numeric value for parameter"
+dskemsg:.ASCIZ	"520 Not done: "
+fstlmsg:.ASCIZ	"520 Not done: File or directory specification is too long"
+ilwcmsg:.ASCIZ	"520 Not done: Wild card characters not allowed"
+ndapmsg:.ASCII	"520 Not done: Device name must be followed by path starting"
+	.ASCIZ	" at root"
+dnnamsg:.ASCIZ  "520 Not done: Device name not allowed"
+ildsmsg:.ASCIZ	"520 Not done: Illegal directory specification"
+npdmsg:	.ASCIZ	"520 Not done: Working directory has no parent directory"
+dskmsg:	.ASCII	"520 Not done: "
+dsk2msg:.BLKB	100t
+nlgimsg:.ASCIZ	"530 Not logged in"
+xfdemsg:.ASCIZ	"550 Error transferring data: "
+xfnemsg:.ASCIZ	"550 Network error on data connection: "
+
+	   .MOD   4
+dataname: .BLKB  16t
+lit10:	  .LONG  10t
+intESP:   .LONG  0		;Stack pointer at interrupt
+debugpnt: .LONG  msgbfr		;Log routine pointer
+radix:	  .LONG  10t
+digits:	  .LONG  0
+debughndl:.LONG  DH_STDERR
+ftpopen:  .LONG  2t		;Number of FTP opens to queue
+ftpnum:   .LONG  4t		;Number of FTP open files
+ftpcnt:   .LONG  0		;Number of FTP streams set up
+respdelay:.LONG  0		;Response delay value
+xosroot:  .BLKB  16t		;XOS system root name
+logname:  .LONG  0		;Log file specification
+datetime: .LONG  0, 0
+dtbufr:	  .BLKB  16t
+loglevel: .BYTE  0		;Logging level
+pwdreq:   .BYTE  0		;Password checking required
+
+prgname::  .ASCIZ "FTPSRV"
+PRGNSZ=!$-prgname
+
+	   .MOD   4
+clsqab:	   .WORD  QFNC_CLOSE	;qab_func    = 0.  - Function
+	   .WORD  0		;qab_status  = 2.  - Returned status
+	   .LONG  0		;qab_error   = 4.  - Error code
+	   .LONG  0		;qab_amount  = 8.  - Amount transfered
+	   .LONG  0		;qab_handle  = 12. - Device handle
+	   .BYTE  0		;qab_vector  = 16. - Vector for interrupt
+	   .BYTE  0, 0, 0	;Reserved
+	   .LONG  0		;qab_option  = 20. - Option bits
+	   .LONG  0		;qab_count   = 24. - Amount to transfer
+	   .LONG  0, 0		;qab_buffer1 = 28. - Pointer to data buffer
+	   .LONG  0, 0		;qab_buffer2 = 36.
+	   .LONG  0, 0		;qab_parm    = 44. - Pointer to parameter list
+
+logmsgbfr: .BYTE  0, 0, '#', 0
+	   .ASCII "% BOOTSRV: "
+msgbfr:    .BLKB  150t
+MSGBFRSIZE=!$-msgbfr
+
+ourname:  .ASCIZ "FTPServer"
+ftpacs:   .ASCIZ "FTP"
+allflsstr:.ASCIZ "FTPAL"{'L'+80h}
+failmsg1: .ASCII {MT_FINALERR}"? FTPSRV: "
+failsz1=!$-failmsg1
+failmsg2: .ASCII {CR,LF}"          "
+failsz2=!$-failmsg2
+failmsg3: .ASCIZ {CR,LF}"? FTPSRV: Terminating"
+crlfmsg:  .BYTE  CR, LF, 0
+failsz3=!$-failmsg3
+
+initmsg:  .ASCII {MT_INTRMDMSG}"% FTPSRV: FTP server initialized for _"
+tcpname:  .BLKB  12t
+INITMSGSIZE=!$-initmsg
+
+xosdevstr:.ASCIZ "XOSDEV:"
+sysstr:   .ASCIZ "SYSTEM:"
+badpidmsg:.ASCIZ "Bad requestor PID"
+nemamsg:  .ASCIZ "Not enough memory available"
+badvuimsg:.ASCIZ "Error initializing user server access"
+no2domsg: .ASCIZ "No functions specified"
+ntcpmsg:  .ASCIZ "FTP device is not a TCP class device"
+cnqimsg:  .ASCIZ "Cannot queue initial TCP open"
+opnemsg:  .ASCII "Error opening device "
+devname:  .BLKB  16t
+nologmsg: .ASCIZ "Cannot open local log file"
+sivfmsg:  .ASCIZ "Cannot initialize interrupt vector"
+	.IRP	ver, >VERSION
+	.IRP	edit, >EDITNO
+finmsg1:  .ASCII {MT_FINALMSG}"% FTPSRV: v'ver'.''edit - Initialization complete"
+	.ENDR
+	.ENDR
+finsz1=!$-finmsg1
+msgname:  .ASCIZ "IPM:"
+phynudp:  .BLKB  12t
+
+	  .MOD   4
+reqname:  .BLKB  64t
+argpntr:  .LONG  0, 0
+
+msgparms: .BYTE  PAR$SET|REP_STR, 0FFh
+	  .WORD  IOPAR_MSGRMTADDRS
+	  .LONG  reqname, !reqname
+	  .WORD  64t, 64t
+	  .BYTE  0
+
+	  .MOD   4
+msgqab:	  .WORD  QFNC_OUTBLOCK	;qab_func    = 0.  - Function
+	  .WORD  0		;qab_status  = 2.  - Returned status
+	  .LONG  0		;qab_error   = 4.  - Error code
+	  .LONG  0		;qab_amount  = 8.  - Amount transfered
+	  .LONG  0		;qab_handle  = 12. - Device handle
+	  .BYTE  0		;qab_vector  = 16. - Vector for interrupt
+	  .BYTE  0, 0, 0	;Reserved
+	  .LONG  0		;qab_option  = 20. - Option bits
+	  .LONG  MSGBFRSIZE	;qab_count   = 24. - Amount to transfer
+	  .LONG  msgbfr		;qab_buffer1 = 28. - Pointer to data buffer
+	  .LONG  !msgbfr
+	  .LONG  0, 0		;qab_buffer2 = 36. - Not used
+	  .LONG  msgparms	;qab_parm    = 44. - Pointer to parameter list
+	  .LONG  !msgparms
+
+	  .MOD   4
+openparms:.BYTE  PAR$GET|REP_TEXT, 8t
+	  .WORD  IOPAR_CLASS
+openclass:.LONG  0, 0
+	  .BYTE  PAR$SET|REP_HEXV, 2t
+	  .WORD  IOPAR_NETLCLPORT
+	  .WORD  UDPP_TFTP
+	  .BYTE  PAR$SET|REP_HEXV, 4t
+	  .WORD  IOPAR_FILOPTN
+	  .LONG  FO$NOPREFIX|FO$XOSNAME
+	  .BYTE  PAR$GET|REP_STR, 0
+	  .WORD  IOPAR_FILSPEC
+	  .LONG  tcpname, !tcpname
+	  .WORD  12t
+tcpnsize: .WORD  0
+	  .BYTE  0
+
+	  .MOD   4
+xdparms:  .BYTE  PAR$SET|REP_HEXV, 4t
+	  .WORD  IOPAR_FILOPTN
+	  .LONG  FO$NOPREFIX|FO$DOSNAME
+	  .BYTE  PAR$GET|REP_STR, 0
+	  .WORD  IOPAR_FILSPEC
+	  .LONG  xosroot, !xosroot
+	  .WORD  16t
+xosrtsz:  .WORD  0
+	  .BYTE  0
+
+	  .MOD   4
+cfgchar:  .BYTE  PAR$GET|REP_STR, 0
+	  .LONG  'SYSN', 'AME'
+	  .LONG  sysname, !sysname
+	  .WORD  34t
+sysnlen:  .WORD  0
+	  .BYTE  0
+
+	.MOD   4
+cfgqab:	.WORD  QFNC$WAIT|QFNC_CLASSFUNC
+				;qab_func    = 0.  - Function
+	.WORD  0		;qab_status  = 2.  - Returned status
+	.LONG  0		;qab_error   = 4.  - Error code
+	.LONG  0		;qab_amount  = 8.  - Amount transfered
+	.LONG  0		;qab_handle  = 12. - Device handle
+	.BYTE  0		;qab_vector  = 16. - Vector for interrupt
+	.BYTE  0, 0, 0		;Reserved
+	.LONG  CF_VALUES	;qab_option  = 20. - Option bits
+	.LONG  0		;qab_count   = 24. - Amount to transfer
+	.LONG  sysstr, !sysstr	;qab_buffer1 = 28. - Pointer to data buffer
+	.LONG  cfgchar, !cfgchar;qab_buffer2 = 36.
+	.LONG  0, 0		;qab_parm    = 44. - Pointer to parameter list
+
+	.END

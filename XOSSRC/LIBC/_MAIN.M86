@@ -1,0 +1,301 @@
+	.TITLE	_main - Startup routines for C programs
+	.SBTTL	STDC run-time library for XOS
+
+;++++
+; This software is in the public domain.  It may be freely copied and used
+; for whatever purpose you see fit, including commerical uses.  Anyone
+; modifying this software may claim ownership of the modifications, but not
+; the complete derived code.  It would be appreciated if the authors were
+; told what this software is being used for, but this is not a requirement.
+
+;   THIS SOFTWARE IS PROVIDED BY THE AUTHORS "AS IS" AND ANY EXPRESS OR
+;   IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
+;   OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+;   IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+;   INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+;   BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS
+;   OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+;   ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR
+;   TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
+;   USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+;----
+
+	.INCLUD	XOSINC:\XMAC\XOS.PAR
+	.INCLUD	XOSINC:\XMAC\STDIO.PAR
+
+;This routine contains the first code executed when a C program is started
+;  after it is loaded.
+
+	.STDSEGS
+	.LNKSEG	_TEXT_s, DGROUP_s
+	.PSECT	_BEGIN_p, DGROUP_m
+_clib_begin::
+	.STACK	_clib_stack
+	.BLKL	128t		;Stack
+_clib_stack::
+
+	.PSECT	_HEAP_p , DGROUP_m
+_clib_heap::
+
+	.PSECT	_DATA_p
+_clib_membase::			;These 3 items must be in this order!
+	.LONG	_clib_begin	;Offset of start of base msect
+_clib_mempnt::
+	.LONG	_clib_heap	;Memory allocation pointer
+_clib_memtop::
+	.LONG	0		;Top of memory offset
+_argc::	.LONG	0
+_argv::	.LONG	0
+
+maemsg:	.ASCIZ	"? Memory allocation error"{CR,LF}
+strmsg:	.ASCIZ	"? Stream initialization error"{CR,LF}
+
+__8087==!1
+
+	.PSECT	_TEXT_p
+
+$$$=!0
+FRM mn_numchr, 4t
+FRM mn_pntadj, 4t
+mn_SIZE=!$$$
+
+;This is the first instruction executed for the process - when get here the
+;  registers are set up as follows:
+;	c{ES:EDI} = Address of argument data
+;	c{SI:0}   = Address of lowest available memory
+
+	.START	_main
+	.ENTRY	_main, _cstart_
+
+_cstart_:
+_main:	PUSHL	#!_DATA_p
+	POPL	DS
+	ENTER	mn_SIZE, 0		;Allocate stack frame
+	PUSHL	DS			;Allocate additional memory for our
+	PUSHL	#_STACKBASE		;  stack but make it all virtual
+	PUSHL	#0Bh.B
+	PUSHL	#_clib_begin-_STACKBASE;
+	CALLF	svcMemChange#
+	TESTL	EAX, EAX
+	JS	$mainmb.S		;If can't get more space for the stack!
+	PUSHL	DS			;See how big we are
+	PUSHL	#_clib_begin
+	PUSHL	#0.B
+	PUSHL	#-1.B
+	CALLF	svcMemChange#
+	TESTL	EAX, EAX
+	JNS	2$.S			;This should not fail!
+$mainmb::
+	LEAL	EDI, maemsg		;Memory allocation failure
+mainfl:	PUSHL	#DH_STDTRM.B
+	PUSHL	DS
+	PUSHL	EDI
+	PUSHL	#0.B
+	CALLF	svcIoOutString#
+	PUSHL	#1.B
+	CALLF	svcSchExit#
+
+strmerr:
+	LEAL	EDI, strmsg		;Stream initialization error
+	JMP	mainfl			;Now exit
+
+;Here with memory allocation determined
+
+2$:	ADDL	EAX, #_clib_begin	;Get offset for top
+	MOVL	_clib_memtop, EAX	;Remember allocated top of memory
+
+;First, we must scan the command line and find the beginning of each string
+;  and count characters
+
+	MOVL	ESI, ES:8		;Get start of command string
+	CLRL	ECX			;Clear character count
+	CLRL	EDX			;Clear string count
+4$:	LODSB	ES:[ESI]		;Skip leading whitespace
+	CMPB	AL, #' '
+	JE	4$.S
+	CMPB	AL, #HT
+	JE	4$.S
+	CMPB	AL, #0			;End of command?
+	JE	22$.S			;Yes
+	DECL	ESI
+	PUSHL	ESI			;Save offset of this string
+	INCL	ESI
+	INCL	EDX			;Count the string
+6$:	INCL	ECX			;Count the character
+	CMPB	AL, #'"'		;Quote?
+	JE	14$.S			;Yes
+8$:	LODSB	ES:[ESI]		;Get next character
+	INCL	ECX
+10$:	CMPB	AL, #0			;End of command?
+	JE	12$.S			;Yes
+	CMPB	AL, #' '		;No - whitespace?
+	JE	12$.S			;Yes
+	CMPB	AL, #HT			;Maybe
+	JNE	6$.S			;No
+12$:	MOVB	ES:-1.B[ESI], #0	;Store null over the terminator
+	CMPB	AL, #0			;At end of command line?
+	JNE	4$.S			;No
+	JMP	22$.S
+
+;Here if have double quote in the argument
+
+14$:	LODSB	ES:[ESI]		;Get next character
+	INCL	ECX			;Count the character
+	CMPB	AL, #0			;End of command line?
+	JE	12$.S			;Yes
+	CMPB	AL, #'"'		;No - another double quote?
+	JNE	14$.S			;No
+
+;Here with a double quote in a quoted string
+
+20$:	LODSB	ES:[ESI]		;Get next character
+	INCL	ECX			;Count it
+	CMPB	AL, #'"'		;Another double quote?
+	JE	14$.S			;Yes - continue in quoted mode
+	JMP	10$.S			;No - switch back to unquoted mode
+
+;Here at end of command line - we now have offset of the beginning of each
+;  string on the stack
+
+22$:	MOVL	mn_numchr.B[EBP], ECX
+	MOVL	_argc, EDX
+	MOVL	EAX, ES:4		;Get length of full file specification
+	INCL	EAX			;Allow for final null
+	INCL	EDX			;Get space needed for argv
+	INCL	EDX
+	SHLL	EDX, #2
+	ADDL	EAX, EDX
+	ADDL	EAX, ECX		;Plus space needed for strings
+	SUBL	EDX, ES:8		;Calculate amount to adjust pointers
+	MOVL	mn_pntadj.B[EBP], EDX
+	PUSHL	EAX			;Get this much space
+	CALL	sbrk#
+	POPL	EBX
+	TESTL	EAX, EAX
+	JS	$mainmb			;If error
+	ADDL	mn_pntadj.B[EBP], EAX
+	ADDL	EAX, #4.B
+	MOVL	_argv, EAX		;Save offset of argv
+	MOVL	ECX, _argc		;Get number of arguments
+	MOVL	[EAX+ECX*4], #0		;Put 0 at end of the table
+	JREGZ	ECX, 32$		;If no argument strings at all
+	MOVL	EDX, mn_pntadj.B[EBP]	;Get adjustment amount
+30$:	POPL	-4.B[EAX+ECX*4]		;Store offset of string
+	ADDL	-4.B[EAX+ECX*4], EDX	;Adjust the offset
+	LOOP	ECX, 30$		;Continue if more to do here
+
+;Here with the argument pointer table (argv) setup - now we must copy the
+;  strings
+
+32$:	MOVL	ECX, _argc		;Get number of strings
+	MOVL	EBX, _argv		;Point to start of argument table
+	PUSHL	DS
+	PUSHL	ES
+	POPL	DS
+	POPL	ES
+	JREGZ	ECX, 38$		;If none at all
+34$:	MOVL	EDI, ES:[EBX]		;Point to place to put string
+	MOVL	ESI, EDI		;Point to current location of string
+	SUBL	ESI, mn_pntadj.B[EBP]
+36$:	LODSB	[ESI]			;Get character
+	STOSB	[EDI]			;Store character
+	CMPB	AL, #0			;Null?
+	JNE	36$.S			;No - continue
+	ADDL	EBX, #4.B		;Yes - bump table pointer
+	LOOP	ECX, 34$		;Continue if more to do here
+38$:	MOVL	ESI, DS:0		;Point to file specification
+	PUSHL	EDI
+40$:	LODSB	[ESI]			;Get character
+	CMPB	AL, #0E0h		;No - special character?
+	JB	42$.S			;No
+	CMPB	AL, #0FFh		;Yes - image prefix?
+	JNE	40$.S			;No
+	LODSB	[ESI]			;Yes - get image character
+42$:	STOSB	[EDI]			;Store character
+	CMPB	AL, #0			;End?
+	JNE	40$.S			;No
+	POPL	EDI
+	PUSHL	DS			;Give up command data segment
+	PUSHL	ES
+	POPL	DS
+	CALLF	svcMemRemove#
+	MOVL	EBX, _argv		;Get address of argv
+	MOVL	ECX, _argc		;Get value of argc
+	LEAVE				;Remove our stack frame
+	MOVL	-4.B[EBX], EDI		;Store pointer to file spec as the "-1"
+					;  entry in argv
+	PUSHL	#0.B			;Push arguments for main (the zero is
+	PUSHL	EBX			;  case someone expects to find a
+	PUSHL	ECX			;  pointer to a Unix style environment
+					;  area as the third argument!)
+
+;Here with the command line arguments setup - now initialize the standard
+;  IO streams
+
+	PUSHL	#_stdin#		;Setup stdin
+	CALL	_fsetup#
+	POPL	EBX			;Dump parameter
+	TESTL	EAX, EAX		;Any error?
+;	JE	strmerr			;Yes, error in setting up stream
+
+	PUSHL	#_stdout#		;Setup stdout
+	CALL	_fsetup#
+	POPL	EBX			;Dump parameter
+	TESTL	EAX, EAX		;Any error?
+;	JE	strmerr			;Yes, error in setting up stream
+
+	PUSHL	#_stderr#		;Setup stderr
+	CALL	_fsetup#
+	POPL	EBX			;Dump parameter
+	TESTL	EAX, EAX		;Any error?
+;	JE	strmerr			;Yes, error in setting up stream
+
+	PUSHL	#_stdtrm#		;Setup stdtrm
+	CALL	_fsetup#
+	POPL	EBX			;Dump parameter
+	TESTL	EAX, EAX		;Any error?
+;	JE	strmerr			;Yes, error in setting up stream
+
+;Here with all setup complete - now call the user's program
+
+	CALL	main#			;Call main program
+	PUSHL	EAX			;Return value is exit status
+	CALL	exit#			;Go exit
+.PAGE
+	.SBTTL	Common error returns
+
+;Error return for functions which have a stack frame and have saved both
+;  EDI and ESI and ESI points to the IOB
+
+$errorrtnlvp2x::
+	MOVL	iob_error.B[ESI], EAX
+$errorrtnlvp2::
+	NEGL	EAX			;Make positive for errno
+	MOVL	errno#, EAX
+	MOVL	EAX, #-1
+	LEAVE
+	POPL	EDI
+	POPL	ESI
+	RET	
+
+$errorrtnlv::
+	LEAVE
+$errorrtn::
+	NEGL	EAX			;Make positive for errno
+	MOVL	errno#, EAX
+	MOVL	EAX, #-1
+	RET
+
+;Error return for functions which do not have stack frame and have saved ESI
+;  only
+
+$errorrtnp1x::
+	MOVL	iob_error.B[ESI], EAX
+$errorrtnp1::
+	NEGL	EAX			;Make positive for errno
+	MOVL	errno#, EAX
+	MOVL	EAX, #-1
+	POPL	ESI
+	RET	
+
+	.END

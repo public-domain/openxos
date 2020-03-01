@@ -1,0 +1,778 @@
+	.TITLE	CONKEY - Device driver for console keyboard - logical routines
+
+;++++
+; This software is in the public domain.  It may be freely copied and used
+; for whatever purpose you see fit, including commerical uses.  Anyone
+; modifying this software may claim ownership of the modifications, but not
+; the complete derived code.  It would be appreciated if the authors were
+; told what this software is being used for, but this is not a requirement.
+
+;   THIS SOFTWARE IS PROVIDED BY THE AUTHORS "AS IS" AND ANY EXPRESS OR
+;   IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
+;   OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+;   IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+;   INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+;   BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS
+;   OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+;   ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR
+;   TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
+;   USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+;----
+
+	.PROC	80486
+	.INCLUD	XOSINC:\XMAC\XOS.PAR
+	.INCLUD	XOSINC:\XMAC\XOSX.PAR
+	.INCLUD	XOSINC:\XMAC\XOSERR.PAR
+	.INCLUD	XOSINC:\XMAC\XOSDOS.PAR
+	.INCLUD	XOSINC:\XMAC\XOSTRM.PAR
+	.INCLUD	XOSINC:\XMAC\XOSXTRM.PAR
+	.INCLUD	XOSINC:\XMAC\XOSLKE.PAR
+	.INCLUD	XOSINC:\XMAC\XOSXLKE.PAR
+
+	LKECONT
+
+	.EXPORT	xosconKeyVInt  , xosconClrKeyI  , xosconKbdInp
+	.EXPORT	xosconKeyVInB  , xosconKeyVOutB , xosconKbdChkRM
+	.EXPORT	xosconKbdMKyTbl, xosconKbdBKyTbl, xosconKeyEn2
+
+	CODE
+
+;NOTE:
+;  The standard AT keyboard interface clears its input available flag whenever
+;  a character is read (INB 60h).  There is no way to peek at the current
+;  character without clearing the flag.  Multiple reads of the character work,
+;  provided that no additional character was typed.  Many DOS programs hook
+;  the keyboard interrupt and use INB 60h to get the character and then call
+;  the standard BIOS interrupt routine to process that same character.  This
+;  works as long as another character is not typed between the program's
+;  INB 60h and the BIOS's INB 60h!  Under DOS, this is usually a very small
+;  window and does not normallly cause any problems.  Under XOS, the window
+;  is somewhat larger because of the interrupt emulation overhead, and incorrect
+;  operation could occur with very fast typing.  This problem is much worse when
+;  the PCN (pseudo-console) device is used.  In this case, the "typing" is
+;  really output from another program and can (and often does) occur at a very
+;  high rate.  Inorder to handle both of these situations (as well as the
+;  unusual case of programs which take a keyboard interrupt and never call the
+;  the BIOS routine) correctly, XOS uses a rather complex scheme to clear
+;  the character available flag.  The goal of this scheme is to elimate the
+;  window between the reading of a character by a program and the reading of
+;  the character by the BIOS routine while still closely emulating the exact
+;  behavior of the real hardware.  This is done as follows:
+;	When a keyboard interrupt is granted, a "keyboard interrupt" flag is
+;	  set.
+;	When an INB 60h is done, a "character read" flag is set, the "character
+;	  available" flag is not cleared.
+;	When an INB 64h is done (which gets the keyboard status), if the
+;	  "character read" flag is set, the flag is cleared, the "input
+;	  available" flag is cleared.  If the "character read" flag is not set,
+;	  a character available status is returned if there is something in the
+;	  input ring and keyboard interrupts are disabled.  If keyboard
+;	  interrupts are enabled, no character available status is always
+;	  returned.  This is done to emulate the behavior under DOS where the
+;	  BIOS will generally grab input character before a program which is
+;	  polling the interface with interrupts enabled can read the character.
+;	When the keyboard interrupt is cleared from the interrupt controller,
+;	  the "character available" flag is cleared if it was set.
+;	When the BIOS routine is called by the program, the current character
+;	  is processed and the "character available" flag is cleared.
+;  This will allow almost all programs to work correctly, if they are polling
+;  the keyboard without interrupts, taking an interrupt and than passing it to
+;  the BIOS routine, or taking an interrupt and processing it completely.  It
+;  will also support combinations of the above methods, as may be encountered
+;  when running a program under a debugger.  Note that clearing the "character
+;  available" flag as indicated above also results in executing code which
+;  processes the next buffered scan code.
+
+	.SBTTL	xosconKeyVInt - Console keyboard INT 9 handler
+
+;Here on attempt to execute the console keyboard interrupt routine in virtual
+;  DOS mode - this will happen if a virtual DOS mode program sets up its own
+;  keyboard vector, takes an interrupt, and then decides to let the usual
+;  routine handle it by jumping to the address which the vector originally
+;  pointed to.  In this case, we pass the keyboard interrupt down the chain
+;  of processes to get the interrupt.
+
+xosconKeyVInt:
+	TOFORK				;Indicate no scan code available
+	ANDB	tdb_keysts2.B[ESI], #{~{KS2$HVSCN|KS2$KEYREAD|KS2$KEYINT}}&0FFh
+	MOVL	EDX, dcb_trkib.B[EDI]	;Get our KIB
+	TESTL	EDX, EDX		;Make sure have one
+	JE	12$.S
+	CMPL	tdb_holdkib.B[ESI], EDX	;Is this KIB holding the chain?
+	JNE	2$.S			;No
+	CLRL	EAX			;Yes, but not any more
+	MOVL	tdb_holdkib.B[ESI], EAX
+2$:	MOVL	EDX, [EDX]		;Get next interrupt block
+	TESTL	EDX, EDX
+	JE	10$.S			;If no more
+4$:	MOVL	ES, ki_pda.B[EDX]	;Yes - get PDA
+	MOVL	EAX, ki_handle.B[EDX]	;Get offset of device slot
+	SHLL	EAX, #5t
+	ADDL	EAX, ES:pdaHndlTbl##
+	MOVL	EAX, ES:[EAX]		;Get offset of DCB
+	CMPL	EAX, #1000h		;Have one?
+	JB	6$.S			;No
+	TESTL	EAX, #0F0000000h
+	JNE	6$.S
+	CMPL	dcb_trtdb.B[EAX], ESI	;Yes - for this virtual screen?
+	JNE	6$.S			;No
+	CALL	knlRaiseRun##		;Yes - raise priority for process
+	CMPW	ES:pdaRMPage0##+9h*4+2, #100h ;Does this process want an
+					      ;  interrupt?
+	JAE	14$.S			;Yes
+6$:	MOVL	EDX, [EDX]		;No - get next interrupt block
+	TESTL	EDX, EDX
+	JNE	4$.S			;If have another
+10$:	MOVZWL	EAX, tdb_xcode.B[ESI]	;No more - restore scan code
+	CALL	kbdckv8			;Process this scan code
+	MOVL	EAX, tdb_kdisp.B[ESI]
+	CALLI	CS:kf_process.B[EAX]	;Process any buffered scan codes
+12$:	FROMFORK
+	CLC
+	RET
+
+;Here to interrupt next process in the chain for the keyboard
+
+14$:	ORB	tdb_keysts2.B[ESI], #KS2$KEYINT|KS2$HVSCN
+					;Indicate processing interrupt and have
+					;  scan code
+	MOVL	tdb_holdkib.B[ESI], EDX	;Remember this KIB is holding the chain
+	MOVL	EAX, #1t		;Get interrupt number
+	PUSHL	ESI
+	CALL	knlRMIntReq##		;Request the interrupt
+	POPL	ESI
+	JMP	12$.S
+.PAGE
+	.SBTTL	xosconClrKeyI - tf_clrkeyi routine
+
+;Here for the tf_clrkeyi function - this function is called from the sd_cleardev
+;  routine for terminals to clean up any hung keyboard interrupts
+;	c{EDX} = Offset of KIB
+;	c{EDI} = Offset of DCB
+;	CALL	xosconClrKeyI
+
+xosconClrKeyI:
+	MOVL	EAX, ki_tdb.B[EDX]	;Point to the TDB
+	CMPL	tdb_holdkib.B[EAX], EDX	;Is this KIB holding the keyboard?
+	JNE	4$.S			;No
+	MOVL	tdb_holdkib.B[EAX], #0	;Yes - but not any more
+	ANDB	tdb_keysts2.B[EAX], #{~{KS2$HVSCN|KS2$KEYINT|KS2$KEYDIS}}&0FFh
+4$:	RET				;Indicate no interrupt pending now
+.PAGE
+	.SBTTL	xosconKbdInp - Subroutine to process keyboard scan codes
+
+;Subroutine to process keyboard scan codes - this is a logical level routine
+;  which is used for both pseudo and real consoles
+
+xosconKbdInp:
+	MOVZBL	EDX, AL
+	MOVB	DL, knlKeyTblXN##[EDX]
+	CMPB	DL, #0
+	JNS	kbdckv0
+	TESTB	AH, #80
+	JS	2$.S
+	JMPIL	kbdmkpi-80h[EDX]
+
+2$:	JMPIL	kbdbkpi-80h[EDX]
+
+;Special key make-code pre-interrupt dispatch table
+
+	DATA
+
+kbdmkpi:.LONG	kbdckv0		;SK_NULL   = 80h - Unused code
+	.LONG	mpilshft	;SK_LSHFT  = 84h - Left shift key
+	.LONG	mpirshft	;SK_RSHFT  = 88h - Right shift key
+	.LONG	mpilctrl	;SK_LCTRL  = 8Ch - Left control key
+	.LONG	mpirctrl	;SK_RCTRL  = 90h - Right control key
+	.LONG	mpilaltkey	;SK_LALT   = 94h - Left alt key
+	.LONG	mpiraltkey	;SK_RALT   = 98h - Right alt key
+	.LONG	mpicaplck	;SK_CAPS   = 9Ch - Caps lock key
+	.LONG	mpinumlck	;SK_NUMLCK = A0h - Num lock key
+	.LONG	mpiscllck	;SK_SCLLCK = A4h - Scroll lock key
+	.LONG	kbdckv0		;SK_BREAK  = A8h - Break key
+
+;Special key break-code pre-interrupt dispatch table
+
+	DATA
+
+kbdbkpi:.LONG	kbdckv0		;SK_NULL   = 80h - Unused code
+	.LONG	bpilshft	;SK_LSHFT  = 84h - Left shift key
+	.LONG	bpirshft	;SK_RSHFT  = 88h - Right shift key
+	.LONG	bpilctrl	;SK_LCTRL  = 8Ch - Left control key
+	.LONG	bpirctrl	;SK_RCTRL  = 90h - Right control key
+	.LONG	bpilaltkey	;SK_LALT   = 94h - Left alt key
+	.LONG	bpiraltkey	;SK_RALT   = 98h - Right alt key
+	.LONG	bpicaplck	;SK_CAPS   = 9Ch - Caps lock key
+	.LONG	bpinumlck	;SK_NUMLCK = A0h - Num lock key
+	.LONG	bpiscllck	;SK_SCLLCK = A4h - Scroll lock key
+	.LONG	kbdckv0		;SK_BREAK  = A8h - Break key
+
+	CODE
+
+;Here for make of left shift key (pre-interrupt)
+
+mpilshft:
+	BTSL	tdb_keysts1.B[ESI], #KS0%LSHFT
+	JMP	kbdckv0
+
+;Here for make of right shift key (pre-interrupt)
+
+mpirshft:
+	BTSL	tdb_keysts1.B[ESI], #KS0%RSHFT
+	JMP	kbdckv0.S
+
+;Here for make of left control key (pre-interrupt)
+
+mpilctrl:
+	BTSL	tdb_keysts1.B[ESI], #KS0%LCTRL
+	JMP	kbdckv0.S
+
+;Here for make of right control key (pre-interrupt)
+
+mpirctrl:
+	BTSL	tdb_keysts1.B[ESI], #KS0%RCTRL
+	JMP	kbdckv0.S
+
+;Here for make of left ALT key (pre-interrupt)
+
+mpilaltkey:
+	BTSL	tdb_keysts1.B[ESI], #KS0%LALT
+	JMP	kbdckv0.S
+
+;Here for make of right ALT key (pre-interrupt)
+
+mpiraltkey:
+	BTSL	tdb_keysts1.B[ESI], #KS0%RALT
+	JMP	kbdckv0.S
+
+;Here for make of caps lock key (pre-interrupt)
+
+mpicaplck:
+	BTSL	tdb_keysts1.B[ESI], #KS0%CAPKY
+	BTCL	tdb_keysts1.B[ESI], #KS0%CAPLK
+	JMP	kbdckv0.S
+
+;Here for make of num lock key (pre-interrupt)
+
+mpinumlck:
+	BTSL	tdb_keysts1.B[ESI], #KS0%NUMKY
+	BTCL	tdb_keysts1.B[ESI], #KS0%NUMLK
+	JMP	kbdckv0.S
+
+;Here for make of scroll lock key (pre-interrupt)
+
+mpiscllck:
+	BTSL	tdb_keysts1.B[ESI], #KS0%SCLKY
+	BTCL	tdb_keysts1.B[ESI], #KS0%SCLLK
+	JMP	kbdckv0.S
+
+;Here for break of left shift key (pre-interrupt)
+
+bpilshft:
+	BTZL	tdb_keysts1.B[ESI], #KS0%LSHFT
+	JMP	kbdckv0.S
+
+;Here for break of right shift key (pre-interrupt)
+
+bpirshft:
+	BTZL	tdb_keysts1.B[ESI], #KS0%RSHFT
+	JMP	kbdckv0.S
+
+;Here for break of left control key (pre-interrupt)
+
+bpilctrl:
+	BTZL	tdb_keysts1.B[ESI], #KS0%LCTRL
+	JMP	kbdckv0.S
+
+;Here for break of right control key (pre-interrupt)
+
+bpirctrl:
+	BTZL	tdb_keysts1.B[ESI], #KS0%RCTRL
+	JMP	kbdckv0.S
+
+;Here for break of left ALT key (pre-interrupt)
+
+bpilaltkey:
+	BTZL	tdb_keysts1.B[ESI], #KS0%LALT
+	JMP	kbdckv0.S
+
+;Here for break of right ALT key (pre-interrupt)
+
+bpiraltkey:
+	BTZL	tdb_keysts1.B[ESI], #KS0%RALT
+	JMP	kbdckv0.S
+
+;Here for break of caps lock key (pre-interrupt)
+
+bpicaplck:
+	BTZL	tdb_keysts1.B[ESI], #KS0%CAPKY
+	JMP	kbdckv0.S
+
+;Here for break of num lock key (pre-interrupt)
+
+bpinumlck:
+	BTZL	tdb_keysts1.B[ESI], #KS0%NUMKY
+	JMP	kbdckv0.S
+
+;Here for break of scroll lock key (pre-interrupt)
+
+bpiscllck:
+	BTZL	tdb_keysts1.B[ESI], #KS0%SCLKY
+	JMP	kbdckv0.S
+.PAGE
+kbdckv0:BTL	tdb_imode.B[ESI], #TIM%DEBUG ;In debug input mode?
+	JC	kbdckv8			;Yes - skip real mode interrupt stuff
+	CMPL	[ESI], #0.B		;No - do we have an attached DCB
+	JE	kbdckv8			;No - can't interrupt
+	MOVW	tdb_xcode.B[ESI], AX	;Yes - store scan code for main program
+	PUSHL	EDI			;  level
+	MOVL	EDI, [ESI]		;Get offset of attached DCB
+	MOVL	EDX, dcb_trkib.B[EDI]	;Have any virtual DOS mode processes?
+	TESTL	EDX, EDX
+	JE	12$.S			;No
+4$:	MOVL	ES, ki_pda.B[EDX]	;Yes - get PDA
+	MOVL	EAX, ki_handle.B[EDX]	;Get offset of device slot
+	SHLL	EAX, #5t
+	ADDL	EAX, ES:pdaHndlTbl##
+	MOVL	EAX, ES:[EAX]		;Get offset of DCB
+	CMPL	EAX, #1000h		;Have one?
+	JB	6$.S			;No
+	TESTL	EAX, #0F0000000h
+	JNE	6$.S
+	CMPL	dcb_trtdb.B[EAX], ESI	;Yes - for this virtual screen?
+	JNE	6$.S			;No
+	CALL	knlRaiseRun##		;Yes - raise priority for process
+	CMPW	ES:pdaRMPage0##+9h*4+2, #100h ;Does this process want an
+					      ;  interrupt?
+	JAE	10$.S			;Yes
+6$:	MOVL	EDX, [EDX]		;No - get next interrupt block
+	TESTL	EDX, EDX
+	JNE	4$.S			;If have another
+kbdckv4:MOVZWL	EAX, tdb_xcode.B[ESI]	;No more - restore scan code
+	JMP	12$.S			;Continue
+
+;Here with process which wants interrupt
+
+10$:	ORB	tdb_keysts2.B[ESI], #KS2$KEYINT|KS2$HVSCN
+					;Indicate processing interrupt and have
+					;  scan code
+	MOVL	tdb_holdkib.B[ESI], EDX	;Remember this KIB is holding the chain
+	MOVL	EAX, #1t		;Get interrupt number
+	PUSHL	ESI
+	CALL	knlRMIntReq##		;Request the interrupt
+	POPL	ESI
+	POPL	EDI
+	RET
+
+;Here if no user programs want a virtual DOS mode keyboard interrupt
+
+12$:	POPL	EDI
+kbdckv8:MOVB	BL, tdb_keysts0.B[ESI]	;Get shift and control state
+	MOVB	BH, BL			;Merge left and right bits
+	SHRB	BL, #4t
+	ORB	BL, BH
+	ANDL	EBX, #07h.B
+	MOVL	EBX, knlScnTblX##[EBX*4] ;Get offset of table for this state
+	MOVZBL	EDX, AL
+	MOVZBL	ECX, [EBX+EDX]		;Get translation for character
+	TESTB	AH, AH			;Is this a key-release code?
+	JS	kbdhvbrk.S		;Yes - go handle it
+	TESTB	CL, CL			;No - special dispatch needed?
+	JS	kbdspd.S		;Yes
+	MOVB	AH, #0			;No - indicate not key-release
+kbdproc:MOVL	EDX, tdb_keysts0.B[ESI]	;Get status bits
+	SHLL	EDX, #16t
+	ORL	EAX, EDX		;Merge status bits with scan code
+	INCL	tdb_kbchar[ESI]
+	JMP	knlTrmInp##		;Process the character
+
+;Here with scan code which requires special dispatch
+
+kbdspd:	CALLI	xosconKbdMKyTbl-80h[ECX] ;Dispatch on the special code
+	JC	kbdproc.S		;If should be a normal key
+	MOVB	AH, #0			;Indicate not key-release
+	JMP	kbdbrk2.S		;Continue
+
+;Special key-make code dispatch table
+
+	DATA
+
+xosconKbdMKyTbl::
+	.LONG	rtnclc		;SK_NULL   = 80h - Unused code
+	.LONG	mlshft		;SK_LSHFT  = 84h - Left shift key
+	.LONG	mrshft		;SK_RSHFT  = 88h - Right shift key
+	.LONG	mlctrl		;SK_LCTRL  = 8Ch - Left control key
+	.LONG	mrctrl		;SK_RCTRL  = 90h - Right control key
+	.LONG	mlaltkey	;SK_LALT   = 94h - Left alt key
+	.LONG	mraltkey	;SK_RALT   = 98h - Right alt key
+	.LONG	mcaplck		;SK_CAPS   = 9Ch - Caps lock key
+	.LONG	mnumlck		;SK_NUMLCK = A0h - Num lock key
+	.LONG	mscllck		;SK_SCLLCK = A4h - Scroll lock key
+	.LONG	rtnclc		;SK_BREAK  = A8h - Break key
+
+	CODE
+.PAGE
+;Here for key-release code from keyboard
+
+kbdhvbrk::
+	TESTB	CL, CL			;Special dispatch needed?
+	JNS	kbdbrk2.S		;No
+	CALLI	xosconKbdBKyTbl-80h[ECX] ;Yes - do special dispatch
+	MOVB	AH, #KB$RELEASE>8	;Indicate key-release code
+kbdbrk2:BTL	tdb_imode.B[ESI], #TIM%SCNALL ;Returning all scan codes?
+	JC	kbdproc.S		;Yes
+	ORB	AH, #KB$INTERN>8	;No - indicate this is an internal code
+	JMP	kbdproc.S		;Continue
+
+;Special key-release code dispatch table
+
+	DATA
+
+xosconKbdBKyTbl::
+	.LONG	ret008		;SK_NULL   = 80h - Unused code
+	.LONG	blshft		;SK_LSHFT  = 84h - Left shift key
+	.LONG	brshft		;SK_RSHFT  = 88h - Right shift key
+	.LONG	blctrl		;SK_LCTRL  = 8Ch - Left control key
+	.LONG	brctrl		;SK_RCTRL  = 90h - Right control key
+	.LONG	blaltkey	;SK_LALT   = 94h - Left alt key
+	.LONG	braltkey	;SK_RALT   = 98h - Right alt key
+	.LONG	bcaplck		;SK_CAPS   = 9Ch - Caps lock key
+	.LONG	bnumlck		;SK_NUMLCK = A0h - Num lock key
+	.LONG	bscllck		;SK_SCLLCK = A4h - Scroll lock key
+	.LONG	ret008		;SK_BREAK  = A8h - Break key
+
+	CODE
+.PAGE
+;Here for make of left shift key
+
+mlshft:	BTSL	tdb_keysts0.B[ESI], #KS0%LSHFT
+	CALL	xosconKbdChkRM		;Need to update the real mdoe segment?
+	JE	rtnclc.S		;No
+	ORB	ES:pdaRMPage0##+bda_vkeysts0, #KV0$LSHFT ;Yes
+	RET				;Return with C clear
+
+;Here for make of right shift key
+
+mrshft:	BTSL	tdb_keysts0.B[ESI], #KS0%RSHFT
+	CALL	xosconKbdChkRM		;Need to update the real mode segment?
+	JE	rtnclc.S		;No
+	ORB	ES:pdaRMPage0##+bda_vkeysts0, #KV0$RSHFT ;Yes
+rtnclc:	CLC
+	RET
+
+;Here for make of left control key
+
+mlctrl:	BTSL	tdb_keysts0.B[ESI], #KS0%LCTRL
+	CALL	xosconKbdChkRM		;Need to update the real mode segment?
+	JE	rtnclc.S		;No
+	ORB	ES:pdaRMPage0##+bda_vkeysts1, #KV1$LCTRL ;Yes
+	JMP	6$.S
+
+;Here for make of right control key
+
+mrctrl:	BTSL	tdb_keysts0.B[ESI], #KS0%RCTRL
+	CALL	xosconKbdChkRM		;Need to update the real mode segment?
+	JE	rtnclc.S		;No
+	ORB	ES:pdaRMPage0##+bda_vkeysts2, #KV2$RCTRL ;Yes
+6$:	ORB	ES:pdaRMPage0##+bda_vkeysts0, #KV0$CTRL
+	RET
+
+;Here for make of left ALT key
+
+mlaltkey:
+	BTSL	tdb_keysts0.B[ESI], #KS0%LALT
+	CALL	xosconKbdChkRM		;Need to update the real mode segment?
+	JE	rtnclc.S		;No
+	ORB	ES:pdaRMPage0##+bda_vkeysts1, #KV1$LALT ;Yes
+	JMP	14$.S
+
+;Here for make of right ALT key
+
+mraltkey:
+	BTSL	tdb_keysts0.B[ESI], #KS0%RALT
+	CALL	xosconKbdChkRM		;Need to update the real mode segment?
+	JE	rtnclc.S		;No
+	ORB	ES:pdaRMPage0##+bda_vkeysts2, #KV2$RALT ;Yes
+14$:	ORB	ES:pdaRMPage0##+bda_vkeysts0, #KV0$ALT
+	RET
+.PAGE
+;Here for make of scroll lock key
+
+mscllck:BTSL	tdb_keysts0.B[ESI], #KS0%SCLKY ;Is the key pressed now?
+	JC	8$.S			;Yes - ignore it this time
+	BTCL	tdb_keysts0.B[ESI], #KS0%SCLLK ;No - toggle scroll lock state
+	CALL	xosconKbdChkRM		;Need to update the real mdoe segment?
+	JE	4$.S			;No
+	ORB	ES:pdaRMPage0##+bda_vkeysts1, #KV1$SCLKY ;Yes
+	ANDB	ES:pdaRMPage0##+bda_vkeysts0, #~KV0$SCLLK ;Assume scroll-lock off
+	BTL	tdb_keysts0.B[ESI], #KS0%SCLLK ;Right?
+	JNC	4$.S			;Yes
+	ORB	ES:pdaRMPage0##+bda_vkeysts0, #KV0$SCLLK ;No - set bit
+	JMP	4$.S
+
+;Here for make of Num lock key
+
+mnumlck:TESTL	tdb_imode.B[ESI], #TIM$ANSI7|TIM$ANSI8 ;Want ANSI ESC sequences?
+	JNE	10$.S			;Yes - this is just another key
+	BTSL	tdb_keysts0.B[ESI], #KS0%NUMKY ;Is the key pressed now?
+	JC	8$.S			;Yes - ignore it this time
+	BTCL	tdb_keysts0.B[ESI], #KS0%NUMLK ;No - toggle NUM lock state
+	CALL	xosconKbdChkRM		;Need to update the real mode segment?
+	JE	4$.S			;No
+	ORB	ES:pdaRMPage0##+bda_vkeysts1, #KV1$NUMKY ;Yes
+	ANDB	ES:pdaRMPage0##+bda_vkeysts0, #~KV0$NUMLK ;Assume num-lock off
+	BTL	tdb_keysts0.B[ESI], #KS0%NUMLK ;Right?
+	JNC	4$.S			;Yes
+	ORB	ES:pdaRMPage0##+bda_vkeysts0, #KV0$NUMLK ;No - set bit
+4$:	MOVL	EDX, tdb_kdisp.B[ESI]	;Update the keyboard lites
+	CALLI	CS:kf_tolites.B[EDX]
+8$:	CLC
+	RET
+
+;Here to return with C set to indicate should process key as normal key
+
+10$:	PUSHL	EAX
+	MOVL	EDX, tdb_kdisp.B[ESI]	;Update the keyboard lites
+	CALLI	CS:kf_tolites.B[EDX]
+	POPL	EAX
+	STC
+	RET
+
+;Here for make of Caps lock key
+
+mcaplck:BTSL	tdb_keysts0.B[ESI], #KS0%CAPKY ;Is the key down now?
+	JC	8$.S			;Yes - ignore it this time
+	BTCL	tdb_keysts0.B[ESI], #KS0%CAPLK ;No - toggle CAPS lock state
+	CALL	xosconKbdChkRM		;Need to update the real mode segment?
+	JE	4$.S			;No
+	ORB	ES:pdaRMPage0##+bda_vkeysts1, #KV1$CAPKY ;Yes
+	ANDB	ES:pdaRMPage0##+bda_vkeysts0, #~KV0$CAPLK ;Assume caps-lock off
+	BTL	tdb_keysts0.B[ESI], #KS0%CAPLK ;Right?
+	JNC	4$.S			;Yes
+	ORB	ES:pdaRMPage0##+bda_vkeysts0, #KV0$CAPLK ;No - set bit
+	JMP	4$.S
+.PAGE
+;Here for release of left shift key
+
+blshft:	BTZL	tdb_keysts0.B[ESI], #KS0%LSHFT
+	CALL	xosconKbdChkRM		;Need to update the real mode segment?
+	JE	4$.S			;No
+	ANDB	ES:pdaRMPage0##+bda_vkeysts0, #~KV0$LSHFT ;Yes
+	RET
+
+;Here for release of right shift key
+
+brshft:	BTZL	tdb_keysts0.B[ESI], #KS0%RSHFT
+	CALL	xosconKbdChkRM		;Need to update the real mode segment?
+	JE	4$.S			;No
+	ANDB	ES:pdaRMPage0##+bda_vkeysts0, #~KV0$RSHFT
+4$:	RET
+
+;Here for release of left control key
+
+blctrl:	BTZL	tdb_keysts0.B[ESI], #KS0%LCTRL
+	CALL	xosconKbdChkRM		;Need to update the real mode segment?
+	JE	10$.S			;No
+	ANDB	ES:pdaRMPage0##+bda_vkeysts1, #~KV1$LCTRL ;Yes
+	JMP	8$.S
+
+;Here for release of right control key
+
+brctrl:	BTZL	tdb_keysts0.B[ESI], #KS0%RCTRL
+	CALL	xosconKbdChkRM		;Need to update the real mode segment?
+	JE	10$.S			;No
+	ANDB	ES:pdaRMPage0##+bda_vkeysts2, #~KV2$RCTRL ;Yes
+8$:	ANDB	ES:pdaRMPage0##+bda_vkeysts0, #~KV0$CTRL
+10$:	RET
+
+;Here for release of left ALT key
+
+blaltkey:
+	BTZL	tdb_keysts0.B[ESI], #KS0%LALT
+	CALL	xosconKbdChkRM		;Need to update the real mode segment?
+	JE	ret008.S		;No
+	ANDB	ES:pdaRMPage0##+bda_vkeysts1, #~KV1$LALT ;Yes
+	JMP	16$.S
+
+;Here for release of right ALT key
+
+braltkey:
+	BTZL	tdb_keysts0.B[ESI], #KS0%RALT
+	CALL	xosconKbdChkRM		;Need to update the real mode segment?
+	JE	ret008.S		;No
+	ANDB	ES:pdaRMPage0##+bda_vkeysts2, #~KV2$RALT ;Yes
+16$:	ANDB	ES:pdaRMPage0##+bda_vkeysts0, #~KV0$ALT
+ret008:	RET
+.PAGE
+;Here for release of scroll lock key
+
+bscllck:BTZL	tdb_keysts0.B[ESI], #KS0%SCLKY ;Indicate key not pressed now
+	CALL	xosconKbdChkRM		;Need to update the real mode segment?
+	JE	4$.S			;No
+	ANDB	ES:pdaRMPage0##+bda_vkeysts1, #~KV1$SCLKY ;Yes
+4$:	RET
+
+;Here for release of Num lock key
+
+bnumlck:BTZL	tdb_keysts0.B[ESI], #KS0%NUMKY ;Indicate key not pressed now
+	CALL	xosconKbdChkRM		;Need to update the real mode segment?
+	JE	6$.S			;No
+	ANDB	ES:pdaRMPage0##+bda_vkeysts1, #~KV1$NUMKY ;Yes
+6$:	RET
+
+;Here for release of Caps lock key
+
+bcaplck:BTZL	tdb_keysts0.B[ESI], #KS0%CAPKY ;Indicate key not pressed now
+	CALL	xosconKbdChkRM		;Need to update the real mode segment?
+	JE	12$.S			;No
+	ANDB	ES:pdaRMPage0##+bda_vkeysts1, #~KV1$CAPKY
+12$:	RET
+.PAGE
+	.SBTTL	xosconKbdChkRM - Subroutine to see if need to update the real mode segment
+
+;Subroutine to see if need to update real mode segment at fork level for
+;  keyboard input
+;	CALL	xosconKbdChkRM
+;	Z:set = Do not update virtual DOS mode address space
+;	Z:clr = Update virtual DOS mode address space
+;  C is always clear, EAX is preserved
+
+xosconKbdChkRM::
+	MOVL	ES, knlCurPda##		;Get selector of current PDA
+	TESTB	ES:pdaStatus1##, #P1$DOSSEG ;Have a DOS environment?
+	JE	4$.S			;No - return with Z set
+	PUSHL	EAX			;Yes
+	MOVL	EAX, ES:pdaHndlTbl##	;Get pointer to device table
+	MOVL	EAX, ES:DH_STDTRM*32t[EAX] ;Get offset of DCB for
+	CMPL	EAX, #1000h		     ;  controlling terminal
+	JB	2$.S			;If none
+	TESTL	EAX, #0F0000000h
+	JNE	2$.S
+	CMPL	[ESI], EAX		;Is it this terminal
+	JNE	6$.S			;No
+	INCL	EAX			;Yes - clear Z
+2$:	POPL	EAX
+4$:	RET
+
+;Here if this is not the controlling terminal
+
+6$:	CLRL	EAX			;Set Z
+	POPL	EAX
+	RET
+.PAGE
+	.SBTTL	xosconKeyVInB - INB instruction for keyboard in virtual DOS mode
+
+;Here for INB instruction for keyboard in virtual-86 mode - get here for
+;  access to either port 60h or 64h
+;	c{EDX} = Port number
+;	c{ESI} = Offset of TDB
+;	CALL	xosconKeyVInB
+;	C:set = Error (will cause a protection error)
+;	C:clr = Normal
+;	  c(AL) = Value of user's AL
+
+;Emulation of the keyboard ports is somewhat complex.  Under DOS, data can
+;  generally only be read from the keyboard from within the keyboard interrupt
+;  service routine or if the keyboard interrupt is disabled (in which case the
+;  BIOS will not be taking characters).  Since Allegor is a multi-tasking
+;  system, we cannot stop processing keyboard characters whenever a DOS process
+;  disables interrupts.  We do stop processing keyboard characters when a
+;  DOS process takes a keyboard interrupt, however.  When a DOS keyboard
+;  interrupt is granted, keyboard processing is disabled until an INB is
+;  done on port 60h, which returns the scan code which caused the interrupt
+;  and re-enables the keyboard.  If port 60h is read other than from an
+;  interrupt routine, a character is obtained from the type-ahead buffer if
+;  there are any there.  This comes close to simulating the behavior under
+;  DOS.
+
+xosconKeyVInB:
+	CMPB	DL, #60h		;For port 60h?
+	JNE	keyvi64	;;;;;.S		;No - must be for port 64h
+	TESTB	tdb_keysts2.B[ESI], #KS2$HVSCN ;Have a held scan code available?
+	JNE	4$.S			;Yes - go get it
+	CALL	xosconKbdChkRM		;No - have a DOS process?
+	JE	4$.S			;No - give him whatever is there!
+	TESTB	SS:pdaRMIMskReg##, #02h	;Yes - are keyboard interrupts enabled?
+	JNE	4$.S			;Yes - also nothing available
+	CMPL	tdb_ircnt[ESI], #0.B	;No - anything in the input ring?
+	JE	4$.S			;No
+	MOVL	EBX, tdb_irtak[ESI]	;Yes - get input ring taker pointer
+	MOVL	EAX, [EBX]		;Get input character
+	ADDL	EBX, #4.B
+	CMPL	EBX, tdb_ibufr[ESI]	;At end of buffer now?
+	JB	2$.S			;No
+	MOVL	EBX, tdb_iring[ESI]	;Yes - reset pointer to beginning
+2$:	MOVL	tdb_irtak[ESI], EBX
+	DECL	tdb_ircnt[ESI]		;Reduce the input ring count
+	MOVZBL	EBX, AL
+	JMP	6$.S			;Continue	
+
+4$:	MOVZBL	EBX, tdb_xcode.B[ESI]	;Get current scan code
+	MOVB	AH, tdb_xcode+1.B[ESI]	;Add key-release code bit if need to
+6$:	MOVB	AL, knlKeyTblPcRaw##[EBX] ;Get PC scan code
+	ANDB	AH, #80h
+	ORB	AL, AH
+	ORB	tdb_keysts2.B[ESI], #KS2$KEYREAD ;Indicate have read the input
+8$:	RET					 ;  buffer
+
+;Here to read port 64h - keyboard status register
+
+keyvi64:TESTB	tdb_keysts2.B[ESI], #KS2$KEYREAD ;Have we gotten a scan code?
+	JE	10$.S			;No
+	TESTB	tdb_keysts2.B[ESI], #KS2$KEYDIS ;Yes - is the keyboard enabled?
+	JNE	10$.S			;No
+	CALL	xosconKeyEn2		;Yes - accept the current character
+10$:	TESTB	tdb_keysts2.B[ESI], #KS2$HVSCN ;Have a held scan code available?
+	JNE	12$.S			;Yes
+	CALL	xosconKbdChkRM		;DOS process?
+	JE	14$.S			;No - nothing available
+	TESTB	SS:pdaRMIMskReg##, #02h	;Yes - are keyboard interrupts enabled?
+	JNE	14$.S			;Yes - also nothing available
+	CMPL	tdb_ircnt[ESI], #0.B	;No - anything in the input ring?
+	JE	14$.S			;No
+12$:	MOVB	AL, #05h		;Yes - indicate have character available
+	RET
+
+;Here if no character is available
+
+14$:	MOVB	AL, #04h		;Get value for user
+	RET
+.PAGE
+	.SBTTL	xosconKeyVOutB - OUTB instruction for keyboard in virtual DOS mode
+
+;Here for OUTB instruction for keyboard in virtual DOS mode - get here for
+;  access to either port 60h or 64h
+;	c(AL)  = Data byte to output
+;	c{EDX} = Port number
+
+xosconKeyVOutB:
+	CMPB	DL, #60h		;For port 60h?
+	JNE	keyvo64.S		;No - must be for port 64h
+
+;Here to write to port 64h - this is a command byte output
+
+keyvo64:CMPB	AL, #0ADh		;Disable keyboard?
+	JE	keyvdis.S		;Yes
+	CMPB	AL, #0AEh		;No - enable keyboard?
+	JE	keyenb.S		;Yes
+	UNIMOP	0E6h, 64h, 0, 0
+
+;Here to disable the keyboard
+
+keyvdis:ORB	tdb_keysts2.B[ESI], #KS2$KEYDIS ;Indicate keyboard disabled
+	RET				;Thats all
+
+;Here to enable the keyboard
+
+keyenb:	ANDB	tdb_keysts2.B[ESI], #~KS2$KEYDIS ;Indicate keyboard enabled
+xosconKeyEn2::
+	TOFORK
+	ANDB	tdb_keysts2.B[ESI], #{~{KS2$HVSCN|KS2$KEYREAD|KS2$KEYINT}}&0FFh
+					;Indicate that no scan code available
+					;  and not processing interrupt
+	MOVL	EAX, tdb_kdisp.B[ESI]	;Process any buffered scan codes
+	CALLI	CS:kf_process.B[EAX]
+	JMP	knlDsmFork##		;Get back to main program level and
+					;  return
+
+	LKEEND

@@ -1,0 +1,344 @@
+	.TITLE	ALARM - Alarm routines
+
+;++++
+; This software is in the public domain.  It may be freely copied and used
+; for whatever purpose you see fit, including commerical uses.  Anyone
+; modifying this software may claim ownership of the modifications, but not
+; the complete derived code.  It would be appreciated if the authors were
+; told what this software is being used for, but this is not a requirement.
+
+;   THIS SOFTWARE IS PROVIDED BY THE AUTHORS "AS IS" AND ANY EXPRESS OR
+;   IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
+;   OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+;   IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+;   INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+;   BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS
+;   OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+;   ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR
+;   TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
+;   USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+;----
+
+	.PROC	80486
+	.INCLUD	XOSINC:\XMAC\XOS.PAR
+	.INCLUD	XOSINC:\XMAC\XOSX.PAR
+	.INCLUD	XOSINC:\XMAC\XOSTIME.PAR
+	.INCLUD	XOSINC:\XMAC\XOSDOS.PAR
+	.INCLUD	XOSINC:\XMAC\XOSXTRM.PAR
+	.INCLUD	XOSINC:\XMAC\XOSERR.PAR
+
+	CODE
+
+	.SBTTL	svcSchAlarm - Alarm and clock interrupt functions
+
+;Here for the svcSchAlarm SVC - Alarm and clock interrupt functions
+;	long     function;	// Function:
+;				//   1 = Remove alarm
+;				//   2 = Request alarm signal at specified
+;				//	   date and time (once only)
+;				//   3 = Request alarm signal after specified
+;				//	   interval (once only)
+;				//   4 = Request alarm signal at specified
+;				//	   interval (repeated)
+;	long     handle;	// Alarm handle
+;	long     vector;	// Signal vector
+;	long     data;		// Signal data
+;	unsigned long date;	// Date
+;	unsigned long time;	// Time or interval value
+;	rtn = svcSchAlarm(function, handle, vector, data, date, time);
+;  Value returned is the alarm handle if normal (0 if alarm removed) or a
+;    negative error code if error
+
+psvcSchAlarm::
+	SVCENTR	CNTSchAlarm#
+rsvcSchAlarm::
+	MOVL	EAX, SS:pdaArg1#	;Get function
+	CMPL	EAX, #4.B		;Legal function?
+	JA	knlBadFunc#		;No
+	JMPIL	alarmdsp[EAX*4]		;Yes - dispatch on the function
+
+;Dispatch table
+
+	DATA
+
+alarmdsp:
+	.LONG	knlBadFunc#	;	    = 0 - Illegal
+	.LONG	alarmremove	;ALF_REMOVE = 1 - Clear alarm
+	.LONG	alarmtime	;ALF_TIME   = 2 - Request alarm signal at
+				;		    specified date and time
+	.LONG	alarmintr	;ALF_INTR   = 3 - Request alarm signal after
+				;		    specified interval
+	.LONG	alarmrept	;ALF_REPT   = 4 - Request repeated alarm signal
+
+
+	CODE
+.PAGE
+;Here for the ALF_REMOVE function for the svcSchAlarm SVC - Remove alarm
+
+alarmremove:
+	MOVL	EAX, SS:pdaArg2#	;Get handle
+	TESTL	EAX, EAX
+	JLE	6$.S			;Fail if illegal value
+	TOFORK
+	CALL	alarmfind		;Find wake block for the alarm
+	JC	2$.S			;Fail if can't find it
+	CALL	knlWakeRemove#		;Found it - give up the wake block
+	FROMFORK
+	CLRL	EAX			;Return 0
+	RET
+
+2$:	FROMFORK
+	JMP	6$.S
+
+;Here for the AL_TIME function for the svcSchAlarm SVC - Request alarm
+;  signal at specified date and time
+
+alarmtime:
+	CALL	knlGetSysDtTm#		;Get current date and time
+	SUBL	SS:pdaArg6#, EAX	;Convert the argument to an incremental
+	SBBL	SS:pdaArg5#, EDX	;  value
+	JS	10$.S			;If time was in the past!
+					;OK - fall into alrmintr
+
+;Here for the AL_INTR function for the svcSysAlarm SVC - Request alarm
+;  signal after specified interval
+
+alarmintr:
+	CALL	toticks			;Convert interval to ticks					;OK - 
+	JS	6$.S
+	PUSHL	#0.B			;Remember not repeated
+	JMP	14$.S
+
+4$:	ADDL	ESP, #12t.B
+6$:	MOVL	EAX, #ER_BDALM
+	RET
+
+8$:	POPL	EAX
+10$:	JMP	knlBadValue#
+
+12$:	ADDL	ESP, #12t.B
+	RET
+
+;Here for the AL_REPT function for the svcSysAlarm SVC - Request repeated
+;  alarm signal
+
+alarmrept:
+	CALL	toticks			;Convert interval to ticks
+	PUSHL	EAX			;Remember interval for repeated
+					;  interrupts
+14$:	MOVL	EDX, SS:pdaArg3#	;Get vector number
+	PUSHL	EDX			;Save vector number
+	PUSHL	EAX			;Save wake count
+	MOVL	EAX, EDX
+	CALL	knlChkVector#		;Is this vector set up?
+	JC	12$.S			;No - fail
+
+	CMPB	AH, #2			;Real mode vector?
+	JB	18$.S			;No
+	CMPW	SS:pdaRMPage0#-200h*4+2[EAX*4], #100h ;Yes - is vector set up?
+	JA	20$.S			;Yes
+16$:	MOVL	EAX, #ER_VECNS		;No - indicate error
+	JMP	12$.S
+
+18$:	TESTB	SS:pdaIdt#+it_type[EAX*8], #87h ;Is the vector set up?
+	JE	16$.S			;No
+20$:	MOVL	EAX, SS:pdaArg2#	;Yes - get handle
+	TESTL	EAX, EAX
+	JE	22$.S			;If want to allocate new handle
+	JS	4$.S			;Fail if illegal value
+	CALL	alarmfind		;Find wake block for the alarm
+	JC	4$.S			;Fail if can't find it
+	TOFORK				;Found it
+	CALL	knlWakeUnlink#		;Remove block from the wake list
+	POPL	EAX			;Restore new wake count
+	CALL	knlWakeInsert#		;Put the wake block back in the list
+	FROMFORK
+	JMP	32$			;Continue
+
+;Here if want to allocate a new wake handle
+
+22$:	MOVL	EAX, SS:pdaAlrmNum	;Do we have too many alarms now?
+	CMPL	EAX, almlimit#
+	JB	24$.S			;No - go on
+	ADDL	ESP, #12t.B		;Yes - fail
+	MOVL	EAX, #ER_TMALM
+	RET
+
+;Here if can have another alarm
+
+24$:	MOVL	EBX, #alarmdone		;Get offset of clock routine
+	CLRL	EDI
+	MOVW	DI, SS
+	POPL	EAX			;Restore wake count
+	TOFORK
+	CALL	knlWakeRequest#		;Enter the wake request
+	JNC	26$.S			;Go on if OK
+	FROMFORK			;If error
+	ADDL	ESP, #8t.B
+	RET
+
+;Here with new wake request entered in the system's wake list
+
+26$:	FROMFORK
+	MOVL	EAX, SS:pdaArg4#	;Store the signal data
+	MOVL	wkb_sigdata.B[ESI], EAX
+	MOVL	EAX, SS:pdaAlrmFWkB#	;Link this wake block to our list
+	MOVL	wkb_pnext.B[ESI], EAX
+	TESTL	EAX, EAX
+	JE	28$.S
+	MOVL	wkb_pprev.B[EAX], ESI
+	CLRL	EAX
+28$:	MOVL	wkb_pprev.B[ESI], EAX
+	MOVB	wkb_sigcnt.B[ESI], AL	;Indicate no signals pending
+	MOVL	SS:pdaAlrmFWkB#, ESI
+	INCL	SS:pdaAlrmNum#		;Count the alarm
+	MOVL	wkb_remove.B[ESI], #alarmrmv ;Store offset of the remove routine
+	INCL	SS:pdaAlrmHndl#		;Bump the wake handle
+	JNS	30$.S			;Just to be safe!!
+	MOVL	SS:pdaAlrmHndl#, #1
+30$:	MOVL	EAX, SS:pdaAlrmHndl#	;Store alarm handle in the wake block
+	MOVL	wkb_handle.B[ESI], EAX
+32$:	POPL	wkb_vector.B[ESI]	;Store vector number
+	POPL	wkb_interval.B[ESI]	;Store repeat interval
+	MOVL	EAX, wkb_handle.B[ESI]	;Return the handle value
+	RET
+.PAGE
+;Subroutine to find wake block for alarm given the alarm handle
+;	c{EAX} = Alarm handle
+;	CALL	alarmfind
+;	C:clr = Normal
+;	  c{ESI} = Offset of wake block
+;	C:set = Error
+
+alarmfind:
+	MOVL	ESI, SS:pdaAlrmFWkB#	;Point to first alarm wake block
+	TESTL	ESI, ESI
+	JE	4$.S			;Fail if no alarm wake blocks
+2$:	CMPL	wkb_handle.B[ESI], EAX	;This one?
+	JE	6$.S			;Yes - return with it
+	MOVL	ESI, wkb_pnext.B[ESI]	;No - advance to next
+	TESTL	ESI, ESI
+	JNE	2$.S			;Continue if more to check
+4$:	STC				;Fail if no more
+6$:	RET
+
+;Subroutine to convert interval value to ticks
+;	CALL	toticks
+;	c{EAX} = Number of ticks
+
+toticks:MOVL	EAX, SS:pdaArg6#	;Get fractional part of length
+	MULL	knlLitTPD#		;Convert to ticks
+	IMULL	EAX, SS:pdaArg5#, #TICKSPERDAY ;Also convert whole number part
+	TESTL	EAX, EAX
+	JS	8$.S
+	ADDL	EAX, EDX		;Get total
+8$:	JS	knlBadValue#		;If too big
+	TESTL	EAX, EAX		;Make sure not 0
+	JNE	ret020.S
+	INCL	EAX
+ret020:	RET
+.PAGE
+;Subroutine called at fork level in scheduler context at end of alarm interval
+;	c[ES] = Selector of PDA
+;	CALL	alarmdone
+
+alarmdone:
+	MOVL	ES, EDI			;Get PDA selector in right register
+	CMPB	wkb_sigcnt.B[ESI], #0	;Have any signals pending?
+	JNE	2$.S			;Yes - don't request another one
+	MOVL	EAX, wkb_vector.B[ESI]	;Get vector number
+	PUSHL	ESI			;No
+	CALL	knlGetQel#		;Yes - allocate a signal link block
+	JC	10$.S			;If error
+	MOVB	slb_szindx.B[ESI], #0
+	MOVB	BL, #SIGT_NORMAL	;Get isgnal type
+	MOVL	ECX, #2			;2 data items
+	CLRL	EDX
+	CALL	knlReqSignal#		;Request signal
+	JC	8$.S			;This should not fail!
+	MOVL	EDX, ESI
+	POPL	ESI
+	TESTL	EDX, EDX		;Did it work?
+	JE	12$.S			;No
+	MOVL	EAX, wkb_handle.B[ESI]	;Store clock handle
+	MOVL	slb_data+0.B[EDX], EAX
+	MOVL	EAX, wkb_sigdata.B[ESI]	;Store user's value as signal data
+	MOVL	slb_data+4.B[EDX], EAX
+	CMPL	wkb_interval.B[ESI], #0.B ;Want to repeat this?
+	JE	12$.S			;No
+	MOVL	slb_grantsub.B[EDX], #alarmgrant ;Yes - store offset and data
+	MOVL	slb_grantEDI.B[EDX], ESI	 ;  for grant subroutine
+	MOVB	wkb_sigcnt.B[ESI], #1	;Set the count of pending signals
+2$:	MOVL	EAX, wkb_interval.B[ESI] ;Get repeat interval value
+4$:	CALL	knlWakeInsert#		;Put wake block back in the wake list
+	STC				;Set C to indicate still using block
+6$:	RET
+
+8$:	CRASH	ERQS			;[Error ReQuesting Signal]
+
+;Here if error allocating a signal link block, just try again next tick!
+
+10$:	POPL	ESI			;Restore offset of the wake block
+	MOVL	EAX, #1
+	JMP	4$.S
+
+;Subroutine called when a repeated alarm signal is granted, ignored, or cleared.
+;  This subroutine is called through the slb_grantsub dispatch in the SLB for
+;  an alarm signal.
+;	c(AL) = Function:
+;		  SGF_GRANTED = 0 - Signal granted
+;		  SGF_CLEARED = 1 - Signal ignored because cleared
+;		  SGF_NOVECT  = 2 - Signal ignored because no vector
+;		  SGF_ALLCLR  = 3 - All signals cleared
+;	c{EDI} = Offset of the wake block
+;	CALL	alramgrant
+
+alarmgrant:
+	MOVB	wkb_sigcnt.B[EDI], #0	;Clear the signal count
+	CMPB	AL, #SGF_CLEARED	;Was the signal issued or individually
+					;  cleared?
+	JBE	6$.S			;Yes - thats all we need to do now
+	MOVL	ESI, EDI		;No - get WKB offset in right register
+	JMP	knlWakeRemove#		;Give up the wake block (this will call
+					;  alarmrmv through the wkb_remove
+					;  dispatch)
+
+;Subroutine to unlink an alarm wake block we are finished with.  This is called
+;  as a result of a dispatch through wkb_remove in knlWakeRemove.  It will be
+;  only called at main program level raised to fork level.
+;	c{ESI} = Offset of the alarm wake block
+;	CALL	alarmrmv
+
+alarmrmv:
+	CMPB	wkb_sigcnt.B[ESI], #0	;Do we have a signal pending?
+	JE	12$.S			;No - go on
+	MOVL	EAX, ESI		;Yes - remove the pending signal
+	MOVL	EDX, #alarmgrant	;  (clrsignal will call alarmgrant with
+	PUSHL	ESI			;  c(AL) = 2, which will clear
+	CALL	clrsignal#		;  wkb_sigcnt and then call alarmrmv!)
+	POPL	ESI
+	RET
+
+;Here if no signal is pending
+
+12$:	MOVL	ES, wkb_EDI.B[ESI]
+	DECL	ES:pdaAlrmNum#		;Reduce number of active alarms
+	JS	20$.S
+	MOVL	EDX, wkb_pprev.B[ESI]	;Get offset of previous block
+	MOVL	EAX, wkb_pnext.B[ESI]	;Get offset of next block
+	TESTL	EDX, EDX		;Have a previous block?
+	JE	14$.S			;No
+	MOVL	wkb_pnext.B[EDX], EAX	;Yes
+	JMP	16$.S
+
+14$:	MOVL	ES:pdaAlrmFWkB#, EAX
+16$:	TESTL	EAX, EAX		;Have a next block?
+	JE	18$.S			;No
+	MOVL	wkb_pprev.B[EAX], EDX	;Yes
+18$:	RET				;Return with C clear to indicate we
+					;  are finished with the wake block
+					;  if we got here through alarmdone
+
+20$:	CRASH	BDAC			;[BaD Alarm Count]
+
+	END

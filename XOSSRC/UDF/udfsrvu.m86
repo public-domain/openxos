@@ -1,0 +1,2279 @@
+	.TITLE	UDFSRVU - UDFSRV routines to access the UDF
+
+;++++
+; This software is in the public domain.  It may be freely copied and used
+; for whatever purpose you see fit, including commerical uses.  Anyone
+; modifying this software may claim ownership of the modifications, but not
+; the complete derived code.  It would be appreciated if the authors were
+; told what this software is being used for, but this is not a requirement.
+
+;   THIS SOFTWARE IS PROVIDED BY THE AUTHORS "AS IS" AND ANY EXPRESS OR
+;   IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
+;   OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+;   IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+;   INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+;   BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS
+;   OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+;   ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR
+;   TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
+;   USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+;----
+
+	.PROC	80386
+
+	.INCLUD	XOSINC:\XMAC\STDIO.PAR
+	.INCLUD	XOSINC:\XMAC\CTYPE.PAR
+	.INCLUD	XOSINC:\XMAC\PROCARG.PAR
+	.INCLUD	XOSINC:\XMAC\XOS.PAR
+	.INCLUD	XOSINC:\XMAC\XOSX.PAR
+	.INCLUD	XOSINC:\XMAC\XOSERR.PAR
+	.INCLUD	XOSINC:\XMAC\XOSTIME.PAR
+	.INCLUD	XOSINC:\XMAC\XOSTRM.PAR
+	.INCLUD	XOSINC:\XMAC\XOSNET.PAR
+	.INCLUD	XOSINC:\XMAC\XOSXNET.PAR
+	.INCLUD	XOSINC:\XMAC\XOSTHREADS.PAR
+	.INCLUD	XOSINC:\XMAC\XOSUDF.PAR
+	.INCLUD	UDFSRV.PAR
+
+	.STDSEGS
+
+	.PSECT	_TEXT_p
+
+;Main thread function for the UDP thread
+
+;Note that the only thread call done here is for UDP input.  All other IO
+;  (which is all disk IO) is done using normal blocking calls.  The effect
+;  of this is that this code is only interruptable when it is waiting for
+;  a datagram.  This greatly simplifies interlocking this code with the
+;  other threads for the instance and makes it possible to use a single
+;  common data area for this routine for all instances.
+
+udpthread::
+	MOVL	ESI, thdData#
+	CALL	udpinit#		;Initialize the UDP thread
+	MOVB	idb_udperrcnt[ESI], #4t
+udploop::
+	PUSHL	idb_udphndl[ESI]	;Get a datagram
+	PUSHL	DS
+	LEAL	EAX, idb_udpbufr[ESI]
+	PUSHL	EAX
+	PUSHL	#UDFRECSIZE
+	PUSHL	DS
+	LEAL	EAX, idb_udpparms[ESI]
+	PUSHL	EAX
+	CALLF	thdIoInBlockP#
+	TESTL	EAX, EAX
+	JNS	6$.S			;If OK
+	DECB	idb_udperrcnt[ESI]
+	JE	2$.S
+	MOVL	EBX, #udpiemsg		;If error
+	CALL	logerror#
+	JMP	udploop.S
+
+;Here if have too many input errors - terminate the session!
+
+2$:	MOVL	EBX, #udpixmsg
+	CALL	logerror#
+4$:	JMP	giveidb#
+
+;Here with a UDP datagram
+
+6$:	MOVB	idb_udperrcnt[ESI], #4t
+	CMPB	srvDebugLevel#, #0
+	JE	8$.S
+	PUSHL	EAX
+	LEAL	EDX, idb_udpbufr[ESI]
+	MOVL	ECX, EAX
+	MOVL	EBX, #udpistr
+	CALL	logmsg#
+	POPL	EAX
+8$:	MOVL	EBX, idb_accesslist[ESI] ;Check our access list
+10$:	TESTL	EBX, EBX
+	JE	udploop			;If he's not in the access list
+	MOVL	EDX, idb_udpparms+4t[ESI] ;Compare addresses
+	XORL	EDX, 4.B[EBX]
+	ANDL	EDX, 8.B[EBX]
+	JE	12$.S			;Found him - go on
+	MOVL	EBX, [EBX]
+	JMP	10$.S
+
+;Here with sender's masked address found in our access list
+
+12$:	MOVL	ECX, EAX		;Get length of the message
+	SUBL	ECX, #16t.B		;Minus the header
+	JLE	udploop		;Ignore it if no data
+	CMPB	idb_udpbufr+0[ESI], #MT_UDF ;No - is the message type right?
+	JNE	4$.S			;No - ignore it
+	CMPB	idb_udpbufr+1[ESI], #UDFM_BILLREQ ;Is this a billing function?
+	JAE	billfunction#		;Yes - go handle that
+	CMPB	idb_udpbufr+1[ESI], #UDFM_DATAREQ ;Is it a data request?
+	JNE	4$.S			;No - ignore it
+	MOVL	EAX, idb_udpbufr+8t[ESI] ;Get the bits in the right order
+	XCHGB	AL, AH
+	RORL	EAX, #16t
+	XCHGB	AL, AH
+	MOVL	idb_bits1[ESI], EAX
+	TESTB	AL, #URQ1$DELETE	;Want to delete the record?
+	JE	16$.S			;No
+	ANDB	AL, #~{URQ1$UPDATE|URQ1$CREATE} ;Yes - make sure no extra bits
+16$:	MOVL	EAX, idb_udpbufr+12t[ESI]
+	XCHGB	AL, AH
+	RORL	EAX, #16t
+	XCHGB	AL, AH
+	MOVL	idb_bits2[ESI], EAX
+	PUSHL	ECX
+	MOVL	ECX, #CLEARNUM		;Initialize our data
+	MOVL	EDI, #clearbgn
+	PUSHL	DS
+	POPL	ES
+	CLD
+	CLRL	EAX
+	RSTOSL	[EDI]
+	MOVL	ECX, #LENNUM
+	MOVL	EDI, #lentbl
+18$:	MOVL	EBX, [EDI]
+	MOVW	[EBX], AX
+	ADDL	EDI, #4.B
+	LOOP	ECX, 18$
+	POPL	ECX
+	LEAL	EBX, idb_udpbufr+16t[ESI]
+	DECL	ECX
+	JS	reqmerr
+	MOVZBL	EAX, [EBX]		;Get length of the group name
+	INCL	EBX
+
+;;; CODE HERE TO CHECK GROUP NAME
+
+	SUBL	ECX, EAX
+	JS	reqmerr
+	ADDL	EBX, EAX
+
+	DECL	ECX
+	JS	reqmerr
+	MOVZBL	EAX, [EBX]		;Get length of the key string
+	ORL	EAX, EAX
+	JE	notfound.S		;Say not found if 0 length key!
+	INCL	EBX
+	SUBL	ECX, EAX
+	JL	reqmerr
+	MOVL	msgleft, ECX
+	CMPL	EAX, #16t.B
+	JA	reqmerr
+	MOVL	ECX, EAX
+	MOVL	EDI, EBX
+	ADDL	EBX, EAX
+	MOVL	msgpnt, EBX
+	CALL	forceupper#
+	CALL	calindex
+	TESTB	idb_bits1+0[ESI], #URQ1$KEYUID ;Do we have a user ID key?
+	JNE	20$.S			;Yes
+	CALL	findname
+	JNC	found.S
+	JMP	notfound.S
+
+;Here if have a user ID key
+
+20$:	CALL	findid
+	JNC	found.S
+notfound:
+	TESTB	idb_bits1+0[ESI], #URQ1$CREATE ;Want to create the record?
+	JNE	updbgn			;Yes
+	INCL	idb_ntfdcnt[ESI]
+	MOVB	DL, #UDFM_NOTFND	;No - fail
+uerr0:	JMP	usrerror0
+
+;Here if have error in the format of the request message
+
+reqmerr::
+	INCL	idb_mfmtcnt[ESI]
+	MOVB	DL, #UDFM_MSGFMT
+	JMP	uerr0.S
+
+udpistr: .ASCIZ	"UDPINP"
+udpiemsg:.ASCIZ	"UDP input error"
+udpixmsg:.ASCIZ	"Too many UDP input errors (SESSION TERMINATED)"
+.PAGE
+2$:	INCL	idb_exstcnt[ESI]
+	MOVB	DL, #UDFM_EXISTS
+	JMP	uerr0.S
+
+;Here with a match on the key - now read the record from the UDF
+
+found:	TESTB	idb_bits1+0[ESI], #URQ1$UPDATE ;Want to update the record?
+	JNE	4$.S			;Yes
+	TESTB	idb_bits1+0[ESI], #URQ1$CREATE ;Want to create the record?
+	JNE	2$.S			;Yes - fail!
+	INCL	idb_readcnt[ESI]	;No - count the read request
+4$:	MOVL	inxblk, EBX		;Save offset of the index entry
+	ANDB	idb_bits1+0[ESI], #~URQ1$CREATE
+	MOVL	EAX, inx_offset.B[EBX]	;Set offset for input
+	MOVL	idb_bgnpos[ESI], EAX	;Remember where this record starts
+	CALL	readbegin#
+	JC	syserr			;If error
+.PAGE
+;Here with the input initialized - now we parse the record and store the
+;  various fields in fixed places, with the prefix bytes removed so we can
+;  handle them easily
+
+	CALL	getbyte#		;Get beginning of record byte
+	JC	2$.S
+	CMPB	AL, #0AAh		;Is it right?
+	JNE	4$.S			;No!
+	CALL	getbyte#		;Yes - get record type
+2$:	JC	badfmt
+	CMPB	AL, #1			;Make sure really have a user record!
+	JE	6$.S
+	CMPB	AL, #2
+4$:	JNE	badfmt.S
+6$:	MOVB	rectype, AL
+lvl2lp:	CALL	getl1byte#		;Get the record type byte
+	JC	10$.S			;If error
+	CMPB	AL, #L2BLKMAX		;Valid record type?
+	JA	badfmt.S		;No!
+	INCL	EDI			;Yes
+	PUSHL	EAX
+	CALL	getl1varval#		;Get the record size
+	POPL	EDX			;Restore record byte
+	JC	8$.S			;If error
+	MOVL	idb_lvl2left[ESI], EAX	;Yes
+	JMPIL	lvl2dsp[EDX*4]		;Dispatch on the block type
+
+;Here if found the end of the block while getting the level 2 record length.
+;  This can happen if we have a single EOR byte at the end.  (This is not a
+;  common case, so its quicker to check for it here!)
+
+8$:	CMPB	AL, #1
+	JA	badfmt.S
+	ORL	EDX, EDX
+	JE	usrrdy
+	JMP	badfmt.S
+
+;Here if error getting the record type byte
+
+10$:	CMPB	AL, #1
+	JBE	usrrdy
+
+;Here with illegal format in the UDF record
+
+badfmt:	INCL	idb_ufmtcnt[ESI]
+	MOVB	DL, #UDFM_UDFFMT
+	JMP	usrerror0
+
+;Level 2 record type dispatch table
+
+	.MOD	4
+lvl2dsp:.LONG	l2eor		;	      =  0 - End of record
+	.LONG	l2username	;UDF_USERNAME =  1 - User name
+	.LONG	l2password	;UDF_PASSWORD =  2 - Password
+	.LONG	l2userdesc	;UDF_USERDESC =  3 - User description
+	.LONG	l2program	;UDF_PROGRAM  =  4 - Initial program
+	.LONG	l2homdir	;UDF_HOMEDIR  =  5 - Home directory
+	.LONG	l2avlpriv	;UDF_AVLPRIV  =  6 - Available privileges
+	.LONG	l2inlpriv	;UDF_INLPRIV  =  7 - Initial privileges
+	.LONG	l2alwmem	;UDF_AVLMEM   =  8 - Allowed memory limits
+	.LONG	l2inlmem	;UDF_INLMEM   =  9 - Initial active memory limits
+	.LONG	l2alwcpu	;UDF_AVLCPU   = 10 - Available CPU limits
+	.LONG	l2inlcpu	;UDF_INLCPU   = 11 - Initial active CPU limits
+	.LONG	l2pswdexp	;UDF_PSWDEXP  = 12 - Password expiration
+	.LONG	l2userexp	;UDF_USEREXP  = 13 - User expiration
+	.LONG	badfmt		;	      = 14 - Illegal
+	.LONG	l2history	;UDF_HISTORY  = 15 - Login history
+	.LONG	l2dirlist	;UDF_DIRLIST  = 16 - User directory listing
+	.LONG	l2access	;UDF_ACCESS   = 17 - Access permissions
+	.LONG	l2avlsect	;UDF_AVLSECT  = 18 - Available sections
+	.LONG	l2inlsect	;UDF_INLSECT  = 19 - Initial sections
+	.LONG	badfmt		;	      = 20 - Illegal
+	.LONG	badfmt		;	      = 21 - Illegal
+	.LONG	badfmt		;	      = 22 - Illegal
+	.LONG	badfmt		;	      = 23 - Illegal
+	.LONG	l2billing	;UDF_BILLING  = 24 - Billing data
+	.LONG	l2crdtcard	;UDF_CRDTCARD = 25 - Credit card data
+	.LONG	badfmt		;	      = 26 - Illegal
+	.LONG	badfmt		;	      = 27 - Illegal
+	.LONG	badfmt		;	      = 28 - Illegal
+	.LONG	badfmt		;	      = 29 - Illegal
+	.LONG	badfmt		;	      = 30 - Illegal
+	.LONG	badfmt		;	      = 31 - Illegal
+	.LONG	l2userid	;UDF_USERID   = 32 - User ID
+	.LONG	l2mailname	;UDF_MAILNAME = 33 - Mailing name
+	.LONG	l2company	;UDF_COMPANY  = 34 - Company name
+	.LONG	l2addr1		;UDF_ADDR1    = 35 - Address - line 1
+	.LONG	l2addr2		;UDF_ADDR2    = 36 - Address - line 2
+	.LONG	l2addr3		;UDF_ADDR3    = 37 - Address - line 3
+	.LONG	l2addr4		;UDF_ADDR4    = 38 - Address - line 4
+	.LONG	l2city		;UDF_CITY     = 39 - City
+	.LONG	l2state		;UDF_STATE    = 40 - State
+	.LONG	l2zip		;UDF_ZIP      = 41 - Postal (ZIP) code
+	.LONG	l2country	;UDF_COUNTRY  = 42 - Country
+	.LONG	l2phone		;UDF_PHONE    = 43 - Phone number
+L2BLKMAX=!{$-lvl2dsp}/4-1
+.PAGE
+;Here for an end-of-record byte
+
+l2eor:	CALL	getl1byte#
+	JNC	l2eor.S
+	CMPB	AL, #1
+	JBE	usrrdy
+	JMP	badfmt
+
+;Here for a password record
+
+l2password:
+	MOVL	EBX, #pswdlen
+	JMP	l2string
+
+;Here for a user name (UDF_USERNAME) record
+
+l2username:
+	PUSHL	#usnmorglen
+	MOVL	EBX, #usnmlen
+	JMP	4$.S
+
+;Here for a user ID (UDF_USERID) record
+
+l2userid:
+	PUSHL	#usidorglen
+	MOVL	EBX, #usidlen
+4$:	PUSHL	EBX
+	CALL	strstring
+	MOVL	EDI, [ESP]
+	MOVZWL	ECX, [EDI]
+	ADDL	EDI, #4.B
+	CALL	forceupper#
+	POPL	EAX
+	POPL	EDI
+	PUSHL	ESI
+	MOVL	ESI, EAX
+	MOVZWL	ECX, [ESI]
+	MOVW	[EDI], CX
+	ADDL	ESI, #4.B
+	ADDL	EDI, #4.B
+	PUSHL	DS
+	POPL	ES
+	CLD
+	RMOVSB	[EDI], [ESI]
+	POPL	ESI
+	JMP	lvl2lp
+
+;Here for a user description (UDF_USERDESC) record
+
+l2userdesc:
+	MOVL	EBX, #desclen
+	JMP	l2string.S
+
+;Here for an initial program record
+
+l2program:
+	MOVL	EBX, #proglen
+	JMP	l2string.S
+
+;Here for a home directory record
+
+l2homdir:
+	MOVL	EBX, #dirlen
+l2string:
+	CALL	strstring
+	JMP	lvl2lp			;Continue
+.PAGE
+;Here for a mailing name (UDF_MAILNAME) record
+
+l2mailname:
+	MOVL	EBX, #mlnmlen
+	JMP	l2string.S
+
+;Here for a company name (UDF_COMPANY) record
+
+l2company:
+	MOVL	EBX, #complen
+	JMP	l2string.S
+
+;Here for a address line 1 (UDF_ADDR1) record
+
+l2addr1:
+	MOVL	EBX, #adr1len
+	JMP	l2string.S
+
+;Here for a address line 2 (UDF_ADDR2) record
+
+l2addr2:
+	MOVL	EBX, #adr2len
+	JMP	l2string.S
+
+;Here for a address line 3 (UDF_ADDR3) record
+
+l2addr3:
+	MOVL	EBX, #adr3len
+	JMP	l2string.S
+
+;Here for a address line 4 (UDF_ADDR4) record
+
+l2addr4:
+	MOVL	EBX, #adr4len
+	JMP	l2string.S
+
+;Here for a city (UDF_CITY) record
+
+l2city:
+	MOVL	EBX, #citylen
+	JMP	l2string.S
+
+;Here for a state (UDF_STATE) record
+
+l2state:
+	MOVL	EBX, #statlen
+	JMP	l2string
+
+;Here for a postal (ZIP) code (UDF_ZIP) record
+
+l2zip:
+	MOVL	EBX, #ziplen
+	JMP	l2string
+
+;Here for a country (UDF_COUNTRY) record
+
+l2country:
+	MOVL	EBX, #cntrlen
+	JMP	l2string
+
+;Here for a phone number (UDF_PHONE) record
+
+l2phone:
+	MOVL	EBX, #fonelen
+	JMP	l2string
+.PAGE
+;Here for an available privileges record
+
+l2avlpriv:
+	MOVL	EBX, #avlplen
+	JMP	l2string
+
+;Here for an initial privileges record
+
+l2inlpriv:
+	MOVL	EBX, #inlplen
+	JMP	l2string
+
+;Here for an available sections record
+
+l2avlsect:
+	MOVL	EBX, #avlslen
+	JMP	l2string
+
+;Here for an initial sections record
+
+l2inlsect:
+	MOVL	EBX, #inlslen
+	JMP	l2string
+
+;Here for an access permissions record
+
+l2access:
+	MOVL	EBX, #accslen
+	JMP	l2string
+
+;Here for a credit card data record
+
+l2crdtcard:
+	MOVL	EBX, #ccrdlen
+	JMP	l2string
+
+;Here for a billing data record
+;  This block contains the following:
+;	BILLFLG    (1) Billing flags
+;	BILLSTS    (1) Billing status
+;	BILLDAY    (1) Billing day
+;	BILLTYPE   (1) Billing type
+;	BILLCLASS  (1) Billing class
+;	PAYTYPE    (1) Type of last payment
+;	           (2) Not used
+;	FREETIME   (4) Free time
+;	BILLTIME   (4) Billed time
+;	CONNCHRG   (4) Connect charges
+;	OTHRCHRG   (4) Other charges
+;	MAXCHRG    (4) Maximum charge balance allowed
+;	LSTPRCDATE (4) Last processing date
+;	LSTPAYAMNT (4) Last payment amount
+;	LSTPAYDATE (4) Last payment date
+;	RETRYDATE  (4) Date payment will be retried
+;	NXTPAYDATE (4) Next payment date
+
+
+l2billing:
+	MOVL	ECX, #BILLDATASZ	;Get size of the data area
+	MOVL	EBX, #billdata		;Point to the data area
+6$:	CALL	getl2byte#		;Get a byte
+	JC	10$.S			;If end of string or error
+	MOVB	[EBX], AL		;Store the byte
+	INCL	EBX
+	LOOP	ECX, 6$			;Continue if room for more
+8$:	CALL	getl2byte#
+	JNC	8$.S
+10$:	JREGZ	ECX, 14$
+12$:	MOVB	[EBX], #0
+	INCL	EBX
+	LOOP	ECX, 12$
+14$:	CMPL	EAX, #1			;Normal end of string?
+	JA	udferr			;No - error
+	MOVB	billchng, #0		;Indicate not changed
+	MOVB	billpres, #1		;Indicate present
+	JMP	lvl2lp
+.PAGE
+;Here for an available memory limits record
+;	WSALLOW - Allowed working set limit value
+;	TMALLOW - Allowed total memory limit value
+;	PMALLOW - Allowed protected mode memory limit value
+;	RMALLOW - Allowed real mode memory limit value
+;	OMALLOW - Allowed overhead memory limit value
+
+l2alwmem:
+	MOVL	EBX, #wsallow
+	JMP	2$.S
+
+;Here for an active memory limits record
+;  This block contains 0 to 5 variable length values:
+;	WSLIMIT - Active working set limit value
+;	TMLIMIT - Active total memory limit value
+;	PMLIMIT - Active protected mode memory limit value
+;	RMLIMIT - Active real mode memory limit value
+;	OMLIMIT - Active overhead memory limit value
+
+l2inlmem:
+	MOVL	EBX, #wslimit
+2$:	MOVL	ECX, #5t
+	CALL	getl2varval#		;Get value
+	JC	badfmt
+	MOVL	[EBX], EAX
+	ADDL	EBX, #4t.B
+	LOOP	ECX, 2$
+4$:	CALL	getl2byte#
+	JNC	4$.S
+	JMP	chkerr.S
+
+lvl2nxt:MOVL	EAX, idb_lvl2left[ESI]
+lvl2nx2:ADDL	EDI, EAX
+	JMP	lvl2lp
+
+;Here for an available CPU limits record
+
+l2alwcpu:
+	JMP	lvl2nxt.S
+
+;Here for an active CPU limits record
+
+l2inlcpu:
+	JMP	lvl2nxt.S
+
+;Here for a password expiration record
+
+l2pswdexp:
+	JMP	lvl2nxt.S
+
+;Here for a user expriation record
+
+l2userexp:
+	JMP	lvl2nxt.S
+
+;Here for a login history record
+
+l2history:
+	MOVL	ECX, #20t
+	MOVL	EBX, #loghist
+6$:	CALL	getl2byte#		;Get a byte
+	JC	10$.S			;If end of string or error
+	MOVB	[EBX], AL		;Store the byte
+	INCL	EBX
+	LOOP	ECX, 6$			;Continue if room for more
+	PUSHL	EBX			;Too long - discard the excess
+8$:	CALL	getl2byte#
+	JNC	8$.S
+	POPL	EBX
+10$:	CMPL	EAX, #1.B		;Normal end of string?
+	JA	udferr.S		;No - error
+	MOVL	ECX, loghist+20t	;Get amount left over
+	SUBL	ECX, EBX
+	PUSHL	DS
+	POPL	ES
+	CLD
+	CLRL	EAX			;Clear the rest of the buffer
+	RSTOSB	[EDI]
+	JMP	lvl2lp			;Continue
+
+;Here if error
+
+udferr:	CMPL	EAX, #2.B		;Format error?
+	JE	badfmt			;Yes
+	INCL	idb_errcnt[ESI]		;No - report IO error
+xoserr::MOVB	DL, #UDFM_ERROR
+	JMP	usrerror
+
+;Here for a user directory listing record
+
+l2dirlist:
+	MOVB	dirlist, #0
+	CALL	getl2byte#		;Get the single data byte
+	JC	chkerr.S
+	MOVB	dirlist, AL		;Store the new value
+14$:	CALL	getl2byte#		;Eat any extra bytes
+	JNC	14$.S
+chkerr:	CMPL	EAX, #1.B
+	JA	udferr.S
+	JMP	lvl2lp
+.PAGE
+	.SBTTL	strstring - Subroutine to store string
+
+;Subroutine to store string from a level 2 record
+;	c{EBX} = Offset of length value for string (must be followed by
+;		   buffer and preceeded by change flag)
+;	CALL	strstring
+
+strstring:
+	MOVZWL	ECX, 2.B[EBX]		;Get size of the buffer
+	ADDL	EBX, #4t.B		;Point to the buffer
+	PUSHL	EBX
+6$:	CALL	getl2byte#		;Get a byte
+	JC	10$.S			;If end of string or error
+	MOVB	[EBX], AL		;Store the byte
+	INCL	EBX
+	LOOP	ECX, 6$			;Continue if room for more
+	PUSHL	EBX			;Too long - discard the excess
+8$:	CALL	getl2byte#
+	JNC	8$.S
+	POPL	EBX
+10$:	CMPL	EAX, #1			;Normal end of string?
+	JA	udferr.S		;No - error
+	POPL	EDX			;Yes - restore offset of buffer
+	SUBL	EBX, EDX		;Calculate length of string
+	MOVW	-4.B[EDX], BX		;Store length
+	MOVB	-8.B[EDX], #0		;Indicate not changed
+	RET
+.PAGE
+;Here if password does not match
+
+badpswd:MOVB	DL, #UDFM_BADPWD
+	JMP	usrerror0
+
+;Here with the user record parsed - now we update any fields he specifed
+;  in his request
+
+usrrdy:	MOVL	EAX, idb_blkpos[ESI]	;Get the size of the record
+	ADDL	EAX, idb_blkpnt[ESI]
+	SUBL	EAX, #idb_blkbufr
+	SUBL	EAX, ESI
+	SUBL	EAX, idb_bgnpos[ESI]
+	MOVL	oldsize, EAX
+	TESTB	idb_bits1+0[ESI], #URQ1$DELETE ;Want to delete the record?
+	JE	8$.S			;No
+	CMPL	idb_comppos[ESI], #0.B	;Yes - are we compressing?
+	JNE	comperr			;Yes - fail
+	CLRL	EAX			;No
+	MOVB	usidchg, #1
+	MOVW	usidlen, AX
+	MOVB	usnmchg, #1
+	MOVW	usnmlen, AX
+	CLRL	ECX
+	JMP	delrec
+
+;Here if not deleting the record
+
+8$:	TESTB	idb_bits1+0[ESI], #URQ1$UPDATE ;Want to update the record?
+	JE	usrupdd			;No - go on
+updbgn:	CLRL	EAX			;Yes
+	MOVL	updcnt, EAX
+	MOVB	AL, rectype
+	MOVB	rectype, #1		;Assume it should be active
+	TESTB	idb_bits1+1[ESI], #URQ1$INACTIVE>8t ;Want to make it inactive?
+	JE	12$.S			;No
+	INCB	rectype			;Yes
+12$:	CMPB	rectype, AL		;Did we change the active state?
+	JE	14$.S			;No
+	INCL	updcnt			;Yes - indicate record changed
+14$:	MOVL	EDI, msgpnt		;Point to data
+updlp:	CMPL	msgleft, #0.B		;Finished?
+	JE	upddone			;Yes
+	DECL	msgleft			;No
+	JS	22$.S
+	MOVZBL	EDX, [EDI]		;Get record type
+	INCL	EDI
+	DECL	msgleft
+	JS	20$.S
+	MOVZBL	EAX, [EDI]		;Get record length
+	INCL	EDI
+	TESTB	AL, #80			;Need another byte?
+	JE	16$.S			;No
+	DECL	msgleft
+	JS	22$.S
+	ANDL	EAX, #7Fh.B		;Yes
+	MOVB	AH, AL
+	MOVB	AL, [EDI]
+	INCL	EDI
+16$:	SUBL	msgleft, EAX		;Reduce amount left in record
+	JS	22$.S
+	MOVL	msgsize, EAX		;Save size of this record
+	CMPL	EDX, #UPDBLKMAX.B	;Legal function?
+	JA	22$.S			;No
+	JMPIL	CS:upddsp[EDX*4]	;Probably - dispatch on it
+
+;Here if don't have a count byte - this is OK if the type is 0!
+
+20$:	ORL	EDX, EDX
+	JE	upddone
+22$:	JMP	updferr
+
+	.MOD	4
+upddsp:	.LONG	upddone		;	      =  0 - End of record
+	.LONG	updusername	;UDF_USERNAME =  1 - User name
+	.LONG	updpassword	;UDF_PASSWORD =  2 - Password
+	.LONG	upduserdesc	;UDF_USERDESC =  3 - User description
+	.LONG	updprogram	;UDF_PROGRAM  =  4 - Initial program
+	.LONG	updhomedir	;UDF_HOMEDIR  =  5 - Home directory
+	.LONG	updavlpriv	;UDF_AVLPRIV  =  6 - Available privileges
+	.LONG	updinlpriv	;UDF_INLPRIV  =  7 - Initial privileges
+	.LONG	updalwmem	;UDF_AVLMEM   =  8 - Allowed memory limits
+	.LONG	updinlmem	;UDF_INLMEM   =  9 - Initial active memory limits
+	.LONG	updalwcpu	;UDF_AVLCPU   = 10 - Available CPU limits
+	.LONG	updinlcpu	;UDF_INLCPU   = 11 - Initial active CPU limits
+	.LONG	updpswdexp	;UDF_PSWDEXP  = 12 - Password expiration
+	.LONG	upduserexp	;UDF_USEREXP  = 13 - User expiration
+	.LONG	updferr		;	      = 14 - Illegal
+	.LONG	updhistory	;UDF_HISTORY  = 15 - Login history
+	.LONG	upddirlist	;UDF_DIRLIST  = 16 - User directory listing
+	.LONG	updaccess	;UDF_ACCESS   = 17 - Access permissions
+	.LONG	updavlsect	;UDF_AVLSECT  = 18 - Available sections
+	.LONG	updinlsect	;UDF_INLSECT  = 19 - Initial sections
+	.LONG	updferr		;	      = 20 - Illegal
+	.LONG	updferr		;	      = 21 - Illegal
+	.LONG	updferr		;	      = 22 - Illegal
+	.LONG	updferr		;	      = 23 - Illegal
+	.LONG	updbilling	;UDF_BILLING  = 24 - Billing data
+	.LONG	updcrdtcard	;UDF_CRDTCARD = 25 - Credit card data
+	.LONG	updferr		;	      = 26 - Illegal
+	.LONG	updferr		;	      = 27 - Illegal
+	.LONG	updferr		;	      = 28 - Illegal
+	.LONG	updferr		;	      = 29 - Illegal
+	.LONG	updferr		;	      = 30 - Illegal
+	.LONG	updferr		;	      = 31 - Illegal
+	.LONG	upduserid	;UDF_USERID   = 32 - User ID
+	.LONG	updmailname	;UDF_MAILNAME = 33 - Mailing name
+	.LONG	updcompany	;UDF_COMPANY  = 34 - Company name
+	.LONG	updaddr1	;UDF_ADDR1    = 35 - Address - line 1
+	.LONG	updaddr2	;UDF_ADDR2    = 36 - Address - line 2
+	.LONG	updaddr3	;UDF_ADDR3    = 37 - Address - line 3
+	.LONG	updaddr4	;UDF_ADDR4    = 38 - Address - line 4
+	.LONG	updcity		;UDF_CITY     = 39 - City
+	.LONG	updstate	;UDF_STATE    = 40 - State
+	.LONG	updzip		;UDF_ZIP      = 41 - Postal (ZIP) code
+	.LONG	updcountry	;UDF_COUNTRY  = 42 - Country
+	.LONG	updphone	;UDF_PHONE    = 43 - Phone number
+UPDBLKMAX=!{$-upddsp}/4-1
+.PAGE
+;Here for illegal update record type
+
+updferr:INCL	idb_mfmtcnt[ESI]
+	MOVB	DL, #UDFM_MSGFMT
+	JMP	usrerror0
+
+;Here for UDF_USERNAME update record - User name
+
+updusername:
+	MOVL	EBX, #usnmlen
+	JMP	updfup
+
+;Here for UDF_PASSWORD update record - Password
+
+updpassword:
+	MOVL	EBX, #pswdlen
+	JMP	updstring
+
+;Here for UDF_USERDESC update record - User description
+
+upduserdesc:
+	MOVL	EBX, #desclen
+	JMP	updstring
+
+;Here for UDF_PROGRAM update record - Initial program
+
+updprogram:
+	MOVL	EBX, #proglen
+	JMP	updstring
+
+;Here for UDF_HOMEDIR update record - Home directory
+
+updhomedir:
+	MOVL	EBX, #dirlen
+	JMP	updstring
+
+;Here for UDF_AVLPRIV update record - Available privileges
+
+updavlpriv:
+	MOVL	EBX, #avlplen
+	JMP	updstring
+
+;Here for UDF_INLPRIV update record - Initial privileges
+
+updinlpriv:
+	MOVL	EBX, #inlplen
+	JMP	updstring
+
+;Here for UDF_AVLSECT update record - Available sections
+
+updavlsect:
+	MOVL	EBX, #avlslen
+	JMP	updstring
+
+;Here for UDF_INLSECT update record - Initial sections
+
+updinlsect:
+	MOVL	EBX, #inlslen
+	JMP	updstring
+
+;Here for UDF_ACCESS update record - Access permissions
+
+updaccess:
+	MOVL	EBX, #accslen
+	JMP	updstring
+
+;Here for UDF_CRDTCARD update record - Credit card data
+
+updcrdtcard:
+	MOVL	EBX, #ccrdlen
+	JMP	updstring
+
+;Here for UDF_BILLING update record - Billing data
+;  This block contains the following:
+;	BILLFLG    (1) Billing flags
+;	BILLSTS    (1) Billing status
+;	BILLDAY    (1) Billing day
+;	BILLTYPE   (1) Billing type
+;	BILLCLASS  (1) Billing type
+;	PAYTYPE    (1) Type of last payment
+;	           (2) Not used
+;	FREETIME   (4) Free time
+;	BILLTIME   (4) Billed time
+;	CONNCHRG   (4) Connect charges
+;	OTHRCHRG   (4) Other charges
+;	MAXCHRG    (4) Maximum charge balance allowed
+;	LSTPRCDATE (4) Last processing date
+;	LSTPAYAMNT (4) Last payment amount
+;	LSTPAYDATE (4) Last payment date
+;	RETRYDATE  (4) Date payment will be retried
+;	NXTPAYDATE (4) Next payment date
+;  This is 8 1-byte values followed by 10 4-byte values.  For all values, a
+;    value of all bits 1 means to not change the value.
+
+updbilling:
+	MOVL	EBX, #billdata
+	MOVL	ECX, #8t
+6$:	DECL	msgsize
+	JS	14$.S
+	MOVB	AL, [EDI]		;Get a byte
+	INCL	EDI
+	CMPB	AL, #0FFh		;Want to change it?
+	JE	8$.S			;No
+	MOVB	[EBX], AL		;Yes - store the value
+8$:	INCL	EBX
+	LOOP	ECX, 6$			;Continue if more
+	MOVL	ECX, #10t
+10$:	SUBL	msgsize, #4t.B
+	JS	14$.S
+	MOVL	EAX, [EDI]		;Get a long
+	ADDL	EDI, #4t.B
+	CMPL	EAX, #0FFFFFFFFh.B	;Want to change it?
+	JE	12$.S			;No
+	MOVL	[EBX], EAX		;Yes - store the value
+12$:	MOVL	EBX, #4t.B
+	LOOP	ECX, 10$
+14$:	MOVB	billpres, #1		;Indicate billing data is present and
+	MOVB	billchng, #1		;  has been changed
+	INCL	updcnt
+	JMP	updnext
+.PAGE
+;Here for UDF_AVLMEM update record - Allowed memory limits
+
+updalwmem:
+	JMP	updnext
+
+;Here for UDF_INLMEM update record - Initial active memory limits
+
+updinlmem:
+	JMP	updnext
+
+;Here for UDF_AVLCPU update record - Available CPU limits
+
+updalwcpu:
+	JMP	updnext
+
+;Here for UDF_INLCPU update record - Initial active CPU limits
+
+updinlcpu:
+	JMP	updnext
+
+;Here for UDF_PSWDEXP update record - Password expiration
+
+updpswdexp:
+	JMP	updnext
+
+;Here for UDF_USEREXP update record - User expiration
+
+upduserexp:
+	JMP	updnext
+
+;Here for UDF_HISTORY update record - Login history
+
+updhistory:
+	MOVL	ECX, msgsize		;Get message length
+	CMPL	ECX, #20t.B		;Want to update entire record?
+	JE	10$.S			;Yes
+	CMPL	ECX, #4t.B		;No - want to update both counts?
+	JE	8$.S			;Yes
+	CMPL	ECX, #2t.B		;No - want to update one count?
+	JNE	updnext.S		;No - ignore this!
+	MOVZWL	EAX, [EDI]		;Yes - get user new count value
+	XCHGB	AL, AH
+	MOVW	loghist+18t, AX		;Store it
+	JMP	updnext.S
+
+;Here to update both counts
+
+8$:	MOVL	ECX, #1
+	JMP	12$.S
+
+;Here to update entire record
+
+10$:	MOVL	ECX, #5
+12$:	MOVL	EBX, #loghist+16t
+	PUSHL	EDI
+14$:	MOVL	EAX, [EDI]
+	ADDL	EDI, #4.B
+	XCHGB	AL, AH
+	RORL	EAX, #16t
+	XCHGB	AL, AH
+	MOVL	[EBX], EAX
+	SUBL	EBX, #4.B
+	LOOP	ECX, 14$
+	POPL	EDI
+	JMP	updnext.S
+.PAGE
+;Here for UDF_DIRLIST update record - User directory listing
+
+upddirlist:
+	CMPL	msgsize, #0.B
+	JE	updnext.S
+	MOVB	AL, [EDI]
+	MOVB	dirlist, AL
+	INCL	updcnt
+updnext:ADDL	EDI, msgsize
+	JMP	updlp
+
+;Here for UDF_USERID update record - User ID
+
+upduserid:
+	MOVL	EBX, #usidlen
+updfup:	MOVL	ECX, EAX
+	PUSHL	EAX
+	CALL	forceupper#
+	POPL	EAX
+	JMP	updstring.S
+
+;Here for UDF_MAILNAME update record - Mailing name
+
+updmailname:
+	MOVL	EBX, #mlnmlen
+	JMP	updstring.S
+
+;Here for UDF_COMPANY update record - Company name
+
+updcompany:
+	MOVL	EBX, #complen
+	JMP	updstring.S
+
+;Here for UDF_ADDR1 update record - Address - line 1
+
+updaddr1:
+	MOVL	EBX, #adr1len
+	JMP	updstring.S
+
+;Here for UDF_ADDR2 update record - Address - line 2
+
+updaddr2:
+	MOVL	EBX, #adr2len
+	JMP	updstring.S
+
+;Here for UDF_ADDR3 update record - Address - line 3
+
+updaddr3:
+	MOVL	EBX, #adr3len
+	JMP	updstring.S
+
+;Here for UDF_ADDR4 update record - Address - line 4
+
+updaddr4:
+	MOVL	EBX, #adr4len
+	JMP	updstring.S
+
+;Here for UDF_CITY update record - City
+
+updcity:
+	MOVL	EBX, #citylen
+	JMP	updstring.S
+
+;Here for UDF_STATE update record - State
+
+updstate:
+	MOVL	EBX, #statlen
+	JMP	updstring.S
+
+;Here for UDF_ZIP update record - Postal (ZIP) code
+
+updzip:
+	MOVL	EBX, #ziplen
+	JMP	updstring.S
+
+;Here for UDF_COUNTRY update record - Country
+
+updcountry:
+	MOVL	EBX, #cntrlen
+	JMP	updstring.S
+
+;Here for UDF_PHONE update record - Phone number
+
+updphone:
+	MOVL	EBX, #fonelen
+updstring:
+	MOVL	EAX, msgsize		;Are we changing the size?
+	CMPW	AX, [EBX]
+	JNE	4$.S			;Yes
+	ORL	EAX, EAX		;No - is it null?
+2$:	JE	updnext			;Yes - no change at all
+	PUSHL	EDI			;No - are we changing the string at all?
+	PUSHL	ESI
+	LEAL	ESI, 4.B[EBX]
+	MOVL	ECX, EAX
+	PUSHL	DS
+	POPL	ES
+	CLD
+	RECMPSB	[EDI], [ESI]
+	POPL	ESI
+	POPL	EDI
+	JE	2$.S			;If not changing it!
+4$:	CMPW	2.B[EBX], AX		;Changing it - is the new length too
+					;  big?
+	JAE	6$.S			;No
+	MOVW	AX, 2.B[EBX]		;Yes - truncate the string!
+6$:	MOVW	[EBX], AX		;Store new length
+	PUSHL	ESI			;Copy the string
+	MOVL	ESI, EDI
+	LEAL	EDI, 4.B[EBX]
+	MOVL	ECX, EAX
+	PUSHL	DS
+	POPL	ES
+	CLD
+	RMOVSB	[EDI], [ESI]
+	MOVL	EDI, ESI
+	POPL	ESI
+	MOVB	-4.B[EBX], #1		;Indicate changed
+	INCL	updcnt
+	JMP	updlp
+.PAGE
+;Here if creating a record and don't have a user name or user ID specified
+
+2$:	INCL	idb_noixcnt[EDI]
+	MOVB	DL, #UDFM_NOINX
+	JMP	usrerror0
+
+;Here when finished updating the fields for a record - now we have to construct
+;  an actual output record provided we actually changed anything!
+
+upddone:MOVW	AX, usnmlen		;Yes - have either a user name or
+	ORW	AX, usidlen		;  user ID field specified?
+	JE	2$.S			;No - fail
+	CMPL	updcnt, #0.B		;Yes - did we really change anything?
+	JE	usrupdd			;No - forget this!
+	MOVL	outleft, #UDFRECSIZE-2
+	MOVL	outpnt, #outbfr+2
+	MOVB	outbfr+0, #0AAh		;Store beginning of block byte
+	MOVB	AL, rectype		;Store record type
+	MOVB	outbfr+1, AL
+	MOVL	EBX, #usnmlen		;Build user name record
+	MOVB	AL, #UDF_USERNAME
+	CALL	storestrudf
+	JC	10$.S
+	MOVL	EBX, #pswdlen		;Build password record
+	MOVB	AL, #UDF_PASSWORD
+	CALL	storestrudf
+	JC	10$.S
+	MOVL	EBX, #desclen		;Build user description record
+	MOVB	AL, #UDF_USERDESC
+	CALL	storestrudf
+	JC	10$.S
+	MOVL	EBX, #proglen		;Build initial program record
+	MOVB	AL, #UDF_PROGRAM
+	CALL	storestrudf
+	JC	10$.S
+	MOVL	EBX, #dirlen		;Build home directory record
+	MOVB	AL, #UDF_HOMEDIR
+	CALL	storestrudf
+	JC	10$.S
+	MOVL	EBX, #avlplen		;Build available privileges record
+	MOVB	AL, #UDF_AVLPRIV
+	CALL	storestrudf
+	JC	10$.S
+	MOVL	EBX, #inlplen		;Build initial privileges record
+	MOVB	AL, #UDF_INLPRIV
+	CALL	storestrudf
+	JC	10$.S
+	MOVL	EBX, #avlmval		;Build available memory limits record
+	MOVB	AL, #UDF_AVLMEM
+	CALL	bldmem
+	JC	10$.S
+	MOVL	EBX, #inlmval		;Build initial memory limits record
+	MOVB	AL, #UDF_INLMEM
+	CALL	bldmem
+	JC	10$.S
+	MOVL	EBX, #avlcval		;Build available CPU limits record
+	MOVB	AL, #UDF_AVLCPU
+	CALL	bldcpu
+10$:	JC	16$.S
+	MOVL	EBX, #inlcval		;Build initial CPU limits value record
+	MOVB	AL, #UDF_INLCPU
+	CALL	bldcpu
+	JC	16$.S
+	MOVL	EBX, #pwddtm		;Build password expiration record
+	MOVB	AL, #UDF_PSWDEXP
+	CALL	bldtime
+	JC	16$.S
+	MOVL	EBX, #usrdtm		;Build user expiration record
+	MOVB	AL, #UDF_USEREXP
+	CALL	bldtime
+	JC	16$.S
+	MOVL	EAX, loghist+4t		;Do we have any log-in history data?
+	ORL	EAX, loghist+12t
+	JE	14$.S			;No
+	MOVB	AL, #UDF_HISTORY	;Yes
+	CALL	beginrecudf
+	JC	16$.S
+	MOVL	ECX, #20t
+	MOVL	EDX, #loghist
+12$:	MOVB	AL, [EDX]
+	INCL	EDX
+	CALL	putbyteudf
+	JC	16$.S
+	LOOP	ECX, 12$
+	CALL	endrecudf
+14$:	CMPB	dirlist, #0		;Do we have any user directory list
+					;  data?
+	JE	18$.S			;No
+	MOVB	AL, #UDF_DIRLIST
+	CALL	beginrecudf
+16$:	JC	20$
+	MOVB	AL, dirlist
+	CALL	putbyteudf
+	JC	20$
+	CALL	endrecudf
+18$:	MOVL	EBX, #accslen		;Build access permissions record
+	MOVB	AL, #UDF_ACCESS
+	CALL	storestrudf
+	JC	20$.S
+	MOVL	EBX, #avlslen		;Build available sections record
+	MOVB	AL, #UDF_AVLSECT
+	CALL	storestrudf
+	JC	20$.S
+	MOVL	EBX, #inlslen		;Build initial sections record
+	MOVB	AL, #UDF_INLSECT
+	CALL	storestrudf
+	JC	20$.S
+	CMPB	billpres, #0		;Do we have any billing data?
+	JE	19$.S			;No
+	MOVL	EBX, #billdata
+	MOVL	ECX, #BILLDATASZ
+	MOVB	AL, #UDF_BILLING
+	CALL	storeinudf
+19$:	MOVL	EBX, #ccrdlen		;Build credit card data record
+	MOVB	AL, #UDF_CRDTCARD
+	CALL	storestrudf
+	JC	20$.S
+	MOVL	EBX, #usidlen		;Build user ID record
+	MOVB	AL, #UDF_USERID
+	CALL	storestrudf
+	JC	20$.S
+	MOVL	EBX, #mlnmlen		;Build mailing name record
+	MOVB	AL, #UDF_MAILNAME
+	CALL	storestrudf
+	JC	20$.S
+	MOVL	EBX, #complen		;Build company name record
+	MOVB	AL, #UDF_COMPANY
+	CALL	storestrudf
+	JC	20$.S
+	MOVL	EBX, #adr1len		;Build address line 1 record
+	MOVB	AL, #UDF_ADDR1
+	CALL	storestrudf
+20$:	JC	24$.S
+	MOVL	EBX, #adr2len		;Build address line 2 record
+	MOVB	AL, #UDF_ADDR2
+	CALL	storestrudf
+	JC	24$.S
+	MOVL	EBX, #adr3len		;Build address line 3 record
+	MOVB	AL, #UDF_ADDR3
+	CALL	storestrudf
+	JC	24$.S
+	MOVL	EBX, #adr4len		;Build address line 4 record
+	MOVB	AL, #UDF_ADDR4
+	CALL	storestrudf
+	JC	24$.S
+	MOVL	EBX, #citylen		;Build city record
+	MOVB	AL, #UDF_CITY
+	CALL	storestrudf
+	JC	24$.S
+	MOVL	EBX, #statlen		;Build state record
+	MOVB	AL, #UDF_STATE
+	CALL	storestrudf
+	JC	24$.S
+	MOVL	EBX, #ziplen		;Build postal (ZIP) code record
+	MOVB	AL, #UDF_ZIP
+	CALL	storestrudf
+	JC	24$.S
+	MOVL	EBX, #cntrlen		;Build country record
+	MOVB	AL, #UDF_COUNTRY
+	CALL	storestrudf
+	JC	24$.S
+	MOVL	EBX, #fonelen		;Build phone number record
+	MOVB	AL, #UDF_PHONE
+	CALL	storestrudf
+24$:	JC	usrerror
+					;OK - fall into strrec on next page
+.PAGE
+;Here with the new user record constructed - now store it in the UDF
+
+strrec:	CMPB	usnmchg, #0		;Did we change the user name?
+	JE	2$.S			;No
+	CMPL	idb_comppos[ESI], #0.B	;Yes - are we compressing?
+	JNE	4$.S			;Yes - fail
+	MOVZWL	ECX, usnmlen		;No
+	JREGZ	ECX, 2$
+	MOVL	EDI, #usnmbfr		;See if the new name is in use
+	CALL	calindex#
+	MOVL	nmnewx, EDX
+	CALL	findname#
+	MOVL	EDX, #1
+	JC	2$.S			;OK if not there
+	CMPL	EBX, inxblk		;Found it - it is us?
+	JNE	6$.S			;No - fail
+2$:	CMPB	usidchg, #0		;Did we change the user ID?
+	JE	8$.S			;No
+	CMPL	idb_comppos[ESI], #0.B	;Yes - are we compressing?
+4$:	JNE	comperr			;Yes - fail
+	MOVZWL	ECX, usidlen		;No
+	JREGZ	ECX, 8$
+	MOVL	EDI, #usidbfr		;See if the new name is in use
+	CALL	calindex#
+	MOVL	idnewx, EDX
+	CALL	findid
+	MOVL	EDX, #2
+	JC	8$.S			;OK if not there
+	CMPL	EBX, inxblk		;Found it - it is us?
+6$:	JNE	12$			;No - fail!
+8$:	MOVL	idb_blkpos[ESI], #-1	;Indicate buffer is not valid
+	CMPL	idb_comppos[ESI], #0.B	;Yes - are we compressing?
+	JNE	14$.S			;Yes - always write at the end of the
+					;  file
+	MOVL	EDI, outpnt		;No - get size of the block
+	SUBL	EDI, #outbfr
+	CMPL	EDI, oldsize		;Is it bigger than the old record?
+	JA	14$.S			;Yes - write it at the end
+	MOVL	ECX, oldsize		;No - get difference
+	SUBL	ECX, EDI
+	ADDL	EDI, #outbfr
+	PUSHL	ES			;Clear the difference
+	POPL	DS
+	MOVB	AL, #0
+	CLD
+	RSTOSB	[EDI]
+	MOVL	EAX, idb_bgnpos[ESI]	;Set position for IO
+	MOVL	iopos#, EAX
+	PUSHL	idb_udfhndl[ESI]	;Write out the data
+	PUSHL	DS
+	PUSHL	#outbfr
+	PUSHL	oldsize
+	PUSHL	DS
+	PUSHL	#ioparms#
+	CALLF	svcIoOutBlockP##
+	TESTL	EAX, EAX
+	JS	syserr.S		;If error
+	INCL	idb_ovrcnt[ESI]		;OK - count the in-place update
+	JMP	usrupdw
+
+syserr:	INCL	idb_errcnt[ESI]		;If error
+	MOVB	DL, #UDFM_ERROR
+	JMP	usrerror
+
+;Here if the new user name or user ID is in use
+
+12$:	INCL	idb_inuscnt[ESI]
+	MOVB	DL, #UDFM_INUSE
+	JMP	usrerror0
+
+;Here if the record is too big to store in place or if we are compressing.
+;  Store the new record at the end of the file, update the index entry, and
+;  mark the old version of the record as deleted.
+
+14$:	MOVL	ECX, idb_eofpos[ESI]	;Position to EOF
+	MOVL	iopos, ECX
+	MOVL	EAX, idb_udfhndl[ESI]
+	CMPL	idb_comppos[ESI], ECX
+	JBE	16$.S
+	MOVL	EAX, idb_comphndl[ESI]
+16$:	PUSHL	EAX			;Write out the data
+	PUSHL	DS
+	PUSHL	#outbfr
+	PUSHL	EDI
+	PUSHL	DS
+	PUSHL	#ioparms#
+	CALLF	svcIoOutBlockP##
+	TESTL	EAX, EAX
+20$:	JS	syserr.S
+	ADDL	idb_eofpos[ESI], EDI	;Advance EOF position
+	INCL	idb_reccnt[ESI]		;Count the new record
+	MOVL	EBX, inxblk		;Get offset of index block
+	ORL	EBX, EBX		;Do we have an index block?
+	JNE	delrec.S		;Yes - go on
+	PUSHL	ECX			;No - this must be a new entry
+	CALL	allocindex#		;Allocate an index block
+	POPL	ECX
+	JC	syserr
+	MOVL	inxblk, EBX
+	INCL	idb_addcnt[ESI]		;Count the add operation
+	INCL	idb_inxcnt[ESI]		;Increase count of indexed records
+	JMP	delrc2.S
+
+delheader:
+	.BYTE	0FFh
+.PAGE
+;Here if we already have an index block, which means we had an old record.  If
+;  we are compressing and this record has already been copied we delete the
+;  original record which has already been copied and add an entry to the list
+;  of records to copy so we will copy the new version.  If it has not been
+;  copied yet nothing special is needed since we are going to change the offset
+;  in the index block so the new record will be copied when we get around to
+;  it.  Note that this results in the new record being copied out of order and
+;  placed in the compressed file where the original record would have gone
+;  rather than at the end, but this does not harm at all.
+
+delrec:	MOVL	EAX, idb_bgnpos[ESI]
+	INCL	EAX			;Restore IO position
+	MOVL	iopos#, EAX
+	MOVL	EDX, idb_udfhndl[ESI]
+	CMPL	idb_comppos[ESI], EAX	;Have we already compressed this record?
+	JB	2$.S			;No
+	PUSHL	ECX
+	CALL	compaddtolist#		;Yes - add this block to the output list
+	POPL	ECX
+	JC	syserr			;If error
+	MOVL	EDX, idb_comphndl[ESI]
+2$:	PUSHL	EDX
+	PUSHL	DS			;Write out the record
+	PUSHL	#delheader
+	PUSHL	#1.B
+	PUSHL	DS
+	PUSHL	#ioparms#
+	CALLF	svcIoOutBlockP##
+	TESTL	EAX, EAX
+	JS	syserr			;If error
+	INCL	idb_delcnt[ESI]		;Count the deleted record
+	TESTB	idb_bits1+0[ESI], #URQ1$DELETE ;Did we delete the record?
+	JE	4$.S			;No
+	INCL	idb_rmvcnt[ESI]		;Yes - count the remove operation
+	JMP	delrc2.S
+
+4$:	INCL	idb_modcnt[ESI]		;Not delete - count modification
+delrc2:	MOVL	EBX, inxblk		;Update record offset in the index block
+	MOVL	inx_offset.B[EBX], ECX
+
+;Here with the user record updated - now we update the indexes if the user
+;  name or user ID fields changed
+
+usrupdw:MOVB	idb_commit[ESI], #1	;Indicate need to commit data to disk
+	CMPB	usnmchg, #0		;Did we change the user name?
+	JE	14$.S			;No
+	CMPW	usnmorglen, #0.B	;Yes - did we have a user name before?
+	JE	12$.S			;No
+	MOVL	EDI, #usnmorgbfr	;Yes - calculate orignal hash index
+	MOVZWL	ECX, usnmorglen
+	CALL	calindex#
+	CALL	findname#		;Find the index entry
+	JC	22$			;If not found (should not be possible!)
+	CMPL	inxblk, EBX		;Did we find the right block?
+	JNE	22$			;No!!!
+	DECL	idb_usnmcnt[ESI]	;Yes
+	MOVL	EAX, [EBX]		;Unlink this index block
+	MOVL	[EDX], EAX
+	CLRL	EAX
+	MOVL	[EBX], EAX
+12$:	MOVZWL	ECX, usnmlen
+	JREGZ	ECX, 14$
+	MOVL	EBX, inxblk
+	MOVL	EDX, nmnewx
+	MOVL	EDI, #usnmbfr
+	CALL	indexname#
+
+;Here with name field indexed if necessary
+
+14$:	CMPB	usidchg, #0		;Did we change the user ID?
+	JE	usrupdd			;No
+	CMPW	usidorglen, #0.B	;Yes - did we have a user ID before?
+	JE	16$.S			;No
+	MOVL	EDI, #usidorgbfr	;Yes - calculate orignal hash index
+	MOVZWL	ECX, usidorglen
+	CALL	calindex#
+	CALL	findid#			;Find the index entry
+	JC	22$.S			;If not found (should not be possible!)
+	CMPL	inxblk, EBX		;Did we find the right block?
+	JNE	22$.S			;No!!!
+	DECL	idb_usidcnt[ESI]	;Yes
+	MOVL	EAX, inx_nextid.B[EBX]	;Unlink this index block
+	MOVL	[EDX], EAX
+	CLRL	EAX
+	MOVL	inx_nextid.B[EBX], EAX
+16$:	MOVL	EBX, inxblk
+	MOVZWL	ECX, usidlen
+	JREGZ 	ECX, 18$
+	MOVL	EDX, idnewx
+	MOVL	EDI, #usidbfr
+	CALL	indexid#
+	JMP	usrupdd.S
+
+;Here if no user ID in the record - See if there is a user name and if not,
+;  give up the index block (this can only happen when we are deleting the
+;  record).
+
+18$:	CMPW	usnmlen, #0.B		;Have a user name?
+	JNE	usrupdd.S		;Yes
+	DECL	idb_inxcnt[ESI]
+	CALL	freeindex#		;No - give up this block (its already
+	JMP	usrupdd.S		;  been completely unlinked)
+
+;Here if cannot find index entry for user name or user ID or if we found the
+;  wrong block - this should not be possible!
+
+22$:	INCL	idb_srvrcnt[ESI]
+	MOVB	DL, #UDFM_SERVER
+	MOVL	EAX, #1
+24$:	JMP	usrerror
+
+;Here if trying to change user name or user ID or trying to delete the
+;  UDF record and the UDF is being compressed
+
+comperr:INCL	idb_compcnt[ESI]
+	MOVB	DL, #UDFM_COMPRS
+	JMP	usrerror0
+.PAGE
+;Here with the indexes updated if necessary - now we have to build and send
+;  our response packet
+
+usrupdd:MOVL	EBX, #rspbufr+16t
+	MOVL	rsppnt, EBX
+	MOVL	rspleft, #UDFRECSIZE-16t
+	MOVL	EAX, idb_udpbufr+0[ESI]	;Copy the header
+	MOVB	AH, #02
+	MOVL	-16t.B[EBX], EAX
+	MOVL	EAX, idb_udpbufr+4[ESI]
+	MOVL	-12t.B[EBX], EAX
+	MOVL	EAX, idb_bits1[ESI]
+	ANDB	AH, #~{{URS1$INACTIVE|URS1$ACTIVE}>8t}
+	ORB	AH, #URS1$ACTIVE>8t
+	CMPB	rectype, #1
+	JE	2$.S
+	XORB	AH, #{URS1$ACTIVE|URS1$INACTIVE}>8t
+2$:	XCHGB	AL, AH
+	RORL	EAX, #16t
+	XCHGB	AL, AH
+	MOVL	-8t.B[EBX], EAX
+	MOVL	EAX, idb_udpbufr+12t[ESI]
+	MOVL	-4t.B[EBX], EAX
+	TESTB	idb_bits1+2[ESI], #URQ1$USERNAME>16t ;Want to return user name?
+	JE	4$.S			;No
+	MOVB	AL, #UDF_USERNAME	;Yes
+	MOVL	EDI, #usnmlen
+	CALL	storestrrsp
+	JC	10$.S
+4$:	TESTB	idb_bits1+2[ESI], #URQ1$PASSWORD>16t ;Want to return password?
+	JE	6$.S			;No
+	MOVB	AL, #UDF_PASSWORD	;Yes
+	MOVL	EDI, #pswdlen
+	CALL	storestrrsp
+	JC	10$.S
+6$:	TESTB	idb_bits1+2[ESI], #URQ1$USERDESC>16t
+					;Want to return user description?
+	JE	8$.S			;No
+	MOVB	AL, #UDF_USERDESC	;Yes
+	MOVL	EDI, #desclen
+	CALL	storestrrsp
+	JC	10$.S
+8$:	TESTB	idb_bits1+2[ESI], #URQ1$PROGRAM>16t
+					;Want to return program specification?
+	JE	12$.S			;No
+	MOVB	AL, #UDF_PROGRAM	;Yes
+	MOVL	EDI, #proglen
+	CALL	storestrrsp
+10$:	JC	usrerror
+12$:	TESTB	idb_bits1+2[ESI], #URQ1$HOMEDIR>16t
+					;Want to return user directory?
+	JE	14$.S			;No
+	MOVB	AL, #UDF_HOMEDIR	;Yes
+	MOVL	EDI, #dirlen
+	CALL	storestrrsp
+	JC	10$.S
+14$:	TESTB	idb_bits1+2[ESI], #URQ1$AVLPRIV>16t
+					;Want to return available priviledges?
+	JE	16$.S			;No
+	MOVB	AL, #UDF_AVLPRIV	;Yes
+	MOVL	EDI, #avlplen
+	CALL	storestrrsp
+	JC	10$.S
+16$:	TESTB	idb_bits1+2[ESI], #URQ1$INLPRIV>16t
+					;Want to return initial priviledges?
+	JE	18$.S			;No
+	MOVB	AL, #UDF_INLPRIV	;Yes
+	MOVL	EDI, #inlplen
+	CALL	storestrrsp
+	JC	10$.S
+18$:	TESTB	idb_bits1+3[ESI], #URQ1$AVLMEM>24t
+					;Want to return available memory limits?
+	JE	20$.S			;No
+	MOVB	AL, #UDF_AVLMEM		;Yes
+	MOVL	EDI, #wsallow
+	CALL	storememrsp
+	JC	10$.S
+20$:	TESTB	idb_bits1+3[ESI], #URQ1$INLMEM>24t
+					;Want to return initial memory limits?
+	JE	24$.S			;No
+	MOVB	AL, #UDF_INLMEM		;Yes
+	MOVL	EDI, #wslimit
+	CALL	storememrsp
+22$:	JC	usrerror
+24$:	TESTB	idb_bits1+3[ESI], #URQ1$AVLCPU>24t
+					;Want to return availalbe CPU limits?
+	JE	26$.S			;No
+	MOVB	AL, #UDF_AVLCPU		;Yes
+	MOVL	EDI, #0
+	CALL	storecpursp
+	JC	22$.S
+26$:	TESTB	idb_bits1+3[ESI], #URQ1$INLCPU>24t
+					;Want to return initial CPU limits?
+	JE	28$.S			;No
+	MOVB	AL, #UDF_INLCPU		;Yes
+	MOVL	EDI, #0
+	CALL	storecpursp
+	JC	22$.S
+28$:	TESTB	idb_bits1+3[ESI], #URQ1$PSWDEXP>24t
+					;Want to return password expiration
+					;  date/time?
+	JE	30$.S			;No
+	MOVB	AL, #UDF_PSWDEXP	;Yes
+	MOVL	EDI, #pwddtm
+	CALL	storedtmrsp
+	JC	22$.S
+30$:	TESTB	idb_bits1+3[ESI], #URQ1$USEREXP>24t
+					;Want to return user expiration
+					;  date/time?
+	JE	32$.S			;No
+	MOVB	AL, #UDF_USEREXP	;Yes
+	MOVL	EDI, #usrdtm
+	CALL	storedtmrsp
+	JC	22$.S
+32$:	TESTB	idb_bits1+3[ESI], #URQ1$HISTORY>24t
+					;Want to return login history?
+	JE	36$.S			;No
+	MOVL	EDI, #loghist+20t
+	MOVL	EAX, -20t.B[EDI]	;Yes - do we have any login history
+	ORL	EAX, -12t.B[EDI]	;  data?
+	JE	36$.S			;No - nothing to return
+	MOVB	AL, #UDF_HISTORY	;Yes
+	CALL	putbytersp
+	JC	44$.S
+	MOVB	AL, #20t		;Its always 20 bytes
+	CALL	putbytersp
+	JC	44$.S
+	MOVL	ECX, #20t
+34$:	DECL	EDI
+	MOVB	AL, [EDI]
+	CALL	putbytersp
+	JC	44$.S
+	LOOP	ECX, 34$
+36$:	TESTB	idb_bits1+3[ESI], #URQ1$DIRLIST>24t
+					;Want to return user directory listing
+					;  status?
+	JE	40$.S			;No
+	CMPB	dirlist, #0		;Yes - do we have anything to return?
+	JE	40$.S			;No
+	MOVB	AL, #UDF_DIRLIST	;Yes
+	CALL	putbytersp
+	JC	44$.S
+	MOVB	AL, #1
+	CALL	putbytersp
+	JC	44$.S
+	MOVB	AL, dirlist
+	CALL	putbytersp
+	JC	44$.S
+40$:	TESTB	idb_bits2+0[ESI], #URQ2$ACCESS
+					;Want to return access permissions?
+	JE	42$.S			;No
+	MOVB	AL, #UDF_ACCESS		;Yes
+	MOVL	EDI, #accslen
+	CALL	storestrrsp
+	JC	44$.S
+42$:	TESTB	idb_bits2+0[ESI], #URQ2$AVLSECT
+					;Want to return available sections?
+	JE	46$.S			;No
+	MOVB	AL, #UDF_AVLSECT	;Yes
+	MOVL	EDI, #avlslen
+	CALL	storestrrsp
+44$:	JC	usrerror
+46$:	TESTB	idb_bits2+0[ESI], #URQ2$INLSECT
+					;Want to return initial sections?
+	JE	48$.S			;No
+	MOVB	AL, #UDF_INLSECT	;Yes
+	MOVL	EDI, #inlslen
+	CALL	storestrrsp
+	JC	44$.S
+48$:	TESTB	idb_bits2+0[ESI], #URQ2$BILLING ;Want to return billing data?
+	JE	50$.S			;No
+	CMPB	billpres, #0		;Yes - do we have any billing data?
+	JE	50$.S			;No
+	MOVL	ECX, #BILLDATASZ	;Yes - give it to him
+	MOVL	EDI, #billdata
+	MOVB	AL, #UDF_BILLING
+	CALL	storeinrsp
+	JC	44$.S
+50$:	TESTB	idb_bits2+1[ESI], #URQ2$CRDTCARD>8t
+					;Want to return credit card data?
+	JE	52$.S			;NO
+	MOVB	AL, #UDF_CRDTCARD	;Yes
+	MOVL	EDI, #ccrdlen
+	CALL	storestrrsp
+	JC	60$.S
+52$:	TESTB	idb_bits2+2[ESI], #URQ2$USERID>16t ;Want to return user ID?
+	JE	54$.S			;No
+	MOVB	AL, #UDF_USERID		;Yes
+	MOVL	EDI, #usidlen
+	CALL	storestrrsp
+	JC	60$.S
+54$:	TESTB	idb_bits2+2[ESI], #URQ2$MAILNAME>16t
+					;Want to return mailing name?
+	JE	56$.S			;No
+	MOVB	AL, #UDF_MAILNAME	;Yes
+	MOVL	EDI, #mlnmlen
+	CALL	storestrrsp
+	JC	60$.S
+56$:	TESTB	idb_bits2+2[ESI], #URQ2$COMPANY>16t
+					;Want to return company name?
+	JE	58$.S			;No
+	MOVB	AL, #UDF_COMPANY	;Yes
+	MOVL	EDI, #complen
+	CALL	storestrrsp
+	JC	60$.S
+58$:	TESTB	idb_bits2+2[ESI], #URQ2$ADDRESS>16t
+					;Want to return address lines?
+	JE	62$.S			;No
+	MOVB	AL, #UDF_ADDR1		;Yes - return address line 1
+	MOVL	EDI, #adr1len
+	CALL	storestrrsp
+	JC	60$.S
+	MOVB	AL, #UDF_ADDR2		;Return address line 2
+	MOVL	EDI, #adr2len
+	CALL	storestrrsp
+60$:	JC	usrerror
+	MOVB	AL, #UDF_ADDR3		;Return address line 3
+	MOVL	EDI, #adr3len
+	CALL	storestrrsp
+	JC	60$.S
+	MOVB	AL, #UDF_ADDR4		;Return address line 4
+	MOVL	EDI, #adr4len
+	CALL	storestrrsp
+	JC	60$.S
+	MOVB	AL, #UDF_CITY		;Return city
+	MOVL	EDI, #citylen
+	CALL	storestrrsp
+	JC	60$.S
+	MOVB	AL, #UDF_STATE		;Return state
+	MOVL	EDI, #statlen
+	CALL	storestrrsp
+	JC	60$.S
+	MOVB	AL, #UDF_ZIP		;Return postal (ZIP) code
+	MOVL	EDI, #ziplen
+	CALL	storestrrsp
+	JC	60$.S
+62$:	TESTB	idb_bits2+2[ESI], #URQ2$USERID>16t ;Want to return country?
+	JE	64$.S			;No
+	MOVB	AL, #UDF_COUNTRY	;Yes
+	MOVL	EDI, #cntrlen
+	CALL	storestrrsp
+	JC	60$.S
+64$:	TESTB	idb_bits2+2[ESI], #URQ2$USERID>16t
+					;Want to return phone number?
+	JE	usrsend.S		;No
+	MOVB	AL, #UDF_PHONE		;Yes
+	MOVL	EDI, #fonelen
+	CALL	storestrrsp
+	JC	60$.S
+					;OK - fall into usrsend on next page
+.PAGE
+;Here with the response message constructed.  Now send it
+
+usrsend:MOVL	ECX, rsppnt
+	SUBL	ECX, #rspbufr		;Store length of response packet
+usrsend2::
+	MOVL	EAX, idb_udpparms+4t[ESI] ;Copy network address for output
+	MOVL	rspipa#, EAX
+	MOVL	EAX, idb_udpparms+12t[ESI]
+	MOVL	rspport#, EAX
+	CMPB	srvDebugLevel#, #0
+	JE	4$.S
+	PUSHL	ECX
+	MOVL	EDX, #rspbufr
+	MOVL	EBX, #udpostr
+	CALL	logmsg#
+	POPL	ECX
+4$:	PUSHL	idb_udphndl[ESI]
+	PUSHL	DS
+	PUSHL	#rspbufr
+	PUSHL	ECX
+	PUSHL	DS
+	PUSHL	#rspparms#
+	CALLF	svcIoOutBlockP##
+	TESTL	EAX, EAX
+	JNS	udploop			;If OK
+	MOVL	EBX, #udpoemsg		;If error
+	CALL	logerror#
+	JMP	udploop
+
+;Here to report error to the user
+;	c(DL)  = UDFSRV error code (function)
+
+;Format of the error response packet:
+; Offset  Size  Use
+;    0      1	Packet type = MT_UDF = 97
+;    1      1   Function
+;    2      1   Packet number
+;    3      1   User sequence number
+;    4      4   User PID
+;    8      4   XOS error code (function = UDFM_ERROR) or server error
+;		  code (function = UDFM_SERVER)
+;   12      4	Reserved, always = 0
+
+usrerror0::
+	CLRL	EAX
+usrerror::				;Enter here with error code in EAX
+	MOVL	rspbufr+8, EAX
+	MOVL	rspbufr+12t, #0
+	MOVL	EAX, idb_udpbufr+0[ESI]
+	MOVB	AH, DL
+	MOVL	rspbufr+0, EAX
+	MOVL	EAX, idb_udpbufr+4[ESI]
+	MOVL	rspbufr+4, EAX
+	MOVL	ECX, #16t
+	JMP	usrsend2
+
+udpostr: .ASCIZ	"UDPOUT"
+udpqemsg:.ASCIZ	"Error queueing UDP input"
+udpoemsg:.ASCIZ	"Error writing UDP output"
+.PAGE
+	.SBTTL	storestrudf - Subroutine to build a record from a simple string value
+
+;Subroutine to build a record from a simple string value
+;	c(AL)  = Record type
+;	c{EBX} = Offset of string description data
+;	CALL	storestrudf
+;	C:set = Error
+;	  c{EAX} = Error code
+;	  c(DL)  = Function for response packet
+;	C:clr = Normal
+
+storestrudf:
+	MOVZWL	ECX, [EBX]		;Get length of string
+	JREGZ	ECX, 12$		;Nothing to do here if 0 length
+	ADDL	EBX, #4.B		;Point to the string buffer
+storeinudf:
+	CALL	putbyteudf		;Store record type
+	JC	14$.S			;If error
+	CMPL	ECX, #7Fh.B		;Need two bytes for the count?
+	JBE	8$.S			;No
+	MOVB	AL, CH			;Yes
+	ORB	AL, #80h
+	CALL	putbyteudf
+	JC	14$.S
+8$:	MOVB	AL, CL
+	CALL	putbyteudf
+	JC	14$.S
+10$:	MOVB	AL, [EBX]
+	INCL	EBX
+	CALL	putbyteudf
+	JC	14$.S
+	LOOP	ECX, 10$
+12$:	CLC
+14$:	RET
+
+
+bldcpu:
+	CLC
+	RET
+
+bldmem:
+	CLC
+	RET
+
+bldtime:
+	CLC
+	RET
+.PAGE
+;Subroutine to store a byte in the UDF file output buffer
+;	c(AL) = Byte to store
+;	CALL	putbyteudf
+;	C:set = Error
+;	  c{EAX} = Error code
+;	  c(DL)  = Function for response packet
+;	C:clr = Normal
+
+putbyteudf::
+	DECL	outleft
+	JS	10$.S
+	PUSHL	EBX
+	MOVL	EBX, outpnt
+	INCL	outpnt
+	CMPB	AL, #0AAh
+	JE	2$.S
+	CMPB	AL, #0ABh
+	JNE	4$.S
+2$:	MOVB	[EBX], #0ABh
+	INCL	EBX
+	INCL	outpnt
+	DECL	outleft
+	JS	8$.S
+	SUBB	AL, #0A9h
+4$:	MOVB	[EBX], AL
+	POPL	EBX
+	CLC
+	RET
+
+;Subroutine to begin an output record for the UDF - can only handle records
+;  with a one byte count.
+;	c(AL) = Record type
+;	CALL	beginrecudf
+;	C:set = Error
+;	  c{EAX} = Error code
+;	  c(DL)  = Function for response packet
+;	C:clr = Normal
+
+beginrecudf:
+	CALL	putbyteudf		;Store the record byte
+	JC	6$.S
+	MOVL	EAX, outpnt		;Save offset for the count byte
+	MOVL	outrec, EAX
+	INCL	outpnt
+	DECL	outleft
+	JS	10$.S
+6$:	RET
+
+;Here if the record is too long
+
+8$:	POPL	EBX
+10$:	INCL	idb_udflcnt[ESI]
+	MOVB	DL, #UDFM_UDFLNG
+	CLRL	EAX
+	STC
+	RET
+
+;Subroutine to terminate a record - beginrec must be called first
+;	CALL	endrecudf
+
+endrecudf:
+	PUSHL	EDX
+	MOVL	EAX, outrec
+	MOVL	EDX, outpnt
+	SUBL	EDX, EAX
+	DECL	EDX
+	MOVB	[EAX], DL
+	POPL	EDX
+	RET
+.PAGE
+	.SBTTL	storestrrsp - Subroutine to store string into response packet
+
+;Subroutine to store string into response packet
+;	c(AL)  = Record type
+;	c{EBX} = Pointer to current byte in output buffer
+;	c{EDI} = Offset of length/pointer pair
+;	CALL	storestrrsp
+;	C:set = Error
+;	  c{EAX} = Error code
+;	  c(DL)  = Function for response packet
+;	C:clr = Normal
+
+storestrrsp:
+	MOVZWL	ECX, [EDI]		;Get length of string
+	JREGZ	ECX, 6$			;Nothing to do if no string
+	ADDL	EDI, #4.B		;Point to the string buffer
+storeinrsp:
+	CALL	putbytersp		;Store record type
+	JC	6$.S
+	CMPL	ECX, #7F.B		;Need two bytes for the length?
+	JBE	2$.S			;No
+	MOVB	AL, CH			;Yes - store high byte
+	ORB	AL, #80h		;Indicate two byte value
+	CALL	putbytersp
+	JC	6$.S
+2$:	MOVB	AL, CL			;Store low byte
+	CALL	putbytersp
+	JC	6$.S
+4$:	MOVB	AL, [EDI]
+	INCL	EDI
+	CALL	putbytersp
+	JC	6$.S
+	LOOP	ECX, 4$
+6$:	RET
+
+	.SBTTL	storedtmrsp - Subroutine to store date/time value into response packet
+
+;Subroutine to store date/time value into response packet
+;	c(AL) = Record type
+;	c{EDI} = Offset of date/time value
+;	CALL	storedtmrsp
+;	C:set = Error
+;	  c{EAX} = Error code
+;	  c(DL)  = Function for response packet
+;	C:clr = Normal
+
+storedtmrsp:
+	MOVL	EDX, [EDI]		;Do we have a value?
+	ORL	EDX, 4.B[EDI]
+	JE	6$.S			;No - nothing needed here
+	CALL	putbytersp		;Begin the record
+	JC	6$.S
+	MOVB	AL, #20t
+	CALL	putbytersp
+	JC	6$.S
+	ADDL	EDI, #8t		;Store date/time value in network byte
+	MOVL	ECX, #8t		;  byte order
+8$:	DECL	EDI
+	MOVB	AL, [EDI]
+	CALL	putbytersp
+	JC	6$.S
+	LOOP	ECX, 8$
+	RET
+.PAGE
+	.SBTTL	storememrsp - Subroutine to memory limits into response packet
+
+;Subroutine to store memory limits into response packet
+;	c(AL) = Record type
+;	c{EDI} = Offset of data array
+;	CALL	storememrsp
+;	C:set = Error
+;	  c{EAX} = Error code
+;	  c(DL)  = Function for response packet
+;	C:clr = Normal
+
+storememrsp:
+	CLC
+	RET
+
+	.SBTTL	storecpursp - Subroutine to CPU limits into response packet
+
+;Subroutine to store CPU limits into response packet
+;	c(AL) = Record type
+;	c{EDI} = Offset of data array
+;	CALL	storecpursp
+;	C:set = Error
+;	  c{EAX} = Error code
+;	  c(DL)  = Function for response packet
+;	C:clr = Normal
+
+storecpursp:
+	CLC
+	RET
+.PAGE
+	.SBTTL	putbytersp - Store byte into a response packet
+
+;Subroutine to store byte into a response packet
+;	c(AL) = Byte value
+;	CALL	putbytersp
+;	C:set = Error
+;	  c{EAX} = Error code
+;	  c(DL)  = Function for response packet
+;	C:clr = Normal
+
+putbytersp:
+	DECL	rspleft			;More space available now?
+	JNS	4$.S			;Yes
+	MOVB	AL, rspbufr+2		;No - get packet number
+	ANDB	AL, #7Fh
+	CMPB	AL, #10t.B		;Too many packets?
+	JA	6$.S			;Yes
+	ORB	rspbufr+2, #80h		;No - indicate incomplete message
+	PUSHL	idb_udphndl[ESI]
+	PUSHL	DS			;Output this packet
+	PUSHL	#rspbufr
+	MOVL	EAX, rsppnt
+	SUBL	EAX, #rspbufr
+	PUSHL	EAX
+	PUSHL	DS
+	PUSHL	#rspparms
+	CALLF	svcIoOutBlockP##
+	ORL	EAX, EAX
+	JS	8$.S			;If error
+	INCB	rspbufr+2		;Increment packet number
+	MOVL	rsppnt, #rspbufr+8t	;Reset pointer and count
+	MOVL	rspleft, #UDFRECSIZE-9t
+4$:	PUSHL	EBX
+	MOVL	EBX, rsppnt		;Get pointer
+	MOVB	[EBX], AL		;Store byte
+	POPL	EBX
+	INCL	rsppnt			;Bump it
+	CLC				;Make sure C is clear
+	RET				;Finished
+
+;Here if have too many packets to send
+
+6$:	INCL	idb_rsplcnt[ESI]
+	MOVB	DL, #UDFM_RSPLNG
+	CLRL	EAX
+	STC
+	RET
+
+;Here if error sending the packet
+
+8$:	INCL	idb_errcnt[ESI]
+	MOVB	DL, #UDFM_ERROR
+	STC
+	RET
+.PAGE
+	.SBTTL	Data
+
+	.PSECT	_DATA_p
+
+msgleft:.LONG	0
+msgpnt:	.LONG	0
+msgsize:.LONG	0
+updcnt:	.LONG	0
+
+outpnt:: .LONG	0
+outleft::.LONG	0
+outrec:  .LONG	0
+outbfr:: .BLKB	UDFRECSIZE
+
+rsppnt:	 .LONG	0
+rspleft: .LONG	0
+rspbufr::.BLKB	UDFRECSIZE
+
+clearbgn::!
+
+oldsize: .LONG	0
+inxblk:: .LONG	0
+nmnewx:  .LONG	0
+idnewx:  .LONG	0
+
+
+avlmval:
+wsallow: .BLKL	1		;Allowed working set limit value
+tmallow: .BLKL	1		;Allowed total memory limit value
+pmallow: .BLKL	1		;Allowed protected mode memory limit value
+rmallow: .BLKL	1		;Allowed real mode memory limit value
+omallow: .BLKL	1		;Allowed overhead memory limit value
+
+inlmval:
+wslimit: .BLKL	1		;Initial working set limit value
+tmlimit: .BLKL	1		;Initial total memory limit value
+pmlimit: .BLKL	1		;Initial protected mode memory limit value
+rmlimit: .BLKL	1		;Initial real mode memory limit value
+omlimit: .BLKL	1		;Initial overhead memory limit value
+
+avlcval: .BLKL	1
+
+inlcval: .BLKL	1
+
+pwddtm:  .BLKL	2		;Password expiration date/time
+usrdtm:  .BLKL	2		;User expiration date/time
+
+loghist: .BLKL	2		;Last login date/time and counts (20 bytes)
+	 .BLKL	2
+	 .BLKW	2
+dirlist: .BYTE	0		;User directory listing bits (1 byte)
+rectype: .BYTE	0		;Record type
+userflg: .LONG	0, 0		;User flag bits
+
+
+billpres: .BYTE  0
+billchng: .BYTE  0
+	  .BYTE  0, 0
+
+billdata:
+billflg::  .BYTE  0
+billsts:   .BYTE  0
+billday::  .BYTE  0
+billtype:  .BYTE  0
+billclass: .BYTE  0
+paytype:   .BYTE  0
+	   .BYTE  0, 0
+freetime:  .LONG  0
+billtime:  .LONG  0
+connchrg:  .LONG  0
+othrchrg:  .LONG  0
+maxchrg:   .LONG  0
+lstprcdate:.LONG  0
+lstpayamnt:.LONG  0
+lstpaydate:.LONG  0
+retrydate: .LONG  0
+nxtpaydate:.LONG  0
+
+BILLDATASZ=!$-billdata
+
+	 .MOD	4		;Following values MUST be in this order!
+
+CLEARNUM==!{$-clearbgn}/4t
+
+lentbl:	.LONG	usnmlen		;Table of pointers to length values to clear
+	.LONG	usnmorglen
+	.LONG	pswdlen
+	.LONG	usidlen
+	.LONG	usidorglen
+	.LONG	desclen
+	.LONG	proglen
+	.LONG	dirlen
+	.LONG	avlplen
+	.LONG	inlplen
+	.LONG	accslen
+	.LONG	avlslen
+	.LONG	inlslen
+	.LONG	mlnmlen
+	.LONG	complen
+	.LONG	adr1len
+	.LONG	adr2len
+	.LONG	adr3len
+	.LONG	adr4len
+	.LONG	citylen
+	.LONG	statlen
+	.LONG	ziplen
+	.LONG	cntrlen
+	.LONG	fonelen
+LENNUM=!{$-lentbl}/4
+
+usnmchg:   .BLKL 1		;TRUE if user name changed
+usnmlen::  .BLKW 1		;Length of the user name string
+	   .WORD USNMSIZE
+usnmbfr::  .BLKB USNMSIZE+4	;User name string buffer
+
+usnmorglen:.BLKW 1
+	   .WORD USNMSIZE
+usnmorgbfr:.BLKB USNMSIZE+4
+
+pswdchg:   .BLKL 1		;TRUE if password changed
+pswdlen:   .BLKW 1		;Length of the password string
+	   .WORD PSWDSIZE
+pswdbfr:   .BLKB PSWDSIZE+4	;Password string buffer
+
+usidchg:   .BLKL 1		;TRUE if user ID changed
+usidlen::  .BLKW 1		;Length of the user ID string
+	   .WORD USIDSIZE
+usidbfr::  .BLKB USIDSIZE+4	;User ID string buffer
+
+usidorglen:.BLKW 1
+	   .WORD USIDSIZE
+usidorgbfr:.BLKB USIDSIZE+4
+
+descchg:   .BLKL 1		;TRUE if user description changed
+desclen:   .BLKW 1		;Length of the user description string
+	   .WORD DESCSIZE
+descbfr:   .BLKB DESCSIZE+4	;User description string buffer
+
+progchg:   .BLKL 1		;TRUE if program name changed
+proglen:   .BLKW 1		;Length of the program name string
+	   .WORD PROGSIZE
+progbfr:   .BLKB PROGSIZE+4	;Program name string buffer
+
+dirchg:    .BLKL 1		;TRUE if home directory changed
+dirlen:    .BLKW 1		;Length of the home directory string
+	   .WORD DIRSIZE
+dirbfr:    .BLKB DIRSIZE+4	;Home directory string buffer
+
+avlpchg:   .BLKL 1		;TRUE if available privileges changed
+avlplen:   .BLKW 1		;Length of the available privileges string
+	   .WORD AVLPSIZE
+avlpbfr:   .BLKB AVLPSIZE+4	;Available privileges string buffer
+
+inlpchg:   .BLKL 1		;TRUE if the initial privileges changed
+inlplen:   .BLKW 1		;Length of the initial privileges string
+	   .WORD INLPSIZE
+inlpbfr:   .BLKB INLPSIZE+4	;Initial privileges string buffer
+
+accschg:   .BLKL 1		;TRUE if the access permissions changed
+accslen:   .BLKW 1		;Length of the access permissions string
+	   .WORD ACCSSIZE
+accsbfr:   .BLKB ACCSSIZE+4	;Access permissions string buffer
+
+avlschg:   .BLKL 1		;TRUE if the available sections changed
+avlslen:   .BLKW 1		;Length of the available sections string
+	   .WORD AVLSSIZE
+avlsbfr:   .BLKB AVLSSIZE+4	;Available sections string buffer
+
+inlschg:   .BLKL 1		;TRUE if the initial sections changed
+inlslen:   .BLKW 1		;Length of the initial sections string
+	   .WORD INLSSIZE
+inlsbfr:   .BLKB INLSSIZE+4	;Initial sections string buffer
+
+ccrdchg:   .BLKL 1		;TRUE if the credit card data changed
+ccrdlen:   .BLKW 1		;Length of the credit card data string
+	   .WORD CCRDSIZE
+ccrdbfr:   .BLKB CCRDSIZE+4
+
+mlnmchg:   .BLKL 1		;TRUE if mailing name changed
+mlnmlen:   .BLKW 1		;Length of mailing name string
+	   .WORD MLNMSIZE
+mlnmbfr:   .BLKB MLNMSIZE+4	;Mailing name string buffer
+
+compchg:   .BLKL 1		;TRUE if company name changed
+complen:   .BLKW 1		;Length of company name string
+	   .WORD COMPSIZE
+compbfr:   .BLKB COMPSIZE+4	;Company name string buffer
+
+adr1chg:   .BLKL 1		;TRUE if address line 1 changed
+adr1len:   .BLKW 1		;Length of address line 1 string
+	   .WORD ADR1SIZE
+adr1bfr:   .BLKB ADR1SIZE+4	;Address line 1 string buffer
+
+adr2chg:   .BLKL 1		;TRUE if address line 2 changed
+adr2len:   .BLKW 1		;Length of address line 2 string
+	   .WORD ADR2SIZE
+adr2bfr:   .BLKB ADR2SIZE+4	;Address line 2 string buffer
+
+adr3chg:   .BLKL 1		;TRUE if address line 3 changed
+adr3len:   .BLKW 1		;Length of address line 3 string
+	   .WORD ADR3SIZE
+adr3bfr:   .BLKB ADR3SIZE+4	;Address line 3 string buffer
+
+adr4chg:   .BLKL 1		;TRUE if address line 4 changed
+adr4len:   .BLKW 1		;Length of address line 4 string
+	   .WORD ADR4SIZE
+adr4bfr:   .BLKB ADR4SIZE+4	;Address line 4 string buffer
+
+citychg:   .BLKL 1		;TRUE if city changed
+citylen:   .BLKW 1		;Length of city string
+	   .WORD CITYSIZE
+citybfr:   .BLKB CITYSIZE+4	;City string buffer
+
+statchg:   .BLKL 1		;TRUE if state changed
+statlen:   .BLKW 1		;Length of state string
+	   .WORD STATSIZE
+statbfr:   .BLKB STATSIZE+4	;State string buffer
+
+zipchg:    .BLKL 1		;TRUE if ZIP code changed
+ziplen:    .BLKW 1		;Length of ZIP code string
+	   .WORD ZIPSIZE
+zipbfr:    .BLKB ZIPSIZE+4	;ZIP code string buffer
+
+cntrchg:   .BLKL 1		;TRUE if country changed
+cntrlen:   .BLKW 1		;Length of country string
+	   .WORD CNTRSIZE
+cntrbfr:   .BLKB CNTRSIZE+4	;Country string buffer
+
+fontchg:   .BLKL 1		;TRUE if phone number changed
+fonelen:   .BLKW 1		;Length of phone number string
+	   .WORD FONESIZE
+fonebfr:   .BLKB FONESIZE+4	;Phone number string buffer
+
+	.END

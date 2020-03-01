@@ -1,0 +1,3104 @@
+;++++
+; This software is in the public domain.  It may be freely copied and used
+; for whatever purpose you see fit, including commerical uses.  Anyone
+; modifying this software may claim ownership of the modifications, but not
+; the complete derived code.  It would be appreciated if the authors were
+; told what this software is being used for, but this is not a requirement.
+
+;   THIS SOFTWARE IS PROVIDED BY THE AUTHORS "AS IS" AND ANY EXPRESS OR
+;   IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
+;   OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+;   IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+;   INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+;   BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS
+;   OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+;   ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR
+;   TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
+;   USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+;----
+
+	.SBTTL	geckoentr - The initial entry for GECKO
+
+	CODE
+
+;This is the initial entry for exec protected mode GECKO - GECKO is normally
+;  called as if by an interrupt, with EIP, CS, and EFR on the stack
+
+.IF EQ $$USERMODE|$$REALMODE|$$FILEMODE
+geckoentr:
+	PUSHL	DS			;Save user's DS
+	PUSHL	#!_geckodata_p		;Setup our DS
+	POPL	DS
+	POPL	uregDS			;Save user DS
+	POPL	uregEIP			;Save user EIP
+	POPL	uregCS			;Save user CS
+	POPL	uregEFR			;Save user EFR
+	MOVL	uregESP, ESP		;Save user stack pointer
+	MOVL	uregSS, SS
+	PUSHL	DS			;Setup GECKO's internal stack pointer
+	POPL	SS
+	MOVL	ESP, #xstack
+.ENDC
+
+;This is the initial entry for user mode GECKO - GECKO is normally called as if
+;  by an interrupt, with EIP, CS, and EFR on the stack
+
+.IF NE $$USERMODE
+.IF EQ $$FILEMODE
+geckoentr::
+	PUSHL	DS			;Save user's DS
+	PUSHL	#!value
+	POPL	DS
+	POPL	uregDS			;Save user DS
+
+	POPL	uregEIP			;Save user EIP
+	POPL	uregCS			;Save user CS
+	POPL	uregEFR			;Save user EFR
+	POPL	uregGS			;Save user GS
+	POPL	uregFS			;Save user FS
+	POPL	uregES			;Save user ES
+	POPL	uregDS			;Save user DS
+	ADDL	ESP, #4t.B		;Discard the count/vector number item
+	TESTB	uregEFR+2, #2		;Trap from V86 mode?
+	JE	4$.S			;No
+	POPL	uregESP			;Yes - save stacked user registers
+	POPL	uregSS
+	JMP	6$.S
+
+4$:	MOVL	uregESP, ESP		;Save user stack pointer
+	MOVL	uregSS, SS
+6$:	PUSHL	DS			;Setup GECKO's internal stack pointer
+	POPL	SS
+	MOVL	ESP, #xstack
+.ENDC
+.ENDC
+
+;This is the initial entry for real mode GECKO - GECKO is normally called as if
+;  by an interrupt, with EIP, CS, and EFR on the stack
+
+.IF NE $$REALMODE
+geckoentr::
+	PUSHW	DS			;Save user's DS
+	PUSHW	#!uregDS
+	POPW	DS
+	POPW	uregDS			;Save user DS
+	POPW	uregEIP			;Save user EIP
+	POPW	uregCS			;Save user CS
+	POPW	uregEFR			;Save user EFR
+	MOVL	uregESP, ESP		;Save user stack pointer
+	MOVW	uregSS, SS
+	PUSHW	DS			;Setup GECKO's internal stack pointer
+	POPW	SS
+	MOVW	SP, #xstack
+.ENDC
+
+;This is the initial entry for file mode GECKO
+
+.IF NE $$FILEMODE
+geckoentr::
+.ENDC
+
+;Start of common code for all 3 modes
+
+	CALL	setvec			;Setup our vectors
+	CALL	savusr			;Save rest of user state
+	PUSHL	DS
+	POPL	ES
+	MOVL	EDI, #fstclr		;Clear the data area
+	MOVL	ECX, #SIZCLR
+	XORL	EAX, EAX
+	CLD
+	RSTOSL	[EDI]
+	CALL	setdisp			;Set up our display routines
+	CALL	intusr			;Set up the user environment
+	CALL	xscreen			;Set up GECKO's screen
+	CALL	xregdmp			;Put registers on the screen
+	MOVL	EAX, #16t		;Initialize radixes
+	MOVL	iradix, EAX
+	MOVL	cradix, EAX
+	MOVL	oradix, EAX
+	MOVL	tradix, EAX
+	MOVL	findmask, #-1		;Initialize the search mask
+.IF NE $$USERMODE|$$REALMODE
+	MOV%	%BX, line1pnt		;Display first banner line
+	CALL	outstrd
+	MOV%	%BX, line2pnt		;Display second banner line
+	CALL	outstrd
+.ENDC
+.PAGE
+	.SBTTL	nxtcmd - Routine to get next input
+
+;Here when ready for next input
+
+nxtcmd:	MOVB	AL, #25h		;Output our prompt
+	CALL	outchr
+2$:	MOVL	ncmdESP, ESP		;Save our state for interrupts
+	MOVW	ncmdSS, SS
+	MOVL	EAX, oradix		;Reset temporary output radix
+	MOVL	tradix, EAX
+	MOVB	AL, poutmd		;And reset temporary output mode
+	MOVB	toutmd, AL
+	MOVB	cciflg, #0		;Clear ^C indication
+	MOVB	linelim, #0		;Clear output line limit
+	CALL	getline			;Get a line from the user
+	MOVB	DL, #1
+	CALL	getnam0			;Get command word (force to upper case)
+	JC	badcmd			;If error
+	CMPB	symbuf+4, #0
+	JNE	badcmd
+25$:	CMPB	AL, #'/'		;Stopped by slash?
+	JNE	3$.S			;No
+	PUSHL	symbuf+0		;Yes - save command
+	MOVB	DL, #1			;Get switch word (force to upper case)
+	CALL	getnam0
+	JC	badswh2
+	CMPB	symbuf+4, #0
+	JNE	badswh2
+	PUSHL	EAX			;Save stopper character
+	MOVL	EAX, symbuf+0
+	PUSHL	CS
+	POPL	ES
+	MOVL	EDI, #swhname		;No - search the switch table
+	MOVL	ECX, #SWHSIZE
+	CLD
+	RNSCASL	[EDI]
+	JNE	badswh0.S
+	CALLI	CS:swhdsp-swhname-4[EDI] ;Dispatch on switch keyword
+	JC	badswh0.S
+	POPL	EAX			;Restore stopper character
+	POPL	symbuf+0		;Restore command keyword
+	JMP	25$.S			;Continue
+
+;Here with all switches (if any) processed
+
+3$:	MOVL	EAX, symbuf+0		;Get command keyword
+	PUSHL	CS
+	POPL	ES
+	TESTB	AL, #80h		;Function key?
+	JNE	8$.S			;Yes
+	MOVL	EDI, #cmdname		;No - search the command table
+	MOVL	ECX, #CMDSIZE
+	CLD
+	RNSCASL	[EDI]
+	JNE	badcmd.S
+	CALLI	CS:cmddsp-cmdname-4[EDI] ;Dispatch on command keyword
+4$:	CALL	outcrl			;Start new line
+6$:	JMP	nxtcmd			;Continue
+
+;Here if have function key
+
+8$:	MOVL	EDI, #funckey		;Search the function key table
+	MOVL	ECX, #FUNCSIZE
+	CLD
+	RNSCASB	[EDI]
+	JNE	6$.S			;Quietly ignore illegal keys
+	SUBL	EDI, #funckey+1
+	MOVL	EAX, CS:funcdsp[EDI*4]	;Get offset of routine
+	BTZL	EAX, #31t		;Want CR-LF after command?
+	JC	10$.S			;No
+.IF EQ $$REALMODE
+	CALLI	EAX			;Yes - do command
+.IFF
+	CALLI	AX
+.ENDC
+	JMP	4$.S
+
+;Here if no CR-LF after command
+
+10$:
+.IF EQ $$REALMODE
+	CALLI	EAX			;Do command
+.IFF
+	CALLI	AX
+.ENDC
+	JMP	2$
+
+;Here if have illegal switch keyword
+
+badswh0:POPL	EBX
+badswh2:POPL	EBX
+	MOV%	%BX, #bswmsg
+	JMP	12$.S
+
+;Here if have illegal command keyword
+
+badcmd:	MOV%	%BX, #bcmmsg		;Output message
+12$:	CALL	outstrcca
+	JMP	4$.S			;Continue
+
+;Here to restart command input
+
+restart:MOVW	SS, ncmdSS		;Restore state for command decoder
+	MOVL	ESP, ncmdESP
+	MOVB	stpflg, #0		;Make sure output not stopped
+	JMP	6$.S
+.PAGE
+	.SBTTL	readi2 - Here with match on an action character
+
+;Define commands
+
+	.MACRO	& ACT
+	CC	0      , ret002
+	CC	'V'    , dispvalue	;Display numeric unsigned value
+	CC	'OR'   , openreg	;Open register
+	CC	'OI'   , openins	;Open instruction
+	CC	'OB'   , openbyte	;Open byte
+	CC	'OW'   , openword	;Open word
+	CC	'OWA'  , openworda	;Open word (16+16 bits) address
+	CC	'OL'   , openlong	;Open long
+	CC	'OLA'  , openlonga	;Open long (16+32 bits) address
+	CC	'OP'   , openprev	;Open previous
+	CC	'ON'   , opennext	;Open next
+	CC	'CR'   , chngreg	;Change register
+	CC	'CI'   , chngins	;Change instruction
+	CC	'CB'   , chngbyte	;Change byte
+	CC	'CW'   , chngword	;Change word
+	CC	'CWA'  , chngworda	;Change word (16+16 bits) address
+	CC	'CL'   , chnglong	;Change long
+	CC	'CLA'  , chnglonga	;Change long (16+32 bits) address
+	CC	'CP'   , chngprev	;Change previous
+	CC	'CN'   , chngnext	;Change next
+	CC	'ER'   , examreg	;Examine register
+	CC	'EI'   , examins	;Examine instruction
+	CC	'EB'   , exambyte	;Examine byte
+	CC	'EW'   , examword	;Examine word
+	CC	'EWA'  , examworda	;Examine word (16+16 bits) address
+	CC	'EL'   , examlong	;Examine long
+	CC	'ELA'  , examlonga	;Examine long (16+32 bits) address
+	CC	'EP'   , examprev	;Examine previous
+	CC	'EN'   , examnext	;Examine previous
+	CC	'E'    , evalexp	;Evaluate expression
+	CC	'FB'   , findbyte	;Search for byte
+	CC	'FW'   , findword	;Search for word
+	CC	'FL'   , findlong	;Search for long
+	CC	'SMSK' , setmask	;Set search mask
+	CC	'OUTB' , outputb	;Output byte
+	CC	'OUTW' , outputw	;Output word
+	CC	'OUTL' , outputl	;Output long
+	CC	'INB'  , inputb		;Input byte
+	CC	'INW'  , inputw		;Input word
+	CC	'INL'  , inputl		;Input long
+	CC	'DB'   , dumpb		;Dump as bytes
+	CC	'DW'   , dumpw		;Dump as words
+	CC	'DWA'  , dumpwa		;Dump as 16 bit words
+	CC	'DL'   , dumpl		;Dump as longs
+	CC	'DLA'  , dumpla		;Dump as 32 bit addresses
+	CC	'DF'   , dumpf		;Dump 12 bit FAT entries
+	CC	'DI'   , dumpi		;Dump as instructions
+	CC	'DR'   , dumpr		;Dump registers
+	CC	'G'    , startp		;Start execution
+	CC	'X'    , execut		;Execute single instruction
+	CC	'T'    , trace		;Trace instruction
+	CC	'DS'   , dispsts	;Display status, etc.
+	CC	'SV'   , srchval	;Search symbol table by value
+	CC	'SN'   , srchname	;Search symbol table by name
+	CC	'SS'   , swscrn		;Switch screens
+
+.IF EQ $$USERMODE
+	CC	'ST'   , swterm		;Switch to/from serial terminal
+.ENDC
+	CC	'SM'   , selsym		;Select module
+	CC	'SO'   , setoutmodes	;Set output modes
+	CC	'SI'   , setinmodes	;Set input modes
+	CC	'QUIT' , goexit		;Exit GECKO
+.IF EQ $$USERMODE|$$REALMODE
+	CC	'RST'  , goreset	;Reset system
+.ENDC
+	CC	'HELP' , help		;Display help info
+	CC	'BS'   , setbkp		;Set breakpoint
+	CC	'BR'   , rmvbkp		;Remove breakpoint
+	CC	'BC'   , clrbkp		;Remove all breakpoints
+	CC	'BL'   , lstbkp		;List breakpoints
+	CC	'WSWB' , setwbwtp	;Set data write watchpoint on byte
+	CC	'WSWW' , setwwwtp	;Set data write watchpoint on word
+	CC	'WSWL' , setwlwtp	;Set data write watchpoint on long
+	CC	'WSAB' , setabwtp	;Set data access watchpoint on byte
+	CC	'WSAW' , setawwtp	;Set data access watchpoint on word
+	CC	'WSAL' , setalwtp	;Set data access watchpoint on long
+	CC	'WSI'  , setiwtp	;Set instruction watchpoint
+	CC	'WL'   , lstwtp		;List watchpoints
+	CC	'WR'   , rmvwtp		;Remove watchpoint
+	CC	'WC'   , clrwtp		;Clear watchpoints
+.IF NE $$USERMODE
+	CC	'RGN'  , showregion	;Show graphic region
+.ENDC
+	.ENDM
+
+;Generate command name table
+
+	.MACRO	CC  name, addr
+	.LONG	name
+	.ENDM
+
+cmdname:ACT
+CMDSIZE=!{$-cmdname}/4
+
+;Generate dispatch table
+
+	.MACRO	CC  name, addr
+	.LONG	addr
+	.ENDM
+
+cmddsp:	ACT
+
+;Define function keys
+
+	.MACRO	& ACT
+	CC	XC_HELP, help		;Display help info
+	CC	XC_SS  , swscrn+NCR	;Switch screens
+	CC	XC_EEIP, examEIP	;Examine instruction at CS:EIP
+	CC	XC_EP  , examprev	;Examine previous
+	CC	XC_ES  , examsame 	;Examine same
+	CC	XC_EN  , examnext	;Examine next
+	CC	XC_X   , execut		;Execute instruction
+	CC	XC_T   , trace		;Trace instruction
+	CC	XC_G   , startp		;Begin execution
+	CC	XC_OEIP, openEIP	;Open instruction at CS:EIP
+	CC	XC_OP  , openprev	;Open previous
+	CC	XC_OS  , opensame	;Open same
+	CC	XC_ON  , opennext	;Open next
+	.ENDM
+
+NCR=!80000000h
+
+;Generate function key table
+
+	.MACRO	CC  index, addr
+	.BYTE	index
+	.ENDM
+
+funckey:ACT
+FUNCSIZE=!$-funckey
+
+;Generate dispatch table
+
+	.MACRO	CC  name, addr
+	.LONG	addr
+	.ENDM
+
+funcdsp:ACT
+
+;Define switches
+
+	.MACRO	& ACT
+	CC	0   , rstc02
+	CC	'B' , swrad2
+	CC	'W' , swrad2
+	CC	'O' , swrad8
+	CC	'Q' , swrad8
+	CC	'D' , swrad10
+	CC	'T' , swrad10
+	CC	'H' , swrad16
+	CC	'C' , swchar
+	CC	'V' , swval
+	CC	'S' , swsym
+	CC	'N' , swnum
+	.ENDM
+
+;Generate switch name table
+
+	.MACRO	CC  name, addr
+	.LONG	name
+	.ENDM
+
+swhname:ACT
+SWHSIZE=!{$-swhname}/4
+
+;Generate dispatch table
+
+	.MACRO	CC  name, addr
+	.LONG	addr
+	.ENDM
+
+swhdsp:	ACT
+.PAGE
+	.SBTTL	setoutmodes - SO command - Set output modes
+
+;Here for the SO command to set output modes
+
+setoutmodes:
+	MOVB	hdrflg, #0		;Indicate nothing done
+2$:	CALL	getchr			;Get input character
+	JE	12$.S
+	CMPB	AL, #' '
+	JBE	2$.S
+	CALL	makupr
+	MOVL	EDI, #outmtbl
+	MOVL	ECX, #OUTMSIZE
+	PUSHL	CS
+	POPL	ES
+	RNSCASB	[EDI]
+	JE	6$.S
+	MOV%	%BX, #iosmsg
+	JMP	outstrc
+
+;Here with match on option character
+
+6$:	MOVB	AL, CS:outmclr-outmtbl-1.B[EDI] ;Get bit to clear
+	MOVB	AH, CS:outmset-outmtbl-1.B[EDI] ;Get bit to set
+	CMPB	AL, #0			;Changing radix value?
+	JE	10$.S			;Yes
+	ANDB	poutmd, AL		;No - clear mode bit(s)
+	ORB	poutmd, AH
+8$:	INCB	hdrflg
+	JMP	2$.S			;Continue
+
+;Here to change radix value
+
+10$:	MOVB	oradix, AH		;Store it
+	JMP	8$.S			;Continue
+
+11$:	RET
+
+;Here when finished
+
+12$:	CMPB	hdrflg, #0		;Did we change anything?
+	JNE	11$.S			;Yes - finished
+	MOV%	%BX, #om1msg		;No - show him the current state
+	CALL	outstrc
+	MOV%	%BX, #omsmsg
+	TESTB	poutmd, #OM$NUM
+	JE	14$.S
+	ADD%	%BX, #omnmsg-omsmsg.B
+14$:	CALL	outstrc
+	MOV%	%BX, #omamsg
+	TESTB	poutmd, #OM$ALF
+	JNE	16$.S
+	ADD%	%BX, #omvmsg-omamsg.B
+16$:	CALL	outstrc
+	MOV%	%BX, #omrmsg
+showrad:CALL	outstrc
+	MOVL	EAX, oradix
+	MOV%	%BX, #r16msg
+	CMPB	AL, #16t
+	JAE	18$.S
+	ADD%	%BX, #r10msg-r16msg.B
+	CMPB	AL, #10t
+	JAE	18$.S
+	ADD%	%BX, #r8msg-r10msg.B
+	CMPB	AL, #8t
+	JAE	18$.S
+	ADD%	%BX, #r2msg-r8msg.B
+18$:	JMP	outstrc
+.PAGE
+	.SBTTL	setinmodes - SI command - Set input modes
+
+;Here for the SI command to set input modes
+
+setinmodes:
+	MOVB	hdrflg, #0		;Indicate nothing done
+2$:	CALL	getchr			;Get input character
+	JE	8$.S
+	CMPB	AL, #' '
+	JBE	2$.S
+	CALL	makupr
+	MOV%	%DI, #inmtbl
+	MOV%	%CX, #INMSIZE
+	PUSH%	CS
+	POP%	ES
+	RNSCASB	[%DI]
+	JE	6$.S
+	MOV%	%BX, #iirmsg
+	JMP	outstrc
+
+;Here with match on option character
+
+6$:	MOVB	AL, CS:inmrdx-inmtbl-1.B[EDI] ;Get new radix value
+	MOVB	iradix, AL		;Store it
+	INCB	hdrflg
+	JMP	2$.S			;Continue
+
+;Here when finished
+
+8$:	CMPB	hdrflg, #0		;Did we change anything?
+	JNE	ret001.S		;Yes - finished
+	MOV%	%BX, #imrmsg		;No - show him the current radix
+	JMP	showrad.S
+
+ret001:	RET
+
+;Set output modes tables
+
+	.MACRO	" MODES
+	MM	B, 2t    , 0FFh
+	MM	W, 2t    , 0FFh
+	MM	O, 8t    , 0FFh
+	MM	Q, 8t    , 0FFh
+	MM	D, 10t   , 0FFh
+	MM	T, 10t   , 0FFh
+	MM	H, 16t   , 0FFh
+	MM	C, OM$ALF, 0
+	MM	V, 0     , OM$ALF
+	MM	N, OM$NUM, 0
+	MM	S, 0     , OM$NUM
+	.ENDM
+
+	.MACRO	" MM  name, set, clr
+	.BYTE	'name'
+	.ENDM
+
+outmtbl:MODES
+OUTMSIZE=!$-outmtbl
+
+	.MACRO	" MM  name, set, clr
+	.BYTE	{~clr}&0FFh
+	.ENDM
+
+outmclr:MODES
+
+	.MACRO	" MM  name, set, clr
+	.BYTE	set
+	.ENDM
+
+outmset:MODES
+
+;Set input modes tables
+
+	.MACRO	" MODES
+	MM	B, 2t
+	MM	W, 2t
+	MM	O, 8t
+	MM	Q, 8t
+	MM	D, 10t
+	MM	T, 10t
+	MM	H, 16t
+	.ENDM
+
+	.MACRO	" MM  name, radix
+	.BYTE	'name'
+	.ENDM
+
+inmtbl:	MODES
+INMSIZE=!$-outmtbl
+
+	.MACRO	" MM  name, radix
+	.BYTE	radix
+	.ENDM
+
+inmrdx:	MODES
+
+
+.PAGE
+	.SBTTL	dispvalue - V command - Dispaly value as unsigned numeric
+
+;Here for the V command to display value as unsigned numeric value
+
+dispvalue:
+	CALL	getfld			;Get value of field
+	JC	ret001.S		;If error
+	MOV%	%BX, #spequsp		;OK
+	CALL	outstrc
+	CMPB	valtyp, #VL_WADDR	;Address?
+	JA	4$.S			;No
+	MOVZWL	EAX, valseg		;Yes - output segment part first
+	CALL	outnum
+	MOVB	AL, #':'
+.IF EQ $$USERMODE|$$REALMODE		;If exec mode
+	TESTB	valseg+2, #1		;Is it a protected mode selector?
+	JE	2$.S			;Yes
+	INCL	EAX			;No - change : to ;
+.ENDC
+.IF NE $$USERMODE			;If user mode
+	MOVB	AH, valseg+2		;Is it the same mode selector as the
+	XORB	AH, v86img+2		;  loaded program?
+	TESTB	AH, #1
+	JE	2$.S			;Yes
+	INCL	EAX			;No - change : to ;
+.ENDC
+2$:	CALL	outchr
+4$:	MOVL	EAX, valofs		;Output offset part
+	JMP	outnum
+.PAGE
+	.SBTTL	evalexp - E command - Evaluate expression and display result
+
+;Here for the E command to evaluate an expression and display the result
+
+evalexp:CALL	getfld			;Get value of field
+	JC	ret002.S		;If error
+	MOV%	%BX, #spequsp		;OK
+	CALL	outstrc
+	MOVL	EAX, valofs		;Get value
+	CMPB	valtyp, #VL_LONG	;Is it an address?
+	JAE	outlong			;No
+	MOV%	%DX, valseg		;Yes - get segment part too
+	JMP	outsgof			;Display it
+.PAGE
+	.SBTTL	examreg - ER command - Display contents of register
+
+;Here for the ER command to display contents of a register
+
+examreg:CALL	getreg			;Get register
+	JC	ret002			;If error
+	CALL	chkend			;Must be last thing on line
+	JNC	dispreg			;If OK
+ret002:	RET				;If error
+
+	.SBTTL	openreg - OR command - Open register
+
+;Here for the OR command to open register
+
+openreg:CALL	getreg			;Get register
+	JC	ret002.S		;If error
+	CALL	chkend
+	JC	ret002.S
+	CALL	dispreg			;Display contents
+	CALL	getnewval		;Get new value
+6$:	JC	ret002.S
+	CMPB	valtyp, #VL_WADDR	;Yes - is this an address?
+	JA	8$.S			;No - don't change segment register
+	MOVXB%	%BX, opnsrg		;Yes - do we have a segment register?
+	OR%	%BX, %BX
+	JS	8$.S			;No
+	MOVZB%	%BX, CS:rgltbl[EBX]
+	MOV%	%AX, valseg		;Store segment part
+.IF EQ $$REALMODE
+	ANDL	EAX, #1FFFFh
+.ENDC
+	MOV%	uregbase[%BX], %AX
+8$:	CMPB	opnreg, #0		;Do we have an offset reigster?
+	JS	ret002.S		;No
+	CALL	chktrunc		;Yes - check for truncation
+	MOVZB%	%BX, opnreg
+	CMPB	BL, #RG_CS		;Is it a segment register?
+	JB	12$.S			;No
+	CMPB	BL, #RG_GS		;Maybe
+	JA	12$.S			;No
+	CMPB	clnflg, #0		;Yes - trailing colon seen?
+	JNE	12$.S			;Yes - leave the value as-is
+.IF NE $$USERMODE
+	MOVW	AX, v86img+2		;Use default selector type
+	MOVW	valofs+2, AX
+.IFF
+	MOVW	valofs+2, #0
+.ENDC
+12$:	MOVZB%	%BX, CS:rgltbl[%BX]	;Get address of register
+	MOVL	EAX, valofs		;Get new value
+	CMP%	%CX, #1.B		;Byte register?
+	JNE	14$.S			;No
+	MOVB	uregbase[%BX], AL	;Yes - store byte
+	JMP	18$.S
+
+14$:	CMP%	%CX, #2.B		;Word register?
+	JNE	16$.S			;No
+	MOVW	uregbase[%BX], AX	;Yes - store word
+	JMP	18$.S
+
+16$:	MOVL	uregbase[%BX], EAX	;Must be long register - store long
+18$:	JMP	xregdmp			;Update register display on screen
+
+	.SBTTL	chngreg - CR command - Change register
+
+;Here for the CR command to change register
+
+chngreg:CALL	getreg			;Get register
+	JC	22$.S			;If error
+	CALL	getnewvl2
+22$:	JMP	6$
+.PAGE
+	.SBTTL	getreg - Subroutine to get register specification
+
+getreg:	CALL	getfld			;Get field
+	JC	1$.S
+	MOVB	AL, valreg		;Are we openning a register?
+	ANDB	AL, valsrg
+	JNS	2$.S			;Yes
+	MOV%	%BX, #normsg		;No - complain
+	CALL	outstrc
+rstc02:	STC
+1$:	RET
+
+2$:	MOVL	EAX, valstate
+	MOVL	opnstate, EAX
+	RET	
+
+	.SBTTL	dispreg - Subroutine to display register contents
+
+dispreg:MOVB	AL, #CLR		;Start out by clearing the line
+	CALL	outchr
+	CMPB	valtyp, #VL_WADDR	;Address?
+	JA	6$.S			;No
+	MOVB	BL, valsrg		;Yes - redisplay segment register name
+	MOVZW%	%AX, valseg
+	CALL	redsreg
+	MOVB	AL, #':'		;Assume standard selector
+	MOVZB%	%BX, valsrg
+	MOVZB%	%BX, CS:rgltbl[%BX]
+	MOV%	%BX, uregbase[%BX]	;Get value of segment register
+.IF NE $$USERMODE
+	XORL	EBX, v86img
+.ENDC
+.IF EQ $$REALMODE
+	BTL	EBX, #16t		;Is it really standard?
+	JNC	4$.S			;Yes
+	INCL	EAX			;No - display ;
+.ENDC
+4$:	CALL	outchr
+6$:	MOVB	BL, valreg
+	MOV%	%AX, valofs
+	CMPB	BL, #RG_CS		;Is this a segment register?
+	JB	8$.S			;No
+	CMPB	BL, #RG_GS		;Maybe
+	JBE	10$.S			;Yes
+8$:	CALL	redsreg			;Display name of register
+	JMP	14$.S
+
+;Here if segment register
+
+10$:	MOVZWL	EAX, AX
+	CALL	redsreg			;Display name of segment register
+	MOVB	AL, #':'
+.IF EQ $$USERMODE|$$REALMODE		;If exec mode
+	TESTB	valofs+2, #01h
+	JE	12$.S
+	INCL	EAX
+.ENDC
+.IF NE $$USERMODE			;If user mode
+	MOVB	AH, valofs+2
+	XORB	AH, v86img+2
+	TESTB	AH, #01h
+	JE	12$.S
+	INCL	EAX
+.ENDC
+12$:	PUSHL	#outword
+	JMP	16$.S
+
+14$:	MOVZBL	EAX, valtyp
+	MOVB	AL, CS:regltbl[EAX]
+	MOVZBL	EBX, valtyp
+	PUSH%	CS:regodsp[EBX*ITEMSIZE]
+16$:	CALL	outchr
+	MOVB	AL, #9
+	CALL	outchr
+	MOVL	EAX, valofs
+	MOV%	%DX, valseg
+	RET
+
+regltbl:.BYTE	'}'		;VL_LADDR = 0 - Long address
+	.BYTE	')'		;VL_WADDR = 1 - Word address
+	.BYTE	'{'		;VL_LONG  = 2 - Long
+	.BYTE	'('		;VL_WORD  = 3 - Word
+	.BYTE	'\'		;VL_BYTE  = 4 - Byte
+
+	.MOD	4
+regodsp:.EXP%	outsgof		;VL_LADDR =  0 - Long address
+	.EXP%	outsgofw	;VL_WADDR =  2 - Word address
+	.EXP%	outlong		;VL_LONG  =  4 - Long
+	.EXP%	outword		;VL_WORD  =  6 - Word
+	.EXP%	outbyte		;VL_BYTE  =  8 - Byte
+.PAGE
+	.SBTTL	examins - EI command - Display contents of location as an instruction
+
+;Here for the EI command to display contents of location as an instruction
+
+examins:CALL	getfld			;Get address
+	JC	4$.S			;If error
+eins2:	CALL	chkend			;Must be last thing on line
+	JNC	dispins			;If OK
+4$:	RET
+
+;Here on F3 to examine instruction pointed to by CS:EIP
+
+examEIP:MOVL	EAX, uregEIP
+	MOVL	valofs, EAX
+	MOVL	EAX, uregCS
+	MOVL	valseg, EAX
+	MOVB	valtyp, #VL_LADDR
+	MOVB	notnul, #1
+	JMP	dispins
+
+	.SBTTL	openins - OI command - Open location as an instruction
+
+;Here for the OI command to open location as an instruction
+
+openins:CALL	getfld			;Get address
+	JC	4$.S			;If error
+oins2:	CALL	chkend
+	JC	4$.S
+6$:	CALL	dispins			;Display contents
+	CALL	getnewval		;Get new value
+	JC	4$.S
+oins4:	CMPB	valtyp, #VL_INS		;Replacing it with an instruction?
+	JE	odone6.S		;Yes - go on
+	MOVB	opnsiz, #1		;No - only change 1 byte!
+odone6:	CALL	chktrunc		;Check for truncation
+	MOVL	EBX, opnofs		;Point to address of item
+	MOVL	EDX, opnseg
+	CMPL	ECX, #4t.B		;Between 1 and 4 bytes?
+	JLE	14$.S			;Yes
+8$:	MOVL	ESI, #valofs		;No - do it a byte at a time
+10$:	LODSB	[ESI]			;Get a byte and bump pointer
+	CALL	putmbyte		;Store byte in memory
+	JC	hvaerr			;If error
+	INCL	EBX
+	LOOP	ECX, 10$		;Loop if more to store
+12$:	RET
+
+;Here to store between 1 and 4 bytes
+
+14$:	TESTB	CL, #01h		;Odd number of bytes (1 or 3)
+	JNE	8$.S			;Yes - do it as bytes
+	MOVL	EAX, valofs		;No - get value
+	CMPL	ECX, #2t.B		;Word?
+	JNE	putmlong		;No - must be a long
+	JMP	putmword		;Yes
+
+;Here on F3 to open instruction pointed to by CS:EIP
+
+openEIP:MOVL	EAX, uregEIP
+	MOVL	valofs, EAX
+	MOVL	EAX, uregCS
+	MOVL	valseg, EAX
+	MOVB	valtyp, #VL_LADDR
+	JMP	6$.S
+
+	.SBTTL	chngins - CI command - Change location as an instruction
+
+;Here for the CI command to change location as an instruction
+
+chngins:CALL	getfld			;Get address
+	JC	12$.S			;If error
+chngin2:MOVB	outflg, #1		;Do display routine witout output to
+	CALL	dispins			;  see how long the old instruction is
+	MOVB	outflg, #0
+	CALL	getnewvl2		;Get the new value
+	JMP	oins4			;Continue
+.PAGE
+getnewval:
+	MOV%	%BX, #opnpmt		;Output %% prompt
+	CALL	outstrc
+	MOVB	datareq, #1		;Indicate requesting data
+	CALL	getline			;Get input
+	MOVB	datareq, #0
+getnewvl2:
+	CALL	getfld			;Get field
+	JC	ret003.S		;If error
+	CALL	chkend			;Must be last on line
+	JC	ret003.S		;If error
+	CMPB	notnul, #0		;Any input at all?
+	JNE	ret003.S		;Yes
+	STC				;No
+ret003:	RET
+.PAGE
+	.SBTTL	dispins - Suboutine to display contents of location as an instruction
+
+;Subroutine to display contents of a location as an instruction
+
+dispins:MOVB	AH, #1			;Get item size
+	MOVB	CH, #VL_INS		;Get item type
+	MOVB	AL, #'!'
+	MOV%	%BX, uregCS
+	CALL	rdspadr			;Get and set up the address
+	JC	ret003.S		;If error
+	CALL	outopc			;Output as instruction
+	JMP	dispdn			;Go finish up
+.PAGE
+	.SBTTL	exambyte - EB command - Display contents of location as a byte
+
+;Here for the EB command to display contents of location as a byte
+
+exambyte:
+	CALL	getfld			;Get address
+	JC	4$.S			;If error
+ebyte2:	CALL	chkend			;Must be last thing on line
+	JNC	dispbyte		;If OK
+4$:	RET
+
+	.SBTTL	openbyte - OB command - Open location as a byte
+
+;Here for the OB command to open location as a byte
+
+openbyte:
+	CALL	getfld			;Get address
+	JC	4$.S			;If error
+obyte2:	CALL	chkend			;Must be last thing on line
+	JC	4$.S
+	CALL	dispbyte
+open4:	CALL	getnewval		;Get new value
+	JC	4$.S
+	JMP	odone6			;Continue
+
+	.SBTTL	chngbyte - CB command - Change byte
+
+;Here for the CB command to change byte
+
+chngbyte:
+	PUSHL	#VL_BYTE+100h
+chng6:	CALL	getfld			;Get address
+	POPL	EAX
+	JC	4$.S			;If error
+	MOVB	CH, AL
+	CALL	setadr			;Set up the address
+	CALL	getnewvl2
+	JMP	odone6			;Continue
+.PAGE
+	.SBTTL	dispbyte - Suboutine to display contents of location as a byte
+
+;Subroutine to display contents of a location as a byte
+
+dispbyte:
+	MOVB	AH, #1			;Get item size
+	MOVB	CH, #VL_BYTE		;Get item type
+	MOVB	AL, #'\'
+	MOVL	EBX, uregDS
+	CALL	rdspadr			;Get and set up the address
+	JC	10$.S			;If error
+	MOVL	EDX, opnseg		;Get contents of byte
+	MOVL	EBX, opnofs
+	CALL	getmbyte
+	JC	hvaerr
+	CALL	outbyte			;Output it
+dispdn:	MOVB	opnreg, #0FFh		;Indicate not register
+	MOVB	opnsrg, #0FFh
+10$:	RET
+.PAGE
+	.SBTTL	examword - EW command - Display contents of location as a word
+
+;Here for the EW command to display contents of location as a word
+
+examword:
+	CALL	getfld			;Get address
+	JC	4$.S			;If error
+eword2:	CALL	chkend			;Must be last thing on line
+	JNC	dispword		;If OK
+4$:	RET
+
+	.SBTTL	openword - OW command - Open location as a word
+
+;Here for the OW command to open location as a word
+
+openword:
+	CALL	getfld			;Get address
+	JC	4$.S			;If error
+oword2:	CALL	chkend			;Must be last thing on line
+	JC	4$.S
+	CALL	dispword
+	JMP	open4
+
+	.SBTTL	chngword - CW command - Change word
+
+;Here for the CW command to change word
+
+chngword:
+	PUSHL	#VL_WORD+200h
+	JMP	chng6			;Continue
+.PAGE
+	.SBTTL	dispword - Suboutine to display contents of location as a word
+
+;Subroutine to display contents of a location as a word
+
+dispword:
+	MOVB	AH, #2			;Get item size
+	MOVB	CH, #VL_WORD		;Get item type
+	MOVB	AL, #'('
+	MOVL	EBX, uregDS
+	CALL	rdspadr			;Get and set up the address
+	JC	10$.S			;If error
+	MOVL	EDX, opnseg		;Get word from memory
+	MOVL	EBX, opnofs
+	CALL	getmword
+	JC	hvaerr
+	CALL	outword			;Output the value
+	JMP	dispdn.S
+
+10$:	RET
+.PAGE
+	.SBTTL	examworda - EWA command - Display contents of location as 16 bit address
+
+;Here for the EWA command to display contents of location as a 16 bit address
+
+examworda:
+	CALL	getfld			;Get address
+	JC	4$.S			;If error
+eworda2:CALL	chkend			;Must be last thing on line
+	JNC	dispworda		;If OK
+4$:	RET
+
+	.SBTTL	openworda - OWA command - Open location as a 16 bit address
+
+;Here for the OWA command to open location as a 16 bit address
+
+openworda:
+	CALL	getfld			;Get address
+	JC	4$.S			;If error
+oworda2:CALL	chkend			;Must be last thing on line
+	JC	4$.S
+	CALL	dispworda
+	JMP	open4
+
+	.SBTTL	chngworda - CWA command - Change 16 bit address
+
+;Here for the CWA command to change 16 bit address
+
+chngworda:
+	PUSHL	#VL_WADDR+400h
+	JMP	chng6
+.PAGE
+	.SBTTL	dispworda - Suboutine to display contents of location as a 16 bit address
+
+;Subroutine to display contents of a location as a 16 bit address
+
+dispworda:
+	MOVB	AH, #4			;Get item size
+	MOVB	CH, #VL_WADDR		;Get item type
+	MOVB	AL, #')'
+	MOVL	EBX, uregDS
+	CALL	rdspadr			;Get and set up the address
+	JC	10$.S			;If error
+	MOVL	EDX, opnseg		;Get offset part
+	MOVL	EBX, opnofs	
+	CALL	getmword
+	JC	hvaerr
+	ADD%	%BX, #2.B		;Point to segment part
+	JMP	rgtcom
+
+10$:	RET
+.PAGE
+	.SBTTL	examlong - EL command - Display contents of location as a long
+
+;Here for the EL command to display contents of location as a long
+
+examlong:
+	CALL	getfld			;Get address
+	JC	4$.S			;If error
+elong2:	CALL	chkend			;Must be last thing on line
+	JNC	displong		;If OK
+4$:	RET
+
+	.SBTTL	openlong - OL command - Open location as a long
+
+;Here for the OL command to open location as a long
+
+openlong:
+	CALL	getfld			;Get address
+	JC	4$.S			;If error
+olong2:	CALL	chkend			;Must be last thing on line
+	JC	4$.S
+	CALL	displong
+	JMP	open4
+
+	.SBTTL	chnglong - CL command - Change long
+
+;Here for the CL command to change long
+
+chnglong:
+	PUSHL	#VL_LONG+400h
+	JMP	chng6
+.PAGE
+	.SBTTL	displong - Suboutine to display contents of location as a long
+
+;Subroutine to display contents of a location as a long
+
+displong:
+	MOVB	AH, #4			;Get item size
+	MOVB	CH, #VL_LONG		;Get item type
+	MOVB	AL, #'{'
+	MOVL	EBX, uregDS
+	CALL	rdspadr			;Get and set up the address
+	JC	10$.S			;If error
+	MOVL	EDX, opnseg		;Get word from memory
+	MOVL	EBX, opnofs
+	CALL	getmlong
+	JC	hvaerr
+	CALL	outlong			;Output the value
+	JMP	dispdn
+
+10$:	RET
+.PAGE
+	.SBTTL	examlonga - ELA command - Display contents of location as 32 bit address
+
+;Here for the EWA command to display contents of location as a 32 bit address
+
+examlonga:
+	CALL	getfld			;Get address
+	JC	4$.S			;If error
+elonga2:CALL	chkend			;Must be last thing on line
+	JNC	displonga		;If OK
+4$:	RET
+
+	.SBTTL	openlonga - OLA command - Open location as a 32 bit address
+
+;Here for the OLA command to open location as a 32 bit address
+
+openlonga:
+	CALL	getfld			;Get address
+	JC	4$.S			;If error
+olonga2:CALL	chkend			;Must be last thing on line
+	JC	4$.S			;If error
+	CALL	displonga
+	JMP	open4
+
+	.SBTTL	chngbyte - CLA command - Change 32 bit address
+
+;Here for the CLA command to change 32 bit address
+
+chnglonga:
+	PUSHL	#VL_LADDR+600h
+	JMP	chng6
+.PAGE
+	.SBTTL	displonga - Suboutine to display contents of location as a 32 bit address
+
+;Subroutine to display contents of a location as a 32 bit address
+
+2$:	RET
+
+displonga:
+	MOVB	AH, #6			;Get item size
+	MOVB	CH, #VL_LADDR		;Get item type
+	MOVB	AL, #'}'
+	MOVL	EBX, uregDS
+	CALL	rdspadr			;Get and set up the address
+	JC	2$.S			;If error
+	MOVL	EDX, opnseg		;Get offset part
+	MOVL	EBX, opnofs	
+	CALL	getmlong
+	JC	4$.S
+	ADDL	EBX, #4.B		;Get segment part
+rgtcom:	PUSHL	EAX
+	CALL	getmword
+.IF NE $$USERMODE
+	ORL	EAX, v86img
+.ENDC
+	MOVL	EDX, EAX
+	POPL	EAX
+4$:	JC	hvaerr
+	CALL	outsgof			;Output the value
+	JMP	dispdn
+.PAGE
+	.SBTTL	examprev - EP command - Display contents of previous location
+
+;Here for the EP command to display contents of previous location
+
+examprev:
+	CALL	prevsub
+	JMP	2$.S
+
+	.SBTTL	openprev - OP command - Open previous location
+
+;Here for the OP command to open previous location
+
+openprev:
+	CALL	prevsub
+	JMP	6$.S
+
+	.SBTTL	chngprev - CP command - Change previous location
+
+;Here for the CP command to change previous location
+
+chngprev:
+	CALL	prevsub
+	JMP	8$.S
+
+	.SBTTL	examsame - F6 key - Examine contents of same location
+
+;Here for the F6 key to examine contents of previous location
+
+examsame:
+	CALL	next2
+	JMP	2$.S
+
+	.SBTTL	opensame - shft-F6 key - Open same location
+
+;Here for the shft-F6 key to open same location
+
+opensame:
+	CALL	next2
+	JMP	6$.S
+
+	.SBTTL	examnext - EP command - Display contents of next location
+
+;Here for the EP command to display contents of next location
+
+examnext:
+	CALL	nextsub
+2$:	JC	4$.S
+	JMPIL	CS:examtbl[EBX*4]
+
+4$:	RET
+
+	.SBTTL	opennext - OP command - Open next location
+
+;Here for the OP command to open next location
+
+opennext:
+	CALL	nextsub
+6$:	JC	4$.S
+	JMPIL	CS:opentbl[EBX*4]
+
+	.SBTTL	chngnext - CN command - Change next location
+
+;Here for the CN command to change next location
+
+chngnext:
+	CALL	nextsub
+8$:	JC	4$.S
+	CMPB	BL, #VL_INS		;Instruction open?
+	JE	chngin2			;Yes - go handle that
+	PUSHL	chngtbl[EBX*4]		;No - get data
+	JMP	chng6			;Continue
+
+;Dispatch table for examine next/previous
+
+	.MOD	4
+examtbl:.LONG	elonga2		;VL_LADDR = 0 - Long address
+	.LONG	eworda2		;VL_WADDR = 1 - Word address
+	.LONG	elong2		;VL_LONG  = 2 - Long
+	.LONG	eword2		;VL_WORD  = 3 - Word
+	.LONG	ebyte2		;VL_BYTE  = 4 - Byte
+	.LONG	eins2		;VL_INS   = 5 - Instruction
+
+;Dispatch table for open next/previous
+
+opentbl:.LONG	olonga2		;VL_LADDR = 0 - Long address
+	.LONG	oworda2		;VL_WADDR = 1 - Word address
+	.LONG	olong2		;VL_LONG  = 2 - Long
+	.LONG	oword2		;VL_WORD  = 3 - Word
+	.LONG	obyte2		;VL_BYTE  = 4 - Byte
+	.LONG	oins2		;VL_INS   = 5 - Instruction
+
+;Data table for change next/previous
+
+chngtbl:.LONG	VL_LADDR+600h	;VL_LADDR = 0 - Long address
+	.LONG	VL_WADDR+400h	;VL_WADDR = 1 - Word address
+	.LONG	VL_LONG+400h	;VL_LONG  = 2 - Long
+	.LONG	VL_WORD+200h	;VL_WORD  = 3 - Word
+	.LONG	VL_BYTE+100h	;VL_BYTE  = 4 - Byte
+.PAGE
+	.SBTTL	nextsub - Subroutine to access next location
+
+;Subroutine to access next location
+;	CALL	nextsub
+;	C:set = Error
+;	C:clr = Normal
+;	  c{EBX} = Location type
+
+nextsub:MOVB	BL, opnreg		;Is he looking at memory?
+	ANDB	BL, opnsrg
+	JNS	4$.S			;No - can't advance!
+	MOVZBL	EAX, opnsiz		;OK - advance by size of the item
+	ADDL	opnofs, EAX
+next2:	MOVL	EAX, opnofs
+	MOVL	valofs, EAX		;Make address look like a value that
+	MOVL	EDX, opnseg		;  was just entered
+	MOVL	valseg, EDX
+	MOVB	valtyp, #VL_LADDR
+	MOVZBL	EBX, opntyp
+	RET
+
+4$:	STC
+	RET
+.PAGE
+	.SBTTL	prevsub - Subroutine to access previous location
+
+;Subroutine to access previous location
+;	CALL	prevsub
+;	C:set = Error
+;	C:clr = Normal
+;	  c{EBX} = Location type
+
+prevsub:CMPB	opntyp, #VL_INS		;Were we looking at an instruction?
+	JE	1$.S			;Yes - this is hard!
+	MOVZBL	ECX ,opnsiz		;No - just back up by size of current
+	SUBL	opnofs, ECX		;  item
+	JMP	next2.S			;Continue
+
+;Here to back up if instruction is open
+
+1$:	MOVL	EAX, opnofs		;Get current address
+	PUSHL	EAX			;Save it
+	SUBL	EAX, #50.B		;Back up a ways
+	JNC	2$.S			;Did we back up past 0?
+	XORL	EAX, EAX		;Yes - start at 0
+2$:	MOVB	outflg, #1		;No output now
+3$:	MOVL	opnofs, EAX		;Evalute this address as instruction
+	MOVB	validi, #1		;See if valid instruction
+	CALL	outopc
+	CMPB	validi, #1		;Was this a valid instruction?
+	JE	4$.S			;Yes
+	MOVL	EAX, opnofs		;No - see if where we started
+	INCL	EAX
+	CMPL	EAX, [ESP]
+	JB	3$.S			;No
+	JMP	6$.S			;Didn't find instruction to back up to!
+
+;Here if valid instruction
+
+4$:	MOVL	EAX, opnofs		;Advance to next instruction
+	MOVZBL	ECX, opnsiz
+	ADDL	EAX, ECX
+	CMPL	EAX, [ESP]
+	JB	3$.S			;No
+	JE	10$.S			;Made it!
+6$:	MOVL	EBX, ECX		;Overshot - just back up 1!
+	DECL	EBX
+	MOVB	opntyp, #VL_BYTE	;Change mode to byte
+	MOVB	opnsiz, #1
+	JMP	12$.S
+
+;Here with valid instruction to back up to!
+
+10$:	MOVL	EAX, opnofs		;Yes - display this instruction
+12$:	POPL	ECX			;Remove junk from the stack
+	MOVB	outflg, #0
+	JMP	next2			;Continue
+.PAGE
+	.SBTTL	dispsts - DS command - Display status
+
+;Here for the STS command - Display status
+
+dispsts:CALL	chkend			;No arguments allowed
+	JC	10$.S
+	CMPL	curbpt, #0.B		;Do we have a current breakpoint?
+	JE	2$.S			;No
+	MOV%	%BX, #bs1msg		;Yes
+	CALL	outstrc
+	MOVL	ESI, curbpt
+	MOVL	EAX, bt_ofs.B[ESI]	;Get address of breakpoint
+	MOVL	EDX, bt_seg.B[ESI]
+	CALL	outsgof			;Display it
+	JMP	4$.S
+
+2$:	MOV%	%BX, #bs2msg
+	CALL	outstrc
+4$:	CMPL	opnmod, #0.B		;Do we have an selected symbol table?
+	JE	6$.S			;No
+	MOV%	%BX, #cstms1		;Yes
+	CALL	outstrc
+.IF EQ $$USERMODE
+	LES%	%DI, opnmod
+.IFF
+	MOVL	EDI, opnmod
+.ENDC
+	JMP	dmpname
+
+6$:	MOV%	%BX, #cstms2
+	JMP	outstrc
+
+10$:	RET
+.PAGE
+	.SBTTL	findbyte - FB command - Search for byte
+
+;Here for the FB command - Search for byte in memory
+;  Command format:
+;	FB value, address, amount{, increment}
+;  If "increment" is not specified, 1 is used.
+
+findbyte:
+	MOVL	EAX, #1			;Get default increment value
+	CALL	findsetup		;Do initial set up
+	JC	10$.S			;If error
+4$:	MOVL	EBX, findaddr+0		;Get contents of byte
+	MOVL	EDX, findaddr+4
+	CALL	getmbyte
+	JC	hvaerr
+	MOVL	findtmp, EAX
+	XORB	AL, findval
+	ANDB	AL, findmask
+	JNE	6$.S
+	MOVL	EAX, findaddr+0		;Get offset part of address
+	MOVL	EDX, findaddr+4		;Get segment part of address
+	CALL	outsgof			;Display address
+	MOVB	AL, #'\'
+	CALL	outchr
+	MOVB	AL, #HT
+	CALL	outchr
+	MOVZBL	EAX, findtmp
+	CALL	outbyte
+	CALL	outcrl
+6$:	MOVL	EAX, findaddr+0
+	ADDL	EAX, findincr
+	MOVL	findaddr+0, EAX
+	CMPL	EAX, findlimit
+	JB	4$.S
+10$:	RET	
+.PAGE
+	.SBTTL	findword - FW command - Search for word
+
+;Here for the FW command - Search for word in memory
+;  Command format:
+;	FW value, address, amount{, increment}
+;  If "increment" is not specified, 2 is used.
+
+findword:
+	MOVL	EAX, #2			;Get default increment value
+	CALL	findsetup		;Do initial set up
+	JC	10$.S			;If error
+4$:	MOVL	EBX, findaddr+0		;Get contents of byte
+	MOVL	EDX, findaddr+4
+	CALL	getmword
+	JC	hvaerr
+	MOVL	findtmp, EAX
+	XORW	AX, findval
+	ANDW	AX, findmask
+	JNE	6$.S
+	MOVL	EAX, findaddr+0		;Get offset part of address
+	MOVL	EDX, findaddr+4		;Get segment part of address
+	CALL	outsgof			;Display address
+	MOVB	AL, #'('
+	CALL	outchr
+	MOVB	AL, #HT
+	CALL	outchr
+	MOVZWL	EAX, findtmp
+	CALL	outword
+	CALL	outcrl
+6$:	MOVL	EAX, findaddr+0
+	ADDL	EAX, findincr
+	MOVL	findaddr+0, EAX
+	CMPL	EAX, findlimit
+	JB	4$.S
+10$:	RET	
+.PAGE
+	.SBTTL	findlong - FL command - Search for long
+
+;Here for the FL command - Search for long in memory
+;  Command format:
+;	FL value, address, amount{, increment}
+;  If "increment" is not specified, 4 is used.
+
+findlong:
+	MOVL	EAX, #4			;Get default increment value
+	CALL	findsetup		;Do initial set up
+	JC	10$.S			;If error
+4$:	MOVL	EBX, findaddr+0		;Get contents of byte
+	MOVL	EDX, findaddr+4
+	CALL	getmlong
+	JC	hvaerr
+	MOVL	findtmp, EAX
+	XORL	EAX, findval
+	ANDL	EAX, findmask
+	JNE	6$.S
+	MOVL	EAX, findaddr+0		;Get offset part of address
+	MOVL	EDX, findaddr+4		;Get segment part of address
+	CALL	outsgof			;Display address
+	MOVB	AL, #'{'
+	CALL	outchr
+	MOVB	AL, #HT
+	CALL	outchr
+	MOVL	EAX, findtmp
+	CALL	outlong
+	CALL	outcrl
+6$:	MOVL	EAX, findaddr+0
+	ADDL	EAX, findincr
+	MOVL	findaddr+0, EAX
+	CMPL	EAX, findlimit
+	JB	4$.S
+10$:	RET	
+.PAGE
+	.SBTTL	setmask - SMSK command - Set search mask
+
+;Here for the SMSK command - Set search mask
+;  Command format:
+;	SMSK value
+
+setmask:CALL	outcrl
+	CALL	getfld			;Get value
+	JC	4$.S
+	CMPB	notnul, #0		;Was a value given?
+	JE	6$.S			;No
+	CALL	chkend			;Yes - must be only argument
+	JC	4$.S
+	MOVL	EAX, valofs		;Store new mask value
+	MOVL	findmask, EAX
+4$:	RET
+
+;Here if no value was given - display the current mask value
+
+6$:	MOVL	EAX, findmask
+	CALL	outnum
+	JMP	outcrl
+.PAGE
+;Subroutine to do initial set up for the memory search command
+;	c{EAX} = Default increment value
+;	CALL	findsetup
+;	C:set = Error
+;	C:clr = Normal
+
+findsetup:
+	MOVL	findincr, EAX		;Store default increment value
+	CALL	outcrl
+	CALL	getfld			;Get value to search for
+	JC	8$.S			;If error
+	CMPB	AL, #','
+	JNE	6$.S
+	MOVL	EAX, valofs
+	MOVL	findval, EAX
+	CALL	getfld			;Get starting address
+	JC	8$.S
+	CMPB	AL, #','
+	JNE	6$.S
+	MOVL	EAX, valofs
+	MOVL	findaddr+0, EAX
+	MOVL	EAX, valseg
+	MOVL	findaddr+4, EAX
+	CALL	getfld			;Get amount
+	JC	8$.S
+	MOVL	EDX, valofs
+	ADDL	EDX, findaddr+0
+	MOVL	findlimit, EDX
+	CMPB	AL, #','
+	JNE	4$.S
+	CALL	getfld			;Get increment value
+	JC	8$.S
+	MOVL	EAX, valofs
+	MOVL	findincr, EAX
+4$:	MOVL	EAX, dheight
+	INCL	EAX
+	MOVB	linelim, AL
+	JMP	chkend			;Must have end of line here
+
+6$:
+
+8$:	RET
+.PAGE
+	.SBTTL	selsym - SM command - Select symbol table for module
+
+;Here for the SM command - Select symbol table for module
+
+selsym:	CALL	getname			;Get name to search for
+	JC	uerror			;If error
+	CALL	chkend
+	JC	ret004.S
+	CMPB	symbuf, #0		;Was a name given?
+	JNE	4$.S			;Yes
+	MOVL	opnmod, #0		;No - unselect current symbol table
+	RET
+
+;Here if a symbol was given
+
+4$:	MOV%	%SI, #symbuf
+	MOVB	BH, symsiz
+	CALL	fndmod			;Search for module name entry
+	JNE	ret004.S		;If not found
+	MOV%	opnmod+0, %DI		;Found it - store as selected module
+.IF EQ $$USERMODE
+	MOV%	opnmod+ITEMSIZE, ES
+.ENDC
+ret004:	RET
+.PAGE
+	.SBTTL	srchval - SV commnand - Numeric search of symbol table
+
+;Here for the SV command - Numeric search of symbol table
+
+srchval:MOVB	symbfs, #'*'
+	MOVB	AL, #1
+	JMP	4$.S
+
+nonerr:	MOV%	%BX, #nonmsg
+	JMP	outstrcca
+
+	.SBTTL	srchname - SS command - Symbolic search of symbol table
+
+;Here for the SS command - Symbolic search of symbol table
+
+srchname:
+	CALL	getname			;Get name to search for
+	JC	uerror			;If error
+	CMPB	symbuf, #0		;Was a name given?
+	JE	nonerr.S		;No - fail
+	MOV%	%SI, #symbuf		;Yes - copy the name
+	MOV%	%DI, #symbfs
+	PUSH%	DS
+	POP%	ES
+	MOV%	%CX, #SYMLEN/ITEMSIZE
+	RMOVS%	[%DI], [%SI]
+	MOVB	AL, symsiz
+4$:	MOVB	symszs, AL
+	CALL	getfld			;Get possible value
+	JC	ret004.S		;If error
+	CALL	chkend
+	JC	ret004.S
+	CMPB	valtyp, #VL_BYTE	;Value must be simple value
+	JBE	6$.S
+	MOV%	%BX, #nsvmsg
+	JMP	outstrcca
+
+;Here with valid value for the comparison
+
+6$:	MOVB	hdrflg, #0
+	MOVL	EAX, dheight
+	INCL	EAX
+	MOVB	linelim, AL
+
+.IF EQ $$USERMODE|$$REALMODE		;If exec mode
+	PUSHL	#GS_DATA.B		;Initialize LKE pointer for loadable
+	POPL	ES			;  symbol tables
+	MOVL	EAX, ES:firstlke#
+	MOVL	nextlke, EAX
+	MOVL	EDI, #geckosymtbl	;Point to base symbol table
+	PUSHL	DS
+	POPL	ES
+	MOVL	EDX, geckosymcnt		;Get length of table
+	MOVL	curmod, #0		;No current module to begin with
+10$:	CMPB	cciflg, #0		;Is he trying to stop us?
+	JNE	14$.S			;Yes
+	CALL	symtblend
+	JNE	16$.S			;Yes
+12$:	CMPB	hdrflg, #0		;No - did we find anything to output?
+	JNE	14$.S			;Yes
+	MOV%	%BX, #nommsg		;No - tell him so
+	JMP	outstrcca
+
+14$:	MOVB	linelim, #0
+	RET
+
+;Here with another symbol table entry to check
+
+16$:	TESTB	ES:sym32_flag.B[EDI], #SF$MOD ;Is this entry a module name?
+	JE	18$.S			;No
+	MOVL	curmod+0, EDI		;Yes - remember it
+	MOVL	curmod+4, ES
+	JMP	50$			;Otherwise skip it
+
+;Here if not a module name entry
+
+18$:	CMPB	notnul, #0		;Was a value given?
+	JE	26$.S			;No - don't check the value
+20$:	MOVB	CL, ES:sym32_flag.B[EDI] ;Get flag bits for the symbol
+	CMPB	valtyp, #VL_WADDR	;Yes - searching for address?
+	JBE	22$.S			;Yes
+	XORB	CL, #SF$ADR		;No - reverse flag bit
+22$:	TESTB	CL, #SF$ADR		;Is this what we want?
+	JE	50$			;No
+	MOVL	EAX, ES:sym32_ofs.B[EDI] ;Yes - get value
+	CMPL	EAX, valofs		;Compare to his value
+	JNE	50$			;Nope
+	MOVZWL	EAX, ES:sym32_seg.B[EDI]
+	TESTB	CL, #SF$V86
+	JE	24$.S
+	BTSL	EAX, #16t
+24$:	CMPL	EAX, valseg
+	JNE	50$
+26$:	PUSHL	EDI
+	MOVL	ESI, #symbfs		;Point to start of what we want
+	MOVB	BL, symszs		;Get its length
+	MOVZBL	ECX, ES:[EDI]		;Get length of table entry
+	ADDL	EDI, #sym32_name.B	;Point to start of name string
+	CALL	cmpstr			;Compare strings
+	JNC	40$.S			;If have complete match
+	JNE	34$.S			;If match not possible
+
+;Here if have *
+
+30$:	INCL	ESI			;Advance to next character
+	DECB	BL
+	JE	40$.S			;Found match if nothing after *
+32$:	MOVB	AL, [ESI]
+	CLD
+	RNSCASB	[EDI]			;Scan to first match
+	JE	36$.S
+34$:	POPL	EDI			;Not this one - restore table pointer
+	JMP	50$			;And continue
+
+;Here with match on character following * in symbol	
+
+36$:	MOVL	ESIsrch, ESI		;Save state
+	MOVL	EDIsrch, EDI
+	MOVB	CLsrch, CL
+	MOVB	BLsrch, BL
+	INCL	ESI			;Advance to next character in symbol
+	DECB	BL
+38$:	CALL	cmpstr			;Compare strings
+	JNC	40$.S			;If have complete match
+	JE	30$.S			;If found another *
+	MOVL	EDI, EDIsrch		;Match not possible here - advance one
+	MOVL	ESI, ESIsrch		;  character and try to match that
+	MOVB	CL, CLsrch		;  string
+	MOVB	BL, BLsrch
+	JMP	32$.S			;Continue
+
+;Here with complete match
+
+40$:	CMPB	hdrflg, #0		;Have we output a header yet?
+	JNE	42$.S			;Yes
+	MOV%	%BX, #vhdmsg		;No - output it now
+	CALL	outstrc
+	MOVB	hdrflg, #1
+42$:	CALL	outcrl
+	POPL	EDI			;Restore table pointer
+	TESTB	ES:sym32_flag.B[EDI], #SF$ADR ;Is value an address?
+	JNE	44$.S			;Yes
+	MOVL	EBX, #sp5str		;No
+	CALL	outstrc
+	JMP	46$.S
+
+;Here if value to display is an address
+
+44$:	MOVW	AX, ES:sym32_seg.B[EDI]	;Display segment part
+	CALL	out4hx
+	MOVB	AL, #':'
+	TESTB	ES:sym32_flag.B[EDI], #SF$V86
+	JE	45$.S
+	INCL	EAX
+45$:	CALL	outchr
+46$:	MOVL	EAX, ES:sym32_ofs.B[EDI] ;Display offset
+	CALL	out8hx
+	MOVL	EBX, #sp2str
+	CALL	outstrc
+	CALL	dmpsym			;Display symbol
+50$:	MOVZBL	EAX, ES:[EDI]		;Bump pointer
+	LEAL	EDI, sym32_name.B[EAX+EDI]
+	DECL	EDX			;Reduce count
+	JMP	10$			;Continue
+.ENDC
+
+.IF NE $$USERMODE			;If user mode
+	MOVL	EDI, geckosymtbl  	;Point to symbol table
+	MOVL	EDX, geckosymcnt  	;Get length of symbol table
+	MOVL	curmod, #0		;No current module to begin with
+10$:	CMPB	cciflg, #0		;Is he trying to stop us?
+	JNE	14$.S			;Yes
+	TESTL	EDX, EDX		;No - any more to look at?
+	JNE	16$.S			;Yes
+12$:	CMPB	hdrflg, #0		;No - did we find anything to output?
+	JNE	14$.S			;Yes
+	MOV%	%BX, #nommsg		;No - tell him so
+	JMP	outstrcca
+
+14$:	MOVB	linelim, #0
+	RET
+
+;Here with another symbol table entry to check
+
+16$:	TESTB	sym32_flag.B[EDI], #SF$MOD
+	JE	18$.S			;No
+	MOVL	curmod+0, EDI		;Yes - remember it
+	JMP	50$			;Otherwise skip it
+
+;Here if not a module name entry
+
+18$:	CMPB	notnul, #0		;Was a value given?
+	JE	26$.S			;No - don't check the value
+20$:	MOVB	CL, sym32_flag.B[EDI]
+	CMPB	valtyp, #VL_WADDR	;Yes - searching for address?
+	JBE	22$.S			;Yes
+	XORB	CL, #SF$ADR		;No - reverse flag bit
+22$:	TESTB	CL, #SF$ADR		;Is this what we want?
+	JE	50$			;No
+	MOVL	EAX, sym32_ofs.B[EDI]
+	CMPL	EAX, valofs		;Compare to his value
+	JNE	50$			;Nope
+	MOVZWL	EAX, sym32_seg.B[EDI]
+	TESTB	CL, #SF$V86
+	JE	24$.S
+	BTSL	EAX, #16t
+24$:	CMPL	EAX, valseg
+	JNE	50$
+26$:	PUSHL	EDI
+	MOVL	ESI, #symbfs		;Point to start of what we want
+	MOVB	BL, symszs		;Get its length
+	MOVZBL	ECX, [EDI]
+	ADDL	EDI, #sym32_name.B	;Point to start of name string
+	CALL	cmpstr			;Compare strings
+	JNC	40$.S			;If have complete match
+	JNE	34$.S			;If match not possible
+
+;Here if have *
+
+30$:	INCL	ESI			;Advance to next character
+	DECB	BL
+	JE	40$.S			;Found match if nothing after *
+32$:
+	PUSHL	DS
+	POPL	ES
+	MOVB	AL, [ESI]
+	CLD
+	RNSCASB	[EDI]			;Scan to first match
+	JE	36$.S
+34$:	POPL	EDI			;Not this one - restore table pointer
+	JMP	50$			;And continue
+
+;Here with match on character following * in symbol	
+
+36$:	MOVL	ESIsrch, ESI		;Save state
+	MOVL	EDIsrch, EDI
+	MOVB	CLsrch, CL
+	MOVB	BLsrch, BL
+	INCL	ESI			;Advance to next character in symbol
+	DECB	BL
+38$:	CALL	cmpstr			;Compare strings
+	JNC	40$.S			;If have complete match
+	JE	30$.S			;If found another *
+	MOVL	EDI, EDIsrch		;Match not possible here - advance one
+	MOVL	ESI, ESIsrch		;  character and try to match that
+	MOVB	CL, CLsrch		;  string
+	MOVB	BL, BLsrch
+	JMP	32$.S			;Continue
+
+;Here with complete match
+
+40$:	CMPB	hdrflg, #0		;Have we output a header yet?
+	JNE	42$.S			;Yes
+	MOV%	%BX, #vhdmsg		;No - output it now
+	CALL	outstrc
+	MOVB	hdrflg, #1
+42$:	CALL	outcrl
+	POPL	EDI			;Restore table pointer
+	TESTB	sym32_flag.B[EDI], #SF$ADR
+	JNE	44$.S			;Yes
+	MOVL	EBX, #sp5str		;No
+	CALL	outstrc
+	JMP	46$.S
+
+;Here if value to display is an address
+
+44$:	MOVW	AX, sym32_seg.B[EDI]
+	CALL	out4hx
+	MOVB	AL, #':'
+	MOVB	AH, sym32_flag.B[EDI]
+	XORB	AH, v86img+2
+	TESTB	AH, #1
+	JE	45$.S
+	INCL	EAX
+45$:	CALL	outchr
+46$:	MOVL	EAX, sym32_ofs.B[EDI]
+	CALL	out8hx
+	MOVL	EBX, #sp2str
+	CALL	outstrc
+	CALL	dmpsym			;Display symbol
+50$:	MOVZBL	EAX, [EDI]
+	LEAL	EDI, sym32_name.B[EAX+EDI]
+	DECL	EDX			;Reduce count
+	JMP	10$			;Continue
+.ENDC
+
+.IF NE $$REALMODE			;If real mode
+	LESW	DI, geckosymtbl		;Point to symbol table
+	MOVW	DX, geckosymcnt		;Get length of symbol table
+	MOVL	curmod, #0		;No current module to begin with
+10$:	CMPB	cciflg, #0		;Is he trying to stop us?
+	JNE	14$.S			;Yes
+	ORW	DX, DX			;No - any more to look at?
+	JNE	16$.S			;Yes
+12$:	CMPB	hdrflg, #0		;No - did we find anything to output?
+	JNE	14$.S			;Yes
+	MOVW	BX, #nommsg		;No - tell him so
+	JMP	outstrcca
+
+14$:	MOVB	linelim, #0
+	RET
+
+;Here with another symbol table entry to check
+
+16$:	TESTB	ES:sym16_flag.B[DI], #SF$MOD ;Is this entry a module name?
+	JE	18$.S			;No
+	MOVW	curmod+0, DI		;Yes - remember it
+	MOVW	curmod+2, ES
+	JMP	50$			;Otherwise skip it
+
+;Here if not a module name entry
+
+18$:	CMPB	notnul, #0		;Was a value given?
+	JE	26$.S			;No - don't check the value
+20$:	MOVB	CL, ES:sym16_flag.B[DI]	;Get flag bits for the symbol
+	CMPB	valtyp, #VL_WADDR	;Yes - searching for address?
+	JBE	22$.S			;Yes
+	XORB	CL, #SF$ADR		;No - reverse flag bit
+22$:	TESTB	CL, #SF$ADR		;Is this what we want?
+	JE	50$			;No
+	MOVZWL	EAX, ES:sym16_ofs.B[DI]	;Yes - get value
+	CMPL	EAX, valofs		;Compare to his value
+	JNE	50$			;Nope
+	MOVZWL	EAX, ES:sym16_seg.B[DI]
+	CMPL	EAX, valseg
+	JNE	50$
+26$:	PUSHW	DI
+	MOVW	SI, #symbfs		;Point to start of what we want
+	MOVB	BL, symszs		;Get its length
+	MOVB	CL, ES:[DI]		;Get length of table entry
+	MOVB	CH, #0
+	ADDW	DI, #sym16_name.B	;Point to start of name string
+	CALL	cmpstr			;Compare strings
+	JNC	40$.S			;If have complete match
+	JNE	34$.S			;If match not possible
+
+;Here if have *
+
+30$:	INCW	SI			;Advance to next character
+	DECB	BL
+	JE	40$.S			;Found match if nothing after *
+32$:	MOVB	AL, [SI]
+	CLD
+	RNSCASB	[DI]			;Scan to first match
+	JE	36$.S
+34$:	POPW	DI			;Not this one - restore table pointer
+	JMP	50$			;And continue
+
+;Here with match on character following * in symbol	
+
+36$:	MOVW	ESIsrch, SI		;Save state
+	MOVW	EDIsrch, DI
+	MOVB	CLsrch, CL
+	MOVB	BLsrch, BL
+	INCW	SI			;Advance to next character in symbol
+	DECB	BL
+38$:	CALL	cmpstr			;Compare strings
+	JNC	40$.S			;If have complete match
+	JE	30$.S			;If found another *
+	MOVW	DI, EDIsrch		;Match not possible here - advance one
+	MOVW	SI, ESIsrch		;  character and try to match that
+	MOVB	CL, CLsrch		;  string
+	MOVB	BL, BLsrch
+	JMP	32$.S			;Continue
+
+;Here with complete match
+
+40$:	CMPB	hdrflg, #0		;Have we output a header yet?
+	JNE	42$.S			;Yes
+	MOVW	BX, #vhdmsg		;No - output it now
+	CALL	outstrc
+	MOVB	hdrflg, #1
+42$:	CALL	outcrl
+	POPW	DI			;Restore table pointer
+	TESTB	ES:sym16_flag.B[DI], #SF$ADR ;Is value an address?
+	JNE	44$.S			;Yes
+	MOVW	BX, #sp5str		;No
+	CALL	outstrc
+	JMP	46$.S
+
+;Here if value to display is an address
+
+44$:	MOVW	AX, ES:sym16_seg.B[DI]	;Display segment part
+	CALL	out4hx
+	MOVB	AL, #':'
+	CALL	outchr
+46$:	MOVZWL	EAX, ES:sym16_ofs.B[DI]	;Display offset
+	CALL	out8hx
+	MOVW	BX, #sp2str
+	CALL	outstrc
+	CALL	dmpsym			;Display symbol
+50$:	MOVB	AL, ES:[DI]		;Bump pointer
+	MOVB	AH, #0
+	ADDW	DI, AX
+	ADDW	DI, #sym16_name.B
+	DECW	DX			;Reduce count
+	JMP	10$			;Continue
+.ENDC
+.PAGE
+	.SBTTL	swscrn - Routine to switch screens
+
+;Here on ESC-- to switch screens
+
+swscrn:	CMPB	serterm, #0		;Using serial terminal now?
+	JNE	10$.S			;Yes - ignore this
+	CMPB	screen, #0		;No - currently displaying GECKO's screen?
+	JE	8$.S			;No
+	JMP	uscreen			;Yes - switch to user's screen
+
+8$:	JMP	xscreen			;Switch to GECKO's screen
+
+10$:	RET
+.PAGE
+	.SBTTL	cmpstr - Subroutine to compare symbol to symbol table entry
+
+;Subroutine to compare symbol to symbol table entry
+;	c(BL)  = Bytes left in symbol
+;	c(CL)  = Bytes left in symbol table entry
+;	c{ESI} = Offset of symbol
+;	c{EDI} = Offset of symbol table entry
+;	CALL	cmpstr
+;	C:clr       = Complete match
+;	C:set,Z:set = * encountered
+;	C:set,Z:clr = Not match possible
+
+.IF EQ $$REALMODE			;If not real mode
+cmpstr:	CMPB	BL, #0			;Anything left to check?
+	JNE	2$.S			;Yes
+	CMPB	CL, #0			;No - anything left in table?
+	JE	ret006.S		;No - have complete match
+	STC				;Yes - can't have match here
+ret006:	RET
+
+;Here with more in symbol to check
+
+2$:	MOVB	AL, [ESI]		;Get next character to look for
+	CMPB	AL, #'*'		;Another wild character?
+	JE	8$.S			;Yes
+	CMPB	CL, #0			;No - more in table?
+	JE	4$.S			;No - can't have match here
+	CMPB	AL, #'#'		;Yes - match anything?
+	JE	6$.S			;Yes
+.IF EQ $$USERMODE
+	CMPB	AL, ES:[EDI]		;No - compare
+.IFF
+	CMPB	AL, [EDI]
+.ENDC
+	JE	6$.S			;This one
+4$:	TESTL	EDI, EDI		;Indicate no match possible here
+	STC
+	RET
+
+;Here with match on character
+
+6$:	INCL	EDI			;Advance pointers
+	DECB	CL
+	INCL	ESI
+	DECB	BL
+	JMP	cmpstr.S		;Continue checking
+
+;Here with * in symbol
+
+8$:	XORB	AL, AL			;Indicate have *
+	STC
+	RET
+.ENDC
+
+.IF NE $$REALMODE
+cmpstr:	CMPB	BL, #0			;Anything left to check?
+	JNE	2$.S			;Yes
+	CMPB	CL, #0			;No - anything left in table?
+	JE	ret006.S		;No - have complete match
+	STC				;Yes - can't have match here
+ret006:	RET
+
+;Here with more in symbol to check
+
+2$:	MOVB	AL, [SI]		;Get next character to look for
+	CMPB	AL, #'*'		;Another wild character?
+	JE	8$.S			;Yes
+	CMPB	CL, #0			;No - more in table?
+	JE	4$.S			;No - can't have match here
+	CMPB	AL, #'#'		;Yes - match anything?
+	JE	6$.S			;Yes
+	CMPB	AL, ES:[DI]		;No - compare
+	JE	6$.S			;This one
+4$:	ORW	DI, DI			;Indicate no match possible here
+	STC
+	RET
+
+;Here with match on character
+
+6$:	INCW	DI			;Advance pointers
+	DECB	CL
+	INCW	SI
+	DECB	BL
+	JMP	cmpstr.S		;Continue checking
+
+;Here with * in symbol
+
+8$:	XORB	AL, AL			;Indicate have *
+	STC
+	RET
+.ENDC
+.PAGE
+	.SBTTL	symtblend - Subroutine to check for end of symbol table
+
+.IF EQ $$USERMODE|$$REALMODE
+
+;Subroutine to check for end of symbol table - advances to next symbol table
+;  if necessary
+;	c{ES:EDI} = Current symbol table pointer
+;	c{EDX}    = Symbol table count
+;	CALL	symtblend
+;	Z:set = End
+;	Z:crl = Not end
+
+symtblend:
+	TESTL	EDX, EDX		;No - any more to look at?
+	JNE	4$.S			;Yes - return with Z clear
+2$:	MOVL	EDX, nextlke		;No - get offset of next LKE
+	TESTL	EDX, EDX		;Have another to check?
+	JE	4$.S			;No - return with Z set
+	PUSHL	#GS_CODE.B
+	POPL	ES
+	MOVL	EDI, ES:[EDX]		;Yes - advance to next LKE
+	MOVL	nextlke, EDI		;Remember it
+	MOVL	EDI, ES:4.B[EDX]	;Get offset of LKE's symbol table
+	TESTL	EDI, EDI		;Does it have one?
+	JE	2$.S			;No - continue to next LKE
+	PUSHL	#GS_DATA		;Yes
+	POPL	ES
+	MOVL	EDX, ES:[EDI]		;Get size of this symbol table
+	TESTL	EDX, EDX
+	JE	2$.S
+	ADDL	EDI, #8.B		;Point to first entry
+4$:	RET
+
+.ENDC
+.PAGE
+	.SBTTL	dmpsym - Subroutine to display symbol from symbol table
+
+;Subroutine to display symbol from symbol table
+;	c{EDI} = Offset of symbol table entry
+;	CALL	dmpsym
+
+.IF EQ $$USERMODE|$$REALMODE		;If exec mode
+
+dmpsym:	MOVB	AL, #' '		;Assume global symbol
+	TESTB	ES:sym32_flag.B[EDI], #SF$GLB ;Right?
+	JNE	1$.S			;Yes
+	MOVB	AL, #'#'		;No - its a local symbol
+1$:	CALL	outchr
+	MOVB	AL, #' '		;Assume not a suppressed symbol
+	TESTB	ES:sym32_flag.B[EDI], #SF$SUP ;Right?
+	JE	2$.S			;Yes
+	MOVB	AL, #'!'		;No
+2$:	CALL	outchr
+	CALL	outspa
+	PUSHL	EDI
+	PUSHL	ES
+	CALL	dmpname
+	CMPL	curmod, #0.B		;Is there a module name?
+	JE	4$.S			;No
+	CALL	outspa
+	MOVB	AL, #'('		;Yes - display it
+	CALL	outchr
+	LESL	EDI, curmod
+	CALL	dmpname
+	MOVB	AL, #')'
+	CALL	outchr
+4$:	POPL	ES
+	POPL	EDI
+	RET
+.ENDC
+
+.IF NE $$USERMODE
+
+dmpsym:	MOVB	AL, #' '		;Assume global symbol
+	TESTB	sym32_flag.B[EDI], #SF$GLB
+	JNE	1$.S			;Yes
+	MOVB	AL, #'#'		;No - its a local symbol
+1$:	CALL	outchr
+	MOVB	AL, #' '		;Assume not a suppressed symbol
+	TESTB	sym32_flag.B[EDI], #SF$SUP
+	JE	2$.S			;Yes
+	MOVB	AL, #'!'		;No
+2$:	CALL	outchr
+	CALL	outspa
+	PUSHL	EDI
+	CALL	dmpname
+	CMPL	curmod, #0.B		;Is there a module name?
+	JE	4$.S			;No
+	CALL	outspa
+	MOVB	AL, #'('		;Yes - display it
+	CALL	outchr
+	MOVL	EDI, curmod
+	CALL	dmpname
+	MOVB	AL, #')'
+	CALL	outchr
+4$:	POPL	EDI
+	RET
+.ENDC
+
+.IF NE $$REALMODE
+
+dmpsym:	MOVB	AL, #' '		;Assume global symbol
+	TESTB	ES:sym16_flag.B[DI], #SF$GLB ;Right?
+	JNE	1$.S			;Yes
+	MOVB	AL, #'#'		;No - its a local symbol
+1$:	CALL	outchr
+	MOVB	AL, #' '		;Assume not a suppressed symbol
+	TESTB	ES:sym16_flag.B[DI], #SF$SUP ;Right?
+	JE	2$.S			;Yes
+	MOVB	AL, #'!'		;No
+2$:	CALL	outchr
+	CALL	outspa
+	PUSHW	DI
+	PUSHW	ES
+	CALL	dmpname
+	CMPL	curmod, #0.B		;Is there a module name?
+	JE	4$.S			;No
+	CALL	outspa
+	MOVB	AL, #'('		;Yes - display it
+	CALL	outchr
+	LESW	DI, curmod
+	CALL	dmpname
+	MOVB	AL, #')'
+	CALL	outchr
+4$:	POPW	ES
+	POPW	DI
+	RET
+.ENDC
+.PAGE
+;Subroutine to output symbol name only
+;	c{EDI} = Offset of symbol table entry
+;	CALL	dmpname
+
+.IF EQ $$USERMODE|$$REALMODE		;If exec mode
+dmpname:MOVZBL	ECX, ES:[EDI]		;Get length of symbol name
+	ADDL	EDI, #sym32_name.B
+8$:	MOVB	AL, ES:[EDI]		;Get character	
+	INCL	EDI
+	CALL	outchr			;Output character
+	LOOP	ECX, 8$
+	RET
+.ENDC
+
+.IF NE $$USERMODE			;If user mode
+dmpname:MOVZBL	ECX, [EDI]
+	ADDL	EDI, #sym32_name.B
+8$:	MOVB	AL, [EDI]
+	INCL	EDI
+	CALL	outchr			;Output character
+	LOOP	ECX, 8$
+	RET
+.ENDC
+
+.IF NE $$REALMODE
+dmpname:
+	MOVB	CL, ES:[DI]		;Get length of symbol name
+	MOVB	CH, #0
+	ADDW	DI, #sym16_name.B
+8$:	MOVB	AL, ES:[DI]		;Get character	
+	INCW	DI
+	CALL	outchr			;Output character
+	LOOP	CX, 8$
+	RET
+.ENDC
+.PAGE
+	.SBTTL	rdspadr - Subroutine to set item size, copy addr & output [TAB]
+
+;Subroutine to set item size, copy address and output tab character
+;	c(AL)  = Display character
+;	c(AH)  = Item size
+;	c(CH)  = Item type
+;	c{EBX} = Default segment register
+;	CALL	rdspadr
+
+rdspadr:PUSHL	EAX			;Save final character
+	CALL	setadr
+	MOVB	AL, #CLR		;Clear the line (overwrite command)
+	CALL	outchr
+	MOVL	EAX, opnofs		;Get offset part of address
+	MOVL	EDX, opnseg		;Get segment part of address
+	CALL	outsgof			;Redisplay address
+	POPL	EAX			;Restore character
+	CALL	outchr			;Output it
+	MOVB	AL, #09h		;Followed by a tab
+	JMP	outchr
+
+setadr:	MOVB	opnsiz, AH		;Store size
+	MOVB	opntyp, CH		;Store item type
+	CMPB	notnul, #0		;Was an address given?
+	JE	2$.S			;No
+	MOVL	EAX, valofs		;Yes - copy address to a standard place
+	MOVL	opnofs, EAX
+	MOVL	EAX, valseg
+	MOVL	opnseg, EAX
+2$:	CMPB	valtyp, #VL_WADDR	;Full address specified?
+	JBE	4$.S			;Yes
+	MOVL	opnseg, EBX		;No - use default segment
+4$:	RET
+.PAGE
+;Subroutine to check for trucnation of value to store
+;	CALL	chktrunc
+;	c{ECX} = Number of bytes to store
+
+chktrunc:
+	MOVZBL	ECX, valsiz		;Get size of open item
+	CMPB	CL, opnsiz		;Compare to size of new item
+	JE	16$			;Same - this is easy!
+	JC	18$			;New item is shorter
+	CMPB	opntyp, #VL_INS		;New item is longer - is an
+					;  instruction open?
+	JNE	2$.S			;No
+	CMPB	valtyp, #VL_INS		;Yes - replacing it with an instruction?
+	JE	20$			;Yes
+
+;Here if storing a longer value over a shorter value - we must see if really
+;  truncating the new value and complain if we are
+
+2$:	CMPB	valtyp, #VL_INS		;Is the new value an instruction?
+	JE	12$.S			;Yes - always truncates
+	CMPB	valtyp, #VL_WADDR	;Is the new value an address?
+	JBE	12$.S			;Yes - always truncates
+	MOVL	EAX, valofs		;No - get new value
+	CMPB	opnsiz, #1		;Storing over byte?
+	JNE	8$.S			;No - must be storing over a word
+
+;Here if storing value over a byte (8 bits)
+
+	CMPB	valsiz, #2		;Is new value a word (16 bits)?
+	JA	4$.S			;No - must be 32 bits
+	ORB	AH, AH			;Yes - are high 8 bits 0?
+	JE	14$.S			;Yes - OK
+	CMPB	AH, #0FFh		;No - are high 8 bits all 1?
+	JNE	12$.S			;No - complain about truncation
+	JMP	6$.S			;Continue
+
+;Here if storing long (32 bits) over a byte (8 bits)
+
+4$:	TESTL	EAX, #0FFFFFF00h	;Are high 24 bits 0?
+	JE	14$.S			;Yes - OK
+	MOVB	AL, #0			;No - are high 24 bits all 1?
+	CMPL	EAX, #0FFFFFF00h
+6$:	TESTB	valofs+0, #80h		;Yes - is bit 7 set too?
+	JMP	10$.S			;Continue
+
+;Here if storing value over a word (16 bits) - new value must be a long
+
+8$:	TESTL	EAX, #0FFFF0000h	;Are high 16 bits 0?
+	JE	14$.S			;Yes - OK
+	CLRW	AX			;No - are high 16 bits all 1?
+	CMPL	EAX, #0FFFF0000h
+	JNE	12$.S			;No - complain about truncation
+	TESTB	valofs+1, #80h		;Yes - is bit 15 set too?
+10$:	JNE	14$.S			;Yes - no truncation
+12$:	MOV%	%BX, #trnmsg		;No - just store over what was open
+	MOVZB%	%CX, opnsiz
+	JMP	26$.S
+
+;Here if storing longer data over shorter when no significant bits are lost
+
+14$:	MOVZB%	%CX, opnsiz		;Just store over what was open without
+16$:	RET				;  complaining
+
+;Here if storing shorter item over longer item
+
+18$:	CMPB	opntyp, #VL_INS		;New item is longer - is an instruction
+					;  open?
+	JE	22$.S			;Yes - give him a warning
+	MOVB	opnsiz, CL		;No - just store what was given without
+	RET				;  complaining
+
+;Here if storing longer instruction over shorter instruction - store the entire
+;  new instruction
+
+20$:	MOV%	%BX, #nilmsg
+	JMP	24$.S
+
+;Here if storing shorter item over instruction - only store what we have
+
+22$:	MOV%	%BX, #nismsg
+24$:	MOVZB%	%CX, valsiz
+	MOVB	opnsiz, CL
+26$:	PUSH%	%CX
+	CALL	outstrc			;Tell him what we are doing
+	POP%	%CX
+	RET
+.PAGE
+	.SBTTL	redsreg - Subroutine to redisplay register
+
+;Subroutine to redisplay register
+;	c{EAX} = Literal value
+;	c(BL)  = Register index or 0FFh if literal value
+;	CALL	redsreg
+
+redsreg:ORB	BL, BL			;Have literal value?
+	JS	outnum			;Yes - display it as number
+	MOVZBL	EBX, BL			;No - index into register name table
+	LEA%	%BX, regtbl[EBX*4]
+	MOVL	ECX, #4
+4$:	MOVB	AL, CS:[%BX]		;Get character
+	CMPB	AL, #' '		;End of register name?
+	JE	ret010.S		;Yes - finished
+	INC%	%BX			;No - bump pointer
+	CALL	outchr			;Output character
+	LOOP	%CX, 4$			;Continue if might have more
+ret010:	RET				;Finished
+.PAGE
+	.SBTTL	inputb - INB - Routine to input byte
+
+;Here on INB command to input a byte
+
+inputb:	CALL	getioin
+	JC	4$.S
+	CLRL	EAX
+
+.IF NE $$REALMODE
+	CMPW	DX, #21h.B
+	JNE	1$.S
+	MOVB	AL, intmask
+	JMP	2$.S
+.ENDC
+
+1$:	INB	[DX]
+	JMP	2$.S
+
+	.SBTTL	inputw - INW - Routine to input word
+
+;Here on INW command to input a word
+
+inputw:	CALL	getioin
+	JC	4$.S
+	CLRL	EAX
+	INW	[DX]
+	JMP	2$.S
+
+	.SBTTL	inputl - INL - Routine to input long
+
+;Here on INL command to input a long
+
+inputl:	CALL	getioin
+	JC	4$.S
+	INL	[DX]
+2$:	PUSHL	EAX
+	CALL	outspa
+	POPL	EAX
+	JMP	outnum
+
+4$:	RET
+.PAGE
+	.SBTTL	outputb - OUTB - Routine to output byte
+
+;Here on OUTB command to output a byte
+
+outputb:CALL	getioout		;Get values
+	JC	4$.S			;If error
+
+.IF NE $$REALMODE
+	CMPW	DX, #21h.B
+	JNE	2$.S
+	MOVB	intmask, AL
+	RET
+.ENDC
+
+2$:	OUTB	[DX]			;Output the byte
+4$:	RET
+
+	.SBTTL	outputw - OUTW - Routine to output word
+
+;Here on OUTW command to output a word
+
+outputw:CALL	getioout		;Get values
+	JC	4$.S			;If error
+	OUTW	[DX]			;Output the word
+	RET
+
+	.SBTTL	outputl - OUTL - Routine to output long
+
+;Here on OUTL command to output a long
+
+outputl:CALL	getioout		;Get values
+	JC	4$.S			;If error
+	OUTL	[DX]			;Output the long
+	RET
+.PAGE
+;Subroutine to get IO register number for INx commands
+;	C:set = Error, message already displayed
+;	C:clr = Normal
+;	  c{EDX} = Register number
+
+getioin:CALL	getfld			;Get IO register
+	JC	12$.S			;If error
+6$:	CALL	chkend			;Must be last thing on line
+	JC	12$.S			;If error
+	MOVL	EDX, valofs
+	CMPB	valtyp, #VL_BYTE	;Make sure valid value type
+	JA	8$.S
+	CMPB	valtyp, #VL_LONG
+	JB	8$.S
+	TESTL	EDX, #0FFFF0000		;Make sure valid value
+	JE	12$.S
+8$:	MOV%	%BX, #iiomsg		;Bad value - fail
+10$:	CALL	outstrc
+	STC
+12$:	RET
+
+14$:	MOV%	%BX, #xermsg
+	JMP	10$.S
+
+;Subroutine to get IO register number and value for OUTx commands
+;	CALL	getioout
+;	C:set = Error, message already displayed
+;	C:clr = Normal
+;	  c{EAX} = Value to output
+;	  c{EDX} = Register number
+
+getioout:
+	CALL	getfld			;Get IO register number
+	JC	12$.S
+	PUSHL	valofs			;Save number
+	MOVZBL	EAX, valtyp
+	PUSHL	EAX
+	CALL	getfld			;Get value to output
+	POPL	ECX
+	POPL	EDX
+	JC	12$.S
+	CMPB	valtyp, #VL_BYTE	;Make sure valid value type
+	JA	14$.S
+	CMPB	valtyp, #VL_LONG
+	JB	14$.S
+	PUSHL	valofs			;Save value to output
+	MOVB	valtyp, CL
+	MOVL	valofs, EDX
+	CALL	6$			;Check the register number
+	POPL	EAX			;Restore value
+	RET
+.PAGE
+	.SBTTL	dumpb - DB - Routine to dump memory in bytes
+
+;Here on DB command to dump memory as bytes
+
+dumpb:	MOVL	EAX, uregDS
+	CALL	dmpset			;Do common setup
+	JC	8$.S
+	MOVB	easci2, #0
+4$:	MOVB	AL, #'\'
+	CALL	bgnline			;Begin the line
+	MOVB	dmpwid, #16t		;Initialize the screen width
+6$:	CALL	getmbyte		;Get byte
+	JC	dmperr.S
+	INCL	EBX
+	PUSHL	EBX
+	PUSHL	EDX
+	CALL	byteascii		;Put in ASCII dump
+	CALL	out2hx			;Output the byte
+	POPL	EDX
+	POPL	EBX
+	DECB	dmpwid			;Is the line full?
+	JE	10$.S			;Yes
+	CALL	outspa			;No - output a space
+	JMP	6$.S			;Continue
+
+8$:	RET
+
+;Here at end of line
+
+10$:	MOVL	EDI, #dascii+2		;Display ASCII part of line (without
+	CALL	dspasci2		;  any leading spaces)
+	CMPB	cciflg, #0		;Is he trying to stop us?
+	JNE	12$.S			;Yes
+	DECL	dmplen			;No - are we finished?
+	JNE	4$.S			;No - continue
+12$:	JMP	dmpret			;Return
+
+dmperr:	MOV%	%BX, #adrmsg
+	CALL	outstrc
+	JMP	dmpret
+.PAGE
+	.SBTTL	dumpf - DF command - Dump memory as 12 bit FAT entries
+
+;Here for DJ command to dump memory as 12 bit FAT entires
+
+1$:	RET
+
+dumpf:	MOVL	EAX, uregDS
+	CALL	dmpset2			;Do common setup
+	JC	1$.S
+2$:	MOVB	AL, #'>'
+	CALL	bgnline			;Begin the line
+	MOVB	dmpwid, #8		;Initialize the screen width
+4$:	CALL	outspa
+	CALL	getmword		;Get word
+	JC	6$.S
+	INCL	EBX			;Bump address
+	INCL	EBX
+	PUSHL	EAX
+	CALL	getmbyte		;Get byte
+6$:	JC	dmperr			;If error
+	INCL	EBX
+	MOVB	2.B[ESP], AL		;Store with previous word
+	PUSHL	EDX
+	PUSHL	EBX
+	MOVL	EAX, 8.B[ESP]		;Output first 12 bits
+	CALL	out3hx
+	CALL	outspa
+	MOVL	EAX, 8.B[ESP]
+	SHRL	EAX, #12t		;Output second 12 bits
+	CALL	out3hx
+	POPL	EBX
+	POPL	EDX
+	POPL	EAX
+	DECB	dmpwid			;Is the line full?
+	JNE	4$.S			;No - continue
+	CMPB	cciflg, #0		;Yes - is he trying to stop us?
+	JNE	8$.S			;Yes
+	DECL	dmplen			;No - are we finished?
+	JNE	2$.S			;No - continue
+8$:	JMP	dmpret			;Return
+.PAGE
+	.SBTTL	dumpw - DW command - Dump memory as words
+
+;Here for the DW command - Dump memory as words
+
+100$:	RET
+
+dumpw:	MOVL	EAX, uregDS
+	CALL	dmpset			;Do common setup
+	JC	100$.S
+2$:	MOVB	AL, #'('
+	CALL	bgnline			;Begin the line
+	MOVB	dmpwid, #8		;Initialize the screen width
+4$:	CALL	outspa
+	CALL	getmword		;Get word
+	JC	dmperr
+	ADDL	EBX, #2.B		;Bump address
+	PUSHL	EBX
+	PUSHL	EDX
+	CALL	wordascii		;Put word in ASCII dump
+	CALL	out4hx			;Output the word
+	POPL	EDX
+	POPL	EBX
+	DECB	dmpwid			;Is the line full?
+	JNE	4$.S			;No - continue
+	CALL	dspascii		;Yes - display ASCII part of line
+	CMPB	cciflg, #0		;Is he trying to stop us?
+	JNE	6$.S			;Yes
+	DECL	dmplen			;No - are we finished?
+	JNE	2$.S			;No - continue
+6$:	JMP	dmpret			;Return
+.PAGE
+	.SBTTL	dumpwa - DWA command - Dump memory as 16 bit addresses
+
+;Here for the DWA command - Dump memory as 16 bit addresses
+
+1$:	RET
+
+dumpwa:	MOVL	EAX, uregDS
+	CALL	dmpset			;Do common setup
+	JC	1$.S
+4$:	MOVB	AL, #')'
+	CALL	bgnline			;Begin the line
+	MOVB	dmpwid, #4		;Initialize the screen width
+10$:	CALL	outspa
+	CALL	getmword		;Get word
+	JC	dmperr
+	ADDL	EBX, #2.B		;Bump address
+	PUSHL	EAX
+	PUSHL	EBX
+	PUSHL	EDX
+	CALL	wordascii		;Put word in ASCII dump
+	POPL	EDX
+	POPL	EBX
+	CALL	getmword		;Get segment part
+	JC	dmperr
+	ADDL	EBX, #2.B
+	PUSHL	EBX
+	PUSHL	EDX
+	CALL	wordascii		;Put word in ASCII dump
+	CALL	out4hx			;Output the segment value
+	MOVB	AL, #':'		;Followed by a colon
+	CALL	outchr
+	POPL	EDX
+	POPL	EBX
+	POPL	EAX
+	PUSHL	EBX
+	PUSHL	EDX
+	CALL	out4hx			;Output the offset value
+	POPL	EDX
+	POPL	EBX
+	DECB	dmpwid			;Is the line full?
+	JNE	10$.S			;No - continue
+	CALL	dspascii		;Yes - display ASCII part of line
+	CMPB	cciflg, #0		;Is he trying to stop us?
+	JNE	dmpret.S		;Yes
+	DECL	dmplen			;No - are we finished?
+	JNE	4$			;No - continue
+dmpret:	MOVL	dmpnxt, EBX		;Remember where we stopped
+	MOVL	dmpseg, EDX
+	MOVB	linelim, #0
+ret014:	RET				;Finished
+.PAGE
+	.SBTTL	dumpl - DL command - Dump memory as longs
+
+;Here for the DL command - Dump memory as longs
+
+dumpl:	MOVL	EAX, uregDS
+	CALL	dmpset			;Do common setup
+	JC	ret014.S
+2$:	MOVB	AL, #'{'
+	CALL	bgnline			;Begin the line
+	MOVB	dmpwid, #4		;Initialize the screen width
+4$:	CALL	outspa
+	CALL	getmlong		;Get long
+	JC	dmperr
+	ADDL	EBX, #4.B		;Bump address
+	PUSHL	EBX
+	PUSHL	EDX
+	CALL	wordascii		;Put low word in ASCII dump
+	PUSHL	EAX
+	SHRL	EAX, #16t		;Put high word in ASCII dump
+	CALL	wordascii
+	POPL	EAX
+	CALL	out8hx			;Output the long
+	POPL	EDX
+	POPL	EBX
+	DECB	dmpwid			;Is the line full?
+	JNE	4$.S			;No - continue
+	CALL	dspascii		;Yes - display ASCII part of line
+	CMPB	cciflg, #0		;Is he trying to stop us?
+	JNE	6$.S			;Yes
+	DECL	dmplen			;No - is the screen full?
+	JNE	2$.S			;No - continue
+6$:	JMP	dmpret			;Return
+.PAGE
+	.SBTTL	dumpl - DLA command - Dump memory as 32 bit addresses
+
+;Here for the DLA command - Dump memory as 32 bit addresses
+
+2$:	RET
+
+dumpla:	MOVL	EAX, uregDS
+	CALL	dmpset			;Do common setup
+	JC	2$.S
+10$:	MOVB	AL, #'}'
+	CALL	bgnline			;Begin the line
+	MOVB	dmpwid, #3		;Initialize the screen width
+12$:	CALL	outspa
+	CALL	getmlong		;Get word
+	JC	dmperr
+	ADDL	EBX, #4.B		;Bump address
+	PUSHL	EAX
+	PUSHL	EBX
+	PUSHL	EDX
+	CALL	wordascii		;Put low word in ASCII dump
+	SHRL	EAX, #16t		;Put high word in ASCII dump
+	CALL	wordascii
+	POPL	EDX
+	POPL	EBX
+	CALL	getmword		;Get segment part
+	JC	dmperr
+	ADDL	EBX, #2.B
+	PUSHL	EBX
+	PUSHL	EDX
+	CALL	wordascii		;Put word in ASCII dump
+	CALL	out4hx			;Output the segment value
+	MOVB	AL, #':'		;Followed by a colon
+	CALL	outchr
+	POPL	EDX
+	POPL	EBX
+	POPL	EAX
+	PUSHL	EBX
+	PUSHL	EDX
+	CALL	out8hx			;Output the offset value
+	POPL	EDX
+	POPL	EBX
+	DECB	dmpwid			;Is the line full?
+	JNE	12$.S			;No - continue
+	CALL	dspascii		;Yes - display ASCII part of line
+	CMPB	cciflg, #0		;Is he trying to stop us?
+	JNE	16$.S			;Yes
+	DECL	dmplen			;No - are we finished?
+	JNE	10$			;No - continue
+16$:	JMP	dmpret			;Yes - finished
+.PAGE
+	.SBTTL	dumpi - DI command - Dump memory as instructions
+
+;Here for the DI command - Dump memory as instructions
+
+2$:	RET
+
+dumpi:	MOVL	EAX, uregCS
+	CALL	dmpset2			;Do common setup
+	JC	2$.S			;If error
+	MOVB	notnul, #0		;Clear flag so dispins will do the right
+	PUSHL	opnofs			;  thing here
+	PUSHL	opnseg			;Save current open location
+	PUSHL	opnstate
+	MOVL	opnofs, EBX		;Set up for dump
+	MOVL	opnseg, EDX
+4$:	CALL	outcrl			;End the line
+	CALL	dispins			;Display one instruction
+	JC	8$.S			;If error (message already displayed)
+	MOVZBL	EAX, opnsiz		;Bump the address
+	ADDL	opnofs, EAX		;Bump the address
+	CMPB	cciflg, #0		;Is he trying to stop us?
+	JNE	6$.S			;Yes
+	DECL	dmplen			;More to do?
+	JNE	4$.S			;Yes
+6$:	MOVL	EBX, opnofs		;No
+	MOVL	EDX, opnseg
+8$:	POPL	opnstate		;Restore open location
+	POPL	opnseg
+	POPL	opnofs
+	JMP	dmpret
+.PAGE
+	.SBTTL	wordascii - Subroutine to store word for ASCII dump
+
+;Subroutine to store word for the ASCII dump at end of line
+;	c[AX] = 16 bit value
+;	c[EDI] = Pointer to ASCII buffer
+;	CALL	wordascii
+
+wordascii:
+	CALL	byteascii		;Store low character
+	XCHGB	AL, AH			;Store high character
+	CALL	byteascii
+	XCHGB	AL, AH
+	RET
+	
+	.SBTTL	byteascii - Subroutine to store byte for ASCII dump
+
+;Subroutine to store byte for the ASCII dump at end of line
+;	c(AL)  = 8 bit value
+;	c[EDI] = Pointer to ASCII buffer
+;	CALL	byteascii
+
+byteascii:
+	PUSHL	EAX			;Save character
+	ANDB	AL, #7Fh		;Only check the low 7 bits
+	CMPB	AL, #' '		;Is this a control character?
+	JL	2$.S			;Yes
+	CMPB	AL, #'~'		;Is character printable?
+	JLE	4$.S			;Yes
+2$:	MOVB	AL, #'.'		;No - display a dot
+4$:	MOVB	[EDI], AL		;Put a character in the string
+	INCL	EDI			;Increment to the next byte
+	POPL	EAX			;Restore character
+8$:	RET
+
+	.SBTTL	dspascii - Subroutine to display ASCII dump
+
+;Subroutine to display ASCII dump at end of line
+
+dspascii:
+	MOVL	EDI, #dascii		;Point to start of buffer
+dspasci2:
+	MOVB	dascii+2, #VRTLIN	;Assume not using serial terminal
+	CMPB	serterm, #0FFh		;Right?
+	JNE	10$.S			;Yes
+	MOVB	dascii+2, #'|'		;No - using serial terminal
+10$:	MOVB	AL, [EDI]		;Get character
+	ORB	AL, AL			;Done?
+	JE	8$.S			;Yes
+	CALL	outchr			;No - display character
+	INCL	EDI			;Bump pointer
+	JMP	dspasci2.S		;Continue
+.PAGE
+;Subroutine to update register display on screen
+
+xregdmp:
+.IF EQ $$USERMODE
+	CMPB	serterm, #0FEh
+	JE	cregdmp
+.ENDC
+	PUSHL	horpsn			;Save current position on screen
+	PUSHL	verpsn
+	INCB	nonscrl			;Write to nonscrolled region
+	MOVB	horpsn, #0
+	MOVL	verpsn, #0
+	CALL	dumpregs		;Display the registers
+	DECB	nonscrl
+	POPL	verpsn			;Restore position
+	POPL	horpsn
+	RET				;Thats all
+
+	.SBTTL	dumpr - DR command - Dump registers
+
+;Here on the DR command to dump registers
+
+dumpr:	CALL	outcrl
+
+;Subroutine to dump registers
+
+dumpregs:
+	MOVL	dmplen, #2		;Initialize the line counter
+	MOVL	EBX, #dmpreg		;Get the address of the dump table
+	MOVB	dmpwid, #DMPSIZE	;Initialize the item counter
+4$:	PUSHL	EBX
+	CALL	outstrc			;Output register name
+	MOVL	EBX, [ESP]
+	MOVB	AL, #'{'		;Assume 32 bit register
+	CMPB	CS:rt_size.B[EBX], #4	;Right?
+	JE	5$.S			;Yes
+	MOVB	AL, #':'		;No - assume protected mode selector
+
+.IF EQ $$USERMODE|$$REALMODE		;If exec mode
+	MOVZBL	EDX, CS:rt_ofset.B[EBX]
+	TESTB	uregbase+2[EDX], #1
+	JE	5$.S			;Yes
+	INCL	EAX			;No - its a V86 selector
+.ENDC
+.IF NE $$USERMODE			;If user mode
+	MOVZBL	EDX, CS:rt_ofset.B[EBX]
+	MOVB	AH, uregbase+2[EDX]
+	XORB	AH, v86img+2
+	TESTB	AH, #1
+	JE	5$.S			;Yes
+	INCL	EAX			;No - its a V86 selector
+.ENDC
+5$:	CALL	outchr
+	MOVB	AL, #' '
+	CALL	outchr
+	MOVL	EBX, [ESP]
+	MOVZBL	EAX, CS:rt_ofset.B[%BX]	;Get address where register value
+					;  is stored
+	MOVL	EAX, uregbase[EAX]	;Get register value
+	CMPB	CS:rt_size.B[%BX], #4	;32 bit register?
+	JE	6$.S			;Yes
+	CALL	out4hx			;No - output 16 bit value
+	JMP	8$.S
+
+6$:	CALL	out8hx			;Output 32 bit value
+8$:	POPL	EBX			;Restore table address
+	ADDL	EBX, #rt_ENSIZ.B	;Bump to point to the next item
+	DECB	dmpwid			;Is there more to do?
+	JNE	4$.S			;Yes - continue	
+	MOVL	EBX, #flglbl
+	CALL	outstrc
+	CALL	outflag			;Display flags
+	JMP	outcrl			;And last line and return
+.PAGE
+	.SBTTL	outflag - Subroutine to output flag mnemonics
+
+;Subroutine to output flag mnemonics
+;	CALL	outflag
+
+outflag:MOVL	EDI, #flgtbl		;Point to the flag table
+	MOV%	%DX, #FLGTSZ		;Get number of entries
+4$:	CALL	outspa
+	MOVL	EBX, uregEFR
+	ANDL	EBX, CS:fst_mask.B[%DI]
+	MOVB	CL, CS:fst_pos.B[%DI]	;Get amount to shift
+	SHRL	EBX, CL
+	MOVB	AL, CS:[EDI+EBX*2]	;Get first byte
+	CALL	outchr
+	MOVB	AL, CS:1.B[EDI+EBX*2]	;Get second byte
+	CALL	outchr
+	ADD%	%DI, #fst_ENSZ.B
+	DEC%	%DX			;More?
+	JNE	4$.S			;Yes - continue
+	RET				;Yes - all done
+.PAGE
+	.SBTTL	dmpset - Subroutine to do common setup for byte and word dumps
+
+;Subroutine to do common setup for byte and word dumps
+;	c{EAX} = Default segment selector value
+;	CALL	dmpset
+;	C:set = Error
+;	C:clr = Normal
+;	  c{EBX} = Offset for first item to dump
+;	  c{EDX} = Segment selector for items to dump
+
+dmpset:	MOVB	DL, #VRTLIN
+	CMPB	serterm, #0FFh
+	JNE	2$.S
+	MOVB	DL, #'|'
+2$:	MOVB	dascii+2, DL
+	MOVB	easci2, DL
+dmpset2:PUSHL	EAX
+	CALL	getfld			;Get address to dump
+	POPL	EAX
+	JC	12$.S			;If error
+	MOVL	EBX, valofs		;Get start address
+	MOVL	EDX, valseg
+	CMPB	valtyp, #VL_WADDR	;Is it really an address?
+	JBE	4$.S			;Yes
+	MOVL	EDX, EAX		;No - use default segment
+4$:	CMPB	notnul, #0		;Was a value given?
+	JNE	6$.S			;Yes - use the value
+	MOVL	EBX, dmpnxt		;No - use last value
+	MOVL	EDX, dmpseg
+6$:	PUSHL	EBX
+	PUSHL	EDX
+	CALL	getcount		;Get number of lines to generate
+	JC	10$.S			;If error
+	CALL	chkend			;No more arguments allowed
+	JC	10$.S
+	TESTL	EAX, EAX		;Can't be 0
+	JNE	8$.S
+	MOVB	AL, #16t		;Default is 16 lines
+8$:	MOVL	dmplen, EAX		;Store length
+	MOVL	EAX, dheight
+	INCL	EAX
+	MOVB	linelim, AL
+10$:	POPL	EDX
+	POPL	EBX
+12$:	RET
+.PAGE
+	.SBTTL	bgnline - Subroutine to begin line for byte or word dump
+
+;Subroutine to begin line for byte or word dump
+;	c(AL)      = Character to follow address
+;	c{EDX:EBX} = Address of first item in line
+;	CALL	bgnline
+;	c{EDX:EBX} = Unchanged
+;	c{EDI}     = Offset of buffer for ASCII part of line
+
+bgnline:PUSHL	EDX
+	PUSHL	EBX
+	PUSHL	EAX
+	CALL	outcrl
+	MOVL	EAX, 8.B[ESP]		;Output the segment selector
+	CALL	out4hx
+	MOVB	AL, #':'		;Follow it with : or ;
+
+.IF EQ $$USERMODE|$$REALMODE		;If exec mode
+	TESTB	10t.B[ESP], #01h
+	JE	4$.S
+	INCL	EAX
+.ENDC
+.IF NE $$USERMODE			;If user mode
+	MOVB	AH, 10t.B[ESP]
+	XORB	AH, v86img+2
+	TESTB	AH, #01h
+	JE	4$.S
+	INCL	EAX
+.ENDC
+
+4$:	CALL	outchr
+	MOVL	EAX, 4.B[ESP]		;Output the offset
+	CALL	out8hx
+	POPL	EAX			;Followed by the character he gave us
+	CALL	outchr
+	POPL	EBX
+	POPL	EDX
+	MOVL	EDI, #xascii		;Get offset address of the ASCII buffer
+	RET				;And return
+.PAGE
+	.SBTTL	dspins - Subroutine to display single instruction
+
+;Subroutine to display single instruction
+;	c{EBX} = Offset
+;	c{EDX} = Segment selector
+
+dspins:	MOVL	opnseg, EDX		;Make it look like the current address
+	MOVL	opnofs, EBX
+	MOVB	notnul, #0
+	MOVL	valtyp, #VL_LADDR
+	MOVB	AH, #1
+	MOVB	CH, #VL_INS
+	MOVB	AL, #'!'
+	CALL	rdspadr			;Setup the instruction
+	CALL	outopc			;Output as instruction
+	JMP	outcrl
+.PAGE
+	.SBTTL	swrad2 - B or W switch - Set output radix to 2
+
+;Here for the B or W switch - Set output radix to 2
+
+swrad2:	MOVL	tradix, #2t
+	CLC
+	RET
+
+	.SBTTL	swrad8 - O or Q switch - Set output radix to 8
+
+;Here for the O or Q switch - Set output radix to 8
+
+swrad8:	MOVL	tradix, #8t
+	CLC
+	RET
+
+	.SBTTL	swrad10 - D or T switch - Set output radix to 10
+
+;Here for the D or T switch - Set output radix to 10
+
+swrad10:MOVL	tradix, #10t
+	CLC
+	RET
+
+	.SBTTL	swrad16 - H switch - Set output radix to 16
+
+;Here for the H switch - Set output radix to 16
+
+swrad16:MOVL	tradix, #16t
+	CLC
+	RET
+
+	.SBTTL	swchar - C switch - Set output mode to character
+
+;Here for the C switch - Set output mode to character
+
+swchar:	ORB	toutmd, #OM$ALF
+	RET
+
+	.SBTTL	swval - V switch - Set output mode to value
+
+;Here for the V switch - Set output mode to value
+
+swval:	ANDB	toutmd, #~OM$ALF
+	RET
+
+	.SBTTL	swnum - N switch - Set output mode to numeric
+
+;Here for the N switch - Set output mode to numeric
+
+swnum:	ORB	toutmd, #OM$NUM
+	RET
+
+	.SBTTL	swsym - S switch - Set output mode to symbolic
+
+;Here for the S switch - Set output mode to symbolic
+
+swsym:	ANDB	toutmd, #~OM$NUM
+	RET
+.PAGE

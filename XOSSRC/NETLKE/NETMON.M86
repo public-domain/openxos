@@ -1,0 +1,343 @@
+	.TITLE	NETMON
+
+;++++
+; This software is in the public domain.  It may be freely copied and used
+; for whatever purpose you see fit, including commerical uses.  Anyone
+; modifying this software may claim ownership of the modifications, but not
+; the complete derived code.  It would be appreciated if the authors were
+; told what this software is being used for, but this is not a requirement.
+
+;   THIS SOFTWARE IS PROVIDED BY THE AUTHORS "AS IS" AND ANY EXPRESS OR
+;   IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
+;   OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+;   IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+;   INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+;   BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS
+;   OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+;   ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR
+;   TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
+;   USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+;----
+
+	.PROC	80386
+	.INCLUD	XOSINC:\XMAC\XOS.PAR
+	.INCLUD	XOSINC:\XMAC\XOSX.PAR
+	.INCLUD	XOSINC:\XMAC\XOSTRM.PAR
+
+	.SEG	code_s, CODE, 32BIT
+	.MSECT	code_m, code_s, ADDR=1000
+	.PSECT	code_p, code_m
+	.SEG	data_s, DATA, 32BIT
+	.MSECT	data_m, data_s, ADDR=1000
+	.PSECT	stack_p, data_m
+	.PSECT	data_p, data_m
+
+;Define offsets in the local process data block
+
+	.SBTTL	Start of program
+
+	.PSECT	code_p
+	.START	start
+
+start::	PUSHL	ES
+	POPL	DS
+	MOVL	ESI, arg_cmdofs		;Get offset of argument string
+2$:	LODSB	[ESI]			;Find end of first atom
+	TESTB	AL, AL
+	JE	6$.S			;If no value given
+	CMPB	AL, #' '
+	JE	4$.S
+	CMPB	AL, #HT
+	JNE	2$.S
+4$:	CALL	getcmdv			;Get number from argument
+	JNC	8$.S			;If got one
+	MOVW	AX, #!data_p		;Error - point to our data segment
+	MOVL	DS, EAX
+	MOVL	ES, EAX
+	MOVL	EDI, #cmermsg		;Get error message
+	JMP	fail4
+
+6$:	MOVL	EAX, #5			;Default is 5 seconds
+8$:	PUSHL	EAX			;Save interval value
+	PUSHL	ES			;Give up the argument segment
+	CALLF	svcMemRemove#
+	MOVW	BX, #!data_p		;Point to our data segment
+	MOVL	DS, EBX
+.PAGE	
+
+	MOVL	inpbits, #TIM$ILFACR|TIM$CHAR ;Set up our terminal state
+	MOVL	outbits, #TOM$IMAGE
+	PUSHL	#DH_STDTRM.B
+	PUSHL	#0.B
+	PUSHL	#0.B
+	PUSHL	#0.B
+	PUSHL	DS
+	PUSHL	#trmsetparm
+	CALLF	svcIoInBlockp#
+	TESTL	EAX, EAX
+	JS	trmfail
+
+;Here with initial setup complete - now setup interrupts
+
+	PUSHL	#IV_CLOCK.B		;Set the clock vector
+	PUSHL	#84h
+	PUSHL	CS
+	PUSHL	#mainloop
+	CALLF	svc_schsetsivect#
+	TESTL	EAX, EAX
+	JS	clkfail			;If error
+	MOVB	inpos, #6
+	PUSHL	#0.B			;Fake up an interrupt to call mainloop
+	PUSHL	#0.B			;  the first time (will enable
+	CALLF	mainloop		;  interrupts when it returns)
+					;Fall into cmdloop on next page
+.PAGE
+;Command loop
+
+cmdloop:MOVL	EDI, #clrcmd
+	MOVB	inpos, #6
+cmdlp2:	MOVL	inpntr, #inbufr
+	MOVB	incnt, #30t
+	PUSHL	#DH_STDTRM.B
+	PUSHL	DS
+	PUSHL	EDI
+	PUSHL	#0.B
+	CALLF	svcIoOutString#
+trmloop:PUSHL	#DH_STDTRM.B
+	CALLF	svcIoInSingle#
+	CMPB	AL, #CR
+	JE	trmloop.S
+	PUSHL	EAX
+	PUSHL	#4.B			;No interrupts here
+	CALLF	svc_schsetsilvl#
+	POPL	EAX
+	CMPB	AL, #BSP		;Backspace?
+	JE	4$.S			;Yes - go delete a character
+	CMPB	AL, #'X'-40h		;Cntl-X?
+	JE	20$			;Yes - junk the whole buffer
+	MOVL	EDI, inpntr
+	CMPB	AL, #' '
+	JL	12$.S
+	MOVB	[EDI], AL
+	INCL	inpntr
+	CALL	cmdecho
+	INCB	inpos
+	DECB	incnt
+	JE	12$.S
+2$:	PUSHL	#0.B			;Allow interrupts now
+	CALLF	svc_schsetsilvl#
+	JMP	trmloop.S
+
+;Here with backspace - delete character from buffer
+
+4$:	CMPB	incnt, #30t.B		;Anything there?
+	JAE	2$.S			;No - ignore this
+	INCB	incnt			;Yes - remove one character
+	DECL	inpntr
+	DECB	inpos
+	MOVB	AL, #' '		;Erase it from the screen
+	CALL	cmdecho
+	MOVB	AL, #0
+	CALL	cmdecho
+	JMP	2$.S			;Continue
+
+;Here with complete command - interrupts are disabled
+
+12$:	MOVL	EDI, inpntr		;Put a null at the end
+	MOVB	[EDI], #0	
+	MOVL	ESI, #inbufr		;Point to the input buffer
+14$:	CALL	getcmdc			;Get command character
+	JE	20$			;If null command, just clear line
+	CMPB	AL, #'I'		;Interval command?
+	JE	cmdintv.S		;Yes
+	CMPB	AL, #'Q'		;Quit command?
+	JE	cmdquit.S		;Yes
+	MOVL	EDI, #bdcmmsg		;No - complain
+	MOVB	inpos, #21t
+16$:	PUSHL	#0.B			;Allow interrupts now
+	CALLF	svc_schsetsilvl#
+	JMP	cmdlp2
+
+;Here for quit command
+
+cmdquit:PUSHL	#DH_STDTRM.B		;Give final message
+	PUSHL	DS
+	PUSHL	#quitmsg
+	PUSHL	#0.B
+	CALLF	svcIoOutString#
+	PUSHL	#0.B			;And exit
+	CALLF	svcSchExit#
+
+;Her for interval command
+
+cmdintv:CALL	getcmdv			;Get decimal value
+	JC	22$.S			;If error
+	CALL	getintr			;Set new interval
+	JC	24$.S			;If error
+20$:	PUSHL	#0.B			;Allow interrupts now
+	CALLF	svc_schsetsilvl#
+	JMP	cmdloop
+
+22$:	MOVL	EDI, #bdnmmsg
+	MOVB	inpos, #19t
+	JMP	16$.S
+
+24$:	MOVL	EDI, #clkemsg
+	MOVB	inpos, #23t
+	JMP	16$.S
+.PAGE
+;Subroutine to get new time interval
+;	c{EAX} = Interval in seconds
+;	CALL	getintr
+;	C:set = Error
+;	C:clr = Normal
+
+getintr:TESTL	EAX, EAX
+	JNE	2$.S
+	INCL	EAX
+2$:	CMPL	EAX, #60t.B		;Too big?
+	JBE	4$.S
+	MOVL	EAX, #60t
+4$:	PUSHL	EAX
+	MOVL	EDI, #buffer
+	MOVB	BL, #2
+	MOVB	BH, #' '
+	CALL	putval
+	MOVW	DX, #HDR_INTRV
+	MOVL	ESI, #cmdline
+	CALL	outbfr
+	POPL	ECX
+	IMULL	ECX, #49710t
+	PUSHL	#3.B			;Request repeated alarm interrupt
+	PUSHL	#0.B
+	PUSHL	ECX
+	CALLF	svcSchAlarm#
+6$:	RET
+
+;Subroutine to get decimal value from command buffer
+;	c{ESI} = Pointer to command buffer
+;	CALL	getcmdv
+;	C:set = Error
+;	C:clr = Normal
+;	  c{EAX} = Value
+
+getcmdv:CLRL	EDX			;Initialize value
+10$:	CALL	getcmdc
+	JE	16$.S
+	CMPB	AL, #' '
+	JE	10$.S
+	CMPB	AL, #HT
+	JE	10$.S
+12$:	CMPB	AL, #'0'		;Digit?
+	JB	14$.S			;No
+	CMPB	AL, #'9'
+	JA	14$.S
+	ANDL	EAX, #0Fh		;Yes - get value
+	IMULL	EDX, #10t.B
+	ADDL	EDX, EAX
+	CALL	getcmdc
+	JNE	12$.S
+	JMP	16$.S
+
+14$:	STC
+16$:	MOVL	EAX, EDX
+	RET
+
+;Subroutine to get next command character
+;	c{ESI} = Pointer to buffer
+;	CALL	getcmdc
+;	Z:set = End of buffer
+;	Z:clr = Character available
+;	  c(AL) = Character
+
+getcmdc:LODSB	[ESI]			;Get command character
+	CMPB	AL, #'a'		;Lower case?
+	JB	18$.S			;No
+	SUBB	AL, #'a'-'A'		;Yes - change to upper case
+18$:	TESTB	AL, AL			;Set Z if end
+	RET
+.PAGE
+;Here if error while linking to system segment
+
+lnkfail:MOVL	EDI, #lnkfmsg
+	JMP	fail2.S
+
+trmfail:MOVL	EDI, #trmfmsg
+	JMP	fail2.S
+
+;Here if error while setting up clock interrupt
+
+clkfail:MOVL	EDI, #clkfmsg
+fail2:	PUSHL	EAX			;Save error code
+	PUSHL	#DH_STDERR.B
+	PUSHL	DS
+	PUSHL	#fl1msg
+	PUSHL	#0.B
+	CALLF	svcIoOutString#
+	PUSHL	#DH_STDERR.B
+	PUSHL	DS
+	PUSHL	EDI
+	PUSHL	#0.B
+	CALLF	svcIoOutString#
+	PUSHL	#DH_STDERR.B
+	PUSHL	DS
+	PUSHL	#fl2msg
+	PUSHL	#0.B
+	CALLF	svcIoOutString#
+	PUSHL	#3.B			;Get error message (error code value
+	PUSHL	DS			;  is already on the stack)
+	MOVL	EDI, #buffer
+	PUSHL	EDI
+	CALLF	svcSysErrMsg#
+fail4:	PUSHL	#DH_STDERR.B
+	PUSHL	DS
+	PUSHL	EDI
+	PUSHL	#0.B
+	CALLF	svcIoOutString#
+	PUSHL	#DH_STDERR.B
+	PUSHL	DS
+	PUSHL	#crlfmsg
+	PUSHL	#0.B
+	CALLF	svcIoOutString#
+	PUSHL	#1.B
+	CALLF	svcSchExit#
+.PAGE
+	.SBTTL	Main display loop
+
+;This is the main display loop - get here as result of clock interrupt
+
+mainloop:
+	PUSHAL				;Save registers
+	PUSHL	ES
+	PUSHL	FS
+	PUSHL	GS
+	MOVL	EAX, DS			;Setup our segment registers
+	MOVL	ES, EAX
+
+	HALT
+.PAGE
+	.SBTTL	Data
+
+	.PSECT	data_p
+	.STACK	stack
+
+	.MOD	4
+trmsetparm:				;Parameter list for setting terminal
+	.BYTE	PAR$SET|REP_HEXV, 4	;  parameters
+	.WORD	IOPAR_CINPMODE
+	.LONG	0FFFFFFFFh&~TIM$ONCE
+	.BYTE	PAR$SET|REP_HEXV, 4
+	.WORD	IOPAR_SINPMODE
+inpbits:.LONG	0
+	.BYTE	PAR$SET|REP_HEXV, 4
+	.WORD	IOPAR_COUTMODE
+	.LONG	0FFFFFFFFh&~TIM$ONCE
+	.BYTE	PAR$SET|REP_HEXV, 4
+	.WORD	IOPAR_SOUTMODE
+outbits:.LONG	0
+	.BYTE	0
+
+buffer:	.BLKB	80t
+	.MOD	4
+	.BLKL	256t
+stack:

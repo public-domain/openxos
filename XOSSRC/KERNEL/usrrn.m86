@@ -1,0 +1,1739 @@
+	.TITLE	USRRN - XOS user mode kernel routines
+
+;++++
+; This software is in the public domain.  It may be freely copied and used
+; for whatever purpose you see fit, including commerical uses.  Anyone
+; modifying this software may claim ownership of the modifications, but not
+; the complete derived code.  It would be appreciated if the authors were
+; told what this software is being used for, but this is not a requirement.
+
+;   THIS SOFTWARE IS PROVIDED BY THE AUTHORS "AS IS" AND ANY EXPRESS OR
+;   IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
+;   OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+;   IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+;   INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+;   BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS
+;   OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+;   ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR
+;   TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
+;   USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+;----
+
+	.PROC	80486
+	.INCLUD	XOSINC:\XMAC\XOS.PAR
+	.INCLUD	XOSINC:\XMAC\XOSX.PAR
+	.INCLUD	XOSINC:\XMAC\XOSERR.PAR
+	.INCLUD	XOSINC:\XMAC\XOSRUN.PAR
+	.INCLUD	XOSINC:\XMAC\XOSXRUN.PAR
+	.INCLUD	XOSINC:\XMAC\XOSTIME.PAR
+
+	USERCODE
+
+;Here for svcIoRun - format is:
+;	struct qab runqab	// QAB
+;	value = svcIoRun(&runqab);
+;  Where value is 0 if request entered or an error code (negative)
+
+$$$=!56t
+BLK arg_runqab, 8	;Address of QAB
+
+	.MOD	4
+usvcIoRun::
+	PUSHL	DS			;Save registers
+	PUSHL	ES
+	PUSHL	FS
+	PUSHL	GS
+	PUSHAL
+	PUSHL	#0.B			;Create a new segment, allocate highest
+	PUSHL	#ST$TOP|ST_32RWDATA	;  available selector
+	CALLF	svcMemCreate#
+	TESTL	EAX, EAX
+	JS	return			;If can't create a segment
+	MOVL	DS, EAX			;Set up to use our new segment
+	MOVL	ES, EAX
+	PUSHL	EAX			;Allocate 4K msect for our local data
+	PUSHL	#run_base#
+	PUSHL	#PG$WRITE|PG$READ.B
+	PUSHL	#1000h
+	CALLF	svcMemChange#
+	TESTL	EAX, EAX
+	JS	2$.S			;If can't get the memory
+	MOVL	run_timeout#, #-1
+	MOVL	run_free#, #run_top#
+	LEAL	ESI, arg_runqab.B[ESP]	;Get address of his QAB
+	PUSHL	SS
+	POPL	FS
+	CALL	getuseradr
+	MOVL	run_usrqab#+0, EBX	;Store it
+	MOVL	run_usrqab#+4, GS
+	CLRL	EAX
+	MOVL	GS:qab_amount.B[EBX], EAX
+	MOVL	GS:qab_error.B[EBX], EAX
+	MOVW	GS:qab_status.B[EBX], AX
+	MOVL	EAX, GS:qab_option.B[EBX] ;Get option bits
+	MOVL	run_option#, EAX	;Save them
+	MOVB	AL, GS:qab_func.B[EBX]	;Get function
+	MOVB	run_func#, AL		;Save it
+	MOVL	EDI, #run_parmlist#+8
+	MOVL	-8.B[EDI], #{PAR$GET|REP_DECV}+{4t<8t}+{IOPAR_LENGTH<16t}
+	MOVL	-4.B[EDI], #0
+	CMPB	AL, #RFNC_RUN		;Is this a run function?
+	JE	6$.S			;Yes
+	CMPB	AL , #RFNC_LOAD		;No - is it a load function?
+	JE	8$.S			;Yes
+	MOVL	EAX, #ER_FUNC		;No - bad function
+fail:	CMPL	run_loadhndl#, #0.B	;Is the load file open?
+	JLE	2$.S			;No
+	PUSHL	EAX			;Yes
+	CALL	usrrnclose		;Close it
+	POPL	EAX
+2$:	PUSHL	EAX			;Yes
+	PUSHL	DS			;Give up our data segment
+	CALLF	svcMemRemove#
+	POPL	EAX
+return:	MOVL	28t.B[ESP], EAX		;Put return value in his saved EAX
+	POPAL				;Restore user's registers
+	POPL	GS
+	POPL	FS
+	POPL	ES
+	POPL	DS
+	RETF	8t
+
+;Here for run function
+
+6$:	MOVL	ESI, #runplst		;Set up our base parameter list
+	MOVL	ECX, #{RUNPLSTSZ+3}/4
+	CLD
+	RMOVSL	[EDI], CS:[ESI]
+	MOVW	run_parmlist#+8t+{runfsa-runplst}+4, DS
+	PUSHL	DS			;Allocate a minimum (4K) argument msect
+	PUSHL	#0.B
+	PUSHL	#PG$WRITE|PG$READ.B
+	PUSHL	#1000h
+	CALLF	svcMemChange#
+	TESTL	EAX, EAX
+	JS	2$.S			;If error
+8$:	LEAL	ESI, qab_parm.B[EBX]	;Get address of user's parameter list
+	PUSHL	GS
+	POPL	FS
+	CALL	getuseradr
+	CMPL	EBX, #0.B		;Have any parameters?
+	JE	opnfile			;No - go on (unusual but possible)
+	MOVL	ESI, EBX		;Yes
+	PUSHL	GS
+	POPL	FS
+10$:	LODSL	FS:[ESI]		;Get header bytes
+	CMPB	AL, #0			;Finished?
+	JE	opnfile			;Yes
+	MOVL	EBX, EAX		;No - get parameter index
+	SARL	EBX, #16t		;Device dependent parameter?
+	JS	20$.S			;Yes - they always pass though
+	CMPB	BH, #PARMMAX		;No - valid page number?
+	JB	12$.S			;Yes
+	CLRL	EBX			;No
+12$:	MOVZBL	EDX, BH			;Get page number for indexing
+	MOVL	EDX, CS:rioptbl[EDX*4]	;Get offset of next level table
+	CMPB	BL, CS:-4.B[EDX]	;Valid value?
+	JB	14$.S			;Yes
+	CLRL	EBX			;No
+14$:	MOVB	BH, #0
+	MOVB	CL, AL			;Get representation
+	ANDB	CL, #PAR$REP
+	CALLI	CS:[EDX+EBX*4]		;Call routine for parameter
+	JNC	10$.S
+	JMP	fail
+
+20$:	CALL	ioppass
+	JMP	12$.S
+.PAGE
+	.MOD	4
+rioptbl:.LONG	rungenptbl	;IOPAR_xxxxxx = 00xx - Generic IO parameters
+	.LONG	runfilptbl	;IOPAR_FILxxx = 01xx - File system IO parameters
+	.LONG	runbadptbl	;IOPAR_TRMxxx = 02xx - Terminal IO parameters
+	.LONG	runbadptbl	;IOPAR_DSKxxx = 03xx - Disk IO parameters
+	.LONG	runbadptbl	;IOPAR_TAPxxx = 04xx - Tape IO parameters
+	.LONG	runbadptbl	;IOPAR_NETxxx = 05xx - Network IO parameters
+	.LONG	runbadptbl	;IOPAR_IPMxxx = 06xx - IPM IO parameters
+	.LONG	runbadptbl	;IOPAR_DGxxx  = 07xx - Datagram IO parameters
+	.LONG	runbadptbl	;	      = 08xx
+	.LONG	runbadptbl	;	      = 09xx
+	.LONG	runbadptbl	;	      = 0Axx
+	.LONG	runbadptbl	;	      = 0Bxx
+	.LONG	runbadptbl	;	      = 0Cxx
+	.LONG	runbadptbl	;	      = 0Dxx
+	.LONG	runbadptbl	;	      = 0Exx
+	.LONG	runbadptbl	;	      = 0Fxx
+	.LONG	runrunptbl	;IOPAR_RUNxxx = 10xx - Run IO parameters
+PARMMAX=!{$-rioptbl}/4
+
+	.LONG	PARMGENMAX
+rungenptbl:
+	.LONG	iopbad		;		   = 0000h
+	.LONG	iopfiloptn	;IOPAR_FILOPTN     = 0001h
+	.LONG	iopfilspec	;IOPAR_FILSPEC     = 0002h
+	.LONG	ioppass		;IOPAR_DEVSTS      = 0003h
+	.LONG	ioppass		;IOPAR_UNITNUM     = 0004h
+	.LONG	ioppass		;IOPAR_GLBID       = 0005h
+	.LONG	iopbad		;IOPAR_DELAY       = 0006h
+	.LONG	ioptimeout	;IOPAR_TIMEOUT     = 0007h
+	.LONG	iopnull		;IOPAR_INPSTS	   = 0008h
+	.LONG	iopnull		;IOPAR_OUTSTS	   = 0009h
+	.LONG	iopbad		;IOPAR_INPQLMT	   = 000Ah
+	.LONG	iopbad		;IOPAR_OUTQLMT	   = 000Bh
+	.LONG	iopbad		;IOPAR_SIVECT1     = 000Ch
+	.LONG	iopbad		;IOPAR_SIVECT2     = 000Dh
+	.LONG	iopbad		;IOPAR_SIDATA      = 000Eh
+	.LONG	iopbad		;IOPAR_NUMOPEN     = 000Fh
+	.LONG	iopbad		;IOPAR_BUFRLMT	   = 0010h
+
+;Values beyond this point are obsolete!
+
+	.LONG	iopbad		;		   = 17.
+	.LONG	iopbad		;		   = 18.
+	.LONG	iopbad		;		   = 19.
+	.LONG	iopbad		;IOPAR_DIRHNDL     = 20.
+	.LONG	iopbad		;IOPAR_BUFRLMT	   = 21.
+	.LONG	ioppass		;IOPAR_SRCATTR     = 22.
+	.LONG	ioppass		;IOPAR_FILATTR     = 23.
+	.LONG	ioppass		;IOPAR_DIROFS      = 24.
+	.LONG	iopnull		;IOPAR_ABSPOS	   = 25.
+	.LONG	iopnull		;IOPAR_RELPOS	   = 26.
+	.LONG	iopnull		;IOPAR_EOFPOS	   = 27.
+	.LONG	iopbad		;IOPAR_VBOF	   = 28.
+	.LONG	iopget		;IOPAR_LENGTH      = 29.
+	.LONG	iopget		;IOPAR_REQALLOC    = 30.
+	.LONG	iopget		;IOPAR_RQRALLOC    = 31.
+	.LONG	iopget		;IOPAR_GRPSIZE     = 32.
+	.LONG	iopget		;IOPAR_ADATE       = 33.
+	.LONG	iopget		;IOPAR_CDATE       = 34.
+	.LONG	iopget		;IOPAR_MDATE       = 35.
+	.LONG	iopget		;IOPAR_PROT        = 36.
+	.LONG	iopget		;IOPAR_OWNER       = 37.
+	.LONG	iopbad		;                  = 38.
+	.LONG	iopbad		;IOPAR_SETLOCK	   = 39.
+	.LONG	iopbad		;IOPAR_CLRLOCK	   = 40.
+	.LONG	iopbad		;IOPAR_CLSTIME     = 41.
+	.LONG	iopbad		;IOPAR_CLSNAME     = 42.
+	.LONG	iopbad		;IOPAR_CLSMSG	   = 43.
+	.LONG	iopbad		;		   = 44.
+	.LONG	iopbad		;		   = 45.
+	.LONG	iopbad		;		   = 46.
+	.LONG	iopbad		;		   = 47.
+	.LONG	iopbad		;		   = 48.
+	.LONG	iopbad		;		   = 49.
+	.LONG	iopbad		;IOPAR_NETSUBUMASK = 50.
+	.LONG	iopbad		;IOPAR_NETPROTOCOL = 51.
+	.LONG	iopbad		;IOPAR_NETLCLPORT  = 52.
+	.LONG	iopbad		;IOPAR_NETRMTHWAS  = 53.
+	.LONG	iopbad		;IOPAR_NETRMTHWAR  = 54.
+	.LONG	iopbad		;IOPAR_NETRMTNETAS = 55.
+	.LONG	iopbad		;IOPAR_NETRMTNETAR = 56.
+	.LONG	iopbad		;IOPAR_NETRMTPORTS = 57.
+	.LONG	iopbad		;IOPAR_NETRMTPORTR = 58.
+	.LONG	iopbad		;IOPAR_NETDSTNAME  = 59.
+	.LONG	iopbad		;IOPAR_NETSMODE    = 60.
+	.LONG	iopbad		;IOPAR_NETCMODE    = 61.
+	.LONG	iopbad		;		   = 62.
+	.LONG	iopbad		;		   = 63.
+	.LONG	iopbad		;		   = 64.
+	.LONG	iopbad		;IOPAR_IPMRMTPID   = 65.
+	.LONG	iopbad		;IOPAR_IPMLCLADDR  = 66.
+	.LONG	iopbad		;IOPAR_IPMRMTADDRS = 67.
+	.LONG	iopbad		;IOPAR_IPMRMTADDRR = 68.
+	.LONG	iopbad		;		   = 69.
+	.LONG	iopbad		;		   = 70.
+	.LONG	iopbad		;		   = 71.
+	.LONG	iopbad		;		   = 72.
+	.LONG	iopbad		;		   = 73.
+	.LONG	iopbad		;		   = 74.
+	.LONG	iopbad		;		   = 75.
+	.LONG	ioppass		;IOPAR_TRMSINPMODE = 76.
+	.LONG	ioppass		;IOPAR_TRMCINPMODE = 77.
+	.LONG	ioppass		;IOPAR_TRMSOUTMODE = 78.
+	.LONG	ioppass		;IOPAR_TRMCOUTMODE = 79.
+	.LONG	ioppass		;IOPAR_TRMBFRLIMIT = 80.
+	.LONG	ioppass		;IOPAR_TRMCLRBUFR  = 81.
+	.LONG	ioppass		;IOPAR_TRMCURTYPE  = 82.
+	.LONG	ioppass		;IOPAR_TRMCURPOS   = 83.
+	.LONG	ioppass		;IOPAR_TRMDISPAGE  = 84.
+	.LONG	iopbad		;IOPAR_TRMSPSTATUS = 85.
+	.LONG	iopbad		;IOPAR_TRMSPBREAK  = 86.
+	.LONG	iopbad		;IOPAR_TRMSPMODEM  = 87.
+	.LONG	iopbad		;		   = 88.
+	.LONG	iopbad		;		   = 89.
+	.LONG	iopbad		;		   = 90.
+	.LONG	iopbad		;		   = 91.
+	.LONG	iopbad		;		   = 92.
+	.LONG	iopbad		;		   = 93.
+	.LONG	iopbad		;		   = 94.
+	.LONG	iopbad		;		   = 95.
+	.LONG	iopbad		;IOPAR_DSKFSTYPE   = 96.
+	.LONG	iopbad		;IOPAR_DSKSECTSIZE = 97.
+	.LONG	iopbad		;IOPAR_DSKCLSSIZE  = 98.
+	.LONG	iopbad		;IOPAR_DSKTTLSPACE = 99.
+	.LONG	iopbad		;IOPAR_DSKAVLSPACE = 100.
+	.LONG	iopbad		;IOPAR_DSKNUMHEAD  = 101.
+	.LONG	iopbad		;IOPAR_DSKNUMSECT  = 102.
+	.LONG	iopbad		;IOPAR_DSKNUMCYLN  = 103.
+	.LONG	iopbad		;		   = 104.
+	.LONG	iopbad		;		   = 105.
+	.LONG	iopbad		;		   = 106.
+	.LONG	iopcmdtail	;IOPAR_RUNCMDTAIL  = 107.
+	.LONG	iopdevlist	;IOPAR_RUNDEVLIST  = 108.
+	.LONG	iopenviron	;IOPAR_RUNENVIRON  = 109.
+	.LONG	iopdebugbfr	;IOPAR_RUNDEBUGBFR = 110.
+	.LONG	iopaddress	;IOPAR_RUNADDRESS  = 111.
+	.LONG	ioprelocval	;IOPAR_RUNRELOCVAL = 112.
+	.LONG	iopfcb1		;IOPAR_RUNFCB1     = 113.
+	.LONG	iopfcb2		;IOPAR_RUNFCB2     = 114.
+	.LONG	iopactpriv	;IOPAR_RUNACTPRIV  = 115.
+	.LONG	iopavlpriv	;IOPAR_RUNAVLPRIV  = 116.
+	.LONG	iopbad		;		   = 117.
+	.LONG	iopwslimit	;IOPAR_RUNWSLIMIT  = 118.
+	.LONG	iopwsallow	;IOPAR_RUNWSALLOW  = 119.
+	.LONG	ioptmlimit	;IOPAR_RUNTMLIMIT  = 120.
+	.LONG	ioptmallow	;IOPAR_RUNTMALLOW  = 121.
+	.LONG	ioppmlimit	;IOPAR_RUNPMLIMIT  = 122.
+	.LONG	ioppmallow	;IOPAR_RUNPMALLOW  = 123.
+	.LONG	ioprmlimit	;IOPAR_RUNRMLIMIT  = 124.
+	.LONG	ioprmallow	;IOPAR_RUNRMALLOW  = 125.
+	.LONG	iopomlimit	;IOPAR_RUNOMLIMIT  = 126.
+	.LONG	iopomallow	;IOPAR_RUNOMALLOW  = 127.
+PARMGENMAX=!{$-rungenptbl}/4
+
+	.LONG	PARMFILMAX
+runfilptbl:
+	.LONG	iopbad		;		   = 0100h
+	.LONG	iopbad		;IOPAR_DIRHNDL     = 0101h
+	.LONG	ioppass		;IOPAR_SRCATTR     = 0102h
+	.LONG	ioppass		;IOPAR_FILATTR     = 0103h
+	.LONG	ioppass		;IOPAR_DIROFS      = 0104h
+	.LONG	iopnull		;IOPAR_ABSPOS	   = 0105h
+	.LONG	iopnull		;IOPAR_RELPOS	   = 0106h
+	.LONG	iopnull		;IOPAR_EOFPOS	   = 0107h
+	.LONG	iopbad		;IOPAR_VBOF	   = 0108h
+	.LONG	iopget		;IOPAR_LENGTH      = 0109h
+	.LONG	iopget		;IOPAR_REQALLOC    = 010Ah
+	.LONG	iopget		;IOPAR_RQRALLOC    = 010Bh
+	.LONG	iopget		;IOPAR_GRPSIZE     = 010Ch
+	.LONG	iopget		;IOPAR_ADATE       = 010Dh
+	.LONG	iopget		;IOPAR_CDATE       = 010Eh
+	.LONG	iopget		;IOPAR_MDATE       = 010Fh
+	.LONG	iopget		;IOPAR_PROT        = 0110h
+	.LONG	iopget		;IOPAR_OWNER       = 0111h
+	.LONG	iopbad		;                  = 0112h
+	.LONG	iopbad		;IOPAR_SETLOCK	   = 0113h
+	.LONG	iopbad		;IOPAR_CLRLOCK	   = 0114h
+	.LONG	iopbad		;IOPAR_CLSTIME     = 0115h
+	.LONG	iopbad		;IOPAR_CLSNAME     = 0116h
+	.LONG	iopbad		;IOPAR_CLSMSG	   = 0117h
+PARMFILMAX=!{$-runfilptbl}/4
+
+	.LONG	PARMRUNMAX
+runrunptbl:
+	.LONG	iopbad		;		   = 1000h
+	.LONG	iopcmdtail	;IOPAR_RUNCMDTAIL  = 1001h
+	.LONG	iopdevlist	;IOPAR_RUNDEVLIST  = 1002h
+	.LONG	iopenviron	;IOPAR_RUNENVIRON  = 1003h
+	.LONG	iopdebugbfr	;IOPAR_RUNDEBUGBFR = 1004h
+	.LONG	iopaddress	;IOPAR_RUNADDRESS  = 1005h
+	.LONG	ioprelocval	;IOPAR_RUNRELOCVAL = 1006h
+	.LONG	iopfcb1		;IOPAR_RUNFCB1     = 1007h
+	.LONG	iopfcb2		;IOPAR_RUNFCB2     = 1008h
+	.LONG	iopactpriv	;IOPAR_RUNACTPRIV  = 1009h
+	.LONG	iopavlpriv	;IOPAR_RUNAVLPRIV  = 100Ah
+	.LONG	iopbad		;		   = 100Bh
+	.LONG	iopwslimit	;IOPAR_RUNWSLIMIT  = 100Ch
+	.LONG	iopwsallow	;IOPAR_RUNWSALLOW  = 100Dh
+	.LONG	ioptmlimit	;IOPAR_RUNTMLIMIT  = 100Eh
+	.LONG	ioptmallow	;IOPAR_RUNTMALLOW  = 100Fh
+	.LONG	ioppmlimit	;IOPAR_RUNPMLIMIT  = 1010h
+	.LONG	ioppmallow	;IOPAR_RUNPMALLOW  = 1011h
+	.LONG	ioprmlimit	;IOPAR_RUNRMLIMIT  = 1012h
+	.LONG	ioprmallow	;IOPAR_RUNRMALLOW  = 1013h
+	.LONG	iopomlimit	;IOPAR_RUNOMLIMIT  = 1014h
+	.LONG	iopomallow	;IOPAR_RUNOMALLOW  = 1015h
+PARMRUNMAX=!{$-runrunptbl}/4
+
+	.LONG	1
+runbadptbl:
+	.LONG	iopbad
+.PAGE
+;Here if cannot return to the caller - must exit
+
+usrrnexit::
+	BTL	run_option#, #R%DEBUG	;Is this a debug load?
+	JC	ret010.S		;Yes - just return
+	ANDL	EAX, #0FFFFFFh		;No - put the termination code in the
+	ORL	EAX, #TC_RUNFAIL<24t	;  high eight bits
+	PUSHL	EAX			;Terminate this process
+	CALLF	svcSchExit#
+.PAGE
+;Here for parameter which cannot be set but otherwise should be passed to the
+;  device
+
+iopget:	TESTB	AL, #PAR$SET		;Trying to set it?
+	JE	ioppass.S		;No - this is OK
+iopillf:MOVL	EAX, #ER_PARMF		;Yes - fail!
+	JMP	iopfail.S
+
+;Here for parameter which should be passed to the device
+
+ioppass:STOSL	[EDI]			;Store header bytes
+	CMPB	CL, #REP_STR		;Is it a string?
+	JE	2$.S
+	CMPB	CL, #REP_DATAS
+	JNE	4$.S			;No
+2$:	MOVB	AH, #12t		;Yes
+4$:	MOVZBL	ECX, AH
+	CMPL	EDI, #run_bufend#-2	;Too big?
+	JA	6$.S			;Yes - fail
+	RMOVSB	[EDI], FS:[ESI]		;Copy data bytes
+	CLC
+ret010:	RET
+
+6$:	MOVL	EAX, #ER_PARMS
+	JMP	iopfail.S
+
+;Here if have bad parameter index
+
+iopbad:	MOVL	EAX, #ER_PARMI
+iopfail:ORB	FS:-4.B[ESI], #PAR$ERROR
+	STC
+	RET
+
+;Here for null parameter - sets are ignored and gets always return 0
+
+iopnull:TESTB	AL, #PAR$GET		;Does he want the value?
+	JNE	10$.S			;Yes
+	MOVZBL	ECX, AH			;No - assume not long string
+	ANDB	AL, #0Fh		;Right?
+	CMPB	AL, #REP_STR
+	JE	8$.S
+	CMPB	AL, #REP_DATAS
+	JE	8$.S			;Yes
+	MOVL	ECX, #12t		;No
+8$:	ADDL	ESI, ECX		;Bump user's address
+	CLC
+	RET
+
+;Here to give him a zero value
+
+10$:	ANDB	AL, #0Fh		;Is it a string?
+	CMPB	AL, #REP_STR
+	JE	14$.S
+	CMPB	AL, #REP_DATAS
+	JE	14$.S			;Yes
+	MOVZBL	ECX, AH			;No - get length of value
+	JREGZ	ECX, 16$
+12$:	MOVB	FS:[ESI], #0		;Give him 0
+	INCL	ESI
+	LOOP	ECX, 12$
+	CLC
+	RET
+
+;Here if string value
+
+14$:	LGSL	EBX, FS:4.B[ESI]	;Get address of his string buffer
+	MOVB	GS:[EBX], #0		;Store a null in it
+	MOVW	FS:14t.B[ESI], #0	;Store 0 as length
+	ADDL	ESI, #16t.B		;Bump his pointer
+16$:	CLC
+	RET
+.PAGE
+;Here for the IOP_FILOPTN parameter - this parameter is handled differently for
+;  R_RUN and R_LOAD functions.  For R_LOAD, the value given is used directly
+;  with the open.  For R_RUN, it is saved and used with a separate
+;  svcIoInBlockP call after the file is open.  This is necessary since we
+;  must have the name returned to our buffer in a standard format with the
+;  open.
+
+iopfiloptn:
+	TESTB	AL, #PAR$GET		;Only PAR$SET is allowed
+	JNE	iopillf
+	TESTB	AL, #PAR$SET
+	JE	iopnull.S
+	CALL	getiopval		;Get the value
+	CMPB	run_func#, #RFNC_RUN	;Is this a RUN function?
+	JNE	4$.S			;No
+	MOVL	run_filoptn#, EAX	;Yes - save user's bits
+	BTZL	EAX, #FO%NOPREFIX
+	ORL	run_parmlist#+8t+{runfopt-runplst}, EAX ;Merge with our bits
+	JMP	6$.S
+
+;Here if not a RUN function - store this in the parameter list for the open
+
+4$:	MOVL	run_parmlist#+8t+{runfopt-runplst}, EAX
+6$:	CLC
+	RET
+.PAGE
+;Here for the IOP_FILSPEC parameter - this parameter is handled differently for
+;  R_RUN and R_LOAD functions.  For R_LOAD, the value given is used directly
+;  with the open.  For R_RUN, it is saved and used with a separate
+;  svcIoInBlockP call after the file is open.  This is necessary since we
+;  must have the name returned to our buffer in a standard format with the
+;  open.
+
+iopfilspec:
+	TESTB	AL, #PAR$SET		;Only PAR$GET is allowed
+	JNE	iopillf
+	TESTB	AL, #PAR$GET
+	JE	iopnull
+	CALL	getiopstr
+	CMPB	run_func#, #RFNC_RUN	;Is this a RUN function?
+	JNE	4$.S			;No
+	MOVL	run_filspec#+0, EBX	;Yes - store data for later use
+	MOVL	run_filspec#+4, GS
+	MOVL	run_filspsz#, ECX
+	JMP	6$.S
+
+;Here if not a RUN function - store this in the parameter list for the open
+
+4$:	MOVL	run_parmlist#+8t+{runfsa-runplst}+0, EBX
+	MOVL	run_parmlist#+8t+{runfsa-runplst}+4, GS
+	MOVL	run_parmlist#+8t+{runfss-runplst}, ECX
+6$:	LEAL	EAX, -2.B[ESI]
+	MOVL	run_fillnpnt#+0, EAX
+	MOVL	run_fillnpnt#+4, FS
+	CLC
+	RET
+.PAGE
+;Here for the IOP_TIMEOUT parameter - specify time-out value
+
+ioptimeout:
+	TESTB	AL, #PAR$GET		;Only PAR$SET is allowed
+	JNE	2$.S
+	TESTB	AL, #PAR$SET
+	JE	4$.S
+	CALL	getiopval		;Get the value
+	MOVL	run_timeout#, EAX ;Store it
+	CLC
+	RET
+
+;Here for the IOP_CMDTAIL parameter - specify command line arguments
+
+iopcmdtail:
+	TESTB	AL, #PAR$GET		;Only PAR$SET is allowed
+	JNE	2$.S
+	TESTB	AL, #PAR$SET
+	JE	4$.S
+	CALL	getiopstr
+	MOVL	run_argaddr#+0, EBX
+	MOVL	run_argaddr#+4, GS
+	MOVL	run_argsize#, ECX
+	CLC
+	RET
+
+;Here for the IOP_DEVLIST parameter - specify devices to pass to child
+
+iopdevlist:
+	TESTB	AL, #PAR$GET		;Only PAR$SET is allowed
+2$:	JNE	6$.S
+	TESTB	AL, #PAR$SET
+4$:	JE	8$.S
+	CALL	getiopstr
+	MOVL	run_devlist#+0, EBX
+	MOVL	run_devlist#+4, GS
+	MOVL	run_devsize#, ECX
+	CLC
+	RET
+
+;Here for the IOP_ENVIRON parameter - specify additional environment strings
+
+iopenviron:
+	TESTB	AL, #PAR$GET		;Only PAR$SET is allowed
+	JNE	6$.S
+	TESTB	AL, #PAR$SET
+	JE	8$.S
+	CALL	getiopstr
+	MOVL	run_envlist#+0, EBX
+	MOVL	run_envlist#+4, GS
+	MOVL	run_envsize#, ECX
+	CLC
+	RET
+
+;Here for the IOP_DEBUGBFR parameter - specify address for debugger information
+
+iopdebugbfr:
+	TESTB	AL, #PAR$SET		;Only PAR$GET is allowed
+	JNE	6$.S
+	TESTB	AL, #PAR$GET
+	JE	8$.S
+	CALL	getiopstr
+	MOVL	run_rlbaddr#+0, EBX
+	MOVL	run_rlbaddr#+4, GS
+	MOVL	run_rlbsize#, ECX
+	CLC
+	RET
+
+;Here for the IOP_ADDRESS parameter - specify load address for msect
+
+iopaddress:
+	TESTB	AL, #PAR$GET		;Only PAR$SET is allowed
+6$:	JNE	iopillf
+	TESTB	AL, #PAR$SET
+8$:	JE	iopnull
+	CALL	getiopadr
+	MOVL	run_loadaddr#+0, EBX
+	MOVL	run_loadaddr#+4, GS
+	MOVL	run_loadsize#, ECX
+	CLC
+	RET
+
+;Here for the IOP_RELOCVAL parameter - specify offset for relocation for msect
+
+ioprelocval:
+	TESTB	AL, #PAR$GET		;Only PAR$SET is allowed
+	JNE	6$.S
+	TESTB	AL, #PAR$SET
+	JE	8$.S
+	CALL	getiopadr
+	MOVL	run_relocval#+0, EBX
+	MOVL	run_relocval#+4, GS
+	CLC
+	RET
+
+;Here for the IOP_ACTPRIV parameter - specify active privlege mask
+
+iopactpriv:
+	TESTB	AL, #PAR$GET		;Only PAR$SET is allowed
+	JNE	6$.S
+	TESTB	AL, #PAR$SET
+	JE	8$.S
+	CALL	getiopstr
+	MOVL	run_actpriv#+0, EBX
+	MOVL	run_actpriv#+4, GS
+	MOVL	run_actsize#, ECX
+	CLC
+	RET
+
+;Here for the IOP_AVLPRIV parameter - specify available privlege mask
+
+iopavlpriv:
+	TESTB	AL, #PAR$GET		;Only PAR$SET is allowed
+10$:	JNE	6$.S
+	TESTB	AL, #PAR$SET
+12$:	JE	8$.S
+	CALL	getiopstr
+	MOVL	run_avlpriv#+0, EBX
+	MOVL	run_avlpriv#+4, GS
+	MOVL	run_avlsize#, ECX
+	CLC
+	RET
+
+;Here for the IOP_RUNWSLIMIT parameter - specify working set size limit
+
+iopwslimit:
+	MOVL	EBX, #run_wslimit#
+	JMP	14$.S
+
+;Here for the IOP_RUNWSALLOW parameter - specify working set size allowed
+
+iopwsallow:
+	MOVL	EBX, run_wsallow#
+14$:	TESTB	AL, #PAR$GET		;Only PAR$SET is allowed
+	JNE	10$.S
+	TESTB	AL, #PAR$SET
+	JE	12$.S
+	CALL	getiopval
+	TESTL	EAX, EAX
+	JNE	16$.S
+	DECL	EAX
+16$:	MOVL	[EBX], EAX
+	CLC
+	RET
+
+;Here for the IOP_RUNTMLIMIT parameter - specify total memory size limit
+
+ioptmlimit:
+	MOVL	EBX, #run_tmlimit#
+	JMP	14$.S
+
+;Here for the IOP_RUNTMALLOW parameter - specify total memory allowed
+
+ioptmallow:
+	MOVL	EBX, #run_tmallow#
+	JMP	14$.S
+
+;Here for the IOP_RUNPMLIMIT parameter - specify protected mode memory limit
+
+ioppmlimit:
+	MOVL	EBX, #run_pmlimit#
+	JMP	14$.S
+
+;Here for the IOP_RUNPMALLOW parameter - specify protected mode memory allowed
+
+ioppmallow:
+	MOVL	EBX, #run_pmallow#
+	JMP	14$.S
+
+;Here for the IOP_RUNRMLIMIT parameter - specify real mode memory limit
+
+ioprmlimit:
+	MOVL	EBX, #run_rmlimit#
+	JMP	14$.S
+
+;Here for the IOP_RUNRMALLOW parameter - specify real mode memory allowed
+
+ioprmallow:
+	MOVL	EBX, #run_rmallow#
+	JMP	14$.S
+
+;Here for the IOP_RUNOMLIMIT parameter - specify overhead memory limit
+
+iopomlimit:
+	MOVL	EBX, #run_omlimit#
+	JMP	14$.S
+
+;Here for the IOP_RUNOMALLOW parameter - specify overhead memory allowed
+
+iopomallow:
+	MOVL	EBX, #run_omallow#
+	JMP	14$.S
+.PAGE
+;Here for the IOP_FCB1 parameter - specify address of first DOS command
+;  line FCB
+
+iopfcb1:PUSHL	EDI
+	MOVL	EDI, #run_fcb1#
+	JMP	2$.S
+
+;Here for the IOP_FCB2 parameter - specify address of second DOS command
+;  line FCB
+
+iopfcb2:PUSHL	EDI
+	MOVL	EDI, #run_fcb2#
+2$:	TESTB	AL, #PAR$GET		;Only PAR$SET is allowed
+	JNE	iopillf
+	TESTB	AL, #PAR$SET
+	JE	iopnull
+	CALL	getiopstr		;Get address and size of the user data
+	CMPL	ECX, #16t.B		;Make sure not too big (ignore extra)
+	JBE	4$.S
+	MOVL	ECX, #16t
+4$:	PUSHL	DS			;Copy the data
+	POPL	ES
+	PUSHL	ESI
+	MOVL	ESI, EBX
+	CLD
+	RMOVSB	[EDI], GS:[ESI]
+	POPL	ESI
+	POPL	EDI
+	CLC
+	RET
+.PAGE
+;Here with all parameters processsed - now open the file
+
+opnfile:MOVB	[EDI], #0		;Terminate the parameter list
+	PUSHL	#O$IN|O$NOINH
+	LFSL	ESI, run_usrqab#	;Get address of file specification
+	ADDL	ESI, #qab_buffer1.B
+	CALL	getuseradr
+	PUSHL	GS
+	PUSHL	EBX
+	PUSHL	DS
+	PUSHL	#run_parmlist#
+	CALLF	svcIoOpen#		;Open the file
+	TESTL	EAX, EAX
+	JS	fail			;If error
+	MOVL	run_loadhndl#, EAX	;OK - store handle
+	MOVL	EAX, run_parmlist#+4	;Store lenth of the file
+	MOVL	run_filelen#, EAX
+	MOVL	run_bfrofs#, #-512t	;Initialize offset for our read routine
+	MOVZWL	EAX, run_parmlist#+8t+{runfss-runplst}+2
+					;Get length of file specification
+	CMPB	run_func#, #RFNC_RUN	;Is this a run function?
+	JNE	fileopen		;No
+	MOVL	arg_filofs, #arg_filspec ;Yes - store offset of file spec
+	MOVL	arg_fillen, EAX		;Store length of file spec
+	ADDL	EAX, #arg_filspec+4.B	;Calculate offset of the argument data
+	ANDL	EAX, #0FFFFFFFC.B
+	MOVL	arg_cmdofs, EAX
+	ADDL	EAX, run_argsize#	;Calculate amount needed for the
+	INCL	EAX			;  argument msect
+	CMPL	EAX, #1000h		;Need more than 1 page?
+	JBE	8$.S			;No
+	PUSHL	DS			;Yes - get the additional memory
+	PUSHL	#0.B
+	PUSHL	#PG$WRITE|PG$READ.B
+	PUSHL	EAX
+	CALLF	svcMemChange#
+	TESTL	EAX, EAX
+	JS	fail			;If error
+8$:	MOVL	ECX, run_argsize#	;Have any argument data?
+	TESTL	ECX, ECX
+	JE	10$.S			;No
+	MOVL	arg_cmdlen, ECX		;Yes
+	MOVL	EDI, arg_cmdofs
+	PUSHL	DS
+	POPL	ES
+	LFSL	ESI, run_argaddr#
+	RMOVSB	[EDI], FS:[ESI]		;Copy the argument data
+10$:	CMPL	run_filspec#, #0.B	;Does the caller want the file spec?
+	JE	fileopen.S		;No
+	LESL	EDI, run_filspec#	;Yes - construct a parameter list to
+	PUSHL	DS			;  get the file spec again the way the
+	POPL	ES			;  use wants it
+	MOVL	EDI, #run_parmlist#
+	CLD
+	MOVL	EAX, #{PAR$SET|REP_HEXV}|{4t<8t}|{IOPAR_FILOPTN<16t}
+	STOSL	[EDI]
+	MOVL	EAX, run_filoptn#
+	STOSL	[EDI]
+	MOVL	EAX, #{PAR$GET|REP_STR}|{IOPAR_FILSPEC<16t}
+	STOSL	[EDI]
+	MOVL	EAX, run_filspec#+0
+	STOSL	[EDI]
+	MOVL	EAX, run_filspec#+4
+	STOSL	[EDI]
+	MOVL	EAX, run_filspsz#
+	STOSL	[EDI]
+	MOVB	AL, #0
+	STOSB	[EDI]
+	PUSHL	run_loadhndl#
+	PUSHL	#0.B
+	PUSHL	#0.B
+	PUSHL	#0.B
+	PUSHL	DS
+	PUSHL	#run_parmlist#
+	CALLF	svcIoInBlockP#
+	TESTL	EAX, EAX
+	JS	fail
+	MOVW	AX, run_parmlist+22t	;Give him the string length
+	LFSL	EDX, run_fillnpnt#
+	MOVW	FS:[EDX], AX		;Fall into fileopen on next page
+.PAGE
+fileopen:
+	CMPB	run_func#, #RFNC_RUN	;Is this a run function?
+	JNE	disp			;No
+	MOVL	ESI, #16t		;Yes
+	CLRL	ECX			;Find start of file name
+	DECL	ECX
+	CLD
+8$:	LODSB	[ESI]
+	CMPB	AL, #0
+	JE	disp
+	CMPB	AL, #FS_FILENAME
+	JNE	8$.S
+	MOVL	run_fnbgn#, ESI		;Remember where the name starts
+	MOVL	EDI, #run_procname#
+	PUSHL	DS
+	POPL	ES
+	MOVL	ECX, #16t
+10$:	LODSB	[ESI]			;Now find start of extension
+	CMPB	AL, #0
+	JE	12$.S
+	CMPB	AL, #FS_MIN
+	JAE	12$.S
+	CMPB	AL, #'.'
+	JE	12$.S
+	DECL	ECX
+	JS	10$.S
+	STOSB	[EDI]
+	JMP	10$.S
+
+;Here with start of extension found
+
+12$:	MOVL	EAX, ESI		;Calculate length of the name
+	SUBL	EAX, run_fnbgn#
+	MOVL	run_fnlen#, EAX
+	CMPB	run_itype#, #IT_BATCH	;Do we need to check for a batch file?
+	JE	disp.S			;No
+	CMPB	-1.B[ESI], #'.'		;Is the extendsion .BAT?
+	JNE	disp.S
+	CMPB	[ESI], #'B'
+	JE	14$.S
+	CMPB	[ESI], #'b'
+	JNE	disp.S
+14$:	CMPB	1.B[ESI], #'A'
+	JE	16$.S
+	CMPB	1.B[ESI], #'a'
+	JNE	disp.S
+16$:	CMPB	2.B[ESI], #'T'
+	JE	18$.S
+	CMPB	2.B[ESI], #'t'
+	JNE	disp.S
+18$:	CMPB	3.B[ESI], #0
+	JE	20$.S
+	CMPB	3.B[ESI], #FS_MIN
+	JB	disp.S
+20$:	MOVB	run_itype#, #IT_BATCH	;Yes - store image type
+	MOVL	EAX, run_loadhndl#	;Make this file the batch file
+	MOVL	run_bathndl#, EAX
+	CLRL	EAX
+	MOVL	run_loadhndl#, EAX	;Clear handle in case error below
+	MOVL	EBX, #run_parmlist#
+	MOVB	8t.B[EBX], #0		;Remove parameter list stuff we don't
+	PUSHL	#O$IN+O$REQFILE
+	PUSHL	CS
+	PUSHL	#batname
+	PUSHL	DS
+	PUSHL	EBX
+	CALLF	svcIoOpen#		;Open the file
+	TESTL	EAX, EAX
+	JS	fail
+	MOVL	run_loadhndl#, EAX	;Store handle or error code
+	JMP	fileopen		;Continue
+.PAGE
+;Here to dispatch on the file header value - we use the first 2 bytes of the
+;  file to be loaded to determine the type of file (.RUN, .EXE, or .COM)
+
+disp:	MOVL	ECX, #2			;Get first two bytes of the file
+	MOVL	EBX, #run_header#
+	CALL	usrrnrdbytes
+	JC	fail
+	MOVZWL	EAX, run_header#	;Get what we read
+	MOVL	EBX, #runtbl
+	MOVL	ECX, #RUNTBLSZ
+2$:	CMPL	EAX, CS:[EBX]
+	JE	4$.S
+	ADDL	EBX, #8t.B
+	LOOP	ECX, 2$
+4$:	CALLI	CS:4.B[EBX]		;Call routine for the file
+	JC	fail			;If error
+	JMP	return			;If normal return
+
+	.MOD	4
+runtbl:	.LONG	22D7h, usrrnrun#
+	.LONG	5A4Dh, usrrnexe#
+	.LONG	0    , usrrncom#
+RUNTBLSZ=!{$-runtbl}/8-1
+
+batname:.ASCIZ	"XOSCMD:SHELL.RUN"
+.PAGE
+;Subroutine to get address from IO parameter value
+;	c{FS:ESI} = Address of address to get
+;	CALL	getiopadr
+;	c{GS:EBX} = Address of string buffer
+
+getiopadr:
+	CMPB	CL, #REP_BINV
+	JAE	2$.S
+	CMPB	AH, #6
+	JB	4$.S
+	MOVZBL	ECX, AH
+	CALL	getuseradr		;Get address
+	ADDL	ESI, ECX		;Bump offset to next parameter
+	RET
+
+2$:	MOVL	EAX, #ER_PARMT
+	STC
+	RET
+
+4$:	MOVL	EAX, #ER_PARMS
+	STC
+	RET
+
+;Subroutine to get string address for IO parameter
+;	c{FS:ESI} = Address of address to get
+;	CALL	getiopstr
+;	c{GS:EBX} = Address of string buffer
+;	c{ECX}    = Length of buffer
+
+getiopstr:
+	CALL	getuseradr		;Get address
+	MOVZWL	ECX, FS:8.B[ESI]	;Get length of string
+	ADDL	ESI, #12t.B		;Bump offset to next parameter
+	RET
+
+;Subroutine to get user address
+;	c{FS:ESI} = Address of address to get
+;	CALL	getuseradr
+;	c{GS:EBX} = Address of string buffer
+
+getuseradr:
+	MOVL	EAX, FS:4.B[ESI]	;Get selector
+	TESTL	EAX, EAX		;Null selector?
+	JE	12$.S			;Yes
+10$:	MOVL	GS, EAX
+	MOVL	EBX, FS:[ESI]		;Get offset
+	RET				;Thats all
+
+;Here with null selector
+
+12$:	CMPL	FS:[ESI], #0.B		;Is the offset null too?
+	JE	10$.S			;Yes - its really a null pointer
+	MOVZWL	EAX, FS:[ESI]		;No - its a real mode address
+	MOVZWL	EBX, FS:2.B[ESI]	;Get real mode selector
+	SHLL	EBX, #4			;Calculate offset
+	ADDL	EBX, EAX
+	PUSHL	#GS_REAL32|03h.B	;Get selector for the real mode segment
+	POPL	GS
+	RET
+.PAGE
+;Subroutine to get value of IO parameter
+;	c(AH) = Length of value
+;	CALL	getiopval
+;	c{EDX,EAX} = Value
+
+getiopval:
+	MOVZBL	ECX, AH
+	CMPL	ECX, #8t.B
+	JAE	getv08.S
+	JMPIL	CS:getvtbl[ECX*4]
+
+	.MOD	4
+getvtbl:.LONG	getv00
+	.LONG	getv01
+	.LONG	getv02
+	.LONG	getv03
+	.LONG	getv04
+	.LONG	getv05
+	.LONG	getv06
+	.LONG	getv07
+
+getv00:	CLRL	EAX
+2$:	CLRL	EDX
+4$:	ADDL	ESI, ECX
+	RET
+
+getv01:	MOVZBL	EAX, FS:[ESI]
+	JMP	2$.S
+
+getv02:	MOVZWL	EAX, FS:[ESI]
+	JMP	2$.S
+
+getv03:	MOVZWL	EAX, FS:1.B[ESI]
+	SHLL	EAX, #8t
+	MOVB	AL, FS:[ESI]
+	JMP	2$.S
+
+getv04:	MOVL	EAX, FS:[ESI]
+	JMP	2$.S
+
+getv05:	MOVZBL	EDX, FS:4.B[ESI]
+	JMP	6$.S
+
+getv06:	MOVZWL	EDX, FS:4.B[ESI]
+	JMP	6$.S
+
+getv07:	MOVZWL	EDX, FS:5.B[ESI]
+	SHLL	EDX, #8t
+	MOVB	DL, FS:4.B[ESI]
+	JMP	6$.S
+
+getv08:	MOVL	EDX, FS:4.B[ESI]
+6$:	MOVL	EAX, FS:[ESI]
+	JMP	4$.S
+.PAGE
+	.SBTTL	usrrncontext - Subroutine to get into correct context
+
+;Subroutine to get into correct context to finish loading program
+;	CALL	usrrncontext
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  Z:set = Need to finish loading program (now in correct context)
+;	  Z:clr = All finished (in original context)
+;	    c{EAX} = Process ID of child
+
+usrrncontext::
+	BTL	run_option#, #R%DEBUG	;Is this a debug load?
+	JNC	6$.S			;No - go on
+	BTL	run_option#, #R%DOSEXEC	;Yes - DOS EXEC call?
+	JC	4$.S			;Yes - fail
+	LESL	EDI, run_rlbaddr#	;No - clear the register part of his
+	MOVL	ECX, #16t		;  relocation data block
+	CLRL	EAX
+	CLD
+	RSTOSL	[EDI]
+	RET				;Nothing else needed here (Z is set)
+
+4$:	MOVL	EAX, #ER_FUNC
+	STC
+	RET
+
+;Here if not doing debug load
+
+6$:	BTL	run_option#, #R%SAMEPROC ;Want same process?
+	JNC	child			;No
+	PUSHL	#8t.B			;Yes - no more software interrupts
+	CALLF	svcSchSetLevel#		;  after this
+	POPL	EAX			;Get our return address
+	PUSHL	DS			;Switch to our private stack (we have
+	POPL	SS			;  been using the caller's stack up to
+	MOVL	ESP, #run_userstk#	;  this point)
+	PUSHL	EAX			;Put return address on the new stack
+	PUSHL	#0.B			;Cancel all IO for all devices for
+	PUSHL	#0.B			;  process
+	PUSHL	#CAN$WAIT|CAN$ALLDEV|CAN$OPEN|CAN$INPUT|CAN$OUTPUT
+	CALLF	svcIoCancel#
+	TESTL	EAX, EAX
+	JS	8$.S			;If error canceling IO
+	PUSHL	#0.B			;Clear all devices
+	CALLF	svcIoClear#
+	MOVL	EAX, #01000000h
+	MOVW	AX, DS
+	PUSHL	EAX			;Give up all memory except for what we
+	CALLF	svcMemRmvMult#		;  are using
+	TESTL	EAX, EAX
+8$:	JS	fail			;If error giving up memory (should not					;  be possible!)
+					;  happen!)
+	MOVL	ESI, run_fnbgn#		;Set up the name of the new program
+	MOVL	EDI, #run_parmlist#+20h
+	PUSHL	DS
+	POPL	ES
+	MOVL	ECX, #12t
+	CLD
+10$:	LODSB	[ESI]
+	CMPB	AL, #'.'
+	JE	12$.S
+	CMPB	AL, #0
+	JE	12$.S
+	STOSB	[EDI]
+	LOOP	ECX, 10$
+12$:	MOVB	[EDI], #0
+	MOVL	ESI, #namelst		;Copy the class characteristics list
+	MOVL	EDI, #run_parmlist#
+	MOVL	ECX, #{RMNLEN+3}/4
+	RMOVSL	[EDI], CS:[ESI]
+	MOVL	run_parmlist#+14t, DS
+	PUSHL	CS			;Set the name
+	PUSHL	#urnprocstr
+	PUSHL	DS
+	PUSHL	#run_parmlist#
+	CALLF	svcIoClsChar#
+	TESTL	EAX, EAX
+	JS	fail			;If error
+	CLRL	EAX			;OK - set Z
+	RET				;And return
+.PAGE
+;Here if need to create a child process - we create a child process and give it
+;  our data segment (we can do this since we are always using the caller's
+;  stack when we get here - all we have to do after this is wait for the child
+;  to finish starting up)
+
+$$$=!0
+FRM urc_event, 4t
+FRM urc_sab  , sab_SIZE
+urc_SIZE=!$$$
+
+child:	ENTER	urc_SIZE, 0		;Create our stack frame
+	CALLF	svcSysGetPid#		;Store our PID for the child
+	MOVL	run_ppid#, EAX
+	MOVL	urc_sab+sab_func.B[EBP], #SFNC$WAIT|SFNC_CHILD
+	MOVB	urc_sab+sab_vector.B[EBP], #0 ;Set up our QAB
+	MOVB	urc_sab+sab_numseg.B[EBP], #1 ;We transfer a single segment
+	MOVL	urc_sab+sab_name+0.B[EBP], #run_procname#
+	MOVL	urc_sab+sab_name+4.B[EBP], DS
+	MOVL	urc_sab+sab_EIP.B[EBP], #childstrt
+	MOVL	urc_sab+sab_CS.B[EBP], CS     ;Store initial register values for
+	MOVL	urc_sab+sab_EFR.B[EBP], #200h ;  the child process
+	MOVL	urc_sab+sab_ESP.B[EBP], #run_userstk#-4t
+	MOVL	urc_sab+sab_SS.B[EBP], DS
+	MOVL	EAX, 4.B[EBP]		;Copy our return address to the child's
+	MOVL	run_userstk#-4t, EAX	;  stack
+	MOVL	EDI, #run_parmlist#+20h ;Store pointer to the parameter list
+	MOVL	urc_sab+sab_parm+0.B[EBP], EDI
+	MOVL	urc_sab+sab_parm+4.B[EBP], DS
+	MOVL	urc_sab+sab_srcsel.B[EBP], DS
+	MOVL	urc_sab+sab_dstsel.B[EBP], #80000000h
+	PUSHL	DS
+	POPL	ES			;Now build the parameter list
+	CLD
+	CMPL	run_devlist#+4, #0.B	;Did he specify a device list?
+	JE	devls4.S		;No
+	MOVL	EAX, #PAR$SET|REP_STR+{IOPAR_RUNDEVLIST<16t}
+	STOSL	[EDI]			;Yes - put it in our parameter list
+	LFSL	ESI, run_devlist#
+	MOVL	EAX, ESI
+	STOSL	[EDI]
+	MOVL	EAX, FS
+	STOSL	[EDI]
+	MOVL	EAX, run_devsize#
+	MOVL	ECX, EAX
+	STOSL	[EDI]			;Fall into devlst on next page
+.PAGE
+devlst:	CLRL	EDX			;Intialize the handle bit map
+	CMPL	run_bathndl#, #0.B	;Have a batch device?
+	JE	2$.S			;No
+	MOVB	DL, #20			;Yes - reserve handle 6 for it
+2$:	MOVL	EBX, #6-1		;Start allocating at handle 6
+	SHRL	ECX, #4t		;Change to number of entries
+4$:	CMPL	FS:[ESI], #0.B		;End of list?
+	JE	devls4.S		;Yes
+	MOVL	EAX, FS:4.B[ESI]	;No - get destination handle
+	CMPL	EAX, #-1.B		;Want to allocate?
+	JNE	12$.S			;No
+6$:	BTL	EDX, EBX		;Yes - find next free handle
+	JNC	10$.S
+	INCL	EBX
+	CMPL	EBX, #32t.B
+	JB	6$.S
+8$:	MOVL	EAX, #ER_BDDVH
+	LEAVE
+	STC
+	RET
+
+;Here with handle to use
+
+10$:	LEAL	EAX, 1.B[EBX]
+	MOVL	FS:4.B[ESI], EAX
+12$:	CMPL	EAX, #32t.B		;Valid handle?
+	JA	8$.S			;No - fail
+	DECL	EAX
+	JS	8$.S
+	BTSL	EDX, EAX		;Is it available?
+	JC	8$.S			;No - fail
+	ADDL	ESI, #16t.B		;Yes - bump device list pointer
+	LOOP	ECX, 4$			;Continue if more to do here
+devls4:	MOVL	EAX, #PAR$SET|REP_STR+{IOPAR_RUNDEVLIST<16t}
+	STOSL	[EDI]			;Always put in another device list to
+	MOVL	EAX, #run_ldevlist#	;  transfer the load device (and the
+	STOSL	[EDI]			;  batch device if we have one)
+	PUSHL	EDI
+	MOVL	EDI, EAX
+	MOVL	EDX, #16t
+	MOVL	EAX, run_bathndl#	;Do we have a batch file open?
+	TESTL	EAX, EAX
+	JE	16$.S			;No
+	ORL	EAX, #0C0000000h	;Yes
+	STOSL	[EDI]
+	MOVL	EAX, #6			;Always use handle 6
+	STOSL	[EDI]
+	CLRL	EAX
+	DECL	EAX
+	STOSL	[EDI]			;Use same command bits
+	INCL	EAX
+	STOSL	[EDI]
+	ADDL	EDX, #16t.B
+16$:	MOVL	EAX, run_loadhndl#	;Put in the load handle
+	ORL	EAX, #0C0000000h
+	STOSL	[EDI]
+	CLRL	EAX			;Allocate destination handle
+	DECL	EAX
+	STOSL	[EDI]
+	STOSL	[EDI]			;Use same command bits
+	POPL	EDI
+	MOVL	EAX, DS
+	STOSL	[EDI]
+	MOVL	EAX, EDX
+	STOSL	[EDI]			;Fall into envlst on next page
+.PAGE
+envlst:	CMPL	run_envlist#, #0.B	;Did he specify an environment list?
+	JE	6$.S			;No
+	MOVL	EAX, #PAR$SET|REP_STR+{IOPAR_RUNENVLIST<16t}
+	STOSL	[EDI]			;Yes - put it in our parameter list
+	MOVL	EAX, run_envlist#+0
+	STOSL	[EDI]
+	MOVL	EAX, run_envlist#+4
+	STOSL	[EDI]
+	MOVL	EAX, run_envsize#
+	STOSL	[EDI]			;Did he specify an active privilege
+6$:	CMPL	run_actpriv#+4, #0.B	;  mask?
+	JE	8$.S			;No
+	MOVL	EAX, #PAR$SET|REP_STR+{IOPAR_RUNACTPRIV<16t}
+	STOSL	[EDI]			;Yes - put it in our parameter list
+	MOVL	EAX, run_actpriv#+0
+	STOSL	[EDI]
+	MOVL	EAX, run_actpriv#+4
+	STOSL	[EDI]
+	MOVL	EAX, run_actsize#
+	STOSL	[EDI]			;Did he specify an available privilege
+8$:	CMPL	run_avlpriv#+4, #0.B	;  mask?
+	JE	10$.S			;No
+	MOVL	EAX, #PAR$SET|REP_STR+{IOPAR_RUNAVLPRIV<16t}
+	STOSL	[EDI]			;Yes - put it in our parameter list
+	MOVL	EAX, run_avlpriv#+0
+	STOSL	[EDI]
+	MOVL	EAX, run_avlpriv#+4
+	STOSL	[EDI]
+	MOVL	EAX, run_avlsize#
+	STOSL	[EDI]
+10$:
+
+;;;;;; qqqqqqqqqqq
+
+	CMPL	run_wslimit#, #0.B	;Did he specify a working set limit?
+	JE	12$.S			;No
+	MOVL	EAX, #PAR$SET|REP_HEXV+{4<8t}+{IOPAR_RUNWSLIMIT<16t}
+	STOSL	[EDI]			;Yes - put it in our parameter list
+	MOVL	EAX, run_wslimit#
+	STOSL	[EDI]
+12$:	CMPL	run_wsallow#, #0.B	;Did he specify a working set allowed
+					;  value?
+	JE	14$.S			;No
+	MOVL	EAX, #PAR$SET|REP_HEXV+{4<8t}+{IOPAR_RUNWSALLOW<16t}
+	STOSL	[EDI]			;Yes - put it in our parameter list
+	MOVL	EAX, run_wsallow#
+	STOSL	[EDI]
+14$:	CMPL	run_tmlimit#, #0.B	;Did he specify a total memory limit?
+	JE	16$.S			;No
+	MOVL	EAX, #PAR$SET|REP_HEXV+{4<8t}+{IOPAR_RUNTMLIMIT<16t}
+	STOSL	[EDI]			;Yes - put it in our parameter list
+	MOVL	EAX, run_tmlimit#
+	STOSL	[EDI]
+16$:	CMPL	run_tmallow#, #0.B	;Did he specify a total memory allowed
+					;  value?
+	JE	18$.S			;No
+	MOVL	EAX, #PAR$SET|REP_HEXV+{4<8t}+{IOPAR_RUNTMALLOW<16t}
+	STOSL	[EDI]			;Yes - put it in our parameter list
+	MOVL	EAX, run_tmallow#
+	STOSL	[EDI]
+18$:	CMPL	run_pmlimit#, #0.B	;Did he specify a protected mode
+					;  memory limit?
+	JE	20$.S			;No
+	MOVL	EAX, #PAR$SET|REP_HEXV+{4<8t}+{IOPAR_RUNPMLIMIT<16t}
+	STOSL	[EDI]			;Yes - put it in our parameter list
+	MOVL	EAX, run_pmlimit#
+	STOSL	[EDI]
+20$:	CMPL	run_pmallow#, #0.B	;Did he specify a protected mode
+					;  memory allowed value?
+	JE	22$.S			;No
+	MOVL	EAX, #PAR$SET|REP_HEXV+{4<8t}+{IOPAR_RUNPMALLOW<16t}
+	STOSL	[EDI]			;Yes - put it in our parameter list
+	MOVL	EAX, run_pmallow#
+	STOSL	[EDI]
+22$:	CMPL	run_rmlimit#, #0.B	;Did he specify a real mode memory
+					;  limit?
+	JE	24$.S			;No
+	MOVL	EAX, #PAR$SET|REP_HEXV+{4<8t}+{IOPAR_RUNRMLIMIT<16t}
+	STOSL	[EDI]			;Yes - put it in our parameter list
+	MOVL	EAX, run_wslimit#
+	STOSL	[EDI]
+24$:	CMPL	run_rmallow#, #0.B	;Did he specify a real mode memory
+					;  allowed value?
+	JE	26$.S			;No
+	MOVL	EAX, #PAR$SET|REP_HEXV+{4<8t}+{IOPAR_RUNRMALLOW<16t}
+	STOSL	[EDI]			;Yes - put it in our parameter list
+	MOVL	EAX, run_rmallow#
+	STOSL	[EDI]
+
+26$:	CMPL	run_omlimit#, #0.B	;Did he specify an overhead memory 
+					;  limit?
+	JE	28$.S			;No
+	MOVL	EAX, #PAR$SET|REP_HEXV+{4<8t}+{IOPAR_RUNOMLIMIT<16t}
+	STOSL	[EDI]			;Yes - put it in our parameter list
+	MOVL	EAX, run_omlimit#
+	STOSL	[EDI]
+28$:	CMPL	run_omallow#, #0.B	;Did he specify an overhead memory
+					;  allowed value?
+	JE	30$.S			;No
+	MOVL	EAX, #PAR$SET|REP_HEXV+{4<8t}+{IOPAR_RUNOMALLOW<16t}
+	STOSL	[EDI]			;Yes - put it in our parameter list
+	MOVL	EAX, run_omallow#
+	STOSL	[EDI]
+30$:	MOVB	AL, #0			;Put a null at the end of the parameter
+	STOSB	[EDI]			;  list
+					;Fall into spwnrdy on next page
+.PAGE
+;Here when finally ready to spawn a child process
+
+spwnrdy:PUSHL	CS			;Reserve an event flag to use to wait
+	PUSHL	#runecname		;  for the child
+	PUSHL	#-1.B
+	CALLF	svcSchResEvent#
+	TESTL	EAX, EAX
+	JNS	8$.S			;Go on if OK
+	CMPL	EAX, #ER_NTDEF		;Was the error "not defined"?
+6$:	JNE	18$			;No - fail
+	PUSHL	CS			;Yes - must not have the event cluster
+	PUSHL	#runecname		;  - try to create it now
+	PUSHL	#10t.B
+	PUSHL	#-1.B
+	CALLF	svcSchMakEvent#
+	TESTL	EAX, EAX
+	JS	6$.S			;If error
+	PUSHL	CS			;OK - now try to reserve an event again
+	PUSHL	#runecname
+	PUSHL	#-1.B
+	CALLF	svcSchResEvent#
+	TESTL	EAX, EAX
+	JS	6$.S			;It should work this time!
+8$:	MOVL	urc_event.B[EBP], EAX	;Save event number to use
+	MOVL	run_event#, EAX		;Also store it for the child process
+	CLRL	ECX			;Assume waiting for child to terminate
+	ORL	EAX, #S$SETUP|S$NOCDS
+	BTL	run_option#, #R%CHILDTERM ;Right?
+	JC	10$.S			;Yes
+	MOVB	CL, run_itype#		;No - get image type to return
+	SHLL	ECX, #12t
+	BTZL	EAX, #S%NOCDS		;Also fix up the option bits
+10$:	BTL	run_option#, #R%SESSION ;Want to create a new session?
+	JNC	12$.S			;No
+	BTSL	EAX, #S%SESSION		;Yes
+12$:	BTL	run_option#, #R%ALLDEV	;Want to transfer all devices?
+	JNC	14$.S			;No
+	BTSL	EAX, #S%ALLDEV		;Yes
+14$:	MOVL	urc_sab+sab_option.B[EBP], EAX ;Store option bits for spawn
+	MOVL	EDX, run_timeout#	;Get time-out value
+	LESL	EBX, run_usrqab#	;Get address of the user's QAB
+	PUSHL	SS
+	LEAL	EAX, urc_sab.B[EBP]
+	PUSHL	EAX
+	CALLF	svcSchSpawn#		;Create the child process
+	TESTL	EAX, EAX
+	JS	16$.S			;If error
+	MOVL	EAX, urc_sab+sab_error.B[EBP]
+	TESTL	EAX, EAX
+	JS	16$.S
+	PUSHL	CS			;Wait for the child process to load its
+	PUSHL	#runecname		;  program
+	MOVL	EAX, urc_event.B[EBP]
+	BTSL	EAX, #31t		;Clear event before returning
+	PUSHL	EAX
+	PUSHL	EDX
+	CALLF	svcSchWaitSEvent#
+	TESTL	EAX, EAX
+	JNE	16$.S			;If did not time out
+	MOVL	EAX, #ER_CPDNR		;Time-out - get right error code
+16$:	PUSHL	EAX			;Save returned value
+	MOVL	ESI, urc_event.B[EBP]
+	CLRL	EAX
+	BTSL	EAX, ESI
+	PUSHL	CS			;Give up the event
+	PUSHL	#runecname
+	PUSHL	EAX
+	CALLF	svcSchRelEvent#
+	POPL	EAX			;Restore returned value
+	LEAVE
+	MOVL	EDX, EAX
+	ANDL	EDX, #7F000000h		;Error?
+	CMPL	EDX, #7F000000h
+	JE	20$.S			;Yes
+	ORL	EAX, ECX		;No - merge in the image type
+	MOVL	ES:qab_amount.B[EBX], EAX ;Store child PID and type
+	JMP	22$.S
+
+;Here if error
+
+18$:	LEAVE
+20$:	BTSL	EAX, #31t		;Set sign bit
+	MOVL	ES:qab_error.B[EBX], EAX ;Store error code
+22$:	CLRL	EAX			;Return 0
+	TESTL	ESP, ESP		;Clear Z
+	RET				;Finished
+
+runecname:.ASCIZ "^XOS^PROC"
+.PAGE
+	.SBTTL	childstrt - Initial code executed by child process
+
+;Initial code executed by child process
+
+childstrt:
+	PUSHL	SS			;Restore DS
+	POPL	DS
+	MOVL	EAX, run_ldevlist#+4	;Get the first new handle
+	CMPL	run_bathndl#, #0.B	;Have a BAT device?
+	JE	4$.S			;No - this is the new load handle
+	MOVL	run_bathndl#, EAX	;Yes - store new BAT handle
+	MOVL	EAX, run_ldevlist#+20t	;Get new load handle
+4$:	MOVL	run_loadhndl#, EAX	;Store new load handle
+	CLRL	EAX			;Set Z
+	RET				;Return from usrrncontext
+.PAGE
+	.SBTTL	usrrnfin - Subroutine to notify parent that child is finished
+
+;Subroutine to notify parent that child is finished with the run function
+;  without errors
+;	CALL	usrrnfin
+
+usrrnfin::
+	CMPL	run_ppid#, #0.B
+	JE	4$.S
+	BTL	run_option#, #R%CHILDTERM
+	JC	4$.S
+	PUSHL	CS
+	PUSHL	#runecname
+	PUSHL	run_event#
+	CALLF	svcSysGetPid#
+	PUSHL	EAX
+	PUSHL	run_ppid#
+	CALLF	svcSchSetEvent#
+4$:	CLRL	EAX
+	RET
+.PAGE
+	.SBTTL	usrrnrdbyter - Subroutine to read random bytes when loading programs
+
+;Subroutine to read random bytes when loading programs - this subroutine is
+;  called to read a small number of bytes using our local data buffer - it is
+;  used when reading the file header and when reading relocation information.
+;	c{EBX} = Offset of data buffer (must be in our data segment)
+;	c{ECX} = Number of bytes to read
+;	c{EDX} = Offset in file
+;	CALL	usrrnrdbyter
+;	C:set = Error code
+;	  c{EAX} = Error code
+;	C:clr = Normal
+
+usrrnrdbyter::
+	CALL	rdsetr			;Set random address
+					;And fall into usrrnrdbytes
+
+	.SBTTL	usrrnrdbytes - Subroutine to read sequential bytes when loading programs
+
+;Subroutine to read sequential bytes when loading programs - this subroutine is
+;  called to read a small number of bytes using our local data buffer - it is
+;  used when reading the file header and when reading relocation information
+;	c{EBX} = Offset of data buffer (must be in our data segment)
+;	c{ECX} = Number of bytes to read
+;	CALL	usrrnrdbyter
+;	C:set = Error code
+;	  c{EAX} = Error code
+;	C:clr = Normal
+
+usrrnrdbytes::
+	CALL	usrrnrdbyte1s		;Get a byte
+	JC	8$.S			;If error
+	MOVB	[EBX], AL		;Store it in our buffer
+	INCL	EBX			;Bump pointer
+	LOOP	ECX, usrrnrdbytes	;Continue if need more
+8$:	RET
+.PAGE
+	.SBTTL	usrrnrdbyte1r - Subroutine to read random byte when loading programs
+
+;Subroutine to read single random byte when loading programs
+;	c{EDX} = Offset in file
+;	CALL	usrrnrdbyter
+;	C:set = Error code
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  c(AL) = Data byte
+
+usrrnrdbyte1r::
+	CALL	rdsetr			;Set random address
+	JC	8$.S			;If error
+					;And fall into usrrnrdbyte1s
+
+	.SBTTL	usrrnrdbyte1s - Subroutine to read sequential byte when loading programs
+
+;Subroutine to read single sequential bytes when loading programs
+;	CALL	usrrnrdbyter
+;	C:set = Error code
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  c(AL) = Data byte
+
+usrrnrdbyte1s::
+	DECL	run_bfrcnt#		;Reduce buffer count
+	JNS	4$.S			;If have something in the buffer
+	ADDL	run_bfrofs#, #512t	;Bump offset in file
+	MOVL	EDX, run_bfrofs#
+	PUSHL	EBX
+	PUSHL	ECX
+	MOVL	EBX, #run_buffer#
+	PUSHL	DS			;Read the next block
+	POPL	ES
+	MOVL	ECX, #512t
+	CALL	usrrnrdblkr
+	POPL	ECX
+	POPL	EBX
+	JC	8$.S
+	MOVL	run_bfrpnt#, #run_buffer
+	MOVL	run_bfrcnt#, #511t
+4$:	MOVL	EAX, run_bfrpnt#	;Get pointer
+	MOVZBL	EAX, [EAX]		;Get byte
+	INCL	run_bfrpnt#		;Bump pointer
+	CLC
+8$:	RET				;And return
+.PAGE
+	.SBTTL	usrrnrdblkr - Subroutine to read random block when loading programs
+
+;Subroutine to read random block when loading programs
+;	c{ES:EBX} = Address of buffer
+;	c{ECX}    = Number of bytes to read
+;	c{EDX}    = Offset in file
+;	CALL	usrrnrdblkr
+;	C:set = Error code
+;	  c{EAX} = Error code
+;	C:clr = Normal
+
+usrrnrdblkr::
+	MOVL	run_parmlist#, #PAR$SET+REP_DECV+{4<8}+{IOPAR_ABSPOS<16t}
+	MOVL	run_parmlist#+4, EDX
+	MOVB	run_parmlist#+8, #0
+	PUSHL	run_loadhndl#		;Stack device handle
+	PUSHL	ES			;Stack buffer address
+	PUSHL	EBX
+	PUSHL	ECX			;Stack byte count
+	PUSHL	DS			;Stack parameter list address
+	PUSHL	#run_parmlist#
+	CALLF	svcIoInBlockP#		;Read the data
+	BTL	EAX, #31t		;Set C if error
+	RET				;Finished
+.PAGE
+	.SBTTL	usrrnrdskip - Subroutine to skip sequential bytes
+
+;Subroutine to skip sequential bytes in the file being loaded
+;	c{ECX} = Admount to skip
+;	CALL	usrrnrdskip
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+
+usrrnrdskip::
+	MOVL	EDX, run_bfrpnt#	;Calculate current position in file
+	SUBL	EDX, #run_buffer#
+	ADDL	EDX, run_bfrofs#
+	ADDL	EDX, ECX		;Plus amount to skip
+rdsetr:	MOVL	EAX, EDX		;Get offset of start of block containing
+	ANDL	EAX, #0FFFFE00h		;  the desired first byte
+	CMPL	EAX, run_bfrofs#	;Do we have it in the buffer?
+	JE	2$.S			;Yes - go on
+	MOVL	run_bfrofs#, EAX	;No - store desired offset
+	PUSHL	EBX
+	PUSHL	ECX
+	PUSHL	EDX
+	MOVL	EDX, EAX
+	MOVL	EBX, #run_buffer#	;Read the block we want
+	PUSHL	DS
+	POPL	ES
+	MOVL	ECX, #512t
+	CALL	usrrnrdblkr
+	POPL	EDX
+	POPL	ECX
+	POPL	EBX
+	JC	4$.S
+2$:	ANDL	EDX, #01FFh		;Get offset in block
+	MOVL	EAX, #512t		;Calculate buffer count
+	SUBL	EAX, EDX
+	MOVL	run_bfrcnt#, EAX
+	ADDL	EDX, #run_buffer#	;Set pointer
+	MOVL	run_bfrpnt#, EDX
+4$:	RET
+.PAGE
+	.SBTTL	usrrnrdname - Subroutine to read symbol name
+
+;Subroutine to read symbol name from the file being loaded
+;	CALL	usrrnrdname
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+
+usrrnrdname::
+	MOVL	EBX, #run_symname#
+	MOVL	ECX, #32t
+4$:	PUSHL	EBX
+	PUSHL	ECX
+	CALL	usrrnrdbyte1s		;Read a byte
+	POPL	ECX
+	POPL	EBX
+	JC	6$.S			;If error
+	MOVB	[EBX], AL		;Store byte
+	INCL	EBX
+	TESTB	AL, #80h		;Last byte in name?
+	JNE	8$.S			;Yes
+	DECL	ECX			;No - can we take more?
+	JNE	4$.S			;Yes - continue
+	MOVL	EAX, #ER_IRFSL		;No - fail
+	STC
+6$:	RET
+
+;Here at end of name
+
+8$:	ANDB	-1.B[EBX], #7Fh		;Fix up the last byte
+	MOVB	[EBX], #0		;Store final null
+	SUBL	EBX, #run_symname#	;Get length of symbol
+	MOVL	run_symsize#, EBX
+	RET
+.PAGE
+	.SBTTL	usrrnclose - Subroutine to close file
+
+;Subroutine to close file (DS points to our data segment)
+;	c{EAX} = Device handle
+;	CALL	usrrnclose
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+
+usrrnclose::
+	PUSHL	run_loadhndl#		;Get handle
+	PUSHL	#0.B
+	CALLF	svcIoClose#		;Close the file (ignore errors)
+	CLRL	EAX			;Clear handle to indicate file not
+	MOVL	run_loadhndl#, EAX	;  open
+	RET	
+.PAGE
+	.SBTTL	usrrngetmem - Subroutine to allocate memory for run
+
+;Subroutine to allocate memory for run
+;	c{ECX} = Amount to allocate
+;	CALL	usrrngetmem
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  c{EDI} = Offset of memory obtained
+
+usrrngetmem::
+	MOVL	EDI, run_free#		;Get current offset
+	TESTL	EDI, #0FFFh		;Do we need to get more memory?
+	JE	2$.S			;Yes
+	LEAL	EBX, -1.B[ECX+EDI]	;Maybe
+	XORL	EBX, EDI
+	TESTL	EBX, #0FFFFF000h
+	JE	4$.S			;No
+2$:	LEAL	EBX, 1.B[ECX+EDI]	;Yes
+	SUBL	EBX, #run_base#
+	PUSHL	DS
+	PUSHL	#run_base#
+	PUSHL	#PG$READ|PG$WRITE.B
+	PUSHL	EBX
+	CALLF	svcMemChange#
+	TESTL	EAX, EAX
+	JS	6$.S			;If error
+4$:	ADDL	run_free#, ECX
+	RET
+
+6$:	STC
+	RET
+.PAGE
+;Parameter list for open for run - this is copied to our data msect before it
+;  is used - NOTE: this must be an even number of longs!
+
+	.MOD	4
+runplst:.BYTE	PAR$SET|REP_HEXV, 4t
+	.WORD	IOPAR_FILOPTN
+runfopt:.LONG	FO$XOSNAME|FO$NODENUM|FO$RXOSNAME|FO$PATHNAME|FO$FILENAME|FO$VERSION
+	.BYTE	PAR$GET|REP_STR, 0
+	.WORD	IOPAR_FILSPEC
+runfsa:	.LONG	10h, 0
+runfss:	.WORD	1024t, 0
+RUNPLSTSZ=!$-runplst
+
+pfixtbl:.BYTE	0FFh		;	     = 0E0
+	.BYTE	FO%DOSNAME+80	;FS_DOSNAME  = 0E1 - DOS disk name next
+	.BYTE	FO%VOLNAME+80	;FS_VOLNAME  = 0E2 - Disk volume name next
+	.BYTE	FO%XOSNAME	;FS_XOSNAME  = 0E3 - XOS disk name next
+	.BYTE	FO%NODENUM	;FS_NODENUM  = 0E4 - Network node number next
+	.BYTE	FO%NODENAME+80	;FS_NODENAME = 0E5 - Network node name next
+	.BYTE	0FFh		;	     = 0E6
+	.BYTE	0FFh		;	     = 0E7
+	.BYTE	0FFh		;	     = 0E8
+	.BYTE	FO%RDOSNAME+80	;FS_RDOSNAME = 0E9 - Remote DOS disk name next
+	.BYTE	FO%RVOLNAME+80	;FS_RVOLNAME = 0EA - Remote disk volume name next
+	.BYTE	FO%RXOSNAME	;FS_RXOSNAME = 0EB - Remote XOS disk name
+				;		       next
+	.BYTE	0FFh		;	     = 0EC
+	.BYTE	0FFh		;	     = 0ED
+	.BYTE	0FFh		;	     = 0EE
+	.BYTE	0FFh		;	     = 0EF
+	.BYTE	FO%PATHNAME	;FS_PATH     = 0F0 - Path next
+	.BYTE	FO%FILENAME	;FS_FILENAME = 0F1 - File name next
+	.BYTE	FO%VERSION	;FS_VERSION  = 0F2 - File version number next
+	.BYTE	FO%ATTR+80	;FS_ATTR     = 0F3 - File attribute byte next
+	.BYTE	0FFh		;	     = 0F4
+	.BYTE	0FFh		;	     = 0F5
+	.BYTE	0FFh		;	     = 0F6
+	.BYTE	0FFh		;	     = 0F7
+	.BYTE	0FFh		;FS_NPATH    = 0F8 - Path for new specification is next (rename)
+	.BYTE	0FFh		;FS_NFILENAME= 0F9 - New file name next
+	.BYTE	0FFh		;FS_NVERSION = 0FA - New file version number next (rename)
+	.BYTE	0FFh		;	     = 0FB
+	.BYTE	0FFh		;	     = 0FC
+	.BYTE	0FFh		;	     = 0FD
+	.BYTE	0FEh		;FS_TRUNC    = 0FE - Entry has been truncated
+	.BYTE	0FEh		;FS_ESC      = 0FF - Escape
+
+;Characteristic list for setting process name
+
+	.MOD	4
+namelst:.BYTE	PAR$SET|REP_STR, 4t
+	.LONG	'NAME', ''
+	.LONG	run_parmlist#+20h, 0
+	.WORD	12t, 12t
+	.BYTE	0
+RMNLEN=!$-namelst
+
+urnprocstr::.ASCIZ "PROCESS:"
+
+	END

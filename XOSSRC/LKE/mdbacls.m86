@@ -1,0 +1,1023 @@
+	.TITLE	MDBACLS - Multidrop bus (MDB) serial port device class
+
+;++++
+; This software is in the public domain.  It may be freely copied and used
+; for whatever purpose you see fit, including commerical uses.  Anyone
+; modifying this software may claim ownership of the modifications, but not
+; the complete derived code.  It would be appreciated if the authors were
+; told what this software is being used for, but this is not a requirement.
+
+;   THIS SOFTWARE IS PROVIDED BY THE AUTHORS "AS IS" AND ANY EXPRESS OR
+;   IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
+;   OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+;   IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+;   INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+;   BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS
+;   OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+;   ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR
+;   TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
+;   USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+;----
+
+;This driver is loosely derived from the SERADRV terminal port driver.  It
+;  implements a complete MDB serial device to eliminate the overhead of
+;  using a terminal class device.  It uses a standard 16450/16550 serial
+;  port.
+
+; **********************************************************************
+; *                                                                    *
+; * This driver uses the RTC periodic interrupt capability.  It CANNOT *
+; *   co-exist with any other driver which uses this interrupt!        *
+; *                                                                    *
+; **********************************************************************
+
+;Because of the use of the RTC alarm interrupt, only one device unit can
+;  be added.  It must be unit 0.
+
+;This is a block oriented device.  A block of output data (one OutBlock
+;  operation) is sent as a single device command.  The first byte is sent
+;  as an address byte (bit 8 set) and the remaining bytes are sent as
+;  data bytes (bit 8 clear).  The last data byte sent must be the CHK byte
+;  which must be supplied by the user program.  One input operation receives
+;  a single command from a peripheral.  The last byte of data is the CHK
+;  byte which is NOT checked by the driver.  All protocol handling, including
+;  time-outs and retransmissions, is done by the user program.
+
+	.PROC	80486
+	.INCLUD	XOSINC:\XMAC\XOS.PAR
+	.INCLUD	XOSINC:\XMAC\XOSX.PAR
+	.INCLUD	XOSINC:\XMAC\XOSTIME.PAR
+	.INCLUD	XOSINC:\XMAC\XOSERR.PAR
+	.INCLUD	XOSINC:\XMAC\XOSTRM.PAR
+	.INCLUD	XOSINC:\XMAC\XOSXTRM.PAR
+	.INCLUD	XOSINC:\XMAC\PCAT.PAR
+	.INCLUD	XOSINC:\XMAC\XOSLKE.PAR
+	.INCLUD	XOSINC:\XMAC\XOSXLKE.PAR
+
+MAJV   =!1t
+MINV   =!0t
+EDITNUM=!1t
+
+	LKEHEAD	MDBACLS, MAJV, MINV, EDITNUM, LKETYPE_CLASS
+
+TRMU_8250 =!1t			;Old 8250
+TRMU_16450=!2t			;8250A/16450
+TRMU_16550=!3t			;16550 with 16 byte FIFO
+
+MDBAOUTSIZE=!32t		;Output buffer size
+MDBAINSIZE =!32t		;Input buffer size
+
+;Define offsets in the PPR DCB
+
+$$$=!4
+BLK dcb_mdbaintlvl , 4t		;Printer hardware interrupt level
+BLK dcb_mdbatimeout, 4t		;Default time-out interval
+BLK dcb_mdbaioreg  , 4t		;Base IO register for printer interface
+BLK dcb_mdbauart   , 1t		;UART type
+BLK dcb_mdbainsta  , 1t		;Input state
+BLK                , 2t
+BLK dcb_mdbaclkfreq, 4t		;UART clock frequency
+BLK dcb_mdbacharout, 4t		;Total number of characters output
+BLK dcb_mdbacharin , 4t		;Total number of characters input
+BLK dcb_mdbacharlst, 4t		;Total number of lost input characters
+BLK dcb_mdbachardsc, 4t		;Total number of discarded input character
+BLK dcb_mdbacharovr, 4t		;Total number of input buffer overruns
+BLK dcb_mdbartcsta , 4t		;RTC state
+BLK dcb_mdbaoutpnt , 4t		;Output buffer pointer
+BLK dcb_mdbaoutcnt , 4t		;Number of output bytes left to output
+BLK dcb_mdbainpnt  , 4t		;Input buffer pointer
+BLK dcb_mdbaincnt  , 4t		;Number of buffer bytes available
+BLK dcb_mdbaoutbufr, MDBAOUTSIZE ;Output buffer
+BLK dcb_mdbainbufr , MDBAINSIZE	;Input buffer
+dcb_mdbaSIZE=!$$$
+
+;Define values for dcb_mdbartcsta
+
+RTCS_IDLE=!0t			;RTC is idle
+RTCS_1INT=!1t			;Expecting first periodic interupt
+RTCS_2INT=!2t			;Expecting second periodic interrupt
+RTCS_3INT=!3t			;Expecting third periodic interrupt
+RTCS_4INT=!4t			;Expecting fourth periodic interrupt
+
+;Define values for dcb_mdbainsta
+
+INS_IDLE  =!0t			;Input is idle
+INS_ACTIVE=!1t			;Input is active
+INS_DONE  =!2t			;Input is complete
+INS_ERROR =!3t			;Input error (lost character)
+
+	CODE
+
+	.SBTTL	SVC dispatch table for MDBA class devices
+
+;SVC dispatch table for MDBA class devices
+
+mdbadsp:.LONG	knlRtnZero##	;sd_mount	=  0. - Mount
+	.LONG	knlRtnZero##	;sd_cleardev	=  4. - Clear device
+	.LONG	knlRtnZero##	;sd_cleardcb	=  8. - Clear DCB
+	.LONG	knlRtnZero##	;sd_commit	= 12. - Commit data to disk
+	.LONG	knlRtnZero##	;sd_transold    = 16. - Transfer device/old
+	.LONG	knlRtnZero##	;sd_transnew    = 20. - Transfer device/new
+	.LONG	knlNullQio##	;sd_opena	= 24. - Open additional
+	.LONG	mdbaopen	;sd_open1	= 28. - Open device/file
+	.LONG	mdbaopen	;sd_devparm     = 32. - Device parameters
+	.LONG	knlIFnDev##	;sd_delete	= 36. - Delete file
+	.LONG	knlIFnDev##	;sd_rename	= 40. - Rename file
+	.LONG	mdbainpblk	;sd_inblock	= 44. - Input block
+	.LONG	mdbaoutblk	;sd_outblock	= 48. - Output block
+	.LONG	mdbaoutblk1	;sd_outblockq	= 52. - Output block (XFF)
+	.LONG	knlIFnDevGQ##	;sd_outstring	= 56. - Output string
+	.LONG	knlRtnMOne##	;sd_getiosts	= 60. - Get input/output status
+	.LONG	knlIFnDevGQ##	;sd_special     = 64. - Special device function
+	.LONG	knlNullClose##	;sd_close	= 68. - Close file
+	.LONG	knlNullLabel##	;sd_label       = 72. - Get device label
+	.LONG	knlNullQioGQ##	;sd_commitfunc	= 76. - Commit data to disk
+	.LONG	knlInfoNone##	;sd_devinfo     = 80. - Get device info
+MDBADSPSZ=!{$-mdbadsp}/4
+
+;Class function dispatch table for printer class devices
+
+	.LONG	CLSFMX
+mdbacls:.LONG	mdbaaddunit	;CF_ADDUNIT = 1. - Add unit
+	.LONG	mdbaunitinfo	;CF_PUNITS  = 2. - Get information about
+				;		     physical units
+	.LONG	knlIFnDev##	;CF_AUNITS  = 3. - Get information about active
+				;		     units
+CLSFMX=!{$-mdbacls}/4
+
+;Class characteristics table for the MDBA device class
+
+mdbacctbl:
+ DCHARBGN  1, knlDCharValCom##
+.PAGE
+;Device parameter table for MDBA IO operations
+
+	.MOD	4
+	.LONG	PARMMAX
+mdbaioparms:
+	.LONG	mdbaiogenparms	 ;IOPAR_xxxxxx = 00xx - Generic IO parameters
+	.LONG	knlNullFilParms##;IOPAR_FILxxx = 01xx - File system IO
+				 ;			  parameters
+	.LONG	knlNullTrmParms##;IOPAR_TRMxxx = 02xx - Terminal IO parameters
+PARMMAX=!{$-mdbaioparms}/4
+
+	.LONG	PARMGENMAX
+mdbaiogenparms:
+	.LONG	0		;		   = 0000h
+	.LONG	knlIopFilOptn##	;IOPAR_FILOPTN     = 0001h
+	.LONG	knlIopFilSpec##	;IOPAR_FILSPEC     = 0002h
+	.LONG	knlIopDevSts##	;IOPAR_DEVSTS      = 0003h
+	.LONG	knlIopUnitNum##	;IOPAR_UNITNUM     = 0004h
+	.LONG	knlIopGlbId##	;IOPAR_GLBID       = 0005h
+	.LONG	knlIopDelay##	;IOPAR_DELAY       = 0006h
+	.LONG	knlIopTimeOut##	;IOPAR_TIMEOUT     = 0007h
+	.LONG	inpsts		;IOPAR_INPSTS      = 0008h
+	.LONG	outsts		;IOPAR_OUTSTS	   = 0009h
+	.LONG	knlIopInpQLmt##	;IOPAR_INPQLMT	   = 000Ah
+	.LONG	knlIopOutQLmt##	;IOPAR_OUTQLMT	   = 000Bh
+	.LONG	0		;IOPAR_SIVECT1     = 000Ch
+	.LONG	0		;IOPAR_SIVECT2     = 000Dh
+	.LONG	0		;IOPAR_SIDATA      = 000Eh
+	.LONG	knlIopNumOpen##	;IOPAR_NUMOPEN     = 000Fh
+	.LONG	0		;IOPAR_BUFRLMT	   = 0010h
+PARMGENMAX=!{$-mdbaiogenparms}/4
+.PAGE
+;Device characteristics for MDBA devices
+
+	DATA
+
+	.MOD	4
+mdbadctbl:
+ DCHARBGN  2, knlDCharValCom##
+ DCHARENT  CLASS   , TEXT, , 8, knlDcMsgClass##, knlDcGetClass##, knlDcSetClass##, 0
+ DCHARENT  UART    , TEXT, , 8, msguart        , getuart        , 0              , dcb_mdbauart
+ DCHARENT  IOREG   , HEXV, , 4, knlDcMsgIoReg##, knlDcGet4Byte##, 0              , dcb_mdbaioreg
+ DCHARENT  INT     , DECV, , 1, knlDcMsgInt##  , knlDcGet1Byte##, 0              , dcb_mdbaintlvl
+ DCHARENT  CLKFREQ , DECV, , 4, msgclkfreq     , knlDcGet4Byte##, setclkfreq     , dcb_mdbaclkfreq
+ DCHARENT  CHAROUT , DECV, , 4, msgcharout     , knlDcGet4Byte##, knlDcSet4Byte##, dcb_mdbacharout
+ DCHARENT  CHARIN  , DECV, , 4, msgcharin      , knlDcGet4Byte##, knlDcSet4Byte##, dcb_mdbacharin
+ DCHARENT  CHARLOST, DECV, , 4, msgcharlost    , knlDcGet4Byte##, knlDcSet4Byte##, dcb_mdbacharlst
+ DCHARENT  CHARDISC, DECV, , 4, msgchardisc    , knlDcGet4Byte##, knlDcSet4Byte##, dcb_mdbachardsc
+ DCHARENT  CHAROVER, DECV, , 4, msgcharover    , knlDcGet4Byte##, knlDcSet4Byte##, dcb_mdbacharovr
+
+	CODE
+
+msguart:    DCHARINFO  {UART type}
+msgclkfreq: DCHARINFO  {UART clock frequency}
+msgcharin:  DCHARINFO  {Number of characters input}
+msgcharout: DCHARINFO  {Number of characters output}
+msgcharlost:DCHARINFO  {Number of lost input characters}
+msgchardisc:DCHARINFO  {Number of discarded input characters}
+msgcharover:DCHARINFO  {Number of input buffer overruns}
+.PAGE
+	.SBTTL	mdbainit - MDBA driver initialization routine
+
+	INITSUB	mdbainit
+
+mdbainit:
+	MOVL	EDI, #mdbachk		;Install our class
+	MOVL	EBX, #mdbacls		;Offset of class function dispatch table
+	MOVL	EAX, #'MDBA'
+	CLRL	EDX
+	MOVL	ECX, #mdbacctbl
+	MOVL	ESI, #mdbaccb
+	CALL	knlNewClass##
+4$:	JC	10$.S			;This should not fail!
+	MOVL	ECX, #codetop
+	CLRL	EDX
+	CLRL	EAX
+10$:	MOVL	EBX, #QSTS$DONE
+	RET
+
+	CODE
+.PAGE
+	.SBTTL	mdbaaddunit - Class function to add unit
+
+;Here for the CL_ADDUNIT function
+;	c{EBX} = Offset of CCB
+;	c{ESI} = Offset of IORB
+;	CALL	mdbaaddunit
+;	c{EAX} = Error code
+;	c{EBX} = Status bits
+;	c{ECX} = Item count (number of units added)
+
+$$$=!0
+FRM au_ioreg  , 4	;Base IO register number
+FRM au_unit   , 4	;Unit number
+FRM au_int    , 4	;Interrupt level
+au_SIZE=!$$$
+
+;Description block for addunitchar
+
+	DATA
+
+	.MOD	4
+mdbaaublk:
+ DCHARBGN  3, knlDCharValCom##
+ DCHARENT  UNIT , DECV, , 1, 0, 0, mdbaauunit , 0
+ DCHARENT  IOREG, HEXV, , 4, 0, 0, mdbaauioreg, 0
+ DCHARENT  INT  , DECV, , 1, 0, 0, mdbaauint  , 0
+
+	CODE
+
+mdbaaddunit:
+	ENTER	au_SIZE, 0		;Set up and initialize our stack frame
+	CLRL	EAX
+	DECL	EAX
+	MOVL	au_unit.B[EBP], EAX
+	MOVL	au_ioreg.B[EBP], EAX
+	MOVL	au_int.B[EBP], EAX
+	IFFAULT	6$
+	LFSL	EDX, iorb_buffer2.B[ESI] ;Get address of add-unit
+					 ;  characteristics
+	CALL	knlGiveQel##		;Give up the IORB
+	MOVL	EBX, #mdbaaublk		;Process the characteristics
+	MOVB	AL, #0			;Fail on bad names here
+	CALL	knlAddUnitChar##
+	JNC	10$.S			;If no error
+4$:	CLRL	ECX
+	MOVL	EBX, #QSTS$DONE
+	LEAVE				;Fail
+	TOFORK
+	STC
+	RET
+
+;Here if address error with IORB
+
+	FAULTHDR
+6$:	CALL	knlGiveQel##
+8$:	MOVL	EAX, #ER_ADRER
+	JMP	4$.S
+
+;Here with all parameters processed - make sure we got everything we need
+
+10$:	MOVL	EAX, au_unit.B[EBP]
+	ORL	EAX, au_ioreg.B[EBP]
+	ORL	EAX, au_int.B[EBP]
+	JNS	14$.S			;If have everything
+	MOVL	EAX, #ER_CHARM
+	JMP	4$.S
+
+;Here with all needed parameters found
+
+12$:	CMPL	mdbaccb+ccb_dcbhead, #0.B ;Do we already have a unit?
+	JE	14$.S			;No - go on
+	MOVL	EAX, #ER_DUADF
+	JMP	4$.S
+
+;Here if don't already have an MDBA0 unit
+
+14$:	MOVL	EDX, au_ioreg.B[EBP]
+	ADDL	EDX, #3.B		;Now check to see if physical interface
+	MOVB	AL, #5			;  exists
+	OUTB	[DX]			;Point to the line control register
+	IOPAUSE				;See if we can change it
+	INB	[DX]
+	CMPB	AL, #5
+	JNE	16$.S
+	MOVB	AL, #3
+	OUTB	[DX]
+	IOPAUSE
+	INB	[DX]
+	CMPB	AL, #3
+	JE	22$.S
+16$:	MOVL	EAX, #ER_PDNAV		;Fail if does not exist
+18$:	MOVL	EBX, #QSTS$DONE
+	CLRL	ECX
+	LEAVE
+	TOFORK
+	STC
+	RET
+
+;Here if error when have the exec memory resource
+
+20$:	CALL	knlGiveXRes##
+	JMP	18$.S
+
+;Here if the interface exists
+
+22$:	MOVB	CL, au_int.B[EBP]	;Get interrupt number
+	CALL	knlChkIRqAvl##		;See if the vector is available
+24$:	JC	4$			;If not available
+	MOVL	EDX, #alarmname		;See if the ALARM vector (8) is
+	MOVB	CL, #8t			;  available
+	CALL	knlChkIRqOwn##
+	JC	24$.S			;If not available
+	CALL	knlGetXRes##		;Get exec memory resource
+	MOVL	ECX, #dcb_mdbaSIZE+dcb_cSIZE ;OK - create a DCB
+	MOVL	EBX, #DS$PHYS|DS$QOUT
+	MOVL	EDI, #mdbadsp
+	CALL	knlMakeDcb##
+	JC	20$.S
+	MOVL	ESI, #mdbaccb
+	CALL	knlLinkDcb##
+	JC	20$.S
+	MOVL	dcb_name+0.B[EDI], #'MDBA' ;Store device name
+	MOVL	dcb_name+4.B[EDI], #'0'
+	MOVL	dcb_devchar.B[EDI], #mdbadctbl ;Store offset of device
+					       ;  characteristics table
+	MOVL	dcb_fdisp.B[EDI], #mdbafork ;Store offset of our fork routine
+	MOVL	dcb_mdbatimeout.B[EDI], #XT_SECOND ;Store default time-out
+	CALL	knlGiveXRes##		;Give up the exec memory resource
+	MOVL	EDX, au_ioreg.B[EBP]
+	MOVL	dcb_mdbaioreg.B[EDI], EDX
+	A2IOP	P_COMINTENB		;Point to interrupt enable regsiter
+	MOVB	AL, #01h		;Enable receive interrupt only
+	OUTB	[DX]
+	IOPAUSE
+	A2IOP	P_COMMODMCON-P_COMINTENB ;Point to modem control reg
+	MOVB	AL, #0Ch		;Clear all modem outputs and set master
+	OUTB	[DX]			;  interrupt enable bit
+	MOVL	EAX, #115200t		;Set default clock frequency
+	MOVL	dcb_mdbaclkfreq.B[EDI], EAX
+	CALL	setbaudrate		;Set baud rate to 9600
+	MOVL	EDX, #ourname
+	MOVL	EBX, #mdbaint		;Get address of interrupt routine
+	MOVB	CL, au_int.B[EBP]	;Get interrupt number
+	MOVB	dcb_mdbaintlvl.B[EDI], CL ;Remember it
+	MOVB	CH, #DT_INT+PL_0	;Set up our interrupt vector
+	CALL	knlSetIRq##
+
+	MOVL	EDX, #alarmname		;Free up the alarm vector
+	MOVB	CL, #8t
+	CALL	knlGiveIRq##
+	MOVL	EAX, #'MDBA'		;Set the alarm vector
+	MOVL	EDX, #'0'
+	MOVL	EBX, #mdbaalarm		;Get address of interrupt routine
+	MOVB	CL, #8t
+	MOVB	CH, #DT_INT+PL_0
+	CALL	knlSetIRq##
+
+
+	PUSHL	#1.B			;Assume this will work
+	MOVL	ECX, #8			;Try to reset it up to 8 times!
+26$:	MOVL	EDX, dcb_mdbaioreg.B[EDI]
+	INB	[DX]			;Read the input data register
+	IOPAUSE
+	A2IOP	P_COMLINESTS-P_COMRDATA	;Read the line status register
+	INB	[DX]
+	IOPAUSE
+	A2IOP	P_COMMODMSTS-P_COMLINESTS
+	INB	[DX]			;Read the modem status register
+	IOPAUSE
+	A2IOP	P_COMINTID-P_COMMODMSTS	;Read the interrupt ID register
+	INB	[DX]
+	IOPAUSE
+	INB	[DX]			;Twice
+	TESTB	AL, #01			;Is the device idle?
+	JNE	28$.S			;Yes
+	LOOP	ECX, 26$		;No - try again if should
+	MOVL	[ESP], #0		;Can't make it idle - return 0
+28$:	A2IOP	P_COMSCRATCH-P_COMINTID	;Scratch register
+	MOVB	AL, #05Ah		;Test value 1
+	OUTB	[DX]
+	IOPAUSE
+	INB	[DX]
+	IOPAUSE
+	CMPB	AL, #05Ah
+	JNE	30$.S			;Its a 8250
+	MOVB	AL, #0A5h		;Test value 2
+	OUTB	[DX]
+	IOPAUSE
+	INB	[DX]
+	IOPAUSE
+	CMPB	AL, #0A5h
+	JE	32$.S			;Its not a 8250
+
+;Here if have original 8250
+
+30$:	MOVB	dcb_mdbauart.B[EDI], #TRMU_8250
+	JMP	36$.S
+
+32$:	A2IOP	P_COMFIFOCTL-P_COMSCRATCH ;FIFO control register
+	MOVB	AL, #1			;Enable FIFO
+	OUTB	[DX]
+	IOPAUSE
+	INB	[DX]			;See if FIFO enabled
+	ANDB	AL, #0C0h
+	CMPB	AL, #0C0h
+	JE	34$.S			;Its a 16550
+	MOVB	dcb_mdbauart.B[EDI], #TRMU_16450
+	JMP	36$.S
+
+;Here if have a 16550
+
+34$:	MOVB	dcb_mdbauart.B[EDI], #TRMU_16550
+36$:	MOVL	ECX, au_int.B[EBP]	;Enable our interrupt
+	CALL	knlEnableInt##
+	MOVL	ECX, #8t		;Also enable the RTC interrupt
+	CALL	knlEnableInt##
+	POPL	ECX			;Get our return value
+	CLRL	EAX
+	MOVL	EBX, #QSTS$DONE
+	LEAVE
+	TOFORK
+	RET
+.PAGE
+;Subroutine called by adduchars when "UNIT" characteristic found
+
+mdbaauunit:
+	TESTL	EAX, EAX
+	JNE	4$.S
+	MOVL	au_unit.B[EBP], EAX
+	RET
+
+;Subroutine called by adduchars when "INT" characteristic found
+
+mdbaauint:
+	CMPL	EAX, #15t.B		;Valid interrupt level?
+	JA	4$.S			;No - fail
+	CMPB	AL, #2			;Maybe
+	JB	4$.S			;No - fail
+	JNE	2$.S
+	MOVB	AL, #9
+2$:	MOVL	au_int.B[EBP], EAX	;Yes - store it
+	CLC
+	RET
+
+;Here if bad characteristic value
+
+4$:	MOVL	EAX, #ER_CHARV		;Get error code
+	STC				;Fail
+	RET
+
+;Subroutine called by adduchars when "IOREG" characteristic found
+
+mdbaauioreg:
+	MOVL	au_ioreg.B[EBP], EAX
+	RET
+.PAGE
+;Here to get the value of the UART characteristic
+
+getuart:MOVZBL	EBX, dcb_mdbauart.B[EDI]
+	MOVL	EAX, CS:urtname+0[EBX*8]
+	MOVL	EDX, CS:urtname+4[EBX*8]
+2$:	RET
+
+	.MOD	4
+urtname:.LONG	'Unkn', 'own'
+	.LONG	'8250', 0	;TRMU_8250  = 1 - Original 8250
+	.LONG	'1645', '0'	;TRMU_16450 = 2 - 8250A/16450
+	.LONG	'1655', '0'	;TRMU_16550 = 3 - 16550
+
+;Here to set the value of the CLKFREQ characteristic
+
+setclkfreq:
+	CMPL	EAX, #1000t		;Make sure not too small
+	JB	knlBadCharV##
+	CMPL	EAX, #50000000t		;Or too big
+	JA	knlBadCharV##
+	MOVL	dcb_mdbaclkfreq.B[EDI], EAX ;Store new value
+setbaudrate:
+	CLRL	EDX			;Calculate the baud rate divisor
+	MOVL	ECX, #9600t
+	IDIVL	ECX
+	MOVL	ECX, EAX
+	MOVL	EDX, dcb_mdbaioreg.B[EDI]
+	A2IOP	P_COMLINECON		;Enable access to the baud rate
+	MOVB	AL, #0ABh		;  registers
+	CLI				;Can't have interrupts while have the
+	OUTB	[DX]			;  baud rate registers enabled
+	IOPAUSE
+	MOVB	AL, CL
+	A2IOP	P_COMBRLSB-P_COMLINECON	;Point to divisor LSB register
+	OUTB	[DX]			;Output LSB
+	IOPAUSE
+	MOVB	AL, CH
+	A2IOP	P_COMBRMSB-P_COMBRLSB	;Point to divisor MSB register
+	OUTB	[DX]			;Output MSB
+	IOPAUSE				;Point to the line control
+	A2IOP	P_COMLINECON-P_COMBRMSB	;  register again
+	MOVB	AL, #2Bh		;Enable access to the data registers
+	OUTB	[DX]
+	STI				;Interrupts are OK now
+	CLC
+	RET
+.PAGE
+	.SBTTL	mdbachk - Device check routine for MDBA devices
+
+;Device check routine for printers
+;	c{SS:EBX} = Address of device name (16 bytes)
+;	CALL	mdbachk
+;	C:set = Error (match found)
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  Z:set = Match found
+;	    c{EDI} = Offset of DCB
+;	  Z:clr = Not found
+;  EBX and ESI are preserved
+
+mdbachk:CMPL	SS:[EBX], #'MDBA'	;Is this MDBA0?
+	JNE	4$.S
+	CMPW	SS:4.B[EBX], #'0'
+	JE	6$.S
+4$:	TESTL	ESP, ESP		;Not MDBA0 - clear Z
+	RET
+
+;Here if name is MDBA0
+
+6$:	CMPL	mdbaccb+ccb_dcbhead, #0.B ;Do we have a DCB?
+	JE	4$.S			;No
+	MOVL	EDI, mdbaccb+ccb_dcbhead ;Yes - return it
+	CLRL	EAX			;Set Z
+	RET
+.PAGE
+	.SBTTL	sd_open - Open device
+
+;Here for the open device entry
+;	c{EDI} = Offset of DCB
+
+mdbaopen:
+	BTL	SS:xffCmd##, #O%ODF
+	JNC	2$.S			;If no illegal options
+	MOVL	EAX, #ER_NTFIL
+2$:	RET
+.PAGE
+	.SBTTL	CF_PUNITS - Get device unit information
+
+;Here for the get device information entry
+;	c{EDI}    = Offset of DCB
+
+mdbaunitinfo:
+	MOVL	EAX, #ER_NIYT
+	STC
+	RET
+.PAGE
+	.SBTTL	sd_outblock - Write block
+
+;Here for the write block entry
+;	c{ECX}    = Byte count
+;	c{ES:EBX} = Buffer address
+;	c{EDI}    = Offset of DCB
+;	CALL	mdbaoutblk
+;	c{EAX} = Error code
+;	c{EBX} = Status bits
+;	c{ECX} = Number bytes output
+
+;Output to this device is somewhat ununual since we have to trick the UART
+;  into outputting 9 bit characters.  The first character in each output
+;  block has bit 8 set.  All following characters have bit 8 clear.  We set
+;  up the UART for 8 bit characters with with fixed parity.  This allows us
+;  to control the 9th bit by changing the parity state.  Unfortunately, the
+;  parity state is not buffered, so we have a problem when we have to change
+;  it between the first and second characters!  We solve this by using the
+;  periodic interrupt from the RTC to time the output of the first character.
+;  We set the RTC for a periodic interrupt every 488 usec. On the first
+;  interrupt, we set parity to 1 and output the first character with the
+;  transmit done interrupt disabled.  We ignore the second and third RTC
+;  interrupts.  On the fourth RTC interrupt (which allows enough time to
+;  completely output the first character), we set parity to 0, output the
+;  second character, enable transmit done interrupts and disable the periodic
+;  RTC interrupt.  The remainder of the characters are output normally in
+;  response to the transmit done interrupt.  It would seen easier to just
+;  set the RTC to interrupt every 1953 usec and only use two interrupts,
+;  but this results in a delay of about 0.8 ms between the first and second
+;  characters.  The MDB spec allows a maximum delay of 1.0 ms.  This seems
+;  a little close.  Doing it the way we do, results in a delay of about 0.4
+;  ms, which seems much safer!
+
+;Since the MDB protocol uses very small output blocks (no more than about
+;  20 characters, we just have a fixed output buffer in the DCB and copy
+;  the output block into it.  This allows all output to be done directly
+;  from interrupt level using very few instruction without needing any
+;  memory mapping.
+
+mdbaoutblk:
+	CALL	knlIoQabLock##		;Lock the QAB
+	JC	2$.S			;If error
+	CALL	knlIoWriteLock##	;Lock the buffer pages
+	JC	2$.S			;If error
+	MOVB	iorb_queue.B[ESI], #dcb_outframe
+	MOVL	iorb_routine.B[ESI], #mdbaoutblk1
+	JMP	knlXfQueue##		;Switch to extended fork context
+
+2$:	TOFORK
+4$:	RET
+
+;Here in extended fork context
+
+mdbaoutblk1:
+	BTL	SS:xffCmd##, #O%OUT	;Is output allowed?
+	JC	8$.S			;Yes - go on
+	CMPL	SS:xffCount##, #0.B	;No - really doing output?
+	JNE	knlIllOut##		;Yes - fail
+8$:	MOVL	EAX, dcb_mdbatimeout.B[EDI] ;Get default time-out value
+	MOVL	SS:xffTimeOut##, EAX
+	CMPL	SS:xffParm##, #0.B	;Do we have a parameter list?
+	JE	10$.S			;No
+	IFFAULT	knlQAdrErr0##
+	LFSL	EDX, SS:xffParm##	;Yes - get address of parameter list
+	MOVL	EBX, #mdbaioparms	;Process parameters
+	MOVL	ECX, #knlComDPParms##
+	CALL	knlProcDevParm##
+10$:	MOVL	ECX, SS:xffCount##	;Get amount to output
+	MOVL	dcb_mdbaoutcnt.B[EDI], ECX ;Initialize the output count
+	JC	14$.S			;If error processing parameters
+	JREGZ	ECX, 12$		;If nothing to output
+	CMPL	ECX, #MDBAOUTSIZE.B	;Too much?
+	JA	16$.S			;Yes - fail
+	LEAL	EAX, dcb_mdbainbufr.B[EDI] ;Reset the input buffer
+	MOVL	dcb_mdbainpnt.B[EDI], EAX
+	MOVL	dcb_mdbaincnt.B[EDI], #0
+	MOVB	dcb_mdbainsta.B[EDI], #INS_ACTIVE ;Enable input
+	MOVL	EDX, dcb_mdbaioreg.B[EDI]
+	A2IOP	P_COMLINECON
+	MOVB	AL, #2Bh		;Set the parity bit
+	OUTB	[DX]
+	CMPL	ECX, #1t.B		;Just one byte to output?
+	JE	18$.S			;Yes - go handle that
+	PUSHL	EDI			;OK - copy data to our output buffer
+	LFSL	ESI, SS:xffBuffer1##
+	ADDL	EDI, #dcb_mdbaoutbufr.B
+	LEAL	EAX, 2.B[EDI]
+	PUSHL	DS
+	POPL	ES
+	CLD
+	RMOVSB	[EDI], FS:[ESI]
+	POPL	EDI
+	MOVL	dcb_mdbaoutpnt.B[EDI], EAX ;Initialize the output pointer
+	MOVB	dcb_mdbartcsta.B[EDI], #RTCS_1INT ;Initialize RTC state
+	MOVB	AL, #0Ch		;Read the RTC status register to make
+	CALL	knlReadCmos##		;  sure the interrupt request is clear
+	MOVB	DL, #25h		;Set RTC for 488 usec periodic interrupt
+	MOVB	AL, #0Ah
+	CALL	knlWriteCmos##
+	MOVB	DL, #42h		;Enable the periodic interrupt
+	MOVB	AL, #0Bh
+	CALL	knlWriteCmos##
+	MOVL	EAX, SS:xffTimeOut##
+	CALL	knlXfWait##		;Wait for output to complete
+	JC	14$.S			;If error
+12$:	CLRL	EAX
+14$:	MOVL	ECX, SS:xffCount##	;Get total amount output
+	SUBL	ECX, dcb_mdbaoutcnt.B[EDI]
+	MOVL	EBX, #QSTS$DONE
+	RET
+
+;Here if block is too big
+
+16$:	MOVL	EAX, #ER_RTOBG
+	JMP	14$.S
+
+;Here if have just one byte to output
+
+18$:	A2IOP	P_COMXDATA-P_COMLINECON
+	LESL	EBX, SS:xffBuffer1##	;Get the single output byte
+	MOVB	AL, ES:[EBX]
+	OUTB	[DX]			;Output it
+	JMP	12$.S			;Finished
+.PAGE
+	.SBTTL	sd_inblock - Read block
+
+;Here for the read block entry
+;	c{ECX}    = Byte count
+;	c{ES:EBX} = Buffer address
+;	c{EDI}    = Offset of DCB
+;	CALL	mdbainpblk
+;	c{EAX} = Error code
+;	c{EBX} = Status bits
+;	c{ECX} = Number of bytes input
+
+;Note that since this is actually a half-duplex protocol, we use the output
+;  frame for input as well as for output.  Also, an input call MUST be
+;  preceeded by an output call, otherwise an ER_FUNCM error will be returned.
+
+mdbainpblk:
+	CALL	knlIoQabLock##		;Lock the QAB
+	JC	2$.S			;If error
+	CALL	knlIoReadLock##		;Lock the buffer pages
+	JC	2$.S			;If error
+	MOVB	iorb_queue.B[ESI], #dcb_outframe
+	MOVL	iorb_routine.B[ESI], #mdbainpblk1
+	JMP	knlXfQueue##		;Switch to extended fork context
+
+2$:	TOFORK
+4$:	RET
+
+;Here in extended fork context
+
+mdbainpblk1:
+	BTL	SS:xffCmd##, #O%IN	;Is input allowed?
+	JC	6$.S			;Yes - go on
+	CMPL	SS:xffCount##, #0.B	;No - really doing input?
+	JNE	knlIllInp##		;Yes - fail
+6$:	CMPB	dcb_mdbainsta.B[EDI], #INS_ACTIVE ;Is input active now?
+	JB	20$			;No - fail
+	MOVL	EAX, dcb_mdbatimeout.B[EDI] ;Get default time-out value
+	MOVL	SS:xffTimeOut##, EAX
+	CMPL	SS:xffParm##, #0.B	;Do we have a parameter list?
+	JE	8$.S			;No
+	IFFAULT	knlQAdrErr0##
+	LFSL	EDX, SS:xffParm##	;Yes - get address of parameter list
+	MOVL	EBX, #mdbaioparms	;Process parameters
+	MOVL	ECX, #knlComDPParms##
+	CALL	knlProcDevParm##
+	JC	4$.S			;If error
+8$:	CMPB	dcb_mdbainsta.B[EDI], #INS_DONE ;Is input already complete?
+	JAE	12$.S			;Yes
+10$:	MOVL	EAX, SS:xffTimeOut##
+	CALL	knlXfWait##		;No - wait until it is
+	JC	22$.S			;If error
+	CMPB	dcb_mdbainsta.B[EDI], #INS_DONE ;Is it complete now?
+	JB	10$.S			;No - false alarm!
+12$:	CLRL	EDX			;Assume no error
+	MOVL	ECX, dcb_mdbaincnt.B[EDI] ;Get amount input
+	CMPL	ECX, SS:xffCount##	;Is his buffer big enough?
+	JBE	14$.S			;Yes
+	MOVL	ECX, SS:xffCount##	;No - just give him what we can
+	MOVL	EDX, #ER_DATTR		;Indicate data truncated
+14$:	LEAL	ESI, dcb_mdbainbufr.B[EDI] ;Copy the input data to his buffer
+	PUSHL	EDI
+	LESL	EDI, SS:xffBuffer1##
+	CLD
+	PUSHL	ECX
+	RMOVSB	[EDI], [ESI]
+	POPL	ECX
+	POPL	EDI
+	MOVL	EAX, EDX
+	CMPB	dcb_mdbainsta.B[EDI], #INS_ERROR ;Have error on input?
+	JNE	16$.S			;No
+	MOVL	EAX, #ER_LSTER		;Yes - report it
+16$:	MOVB	dcb_mdbainsta.B[EDI], #INS_IDLE ;Indicate input is idle now
+18$:	MOVL	EBX, #QSTS$DONE
+	RET
+
+;Here if input is not active
+
+20$:	MOVL	EAX, #ER_FUNCM
+22$:	CLRL	ECX
+	JMP	18$.S
+.PAGE
+	.SBTTL	outsts - Here for the IOPAR_OUTSTS parameter
+
+;Here for the IOPAR_OUTSTS parameter - Get output ready status
+
+	DPARMHDR  GET, HEXV
+outsts:	CLRL	EAX			;Assume not ready
+
+;;;;; qqqqqqqqqqq
+
+	JMP	knlStrParm4##		;Store value and return
+
+	.SBTTL	inpsts - Here for the IOPAR_INPSTS parameter
+
+;Here for the IOPAR_INPSTS parameter - Get input ready status
+
+	DPARMHDR  GET, HEXV
+inpsts:	CLRL	EAX			;Assume not ready
+
+;;;;; qqqqqqqqqqq
+
+	JMP	knlStrParm4##		;Store value and return
+.PAGE
+	.SBTTL	RTC periodic interrupt (ALARM) routine
+
+;Here on a periodic interrupt from the RTC (ALARM interrupt)
+
+mdbaalarm:
+	PUSHAL				;Save all registers
+	PUSHL	DS
+	PUSHL	ES
+	PUSHL	FS
+	PUSHL	GS
+	MOVW	AX, #GS_DATA		;Make our data addressable
+	MOVL	DS, EAX
+	MOVL	EDI, mdbaccb+ccb_dcbhead ;Get offset of our DCB
+	MOVB	AL, #0Ch		;Read the RTC status register to clear
+	CALL	knlReadCmos##		;  the interrupt request
+	MOVL	EAX, dcb_mdbartcsta.B[EDI] ;Dispatch on the RTC state
+	JMPIL	CS:rtcdsp[EAX*4]
+
+	.MOD	4
+rtcdsp:	.LONG	rtcidle		;RTCS_IDLE = 0
+	.LONG	rtcbegin	;RTCS_1INT = 1
+	.LONG	rtcwait		;RTCS_2INT = 2
+	.LONG	rtcwait		;RTCS_3INT = 3
+	.LONG	rtcfinish	;RTCS_4INT = 4
+
+;Here if RTC is idle
+
+rtcidle:
+	CRASH	RTCI
+
+;Here on first RTC periodic interrupt - output our first data character if
+;  serial output is idle
+
+rtcbegin:
+	MOVL	EDX, dcb_mdbaioreg.B[EDI] ;Get base register number
+	A2IOP	P_COMLINESTS		;Get the line status
+	INB	[DX]
+	TESTB	AL, #40h		;Is output idle now?
+	JE	rtcdism.S		;No - do nothing this time
+	A2IOP	P_COMXDATA-P_COMLINESTS	;Yes
+	MOVB	AL, dcb_mdbaoutbufr+0.B[EDI] ;Get first output byte
+	OUTB	[DX]			;Output it
+	DECL	dcb_mdbaoutcnt.B[EDI]	;Reduce the output count
+					;Fall into rtcwait to advance the state
+
+;Here on second and third RTC periodic interrupt - just advance the state
+
+rtcwait:INCL	dcb_mdbartcsta.B[EDI]
+rtcdism:MOVB	AL, #INT_EOI		;Release interrupt controller
+	CLI
+	OUTB	P_INC2P0		;Yes - release 2nd interrupt controller
+	OUTB	P_INC1P0		;Always release 1st interrupt controller
+	JMP	knlDismissInt2##	;Check for scheduling and dismiss
+
+;Here on fourth RTC periodic interrupt - clear parity bit, enable output
+;  done interrupt, disable the RTC periodic interrupt and output the second
+;  data character
+
+rtcfinish:
+	MOVB	AL, #0Bh		;Disable the RTC periodic interrupt
+	MOVB	DL, #02h
+	CALL	knlWriteCmos##
+	MOVL	EDX, dcb_mdbaioreg.B[EDI] ;Get base register number
+	A2IOP	P_COMLINECON		;Point to line control register
+	MOVB	AL, #3Bh		;Clear the parity bit
+	OUTB	[DX]
+	A2IOP	P_COMXDATA-P_COMLINECON	;Point to the data register
+	MOVB	AL, dcb_mdbaoutbufr+1.B[EDI] ;Get second output byte
+	OUTB	[DX]			;Output it
+	DECL	dcb_mdbaoutcnt.B[EDI]	;Reduce the output count
+	A2IOP	P_COMINTENB-P_COMXDATA	;Point to the interrupt enable register
+	MOVB	AL, #03h		;Enable output done interrupt
+	OUTB	[DX]
+	MOVB	dcb_mdbartcsta.B[EDI], #RTCS_IDLE ;Reset the RTC state
+	JMP	rtcdism.S		;Dismiss the interrupt
+.PAGE
+	.SBTTL	Serial port interrupt routine
+
+;Here on an interrupt for the serial port
+
+mdbaint:PUSHAL				;Save all registers
+	PUSHL	DS
+	PUSHL	ES
+	PUSHL	FS
+	PUSHL	GS
+	MOVW	AX, #GS_DATA		;Make our data addressable
+	MOVL	DS, EAX
+	MOVL	EDI, mdbaccb+ccb_dcbhead ;Get offset of our DCB
+intloop:MOVL	EDX, dcb_mdbaioreg.B[EDI] ;Get base IO register for serial port
+	A2IOP	P_COMINTID		;Point to interrupt ID register
+	INB	[DX]
+	ANDL	EAX, #07h.B
+	JMPIL	CS:comidsp[EAX*4]	;Dispatch on the interrupt
+
+;Interrupt dispatch table
+
+	.MOD	4
+comidsp:.LONG	mdmchg		;000 - Modem status change
+	.LONG	intdone		;001
+	.LONG	xmtdone		;010 - Xmit done
+	.LONG	intdone		;011
+	.LONG	inpavl		;100 - Input available
+	.LONG	intdone		;101
+	.LONG	inperr		;110 - Input error
+	.LONG	intdone		;111
+.PAGE
+;Here for input error interrupt
+
+inperr:	A2IOP	P_COMLINESTS-P_COMINTID	;Point to line status register
+
+	CRASH	????
+
+	JMP	intloop.S
+
+;Here for input available interrupt
+
+inpavl:	A2IOP	P_COMLINESTS-P_COMINTID	;Point to the line status register
+	INB	[DX]			;Get line status bits
+	TESTB	AL, #0Ah		;Overrun or framing error?
+	JNE	2$.S			;Yes
+	MOVB	AH, AL			;No - save status bits for later
+	A2IOP	P_COMRDATA-P_COMLINESTS	;Point to the data register
+	INB	[DX]			;Get the input character
+	CMPB	dcb_mdbainsta.B[EDI], #INS_ACTIVE ;Is input active now?
+	JNE	4$.S			;No - discard this character
+	CMPL	dcb_mdbaincnt.B[EDI], #MDBAINSIZE.B ;Have room for another?
+	JAE	5$.S			;No - discard it!
+	MOVL	EBX, dcb_mdbainpnt.B[EDI] ;Yes - get input pointer
+	MOVB	[EBX], AL		;Store character in our buffer
+	INCL	dcb_mdbainpnt.B[EDI]	;Advance pointer and count
+	INCL	dcb_mdbaincnt.B[EDI]
+	INCL	dcb_mdbacharin.B[EDI]
+	TESTB	AH, #04h		;Parity error?
+	JE	intloop.S		;No
+	MOVB	dcb_mdbainsta.B[EDI], #INS_DONE ;Yes - indicate input done
+1$:	CALL	knlReqFork##		;Request fork
+	JMP	intloop.S
+
+;Here if have framing or overrun error
+
+2$:	INCL	dcb_mdbacharlst.B[EDI]	;Count the lost character
+	MOVB	dcb_mdbainsta.B[EDI], #INS_ERROR ;Yes - indicate input lost
+	JMP	1$.S
+
+;Here if input is not active
+
+4$:	INCL	dcb_mdbachardsc.B[EDI]	;Count the discarded character
+	JMP	intloop
+
+;Here if buffer is full
+
+5$:	INCL	dcb_mdbacharovr.B[EDI]	;Count the buffer overrun
+	JMP	intloop
+
+;Here for xmit done interrupt
+
+xmtdone:DECL	dcb_mdbaoutcnt.B[EDI]	;Have more to output?
+	JL	12$.S			;No - finished here
+	A2IOP	P_COMXDATA-P_COMINTID	;Yes - point to the data register
+	MOVL	EBX, dcb_mdbaoutpnt.B[EDI] ;Get output pointer
+	MOVB	AL, [EBX]		;Get character
+	OUTB	[DX]			;Output it
+	INCL	dcb_mdbaoutpnt.B[EDI]	;Advance pointer
+	JMP	intloop			;Continue
+
+;Here if finished with output for this block
+
+12$:	A2IOP	P_COMINTENB-P_COMINTID	;Point to the interrupt enable register
+	MOVB	AL, #01h		;Disable output done interrupt
+	OUTB	[DX]
+	CALL	knlReqFork##		;Request fork
+	JMP	intloop
+
+;Here for modem status change interrupt
+
+mdmchg:
+
+	CRASH	????
+
+	JMP	intloop
+
+;Here when have no more interrupt conditions to service
+
+intdone:MOVB	AL, #INT_EOI		;Release interrupt controller
+	CLI
+	CMPB	dcb_mdbaintlvl.B[EDI], #7 ;High interrupt?
+	JBE	14$.S			;No
+	OUTB	P_INC2P0		;Yes - release 2nd interrupt controller
+14$:	OUTB	P_INC1P0		;Always release 1st interrupt controller
+	JMP	knlDismissInt2##	;Check for scheduling and dismiss
+.PAGE
+	.SBTTL	mdbafork - MDBA fork routine
+
+;Here at fork level for MDBA device
+
+mdbafork:
+	CLRL	EAX
+	JMP	knlResumeOutput##	
+.PAGE
+	.SBTTL	Data
+
+	DATA
+
+	.MOD	4
+mdbaccb:.BLKB	ccb_SIZE
+alarmname:
+	.ASCII	"SYSTEM_RTC"
+	.LONG	0
+ourname:.LONG	'MDB0', 0, 0, 0
+
+	LKEEND

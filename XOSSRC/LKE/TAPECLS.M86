@@ -1,0 +1,914 @@
+	.TITLE	TAPECLS - Tape (type A) class driver for XOS
+
+;++++
+; This software is in the public domain.  It may be freely copied and used
+; for whatever purpose you see fit, including commerical uses.  Anyone
+; modifying this software may claim ownership of the modifications, but not
+; the complete derived code.  It would be appreciated if the authors were
+; told what this software is being used for, but this is not a requirement.
+
+;   THIS SOFTWARE IS PROVIDED BY THE AUTHORS "AS IS" AND ANY EXPRESS OR
+;   IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
+;   OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+;   IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+;   INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+;   BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS
+;   OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+;   ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR
+;   TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
+;   USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+;----
+
+	.PROC	80486
+	.INCLUD	XOSINC:\XMAC\XOS.PAR
+	.INCLUD	XOSINC:\XMAC\XOSX.PAR
+	.INCLUD	XOSINC:\XMAC\XOSTIME.PAR
+	.INCLUD	XOSINC:\XMAC\XOSERR.PAR
+	.INCLUD	XOSINC:\XMAC\XOSLKE.PAR
+	.INCLUD	XOSINC:\XMAC\XOSXLKE.PAR
+	.INCLUD	TAPE.PAR
+
+MAJV   =!1t
+MINV   =!1t
+EDITNUM=!0t
+
+	LKEHEAD	TAPECLS, MAJV, MINV, EDITNUM, LKETYPE_CLASS
+
+;This device class implements a generic magnetic tape device class.  TAPE
+;  devices are statically allocated with a one-to-one correspondence between
+;  physical devices and DCBs.  Tape controllers which handle multiple tape
+;  units are supported and are scheduled by this module.
+
+	.EXPORT	xostapNewDriver, xostapMakeKcb   , xostapMakeDcb
+	.EXPORT	xostapMsgRecOut, xostapMsgByteOut, xostapMsgRecIn
+	.EXPORT	xostapMsgByteIn, xostapMsgParErr
+
+	.SBTTL	SVC dispatch table for TAPE class devices
+
+;SVC dispatch table for TAPE class devices
+
+	CODE
+
+tapedsp:.LONG	knlRtnZero##	;sd_mount	=  0. - Mount
+	.LONG	knlRtnZero##	;sd_cleardev	=  4. - Clear device
+	.LONG	tapecdcb	;sd_cleardcb	=  8. - Clear DCB
+	.LONG	knlRtnZero##	;sd_commit	= 12. - Commit data to disk
+	.LONG	knlRtnZero##	;sd_transold    = 16. - Transfer device/old
+	.LONG	knlRtnZero##	;sd_transnew    = 20. - Transfer device/new
+	.LONG	knlNullQio##	;sd_opena	= 24. - Open additional
+	.LONG	tapeopen	;sd_open1	= 28. - Open device/file
+	.LONG	tapeopen	;sd_devparm     = 32. - Device parameters
+	.LONG	knlIFnDev##	;sd_delete	= 36. - Delete file
+	.LONG	knlIFnDev##	;sd_rename	= 40. - Rename file
+	.LONG	tapeinpblk	;sd_inblock	= 44. - Input block
+	.LONG	tapeoutblk	;sd_outblock	= 48. - Output block
+	.LONG	tapeoutblk1	;sd_outblockq	= 52. - Output block (XFF)
+	.LONG	tapeoutstr	;sd_outstring	= 56. - Output string
+	.LONG	knlRtnMOne##	;sd_getiosts	= 60. - Get input/output status
+	.LONG	tapespecial	;sd_special     = 64. - Special device function
+	.LONG	tapeclose	;sd_close	= 68. - Close file
+	.LONG	knlNullLabel##	;sd_getlabel    = 72. - Get device label
+	.LONG	knlNullQioGQ##	;sd_commitfunc	= 76. - Commit data to disk
+	.LONG	knlInfoNone##	;sd_devinfo     = 80. - Get device info
+TAPEDSPSZ=!{$-tapedsp}/4
+
+;Class function dispatch table for TAPE class devices
+
+	.LONG	CLSFMX
+tapecls:.LONG	tapeaddunit	;CF_ADDUNIT = 1. - Add unit
+	.LONG	tapeunitinfo	;CF_PUNITS  = 2. - Get information about
+				;		     physical units
+	.LONG	knlIFnDev##	;CF_AUNITS  = 3. - Get information about active
+				;		     units
+CLSFMX=!{$-tapecls}/4
+.PAGE
+;Device characteristics tables for TAPE devices are defined in the TAPE
+;  device driver modules
+
+;Class characteristics tables for the TAPE device class
+
+	DATA
+
+	.MOD	4
+tapecctbl:
+ DCHARBGN  1, knlDCharValCom##
+ DCHARENT  NUMBER , DECV, , 4, msgnumber , knlGetSysVal##, 0, tapedcbnum
+
+	CODE
+
+msgnumber:       DCHARINFO  {Number of in use TAPE devices}
+xostapMsgRecOut: DCHARINFO  {Number of records output}
+xostapMsgByteOut:DCHARINFO  {Number of bytes output}
+xostapMsgRecIn:  DCHARINFO  {Number of records input}
+xostapMsgByteIn: DCHARINFO  {Number of bytes input}
+xostapMsgParErr: DCHARINFO  {Number of parity errors}
+	.MOD	4
+.PAGE
+;Device parameter table for TAPE: opens
+
+	.LONG	OPARMMAX
+tapeopnparms:
+	.LONG	tapeopngenparms	 ;IOPAR_xxxxxx = 00xx - Generic IO parameters
+	.LONG	knlNullFilParms##;IOPAR_FILxxx = 01xx - File system IO
+				 ;			  parameters
+	.LONG	knlNullTrmParms##;IOPAR_TRMxxx = 02xx - Terminal IO parameters
+OPARMMAX=!{$-tapeopnparms}/4
+
+	.LONG	OPARMGENMAX	;Size of table
+tapeopngenparms:
+	.LONG	0		;	       = 0000h
+	.LONG	knlIopFilOptn##	;IOPAR_FILOPTN = 0001h
+	.LONG	knlIopFilSpec##	;IOPAR_FILSPEC = 0002h
+	.LONG	knlIopDevSts##	;IOPAR_DEVSTS  = 0003h
+	.LONG	knlIopUnitNum##	;IOPAR_UNITNUM = 0004h
+	.LONG	knlIopGlbId##	;IOPAR_GLBID   = 0005h
+	.LONG	0		;IOPAR_DELAY   = 0006h
+	.LONG	knlIopTimeOut##	;IOPAR_TIMEOUT = 0007h
+	.LONG	0		;IOPAR_INPSTS  = 0008h
+	.LONG	0		;IOPAR_OUTSTS  = 0009h
+	.LONG	knlIopInpQLmt##	;IOPAR_INPQLMT = 000Ah
+	.LONG	knlIopOutQLmt##	;IOPAR_OUTQLMT = 000Bh
+	.LONG	0		;IOPAR_SIVECT1 = 000Ch
+	.LONG	0		;IOPAR_SIVECT2 = 000Dh
+	.LONG	0		;IOPAR_SIDATA  = 000Eh
+	.LONG	knlIopNumOpen##	;IOPAR_NUMOPEN = 000Fh
+	.LONG	knlIopBufrLmt##	;IOPAR_BUFRLMT = 0010h
+OPARMGENMAX=!{$-tapeopngenparms}/4
+
+;Device parameter table for TAPE: IO operations
+
+	.LONG	PARMMAX
+tapeioparms:
+	.LONG	tapeiogenparms	 ;IOPAR_xxxxxx = 00xx - Generic IO parameters
+	.LONG	knlNullFilParms##;IOPAR_FILxxx = 01xx - File system IO
+				 ;			  parameters
+	.LONG	knlNullTrmParms##;IOPAR_TRMxxx = 02xx - Terminal IO parameters
+	.LONG	0		 ;IOPAR_DSKxxx = 03xx - Disk IO parameters
+	.LONG	tapeiotapparms	 ;IOPAR_TAPxxx = 04xx - Tape IO parameters
+PARMMAX=!{$-tapeioparms}/4
+
+	.LONG	PARMGENMAX	;Size of table
+tapeiogenparms:
+	.LONG	0		;	          = 0000h
+	.LONG	knlIopFilOptn##	;IOPAR_FILOPTN    = 0001h
+	.LONG	knlIopFilSpec##	;IOPAR_FILSPEC    = 0002h
+	.LONG	knlIopDevSts##	;IOPAR_DEVSTS     = 0003h
+	.LONG	knlIopUnitNum##	;IOPAR_UNITNUM    = 0004h
+	.LONG	knlIopGlbId##	;IOPAR_GLBID      = 0005h
+	.LONG	0		;IOPAR_DELAY      = 0006h
+	.LONG	knlIopTimeOut##	;IOPAR_TIMEOUT    = 0007h
+	.LONG	0		;IOPAR_INPSTS     = 0008h
+	.LONG	0		;IOPAR_OUTSTS     = 0009h
+	.LONG	knlIopInpQLmt##	;IOPAR_INPQLMT    = 000Ah
+	.LONG	knlIopOutQLmt##	;IOPAR_OUTQLMT    = 000Bh
+	.LONG	0		;IOPAR_SIVECT1    = 000Ch
+	.LONG	0		;IOPAR_SIVECT2    = 000Dh
+	.LONG	0		;IOPAR_SIDATA     = 000Eh
+	.LONG	knlIopNumOpen##	;IOPAR_NUMOPEN    = 000Fh
+	.LONG	knlIopBufrLmt##	;IOPAR_BUFRLMT    = 0010h
+PARMGENMAX=!{$-tapeiogenparms}/4
+
+	.LONG	PARMTAPMAX
+tapeiotapparms:
+	.LONG	0		;
+	.LONG	tapioprecmin	;IOPAR_TAPRECMIN  =!0401h
+	.LONG	tapioprecmax	;IOPAR_TAPRECMAX  =!0402h
+	.LONG	tapiopreclen	;IOPAR_TAPRECLEN  =!0403h
+	.LONG	tapiopdensidy	;IOPAR_TAPDENSITY =!0404h
+	.LONG	tapiopgaplen	;IOPAR_TAPGAPLEN  =!0405h
+	.LONG	tapiopbfrmode	;IOPAR_TAPBFRMODE =!0406h
+PARMTAPMAX=!{$-tapeiotapparms}/4
+.PAGE
+	.SBTTL	Initialization routine
+
+	INITSUB	inittape
+
+inittape:
+	MOVL	EDI, #tapechk		;Install our class
+	MOVL	EBX, #tapecls		;Offset of class function dispatch table
+	MOVL	EAX, #'TAPE'
+	CLRL	EDX
+	MOVL	ECX, #tapecctbl
+	MOVL	ESI, #tapeccb
+	CALL	knlNewClass##		;Create the TAPE class
+	JC	10$.S			;If error
+	MOVL	ECX, #codetop
+	CLRL	EDX
+	CLRL	EAX
+10$:	MOVL	EBX, #QSTS$DONE
+	RET
+
+	CODE
+.PAGE
+	.SBTTL	xostapNewDriver - Subroutine to register low level TAPE driver
+
+;Subroutine to register low level TAPE driver - must be called with the
+;  exec memory resource
+;	c{EBX} = Name of driver (4 characters)
+;	c{EDX} = Offset of addunit subroutine
+;	CALL	xostapNewDriver
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+
+xostapNewDriver:
+	MOVL	ECX, #12t
+	CALL	knlGetXMem##		;Get memory for the driver data block
+	JC	4$.S			;If error
+	MOVL	4.B[EDI], EBX		;OK - store name
+	MOVL	8.B[EDI], EDX		;Store offset of addunit subroutine
+	MOVL	EAX, tapefirstdrv	;Link into list of TAPE drivers
+	MOVL	[EDI], EAX
+	MOVL	tapefirstdrv, EDI
+	CLRL	EAX			;Make sure C is clear and return 0
+4$:	RET
+.PAGE
+	.SBTTL	tapeadadunit - Class function to add unit
+
+;Here for the add unit class function (CL_ADDUNIT) for the TAPE class
+;	c{EBX} = Offset of CCB
+;	c{ESI} = Offset of IORB
+;	CALL	tapeaddunit
+;	c{EAX} = Error code
+;	c{EBX} = Status bits
+;	c{ECX} = Item count (number of units added)
+
+;Description block for adduparms:
+
+	DATA
+
+	.MOD	4
+tapeaublk:
+ DCHARBGN  2, knlDCharValCom##
+ DCHARENT  UNIT , DECV, , 1, knlDcMsgUnit## , 0, auunit , 0
+ DCHARENT  TYPE , TEXT, , 4, knlDcMsgType## , 0, auctype, 0
+ DCHARENT  INDEX, DECV, , 1, knlDcMsgIndex##, 0, auindex, 0
+
+	CODE
+
+$$$=!0
+FRM au_unit  , 4t		;Unit number
+FRM au_index , 4t		;Index on controller
+FRM au_ioreg , 4t
+FRM au_kcb   , 4t		;Offset of KCB
+FRM au_type  , 4t		;Controller type
+FRM au_qab   , 8t		;Address of QAB
+FRM au_char  , 8t		;Address of chracteristics list
+au_SIZE=!$$$
+
+tapeaddunit:
+	ENTER	au_SIZE, 0		;Set up and initialize our stack frame
+	CLRL	EAX
+	MOVL	au_kcb.B[EBP], EAX
+	MOVL	au_ioreg.B[EBP], EAX
+	DECL	EAX
+	MOVL	au_unit.B[EBP], EAX
+	MOVL	au_type.B[EBP], EAX
+	MOVL	au_index.B[EBP], #1
+	IFFAULT	6$
+	LFSL	EAX, iorb_qab.B[ESI]
+	MOVL	au_qab+0.B[EBP], EAX
+	MOVL	au_qab+4.B[EBP], FS
+	IFFAULT	6$
+	LFSL	EDX, iorb_buffer2.B[ESI]
+	MOVL	au_char+0.B[EBP], EDX
+	MOVL	au_char+4.B[EBP], FS
+	CALL	knlGiveQel##		;Give up the IORB
+	MOVL	EBX, #tapeaublk		;Process the characteristics
+	MOVB	AL, #1			;Ignore bad names here
+	CALL	knlAddUnitChar##
+	JNC	8$.S			;If no error
+4$:	CLRL	ECX
+	MOVL	EBX, #QSTS$DONE
+	LEAVE				;Fail
+	TOFORK
+	STC
+	RET
+
+;Here if address error with IORB
+
+	FAULTHDR
+6$:	CALL	knlGiveQel##
+	MOVL	EAX, #ER_ADRER
+	JMP	4$.S
+
+;Here with all parameters processed - make sure we got everything we need
+
+8$:	MOVL	EAX, au_unit.B[EBP]
+	ORL	EAX, au_type.B[EBP]
+	INCL	EAX
+	JNE	12$.S
+10$:	MOVL	EAX, #ER_CHARM
+	JMP	4$.S
+
+;Here with all needed parameters found
+
+12$:	MOVL	EAX, au_type.B[EBP]	;Get type name
+	MOVL	ECX, tapefirstdrv	;Point to first disk driver data block
+14$:	JREGZ	ECX, 15$
+	CMPL	4.B[ECX], EAX		;Yes - is this the one we want?
+	JE	16$.S			;Yes
+	MOVL	ECX, [ECX]		;No - advance to next
+	JMP	14$.S
+
+15$:	MOVL	EAX, #ER_NSTYP
+	JMP	4$.S
+
+;Here with data block for disk driver - now we must see if the KCB is already
+;  defined
+
+16$:	MOVL	EBX, tapefirstkcb	;Point to first tape KCB
+	TESTL	EBX, EBX
+	JE	28$.S			;If no KCBs at all
+	MOVL	EDX, au_ioreg.B[EBP]	;Get IO register number
+18$:	MOVL	EAX, au_type.B[EBP]
+	CMPL	EAX, kcb_type.B[EBX]	;For this type controller?
+	JNE	26$.S			;No
+	CMPL	EDX, kcb_ioreg.B[EBX]	;Yes - for this controller?
+	JNE	20$.S			;No
+	TESTB	kcb_bits.B[EBX], #KB$ERROR ;Yes - can we use it?
+	JNE	30$.S			;No - fail
+	MOVL	au_kcb.B[EBP], EBX	;Yes - remember offset of the KCB
+20$:	MOVL	EDI, kcb_dcbhead.B[EBX]	;Yes - get first DCB
+	TESTL	EDI, EDI
+	JE	26$.S			;If no DCBs for controller
+22$:	MOVB	AL, au_unit.B[EBP]
+	CMPB	dcb_punit.B[EDI], AL	;Same unit number?
+	JE	32$.S			;Yes - fail
+	MOVB	AL, au_index.B[EBP]	;No - same index?
+	CMPB	dcb_tpindex.B[EDI], AL
+	JNE	24$.S			;No
+	CMPL	kcb_ioreg.B[EBX], EDX	;Yes - on this controller?
+	JE	32$.S			;Yes - fail
+24$:	MOVL	EDI, [EDI]		;No - advance to next DCB
+	TESTL	EDI, EDI
+	JNE	22$.S
+26$:	MOVL	EBX, [EBX]		;No more DCBs, advance to next KCB
+	TESTL	EBX, EBX
+	JNE	18$.S			;Continue if another KCB
+28$:	MOVL	EAX, 8.B[ECX]		;Get offset of dispatch table
+	MOVL	EAX, CS:ts_addunit.B[EAX] ;Get offset of routine
+	MOVL	audisp, EAX
+	MOVL	EAX, au_unit.B[EBP]	;Get unit number
+	MOVL	EBX, au_kcb.B[EBP]	;Get offset of KCB (if any)
+	MOVL	ECX, au_index.B[EBP]	;Get index on controller
+	MOVL	EDI, au_ioreg.B[EBP]	;Get base IO register for controller
+	LGSL	ESI, au_qab.B[EBP]	;Get offset of the QAB
+	LFSL	EDX, au_char.B[EBP]	;Get address of the characteristics
+	LEAVE				;  list
+$$$$ta::
+	JMPIL	audisp			;Dispatch to addunit routine for driver
+
+;Here if bad controller
+
+30$:	MOVL	EAX, #ER_DEVER
+	JMP	34$.S
+
+;Here if unit already defined (same unit number)
+
+32$:	MOVL	EAX, #ER_DUADF
+34$:	JMP	4$
+.PAGE
+;Subroutine called by adduchar when "UNIT" characteristics found
+
+auunit:CMPL	EAX, #99t
+	JA	4$.S
+	MOVL	au_unit.B[EBP], EAX
+	CLC
+	RET
+
+;Subroutine called by adduchar when "TYPE" characteristics found
+
+auctype:
+	MOVL	au_type.B[EBP], EAX
+	RET
+
+4$:	MOVL	EAX, #ER_CHARV
+	STC
+	RET
+
+;Subroutine called by adduchar when "IOREG" characteristics found
+
+aureg:	CMPL	EAX, #0.B
+	JE	4$.S
+	CMPL	EAX, #0FFFFh
+	JA	4$.S
+	MOVL	au_ioreg.B[EBP], EAX
+	CLC
+	RET
+
+;Subroutine called by adduchar when "INDEX" characcteristics found
+
+auindex:
+	MOVL	au_index.B[EBP], EAX
+	RET
+.PAGE
+	.SBTTL	tapeunitinfo - TAPE class get phyical unit information function
+
+;Here for the get physical unit information class function (CL_PUNITS) for the
+;  TAPE class
+;	c{EBX} = Offset of CCB
+;	c{ESI} = Offset of IORB
+;	CALL	tapeunitinfo
+;	c{EAX} = Error code
+;	c{EBX} = Status bits
+;	c{ECX} = Item count
+;  A zero count (iorb_count) requests that the number of units only be returned
+;    in qab_amount.  A non-zero count indicates that a buffer is available for
+;    that many unit names (8 characters each, null padded).
+
+tapeunitinfo:
+	CRASH	NIYT
+.PAGE
+	.SBTTL	xostapMakeKcb - Subroutine to create TAPE KCB
+
+;Subroutine to create TAPE KCB - must be called with the exec memory resource
+;	c(AL)  = Value for kcb_bits
+;	c{ECX} = Size of KCB to make (positive part only)
+;	c{EBX} = Offset of controller dispatch table
+;	c{EDX} = Type name
+;	CALL	xostapMakeKcb
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  c{ESI} = Address of KCB just created
+
+xostapMakeKcb:
+	PUSHL	EDX			;Save type name
+	PUSHL	EBX			;Save offset of dispatch table
+	PUSHL	EAX			;Save value for kcb_bits
+	CALL	knlGetXMem##		;Allocate space for KCB
+	JC	4$.S
+	LEAL	ESI, kcb_mSIZE.B[EDI]
+	POPL	EAX
+	MOVB	kcb_bits.B[ESI], AL	;Store bits in the KCB
+	POPL	kcb_disp.B[ESI]		;Store offset of dispatch table
+	POPL	EBX
+	MOVL	kcb_type.B[ESI], EBX	;Store type name in the KCB
+	CLRL	EAX
+	DECL	EAX
+	MOVL	kcb_fnext.B[ESI], EAX	;Initialize fork list link
+	PUSHL	tapefirstkcb		;Link into tape KCB chain
+	POPL	[ESI]
+	MOVL	tapefirstkcb, ESI
+	RET				;Thats all
+
+;Here if error
+
+4$:	POPL	EBX			;Fix up the stack
+	POPL	EBX
+	POPL	EBX
+	RET				;And return
+.PAGE
+	.SBTTL	xostapMakeDcb - Subroutine to create TAPE DCB
+
+;Subroutine to create TAPE DCB - must be called with the exec memory resource
+;	c{EAX} = Unit number
+;	c{EBX} = Type name
+;	c{ECX} = Total size of the DCB
+;	c{EDX} = Offset of device characteristics table for TAPE: device
+;	c{EDI} = Offset of device dispatch table
+;	c{ESI} = Offset of tape KCB
+;	CALL	xostapMakeDcb
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  c{EDI} = Address of DCB just created
+
+xostapMakeDcb:
+	PUSHL	EAX			;Save unit number
+	PUSHL	EBX			;Save type name
+	PUSHL	EDX			;Save device characteristics offset
+	MOVL	EBX, #DS$PHYS|DS$REMOVE|DS$QIN|DS$QOUT
+	MOVL	EDI, #tapedsp
+	CALL	knlMakeDcb##		;Create the DCB
+	POPL	ECX			;Restore device characteristics offset
+	POPL	EBX			;Restore type name
+	POPL	EDX			;Restore unit number
+	JC	ret002			;If error
+	MOVL	dcb_type.B[EDI], EBX	;Store type name
+	MOVL	dcb_devchar.B[EDI], ECX	;Store device characteristics offset
+	MOVB	dcb_punit.B[EDI], DL	;Store unit number
+	MOVL	dcb_tpkcb.B[EDI], ESI
+	LEAL	ECX, kcb_dcbhead.B[ESI]	;Insert the new DCB into the list for
+2$:	MOVL	EBX, [ECX]		;  its controller
+	TESTL	EBX, EBX
+	JE	6$.S
+	CMPB	DL, dcb_punit.B[EBX]
+	JB	4$.S
+	LEAL	ECX, dcb_tpnext.B[EBX]
+	JMP	2$.S
+
+;Here with place to insert this DCB
+
+4$:	MOVL	dcb_tpnext.B[EDI], EBX
+	JMP	8$.S
+
+;Here to insert DCB at end of list
+
+6$:	MOVL	kcb_dcbtail.B[ESI], EDI
+8$:	MOVL	[ECX], EDI
+	LEAL	EBX, dcb_name+3.B[EDI]	;Construct unit name
+	MOVL	-3.B[EBX], #'TAP'
+	MOVL	EAX, EDX
+	CALL	knlPutDecNmbr##
+	CLRL	ECX
+	PUSHL	ESI
+	MOVL	ESI, #tapeccb
+	CALL	knlLinkDcb##
+	POPL	ESI
+	RET
+.PAGE
+	.SBTTL	tapechk - Device check routine for TAPE class devices
+
+;Device check routine for TAPE class devices
+;	c{SS:EBX} = Address of device name (16 bytes)
+;	CALL	tapechk
+;	C:set = Error (match found)
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  Z:set = Match found
+;	    c{EDI} = Offset of DCB
+;	  Z:clr = Not found
+;  EBX and ESI are preserved
+
+tapechk:MOVL	EAX, SS:[EBX]
+	ANDL	EAX, #0FFFFFFh
+	CMPL	EAX, #'TAP'		;Is this TAP*?
+	JNE	6$.S			;No
+	MOVL	EDI, tapeccb+ccb_dcbhead ;Yes - point to first TAPE DCB
+	TESTL	EDI, EDI
+	JE	6$.S			;If none at all
+2$:	MOVL	EAX, dcb_name+0.B[EDI]	;Does name match?
+	CMPL	SS:[EBX], EAX
+	JNE	4$.S			;No
+	MOVL	EAX, dcb_name+4.B[EDI]
+	CMPL	SS:4.B[EBX], EAX
+	JNE	4$.S			;No
+	MOVL	EAX, dcb_name+8.B[EDI]
+	CMPL	SS:8.B[EBX], EAX
+	JNE	4$.S			;No
+	MOVL	EAX, dcb_name+12t.B[EDI]
+	CMPL	SS:12t.B[EBX], EAX
+	JE	ret002.S		;Yes - this is it!
+4$:	MOVL	EDI, dcb_next.B[EDI]	;No - try next
+	TESTL	EDI, EDI
+	JNE	2$.S			;Continue if another
+6$:	TESTL	ESP, ESP		;No more - clear Z
+ret002:	RET
+.PAGE
+	.SBTTL	sd_cleardcb - Clear DCB
+
+;Here for the clear DCB entry
+;	c{EDI} = Offset of DCB
+
+tapecdcb:
+	CLC
+	RET
+.PAGE
+	.SBTTL	tapioprecmin - Process IOPAR_TAPRECMIN IO parameter
+
+;Here to process the IOPAR_TAPRECMIN IO parameter
+
+	DPARMHDR GET, DECV
+tapioprecmin:
+	MOVL	EAX, dcb_tprecmin.B[EDI]
+	JMP	knlStrParm4##
+
+	.SBTTL	tapioprecmax - Process IOPAR_TAPRECMAX IO parameter
+
+;Here to process the IOPAR_TAPRECMAX IO parameter
+
+	DPARMHDR GET, DECV
+tapioprecmax:
+	MOVL	EAX, dcb_tprecmin.B[EDI]
+	JMP	knlStrParm4##
+
+	.SBTTL	tapiopreclen - Process IOPAR_TAPRECLEN IO parameter
+
+;Here to process the IOPAR_TAPRECLEN IO parameter
+
+	DPARMHDR BOTH, DECV
+tapiopreclen:
+	MOVL	EAX, #ER_NIYT
+	STC
+	RET
+
+	.SBTTL	tapiopdensity - Process IOPAR_TAPDENSITY IO parameter
+
+;Here to process the IOPAR_TAPDENSITY IO parameter
+
+	DPARMHDR BOTH, DECV
+tapiopdensidy:
+	MOVL	EAX, #ER_NIYT
+	STC
+	RET
+
+	.SBTTL	tapiopgaplen - Process IOPAR_TAPGAPLEN IO parameter
+
+;Here to process the IOPAR_TAPGAPLEN IO parameter
+
+	DPARMHDR BOTH, DECV
+tapiopgaplen:
+	MOVL	EAX, #ER_NIYT
+	STC
+	RET
+
+	.SBTTL	tapiopbfrmode - Process IOPAR_TAPBFRMODE IO parameter
+
+;Here to process the IOPAR_TAPBFRMODE IO parameter
+
+	DPARMHDR BOTH, DECV
+tapiopbfrmode:
+	MOVL	EAX, #ER_NIYT
+	STC
+	RET
+.PAGE
+	.SBTTL	sd_open - Open device
+
+;Here for the open device entry (sd_open) - also used for the device parameters
+;  entry (sd_parm)
+;	c{EDI} = Offset of DCB
+
+tapeopen:
+	CMPL	SS:xffParm##, #0.B
+	JE	4$.S
+	MOVL	EBX, #tapeopnparms	;Process device parameters
+	MOVL	ECX, #knlComDPParms##
+	IFFAULT	knlRtnAdrEr##
+	LFSL	EDX, SS:xffParm##
+	CALL	knlProcDevParm##
+	JC	8$.S
+4$:	CLRL	EAX
+8$:	RET
+.PAGE
+	.SBTTL	sd_inblock - Queued input block
+
+;Here for the sd_inblock entry - Input block
+;	c{ESI} = Offset of IORB
+;	c{EDI} = Offset of DCB
+;	CALL	tapeinpblk
+;	c{EAX} = Error code
+;	c{ECX} = Amount output
+;	c{EBX} = Status bits
+
+tapeinpblk:
+	CALL	knlIoQabLock##		;Lock the QAB
+	JC	2$.S			;If error
+	CALL	knlIoReadLock##		;Lock the buffer
+	JC	2$.S			;If error
+	MOVB	iorb_queue.B[ESI], #dcb_outframe
+	MOVL	iorb_routine.B[ESI], #tapeinpblk1
+	JMP	knlXfQueue##		;Switch to extended fork context
+
+;Here if error locking the buffer
+
+2$:	TOFORK
+4$:	RET
+
+;Here in extended fork context
+
+tapeinpblk1:
+	CALL	gettapecon		;Get the tape controller
+	JC	4$.S
+	CMPL	SS:xffParm##, #0.B	;Have any device parameters?
+	JE	6$.S			;No
+	MOVL	EBX, #tapeioparms	;Yes - process parameters
+	MOVL	ECX, #knlComDPParms##
+	IFFAULT	knlQAdrErr0##
+	LFSL	EDX, SS:xffParm##
+	CALL	knlProcDevParm##
+	JC	8$.S
+6$:	CMPL	SS:xffCount##, #0.B	;Get count
+	JE	10$.S			;If nothing to do here
+	IFFAULT	knlQAdrErr0##
+	LESL	EBX, SS:xffBuffer1##	;Get address of buffer
+	MOVL	ECX, SS:xffCount##
+	MOVL	EAX, kcb_disp.B[ESI]
+	CALLI	CS:tf_read.B[EAX]
+8$:	JMP	givetapecon
+
+10$:	CLRL	EAX
+	MOVL	EBX, #QSTS$DONE
+	JMP	8$.S
+.PAGE
+	.SBTTL	sd_outstring - Queued output null terminated string
+
+;Here for the sd_outstring entry - output null terminated string
+;	c{ESI} = Offset of IORB
+;	c{EDI} = Offset of DCB
+;	CALL	tapeoutstr
+;	c{EAX} = Error code
+;	c{ECX} = Amount output
+;	c{EBX} = Status bits
+
+tapeoutstr:
+	CALL	knlIoQabLock##		;Lock the QAB
+	JC	2$.S			;If error
+	CALL	knlIoStringLock##	;Lock the string
+	JNC	6$.S			;OK - go on
+2$:	TOFORK				;If error
+4$:	RET
+
+	.SBTTL	sd_outblock - Queued output block
+
+;Here for the sd_outblock entry - output block
+;	c{ESI} = Offset of IORB
+;	c{EDI} = Offset of DCB
+;	CALL	tapeoutblk
+;	c{EAX} = Error code
+;	c{ECX} = Amount output
+;	c{EBX} = Status bits
+
+tapeoutblk:
+	CALL	knlIoQabLock##		;Lock the QAB
+	JC	2$.S			;If error
+	CALL	knlIoWriteLock##	;Lock the buffer
+	JC	2$.S			;If error
+6$:	MOVB	iorb_queue.B[ESI], #dcb_outframe
+	MOVL	iorb_routine.B[ESI], #tapeoutblk1
+	JMP	knlXfQueue##		;Switch to extended fork context
+
+;Here in extended fork context
+
+tapeoutblk1:
+	CALL	gettapecon		;Get the tape controller
+	JC	4$.S
+	CMPL	SS:xffParm##, #0.B	;Have any device parameters?
+	JE	8$.S			;No
+	MOVL	EBX, #tapeioparms	;Yes - process parameters
+	MOVL	ECX, #knlComDPParms##
+	IFFAULT	knlQAdrErr0##
+	LFSL	EDX, SS:xffParm##
+	CALL	knlProcDevParm##
+	JC	10$.S
+8$:	CMPL	SS:xffCount##, #0.B	;Get count
+	JE	12$.S
+	IFFAULT	knlQAdrErr0##
+	LESL	EBX, SS:xffBuffer1##	;Get address of buffer
+	MOVL	ECX, SS:xffCount##
+	MOVL	EAX, kcb_disp.B[ESI]
+	CALLI	CS:tf_write.B[EAX]
+10$:	JMP	givetapecon
+
+12$:	CLRL	EAX
+	MOVL	EBX, #QSTS$DONE
+	JMP	10$.S
+.PAGE
+	.SBTTL	sd_special - Special device function
+
+;Here for the special device function entry
+;	c{EDI} = Offset of DCB
+;	c{ESI} = Offset of IORB
+;	CALL	tapespecial
+;	c{EAX} = Error code
+;	c{EBX} = Status bits
+;	c{ECX} = Item count
+
+tapespecial:
+	CALL	knlIoQabLock##		;Lock the QAB
+	JC	4$.S			;If error
+	MOVB	iorb_queue.B[ESI], #dcb_outframe
+	MOVL	iorb_routine.B[ESI], #tapespecial1
+	JMP	knlXfQueue##		;Switch to extended fork context
+
+;Here if error locking the buffer
+
+4$:	TOFORK
+6$:	RET
+
+;Here in extended fork context
+
+tapespecial1:
+	CALL	gettapecon		;Get ownership of the controller
+	JC	6$.S
+	CMPL	SS:xffParm##, #0.B	;Have any device parameters?
+	JE	8$.S			;No
+	MOVL	EBX, #tapeioparms	;Yes - process parameters
+	MOVL	ECX, #knlComDPParms##
+	LFSL	EDX, SS:xffParm##
+	CALL	knlProcDevParm##
+	JC	10$.S
+8$:	MOVZBL	EAX, SS:xffOption##	;Get function
+	TESTL	EAX, EAX
+	JE	12$.S
+	CMPL	EAX, #TAPESFMAX.B	;Legal function?
+	JAE	12$.S			;No
+	MOVB	AL, CS:tapesffnc-1[EAX]	;Yes - get corresponding tape function
+	MOVL	ESI, dcb_tpkcb.B[EDI]	;Get offset of the KCB
+	MOVL	ECX, SS:xffCount##	;Get count value
+	ADDL	EAX, kcb_disp.B[ESI]
+	CALLI	CS:[EAX]		;Dispatch to driver for the function
+10$:	JMP	givetapecon
+
+12$:	MOVL	EAX, #ER_IFDEV
+	CLRL	ECX
+	MOVL	EBX, #QSTS$DONE
+	JMP	10$.S
+
+;Function table for special device functions for TAPE devices
+
+tapesffnc:
+	.BYTE	tf_unload	;SDF_TAPE_UNLOAD   =  1. - Unload tape
+	.BYTE	tf_rewind	;SDF_TAPE_REWIND   =  2. - Rewind tape
+	.BYTE	tf_format	;SDF_TAPE_FORMAT   =  3. - Format tape
+	.BYTE	tf_reten	;SDF_TAPE_RETEN    =  4. - Retension tape
+	.BYTE	tf_writefm	;SDF_TAPE_WRITEFM  =  5. - Write filemarks
+	.BYTE	tf_writesm	;SDF_TAPE_WRITESM  =  6. - Write setmarks
+	.BYTE	tf_lock		;SDF_TAPE_LOCK     =  7. - Lock/unlock tape
+				;			     mounting
+	.BYTE	tf_erasegap	;SDF_TAPE_ERASEGAP =  8. - Erase gap
+	.BYTE	tf_eraseall	;SDF_TAPE_ERASEALL =  9. - Erase gap
+	.BYTE	tf_skprec	;SDF_TAPE_SKPREC   = 10. - Skip records
+	.BYTE	tf_skpfile	;SDF_TAPE_SKPFILE  = 11. - Skip filemarks
+	.BYTE	tf_confile	;SDF_TAPE_CONFILE  = 12. - Skip to consective
+				;			     filemarks
+	.BYTE	tf_skpset	;SDF_TAPE_SKPSET   = 13. - Skip setmarks
+	.BYTE	tf_conset	;SDF_TAPE_CONSET   = 14. - Skip to consective
+				;			     setmarks
+	.BYTE	tf_skp2eod	;SDF_TAPE_SKP2EOD  = 15. - Skip to end-of-data
+TAPESFMAX=!$-tapesffnc+1
+.PAGE
+	.SBTTL	sd_close - Close device
+
+;Here for the close device entry
+;	c{ECX} = Close option bits
+;	c{EDI} = Offset of DCB
+;	c{ESI} = Offset of device table entry
+;	CALL	tapeclose
+;	C:set = Error or not ready
+;	  c{EAX} = Error code (0 means not ready)
+;	C:clr = Normal
+
+tapeclose:
+	CLRL	EAX
+	TOFORK
+	JMP	knlCloseFin##
+.PAGE
+	.SBTTL	gettapecon - Subroutine to get access to tape controller
+
+gettapecon:
+	MOVL	ESI, dcb_tpkcb.B[EDI]	;Get offset of the KCB
+	CMPL	kcb_curdcb.B[ESI], #0.B	;Is the controller busy now?
+	JE	10$.S			;No
+	MOVL	EAX, kcb_reqtail.B[ESI]	;Yes - link this DCB to the end of the
+	TESTL	EAX, EAX		;  controller's request list
+	JE	6$.S
+	MOVL	dcb_tpreqnext.B[EAX], EDI
+	JMP	8$.S
+
+6$:	MOVL	kcb_reqhead.B[ESI], EDI
+8$:	MOVL	kcb_reqtail.B[ESI], EDI
+	MOVL	EAX, #-1		;Wait until controller is available
+	CALL	knlXfWait##
+	JC	14$.S			;If error while waiting
+	CMPL	kcb_curdcb.B[ESI], EDI
+	JE	12$.S
+	CRASH	TCSE			;[Tape Controller Scheduling Error]
+
+;Here if controller is not busy
+
+10$:	MOVL	kcb_curdcb.B[ESI], EDI	;Make this the current DCB
+12$:	MOVL	EAX, kcb_disp.B[ESI]
+	CALLI	CS:tf_chkmount.B[EAX]	;Check that tape is mounted
+	JNC	16$.S			;If OK
+	CALL	givetapecon		;Error - give up the tape controller
+14$:	CLRL	ECX
+	MOVL	EBX, #QSTS$DONE
+	STC
+16$:	RET
+.PAGE
+	.SBTTL	givetapecon - Subroutine to give up access to tape controller
+
+givetapecon:
+	CMPL	kcb_reqhead.B[ESI], #0.B ;Anyone waiting?
+	JNE	4$.S			;Yes
+	MOVL	kcb_curdcb.B[ESI], #0	;No
+	JMP	8$.S
+
+;Here if someone is waiting for the controller
+
+4$:	MOVL	EDX, kcb_reqhead.B[ESI]
+	MOVL	kcb_curdcb.B[ESI], EDX
+	PUSHL	EAX
+	MOVL	EAX, dcb_tpreqnext.B[EDX]
+	MOVL	kcb_reqhead.B[ESI], EAX
+	TESTL	EAX, EAX
+	JNE	6$.S
+	MOVL	kcb_reqtail.B[ESI], EAX
+6$:	POPL	EAX
+	MOVL	dcb_tpreqnext.B[EDX], #-1
+8$:	MOVL	EBX, #QSTS$DONE
+	RET
+.PAGE
+	.SBTTL	TAPE class driver data
+
+	DATA
+
+tapedcbnum:  .LONG 0		;Number of in use TAPE DCBs
+tapeccb:     .BLKB ccb_SIZE	;TAPE CCB
+tapefirstdrv:.LONG 0		;Offset of first TAPE driver data block
+tapefirstkcb:.LONG 0		;Offset of first TAPE KCB
+audisp:	     .LONG 0		;Temp dispatch index for addunit routine
+
+	LKEEND

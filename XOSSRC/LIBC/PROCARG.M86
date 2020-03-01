@@ -1,0 +1,912 @@
+	.TITLE	procarg - General command argument processor for XOS
+	.SBTTL	Run-time library for XC for XOS
+
+;++++
+; This software is in the public domain.  It may be freely copied and used
+; for whatever purpose you see fit, including commerical uses.  Anyone
+; modifying this software may claim ownership of the modifications, but not
+; the complete derived code.  It would be appreciated if the authors were
+; told what this software is being used for, but this is not a requirement.
+
+;   THIS SOFTWARE IS PROVIDED BY THE AUTHORS "AS IS" AND ANY EXPRESS OR
+;   IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
+;   OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+;   IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+;   INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+;   BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS
+;   OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+;   ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR
+;   TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
+;   USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+;----
+
+	.INCLUD XOSINC:\XMAC\XOS.PAR
+	.INCLUD	XOSINC:\XMAC\XOSERR.PAR
+	.INCLUD	XOSINC:\XMAC\CTYPE.PAR
+	.INCLUD	XOSINC:\XMAC\STDIO.PAR
+	.INCLUD	XOSINC:\XMAC\PROCARG.PAR
+
+	.STDSEGS
+
+;Define data block for keeping track of indirect files
+
+$$$=!0
+BLK ifb_previous, 4t	;Pointer to previous IFB
+BLK ifb_stream  , 4t	;Pointer to IO stream
+BLK ifb_point   , 4t	;Pointer to next character
+BLK ifb_buffer  , 512t	;Line buffer
+ifb_SIZE=!$$$
+
+	.PSECT	_DATA_p
+
+rstr:	.ASCII	"r"
+nullstr:.BYTE	0
+optstr:	.ASCIZ	"option"
+keystr:	.ASCIZ	"keyword"
+eocf:	.ASCIZ	"Error opening command file %.40s"
+unexfmt:.ASCIZ	"Unexpected argument ""%.40s"""
+iokwfmt:.ASCIZ	"Illegal %s ""%s"" specified"
+nvgfmt:	.ASCIZ	"No value given for %s %.32s"
+unxvfmt:.ASCIZ	"Unexpected value given for %s %.32s"
+nv2lfmt:.ASCIZ	"Numeric value too large for "
+toolfmt:.ASCIZ	"Argument for %s ""%s"" is too long";
+bnvfmt:	.ASCIZ	"Bad numeric value for %s %.32s"
+svifmt:	.ASCIZ	"String value illegal for %s ""%.32s"""
+ivgfmt:	.ASCIZ	"Illegal value given for %.40s %s"
+ce1fmt:	.ASCIZ	"? %s: %s"{LF}
+ce2fmt:	.ASCIZ	"    %*s%s"{LF}
+ai2lfmt:.ASCIZ	"Argument ""%.40s"" is too long"
+nema:	.ASCIZ	"Not enought memory available"
+cfn2l:	.ASCIZ	"Command file name is too long"
+uqsmsg:	.ASCIZ	"Unterminated quoted string"
+ercfmsg:.ASCIZ	"Error reading command file"
+
+$$$=!0
+FRM pa_apnt   , 4t
+FRM pa_cpnt   , 4t	;String pointer for input code
+FRM pa_kind   , 4t
+FRM pa_ifb    , 4t	;Pointer to current indirect file block
+FRM pa_count  , 4t
+FRM pa_radix  , 4t
+FRM pa_value  , 4t
+FRM pa_argfnc , 4t
+FRM pa_tbl    , 4t
+FRM pa_chr    , 4t
+FRM pa_inquote, 1t	;TRUE if processing quoted string
+
+FRM pa_minus  , 1t	;TRUE if - before numeric value
+FRM pa_switchr, 1t	;Switch character for this item
+FRM pa_haveend, 1t	;TRUE if have seen end of input
+FRM pa_haveext, 1t
+FRM           , 3t
+FRM pa_kwbfr  , 32t	;Keyword buffer
+FRM pa_argdata, argdata_SIZE
+FRM pa_argbufr, 512t
+pa_SIZE=!$$$
+
+$$$=16t
+BLK arg_argpnt  , 4t	;Pointer to pointer to argument string
+BLK arg_flags   , 4t	;Flag bits
+BLK arg_opttbl  , 4t	;Offset of option table
+BLK arg_kwtbl   , 4t	;Offset of keyword table
+BLK arg_argfnc  , 4t	;Function to process normal arguments
+BLK arg_errfnc  , 4t	;Function to call with error message
+BLK arg_contfnc , 4t	;Function to call for next input line
+BLK arg_indirext, 4t	;Default extension for indirect file
+
+	.PSECT	_TEXT_p
+	.ENTRY	procarg
+procarg:PUSHL	EDI
+	PUSHL	ESI
+	ENTER	pa_SIZE, 0
+	MOVB	pa_inquote.B[EBP], #0	;Not currently quoting string
+	MOVB	pa_haveend.B[EBP], #0		;Not at end of input
+	MOVL	EAX, arg_argpnt.B[EBP]	;Initialize input pointer
+	TESTL	EAX, EAX
+	JE	2$.S
+	MOVL	EDX, [EAX]
+	MOVL	pa_cpnt.B[EBP], EDX
+	ADDL	EAX, #4.B
+	MOVL	pa_apnt.B[EBP], EAX
+	TESTL	EDX, EDX		;Have any input at all?	
+	JNE	4$.S
+2$:	MOVB	pa_haveend.B[EBP], #1
+4$:	MOVL	pa_ifb.B[EBP], #0
+	CALL	getchr			;Get a character
+loop:	CALL	skipws			;Make sure not whitespace
+	TESTL	EAX, EAX
+	JS	10$.S
+	MOVL	EDX, arg_argfnc.B[EBP]
+	MOVL	pa_argfnc.B[EBP], EDX
+	CMPB	AL, #'@'		;Indirect file name?
+	JNE	notindir		;No
+	BTL	arg_flags.B[EBP], #PAF%INDIRECT ;Maybe
+	JNC	notindir		;No
+	LEAL	ESI, pa_argbufr[EBP]	;Yes
+	MOVL	ECX, #500t
+	MOVB	pa_haveext.B[EBP], #0
+8$:	CALL	getchr			;Get name character
+	CMPL	EAX, #0.B		;End of name?
+	JLE	16$.S			;Yes
+	DECL	ECX			;No - room for more?
+	JNE	12$.S			;Yes - go on
+	MOVL	EBX, #cfn2l		;No - fail
+	CLRL	EDX
+	JMP	callerror
+
+;Here for normal termination
+
+10$:	MOVL	EAX, #1			;Return TRUE
+	LEAVE
+	POPL	ESI
+	POPL	EDI
+	RET
+
+;Here to store character in buffer for name of indirect file
+
+12$:	CMPB	AL, #'.'		;Period?
+	JNE	14$.S			;No
+	MOVB	pa_haveext.B[EBP], #1	;Yes - remember have extension
+14$:	MOVB	[ESI], AL		;Store character
+	INCL	ESI
+	JMP	8$.S			;Continue
+
+;Here with name for indirect file collected
+
+16$:	CMPB	pa_haveext.B[EBP], #0	;Did we see an extension?
+	JNE	20$.S			;Yes
+	PUSHL	#4.B			;No - add default extension
+	PUSHL	arg_indirext.B[EBP]
+	PUSHL	ESI
+	CALL	strnmov#
+	ADDL	ESP, #12t.B
+	MOVL	ESI, EAX
+20$:	MOVB	[ESI], #0
+	PUSHL	#rstr			;Open the file
+	LEAL	EAX, pa_argbufr[EBP]
+	PUSHL	EAX
+	CALL	fopen#
+	ADDL	ESP, #8t.B
+	TESTL	EAX, EAX		;Error?
+	JNE	22$.S			;No - go on
+
+$$$$cmd::
+
+	LEAL	EAX, pa_argbufr[EBP]
+	PUSHL	EAX
+	PUSHL	#eocf
+	ADDL	EAX, #80t.B
+	PUSHL	EAX
+	CALL	sprintf#
+	ADDL	ESP, #12t.B
+	MOVL	EAX, errno#
+	NEGL	EAX			;Negate it for XOS
+	LEAL	EBX, pa_argbufr+80t[EBP]
+	JMP	ioerror
+
+;Here with indirect file open
+
+22$:	PUSHL	EAX			;Save stream pointer
+	PUSHL	#ifb_SIZE		;Allocate memory for an IFB
+	CALL	malloc#
+	POPL	ECX
+	POPL	EDX
+	TESTL	EAX, EAX
+	JNE	24$.S
+	MOVL	EAX, #ER_NEMA		;Set up an error code here
+	MOVL	EBX, #nema
+	JMP	ioerror
+
+;Here with memory allocated for the IFB
+
+24$:	MOVL	EBX, EAX
+	MOVL	ifb_stream.B[EBX], EDX	;Store stream pointer
+	MOVL	EAX, pa_ifb.B[EBP]
+	MOVL	[EBX], EAX		;Link in the new IFB
+	MOVL	pa_ifb.B[EBP], EBX
+	CALL	fillbufr		;Fill the input buffer
+	JMP	loop			;Continue
+.PAGE
+;Here if do not have an indirect file name here
+
+notindir:
+	CMPB	pa_inquote.B[EBP], #0
+	JNE	6$.S
+	CMPB	AL, #'/'		;Is this an option?
+	JE	4$.S
+	CMPB	AL, #'-'
+	JE	4$.S
+	CMPB	AL, #'+'
+	JNE	6$.S
+	BTL	arg_flags.B[EBP], #PAF%PSWITCH
+	JNC	6$.S
+4$:	MOVB	pa_switchr.B[EBP], AL
+	MOVL	pa_kind.B[EBP], #optstr
+	MOVL	pa_argfnc.B[EBP], #0
+	CALL	getchr
+	MOVL	EDX, arg_opttbl[EBP]
+	JMP	8$.S
+
+;Here if don't have start of option
+
+6$:	MOVL	EDX, arg_kwtbl.B[EBP]	;Have a keyword table?
+	TESTL	EDX, EDX
+	JE	nokeyw			;No
+	MOVL	EDX, arg_kwtbl.B[EBP]	;Yes
+	MOVB	pa_switchr.B[EBP], #0
+	MOVL	pa_kind.B[EBP], #keystr
+8$:	MOVL	pa_tbl.B[EBP], EDX
+	LEAL	ESI, pa_kwbfr.B[EBP]
+	MOVL	ECX, #32t
+	CMPB	AL, #'+'
+	JNE	12$.S
+	BTL	arg_flags.B[EBP], #PAF%PATOM
+	JNC	12$.S
+	MOVB	[ESI], AL
+	INCL	ESI
+	JMP	18$.S
+
+12$:	CMPL	EAX, #0.B
+	JLE	18$.S
+	CMPB	AL, #'='
+	JE	18$.S
+	CMPB	AL, #'/'
+	JE	18$.S
+	CMPB	AL, #'-'
+	JE	18$.S
+	CMPB	AL, #'+'
+	JNE	14$.S
+	BTL	arg_flags.B[EBP], #PAF%PSWITCH
+	JC	18$.S
+	BTL	arg_flags.B[EBP], #PAF%PATOM
+	JC	18$.S
+14$:	DECL	ECX
+	JLE	16$.S
+	MOVB	[ESI], AL
+	INCL	ESI
+16$:	CALL	getchr
+	JMP	12$.S
+
+;Here with atom collected
+
+18$:	MOVB	[ESI], #0
+	MOVL	pa_chr.B[EBP], EAX
+	MOVL	EDI, pa_tbl.B[EBP]
+	TESTL	EDI, EDI		;Was a table specified?
+	JE	30$.S			;No
+	LEAL	ECX, pa_kwbfr.B[EBP]
+	PUSHL	ECX			;Yes
+	CALL	strupr#
+	POPL	ECX
+20$:	MOVL	EBX, argspec_name.B[EDI]
+	TESTL	EBX, EBX		;End of table?
+	JE	30$.S			;Yes - no match
+	CMPW	[EBX], #'*'.B		;No - match anything?
+	JE	22$.S			;Yes
+	LEAL	EAX, pa_kwbfr.B[EBP]	;No - compare keyword to table entry
+	PUSHL	EAX
+	PUSHL	EBX
+	CALL	strcmp#
+	ADDL	ESP, #8t.B
+	TESTL	EAX, EAX
+	JNE	26$.S			;If different
+22$:	CMPB	pa_switchr.B[EBP], #0.B	;Same - started with switch character?
+	JE	tblmatch.S		;No - its a keyword
+	TESTL	argspec_flags.B[EDI], #ASF$MINUS|ASF$PLUS ;Yes - have any
+							  ;  switch restriction?
+	JE	tblmatch.S		;No
+	CMPB	pa_switchr.B[EBP], #'+'	;Yes - it is plus?
+	JNE	24$.S			;No
+	BTL	argspec_flags.B[EDI], #ASF%PLUS ;Yes - is it valid here?
+	JC	tblmatch.S		;Yes
+	JMP	26$.S			;No - continue searching
+
+24$:	CMPB	pa_switchr.B[EBP], #'-'	;Is it minus?
+	JNE	26$.S			;No
+	BTL	argspec_flags.B[EDI], #ASF%MINUS ;Yes - is it valid here?
+	JC	tblmatch.S		;Yes
+26$:	ADDL	EDI, #argspec_SIZE.B	;No - advance to next table entry
+	JMP	20$.S			;Continue
+
+;Here if no match on the argument table
+
+30$:	CMPL	pa_argfnc.B[EBP], #0.B	;Have a function to call?
+	JNE	nonopt			;Yes
+	MOVL	EDX, #iokwfmt		;No - fail
+badvl2:	JMP	badval
+.PAGE
+;Here, with a match on the table - now we must see if there is a value next
+
+tblmatch:
+	MOVL	pa_argdata+argdata_flags.B[EBP], #0
+	LEAL	EAX, pa_kwbfr.B[EBP]
+	MOVL	pa_argdata+argdata_name.B[EBP], EAX
+	MOVL	EAX, argspec_data.B[EDI]
+	MOVL	pa_argdata+argdata_data.B[EBP], EAX
+	MOVL	EAX, pa_chr.B[EBP]
+	CALL	skipws
+	CMPB	AL, #'='		;Do we have an = ?
+	JE	haveq.S			;Yes
+	MOVL	EDX, #nvgfmt		;No
+	BTL	argspec_flags.B[EDI], #ASF%VALREQ ;Is this OK?
+	JC	badvl2.S		;No - complain
+	BTSL	pa_argdata+argdata_flags.B[EBP], #ADF%NONE
+tblmcu:	PUSHL	EAX
+	MOVL	pa_argdata+argdata_value.B[EBP], #0
+	JMP	callusr
+.PAGE
+;Here if = follows option or keyword name
+
+haveq:	MOVL	EDX, #unxvfmt		;Get offset of message in case error
+	TESTL	argspec_flags.B[EDI], #ASF$NVAL|ASF$SSVAL|ASF$LSVAL
+					;Is this allowed?
+	JE	badvl2.S		;No - fail
+	CLRL	EAX			;Yes - get next character
+	CALL	skipws
+	CMPB	AL, #0			;End of string?
+	JLE	4$.S			;Yes - value is null
+	CMPB	AL, #'/'		;Start of next option?
+	JNE	6$.S			;No - have non-null value
+	CMPB	pa_inquote.B[EBP], #0	;Yes - in quotes?
+	JNE	6$.S			;Yes - its part part of the value
+4$:	BTSL	pa_argdata+argdata_flags.B[EBP], #ADF%NULL ;Indicate null value
+	JMP	tblmcu.S		;Continue
+
+;Here if don't have null value
+
+6$:	BTL	argspec_flags.B[EDI], #ASF%NVAL ;Can it be numeric?
+	JNC	14$.S			;No - always treat it as a string
+	MOVB	pa_minus.B[EBP], #0	;Yes - assume plus
+	CMPB	AL, #'0'		;Is it numeric?
+	JB	8$.S			;No
+	CMPB	AL, #'9'
+	JBE	numval.S		;Yes
+8$:	CMPB	AL, #'+'		;No - is it a sign?
+	JE	10$.S			;Yes
+	CMPB	AL, #'-'
+	JNE	14$.S			;No
+	MOVB	pa_minus.B[EBP], #1	;Minus - remember that
+10$:	MOVL	pa_chr.B[EBP], EAX
+	CALL	getchr			;Have sign - get next character
+	CMPB	AL, #'0'		;Is it numeric?
+	JB	12$.S			;No
+	CMPB	AL, #'9'		;Maybe
+	JB	numval.S		;Yes
+12$:	CALL	ungetchr		;No - put it back
+	MOVL	EAX, pa_chr.B[EBP]
+14$:	JMP	notnumv			;Continue
+.PAGE
+;Here with numeric value to collect
+
+numval:	MOVL	pa_chr.B[EBP], EAX	;Save first character of value
+	PUSHL	pa_cpnt.B[EBP]		;Save the input state
+	PUSHL	pa_apnt.B[EBP]
+	MOVB	AL, pa_haveend.B[EBP]
+	MOVB	AH, pa_inquote.B[EBP]
+	PUSHL	EAX
+4$:	CALL	getchr			;Scan ahead to end of value
+	TESTB	_chrtbl#[EAX], #CT$HEXDG|CT$DIGIT
+	JNE	4$.S
+	POPL	EDX			;Restore the input state
+	MOVB	pa_inquote.B[EBP], DH
+	MOVB	pa_haveend.B[EBP], DL
+	POPL	pa_apnt.B[EBP]
+	POPL	pa_cpnt.B[EBP]
+	MOVL	pa_radix.B[EBP], #10t	;Assume radix is 10
+	CMPB	AL, #'.'		;Is this a value list?
+	JE	lstval.S		;Yes
+	CMPB	AL, #'-'		;Maybe
+	JNE	notlval.S		;No
+	MOVL	pa_radix.B[EBP], #16t	;Yes, and its radix is 16
+lstval:	LEAL	EBX, pa_argdata+argdata_value.B[EBP]
+	MOVL	pa_count.B[EBP], #4
+	MOVL	[EBX], #0
+	PUSHL	EBX
+	XCHGL	EAX, pa_chr.B[EBP]	;Restore first character of value, save
+6$:	LEAL	ESI, pa_value.B[EBP]	;  separator character
+	MOVL	EDX, pa_radix.B[EBP]
+	MOVL	ECX, pa_radix.B[EBP]
+	CALL	collectval		;Collect next part of the value
+	POPL	EBX
+	MOVL	EDX, #nv2lfmt
+	CMPL	pa_value.B[EBP], #255t	;Is it too large
+	JA	badval.S		;Yes - fail
+	MOVB	DL, pa_value.B[EBP]	;No - store it
+	MOVB	[EBX], DL
+	INCL	EBX
+	DECL	pa_count.B[EBP]		;Have another value part here?
+	JLE	valend.S		;No
+	CMPL	EAX, pa_chr.B[EBP]	;Maybe
+	JNE	valend.S		;No
+	PUSHL	EBX
+	CALL	getchr			;Yes - get first character of next value
+	JMP	6$.S			;Continue
+.PAGE
+;Here if value is not a value list
+
+notlval:MOVL	EAX, pa_chr.B[EBP]	;Restore first character of value
+	LEAL	ESI, pa_argdata+argdata_value.B[EBP] ;Point to place for value
+	MOVL	EDX, #10t		;Get radix values
+	MOVL	ECX, #8t
+	CALL	collectval		;Collect the value
+valend:	CMPL	EAX, #0.B		;End of item?
+	JLE	6$.S			;Yes
+	MOVL	EDX, #bnvfmt
+	CMPB	AL, #'/'		;Maybe
+	JNE	badval.S		;No - fail
+6$:	PUSHL	EAX			;Save next character
+	CMPB	pa_minus.B[EBP], #0	;Yes - should it be negative?
+	JE	8$.S			;No
+	NEGL	pa_argdata+argdata_value.B[EBP] ;Yes
+8$:	BTSL	pa_argdata+argdata_flags.B[EBP], #ADF%NVAL
+					;Indicate have numeric value
+	JMP	callusr			;Continue
+.PAGE
+;Here if don't have numeric value
+
+notnumv:TESTL	argspec_flags.B[EDI], #ASF$SSVAL|ASF$LSVAL
+					;Is a string value OK here?
+	JNE	4$.S			;Yes - go on
+	MOVL	EDX, #svifmt
+badval:	LEAL	EAX, pa_kwbfr.B[EBP]	;No - fail
+	PUSHL	EAX
+	PUSHL	pa_kind.B[EBP]
+	PUSHL	EDX
+	LEAL	EAX, pa_argbufr[EBP]
+	PUSHL	EAX
+	CALL	sprintf#
+	ADDL	ESP, #16t.B
+	LEAL	EBX, pa_argbufr[EBP]
+	CLRL	EDX
+	JMP	callerror
+
+;Here if a string value is OK
+
+4$:	LEAL	EBX, pa_argbufr[EBP]
+	MOVL	ECX, #512t
+6$:	MOVL	EDX, #toolfmt
+	DECL	ECX			;Room for more?
+	JE	badval.S		;No - fail
+	MOVB	[EBX], AL		;Yes
+	INCL	EBX
+	PUSHL	EBX
+	CALL	getchr			;Get next character
+	POPL	EBX
+	TESTL	EAX, EAX		;End of string?
+	JLE	10$.S			;Yes
+	CMPB	AL, #'/'		;Maybe
+	JNE	6$.S			;No
+	CMPB	pa_inquote.B[EBP], #0	;Yes, unless in quote mode
+	JNE	6$.S
+10$:	PUSHL	EAX			;End of string - save stopper character
+	MOVB	[EBX], #0		;End it with a null
+	BTL	argspec_flags.B[EDI], #ASF%LSVAL ;Long string OK?
+	JNC	20$			;No
+	CMPL	argspec_svalues.B[EDI], #0.B ;Yes - did he give us a value
+					     ;  table?
+	JE	18$.S			;No
+
+$$$$str::
+	LEAL	EAX, pa_argbufr[EBP]
+	PUSHL	EAX			;Yes - convert string to upper case
+	CALL	strupr#
+	POPL	ECX
+	MOVL	ESI, argspec_svalues.B[EDI]
+12$:	CMPL	[ESI], #0.B		;End of table?
+	JE	16$.S			;Yes
+	LEAL	EAX, pa_argbufr[EBP]
+	PUSHL	EAX			;No - compare string to table entry
+	PUSHL	[ESI]
+	CALL	strcmp#
+	ADDL	ESP, #8.B
+	ADDL	ESI, #4t.B
+	TESTL	EAX, EAX
+	JNE	12$.S
+	SUBL	ESI, argspec_svalues.B[EDI]
+	SHRL	ESI, #2t
+	DECL	ESI
+	MOVL	pa_argdata+argdata_value.B[EBP], ESI
+	BTSL	pa_argdata+argdata_flags.B[EBP], #ADF%XSVAL
+	JMP	callusr
+
+;Here if cannot find a match with the user's value table
+
+16$:	MOVL	EDX, #ivgfmt
+17$:	JMP	badval
+
+;Here if no value table given - just return the string
+
+18$:	LEAL	EAX, pa_argbufr[EBP]
+	MOVL	pa_argdata+argdata_value.B[EBP], EAX
+	SUBL	EBX, EAX		;Calculate length of the string
+	MOVL	pa_argdata+argdata_length.B[EBP], EBX ;Give it to him
+	BTSL	pa_argdata+argdata_flags.B[EBP], #ADF%LSVAL
+	JMP	callusr.S
+
+;Here if do not want a long string value - return this as a short string
+;  (which can be up to 4 characters long)
+
+20$:	MOVL	pa_count.B[EBP], #4
+	LEAL	ESI, pa_argdata+argdata_value.B[EBP]
+	LEAL	EDI, pa_argbufr[EBP]
+22$:	MOVL	EDX, #toolfmt
+	DECL	pa_count.B[EBP]
+	JE	17$.S
+	MOVB	AL, [ESI]
+	INCL	ESI
+	MOVB	[EDI], AL
+	INCL	EDI
+	CMPB	AL, #0
+	JNE	22$.S
+26$:	DECL	pa_count.B[EBP]
+	JS	callusr.S
+	MOVB	[EDI], #0
+	INCL	EDI
+	JMP	26$.S
+
+callusr:LEAL	EAX, pa_argdata.B[EBP]
+	PUSHL	EAX
+	CALLI	argspec_func.B[EDI]
+callus2:POPL	ECX
+	TESTL	EAX, EAX
+	JE	30$.S
+	POPL	EAX
+	JMP	loop
+
+30$:	LEAVE
+	POPL	ESI
+	POPL	EDI
+	RET
+.PAGE
+;Here if no keyword table was specified
+
+nokeyw:	CMPL	pa_argfnc.B[EBP], #0.B	;Was an argument function given?
+	JE	14$			;No
+nonopt:	LEAL	EDI, pa_argbufr[EBP]	;Point to the argument buffer
+	MOVL	ECX, #512t		;Get maximum length
+	CMPB	AL, #'+'		;Does it start with a plus?
+	JNE	2$.S			;No
+	CMPB	arg_flags.B[EBP], #PAF%PATOM ;Yes - is this special?
+	JNC	2$.S			;No
+	MOVB	[EDI], AL		;Yes
+	INCL	EDI
+	CALL	getchr
+	JMP	6$.S	
+
+2$:	TESTL	EAX, EAX		;End of string?
+	JLE	6$.S			;Yes
+	CMPB	pa_inquote.B[EBP], #0	;No - in quoted string?
+	JNE	4$.S			;Yes
+	CMPB	AL, #'/'		;No - start of option?
+	JE	6$.S			;Yes
+	CMPB	AL, #'+'		;Maybe
+	JNE	4$.S			;No
+	BTL	arg_flags.B[EBP], #PAF%PATOM
+	JNC	6$.S			;Yes
+4$:	DECL	ECX			;Not start of option - count it
+	JS	10$.S			;If too long
+	MOVB	[EDI], AL		;OK - store in buffer
+	INCL	EDI
+	CALL	getchr			;Get next character
+	JMP	2$.S			;Continue
+
+;Here with end of string while collecting argument
+
+6$:	MOVB	[EDI], #0		;Terminate the argument string
+	PUSHL	EAX			;Save stopper character
+	LEAL	EAX, pa_argbufr[EBP]
+	PUSHL	EAX
+	CALLI	pa_argfnc.B[EBP]	;Call user routine for the argument
+	JMP	callus2
+
+;Here if argument string is too long for our buffer
+
+10$:	LEAL	EAX, pa_argbufr[EBP]
+	PUSHL	EAX
+	PUSHL	#ai2lfmt
+	ADDL	EAX, #120t.B
+	PUSHL	EAX
+	CALL	sprintf#
+	ADDL	ESP, #12t.B
+	LEAL	EBX, pa_argbufr+120t[EBP]
+	CLRL	EDX
+	JMP	callerror.S
+
+;Here if no keyword table and no argument function given and have an argument
+
+14$:	MOVL	EAX, pa_cpnt.B[EBP]
+	DECL	EAX
+	PUSHL	EAX
+	PUSHL	#unexfmt
+	LEAL	EAX, pa_argbufr+80t[EBP]
+	PUSHL	EAX
+	CALL	sprintf
+	ADDL	ESP, #12t.B
+	LEAL	EBX, pa_argbufr+80t[EBP]
+	CLRL	EDX
+	JMP	callerror.S
+.PAGE
+;Subroutine to collect a numeric value
+;	c(AL)  = First character of value string
+;	c{ESI} = Pointer to value
+;	c{EDX} = Primary radix
+;	c{ECX} = Alternate radix (used if leading 0)
+;	CALL	collectval
+;	c(AL) = Next character after value
+
+collectval:
+	MOVL	pa_radix.B[EBP], EDX	;Assume want primary radix
+	MOVL	[ESI], #0		;Intialize the value
+	CMPB	AL, #'0'		;Does it start with 0?
+	JNE	6$.S			;No
+	MOVL	pa_radix.B[EBP], ECX	;Yes - assume alternate radix
+	CALL	getchr
+	CMPB	AL, #'X'		;Does he want hex?
+	JE	2$.S
+	CMPB	AL, #'x'
+	JNE	6$.S
+2$:	MOVL	pa_radix.B[EBP], #16t	;Yes
+4$:	CALL	getchr
+6$:	TESTB	_chrtbl#[EAX], #CT$HEXDG|CT$DIGIT
+	JE	10$.S
+	MOVL	ECX, EAX
+	CMPB	CL, #'A'
+	JB	8$.S
+	ADDB	CL, #9
+8$:	ANDB	CL, #0Fh
+	CMPB	CL, pa_radix.B[EBP]
+	JAE	10$.S
+	MOVL	EAX, [ESI]
+	IMULL	EAX, pa_radix.B[EBP]
+	ADDL	EAX, ECX
+	MOVL	[ESI], EAX
+	JMP	4$.S
+
+10$:	RET
+.PAGE
+	.SBTTL	callerror - Routine to process errors
+
+;Routine to process errors - this routine never returns directly - if the
+;  user specified an error function, that function is called and then a
+;  direct return from procarg is done - if the user did not specify an
+;  error function, this routine exits after printing an error message
+;	c{EBX} = Offset of first message string
+;	c{EDX} = Offset of second message string
+;	JMP	callerror
+
+callerror:
+	CMPL	arg_errfnc.B[EBP], #0.B	;Did he give us an error function?
+	JNE	8$.S			;Yes - go call it
+	PUSHL	EDX			;Save offset of 2nd string
+	PUSHL	EBX			;Output 1st string
+	PUSHL	#prgname#
+	PUSHL	#ce1fmt
+	PUSHL	#_stderr#
+	CALL	fprintf#
+	ADDL	ESP, #16t.B
+	POPL	ECX			;Restore offset of 2nd string
+	JREGZ	ECX, 4$			;If no 2nd string
+	PUSHL	ECX
+	PUSHL	#nullstr
+	PUSHL	#prgname#
+	CALL	strlen#
+	POPL	ECX
+	PUSHL	EAX
+	PUSHL	#ce2fmt
+	PUSHL	#_stderr#
+	CALL	fprintf#
+	ADDL	ESP, #20t.B
+4$:	PUSHL	#1.B
+	CALL	exit#
+
+;Here if the user specified an error function
+
+8$:	PUSHL	EDX
+	PUSHL	EBX
+	CALLI	arg_errfnc.B[EBP]
+	ADDL	ESP, #8t.B
+	MOVB	pa_haveend.B[EBP], #1
+	CLRL	EAX
+	LEAVE
+	POPL	ESI
+	POPL	EDI
+ret020:	RET
+.PAGE
+	.SBTTL	skipws - Subroutine to skip whitespace and return next character
+
+;Subroutine to skip whitespace and return next character
+;	c{EAX} = Current character
+;	CALL	skipws
+;	c{EAX} = Next character
+
+skipws:	TESTL	EAX, EAX		;At end of string?
+	JE	4$.S			;Yes
+	TESTB	_chrtbl#[EAX], #CT$SPACE ;No - whitespace character?
+	JE	ret020.S		;No - just return with it
+4$:	CALL	getchr			;Yes - get next character
+	JMP	skipws.S		;Continue
+.PAGE
+	.SBTTL	getchr - Subroutine to get next input character
+
+;Subroutine to get next input character (this level routine mainly handles
+;  quoted strings)
+;	CALL	getchr
+;	c{EAX} = Character (0 if end of string, -1 if end of input)
+
+getchr:	CMPB	pa_haveend.B[EBP], #0
+	JE	2$.S
+	CMPL	pa_ifb.B[EBP], #0.B
+	JE	6$.S
+2$:	CMPB	pa_inquote.B[EBP], #0
+	JE	10$.S
+	CALL	xgetchr
+	TESTL	EAX, EAX
+	JS	8$.S
+	CMPB	AL, #'"'		;Have a quote?
+	JNE	4$.S			;No - just return it
+	CALL	xgetchr			;Yes - get next character
+	CMPB	AL, #'"'		;Another quote?
+	JE	4$.S			;Yes - return it
+	MOVB	pa_inquote.B[EBP], #0	;No - indicate not in quotes now
+	BTL	arg_flags.B[EBP], #PAF%EATQUOTE
+	JC	11$.S
+	CALL	ungetchr
+	MOVB	AL, #'"'
+4$:	RET
+	
+;Here if at end of input
+
+6$:	MOVL	EAX, #-1
+	RET
+
+;Here if have end of input while in quoted string - this is a fatal error
+
+8$:	MOVL	EBX, #uqsmsg
+	CLRL	EDX
+	JMP	callerror
+
+;Here if not in quotes now
+
+10$:	CALL	xgetchr			;Get next character
+	CMPB	AL, #'"'		;Quote character?
+	JE	12$.S			;Yes
+11$:	TESTB	_chrtbl#[EAX], #CT$SPACE
+	JE	14$.S
+	CLRL	EAX
+	RET
+
+12$:	MOVB	pa_inquote.B[EBP], #1	;Indicate in quotes now
+	BTL	arg_flags.B[EBP], #PAF%EATQUOTE
+	JC	2$.S
+14$:	RET
+.PAGE
+	.SBTTL	xgetchr - Subroutine to get character at lowest level
+
+;Subroutine to get character at lowest level
+;	CALL	xgetchr
+;	c{EAX} = Character (-1 means end of input)
+
+xgetchr:CMPL	pa_ifb.B[EBP], #0.B	;Getting input from a file?
+	JE	10$.S			;No
+	MOVL	EBX, pa_ifb.B[EBP]
+	MOVL	EAX, ifb_point.B[EBX]
+	MOVZBL	EAX, [EAX]
+	CMPB	AL, #0.B
+	JE	2$.S
+	CMPB	AL, #LF.B
+	JNE	6$.S
+2$:	BTL	arg_flags.B[EBP], #PAF%ECHOINDIR
+	JNC	4$.S
+	PUSHL	#_stdout#
+	PUSHL	#LF.B
+	CALL	fputc#
+	ADDL	ESP, #8t.B
+4$:	JMP	fillbufr
+
+6$:	INCL	ifb_point.B[EBX]
+	BTL	arg_flags.B[EBP], #PAF%ECHOINDIR
+	JNC	8$.S
+	PUSHL	EAX
+	PUSHL	#_stdout
+	PUSHL	EAX
+	CALL	fputc#
+	ADDL	ESP, #8t.B
+	POPL	EAX
+8$:	RET
+
+;Here if not reading from an indirect file
+
+10$:	MOVL	EBX, pa_cpnt.B[EBP]
+	INCL	pa_cpnt.B[EBP]
+	MOVZBL	EAX, [EBX]
+	ORB	AL, AL			;Return if not end of string
+	JNE	8$.S
+	MOVL	EBX, pa_apnt.B[EBP]	;Advance to next string
+	ADDL	pa_apnt.B[EBP], #4.B
+	MOVL	EAX, [EBX]
+	MOVL	pa_cpnt.B[EBP], EAX
+	TESTL	EAX, EAX		;Do we have another string?
+	JNE	12$.S			;Yes - return 0 this time
+	MOVB	pa_haveend.B[EBP], #1	;No - indicate at end
+	MOVL	EAX, #-1		;Return -1 with C set
+	RET
+
+12$:	CLRL	EAX
+	RET
+.PAGE
+	.SBTTL	ungetchr - Subroutine to unget a character
+
+;Subroutine to unget a character
+;	CALL	ungetchr
+
+ungetchr:
+	CMPL	pa_ifb.B[EBP], #0.B
+	JE	4$.S
+	MOVL	EBX, pa_ifb.B[EBP]
+	DECL	ifb_point.B[EBX]
+	RET
+
+4$:	DECL	pa_cpnt.B[EBP]
+	RET
+.PAGE
+	.SBTTL	fillbufr - Subroutine to fill the current line buffer
+
+;Subroutine to fill the current line buffer
+;	CALL	fillbufr
+;	c{EAX} = First character (which is always a null, to ensure that no
+;		   strings get split across files)
+
+fillbufr:
+	MOVL	EBX, pa_ifb.B[EBP]
+	PUSHL	ifb_stream.B[EBX]
+	PUSHL	#512t
+	ADDL	EBX, #ifb_buffer.B
+	PUSHL	EBX
+	CALL	fgets#
+	ADDL	ESP, #12t.B
+	TESTL	EAX, EAX
+	JNE	8$.S
+	PUSHL	errno#
+	MOVL	EBX, pa_ifb.B[EBP]
+	PUSHL	ifb_stream.B[EBX]
+	CALL	fclose#
+	POPL	ECX
+	MOVL	EBX, pa_ifb.B[EBP]
+	MOVL	EAX, ifb_previous.B[EBX]
+	MOVL	pa_ifb.B[EBP], EAX
+	PUSHL	EBX
+	CALL	free#
+	POPL	ECX
+	POPL	EAX
+	CMPL	EAX, #0.B
+	JE	4$.S
+	NEGL	EAX			;Negate for XOS error code
+	CMPL	EAX, #ER_EOF.B
+	JNE	ioerror.S
+4$:	CLRL	EAX
+	MOVL	errno#, #0
+	RET
+
+8$:	MOVL	EBX, pa_ifb.B[EBP]
+	LEAL	EAX, ifb_buffer.B[EBX]
+	MOVL	ifb_point.B[EBX], EAX
+	CLRL	EAX
+	RET
+.PAGE
+	.SBTTL	ioerror - Subroutine to display message for IO error
+
+;Routine to display message for IO error (never returns)
+;	c{EAX} = XOS error code (i.e., negative)
+;	c{EBX} = Offset of message
+;	JMP	ioerror
+
+ioerror:SUBL	ESP, #100t.B
+	MOVL	EDX, ESP
+	PUSHL	EAX
+	PUSHL	#3.B
+	PUSHL	DS
+	PUSHL	EDX
+	CALLF	svcSysErrMsg#
+	JMP	callerror
+
+	.END

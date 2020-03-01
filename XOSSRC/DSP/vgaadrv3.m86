@@ -1,0 +1,790 @@
+	.TITLE	VGAADRV3 - Loadable driver for basic VGA display
+
+;++++
+; This software is in the public domain.  It may be freely copied and used
+; for whatever purpose you see fit, including commerical uses.  Anyone
+; modifying this software may claim ownership of the modifications, but not
+; the complete derived code.  It would be appreciated if the authors were
+; told what this software is being used for, but this is not a requirement.
+
+;   THIS SOFTWARE IS PROVIDED BY THE AUTHORS "AS IS" AND ANY EXPRESS OR
+;   IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
+;   OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+;   IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+;   INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+;   BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS
+;   OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+;   ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR
+;   TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
+;   USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+;----
+
+	.PROC	80486
+	.INCLUD	XOSINC:\XMAC\XOS.PAR
+	.INCLUD	XOSINC:\XMAC\XOSX.PAR
+	.INCLUD	XOSINC:\XMAC\XOSERR.PAR
+	.INCLUD	XOSINC:\XMAC\XOSTRM.PAR
+	.INCLUD	XOSINC:\XMAC\XOSXTRM.PAR
+	.INCLUD	XOSINC:\XMAC\XOSDOS.PAR
+	.INCLUD	XOSINC:\XMAC\PCAT.PAR
+	.INCLUD	XOSINC:\XMAC\XOSLKE.PAR
+	.INCLUD	XOSINC:\XMAC\XOSXLKE.PAR
+
+	LKECONT
+	CODE
+
+	.SBTTL	vgadspcur - Subroutine to set cursor on screen
+
+;Subroutine to set on screen cursor - must be called at fork level
+;	CALL	vgadspcur
+
+vgadspcur::
+	PUSHL	EAX			;Save count
+	MOVZBL	EBX, tdb_dsppage[ESI]	;Get page number
+	MOVZBL	ECX, tdb_curpos+1.B[ESI+EBX*2] ;Calculate character offset on
+	IMULL	ECX, tdb_columns[ESI]	       ;  screen
+	ADDL	ECX, ECX
+	MOVL	EDX, tdb_pgsize[ESI]	;Get offset to start of page
+	IMULL	EDX, EBX
+	ADDL	ECX, EDX		;Add it in
+	SHRL	ECX, #1
+	MOVZBL	EAX, tdb_curpos+0.B[ESI+EBX*2]
+	ADDL	ECX, EAX
+	MOVW	tdb_dcurpos[ESI], CX	;Store new values for the display
+					;  registers
+	ORB	tdb_stsdsp+1.B[ESI], #TSD$MCURSOR>8 ;Remember cursor position
+						    ;  changed
+	TESTB	tdb_stsdsp+1.B[ESI], #TSD$ACTDSP>8 ;Is this the active display?
+	JE	6$.S			;No
+	TESTB	tdb_stsdsp+1.B[ESI], #TSD$FCURSOR>8 ;Yes - is the cursor frozen?
+	JNE	6$.S			;Yes
+	MOVL	EDX, tdb_bioreg[ESI]	;No - update hardware state
+	ADDL	EDX, #P_EGACCRTINDX-P_EGABASE.B
+	MOVB	AL, #15t		;Point to cursor register in CRTC
+	OUTB	[DX]
+	IOPAUSE
+	INCL	EDX
+	MOVB	AL, CL
+	OUTB	[DX]
+	IOPAUSE
+	DECL	EDX
+	MOVB	AL, #14t
+	OUTB	[DX]
+	IOPAUSE
+	INCL	EDX
+	MOVB	AL, CH
+	OUTB	[DX]
+6$:	CALL	xosconDosChk##		;Is this terminal for a DOS process?
+	JE	8$.S			;No
+	MOVW	AX, tdb_curpos.B[ESI+EBX*2]	       ;Yes - update cursor pos
+	MOVW	GS:pdaRMPage0##+bda_vcurpos[EBX*2], AX ;  on real mode page 0
+8$:	CLC				;Make sure C is clear
+	POPL	EAX			;Restore count
+	RET				;And return
+.PAGE
+	.SBTTL	vgachratr - Subroutine to display character and attribute
+
+;Subroutine to display character and attribute at cursor position
+;	c(AL)  = Character
+;	c(AH)  = Attribute byte
+;	c{EBX} = Page number
+;	c(DL)  = Horizontal position
+;	c(DH)  = Vertical position
+;	c{ESI} = Offset of terminal TDB
+;	CALL	vgachratr
+
+vgachratr::
+	CMPB	tdb_mode[ESI], #DM_TEXT ;Text mode display?
+	JNE	gferr.S			;No - can't do this!
+	PUSHL	EDX			;Yes - save position
+	MOVL	ECX, tdb_pgsize[ESI]	;Get page size
+	IMULL	ECX, EBX		;Times page number
+	MOVZBL	EDX, DH			;Get vertical position in page
+	IMULL	EDX, tdb_columns[ESI]
+	ADDL	EDX, EDX
+	ADDL	ECX, EDX
+	POPL	EDX			;Restore position
+	MOVZBL	EDX, DL			;Add in position in line
+	ADDL	EDX, EDX
+	ADDL	ECX, EDX
+	ADDL	ECX, tdb_vtaddr.B[ESI]	;Add in offset of screen
+	MOVW	[ECX], AX		;Put character and attribute on screen
+	RET				;Finished
+.PAGE
+	.SBTTL	vgachr - Subroutine to display character
+
+;Subroutine to display character at cursor position
+;	c(AL)  = Character
+;	c{EBX} = Page number
+;	c(CL)  = Foreground color
+;	c(CH)  = Background color
+;	c(DL)  = Horizontal position
+;	c(DH)  = Vertical position
+;	c{ESI} = Offset of terminal TDB
+;	CALL	vgachr
+;  EBX is preserved
+
+vgachr::CMPB	tdb_mode[ESI], #DM_TEXT ;Text mode display?
+	JNE	gferr.S			;No - can't do this!
+	PUSHL	EDX			;Yes - save position
+	MOVL	ECX, tdb_pgsize[ESI]	;Get page size
+	IMULL	ECX, EBX		;Times page number
+	MOVZBL	EDX, DH			;Get vertical position in page
+	IMULL	EDX, tdb_columns[ESI]
+	ADDL	EDX, EDX
+	ADDL	ECX, EDX
+	POPL	EDX			;Restore position
+	MOVZBL	EDX, DL			;Add in position in line
+	ADDL	EDX, EDX
+	ADDL	ECX, EDX
+	ADDL	ECX, tdb_vtaddr.B[ESI]	;Add in offset of screen
+	MOVB	[ECX], AL		;Put character on screen
+	RET				;Finished
+.PAGE
+	.SBTTL	vgascroll - Function to scroll window (INT 10, func. 06 & 07)
+
+;Function to scroll window (INT 10, functions 06 & 07)
+;	c(AL)  = Function: 0 = up, 1 = down, 2 = right, 3 = left
+;	c(BL)  = Page number
+;	c(BH)  = Number of lines to scroll (positive is down, negative is up)
+;	c(CL)  = X coordinate, upper left corner of window
+;	c(CH)  = Y coordinate, upper left corner of window
+;	c(DL)  = X coordinate, lower right corner of window
+;	c(DH)  = Y coordinate, lower right corner of window
+;	c{ESI} = Offset of TDB
+;	CALL	vgascroll
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  c{EAX} = 0
+
+$$$=!0
+FRM  sc_func  , 1t	;Function
+FRM           , 3t
+FRM  sc_length, 4t	;Length of line to scroll (in bytes)
+FRM  sc_fline , 4t	;First line in window
+FRM  sc_distsl, 4t	;Distance to scroll in scan lines (+ is down, - is up)
+FRM  sc_distcl, 4t	;Distance to scroll in character lines
+FRM  sc_height, 4t	;Height of window
+FRM  sc_fill  , 4t	;Fill colors
+FRM  sc_offset, 4t	;Screen offset
+FRM  sc_table , 4t	;Offset of scan line table
+FRM  sc_incr  , 4t	;Address increment for EGA scroll
+sc_SIZE=!$$$
+
+gferr:	MOVL	EAX, #ER_FUNCM
+	STC
+	RET
+
+vgascroll::
+	CMPB	tdb_mode[ESI], #DM_TEXT ;Text mode?
+	JNE	gferr.S			;No - can't do that!
+	CMPB	DL, tdb_columns[ESI]	;Yes - make sure window coordinates
+	JB	2$.S			;  are valid
+	MOVB	DL, tdb_columns[ESI]
+	DECL	EDX
+2$:	CMPB	DH, tdb_rows[ESI]
+	JB	4$.S
+	MOVB	DH, tdb_rows[ESI]
+	DECB	DH
+4$:	CMPB	CL, DL
+	JBE	6$.S
+	MOVB	CL, DL
+6$:	CMPB	CH, DH
+	JBE	8$.S
+	MOVB	CH, DH
+8$:	ENTER	sc_SIZE, 0
+	CMPB	BH, #0			;Want to clear the window?
+	JNE	10$.S			;No
+	MOVB	AL, #1			;Yes - use correct function for this
+10$:	MOVB	sc_func.B[EBP], AL	;Store function
+	MOVXBL	EAX, BH			;Store distance to scroll
+	MOVL	sc_distsl.B[EBP], EAX
+	MOVL	sc_distcl.B[EBP], EAX
+	MOVZBL	EAX, CH			;Store first line in window
+	MOVL	sc_fline.B[EBP], EAX
+	MOVZBL	EDI, DH			;Store height of window
+	SUBL	EDI, EAX
+	INCL	EDI
+	MOVL	sc_height.B[EBP], EDI
+	MOVZBL	EBX, BL			;Get page number
+	CMPB	BL, #8t.B		;Valid page number?
+	JB	12$.S			;Yes
+	MOVB	BL, #0			;No - use page 0!
+12$:	IMULL	EBX, tdb_pgsize[ESI]	;Get offset in display buffer
+	ADDL	EBX, tdb_vtaddr.B[ESI]
+	MOVZBL	ECX, CL			;Get distance to left side of window
+	MOVL	EAX, ECX
+	ADDL	ECX, ECX		;Change to bytes
+	ADDL	EBX, ECX		;Add into offset
+	MOVL	sc_offset.B[EBP], EBX
+	CMPB	DL, tdb_columns[ESI]	;Too far right?
+	JB	14$.S			;No
+	MOVB	DL, tdb_columns[ESI]	;Yes
+	DECB	DL
+14$:	MOVZBL	ECX, DL			;Get distance to right side of window
+	SUBL	ECX, EAX		;Calculate width of window
+	INCL	ECX
+	ADDL	ECX, ECX		;Change to bytes
+	MOVL	sc_length.B[EBP], ECX
+	MOVB	AH, tdb_tattrfil[ESI]	;Construct fill pattern
+	MOVB	AL, #' '
+	MOVL	EBX, EAX
+	SHLL	EAX, #16t
+	MOVW	AX, BX
+	MOVL	sc_fill.B[EBP], EAX
+	PUSHL	DS
+	POPL	ES
+	CLD
+	PUSHL	ESI
+	MOVZBL	EAX, sc_func.B[EBP]	;Dispatch on the function
+	JMPIL	scrtdsp[EAX*4]
+
+	DATA
+
+scrtdsp:.LONG	scrtup		; 0 = Up
+	.LONG	scrtdown	; 1 = Down
+	.LONG	scrtright	; 2 = Right
+	.LONG	scrtleft	; 3 = Left
+
+	CODE
+.PAGE
+;Here to scroll up
+
+scrtup:	MOVL	EDX, sc_height.B[EBP]
+	CMPL	EDX, sc_distcl.B[EBP]	;Too much?
+	JBE	scrtclr			;Yes
+	SUBL	EDX, sc_distcl.B[EBP]	;No - calculate number of lines to move
+	MOVL	ECX, tdb_columns[ESI]	;Get and save amount to increment
+	ADDL	ECX, ECX		;  pointers
+	MOVL	sc_incr.B[EBP], ECX
+	MOVL	EAX, sc_fline.B[EBP]
+	MOVL	EBX, EAX
+	ADDL	EAX, sc_distcl.B[EBP]
+	IMULL	EAX, ECX
+	ADDL	EAX, sc_offset.B[EBP]
+	IMULL	EBX, ECX
+	ADDL	EBX, sc_offset.B[EBP]
+2$:	MOVL	ESI, EAX		;Get address of source line
+	MOVL	EDI, EBX		;Get address of destination line
+	MOVL	ECX, sc_length.B[EBP]	;Get length of line
+	SHRL	ECX, #2			;Change to number of longs (round down)
+	RMOVSL	[EDI], [ESI]		;Move longs
+	TESTB	sc_length.B[EBP], #2	;Have a word left over?
+	JE	4$.S			;No
+	MOVSW	[EDI], [ESI]		;Yes - move it
+4$:	TESTB	sc_length.B[EBP], #1	;Have a byte left over?
+	JE	6$.S			;No
+	MOVSB	[EDI], [ESI]		;Yes - move it
+6$:	ADDL	EAX, sc_incr.B[EBP]	;Bump pointers
+	ADDL	EBX, sc_incr.B[EBP]
+	DECL	EDX			;More to move?
+	JNE	2$.S			;Yes - continue
+	MOVL	EAX, sc_fill.B[EBP]	;No - get fill pattern
+	MOVL	EDX, sc_distcl.B[EBP]	;Get amount to clear
+8$:	MOVL	EDI, EBX		;Get address of line to clear
+	MOVL	ECX, sc_length.B[EBP]
+	SHRL	ECX, #2			;Change to number of longs (round down)
+	RSTOSL	[EDI]			;Store longs
+	TESTB	sc_length.B[EBP], #2	;Have a word left over?
+	JE	10$.S			;No
+	STOSW	[EDI]			;Yes - store it
+10$:	TESTB	sc_length.B[EBP], #1	;Have a byte left over?
+	JE	12$.S			;No
+	STOSB	[EDI]			;Yes - store it
+12$:	ADDL	EBX, sc_incr.B[EBP]
+	DECL	EDX
+	JNE	8$.S
+	POPL	ESI
+	LEAVE
+	RET
+.PAGE
+;Here to scroll down
+
+scrtdown:
+	MOVL	EDX, sc_height.B[EBP]
+	CMPL	EDX, sc_distcl.B[EBP]	;Too much?
+	JA	4$.S			;No
+scrtclr:MOVL	sc_distcl.B[EBP], #0	;Yes - just clear the window
+	MOVL	EDX, sc_height.B[EBP]
+4$:	SUBL	EDX, sc_distcl.B[EBP]	;Calculate number of lines to move
+	MOVL	EAX, sc_fline.B[EBP]	;Calculate first destination line
+	DECL	EAX
+	MOVL	EBX, EAX
+	ADDL	EBX, sc_height.B[EBP]
+	MOVL	ECX, tdb_columns[ESI]
+	ADDL	ECX, ECX
+	MOVL	sc_incr.B[EBP], ECX
+	IMULL	EBX, ECX
+	ADDL	EBX, sc_offset.B[EBP]
+	CMPL	sc_distcl.B[EBP], #0.B	;Anything to move at all?
+	JE	12$.S			;No
+	ADDL	EAX, EDX		;Yes - calculate first source line
+	IMULL	EAX, ECX
+	ADDL	EAX, sc_offset.B[EBP]
+6$:	MOVL	ESI, EAX		;Get address of source line
+	MOVL	EDI, EBX		;Get address of destination line
+	MOVL	ECX, sc_length.B[EBP]	;Get length of line
+	SHRL	ECX, #2			;Change to number of longs (round down)
+	RMOVSL	[EDI], [ESI]		;Move longs
+	TESTB	sc_length.B[EBP], #2	;Have a word left over?
+	JE	8$.S			;No
+	MOVSW	[EDI], [ESI]		;Yes - move it
+8$:	TESTB	sc_length.B[EBP], #1	;Have a byte left over?
+	JE	10$.S			;No
+	MOVSB	[EDI], [ESI]		;Yes - move it
+10$:	SUBL	EAX, sc_incr.B[EBP]	;Bump pointers
+	SUBL	EBX, sc_incr.B[EBP]
+	DECL	EDX			;More to move?
+	JNE	6$.S			;Yes - continue
+12$:	MOVL	EAX, sc_fill.B[EBP]	;Get fill pattern
+	MOVL	EDX, sc_distcl.B[EBP]	;Get amount to clear
+	TESTL	EDX, EDX		;Clearing entire window?
+	JNE	14$.S			;No
+	MOVL	EDX, sc_height.B[EBP]	;Yes - get height of window
+14$:	MOVL	EDI, EBX		;Get address of line to clear
+	MOVL	ECX, sc_length.B[EBP]
+	SHRL	ECX, #2			;Change to number of longs (round down)
+	RSTOSL	[EDI]			;Store longs
+	TESTB	sc_length.B[EBP], #2	;Have a word left over?
+	JE	16$.S			;No
+	STOSW	[EDI]			;Yes - store it
+16$:	TESTB	sc_length.B[EBP], #1	;Have a byte left over?
+	JE	18$.S			;No
+	STOSB	[EDI]			;Yes - store it
+18$:	SUBL	EBX, sc_incr.B[EBP]
+	DECL	EDX
+	JNE	14$.S
+	POPL	ESI
+	LEAVE
+	RET
+.PAGE
+;Here to scroll left
+
+scrtleft:
+	MOVL	EDX, sc_length.B[EBP]
+	MOVL	EAX, sc_distcl.B[EBP]	;Too much?
+	ADDL	EAX, EAX
+	CMPL	EDX, EAX
+	JBE	scrtclr			;Yes
+	MOVL	sc_distcl.B[EBP], EAX	;No
+	SUBL	EDX, EAX		;Calculate number of bytes to move
+	MOVL	EAX, sc_fline.B[EBP]
+	IMULL	EBX, EAX, #160t
+	ADDL	EBX, sc_offset.B[EBP]
+4$:	MOVL	ESI, EBX		;Set up pointers to move data left
+	MOVL	EDI, ESI
+	ADDL	ESI, sc_distcl.B[EBP]
+	MOVL	ECX, EDX
+	CLD
+	SHRL	ECX, #1
+	RMOVSW	[EDI], [ESI]		;Move the line left
+	MOVL	EAX, sc_fill.B[EBP]	;Get fill pattern
+	MOVL	ECX, sc_distcl.B[EBP]	;Get amount to fill
+	SHRL	ECX, #1
+	RSTOSW	[EDI]			;Store fill pattern
+	DECL	sc_height.B[EBP]	;More lines to move?
+	JNE	4$.S			;Yes - continue
+	POPL	ESI			;No - finished
+	LEAVE
+	RET
+.PAGE
+;Here to scroll right
+
+scrtright:
+	MOVL	EDX, sc_length.B[EBP]
+	MOVL	EAX, sc_distcl.B[EBP]	;Too much?
+	ADDL	EAX, EAX
+	CMPL	EDX, EAX
+	JBE	scrtclr			;Yes
+	MOVL	sc_distcl.B[EBP], EAX	;No
+	SUBL	EDX, EAX		;Calculate number of bytes to move
+	MOVL	EAX, sc_fline.B[EBP]
+	IMULL	EBX, EAX, #160t
+	ADDL	EBX, sc_offset.B[EBP]
+	ADDL	EBX, sc_length.B[EBP]
+	SUBL	EBX, #2t.B
+4$:	MOVL	ESI, EBX		;Set up pointers to move data right
+	MOVL	EDI, ESI
+	SUBL	ESI, sc_distcl.B[EBP]
+	MOVL	ECX, EDX
+	STD
+	SHRL	ECX, #1
+	RMOVSW	[EDI], [ESI]		;Move the line right
+	MOVL	EAX, sc_fill.B[EBP]	;Get fill pattern
+	MOVL	ECX, sc_distcl.B[EBP]	;Get amount to fill
+	SHRL	ECX, #1
+	RSTOSW	[EDI]			;Store fill pattern
+	DECL	sc_height.B[EBP]	;More lines to move?
+	JNE	4$.S			;Yes - continue
+	POPL	ESI			;No - finished
+	LEAVE
+	RET
+.PAGE
+	.SBTTL	vgaloadfont - Subroutine to load a display font
+
+;Subroutine to load a display font
+;	c(AL)     = Font:
+;		      0 = Load custom font
+;		      1 = Load standard 8x8 font
+;		      2 = Load standard 8x14 font
+;		      3 = Load standard 8x16 font
+;		      5 = Load standard 9x8 font
+;		      6 = Load standard 9x14 font
+;		      7 = Load standard 9x16 font
+;	c(AH)     = Bits 2-0 = Table number
+;		    Bits 6-3 = Not used, must be 0
+;		    Bit  7: 0 = Do not change display set up
+;			    1 = Adjust display set up to match font
+;	c{ES:EDI} = Address of custom font table (if c(AL) = 0)
+;	c{ECX}    = Number of characters to load
+;	c{EDX}    = First character to load
+;	c(BL)     = Bytes per character (if c(AL) = 0)
+;	c{ESI}    = Offset of terminal TDB
+;	CALL	vgaloadfont
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+
+$$$=!0
+FRM lf_buffer, 8t
+FRM lf_page  , 4t
+FRM          , 2t
+FRM lf_size  , 1t		;Font size
+FRM lf_table , 1t
+FRM lf_font  , 4t
+FRM lf_page  , 4t
+FRM lf_begin , 4t
+FRM lf_count , 4t
+lf_SIZE=!$$$
+
+vgaloadfont::
+	ENTER	lf_SIZE, 0
+	MOVL	lf_buffer+0.B[EBP], EDI
+	MOVL	lf_buffer+0.B[EBP], ES
+	MOVB	lf_size.B[EBP], BL
+	CMPB	AL, #7
+	JA	2$.S
+	MOVB	lf_table.B[EBP], AH
+	ANDB	AH, #7Fh
+	MOVZBL	EDI, AH			;Get table number
+	CMPL	EDI, #7.B		;Valid?
+	JA	2$.S			;No - fail
+	MOVZBL	EDI, pgxlate[EDI]	;Yes - translate to display page number
+	MOVL	lf_page.B[EBP], EDI
+	MOVZBL	EAX, AL			;Get font number
+	CMPL	EAX, #7.B		;Valid?
+2$:	JA	knlBadValueLv##		;No - fail
+	ADDL	EAX, EAX		;Yes - get font * 2
+	MOVL	lf_font.B[EBP], EAX
+	CMPL	EDX, #127t.B		;Storing into first page?
+	JBE	4$.S			;Yes
+	INCL	lf_page.B[EBP]		;No - start with second page
+	SUBL	EDX, #128t
+4$:	MOVL	lf_begin.B[EBP], EDX	;Save beginning character
+	MOVL	lf_count.B[EBP], ECX	;Save number of characters
+	TESTB	tdb_stsdsp+1.B[ESI], #TSD$ACTDSP>8 ;Is this the active display?
+	JE	6$.S			;No
+	CALL	vgawrtchargen#		;Yes - set up to access character
+					;  generator memory
+6$:	MOVL	EDI, lf_page.B[EBP]
+	MOVL	EDX, EDI
+	SHLL	EDI, #12t
+	ADDL	EDI, tdb_vtaddr.B[ESI]
+	PUSHL	ESI
+	TESTB	tdb_pglist+3[ESI+EDX*4], #PL$MODIFIED>24t
+					;Has the page been modified?
+	JNE	10$.S			;Yes
+	ORB	tdb_pglist+3[ESI+EDX*4], #PL$MODIFIED>24t
+					;No - indicate modified now
+	TESTB	tdb_pglist+3[ESI+EDX*4], #PL$VIRTUAL>24t ;Is it virtual?
+	JE	10$.S			;No
+
+;Here if the character generator page to modify is virtual and has not
+;  been modified since it was initialized - If we are not writting the entire
+;  page we must realize it with its initialized contents first.  For text
+;  pages this is done automatically by the screen symbiont since the initial
+;  contents is defined completely by the page list value.  The screen symbiont
+;  does not have ready access to the font tables and since we already have
+;  all the code to store fonts here, it seems easier to do this here rather
+;  than in the screen symbiont.
+
+	CMPL	lf_begin.B[EBP], #0	;Starting with first character?
+	JNE	8$.S			;No
+	CMPL	lf_count.B[EBP], #127t.B ;Yes - filling entire page?
+	JBE	10$.S			;Yes - nothing needed here
+8$:	MOVZWL	EAX, tdb_pglist[ESI+EDX*4]
+	MOVL	ESI, vgafonttbl#[EAX*4]
+	MOVB	DL, #128t
+	MOVB	DH, #0
+	PUSHL	EDI
+	CALL	vgainitchargen#
+	POPL	EDI
+10$:	MOVL	EAX, lf_font.B[EBP]
+	TESTL	EAX, EAX
+	JNE	12$.S
+	IFFAULT	18$
+	LFSL	ESI, lf_buffer.B[EBP]
+	MOVZBL	EBX, lf_size.B[EBP]
+	JMP	14$.S
+
+;Here if loading standard font
+
+12$:	MOVL	ESI, vgafonttbl#[EAX*4]
+	TESTL	ESI, ESI
+	JE	16$.S
+	MOVZBL	EBX, vgafontsize#[EAX]
+	MOVB	lf_size.B[EBP], BL
+	PUSHL	DS
+	POPL	FS
+14$:	MOVB	DL, lf_count.B[EBP]
+	MOVB	DH, lf_begin.B[EBP]
+	CALL	vgainitchargen#
+	POPL	ESI
+	TESTB	lf_page.B[EBP], #01h	;Finished?
+	JNE	20$.S			;Yes
+	MOVL	EAX, #128t		;Get number of characters already set up
+	SUBL	EAX, lf_begin.B[EBP]
+	SUBL	lf_count.B[EBP], EAX	;Reduce number to do
+	JLE	20$.S			;If finished
+	ADDL	lf_buffer.B[EBP], EAX
+	MOVL	lf_begin.B[EBP], #0	;Need to do the second page
+	INCL	lf_font.B[EBP]
+	INCL	lf_page.B[EBP]
+	JMP	6$
+
+;Here if have error while set up to write the character generator pages
+
+16$:	CALL	vgarestore#
+	JMP	knlBadValueLv##
+
+18$:	FAULTHDR
+	CALL	vgarestore#
+	JMP	knlRtnAdrErLv##
+
+;Here if finished loading the font characters
+
+20$:	TESTB	tdb_stsdsp+1.B[ESI], #TSD$ACTDSP>8 ;Is this the active display?
+	JE	22$.S			;No
+	CALL	vgarestore#		;Yes - restore VGA registers
+22$:	TESTB	lf_table.B[EBP], #80h	;Want to adjust display set up?
+	JE	44$			;No
+	MOVB	AL, lf_size.B[EBP]	;Update character size
+	CMPB	AL, tdb_charch[ESI]	;Did the character size change?
+	JE	44$			;No - nothing needed here
+	MOVB	DL, tdb_charch[ESI]	;Yes - save old size
+	MOVB	tdb_charch[ESI], AL	;Store new size
+	MOVZWL	EAX, tdb_dvertend[ESI]	;Calculate number of text rows
+	INCL	EAX
+	MOVZBL	ECX, tdb_charch[ESI]
+	CLRL	EDX
+	IDIVL	ECX
+	MOVB	tdb_rows[ESI], AL
+	IMULL	EAX, ECX		;Recalculate number of scan lines to
+	MOVL	tdb_vert[ESI], EAX	;  ensure no paritial text rows
+	DECL	EAX
+	MOVL	tdb_dvertend[ESI], EAX
+
+;Now we need to adjust the cursor shape if the font size has changed.  We
+;  first determine which of 7 basic shapes the cursor had with the previous
+;  font size and then set up the shape to be the same basic shape at the
+;  new font size.  The basic shapes are:
+;	1. Thin overline (1 line thick cursor at top of cell)
+;	2. Thick overline (2 line thick cursor at top of cell)
+;	3. Thin underline (1 line thick cursor at bottom of cell)
+;	4. Thick underline (2 line thick cursor at bottom of cell)
+;	5. Full block (cursor fills entire character cell)
+;	6. Upper half block
+;	7. Lower half block
+
+	MOVB	AL, tdb_curmode+1[ESI]	;Get cursor start row
+	CMPB	AL, #1t			;Is it at the top of the cell?
+	JA	30$.S			;No
+	MOVB	AH, tdb_curmode+0[ESI]	;Yes - get height of the cursor
+	SUBB	AH, AL
+	CMPB	AH, #1			;One or two line overline?
+	JLE	42$.S			;Yes - no adjustment needed
+
+	ADDB	AH, AH			;No - more than half the cell height?
+	CMPB	AH, DL
+	JA	26$.S			;Yes - have full block cursor
+
+;Here if have an upper half block cursor
+
+	MOVB	AL, tdb_charch[ESI]
+	SHRB	AL, #1
+	JMP	28$.S
+
+;Here if have a full block cursor
+
+26$:	MOVB	AL, tdb_charch[ESI]
+	DECB	AL
+28$:	MOVB	tdb_curmode+1[ESI], #0
+	JMP	40$.S
+
+;Here if cursor does not start at top of the cell
+
+30$:	MOVB	AH, AL			;Does it start below the middle?
+	ADDB	AH, AH
+	CMPB	AH, DL
+	JA	32$.S			;Yes
+
+;Here if have a lower half block cursor
+
+	MOVB	AL, tdb_charch[ESI]
+	SHRB	AL, #1t
+	JMP	38$.S
+
+;Here if cursor starts below the middle of the character cell
+
+32$:	MOVB	AH, DL
+	DECB	AH
+	CMPB	AL, AH
+	JB	34$.S			;If have 2 line underline cursor
+
+;Here if have a one line underline cursor
+
+	MOVB	AL, tdb_charch[ESI]
+	JMP	36$.S
+
+;Here if have a two line underline cursor
+
+34$:	MOVB	AL, tdb_charch[ESI]
+
+	DECB	AL
+36$:	DECB	AL
+38$:	MOVB	tdb_curmode+1[ESI], AL
+
+	MOVB	AL, tdb_charch[ESI]
+	DECB	AL
+40$:	MOVB	tdb_curmode+0[ESI], AL
+
+;Here with cursor adjustment complete
+
+42$:	TESTB	tdb_stsdsp+1.B[ESI], #TSD$ACTDSP>8 ;Is this the active display?
+	JE	44$			;No
+	MOVL	EDX, tdb_bioreg[ESI]	;Yes - point to CRT controller port
+	ADDL	EDX, #P_EGACCRTINDX-P_EGABASE.B
+	MOVB	AL, #09h		;Register 9
+	OUTB	[DX]
+	IOPAUSE
+	INCL	EDX
+	INB	[DX]
+	IOPAUSE
+	ANDB	AL, #0E0h
+	MOVB	AH, tdb_charch[ESI]
+	DECB	AH
+	ORB	AL, AH
+	OUTB	[DX]
+	DECL	EDX
+	MOVB	AL, #0Ah		;Register 0Ah
+	OUTB	[DX]
+	IOPAUSE
+	INCL	EDX
+	MOVB	AL, tdb_dcurmode+1[ESI]
+	OUTB	[DX]
+	IOPAUSE
+	DECL	EDX
+	MOVB	AL, #0Bh		;Register 0Bh
+	OUTB	[DX]
+	IOPAUSE
+	INCL	EDX
+	MOVB	AL, tdb_dcurmode+0[ESI]
+	OUTB	[DX]
+	IOPAUSE
+	DECL	EDX
+	MOVB	AL, #0Eh		;Register 0Eh
+	OUTB	[DX]
+	IOPAUSE
+	INCL	EDX
+	MOVB	AL, tdb_dcurpos+1[ESI]
+	OUTB	[DX]
+	IOPAUSE
+	DECL	EDX
+	MOVB	AL, #0Fh		;Register 0Fh
+	OUTB	[DX]
+	IOPAUSE
+	INCL	EDX
+	MOVB	AL, tdb_dcurpos+0[ESI]
+	OUTB	[DX]
+	IOPAUSE
+	DECL	EDX
+	MOVB	AL, #12h		;Register 12h (vertical display end)
+	OUTB	[DX]
+	IOPAUSE
+	INCL	EDX
+	MOVB	AL, tdb_dvertend+0[ESI]
+	OUTB	[DX]
+	IOPAUSE
+	DECL	EDX
+	MOVB	AL, #07h		;Register 07h (overflow bits)
+	OUTB	[DX]
+	IOPAUSE
+	INCL	EDX
+	INB	[DX]
+	IOPAUSE
+	ANDB	AL, #0BDh
+	MOVB	AH, tdb_dvertend+1[ESI]
+	ADDB	AH, AH
+	MOVB	CL, AH
+	SHLB	CL, #4t
+	ANDB	AH, #02h
+	ANDB	CL, #40h
+	ORB	CL, AH
+	ORB	AL, CL
+	OUTB	[DX]
+44$:	LEAVE
+	CLRL	EAX
+	RET
+.PAGE
+;Subroutine to set font size and tables
+;	c{ECX} = Font table for first 256 characters
+;	c{EDX} = Font table for second 256 characters
+;	CALL	vgaselfont
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+
+vgaselfont::
+	MOVB	AL, CL			;Construct value for the font select
+	SHLB	CL, #2			;  register
+	ANDB	AL, #03h
+	ANDB	CL, #10h
+	ORB	AL, CL
+	SHLB	DL, #2
+	MOVB	AH, DL
+	ADDB	DL, DL
+	ANDB	AH, #06h
+	ANDB	DL, #20h
+	ORB	AH, DL
+	ORB	AH, AL
+	MOVB	tdb_dfontsel.B[ESI], AH
+	TESTB	tdb_stsdsp+1.B[ESI], #TSD$ACTDSP>8 ;Is this the active display?
+	JE	4$.S			;No
+	MOVL	EDX, tdb_bioreg[ESI]	;Yes - point to sequencer port
+	ADDL	EDX, #P_EGASEQINDX
+	MOVB	AL, #03h		;Write register 3
+	OUTB	[DX]
+	IOPAUSE
+	INCL	EDX
+	MOVB	AL, AH
+	OUTB	[DX]
+4$:	RET
+.PAGE
+	.SBTTL	Data
+
+	DATA
+
+;Table which translates from character generator table number to display
+;  page number
+
+pgxlate:.BYTE	10		;Page 0
+	.BYTE	14		;Page 1
+	.BYTE	18		;Page 2
+	.BYTE	1C		;Page 3
+	.BYTE	12		;Page 4
+	.BYTE	16		;Page 5
+	.BYTE	1A		;Page 6
+	.BYTE	1E		;Page 7
+
+	END

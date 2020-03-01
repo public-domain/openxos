@@ -1,0 +1,2627 @@
+	.TITLE	HDKADRV - Hard disk device driver type A
+
+;++++
+; This software is in the public domain.  It may be freely copied and used
+; for whatever purpose you see fit, including commerical uses.  Anyone
+; modifying this software may claim ownership of the modifications, but not
+; the complete derived code.  It would be appreciated if the authors were
+; told what this software is being used for, but this is not a requirement.
+
+;   THIS SOFTWARE IS PROVIDED BY THE AUTHORS "AS IS" AND ANY EXPRESS OR
+;   IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
+;   OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+;   IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+;   INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+;   BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS
+;   OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+;   ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR
+;   TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
+;   USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+;----
+
+	.PROC	80486
+	.INCLUD	XOSINC:\XMAC\XOS.PAR
+	.INCLUD	XOSINC:\XMAC\XOSX.PAR
+	.INCLUD	XOSINC:\XMAC\XOSERR.PAR
+	.INCLUD	XOSINC:\XMAC\XOSTIME.PAR
+	.INCLUD	XOSINC:\XMAC\PCAT.PAR
+	.INCLUD	XOSINC:\XMAC\XOSXDISK.PAR
+	.INCLUD	XOSINC:\XMAC\XOSDISK.PAR
+	.INCLUD	XOSINC:\XMAC\XOSLKE.PAR
+	.INCLUD	XOSINC:\XMAC\XOSXLKE.PAR
+	.INCLUD	XOSINC:\XMAC\XOSXHDK.PAR
+
+;This is the device driver for the standard PC/AT hard disk controller.
+
+$$DSKWRITE=!0		;Set non-zero for write only debug posting
+$$CHKLST  =!0		;Set to 1 to include code for checking buffer lists
+			;  for debugging
+
+MAJV   =!1t
+MINV   =!0t
+EDITNUM=!5t
+
+;v1.0.0  17-JuL-94
+;	Initial version
+;v1.0.1  19-Jan-95
+;	Added general support for extended IDE controllers (for > 0.5GB drives)
+;	(this version also replaces HDKBDRV which provided temporary support
+;	for large drives).  This version should support all combinations of
+;	drive and BIOS parameter mapping provided the drive mapping is tight.
+;	As far as we know, all large drives use tight mapping!  It will support
+;	smaller (also, generally, older) drives which use loose mapping.  This
+;	version uses the number of sector and number of head values from the
+;	partition table block if they are consistent.
+;v1.0.3  8-Jun-97
+;	Added support for LBA mode for ATA-3 complient drives.
+;v1.0.4  18-Nov-99
+;	Removed the BOOT load-time characteristic (not needed since DISKINST
+;	can now be executed during startup).
+;v1.0.5  28-Dec-99
+;	Fixed problem in block2pda, was not clearing C after divide, some CPUs
+;	(not all) seem to randomly set C when dividing!
+
+	LKEHEAD	HDKADRV, MAJV, MINV, EDITNUM, LKETYPE_DEVICE
+
+;Determining disk configuration is a major problem due to the confusion between
+;  the CMOS and boot partition parameters and due to the gradual shift from
+;  using CMOS values to self-configuring IDE drives and eventually to ATA-3
+;  complient drives.  This is made much more difficult because it is very
+;  difficult to tell exactly what kind of drive we have.  There are basically
+;  5 classes of drives in use:
+;	ST-506 drives - These are the original PC drives and do not support
+;		the get parameters command and cannot be reconfigured.
+;	ESDI/fixed IDE drives - These drives do support the get parameters
+;		command but cannot be reconfigured.
+;	IDE drives with loose reconfiguration - These drives support the get
+;		parameters command and can be reconfigured in a limited way.
+;		Reconfiguration may result in lost capacity.
+;	IDE drives with tight reconfiguration - These drives support the get
+;		parameters command and can be fully reconfigured without loss
+;		of capacity.
+;	ATA-3 complient drives - These drives meet the ATA-3 (extended IDE)
+;		specification.  In particular, they support LBA (Linear Block
+;		Address) mode which eliminates all of the configuration issues.
+
+;We initially use the CMOS (or the ADDUNIT characteristics values if not a
+;  BIOS supported drive).  If we can get the actual drive parameter values,
+;  we switch to using them as soon as we obtain them.  If we can read the
+;  partition table, we use the sectors and heads value from the partition
+;  table.  We calculate a number of cylinders value based on the total size
+;  size obtained from the CMOS or the drive parameters.  If the drive reports
+;  an LBA mode number of sectors, we assume the drive supports LBA mode and
+;  use it.  Otherwise, if the partition table indicates more than 16 heads, we
+;  remap the values to match what we can send to the drive.  Note that this
+;  should only happen for a very few pre-ATA-3 large IDE drives.  It seems to
+;  work in general, but there may be some cases where it will fail!
+
+;Note that even with LBA drives, we still keep track of the drive parameter
+;  values, even though they are not used when accessing the drive.  They are
+;  reported as DEVCHAR values.  Also note that these values are not very
+;  meaningful in this case and usually bear no relationship to the actual
+;  phsycial disk configuration.
+
+;In general, the values reported for physical units and partitions may not
+;  be consistent, since the values for DOS partitions are updated from the
+;  partition's boot block when a valid boot block is present.
+
+;WARNING: Drives which cannot reconfigure will NOT WORK if the CMOS and/or
+;  partition table values (whichever we wind up using) do not match the
+;  actual physical disk parameters!  We DO NOT check for this, since we
+;  have no sure way of knowing if a drive can reconfigure!!
+
+;The initial values (ucb_isects, ucb_iheads, and ucb_icylns) always contain
+;  the CMOS or physical (if available) values.  The current values (ucb_csects,
+;  ucb_cheads, and ucb_ccylns) contain the values obtained from the partition
+;  table.  If mapping is necessary, the mapped values are stored in ucb_hdmsects,
+;  ucb_hdmheads, and ucb_hdmcylns.
+
+;When a partition is set up, its initial and current values are both taken from
+;  the underlying disk's current values.  Its mapped values (if needed) are
+;  taken from the underlying disk's mapped values.
+
+;Define time-out values (in seconds)
+
+TO_RESTORE =!20t	;Restore time-out period
+TO_SETPARMS=!2t		;Set drive parameters time-out period
+TO_XFER    =!6t		;Data transfer time-out period
+TO_RESET   =!20t	;Reset time-out period
+
+	CODE
+
+;Hard disk device driver dispatch table.  Note that kf_xxx entries are for
+;  controller functions which require ownership of the controller.  They must
+;  be called only by passing their index to the xosdskXfer routine.  The ks_xxx
+;  entires are for general subroutines which do not require controller
+;  ownership.  They are called directly.  They must NOT be passed to dskXfer.
+
+hdkdsp:	.LONG	0		;kf_init     =  0. - Initialize controller
+	.LONG	hdkgetparms	;kf_getparms =  4. - Get drive parameters
+	.LONG	hdkgetaparms	;kf_getaparms=  8. - Get ATAPI drive parameters
+	.LONG	hdksetparms	;kf_setparms = 12. - Set drive parameters
+	.LONG	hdkreadraw	;kf_readraw  = 16. - Read raw
+	.LONG	hdkreaddata	;kf_readdata = 20. - Read block
+	.LONG	hdkreadlist	;kf_readlist = 24. - Read buffer list
+	.LONG	0		;kf_readid   = 28. - Read ID field
+	.LONG	hdkwritraw	;kf_writraw  = 32. - Write raw
+	.LONG	hdkwritdata	;kf_writdata = 36. - Write block
+	.LONG	hdkwritlist	;kf_writlist = 40. - Write buffer list
+	.LONG	hdkformat	;kf_format   = 44. - Format track
+	.LONG	0		;kf_chkwp    = 48. - Check write protect status
+	.LONG	hdkchkchgf	;kf_chkchg   = 52. - Check for possible disk
+				;		       change at fork level
+	.LONG	hdkgettoc	;kf_gettoc   = 56. - Get CD-ROM TOC data
+	.LONG	hdkgettrks	;kf_gettrks  = 60. - Get CD-ROM track data
+	.LONG	hdkmedia	;ks_media    = 64. - Determine media type
+	.LONG	knlRtnZero##	;ks_chkwp    = 68. - Check write protect status
+	.LONG	hdkchkchg	;ks_chkchg   = 72. - Check for possible disk
+				;		       change
+	.LONG	hdksenchg	;ks_senchg   = 76. - Sense disk change
+	.LONG	hdkaaddunit	;ks_addunit  = 80. - Add disk unit
+	.LONG	xosdskHdkClear##;ks_unmount  = 84. - Unmount disk
+
+;Hard disk type A device characteristics table
+
+	DATA
+
+	.MOD	4
+hdkdchartbl:
+ DCHARBGN  1, knlDCharValCom##
+ DCHARENT  CLASS   , TEXT, ,   8, knlDcMsgClass##    , knlDcGetClass##  , knlDcSetClass##   , 0
+ DCHARENT  TYPE    , TEXT, ,   4, knlDcMsgType##     , knlDcGet4Byte##  , 0                 , dcb_type
+ DCHARENT  IOREG   , HEXV, ,   2, knlDcMsgIoReg##    , xosdskGtU2Byte## , 0                 , ucb_ioreg1
+ DCHARENT  INDEX   , DECV, ,   1, knlDcMsgIndex##    , xosdskGtU1Byte## , 0                 , ucb_index
+ DCHARENT  INT     , DECV, ,   1, knlDcMsgInt##      , xosdskGtK1Byte## , 0                 , kcb_intlvl
+ DCHARENT  MODEL   , STR , ,  42, knlDcMsgModel##    , xosdskGtUxStr##  , 0                 , ucbx_model
+ DCHARENT  SERIALNO, STR , ,  22, knlDcMsgSerialNo## , xosdskGtUxStr##  , 0                 , ucbx_serialno
+ DCHARENT  REVISION, STR , ,  10, knlDcMsgRevision## , xosdskGtUxStr##  , 0                 , ucbx_revision
+ DCHARENT  CONFIG  , HEXV, ,   4, msgconfig          , xosdskGtU4Byte## , 0                 , ucb_hdconfig
+ DCHARENT  SECPINT , DECV, ,   4, msgsecpint         , xosdskGtU4Byte## , 0                 , ucb_hdsecpi
+ DCHARENT  BUFSIZE , DECV, ,   4, msgbufsize         , xosdskGtU4Byte## , 0                 , ucb_hdbufsz
+ DCHARENT  UNITTYPE, TEXT, ,   4, knlDcMsgUnitType## , xosdskUnitType## , 0                 , 0
+ DCHARENT  MSENSOR , TEXT, ,   4, xosdskMsgMSensor## , xosdskGetBits##  , 0                 , UB$MEDIAC
+ DCHARENT  REMOVE  , TEXT, ,   4, xosdskMsgRemove##  , xosdskGetRemove##, 0                 , 0
+ DCHARENT  READY   , TEXT, ,   4, xosdskMsgReady##   , getready         , setready          , 0
+ DCHARENT  ATAPI   , TEXT, ,   4, msgatapi           , xosdskGetBits##  , 0                 , UB$ATAPI
+ DCHARENT  CMDRSP  , TEXT, ,   8, msgcmdrsp          , getcmdrsp        , 0                 , 0
+ DCHARENT  VOLNAME , TEXT, ,  16, xosdskMsgVolName## , xosdskGtU16Byte##, xosdskStU8Byte##  , ucb_volname
+ DCHARENT  DOSNAME , TEXT, ,  16, xosdskMsgDosName## , xosdskGtU16Byte##, xosdskSetDosName##, ucb_dosname
+ DCHARH    dosnmdc , xosdskGetHdDosNm##, xosdskFindDosNm##
+ DCHARENT  PCCARD  , TEXT, ,  16, msgpccard          , getpccard        , setpccard         , 0
+ DCHARENT  PARTN   , HEXV, ,   1, xosdskMsgPartn##   , xosdskGtU1Byte## , 0                 , ucb_partnx
+ DCHARENT  PARTOFF , DECV, ,   4, xosdskMsgPartOff## , xosdskGtU4Byte## , 0                 , ucb_partnoff
+ DCHARENT  CBLKSZ  , DECV, ,   2, xosdskMsgCBlkSz##  , xosdskGtU4Byte## , 0                 , ucb_csecsz
+ DCHARENT  CHEADS  , DECV, ,   1, xosdskMsgCHeads##  , xosdskGtU1Byte## , xosdskHdkSetHead##, ucb_cheads
+ DCHARENT  CSECTS  , DECV, ,   4, xosdskMsgCSects##  , xosdskGtU4Byte## , xosdskHdkSetSec## , ucb_csects
+ DCHARENT  CCYLNS  , DECV, ,   4, xosdskMsgCCylns##  , xosdskGtU4Byte## , xosdskHdkSetCyln##, ucb_ccylns
+ DCHARENT  CBLOCKS , DECV, ,   4, xosdskMsgCBlocks## , xosdskGtU4Byte## , 0                 , ucb_cblocks
+ DCHARENT  IBLKSZ  , DECV, ,   2, xosdskMsgIBlkSz##  , xosdskGtU4Byte## , xosdskStU4Byte##  , ucb_isecsz
+ DCHARENT  IHEADS  , DECV, ,   1, xosdskMsgIHeads##  , xosdskGtU1Byte## , xosdskStU1Byte##  , ucb_iheads
+ DCHARENT  ISECTS  , DECV, ,   4, xosdskMsgISects##  , xosdskGtU4Byte## , xosdskStU4Byte##  , ucb_isects
+ DCHARENT  ICYLNS  , DECV, ,   4, xosdskMsgICylns##  , xosdskGtU4Byte## , xosdskStU4Byte##  , ucb_icylns
+ DCHARENT  IBLOCKS , DECV, ,   4, xosdskMsgIBlocks## , xosdskGtU4Byte## , 0                 , ucb_iblocks
+ DCHARENT  LBAMODE , TEXT, ,   4, msglbamode         , xosdskGetBits##  , 0                 , UB$LBA
+ DCHARENT  MSECTS  , DECV, ,   4, msgmsects          , xosdskGtU4Byte## , 0                 , ucb_hdmsects
+ DCHARENT  MHEADS  , DECV, ,   4, msgmheads          , xosdskGtU4Byte## , 0                 , ucb_hdmheads
+ DCHARENT  MCYLNS  , DECV, ,   4, msgmcylns          , xosdskGtU4Byte## , 0                 , ucb_hdmcylns
+ DCHARENT  WTMAX   , DECV, ,   4, knlDcMsgWTMax##    , xosdskGtU4Byte## , xosdskSetWTMax##  , ucb_wtmax
+ DCHARENT  RAMAX   , DECV, ,   4, knlDcMsgRAMax##    , xosdskGtU4Byte## , xosdskSetRAMax##  , ucb_ramax
+ DCHARENT  DTHLIMIT, DECV, ,   4, knlDcMsgDTHLimit## , xosdskGtU4Byte## , 0                 , ucb_dthlimit
+ DCHARENT  BLOCKIN , DECV, ,   4, xosdskMsgBlockIn## , xosdskGtU4Byte## , xosdskStU4Byte##  , ucb_blockin
+ DCHARENT  BLOCKOUT, DECV, ,   4, xosdskMsgBlockOut##, xosdskGtU4Byte## , xosdskStU4Byte##  , ucb_blockout
+ DCHARENT  BYTEIN  , DECV, ,   4, knlDcMsgByteIn##   , xosdskGtU4Byte## , xosdskStU4Byte##  , ucb_bytein
+ DCHARENT  BYTEOUT , DECV, ,   4, knlDcMsgByteOut##  , xosdskGtU4Byte## , xosdskStU4Byte##  , ucb_byteout
+ DCHARENT  SHRDELAY, DECV, ,   4, xosdskMsgShrDelay##, xosdskGtU4Byte## , xosdskStU4Byte##  , ucb_shrdelay
+ DCHARENT  SHRRETRY, DECV, ,   4, xosdskMsgShrRetry##, xosdskGtU4Byte## , xosdskStU4Byte##  , ucb_shrretry
+ DCHARENT  SHRFAIL , DECV, ,   4, xosdskMsgShrFail## , xosdskGtU4Byte## , xosdskStU4Byte##  , ucb_shrfail
+ DCHARENT  TDEVERR , DECV, ,   4, knlDcMsgTDevErr##  , xosdskGtU4Byte## , xosdskStU4Byte##  , ucb_tdeverr
+ DCHARENT  HDEVERR , DECV, ,   4, knlDcMsgHDevErr##  , xosdskGtU4Byte## , xosdskStU4Byte##  , ucb_hdeverr
+ DCHARENT  TDATAERR, DECV, ,   4, knlDcMsgTDataErr## , xosdskGtU4Byte## , xosdskStU4Byte##  , ucb_tdataerr
+ DCHARENT  HDATAERR, DECV, ,   4, knlDcMsgHDataErr## , xosdskGtU4Byte## , xosdskStU4Byte##  , ucb_hdataerr
+ DCHARENT  TSEEKERR, DECV, ,   4, xosdskMsgTSeekErr##, xosdskGtU4Byte## , xosdskStU4Byte##  , ucb_tseekerr
+ DCHARENT  HSEEKERR, DECV, ,   4, xosdskMsgHSeekErr##, xosdskGtU4Byte## , xosdskStU4Byte##  , ucb_hseekerr
+ DCHARENT  TIDFERR , DECV, ,   4, xosdskMsgTIdFErr## , xosdskGtU4Byte## , xosdskStU4Byte##  , ucb_tidferr
+ DCHARENT  HIDFERR , DECV, ,   4, xosdskMsgHIdFErr## , xosdskGtU4Byte## , xosdskStU4Byte##  , ucb_hidferr
+ DCHARENT  TRNFERR , DECV, ,   4, xosdskMsgTRNFErr## , xosdskGtU4Byte## , xosdskStU4Byte##  , ucb_trnferr
+ DCHARENT  HRNFERR , DECV, ,   4, xosdskMsgHRNFErr## , xosdskGtU4Byte## , xosdskStU4Byte##  , ucb_hrnferr
+ DCHARENT  TOVRNERR, DECV, ,   4, knlDcMsgTOvrnErr## , xosdskGtU4Byte## , xosdskStU4Byte##  , ucb_tovrnerr
+ DCHARENT  HOVRNERR, DECV, ,   4, knlDcMsgHOvrnErr## , xosdskGtU4Byte## , xosdskStU4Byte##  , ucb_hovrnerr
+ DCHARENT  HUNGERR , DECV, ,   4, knlDcMsgHungErr##  , xosdskGtU4Byte## , xosdskStU4Byte##  , ucb_hungerr
+ DCHARENT  UXINTERR, DECV, ,   4, xosdskMsgUnexpInt##, xosdskGtK4Byte## , xosdskStK4Byte##  , kcb_hduxint
+ DCHARENT  FSTYPE  , TEXT, ,   8, xosdskMsgFSType##  , xosdskGtU8Byte## , 0                 , ucb_fsname
+ DCHARENT  CLSSZ   , DECV, ,   4, xosdskMsgClsSz##   , xosdskGtU4Byte## , 0                 , ucb_clussize
+ DCHARENT  CLUSTERS, DECV, ,   4, xosdskMsgClsters## , xosdskGtU4Byte## , 0                 , ucb_total
+ DCHARENT  AVAIL   , DECV, ,   4, xosdskMsgAvail##   , xosdskGtU4Byte## , 0                 , ucb_avail
+ DCHARENT  FATMODE , HEXV, ,   1, xosdskMsgFatMode## , xosdskGtU1Byte## , 0                 , ucb_fatmode
+ DCHARENT  DUPFAT  , TEXT, ,   4, xosdskMsgDupFat##  , xosdskGetBits##  , xosdskSetBits##   , UB$DUPFAT
+ DCHARENT  FATSIZE , DECV, ,   4, xosdskMsgFatSize## , xosdskGtU4Byte## , 0                 , ucb_satsize
+ DCHARENT  NUMFATS , DECV, ,   4, xosdskMsgNumFats## , xosdskGtU4Byte## , 0                 , ucb_numsat
+ DCHARENT  ROOTBLK , DECV, ,   4, xosdskMsgRootBlk## , xosdskGtU4Byte## , 0                 , ucb_rootblk
+ DCHARENT  ROOTSIZE, DECV, ,   4, xosdskMsgRootSize##, xosdskGtU4Byte## , 0                 , ucb_rootsize
+ DCHARENT  ROOTPROT, STR , , 100, xosdskMsgRootProt##, xosdskGtRtProt## , xosdskStRtProt##  , 0
+
+	CODE
+
+msgconfig: DCHARINFO {Disk configuration bits}
+msgatapi:  DCHARINFO {ATAPI unit}
+msgcmdrsp: DCHARINFO {ATAPI command response type}
+msgsecpint:DCHARINFO {Maximum sectors per interrupt}
+msgbufsize:DCHARINFO {Size of internal disk buffer}
+msgpsects: DCHARINFO {Number of physical sectors reported by drive}
+msgpheads: DCHARINFO {Number of physical heads reported by drive}
+msgpcylns: DCHARINFO {Number of physical cylinders reported by drive}
+msgmsects: DCHARINFO {Number of mapped sectors reported by drive}
+msgmheads: DCHARINFO {Number of mapped heads reported by drive}
+msgmcylns: DCHARINFO {Number of mapped cylinders reported by drive}
+msglbamode:DCHARINFO {Disk uses LBA mode}
+msgpccard: DCHARINFO {Associated PC-card controller and socket}
+.PAGE
+	.SBTTL	Initialization
+
+	INITSUB	inithdka
+
+	DATA
+
+	.MOD	4
+hdkinitblk:					;Characteristics description
+ DCHARBGN  2, knlDCharValCom##			;  block for initialization
+ DCHARENT  RESULT, STR , , 0, 0, knlGetDcNullS##, 0        , 0
+
+	ONCE
+
+;Initialization subroutine
+;	c{FDS:EDX] = Address of characteristics list
+;	CALL	inithdka
+;	C:set = Error code
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  c{ECX} = Offset of first code byte to not save
+;	  c{EDX} = Offset of first data byte to not save
+
+inithdka:
+	PUSHL	FS
+	PUSHL	EDX
+	MOVL	EBX, #'HDKA'		;Get disk driver name
+	MOVL	EDX, #hdkdsp		;Get offset of dispatch table
+	CALL	xosdskNewDriver##	;Register this disk driver
+	POPL	EDX
+	POPL	FS
+	JC	6$.S			;If error
+	TESTL	EDX, EDX		;Have a characteristics list?
+	JE	2$.S			;No
+	MOVL	EBX, #hdkinitblk	;Yes - point to characteristics table
+	CALL	knlAddUnitChar##	;Process characteristics
+	JC	10$.S			;If error
+2$:	CLRL	EAX			;OK
+	CLRL	EDX
+	MOVL	ECX, #codetop
+6$:	RET
+
+;Here if error after driver has been registered
+
+10$:	CALL	xosdskUnlinkDriver##
+	STC
+	RET
+
+	CODE
+.PAGE
+	.SBTTL	hdkaaddunit - Subroutine to add disk unit
+
+;Subroutine to add disk unit
+;	c{EAX}    = Unit number
+;	c{EBX}    = Offset of KCB for controller (0 if none)
+;	c{ECX}    = Index on controller
+;	c{FS:EDX} = Address of characteristics list
+;	c{ESI}    = Base IO register
+;	CALL	hdkaaddunit
+;	c{EAX} = Error code
+;	c{EBX} = Status bits
+;	c{ECX} = Item count (number of units added)
+
+$$$=!0
+FRM hau_char , 8	;Address of characteristics list
+FRM hau_ioreg, 4	;Base IO register number
+FRM hau_int  , 4	;Interrupt number
+FRM hau_index, 4	;Index on controller
+FRM hau_unit , 1	;Unit number
+FRM hau_info , 1	;Information about drive
+FRM          , 2
+FRM hau_wpc  , 4	;Write pre-comp cylinder
+FRM hau_head , 4	;Number of heads
+FRM hau_sect , 4	;Number of sectors per track
+FRM hau_cyln , 4	;Number of cylinders
+FRM hau_into , 4	;Offset of interrupt routine
+FRM hau_kcb  , 4	;Offset of KCB
+hau_SIZE=!$$$
+
+;Define bits for hau_info
+
+INFO$NEWKCB=!01h	;New KCB created
+
+	DATA
+
+	.MOD	4
+hdkaublk:					;Characteristics description
+ DCHARBGN  3, knlDCharValCom##			;  block for addunit
+ DCHARENT  TYPE    , TEXT, , 8, 0, 0, knlRtnZero##, 0
+ DCHARENT  UNIT    , DECV, , 4, 0, 0, knlRtnZero##, 0
+ DCHARENT  IOREG   , HEXV, , 4, 0, 0, knlRtnZero##, 0
+ DCHARENT  INT     , DECV, , 1, 0, 0, hdkauintvec , 0
+ DCHARENT  INDEX   , DECV, , 4, 0, 0, hdkauindex  , 0
+ DCHARENT  IHEADS  , DECV, , 4, 0, 0, hdkauhead   , 0
+ DCHARENT  ISECTS  , DECV, , 4, 0, 0, hdkautsz    , 0
+ DCHARENT  ICYLNS  , DECV, , 4, 0, 0, hdkaucyln   , 0
+ DCHARENT  WPCCYLN , DECV, , 4, 0, 0, hdkauwpc    , 0
+
+	CODE
+
+hdkaaddunit:
+	ENTER	hau_SIZE, 0		;Allocate our stack frame
+	TESTL	ESI, ESI
+	JE	20$
+	MOVB	hau_unit.B[EBP], AL	;Store unit number
+	MOVL	hau_kcb.B[EBP], EBX	;Store possible KCB offset
+	MOVL	hau_ioreg.B[EBP], ESI	;Store base IO register
+	CLRL	EAX
+	MOVB	hau_info.B[EBP], AL
+	MOVL	hau_head.B[EBP], EAX
+	MOVL	hau_sect.B[EBP], EAX
+	MOVL	hau_cyln.B[EBP], EAX
+	DECL	EAX
+	MOVL	hau_index.B[EBP], EAX
+	MOVL	hau_int.B[EBP], EAX
+	MOVL	hau_wpc.B[EBP], EAX
+	MOVL	EBX, #hdkaublk		;Point to our characteristics table
+	DECL	EAX
+	CALL	knlAddUnitChar##	;Process characteristics
+	JC	16$			;If error
+	MOVL	EAX, hau_head.B[EBP]	;Is the disk configuration completely
+	ORL	EAX, hau_sect.B[EBP]	;  unspecified?
+	ORL	EAX, hau_cyln.B[EBP]
+	JNE	6$.S			;No
+
+;Here if the configuration is completely unspecified.  See if this is for one
+;  of the standard PC hard disks, and if so, use the machine's CMOS data to
+;  get the required values.
+
+2$:	CMPL	hau_ioreg.B[EBP], #1F0h	;Is this the standard controler?
+	JNE	6$.S			;No - go on
+	MOVL	ESI, hau_index.B[EBP]	;Yes - is it disk 1 or 2?
+	CMPL	ESI, #2.B
+	JA	6$.S			;No - go on
+	SHLL	ESI, #4t
+	ADDL	ESI, #knlHdkDataC##-10h	;Yes - point to data for the disk
+	MOVZWL	EAX, [ESI]		;Get number of cylinders
+	TESTL	EAX, EAX		;If zero, there is no data available
+	JE	6$.S
+	MOVL	hau_cyln.B[EBP], EAX
+	MOVZBL	EAX, 2.B[ESI]		;Get number of heads
+	MOVL	hau_head.B[EBP], EAX
+	MOVZWL	EAX, 5.B[ESI]		;Get write pre-comp cylinder
+	MOVL	hau_wpc.B[EBP], EAX
+	MOVZBL	EAX, 0E.B[ESI]		;Get number of sectors per track
+	MOVL	hau_sect.B[EBP], EAX
+6$:	MOVL	EAX, hau_index.B[EBP]	;Do we have all of the necessary
+	ORL	EAX, hau_int.B[EBP]	;  configuration information?
+	INCL	EAX
+	JE	20$.S			;No - fail
+	MOVB	AL, #'D'		;See if this unit is defined now
+	MOVB	AH, hau_unit.B[EBP]
+	CALL	xosdskSrchUnit##
+	JE	12$.S			;Defined - fail
+	CALL	knlGetXRes##		;Get the exec memory resource
+	MOVL	EBX, hau_kcb.B[EBP]	;Is there a KCB now?
+	TESTL	EBX, EBX
+	JE	22$.S			;No
+	JMP	44$			;Yes - continue
+
+;Here if unit is already defined
+
+12$:	MOVL	EAX, #ER_DUADF
+	JMP	16$.S
+
+;Here if error while have exec memory resource
+
+14$:	CALL	knlGiveXRes##
+16$:	LEAVE
+	CLRL	ECX
+	MOVL	EBX, #QSTS$DONE
+	TOFORK
+	RET
+
+;Here if error creating the UCB
+
+18$:	TESTB	hau_info.B[EBP], #INFO$NEWKCB
+	JE	14$.S
+	MOVL	EBX, hau_kcb.B[EBP]
+	CALL	xosdskGiveupKcb2##
+	JMP	14$.S
+
+;Here if required characteristic value is missing
+
+20$:	MOVL	EAX, #ER_CHARM
+	JMP	16$.S
+
+;Here if no KCB now - see if the controller exists
+
+22$:	MOVL	EDX, hau_ioreg.B[EBP]	;Select the unit we are trying to add
+	A2IOP	P_DCHDDH		;  (this makes sure we don't zap the
+	MOVB	AL, hau_index.B[EBP]	;  other unit on the controller and
+	SHLB	AL, #4t			;  also re-enables ATAPI units which
+	ADDB	AL, #0A0h-10h		;  have gone off-line)
+	OUTB	[DX]
+	IOPAUSE
+	A2IOP	P_DCHDCYL-P_DCHDDH	;Point to the cylinder number register
+	MOVB	AL, #25h		;Set it to some value
+	OUTB	[DX]
+	IOPAUSE
+	INCL	EDX			;Write 0 to the next register to be
+	MOVB	AL, #0h			;  sure we have discharged the bus
+	OUTB	[DX]
+	IOPAUSE
+	DECL	EDX
+	INB	[DX]			;Read it back
+	CMPB	AL, #25h		;Is it right?
+	JNE	24$.S			;No
+	MOVB	AL, #42			;Yes - now set it to another value
+	OUTB	[DX]
+	IOPAUSE
+	INCL	EDX			;Write 0 to the next register to be
+	MOVB	AL, #0h			;  sure we have discharged the bus
+	OUTB	[DX]
+	IOPAUSE
+	DECL	EDX
+	INB	[DX]			;Read it back
+	CMPB	AL, #42			;Is it right?
+	JE	26$.S			;Yes
+24$:	MOVL	EAX, #ER_PDNAV		;No - fail
+	JMP	14$
+
+;Here if controller exits
+
+26$:	MOVL	ECX, #HDKAINTSZ		;Get space for interrupt code
+	CALL	knlGetXCode##
+	JC	14$
+	PUSHL	EDI			;Remember where code is going
+	MOVL	ESI, #hdkaint		;Copy prototype interrupt routine
+	SHRL	ECX, #2
+	MOVB	gdtable+GS_CODEALS+5, #DT_RWDATA+PL_0 ;Enable alaised code space
+	PUSHL	#GS_CODEALS.B
+	POPL	ES
+	CLD
+	RMOVSL	[EDI], ES:[ESI]
+	CLRL	EAX
+	MOVL	ES, EAX
+	MOVB	gdtable+GS_CODEALS+5, AL
+	POPL	ESI
+	MOVL	EBX, #hdkdsp
+	MOVL	EDX, #'HDKA'
+	MOVL	hau_into.B[EBP], ESI
+	MOVL	ECX, #kcb_hdSIZE	;Make a KCB
+	MOVB	AL, #KB$AHEAD+KB$DEFER
+	CLRL	ESI
+	CALL	xosdskMakeKcb##
+	JC	14$
+	MOVL	hau_kcb.B[EBP], EDI	;Remember where our KCB is
+	ORB	hau_info.B[EBP], #INFO$NEWKCB
+	MOVL	EAX, hau_ioreg.B[EBP]	;Store base IO register number in the
+	MOVL	kcb_ioreg1.B[EDI], EAX	;  KCB
+	ADDL	EAX, #0Eh.B
+	CMPL	EAX, #1FEh		;Is this the primary or secondary
+	JE	32$.S			;  controller?
+	CMPL	EAX, #17Eh
+	JNE	34$.S			;No
+32$:	ADDL	EAX, #206h-0Eh		;Yes
+34$:	MOVL	kcb_ioreg2.B[EDI], EAX	;Store second base IO register number
+					;  (This is used to access the "control"
+					;  register which shared with the
+					;  floppy controller if this is a
+					;  primary or secondary controller or
+					;  is at offset 0Eh from the first
+					;  base IO register otherwise.)
+	MOVL	EBX, #hwname+8		;Construct the hardware name
+	MOVL	EAX, hau_ioreg.B[EBP]
+	CALL	knlPutHex4Nmbr##
+	MOVL	EBX, #hwname		;Register our IO register addresses
+	MOVL	EDX, kcb_ioreg1.B[EDI]
+	LEAL	ECX, 0Fh.B[EDX]
+	CMPL	EDX, #1F0h
+	JE	36$.S
+	CMPL	EDX, #170h
+	JNE	38$.S
+36$:	SUBL	ECX, #8.B
+	CALL	knlRegIORegs##
+	JC	40$.S
+	MOVL	EDX, kcb_ioreg2.B[EDI]	;Register our IRQ number
+	MOVL	ECX, EDX
+38$:	CALL	knlRegIORegs##
+	JC	40$.S
+	MOVL	EDX, #hwname
+	MOVL	ECX, hau_int.B[EBP]	;Set up our interrupt vector
+	MOVB	kcb_intlvl.B[EDI], CL
+	MOVL	EBX, hau_into.B[EBP]
+	MOVB	CH, #DT_TRAP
+	CALL	knlSetIRq##
+40$:	JC	14$
+	MOVL	EDX, hau_into.B[EBP]
+	MOVL	EBX, hau_kcb.B[EBP]
+	MOVL	kcb_fdisp.B[EDI], #hdkfork ;Store fork location
+	MOVB	gdtable+GS_CODEALS+5, #DT_RWDATA+PL_0 ;Fix up the interrupt
+	PUSHL	#GS_CODEALS.B			      ;  code
+	POPL	ES
+	MOVL	ES:{fix1-hdkaint}+1.B[EDX], EBX
+	MOVL	EAX, #hdkaint
+	SUBL	EAX, EDX
+	ADDL	ES:{fix2-hdkaint}+1.B[EDX], EAX
+	CLRL	EAX
+	MOVL	ES, EAX
+	MOVB	gdtable+GS_CODEALS+5, AL
+	MOVL	EAX, hdkakcb		;Link into our list of KCBs
+	MOVL	hdkakcb, EDI
+	MOVL	kcb_nexts.B[EDI], EAX
+	TESTL	EAX, EAX		;First time?
+	JNE	42$.S			;Yes
+	MOVL	EBX, #hdkaoas		;Yes - setup our once-a-second routine
+	CALL	knlSetupOAS##
+42$:	MOVL	ECX, hau_int.B[EBP]	;Enable our interrupt
+	CALL	knlEnableInt##
+
+;Here with KCB set up or if already have a KCB
+
+44$:	MOVB	AL, #UB$DUPFAT		;Get value for ucb_bits
+	MOVB	AH, #'D'		;Get first letter of our name
+	MOVZBL	EDX, hau_unit.B[EBP]	;Get unit number
+	MOVL	ECX, #ucb_hdSIZE
+	MOVL	EBX, hau_kcb.B[EBP]	;Get offset of KCB
+	CALL	xosdskMakeUcb##		;Make a UCB
+	JC	14$			;If error
+	CALL	knlGiveXRes##
+	MOVB	ucb_hdcmdwrt[ESI], #0FFh ;Indicate no packet commands
+	MOVB	ucb_hdcmdrd[ESI], #0FFh
+	MOVZBL	EAX, hau_head.B[EBP]	;Store number of heads
+	MOVL	ucb_cheads.B[ESI], EAX
+	MOVL	ucb_iheads.B[ESI], EAX
+	MOVL	EAX, hau_sect.B[EBP]	;Store number of sectors/track
+	MOVL	ucb_csects.B[ESI], EAX
+	MOVL	ucb_isects.B[ESI], EAX
+	MOVL	EAX, #512t		;Store sector size
+	MOVL	ucb_csecsz.B[ESI], EAX
+	MOVL	ucb_isecsz.B[ESI], EAX
+	MOVL	EAX, hau_cyln.B[EBP]	;Store number of cylinders
+	MOVL	ucb_ccylns.B[ESI], EAX
+	MOVL	ucb_icylns.B[ESI], EAX
+	DECL	EAX
+	MOVL	ucb_cylmax.B[ESI], EAX
+	INCL	EAX			;Calculate total number of blocks
+	IMULL	EAX, ucb_csects.B[ESI]
+	IMULL	EAX, ucb_cheads.B[ESI]
+	MOVL	ucb_cblocks.B[ESI], EAX
+	MOVL	ucb_iblocks.B[ESI], EAX
+	MOVL	EAX, hau_wpc.B[EBP]	;Store write pre-comp cylinder
+	SHRL	EAX, #2
+	MOVB	ucb_hdwpc[ESI], AL
+	MOVL	EAX, hau_index.B[EBP]	;Store unit index and select values
+	MOVB	ucb_index.B[ESI], AL
+	MOVL	EDX, hau_kcb.B[EBP]
+	MOVL	EAX, kcb_ioreg1.B[EDX]	;Store base IO register numbers in the
+	MOVL	ucb_ioreg1.B[ESI], EAX	;  UCB
+	MOVL	EAX, kcb_ioreg2.B[EDX]
+	MOVL	ucb_ioreg2.B[ESI], EAX
+	MOVB	ucb_sts1.B[ESI], #U1$RECAL ;Indicate should recalibrate first
+	MOVZBL	EAX, ucb_index.B[ESI]	;Set up the unit select value
+	ADDL	EAX, #0Ah-1
+	SHLL	EAX, #4
+	MOVB	ucb_select.B[ESI], AL	 ;Store offset of our device
+	MOVL	ucb_devchar.B[ESI], #hdkdchartbl ;  characteristics table
+	MOVL	ucb_ramax[ESI], #32t	;Set initial read-ahead maximum
+	MOVL	ucb_wtmax[ESI], #32t	;Set initial write transfer maximum
+	MOVL	EDX, ESI
+	CALL	knlGetQel##		;Get an IORB
+	JC	50$.S
+	MOVL	EDI, ESI
+	PUSHL	DS
+	POPL	ES
+	MOVL	ECX, #16t
+	CLRL	EAX
+	CLD
+	RSTOSL	[EDI]
+	MOVL	iorb_count.B[ESI], EDX	;Store UCB offset where we can find it
+	MOVL	iorb_finish.B[ESI], #initfin
+	MOVL	iorb_routine.B[ESI], #initcon
+	MOVL	SS:pdaResponse##, EAX
+	CLRL	EDI
+	CALL	knlXfBegin##		;(This returns at fork level)
+46$:	PUSHL	SS			;Set up to wait
+	POPL	ES
+	MOVB	AL, #knlQX_DW2##
+	CALL	knlWRequeue##
+	FROMFORK
+	CALLF	schedule		;Call the scheduler (this is an
+	TOFORK				;  uninterruptable wait!)
+	MOVL	EAX, SS:pdaResponse##	;Note that we ignore errors here
+	TESTL	EAX, EAX		;  (The only reason we are doing
+	JE	46$.S			;  the media check here is to get
+48$:	CLRL	EAX			;  the device type immediately if we
+	CLRL	ECX			;  can, we don't really have to have
+	MOVL	EBX, #QSTS$DONE		;  it now!)
+	LEAVE
+	RET
+
+;Here error allocating the QEL
+
+50$:	TOFORK
+	JMP	48$.S
+.PAGE
+;Extended fork context routine to finish initializing an IDE disk unit
+
+initcon:MOVL	EDX, #xosdskCcb##	;Get a disk DCB
+	MOVL	ESI, SS:xffCount##	;Get offset of our UCB
+	PUSHL	#0.B
+	PUSHL	#0.B
+	PUSHL	#'INIT'
+	PUSHL	#'HDKA'
+	MOVL	EBX, ESP
+	CALL	xosdskGetDcb##
+	JC	6$.S			;If can't get one
+	ADDL	ESP, #16t.B
+	MOVW	dcb_outframe.B[EDI], SS	;OK - store XFF selector
+	MOVL	SS:xffDcb##, EDI
+	CALL	getdriveinfo
+	CALL	xosdskCDcb##		;Give up the DCB we were using
+	CLRL	EAX
+	MOVL	SS:xffDcb##, EAX
+	INCL	EAX
+	RET
+
+;Here if error creating a disk DCB
+
+6$:	ADDL	ESP, #16t.B
+	STC
+	RET
+
+;Here when finished with the XFF
+
+initfin:MOVW	ES, SS:xffPda##
+	MOVL	ES:pdaResponse##, EAX
+	CALL	knlRRequeue##
+	JMP	knlXfFinish##
+.PAGE
+;Subroutine called by addunitchar for the INDEX parameter
+
+hdkauindex:
+	TESTL	EAX, EAX		;Valid index on controller?
+	JE	6$.S			;No
+	CMPL	EAX, #2.B		;Maybe
+	JA	6$.S			;No
+	MOVL	hau_index.B[EBP], EAX	;Yes - store index
+	CLC
+	RET
+
+;Subroutine called by addunitchar for the "INT" parameter
+
+hdkauintvec:
+	CMPL	EAX, #2.B		;Valid value?
+	JB	6$.S			;No
+	JNE	2$.S			;Maybe
+	MOVB	AL, #9t			;Yes - do vector 2 fixup
+2$:	CMPL	EAX, #15t		;Maybe
+	JA	6$.S			;No
+	MOVL	hau_int.B[EBP], EAX	;Yes - store value
+	CLC
+	RET
+
+;Subroutine called by addunitchar for the "IHEADS" parameter
+
+hdkauhead:
+	TESTL	EAX, EAX		;0?
+	JE	6$.S			;Yes - illegal
+	MOVL	hau_head.B[EBP], EAX	;OK - store number of heads
+	CLC
+	RET
+
+6$:	MOVL	EAX, #ER_CHARV
+	STC
+	RET
+
+;Subroutine called by addunitchar for the "ISECTS" parameter
+
+hdkautsz:
+	MOVL	hau_sect.B[EBP], EAX
+	RET
+
+;Subroutine called by addunitchar for the "ICYLNS" parameter
+
+hdkaucyln:
+	MOVL	hau_cyln.B[EBP], EAX
+	RET
+
+;Subroutine called by addunitchar for the "WPCCYLN" parameter
+
+hdkauwpc:
+	CWL				;Extend 16 bit value to 32 bits
+	CMPL	EAX, #1024t		;Valid value?
+	JB	8$.S			;Yes
+	CLRL	EAX			;No - indicate no write pre-comp
+	DECL	EAX
+8$:	MOVL	hau_wpc.B[EBP], EAX	;Yes - store value
+	CLC
+	RET
+.PAGE
+;Here to get value for the CMDRSP device characteristic
+
+getcmdrsp:
+	MOVL	ESI, [EDI]
+	MOVB	AL, ucb_sts3.B[ESI]
+	ANDL	EAX, #U3$ATAPIRSP.B
+	MOVL	EAX, CS:cmdrsptbl[EAX*4]
+	CLRL	EDX
+	RET
+
+	.MOD	4
+cmdrsptbl:
+	.LONG	'N/A'
+	.LONG	'Slow'
+	.LONG	'Int'
+	.LONG	'Fast'
+
+;Here to get value for the PCCARD device characteristic
+
+getpccard:
+	MOVL	ESI, [EDI]
+	CMPL	ucb_baseucb.B[ESI], #0.B
+	JE	2$.S
+	MOVL	ESI, ucb_baseucb.B[ESI]
+2$:	CLRL	EAX
+	MOVL	EBX, #temp
+	MOVL	[EBX], EAX		;First, clear the returned value
+	MOVL	4.B[EBX], EAX
+	MOVL	8.B[EBX], EAX
+	MOVL	12t.B[EBX], EAX
+	CMPL	ucb_pccregfnc[ESI], #0.B ;Are we associated with a PC-card?
+	JNE	4$.S			;Yes
+	MOVL	[EBX], #'None'		;No
+	JMP	10$.S
+
+;Here if have a PC-card socket controller associated with this disk
+
+4$:	MOVL	EDX, ucb_pccdcb[ESI]	;Get DCB for the socket controller
+	ADDL	EDX, #dcb_name.B
+6$:	MOVB	AL, [EDX]		;Give him the device name
+	CMPB	AL, #0
+	JE	8$.S
+	INCL	EDX
+	MOVB	[EBX], AL
+	INCL	EBX
+	JMP	6$.S
+
+8$:	MOVB	[EBX], #':'		;Followed by a colon
+	MOVB	AL, ucb_pccsocket[ESI]	;Followed by the PC-card socket number
+	ADDB	AL, #'0'
+	MOVB	1.B[EBX], AL
+	MOVB	2.B[EBX], #0
+10$:	MOVL	EAX, #temp
+	RET
+
+;Here to get value for the READY device characteristic
+
+getready:
+	MOVL	ESI, [EDI]
+	MOVL	EAX, #'Yes'
+	TESTB	ucb_sts2.B[ESI], #U2$REMOVED
+	JE	14$.S
+	MOVL	EAX, #'No'
+14$:	RET
+.PAGE
+;Here to set the value of the PCCARD device characteristic - This characteristic
+;  has a text value which consists of the device name for the PC-card to be
+;  associated with the disk device followed by a colon followed by the number
+;  of the socket on the PC-card controller.  The PC-card controler driver is
+;  accessed using the value of a system string with a name formed by the
+;  PC-card device name without the unit number (lower case) followed by
+;  "DrvRegister".  The value of the system string is the code offset of the
+;  driver register routine.  Setting this parameter also causes the disk to
+;  be marked as removable.
+
+$$$=!0
+FRM spcc_unit  , 4t
+FRM spcc_socket, 4t
+FRM spcc_strnam, 32t
+FRM spcc_strval, 4t
+spcc_SIZE=!$$$
+
+2$:	MOVL	EAX, #ER_PARMF
+	STC
+	RET
+
+setpccard:
+	MOVL	ESI, [EDI]		;Is this a base unit?
+	CMPL	ucb_baseucb.B[ESI], #0.B
+	JNE	2$.S			;No - can't do this!
+	ENTER	spcc_SIZE, 0		;Yes
+	MOVL	ECX, #16t
+	MOVL	EBX, #knlDcValue##
+	LEAL	EDX, spcc_strnam.B[EBP]
+
+;First copy the device name (without the unit number) and force to lower case
+
+4$:	MOVB	AL, [EBX]
+	CMPB	AL, #0
+	JE	10$.S
+	CMPB	AL, #':'
+	JE	10$.S
+	CMPB	AL, #'0'
+	JB	6$.S
+	CMPB	AL, #'9'
+	JBE	12$.S
+6$:	INCL	EBX
+	DECL	ECX
+	CMPB	AL, #'a'
+	JA	8$.S
+	ADDB	AL, #'a'-'A'
+8$:	MOVB	SS:[EDX], AL
+	INCL	EDX
+	TESTL	ECX, ECX
+	JNE	4$.S
+10$:	JMP	knlBadParmVLv##
+
+;Here with unit number next
+
+12$:	CALL	getpcnum		;Get unit number
+	MOVL	spcc_unit.B[EBP], EAX
+	CMPB	[EBX], #':'		;Must have colon next
+	JNE	10$.S
+	INCL	EBX
+	CALL	getpcnum		;Get socket number
+	MOVL	spcc_socket.B[EBP], EAX
+	MOVL	SS:[EDX], #'DrvR'	;Finish storing the system string name
+	MOVL	SS:4.B[EDX], #'egis'
+	MOVL	SS:8.B[EDX], #'ter'
+	MOVL	EAX, SS			;Look for the system string
+	MOVL	FS, EAX
+	MOVL	GS, EAX
+	LEAL	EBX, spcc_strnam.B[EBP]
+	LEAL	EDX, spcc_strval.B[EBP]
+	MOVL	ECX, #4t
+	PUSHL	EDI
+	PUSHL	ESI
+	CALL	knlSysStrGet##
+	POPL	ESI
+	POPL	EDI
+	JC	10$.S			;If not found
+	CMPL	EAX, #4t.B		;Make sure have 4-byte value
+	JNE	10$.S
+	CMPL	ucb_pccregfnc[ESI], #0.B ;Already associated with a PC-card?
+	JE	16$.S			;No
+	MOVL	EAX, ucb_pccdcb[ESI]	;Yes
+	MOVZBL	EAX, dcb_punit.B[EAX]
+	MOVZBL	EDX, ucb_pccsocket[ESI]
+	CLRL	EBX
+	PUSHL	EDI
+	PUSHL	ESI
+	CALLI	ucb_pccregfnc[ESI]	;Unregister us
+	POPL	ESI
+	POPL	EDI
+	MOVL	ucb_pccregfnc[ESI], #0
+16$:	MOVL	EAX, spcc_unit.B[EBP]	;Register this as the associated
+	MOVL	EDX, spcc_socket.B[EBP]	;  driver for the PC-card socket
+	MOVL	EBX, #hdkremoved
+	PUSHL	EDI
+	PUSHL	ESI
+	MOVL	EDI, ESI
+	ADDL	ESI, #ucb_name.B
+	CALLI	spcc_strval.B[EBP]
+	POPL	ESI
+	POPL	EDI
+	JC	24$.S			;If error
+	MOVL	ucb_pccdcb[ESI], EAX	;OK - store offset of the PC-card DCB
+	MOVL	EAX, spcc_strval.B[EBP]
+	MOVL	ucb_pccregfnc[ESI], EAX
+	MOVL	EAX, spcc_socket.B[EBP]
+	MOVB	ucb_pccsocket[ESI], AL
+	ORB	ucb_dsp.B[ESI], #DS$REMOVE ;Indicate disk is removeable
+	MOVL	EBX, ucb_kcb.B[ESI]	;Get offset of KCB
+	MOVL	EBX, kcb_fucb.B[EBX]	;Get first UCB
+18$:	TESTL	EBX, EBX		;More?
+	JE	24$.S			;No
+	CMPL	ucb_baseucb.B[EBX], ESI	;Is this UCB for one of our partitions?
+	JNE	20$.S			;No
+	ORB	ucb_dsp.B[EBX], #DS$REMOVE ;Yes - indicate removeable
+20$:	MOVL	EBX, [EBX]		;Get next UCB for controller
+	JMP	18$.S			;Continue
+
+24$:	LEAVE
+ret010:	RET
+.PAGE
+;Subroutine to get numeric value from string defining the PCCARD characteristic
+;	c{EBX} = Offset of next character in string
+;	CALL	getpcnum
+;	c{EAX} = Value
+;	c{EBX} = Updated character offset (points to next character after end
+;		   of value)
+
+getpcnum:
+	CLRL	EAX
+4$:	MOVB	CL, [EBX]
+	CMPB	CL, #'0'
+	JL	ret010.S
+	CMPB	CL, #'9'
+	JG	ret010.S
+	INCL	EBX
+	IMULL	EAX, #10t.B
+	ANDL	ECX, #0Fh
+	ADDL	EAX, ECX
+	JMP	4$.S
+.PAGE
+;Here to set value for the READY device characteristic - this can only be used
+;  to set READY to "Yes"
+
+setready:
+	MOVL	ESI, [EDI]
+	CMPL	ucb_baseucb.B[ESI], #0.B ;Is this a partition?
+	JNE	knlBadCharF##		;Yes - can't do this!
+	CMPL	EAX, #'YES'
+	JNE	knlBadCharV##
+	ANDB	ucb_sts2.B[ESI], #~U2$REMOVED
+	MOVL	EBX, ucb_kcb.B[ESI]	;Get offset of KCB
+	MOVL	EBX, kcb_fucb.B[EBX]	;Get first UCB
+2$:	TESTL	EBX, EBX		;More?
+	JE	ret012.S		;No
+	CMPL	ucb_baseucb.B[EBX], ESI	;Is this UCB for one of our partitions?
+	JNE	4$.S			;No
+	ANDB	ucb_sts2.B[EBX], #~U2$REMOVED ;Yes - indicate not removed
+4$:	MOVL	EBX, [EBX]		;Get next UCB for controller
+	JMP	2$.S			;Continue
+
+ret012:	RET
+.PAGE
+	.SBTTL	ks_media - Subroutine to determine media parameters
+
+;Subroutine to determine media parameters - must be called in extended fork
+;  context
+;	c{EDI} = Offset of DCB
+;	c{ESI} = Offset of UCB
+;	CALL	hdkmedia
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  Z:set = Disk may be file structured
+;	  Z:clr = Disk cannot be file structured
+
+hdkmedia:
+	CALL	getdriveinfo
+	JNC	xosdskHdkMedia##
+	RET
+.PAGE
+getdriveinfo:
+	CMPL	ucb_baseucb.B[ESI], #0.B ;Is this a partition?
+	JNE	ret012.S		;Yes - nothing needed here
+	CALL	xosdskGetSBufr##	;No - get a system cache buffer
+	JC	ret012.S
+	TESTB	ucb_bits.B[ESI], #UB$ATAPI ;Is this known to be an ATAPI unit?
+	JNE	8$.S			;Yes
+	PUSHL	DS			;No
+	POPL	ES
+	MOVL	ECX, #512t
+	MOVL	EAX, #kf_getparms	;Do an identify drive command to try
+	PUSHL	EBX			;  to get the drive parameters
+	CALL	xosdskXfer##
+	POPL	EBX
+	JNC	12$.S			;Go on if it worked
+
+;Here if the ATA identify drive command failed - check for the ATAPI signature
+
+	MOVL	EDX, ucb_ioreg1.B[ESI]
+	A2IOP	P_DCATAPIBCL
+	INB	[DX]
+	CMPB	AL, #14h
+	JNE	6$.S
+	A2IOP	P_DCATAPIBCH-P_DCATAPIBCL
+	INB	[DX]
+	CMPB	AL, #0EBh
+6$:	JNE	24$			;Assume this is an old-style IDE unit!
+
+;Here if this is known to be an ATAPI unit - do an ATAPI identify drive command
+
+8$:	PUSHL	DS
+	POPL	ES
+	MOVL	ECX, #512t
+	MOVL	EAX, #kf_getaparms	;Note that the kf_getaparms routine
+	PUSHL	EBX			;  does some additional ATAPI commands
+	CALL	xosdskXfer##		;  to obtain additional data about the
+	POPL	EBX			;  unit
+	JNC	14$.S
+	JMP	24$			;This should not fail!
+
+;Here if the ATA identify command worked
+
+12$:	ANDB	1.B[EBX], #3Fh		;Make sure protocol value is right
+
+;Start of common code for ATA and ATAPI identify commands
+
+14$:	MOVZWL	EAX, 0t*2.B[EBX]	;OK - get configuration bits
+	MOVL	ucb_hdconfig[ESI], EAX
+	TESTB	AL, #80h		;Removable unit?
+	JE	16$.S			;No
+	ORB	ucb_bits.B[ESI], #UB$MEDIAC ;Yes
+	ORB	ucb_dsp.B[ESI], #DS$REMOVE
+16$:	MOVZBL	EAX, 47t*2.B[EBX]	;Get maximum sectors per interrupt
+	MOVL	ucb_hdsecpi[ESI], EAX
+	MOVZWL	EAX, 21t*2.B[EBX]	;Get number of buffers
+	SHLL	EAX, #9			;Change to bytes
+	MOVL	ucb_hdbufsz[ESI], EAX
+	TESTB	ucb_bits.B[ESI], #UB$ATAPI ;ATAPI unit?
+	JE	18$.S
+	CMPB	ucb_unittype.B[ESI], #DT_HARD
+	JNE	18$.S
+	CMPL	88t.B[EBX], #6F70466Ch
+	JNE	18$.S
+	CMPL	92t.B[EBX], #7079h
+	JNE	18$.S
+	MOVB	ucb_unittype.B[ESI], #DT_UHD3	
+18$:	PUSHL	EBX
+	ADDL	EBX, #27t*2.B		;Get model number string
+	MOVL	EDX, ucb_ext.B[ESI]
+	ADDL	EDX, #ucbx_model.B
+	MOVL	ECX, #20t
+	CALL	getidstr
+	MOVL	EBX, [ESP]
+	ADDL	EBX, #10t*2.B		;Get serial number string
+	MOVL	EDX, ucb_ext.B[ESI]
+	ADDL	EDX, #ucbx_serialno.B
+	MOVL	ECX, #10t
+	CALL	getidstr
+	MOVL	EBX, [ESP]
+	ADDL	EBX, #23t*2.B		;Get firmware version string
+	MOVL	EDX, ucb_ext.B[ESI]
+	ADDL	EDX, #ucbx_revision.B
+	MOVL	ECX, #4t
+	CALL	getidstr
+	POPL	EBX
+	MOVZWL	EAX, 0Ch.B[EBX]		;Get actual number of sectors
+	MOVL	ucb_csects.B[ESI], EAX
+	MOVL	ucb_isects.B[ESI], EAX
+	MOVZWL	EAX, 06h.B[EBX]		;Get actual number of heads
+	MOVL	ucb_cheads.B[ESI], EAX
+	MOVL	ucb_iheads.B[ESI], EAX
+	MOVZWL	EAX, 02h.B[EBX]		;Get actual number of cylinders
+	MOVL	ucb_ccylns.B[ESI], EAX
+	MOVL	ucb_icylns.B[ESI], EAX
+	PUSHL	120t.B[EBX]		;Save total number of LBA blocks
+	TESTB	ucb_bits.B[ESI], #UB$ATAPI ;ATAPI unit?
+	JNE	20$.S			;Yes - always have LBA mode available
+	TESTB	99t.B[EBX], #02h	;No - might LBA mode be available?
+	JE	22$.S			;Yes
+	CMPL	120t.B[EBX], #0.B	;Maybe
+	JE	22$.S			;No
+	ORB	ucb_bits.B[ESI], #UB$LBA ;Yes - enable LBA mode
+	MOVL	dcb_dkdblk.B[EDI], #0	;No - try to read block 0 using LBA mode
+	PUSHL	DS
+	POPL	ES
+	MOVL	ECX, #512t
+	MOVL	EAX, #kf_readdata
+	PUSHL	EBX
+	CALL	xosdskXfer##
+	POPL	EBX
+	JC	22$.S			;If error
+20$:	POPL	EAX			;OK - use have LBA mode available
+	JMP	32$.S
+
+;Here if LBA mode read failed
+
+22$:	POPL	EAX			;Fix up the stack
+24$:	ANDB	ucb_bits.B[ESI], #~UB$LBA ;Assume this means that LBA mode is
+					  ;  not supported
+
+;Here if don't have LBA mode available - We make sure we have non-zero
+;  values for the number of cylinders, heads, and sectors.  This ensures
+;  that we will not get a divide error when accessing the disk.  If there
+;  is a file structure on the disk, we will use the values from the file
+;  structure's boot block.  If not, we will probably not be able to access
+;  anything beyond the first track on the disk!
+
+	CMPL	ucb_icylns.B[ESI], #0.B	;Have a cylinders value?
+	JNE	26$.S			;Yes
+	MOVL	ucb_icylns.B[ESI], #500t ;No - put in a fake non-zero value
+	MOVL	ucb_ccylns.B[ESI], #500t
+26$:	CMPL	ucb_iheads.B[ESI], #0.B	;Have a heads value?
+	JNE	28$.S			;Yes
+	MOVL	ucb_iheads.B[ESI], #6t	;No - put in a fake non-zero value
+	MOVL	ucb_cheads.B[ESI], #6t
+28$:	CMPL	ucb_isects.B[ESI], #0.B	;Have a sectors value?
+	JNE	30$.S			;Yes
+	MOVL	ucb_isects.B[ESI], #17t	;No - put in a fake non-zero value
+	MOVL	ucb_csects.B[ESI], #17t
+30$:	MOVL	EAX, ucb_icylns.B[ESI]	;Calculate total number of blocks
+	IMULL	EAX, ucb_cheads.B[ESI]
+	IMULL	EAX, ucb_csects.B[ESI]
+32$:	MOVL	ucb_cblocks.B[ESI], EAX
+	MOVL	ucb_iblocks.B[ESI], EAX
+	CALL	xosdskGiveBufr##	;Give up the buffer we used
+	TESTB	ucb_bits.B[ESI], #UB$LBA
+	JNE	34$.S
+	MOVL	EAX, #kf_setparms	;Set the drive parameters
+	CALL	xosdskXfer##
+	CLC
+34$:	RET
+.PAGE
+;Subroutine to copy string for the disk unit identify data - these strings are
+;  stored as a list of words with reverse byte order - a string may be null
+;  terminated or space filled to its maximum length - this routine fixes up
+;  the byte order and removes any trailing or leading spaces and replaces all
+;  multiple spaces with a single space character
+;	c{EBX} = Offset of start of string
+;	c{EDX} = Offset to receive string
+;	c{ECX} = Maximum length of string (in words)
+;	CALL	getidstr
+
+getidstr:
+	PUSHL	ECX			;First, fix up the byte order
+	PUSHL	EBX
+2$:	RORW	[EBX], #8
+	ADDL	EBX, #2.B
+	LOOP	ECX, 2$
+	POPL	EBX			;Restore pointer
+	POPL	ECX			;Restore count
+	ADDL	ECX, ECX		;Change to byte count
+4$:	CMPB	[EBX], #' '		;Leading space?
+	JNE	6$.S			;No
+	INCL	EBX			;Yes - skip it
+	LOOP	ECX, 4$
+	JMP	16$.S			;If null string (all spaces)
+
+;Here with non-space character
+
+6$:	PUSHL	EDX
+8$:	MOVB	AL, [EBX]		;Get byte
+	INCL	EBX			;Bump pointer
+	CMPB	AL, #' '		;Space?
+	JNE	10$.S			;No
+	CMPB	-1.B[EDX], #' '		;Was previous character a space?
+	JE	12$.S			;Yes - skip this one
+10$:	MOVB	[EDX], AL		;No - store byte
+	INCL	EDX			;Bump pointer
+	CMPB	AL, #0			;End of string?
+	JE	14$.S			;Yes
+	CMPB	AL, #' '		;Space?
+	JE	12$.S			;Yes
+	MOVL	[ESP], EDX		;No - remember this as end
+12$:	LOOP	ECX, 8$			;Continue if more to copy
+14$:	POPL	EDX			;Restore offset of end of string
+16$:	MOVB	[EDX], #0		;Put null at end
+	RET
+.PAGE
+	.SBTTL	ks_senchg - Sense disk change
+
+;Subroutine to sense if a disk has changed - This function is called to
+;  determine if a disk has been changed when obtaining a block from the
+;  cache.  If this is an ATAPI disk and there has been disk activity within
+;  the last second, it assumes the disk has not been changed.  Otherwise it
+;  sends a test unit ready command to the disk.  This will give a disk changed
+;  error if the disk has been changed since the last IO operation.  If it is
+;  not an ATAPI disk, it simply checks the U2$MCHNG bit.
+;	c{EDI} = Offset of DCB
+;	CALL	hdksenchg
+;	c{EDX} = Return value:
+;		   0 - Error, c{EAX} = Error code
+;		   1 - Disk not changed
+;		   2 - Might be changed (no MS) - never returned here
+;		   3 - Probably changed (try to assume changed) - never
+;			 returned here
+;		   4 - Probably changed (always verify)
+
+hdksenchg:
+	TESTB	ucb_dsp.B[ESI], #DS$REMOVE ;Is this disk removable?
+	JE	2$.S			;No - it can't be changed!
+	TESTB	ucb_bits.B[ESI], #UB$ATAPI ;Yes - ATAPI drive?
+	JE	10$.S			;No - this is easy
+
+	JMP	4$.S		;#######
+
+
+	MOVL	EAX, knlTickCnt##	;Yes - do we need to do this now?
+	SUBL	EAX, ucb_acstime.B[ESI]
+	JS	2$.S			;No
+	CMPL	EAX, #TICKSPERSEC	;Maybe
+	JAE	4$.S			;Yes - must check
+2$:	MOVL	EDX, #1			;No - indicate not changed
+	RET
+
+
+;Here for ATAPI disk to do a test unit ready command
+
+4$:	PUSHL	EBX
+	MOVL	EAX, #kf_chkchg		;See if the disk has been changed
+	CALL	xosdskXfer##
+	POPL	EBX
+	JNC	2$.S			;Not changed if no error
+	CLRL	EDX			;Error - assume not media changed
+	CMPL	EAX, #ER_MDCHG.B	;Is it?
+	JNE	6$.S			;No
+	MOVB	DL, #4			;Yes
+6$:	RET
+
+	.SBTTL	ks_chkchg - Check for disk change
+
+;Subroutine to check if a disk has changed - This function is called to
+;  determine if a disk has been changed when mounting a disk.  If this is an
+;  ATAPI drive, we always indicate not changed since ATAPI drives always
+;  give a media changed indication when we actually do IO, thus there is no
+;  real need to do a seperate operation here.  If it is not an ATAPI disk,
+;  then in can only be removable if it is a PCCard device.  We simply check
+;  the U2$MCHNG bit.
+;	c{EDI} = Offset of DCB
+;	CALL	hdkchkchg
+;	c{EDX} = Return value:
+;		   0 - Error, c{EAX} = Error code
+;		   1 - Disk not changed
+;		   2 - Might be changed (no MS) - never returned here
+;		   3 - Probably changed (try to assume changed) - never
+;			 returned here
+;		   4 - Probably changed (always verify)
+
+hdkchkchg:
+	TESTB	ucb_dsp.B[ESI], #DS$REMOVE ;Is this disk removable?
+	JE	2$.S			;No - it can't be changed!
+	TESTB	ucb_bits.B[ESI], #UB$ATAPI ;Yes - ATAPI drive?
+	JNE	2$.S			;Yes - say not changed
+10$:	TESTB	ucb_sts2.B[ESI], #U2$MCHG
+	JE	2$.S
+	MOVL	EDX, #4
+	RET
+.PAGE
+	.SBTTL	kf_setparms - Set drive parameters
+
+;Here for the set drive parameters function - This command issues an initialize
+;  drive parameters command using the values from ucb_csects and ucb_cheads,
+;  scaled if necessary to bring the value into range.  The number of heads
+;  cannot be greater than 16.  If the ucb_cheads value is greater than 16, the
+;  actual value from the drive is used if it is 16 or less.  If it is more than
+;  16, a value of 16 is used for the number of heads and the number of sectors
+;  value is increased to compensate as much as possible.  In any case, the
+;  values used here are stored in ucb_hdmheads and ucb_hdmsects.  This command
+;  should never be issued for a LBA drive.
+;	c{ESI}    = Offset of UCB
+;	c{EDI}    = Offset of DCB
+;	CALL	hdksetparms
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  c{EAX} = 0
+
+hdksetparms:
+	TESTB	ucb_sts2.B[ESI], #U2$REMOVED ;Still have a controller?
+	JNE	knlNotReady##
+	CLRL	EAX			;Assume no mapping needed
+	MOVL	ucb_hdmsects[ESI], EAX
+	MOVL	ucb_hdmheads[ESI], EAX
+	MOVL	ucb_hdmcylns[ESI], EAX
+	MOVL	ECX, ucb_csects.B[ESI]	;Get number of sectors
+	MOVL	EAX, ucb_cheads.B[ESI]	;Get number of heads
+	CMPL	EAX, #16t.B		;Too many heads?
+	JBE	8$.S			;No - use it
+	MOVL	ECX, ucb_isects.B[ESI]	;Yes - get actual values from drive
+	MOVL	EAX, ucb_iheads.B[ESI]
+	CMPL	EAX, #16t.B		;Usable head value?
+	JBE	6$.S			;Yes
+4$:	IMULL	ECX, EAX		;No - calculate adjusted number of
+	ADDL	ECX, #15t.B		;  sectors
+	SHRL	ECX, #4t
+	MOVL	EAX, #16t		;Use 16 heads
+	CMPL	ECX, #63t.B		;Too many sectors?
+	JBE	6$.S			;No
+	MOVL	ECX, #63t		;Yes - use 63
+6$:	MOVL	ucb_hdmsects[ESI], ECX	;Store mapped values
+	MOVL	ucb_hdmheads[ESI], EAX
+	IMULL	ECX, EAX
+	CLRL	EDX			;Calculate adjusted number of cylinders
+	MOVL	EAX, ucb_iblocks.B[ESI]
+	DIVL	ECX
+	MOVL	ucb_hdmcylns[ESI], EAX	;Calcualte adjusted number of total
+	IMULL	EAX, ucb_hdmheads[ESI]	;  blocks
+	IMULL	EAX, ucb_hdmsects[ESI]
+	MOVL	ucb_cblocks.B[ESI], EAX
+	MOVL	ECX, ucb_hdmsects[ESI]
+	MOVL	EAX, ucb_hdmheads[ESI]
+8$:	MOVL	EDX, ucb_ioreg1.B[ESI]
+	A2IOP	P_DCHDDH
+	DECL	EAX
+	ORB	AL, ucb_select.B[ESI]	;Merge in drive select bit
+	OUTB	[DX]			;Store number of heads and drive select
+	IOPAUSE
+	A2IOP	P_DCHDSCN-P_DCHDDH	;Store number of sectors
+	MOVL	EAX, ECX
+	OUTB	[DX]
+	IOPAUSE
+	MOVL	EBX, ucb_kcb.B[ESI]
+	MOVB	kcb_sts1.B[EBX], #0
+	A2IOP	P_DCHDCMD-P_DCHDSCN	;Store command
+	MOVB	AL, #91h
+	OUTB	[DX]
+	MOVB	kcb_itimer.B[EBX], #TO_SETPARMS
+	MOVL	EAX, #-1
+	JMP	knlXfWait##		;Wait until finished
+.PAGE
+	.SBTTL	kf_getparms - Get drive parameters
+
+;Here for the get drive parameters function
+;	c{ES:EBX} = Address of buffer
+;	c{ECX}    = Byte count
+;	c{ESI}    = Offset of UCB
+;	c{EDI}    = Offset of DCB
+;	CALL	hdkgetparms
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  c{EAX} = 0
+
+hdkgetparms:
+	CLRL	EDX
+	MOVL	EAX, #0EC00FF00|K1$INPUT ;Get ATA identify drive command
+	JMP	hdkxfer			;Go handle it just like a read command!
+
+	.SBTTL	kf_getaparms - Get ATAPI drive parameters
+
+;Here for the get ATAPI drive parameters function - This function also
+;  does an ATAPI read capacity command and a mode sense command to obtain
+;  the inactivity time value and fills in the data from these commands in
+;  the "normal" ATA items in the parameter block.
+;	c{ES:EBX} = Address of buffer
+;	c{ECX}    = Byte count
+;	c{ESI}    = Offset of UCB
+;	c{EDI}    = Offset of DCB
+;	CALL	hdkgetaparms
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  c{EAX} = 0
+
+2$:	MOVL	EAX, #ER_DEVER		;No - fail!
+	STC
+4$:	RET
+
+hdkgetaparms:
+	CLRL	EDX
+	MOVL	EAX, #0A100FF00|K1$INPUT ;Get ATAPI identify drive command
+	PUSHL	EBX
+	CALL	hdkxfer			;Do it
+	POPL	EBX
+	JC	4$.S			;If error
+	MOVB	ucb_hdcmdwrt[ESI], #2Ah	;Store the ATAPI packet command values
+	MOVB	ucb_hdcmdrd[ESI], #28h
+	ORB	ucb_bits.B[ESI], #UB$ATAPI|UB$LBA ;Indicate ATAPI drive
+	MOVL	EAX, [EBX]
+	TESTB	AH, #80h		;Is the protocol type right?
+	JE	2$.S			;No
+	TESTB	AH, #40h		;Maybe
+	JNE	2$.S			;No
+	SHRB	AL, #5t			;Yes - get the command response type
+	ANDB	AL, #03h
+	CMPB	AL, #3			;Is it valid?
+	JAE	2$.S			;No - fail!
+	INCL	EAX			;Yes - store the value
+	ANDB	ucb_sts3.B[ESI], #~{U3$ATAPIRSP|U3$CMDINT}
+	CMPB	AL, #ACR_INT
+	JNE	8$.S
+	ORB	AL, #U3$CMDINT
+8$:	ORB	ucb_sts3.B[ESI], AL
+	ANDB	AH, #1Fh		;Get the device type
+	MOVB	AL, #DT_HARD		;Assume hard disk
+	CMPB	AH, #0			;Right?
+	JE	10$.S			;Yes
+	MOVB	AL, #DT_CDRM		;No - assume CD-ROM
+	CMPB	AH, #5			;Right?
+	JE	10$.S			;Yes
+	MOVB	AL, #DT_OPTD		;No - assume optical disk
+	CMPB	AH, #7h			;Right?
+	JNE	2$.S			;No - fail!
+10$:	MOVB	ucb_unittype.B[ESI], AL	;Yes - store unit type
+
+;Now do a Read Capacity command to get the size of the unit
+
+	PUSHL	#6t.B
+12$:	PUSHL	EBX
+	ADDL	EBX, #504t
+	CLRL	EDX
+	MOVL	ECX, #8t
+	MOVL	EAX, #002500|K1$INPUT
+	CALL	hdkxfer
+	POPL	EBX
+	JC	14$.S
+	ADDL	ESP, #4t.B
+	MOVL	EAX, 504t[EBX]
+	XCHGB	AL, AH
+	RORL	EAX, #16t
+	XCHGB	AL, AH
+	INCL	EAX
+	JMP	20$.S
+
+14$:	CMPL	EAX, #ER_NTRDY.B	;Not ready?
+	JNE	16$.S			;No
+	ADDL	ESP, #4t.B		;Yes - assume we have 512 byte blocks
+	MOVL	ucb_pblksz[ESI], #1
+	CLRL	EAX
+	MOVL	120t.B[EBX], EAX
+	RET
+
+;Here if error on the Read Capacity command other than not ready
+
+16$:	CMPL	EAX, #ER_MDCHG.B	;Media change?
+	JNE	18$.S			;No
+	DECL	[ESP]			;Yes - have we tried enough?
+	JNE	12$.S			;No - try it again
+
+;Here if the Read Capacity command failed - try to do a Read Format Capacity
+;  command
+
+18$:	ADDL	ESP, #4t.B
+	PUSHL	EBX
+	ADDL	EBX, #500t
+	CLRL	EDX
+	MOVL	ECX, #12t
+	MOVL	EAX, #002300|K1$INPUT
+	CALL	hdkxfer
+	POPL	EBX
+	JC	28$.S
+	MOVL	EAX, 504t[EBX]
+	XCHGB	AL, AH
+	RORL	EAX, #16t
+	XCHGB	AL, AH
+20$:	MOVL	EDX, 508t[EBX]		;Get the block size
+	MOVB	DL, DH
+	MOVB	DH, #0
+	RORL	EDX, #16t
+	XCHGB	DL, DH
+	SHRL	EDX, #9t
+	CMPL	EDX, #1.B
+	JL	22$.S
+	CMPL	EDX, #4.B
+	JBE	24$.S
+22$:	MOVL	EDX, #1
+24$:	MOVL	ucb_pblksz[ESI], EDX
+	IMULL	EAX, EDX
+	MOVL	120t.B[EBX], EAX
+	CLRL	EAX
+28$:	RET
+.PAGE
+	.SBTTL	kf_sessions - Function to get CD-ROM session list
+
+;Here for the get CD-ROM session list function
+;	c{ES:EBX} = Address of buffer
+;	c{ECX}    = Maximum amount to transfer
+;	c{ESI}    = Offset of UCB
+;	c{EDI}    = Offset of DCB
+;	CALL	hdkgettoc
+;	c{ECX} = Amount transfered
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  c{EAX} = 0
+;  Data returned in the buffer is the raw data received from the drive
+
+hdkgettoc:
+	MOVL	EAX, #024300|K1$INPUT
+	JMP	hdkxfer
+
+	.SBTTL	kf_tracks - Function to get CD-ROM track list
+
+;Here for the get CD-ROM track list function
+;	c{ES:EBX} = Address of buffer
+;	c{ECX}    = Maximum amount to transfer
+;	c{ESI}    = Offset of UCB
+;	c{EDI}    = Offset of DCB
+;	CALL	hdkgettrks
+;	c{ECX} = Amount transfered
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  c{EAX} = 0
+;  Data returned in the buffer is the raw data received from the drive
+
+hdkgettrks:
+	MOVL	EAX, #004300|K1$INPUT
+	JMP	hdkxfer
+.PAGE
+	.SBTTL	kf_format - Function to format track
+
+;Here for the format track function
+;	c{EDI} = Offset of DCB
+;	CALL	hdkformat
+
+hdkformat:
+	MOVL	EAX, #50FF00h		;Get ATA format command
+	JMP	hdkxfer.S
+.PAGE
+	.SBTTL	kf_chkchg - Check for possible disk change at fork level
+
+;Here for the check for disk change function - This function is only used
+;  for ATAPI disks.  It issues a test unit ready function which will fail
+;  with an ER_MDCHG error if the media might have been changed.
+
+hdkchkchgf:
+	CLRL	ECX
+	CLRL	EDX
+	CLRL	EBX
+	CLRL	EAX
+	JMP	hdkxfer
+.PAGE
+	.SBTTL	kf_readraw - Function to read data using raw disk address
+
+;Here for the read raw block function
+;	c{ES:EBX} = Address of buffer
+;	c{ECX}    = Amount to transfer
+;	c{ESI}    = Offset of UCB
+;	c{EDI}    = Offset of DCB
+;	CALL	hdkreadraw
+;	c{ECX} = Amount transfered
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  c{EAX} = 0
+
+hdkreadraw:
+	CALL	getrawpda		;Get raw mode disk address
+	JMP	2$.S
+
+	.SBTTL	kf_readlist - Function to read data into buffer list
+
+;Here for the read buffer list function
+;	c{ES:EBX} = Address of buffer
+;	c{ECX}    = Amount to transfer
+;	c{ESI}    = Offset of UCB
+;	c{EDI}    = Offset of DCB
+;	CALL	hdkreadlist
+;	c{ECX} = Amount transfered
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  c{EAX} = 0
+
+hdkreadlist:
+.IF NE $$CHKLST
+	CALL	checklist
+.ENDC
+	CALL	block2pda
+2$:	JC	6$.S
+	MOVL	EAX, #2000FF00h|K1$INPUT|K1$LIST|K1$BLKCNT
+	JMP	4$.S			;Get ATA read cmd and kcb_sts1 value
+
+	.SBTTL	kf_readdata - Function to read data into single buffer
+
+;Here for the read block function
+;	c{ES:EBX} = Address of buffer
+;	c{ECX}    = Amount to transfer
+;	c{ESI}    = Offset of UCB
+;	c{EDI}    = Offset of DCB
+;	CALL	hdkreaddata
+;	c{ECX} = Amount transfered
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  c{EAX} = 0
+
+hdkreaddata:
+	CALL	block2pda
+	JC	6$.S
+	MOVL	EAX, #2000FF00h|K1$INPUT|K1$BLKCNT ;Get ATA read cmd and
+						   ;  kcb_sts1 value
+4$:	MOVB	AH, ucb_hdcmdrd[ESI]	;Get ATAPI packet read command
+	JMP	hdkxfer.S
+
+	.SBTTL	kf_writraw - Function to write data using raw disk address
+
+;Here for the write raw block function
+;	c{ES:EBX} = Address of buffer
+;	c{ECX}    = Amount to transfer
+;	c{ESI}    = Offset of UCB
+;	c{EDI}    = Offset of DCB
+;	CALL	hdkwritraw
+;	c{ECX} = Amount transfered
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  c{EAX} = 0
+
+hdkwritraw:
+	CALL	getrawpda		;Get raw mode disk address
+	JNC	8$.S
+6$:	CLRL	ECX
+	STC
+	RET
+
+	.SBTTL	kf_writlist - Function to write data from buffer list
+
+;Here for the write buffer list function
+;	c{ES:EBX} = Address of buffer
+;	c{ECX}    = Amount to transfer
+;	c{ESI}    = Offset of UCB
+;	c{EDI}    = Offset of DCB
+;	CALL	hdkwritlist
+;	c{ECX} = Amount transfered
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  c{EAX} = 0
+
+hdkwritlist:
+.IF NE $$CHKLST
+	CALL	checklist
+.ENDC
+	CALL	block2pda
+	JC	6$.S
+	MOVL	EAX, #3000FF00h|K1$LIST|K1$BLKCNT ;Get ATA write and kcb_sts1
+	JMP	10$.S				  ;  value
+
+	.SBTTL	kf_writdata - Function to write data from single buffer
+
+;Here for the write block function
+;	c{ES:EBX} = Address of buffer
+;	c{ECX}    = Amount to transfer
+;	c{ESI}    = Offset of UCB
+;	c{EDI}    = Offset of DCB
+;	CALL	hdkwritdata
+;	c{ECX} = Amount transfered
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  c{EAX} = 0
+
+hdkwritdata:
+	CALL	block2pda
+	JC	6$.S
+8$:	MOVL	EAX, #3000FF00h|K1$BLKCNT ;Get ATA write and kcb_sts1 value
+10$:	MOVB	AH, ucb_hdcmdwrt[ESI]	;Get ATAPI packet write command
+					;Fall into hdkxfer on next page
+.PAGE
+;Here to actually do the transfer
+;	c{EAX}    = (bits 7 -0 ) Value for kbc_sts1
+;		    (bits 23-8 ) ATAPI packet command
+;		    (bits 31-24) ATA command
+;	c{ES:EBX} = Address of buffer
+;	c{EDX}    = Disk address
+;	c(DL)     = Packet command
+;	c{ESI}    = Offset of UCB
+;	c{EDI}    = Offset of DCB
+
+$$$=!0				;The next 3 items MUST be in this order!
+FRM xfr_func   , 1t		;Function value for interface
+FRM xfr_pktcmd2, 1t		;Second byte of packet command
+FRM xfr_pktcmd1, 1t		;First byte of packet command
+FRM xfr_sts1   , 1t		;Value for kcb_sts1
+FRM            , 3t
+FRM xfr_changed, 1t
+FRM xfr_daddr  , 4t		;Disk address
+FRM xfr_bfrpnt , 4t
+FRM xfr_datapnt, 4t
+FRM xfr_bfrleft, 4t
+FRM xfr_ttlleft, 4t
+FRM xfr_buffer , 8t		;Address of buffer for transfer
+FRM xfr_count  , 4t		;Amount to transfer
+xfr_SIZE=!$$$
+
+hdkxfer:TESTB	ucb_sts2.B[ESI], #U2$REMOVED ;Still have a controller?
+	JNE	knlNotReady##
+	ENTER	xfr_SIZE, 0		;Set up a stack frame
+	MOVL	xfr_sts1.B[EBP], EAX	;Save functions
+	MOVL	xfr_count.B[EBP], ECX	;Save amount to transfer
+	MOVL	xfr_daddr.B[EBP], EDX	;Save disk address
+	MOVL	xfr_buffer+0.B[EBP], EBX ;Store buffer address
+	MOVL	xfr_buffer+4.B[EBP], ES
+	MOVB	xfr_changed.B[EBP], #0
+hdkxfer2:
+	MOVL	EBX, ucb_kcb.B[ESI]
+	CLRL	EAX			;Clear amount transfered
+	MOVL	kcb_amount.B[EBX], EAX
+	MOVL	EAX, xfr_buffer+0.B[EBP] ;Store buffer pointers
+	MOVL	kcb_buffer.B[EBX], EAX
+	MOVL	xfr_bfrpnt.B[EBP], EAX
+	MOVL	xfr_datapnt.B[EBP], EAX
+	MOVL	EAX, xfr_count.B[EBP]	;Store amount to transfer
+	MOVL	xfr_ttlleft.B[EBP], EAX
+	MOVL	kcb_left.B[EBX], EAX
+	MOVB	DL, xfr_sts1.B[EBP]
+	MOVB	kcb_sts1.B[EBX], DL
+	TESTB	DL, #K1$LIST		;Using a buffer list?
+	JE	2$.S			;No
+	MOVL	EAX, #512t		;Yes - get size of one buffer
+2$:	MOVL	xfr_bfrleft.B[EBP], EAX	;Initialize amount left in first buffer
+	MOVB	AL, ucb_select.B[ESI]	;Get drive select value
+	MOVL	EDX, ucb_ioreg1.B[ESI]	;Point to the drive/head register
+	A2IOP	P_DCHDDH
+	CMPB	xfr_pktcmd1.B[EBP], #0FFh ;Want a packet command?
+	JNE	xferatapi		;Yes
+	ORB	AL, xfr_daddr+1.B[EBP]	;No - merge in head bits
+	OUTB	[DX]
+	MOVB	AL, #08h		;Get value for the fixed disk
+	MOVL	EDX, ucb_ioreg2.B[ESI]	;  register
+	OUTB	[DX]
+	MOVB	AL, ucb_hdwpc[ESI]	;Get write precomp value
+	MOVL	EDX, ucb_ioreg1.B[ESI]
+	A2IOP	P_DCHDWP
+	OUTB	[DX]
+	TESTB	ucb_sts1.B[ESI], #U1$RECAL ;Need to recalibrate now?
+	JE	4$.S			;No - go do transfer
+	MOVB	kcb_itimer.B[EBX], #TO_RESTORE ;Yes
+	MOVB	AL, #10h		;Start a restore operation
+	A2IOP	P_DCHDCMD-P_DCHDWP
+	OUTB	[DX]
+	MOVL	EAX, #-1
+	CALL	knlXfWait##		;Wait until done
+	JC	xferdn			;If error
+	ANDB	ucb_sts1.B[ESI], #~U1$RECAL ;OK - indicate restore done
+4$:	TESTB	ucb_sts2.B[ESI], #U2$REMOVED ;Still have a controller?
+	JNE	knlNotReadyLv##
+	MOVB	AL, xfr_daddr+0.B[EBP]	;Give sector number to the controller
+	MOVL	EDX, ucb_ioreg1.B[ESI]
+	A2IOP	P_DCHDSEC
+	OUTB	[DX]
+	IOPAUSE
+	MOVB	AL, xfr_daddr+2.B[EBP]	;Give cylinder number to the controller
+	INCL	EDX
+	OUTB	[DX]
+	IOPAUSE
+	MOVB	AL, xfr_daddr+3.B[EBP]
+	INCL	EDX
+	OUTB	[DX]
+	IOPAUSE
+	MOVL	EAX, xfr_count.B[EBP]	;Assume not format, get sector count
+	SHRL	EAX, #9t
+	CMPB	xfr_func.B[EBP], #50h	;Format function?
+	JNE	6$.S			;No
+	MOVZBL	EAX, ucb_csects.B[ESI]	;Yes - fix up the sector count value
+6$:	MOVL	ECX, EAX
+	A2IOP	P_DCHDSCN-P_DCHDCYH
+	OUTB	[DX]			;Give sector count to the controller
+	IOPAUSE
+	MOVB	kcb_intstate.B[EBX], #HDIS_ATA ;Set interrupt state
+	MOVB	AL, xfr_func.B[EBP]	;Get function
+	A2IOP	P_DCHDCMD-P_DCHDSCN	;Give it to the controller
+	OUTB	[DX]
+	IMULL	EAX, ECX, #512t		;Get number of bytes to transfer
+	TESTB	kcb_sts1.B[EBX], #K1$INPUT ;Input function?
+	JNE	10$.S			;Yes
+	ADDL	ucb_blockout[ESI], ECX	;No
+	ADDL	ucb_byteout[ESI], EAX
+	MOVL	ECX, #3000t		;Don't wait too long here
+	A2IOP	P_DCHDSTS-P_DCHDCMD
+	IOPAUSE
+8$:	INB	[DX]			;Is controller ready for data?
+	TESTB	AL, #08
+	LOOPE	ECX, 8$			;Wait until ready
+	JE	hdknorsp.S		;Fail if didn't come ready
+	PUSHL	ESI			;OK
+	LESL	ESI, xfr_buffer.B[EBP]	;Get address
+	A2IOP	P_DCHDDATA-P_DCHDSTS	;Point to data register
+	MOVL	ECX, #256t
+	CLD
+	ROUTSW	ES:[ESI]		;Output data to controller
+	POPL	ESI
+	ADDL	kcb_amount.B[EBX], #512t
+	JMP	12$.S
+
+;Here if doing input
+
+10$:	ADDL	ucb_blockin[ESI], ECX
+	ADDL	ucb_bytein[ESI], EAX
+12$:	CALL	knlXfWaitNTO##		;Wait until finished
+
+;NEED TO FIX ERROR HANDLING HERE!!!!!!!
+
+	TESTB	ucb_sts2.B[ESI], #U2$REMOVED ;Still have a controller?
+	JNE	knlNotReady##		;No - fail!
+	CMPL	EAX, #ER_NORSP.B	;Time-out error?
+	JE	xferdn.S		;Yes
+	TESTB	kcb_sts1.B[EBX], #K1$INPUT ;No - doing input?
+	JE	14$.S			;No
+	PUSHL	EDI			;Yes
+	MOVL	EDI, kcb_buffer.B[EBX]
+	ORB	cb_sts.B[EDI], #CB$FULL
+	MOVL	ES, xfr_buffer+4.B[EBP]
+	MOVL	ECX, #256t
+	A2IOP	P_DCHDDATA-P_DCHDSTS	;Point to data register
+	CLD
+	RINSW	[EDI]			;Input data from controller
+	POPL	EDI
+	ADDL	kcb_amount.B[EBX], #512t
+14$:	MOVL	EDX, ucb_ioreg1.B[ESI]
+	A2IOP	P_DCHDSTS		;Get controller status
+	INB	[DX]
+	TESTB	AL, #01h		;Any hard errors?
+	JNE	hdkerr.S		;Yes
+	BTL	EAX, #2t		;No - did we have a corrected error?
+	ADCL	ucb_tdataerr[ESI], #0.B
+	LEAVE
+	CLRL	EAX
+	MOVL	ECX, kcb_amount.B[EBX]
+	RET
+
+;Here if have time-out waiting for the output buffer
+
+hdknorsp:
+	MOVL	EAX, #ER_NORSP
+	JMP	xferdn.S
+
+;Here if have error
+
+hdkerr:	MOVL	EDX, ucb_ioreg1.B[ESI]
+	A2IOP	P_DCHDERR		;Get error byte
+	INB	[DX]
+	MOVL	EBX, #ataerrtbl		;Point to our error table
+	MOVL	ECX, #ERRNUM
+20$:	TESTB	AL, CS:[EBX]		;This error?
+	JNE	22$.S			;Yes
+	ADDL	EBX, #3.B		;No
+	LOOP	ECX, 20$
+22$:	MOVXBL	EAX, CS:1.B[EBX]	;Get error code
+	MOVZBL	EBX, CS:2.B[EBX]
+	ADDL	EBX, ESI
+	INCL	[EBX]			;Bump both the total and hard
+	INCL	4.B[EBX]		;  error counts
+xferdn:	LEAVE
+	MOVL	ECX, kcb_amount.B[EBX]
+	BTL	EAX, #31t
+	RET
+.PAGE
+;Here to transfer data for an ATAPI drive
+;	c(AL) = Drive select value
+;	c[DX] = P_DCATAPIDS
+
+xferatapi:
+	OUTB	[DX]
+	LEAL	EDX, kcb_cmdpkt.B[EBX]
+	MOVZWL	EAX, xfr_pktcmd1.B[EBP]	;Get the command bytes
+	MOVL	[EDX], EAX
+	CMPB	AL, #43h		;Is it a Read TOC command?
+	JNE	2$.S			;No
+	MOVL	4.B[EDX], #02000000h	;Yes
+	MOVL	8.B[EDX], #0
+	TESTB	AH, #02h		;Want session data?
+	JE	8$.S			;No
+	MOVB	2.B[EDX], #02h		;Yes - indicate that
+	MOVB	9.B[EDX], #80h
+	JMP	8$.S
+
+;Here if not a Read TOC command
+
+2$:	MOVL	ECX, xfr_daddr.B[EBP]	;Get the device address (4 bytes, MSB
+	XCHGB	CL, CH			;  first)
+	RORL	ECX, #16t
+	XCHGB	CL, CH
+	MOVL	2.B[EDX], ECX
+	MOVB	6.B[EDX], #0
+	MOVL	ECX, xfr_count.B[EBP]	;Get the byte count
+	CMPB	AL, #25h		;Is it a Read Capacity command?
+	JNE	4$.S			;No
+	CLRL	ECX			;Yes - no count in packet!
+4$:	TESTB	kcb_sts1.B[EBX], #K1$BLKCNT ;Want block count?
+	JE	6$.S			;No
+	SHRL	ECX, #9t		;Yes
+	CMPL	ucb_pblksz[ESI], #1.B	;Large block device?
+	JE	6$.S			;No
+	PUSHL	EDX			;Yes - fix up the block count
+	CLRL	EDX
+	MOVL	EAX, ECX
+	IDIVL	ucb_pblksz[ESI]
+	POPL	EDX
+	MOVL	ECX, EAX
+6$:	XCHGB	CL, CH			;Store count (2 bytes, MSB first)
+	MOVW	7.B[EDX], CX
+	MOVB	9.B[EDX], #0
+	MOVW	10t.B[EDX], #0		;Store the last 2 unused bytes
+8$:	CALL	doatapi			;Do the packet command
+	JC	12$.S			;If error
+	CLRL	EAX			;OK - all finished
+10$:	LEAVE
+	MOVL	EDX, knlTickCnt##	;Remember when we did this
+	MOVL	ucb_acstime.B[ESI], EDX
+	MOVL	ECX, kcb_amount.B[EBX]
+	RET
+
+;Here if error
+
+12$:	CMPL	EAX, #ER_DEVER		;Device error?
+	JE	14$.S			;Yes
+	STC				;No - just return this error
+	JMP	10$.S
+
+;Here with a device error - Note that since all we use here is the sense code
+;  to determine our error code, we don't really need to do a request sense
+;  command, but we do one anyway just in case some devices will be unhappy if
+;  we don't!  Currently, we ignore almost everything except the sense code
+;  (which was actually avaliable from the error register anyway!)
+
+14$:	CALL	dosense
+	JC	10$.S			;If error here, just return the error
+	MOVB	AL, kcb_sense+0.B[EBX]	;Get the error code
+	ANDB	AL, #7Fh
+	CMPB	AL, #70h		;Normal error?
+	JNE	16$.S			;No - report device driver error (we
+					;  should never see a defered error
+					;  since we don't use any immediate
+					;  commands)
+	MOVB	AL, kcb_sense+2.B[EBX]	;Get the sense key value
+	TESTB	AL, #20h		;Allocation length error?
+	JE	18$.S			;No
+16$:	CLRL	EAX			;Yes - this should not be possible!
+18$:	ANDL	EAX, #0Fh.B
+	MOVXWL	EAX, CS:atapierrtbl[EAX*2] ;Get our correspnding error code
+	CMPL	EAX, #ER_MDCHG		;No - is the error "media changed"?
+	JNE	22$.S			;No
+	CMPB	xfr_changed.B[EBP], #1	;Yes - have we already done this twice?
+	JG	22$.S			;Yes - fail now
+	CMPB	xfr_pktcmd1.B[EBX], #28h ;Read or write command?
+	JE	20$.S			;Yes
+	CMPB	xfr_pktcmd1.B[EBX], #2Ah ;Maybe
+	JNE	24$.S			;No - don't handle "media changed" here
+20$:	INCB	xfr_changed.B[EBP]	;No
+	TESTB	ucb_sts1.B[ESI], #U1$MOUNT ;Is the disk mounted now?
+	JE	hdkxfer2		;No - don't care about this - try again
+	MOVL	EAX, dcb_sdisp.B[EDI]	;Yes - see if it is really changed
+	CALLI	CS:dd_vfychg.B[EAX]
+	JNC	hdkxfer2		;Try again if OK
+22$:	BTL	EAX, #31t
+	JMP	10$
+
+;Here if have a media change indication for other than a read or write
+;  command - In this case we do another sense command to make sure we clear
+;  the change indication (some disks will report this twice immediately after
+;  reset, once indicating reset and once indicating possible media change).
+
+24$:	CALL	dosense
+	JC	10$
+	MOVL	EAX, #ER_MDCHG
+	STC
+	JMP	10$
+.PAGE
+dosense:LEAL	EAX, kcb_sense.B[EBX]
+	MOVL	kcb_buffer.B[EBX], EAX
+	MOVL	xfr_bfrpnt.B[EBP], EAX
+	MOVL	xfr_datapnt.B[EBP], EAX
+	MOVL	kcb_left.B[EBX], #18t
+	MOVL	xfr_ttlleft.B[EBP], #18t
+	MOVL	xfr_bfrleft.B[EBP], #18t
+	MOVB	kcb_sts1.B[EBX], #K1$INPUT
+	PUSHL	kcb_amount.B[EBX]
+	MOVL	kcb_amount.B[EBX], #0
+	MOVL	EDX, #sensepkt
+	CALL	doatapi
+	POPL	kcb_amount.B[EBX]
+	RET
+.PAGE
+;Subroutine to do ATAPI packet command
+;	c{EBX} = Offset of KCB
+;	c{EDX} = Offset of command packet
+;	c{ESI} = Offset of UCB
+;	CALL	doatapi
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+
+doatapi:MOVL	kcb_pktpnt.B[EBX], EDX	;Save offset of the command packet
+	MOVL	EDX, ucb_ioreg1.B[ESI]
+	A2IOP	P_DCATAPIFEAT
+	MOVB	AL, #0
+	OUTB	[DX]
+	IOPAUSE
+	A2IOP	P_DCATAPISTS-P_DCATAPIFEAT
+	MOVL	ECX, #100000h
+2$:	INB	[DX]
+	TESTB	AL, #80h
+	JNE	4$.S
+	TESTB	AL, #40h
+	JNE	6$.S
+4$:	LOOP	ECX, 2$
+	JMP	hdknorsp
+
+;Here with the controller ready for a command
+
+6$:	MOVB	AL, #08h		;Set the disk control register
+	MOVL	EDX, ucb_ioreg2.B[ESI]
+	OUTB	[DX]
+	MOVL	EDX, ucb_ioreg1.B[ESI]
+	A2IOP	P_DCATAPIFEAT		;Set the features registers
+	MOVB	AL, #0
+	OUTB	[DX]
+	A2IOP	P_DCATAPIDS-P_DCATAPIFEAT ;Set device select register
+	MOVB	AL, ucb_select.B[ESI]
+	OUTB	[DX]
+	A2IOP	P_DCATAPIBCL-P_DCATAPIDS ;Set the byte count register
+	MOVB	AL, xfr_ttlleft+0.B[EBP]
+	OUTB	[DX]
+	A2IOP	P_DCATAPIBCH-P_DCATAPIBCL
+	MOVB	AL, xfr_ttlleft+1.B[EBP]
+	OUTB	[DX]
+	MOVB	kcb_intstate.B[EBX], #HDIS_DATA ;Set interrupt state
+	A2IOP	P_DCATAPICMD-P_DCATAPIBCH ;Start the packet command
+	MOVB	AL, #0A0h
+	TESTB	ucb_sts3.B[ESI], #U3$CMDINT ;Have interrupt command response?
+	JE	8$.S			;No
+	MOVB	kcb_intstate.B[EBX], #HDIS_PKT ;Yes - set interrupt state
+	OUTB	[DX]
+	JMP	atapiwait.S		;Continue
+
+;Here if have to poll to see when ready for the command packet
+
+8$:	OUTB	[DX]
+	MOVL	ECX, #100000h
+	A2IOP	P_DCATAPISTS-P_DCATAPICMD ;Wait until ready for the packet
+10$:	INB	[DX]
+	TESTB	AL, #08h
+	LOOPE	ECX, 10$
+	JE	hdknorsp
+	A2IOP	P_DCATAPIDATA-P_DCATAPISTS
+	PUSHL	ESI
+	MOVL	ESI, kcb_pktpnt.B[EBX]
+	MOVL	ECX, #6t
+	CLD
+	ROUTSW	[ESI]			;Output the packet
+	POPL	ESI			;Restore ESI
+					;Fall into atapiwait on next page
+.PAGE
+;Here to transfer data at fork level
+
+atapiwait:
+	MOVL	EAX, #XT_SECOND*15t
+	CALL	knlXfWait##		;Wait for an interrupt
+	JC	4$.S			;If error (can only be ER_NORSP)
+	TESTB	kcb_ists.B[EBX], #01h	;Error indicated?
+	JNE	atapierror.S		;Yes
+	TESTB	kcb_ists.B[EBX], #08h	;No - need to transfer data now?
+	JNE	10$.S			;Yes
+4$:	RET				;No - all finished
+
+;Here if error indicated by the device
+
+atapierror:
+	MOVL	EDX, kcb_ioreg1.B[EBX]	;Make sure unit is selected
+	A2IOP	P_DCATAPIDS
+	MOVB	AL, ucb_select.B[ESI]
+	OUTB	[DX]
+	MOVL	EAX, #ER_DEVER
+	STC
+	RET
+
+;Here if have impossible condition or device state
+
+atapidvder:
+	MOVL	EAX, #ER_DVDER		;Report this as a "device driver" error
+	STC
+	RET
+
+;Here if need to transfer some data
+
+10$:	MOVL	EDX, kcb_ioreg1.B[EBX]
+	A2IOP	P_DCATAPIBCL		;Get amount of data device wants to
+	INB	[DX]			;  transfer now
+	MOVZBL	ECX, AL
+	A2IOP	P_DCATAPIBCH-P_DCATAPIBCL
+	INB	[DX]
+	MOVB	CH, AL
+	CMPL	ECX, xfr_ttlleft.B[EBP]	;Too much?
+	JA	atapidvder.S		;Yes - fail
+	A2IOP	P_DCATAPIDATA-P_DCATAPIBCH ;OK - point to the data register
+	CLD
+	TESTB	kcb_ireason.B[EBX], #02h ;Does device want to do input?
+	JE	atapioutput		;No
+					;Yes - fall into atapiinput on next page
+.PAGE
+;Here if device wants to do input
+
+atapiinput:
+	TESTB	kcb_sts1.B[EBX], #K1$INPUT ;Do we agree?
+	JE	atapidvder.S		;No - error!
+	PUSHL	DS
+	POPL	ES
+	PUSHL	EDI
+2$:	PUSHL	ECX
+	CMPL	ECX, xfr_bfrleft.B[EBP]	;More than one buffer?
+	JBE	4$.S			;No
+	MOVL	ECX, xfr_bfrleft.B[EBP]	;Yes
+4$:	MOVL	EDI, xfr_datapnt.B[EBP]	;Point to the data
+	MOVL	EAX, ECX
+	SHRL	ECX, #1t
+	RINSW	[EDI]			;Input data from the controller
+	ADDL	kcb_amount.B[EBX], EAX	;Increase amount done
+	ADDL	xfr_datapnt.B[EBP], EAX
+	SUBL	xfr_ttlleft.B[EBP], EAX	;Decreate amount left to do
+	SUBL	xfr_bfrleft.B[EBP], EAX
+	JG	6$.S			;If something left in the buffer
+	TESTB	kcb_sts1.B[EBX], #K1$LIST ;Do we have a buffer list?
+	JE	6$.S			;No
+	MOVL	EDI, xfr_bfrpnt.B[EBP]	;Yes
+	ORB	cb_sts.B[EDI], #CB$FULL	;Indicate buffer is full
+	MOVL	ECX, cb_xnext.B[EDI]	;Get offset of next buffer
+	MOVL	xfr_bfrpnt.B[EBP], ECX
+	MOVL	xfr_datapnt.B[EBP], ECX
+	MOVL	xfr_bfrleft.B[EBP], #512t
+6$:	POPL	ECX
+	SUBL	ECX, EAX
+	JG	2$.S
+	POPL	EDI
+	JMP	atapiwait
+.PAGE
+;Here if device wants to do output
+
+atapioutput:
+	TESTB	kcb_sts1.B[EBX], #K1$INPUT ;Do we agree?
+	JNE	atapidvder		;No - error!	;;;;;;;;;;;;;
+	PUSHL	ESI
+2$:	PUSHL	ECX
+	CMPL	ECX, xfr_bfrleft.B[EBP]	;More than one buffer?
+	JBE	4$.S			;No
+	MOVL	ECX, xfr_bfrleft.B[EBP]	;Yes
+4$:	MOVL	ESI, xfr_datapnt.B[EBP]	;Point to the data
+	MOVL	EAX, ECX
+	SHRL	ECX, #1t
+	ROUTSW	[ESI]			;Input data from the controller
+	ADDL	kcb_amount.B[EBX], EAX	;Increase amount done
+	ADDL	xfr_datapnt.B[EBP], EAX
+	SUBL	xfr_ttlleft.B[EBP], EAX	;Decreate amount left to do
+	SUBL	xfr_bfrleft.B[EBP], EAX
+	JG	6$.S			;If something left in the buffer
+	TESTB	kcb_sts1.B[EBX], #K1$LIST ;Do we have a buffer list?
+	JE	6$.S			;No
+	MOVL	ESI, xfr_bfrpnt.B[EBP]	;Yes
+	MOVL	ECX, cb_xnext.B[ESI]	;Get offset of next buffer
+	MOVL	xfr_bfrpnt.B[EBP], ECX
+	MOVL	xfr_datapnt.B[EBP], ECX
+	MOVL	xfr_bfrleft.B[EBP], #512t
+6$:	POPL	ECX
+	SUBL	ECX, EAX
+	JG	2$.S
+	POPL	ESI
+	JMP	atapiwait
+.PAGE
+	.SBTTL	getrawpda - Subroutine to get raw mode disk address
+
+;Subroutine to get raw mode physical disk address
+;	CALL	getrawpda
+;	c{EDX} = Track number (16) Head number (8) Sector number (8)
+
+getrawpda:
+	MOVL	EDX, dcb_dkdblk.B[EDI]	;Get raw disk address
+	CMPL	ucb_hdmsects[ESI], #0	;Is this disk mapped?
+	JE	4$.S			;No - just return the address unchanged
+	MOVZWL	EAX, DX			;Yes - get track number
+	CMPL	EAX, ucb_cylmax.B[EDI]	;Is it valid?
+	JAE	2$.S			;No - fail
+	IMULL	EAX, ucb_cheads.B[ESI]	;Yes - times number of heads
+	MOVZBL	EDX, dcb_dkdblk+2.B[EDI] ;Get head number
+	CMPL	EDX, ucb_cheads.B[ESI]	;Is it valid?
+	JAE	2$.S			;No - fail
+	ADDL	EAX, EDX		;Yes - add it in
+	IMULL	EAX, ucb_csects.B[ESI]	;Times number of sectors
+	MOVB	DL, dcb_dkdblk+3.B[EDI]	;Get sector number
+	CMPL	EDX, ucb_csects.B[ESI]	;Is it valid?
+	JA	2$.S			;No - fail
+	DECL	EDX			;Yes - reduce by 1
+	JS	2$.S
+	ADDL	EAX, EDX		;Add it in
+	JMP	8$.S			;Now translate to mapped disk address
+
+;Here if have bad cylinder number
+
+2$:	MOVL	EAX, #ER_BDDBK		;Get error code
+	STC
+4$:	RET
+
+	.SBTTL	block2pda - Subroutine to convert block number to physical disk address
+
+;Here for the convert block number to physical address function - unlike most
+;  other driver functions, this one may be called at any interrupt
+;  level - it does not effect the controller in any way!
+;	c{dcb_dkdblk{EDI}} = Block number on disk
+;	c{EDI}             = Offset of DCB
+;	CALL	block2pda
+;	C:clr = Normal
+;	  c{EDX} = Track number (16) Head number (8) Sector number (8)
+;	C:set = Error
+;	  c{EAX} = Error code
+
+block2pda:
+	MOVL	EAX, dcb_dkdblk.B[EDI]	;Get block number on disk
+	CMPL	EAX, ucb_cblocks.B[ESI]	;Valid value?
+	JAE	2$.S			;No - fail
+8$:	ADDL	EAX, ucb_partnoff.B[ESI] ;Add in position of start of partition
+	TESTB	ucb_bits.B[ESI], #UB$LBA ;Can we use LBA mode?
+	JNE	20$.S			;Yes
+	CLRL	EDX			;No
+	CMPL	ucb_hdmsects[ESI], #0	;Is this disk mapped?
+	JE	10$.S			;No
+	DIVL	ucb_hdmsects[ESI]	;Yes - use right values
+	INCL	EDX			;Get sector number
+	PUSHL	EDX			;Save sector number
+	CLRL	EDX
+	DIVL	ucb_hdmheads[ESI]	;Get head and cylinder numbers
+	JMP	12$.S
+
+;Here if drive is not mapped
+
+10$:	CMPL	ucb_csects.B[ESI], #0.B
+	JE	14$.S
+	CMPL	ucb_cheads.B[ESI], #0.B
+	JE	14$.S
+	DIVL	ucb_csects.B[ESI]	;Get sector number
+	INCL	EDX
+	PUSHL	EDX			;Save sector number
+	CLRL	EDX
+	DIVL	ucb_cheads.B[ESI]	;Get head and cylinder numbers
+12$:	MOVB	1.B[ESP], DL		;Yes - store head number
+	MOVW	2.B[ESP], AX		;Store cylinder number
+	POPL	EDX			;Put in right register
+	CLC				;Make sure C is clear
+	RET				;All done
+
+;Here if disk configuration is not known - return a sector number equal to
+;  the block+1 with head and track = 0.  This will allow access to the first
+;  track on a disk even when the configuration is not known.
+
+14$:	MOVL	EDX, dcb_dkdblk.B[EDI]
+	INCL	EDX
+	RET
+
+;Here for LBA mode drive
+
+20$:	TESTB	ucb_bits.B[ESI], #UB$ATAPI ;ATAPI unit?
+	JNE	22$.S			;Yes - go handle that
+	MOVL	EDX, EAX		;No
+	ROLL	EDX, #8t		;Reorder the bits so they are in the
+	MOVB	AH, DL			;  right places for the drive - the
+	MOVW	DX, AX			;  drive encodes the LBA as
+	ORB	DH, #0E0h		;  Ehccccss while we encode the CHS
+	RET				;  value as cccchhss
+
+;Here if ATAPI drive
+
+22$:	CMPL	ucb_pblksz[ESI], #1.B
+	JE	24$.S
+	CLRL	EDX
+	IDIVL	ucb_pblksz[ESI]
+	CLC
+24$:	MOVL	EDX, EAX
+	RET
+.PAGE
+	.SBTTL	hdkremoved - Subroutine called when PC-card ATA controller is removed
+
+;Subroutine called when PC-card ATA controller is removed
+;	c(AL)  = 0 if card removed, 1 if card inserted (We should never see a
+;		   value of 1 since we unregister as soon as the card is
+;		   removed!)
+;	c{EDI} = Offset of UCB for base unit for disk
+;	CALL	hdkremoved
+
+hdkremoved:
+	MOVL	ESI, EDI		;Get UCB offset in right register
+	CMPB	AL, #0			;Is this a card removed event?
+	JNE	10$.S			;No - serious problem!
+	ORB	ucb_sts2.B[ESI], #U2$REMOVED|U2$MCHG
+					;Indicate controller removed
+	MOVL	EBX, ucb_kcb.B[ESI]	;Get offset of KCB
+	MOVL	EBX, kcb_fucb.B[EBX]	;Get first UCB
+2$:	TESTL	EBX, EBX		;More?
+	JE	6$.S			;No
+	CMPL	ucb_baseucb.B[EBX], ESI	;Is this UCB for one of our partitions?
+	JNE	4$.S			;No
+	ORB	ucb_sts2.B[EBX], #U2$REMOVED|U2$MCHG
+					;Yes - indicate controller removed
+4$:	MOVL	EBX, [EBX]		;Get next UCB for controller
+	JMP	2$.S			;Continue
+
+6$:	MOVL	EAX, ucb_pccdcb[ESI]	;Unregister us
+	MOVZBL	EAX, dcb_punit.B[EAX]
+	MOVZBL	EDX, ucb_pccsocket[ESI]
+	CLRL	EBX
+	PUSHL	ESI
+	CALLI	ucb_pccregfnc[ESI]
+	POPL	ESI
+
+;;;;;;;;; NEED CODE HERE TO TERMINATE CURRENT OPERATION IF ANY !!!!!!!
+
+	RET
+
+;Here if get a card inserted event
+
+10$:	CRASH	PCCD
+.PAGE
+	.SBTTL	hdkfork - Device fork level routine
+
+;Here at device fork level after operation is complete
+;	c{EDI} = Offset of KCB
+
+hdkfork:MOVL	EBX, EDI
+	MOVL	EDI, kcb_curdcb.B[EBX]
+	TESTL	EDI, EDI
+	JE	4$.S
+	MOVL	ESI, [EDI]
+	TESTL	ESI, ESI
+	JE	6$.S
+	TESTB	ucb_sts2.B[ESI], #U2$REMOVED
+	JNE	6$.S
+	TESTB	kcb_sts1.B[EBX], #K1$TIMEOUT ;Have a time-out?
+	JNE	10$.S			;Yes
+	CLRL	EAX			;No
+2$:	JMP	knlResumeOutput##
+
+4$:	RET
+
+;Here if we have lost the controller
+
+6$:	MOVL	EAX, #ER_NTRDY
+	JMP	2$.S
+
+;Here if have a time-out
+
+10$:	INCL	ucb_hungerr[ESI]
+	MOVL	EAX, #ER_NORSP
+	JMP	2$.S
+.PAGE
+	.SBTTL	hdkaint - Hard disk interrupt routine
+
+;Prototype hard disk interrupt routine - this routine is copied to allocated
+;  code segment memory to create a seperate interrupt entry for each controller
+
+hdkaint:PUSHAL				;Save all registers
+	PUSHL	DS
+	PUSHL	ES
+	PUSHL	FS
+	PUSHL	GS
+	PUSHL	#GS_DATA.B
+	POPL	DS
+fix1:	MOVL	EDI, #0			;Get our KCB
+fix2:	JMP	hdkaintcom		;Go to common code
+HDKAINTSZ=!$-hdkaint
+
+;Common interrupt routine - get here after all registers have been saved on the
+;  stack and the offset of the KCB for the controller has been placed in EDI
+
+hdkaintcom:
+	MOVL	EAX, kcb_curdcb.B[EDI]	;Are we expecting this?
+	TESTL	EAX, EAX
+	JE	12$.S			;No
+	MOVL	EBX, [EAX]		;Yes - make sure we still have a
+	TESTL	EBX, EBX		;  controller
+	JE	14$.S
+	TESTB	ucb_sts2.B[EBX], #U2$REMOVED
+	JNE	14$.S
+	MOVZBL	EAX, kcb_intstate.B[EDI] ;Dispatch on the interrupt state
+	JMPIL	CS:intdsp[EAX*4]
+
+	.MOD	4
+intdsp:	.LONG	intata		; HDIS_ATA  = 0 - ATA interrupt
+	.LONG	intatapipkt	; HDIS_PKT  = 1 - Ready for ATAPI command packet
+	.LONG	intatapidata	; HDIS_DATA = 2 - Ready for ATAPI data transfer
+
+intata:	TESTB	kcb_sts1.B[EDI], #K1$LIST ;Should we transfer data here?
+	JE	14$.S			;No
+	TESTB	kcb_sts1.B[EDI], #K1$TIMEOUT ;Yes - time-out interrupt?
+	JNE	14$.S			;Yes
+	MOVL	EDX, kcb_ioreg1.B[EDI]	;No - get controller status
+	A2IOP	P_DCHDSTS
+	INB	[DX]
+	TESTB	AL, #01h		;Any hard errors?
+	JNE	14$.S			;Yes - stop now
+	TESTB	kcb_sts1.B[EDI], #K1$INPUT ;Input?
+	JE	20$.S			;No - output
+	MOVL	ESI, kcb_buffer.B[EDI]	;Yes - point to the buffer
+	MOVL	ECX, cb_xnext.B[ESI]	;Get offset of next buffer
+	TESTL	ECX, ECX		;Have another one?
+	JE	14$.S			;No - don't transfer any data here
+	MOVL	kcb_buffer.B[EDI], ECX	;Yes
+	XCHGL	EDI, ESI
+	ORB	cb_sts.B[EDI], #CB$FULL	;Indicate buffer is full
+	PUSHL	DS
+	POPL	ES
+	MOVL	ECX, #256t
+	A2IOP	P_DCHDDATA-P_DCHDSTS	;Point to the data register
+	CLD
+	RINSW	[EDI]			;Input data from the controller
+	MOVL	EDI, ESI
+	ADDL	kcb_amount.B[EDI], #512t ;Increase amount done
+	JMP	intdone.S		;Thats all for now
+
+;Here if have an unexpected interrupt
+
+12$:	INCL	kcb_hduxint.B[EDI]	;Count it
+	JMP	intdone.S
+
+;Here to stop transfer
+
+14$:	MOVB	kcb_itimer.B[EDI], #0	;Stop the interrupt timer
+intfin:	CALL	knlReqFork#
+intdone:MOVB	AL, #INT_EOI		;Release interrupt controllers
+	CMPB	kcb_intlvl.B[EDI], #7
+	CLI
+	JBE	18$.S
+	OUTB	P_INC2P0
+18$:	OUTB	P_INC1P0
+	JMP	knlDismissInt2##	;And dismiss interrupt
+
+;Here if doing output
+
+20$:	MOVL	ESI, kcb_buffer.B[EDI]	;Get offset of this buffer
+	MOVL	ESI, cb_xnext.B[ESI]	;Get selector for next buffer
+	TESTL	ESI, ESI		;Was this the last one?
+	JE	14$.S			;Yes - finished here
+	MOVL	kcb_buffer.B[EDI], ESI	;No - advance to next buffer
+	MOVL	ECX, #256t
+	A2IOP	P_DCHDDATA-P_DCHDSTS	;Point to the data register
+	CLD
+	ROUTSW	[ESI]			;Output data to the controller
+	ADDL	kcb_amount.B[EDI], #512t ;Increase amount done
+	JMP	intdone.S
+.PAGE
+;Here for interrupt for ATAPI unit which is ready to transfer the comman
+;  packet - Since this is fairly quick, we just do it here.
+
+intatapipkt:
+	MOVL	EDX, kcb_ioreg1.B[EDI]
+	A2IOP	P_DCATAPISTS
+	INB	[DX]
+	TESTB	AL, #01h		;Error indicated by device?
+	JNE	intaerr.S		;Yes
+	TESTB	AL, #08h		;No - ready for data?
+	JE	intadvder.S		;No - this should not happen here!
+	A2IOP	P_DCATAPIIR-P_DCATAPISTS
+	INB	[DX]			;Get interrupt reason value
+	TESTB	AL, #01h		;Ready for command?
+	JE	intadvder.S		;No
+	TESTB	AL, #02h		;Maybe
+	JNE	intadvder.S		;No
+	A2IOP	P_DCATAPIDATA-P_DCATAPIIR ;Yes - output the command packet
+	MOVL	ESI, kcb_pktpnt.B[EDI]
+	MOVL	ECX, #6
+	CLD
+	ROUTSW	[ESI]
+	MOVB	kcb_intstate[EDI], #HDIS_DATA ;Update interrupt state
+	JMP	intdone			;Finished for now
+.PAGE
+;Here for interrupt for ATAPI unit which is ready to transfer data - all
+;  data transfers are done at fork level
+
+intatapidata:
+	MOVL	EDX, kcb_ioreg1.B[EDI]
+	A2IOP	P_DCATAPISTS
+	INB	[DX]
+	MOVB	kcb_ists.B[EDI], AL	;Store the status bits
+	TESTB	AL, #01h		;Error?
+	JNE	6$.S			;Yes
+	A2IOP	P_DCATAPIIR-P_DCATAPISTS ;Yes
+	TESTB	AL, #08h		;No - ready for data?
+	JE	4$.S			;No
+	INB	[DX]			;Yes - get the interrupt reason byte
+	TESTB	AL, #01h		;Expecting data transfer?
+	JNE	intadvder.S		;No
+	MOVB	kcb_ireason.B[EDI], AL	;Yes - store the interrupt reason byte
+	JMP	intfin			;Request fork and dismiss interrupt
+
+4$:	INB	[DX]			;Get the interrupt reason byte
+	MOVB	kcb_ireason.B[EDI], AL
+	NOTB	AL			;Completion indication?
+	TESTB	AL, #03h
+	JE	intfin			;Yes
+	JMP	intadvder.S		;No - fail
+
+intaerr:MOVB	kcb_ists.B[EDI], AL
+6$:	A2IOP	P_DCATAPIERR-P_DCATAPISTS
+	INB	[DX]
+	MOVB	kcb_ierror.B[EDI], AL
+	JMP	intfin			;All finished here
+
+;Here if have impossible condition or device state
+
+intadvder:
+	MOVB	kcb_ists.B[EDI], #0FEh	;Indicate have impossible condition
+	JMP	intfin
+.PAGE
+	.SBTTL	hdkaoas - Once-a-second routine
+
+;Here once each second
+
+hdkaoas:MOVL	EDI, hdkakcb		;Get first HDKA KCB
+2$:	CLI
+	CMPB	kcb_itimer.B[EDI], #0	;Is our timer running?
+	JE	4$.S			;No - go on
+	DECB	kcb_itimer.B[EDI]	;Yes - count it down
+	JE	8$.S
+4$:	STI
+6$:	MOVL	EDI, kcb_nexts.B[EDI]	;Advance to next KCB
+	TESTL	EDI, EDI		;Continue if have another
+	JNE	2$.S
+	RET				;Finished
+
+;Here if have hung disk
+
+8$:	ORB	kcb_sts1.B[EDI], #K1$TIMEOUT ;Indicate time-out error
+	TESTB	kcb_sts1.B[EDI], #K1$RESET ;Already doing reset?
+	JNE	10$.S			;Yes
+	ORB	kcb_sts1.B[EDI], #K1$RESET ;No - indicate doing reset now
+	MOVB	kcb_itimer.B[EDI], #TO_RESET ;Restart interrupt timer
+	MOVL	EDX, kcb_ioreg2.B[EDI]
+	MOVB	AL, #0Ch		;Reset the disks
+	OUTB	[DX]
+	STI
+	MOVL	ECX, #20t
+	CALL	knlSDelay##
+	MOVB	AL, #0Ah
+	OUTB	[DX]
+	JMP	6$.S			;Go on
+
+;Here if reset attempt timed out
+
+10$:	CMPL	kcb_curdcb.B[EDI], #0.B
+	JE	6$.S
+	CLI
+	CALL	knlReqFork##		;Force a fork here
+	JMP	4$.S
+.PAGE
+.IF NE $$CHKLST
+checklist:
+	PUSHL	EAX
+	PUSHL	EBX
+	MOVL	EAX, #512t
+4$:	MOVL	EBX, cb_xnext.B[EBX]
+	TESTL	EBX, EBX
+	JE	6$.S
+	ADDL	EAX, #512t
+	JMP	4$.S
+
+6$:	CMPL	EAX, ECX
+	JE	8$.S
+	CRASH	LIST
+
+8$:	POPL	EBX
+	POPL	EAX
+	RET
+.ENDC
+.PAGE
+	.SBTTL	Data
+
+;ATA error code table
+
+	.MOD	2
+ataerrtbl:
+	.BYTE	011h, ER_IDFER, ucb_tidferr
+	.BYTE	002h, ER_SEKER, ucb_tseekerr
+	.BYTE	0C0h, ER_DATER, ucb_tdataerr
+	.BYTE	000h, ER_DEVER, ucb_tdeverr
+ERRNUM=!{$-ataerrtbl}/3-1
+
+;ATAPI error code table
+
+atapierrtbl:
+	.WORD	ER_DVDER	; 0 - No error
+	.WORD	0		; 1 - Recovered error (not reported)
+	.WORD	ER_NTRDY	; 2 - Not ready
+	.WORD	ER_DATER	; 3 - Data error
+	.WORD	ER_DEVER	; 4 - Device error
+	.WORD	ER_DVDER	; 5 - Illegal request
+	.WORD	ER_MDCHG	; 6 - Medial changed or unit reset
+	.WORD	ER_WPRER	; 7 - Data protect error
+	.WORD	ER_DEVER	; 8 - Reserved
+	.WORD	ER_DEVER	; 9 - Reserved
+	.WORD	ER_DEVER	;10 - Reserved
+	.WORD	ER_DEVER	;11 - Aborted command
+	.WORD	ER_DEVER	;12 - Reserved
+	.WORD	ER_DEVER	;13 - Reserved
+	.WORD	ER_DEVER	;14 - Miscompare (compare is not used)
+	.WORD	ER_DEVER	;15 - Reserved
+
+	DATA
+
+	.MOD	4
+
+hdkakcb:.LONG	0		;Offset of first hard disk KCB
+temp:	.BLKB	16t		;Temp for getpccard
+hwname: .LONG	'DISK', 'hdka'	;IRQ name for knlSetIRq
+	.LONG	0, 0
+
+sensepkt:.LONG	03h		;Request sense command packet
+	 .LONG	18t
+	 .LONG	0
+
+
+blkblk:	.BYTE	0, 0, 0, 8
+	.LONG	1
+	.BYTE	00, 00, 02, 00
+
+
+	LKEEND

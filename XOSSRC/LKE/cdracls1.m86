@@ -1,0 +1,3052 @@
+	.TITLE	CDRACLS1 - CD-ROM (ISO-9660) file system class driver for XOS
+
+;++++
+; This software is in the public domain.  It may be freely copied and used
+; for whatever purpose you see fit, including commerical uses.  Anyone
+; modifying this software may claim ownership of the modifications, but not
+; the complete derived code.  It would be appreciated if the authors were
+; told what this software is being used for, but this is not a requirement.
+
+;   THIS SOFTWARE IS PROVIDED BY THE AUTHORS "AS IS" AND ANY EXPRESS OR
+;   IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
+;   OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+;   IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+;   INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+;   BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS
+;   OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+;   ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR
+;   TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
+;   USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+;----
+
+	.PROC	80486
+	.INCLUD	XOSINC:\XMAC\XOS.PAR
+	.INCLUD	XOSINC:\XMAC\XOSX.PAR
+	.INCLUD	XOSINC:\XMAC\XOSERR.PAR
+	.INCLUD	XOSINC:\XMAC\XOSDISK.PAR
+	.INCLUD	XOSINC:\XMAC\XOSXDISK.PAR
+	.INCLUD	XOSINC:\XMAC\XOSTIME.PAR
+	.INCLUD	XOSINC:\XMAC\XOSLKE.PAR
+	.INCLUD	XOSINC:\XMAC\XOSXLKE.PAR
+	.INCLUD	CDRACLS.PAR
+
+MAJV   =!1t
+MINV   =!1t
+EDITNUM=!1t
+
+;1.0.1	4-Jan-96
+;	Fixed problem in parsing directory entries with 1 character extensions.
+;1.1.0  12-Jan-98
+;	Updated to work correctly with XOS long-filename support; fixed
+;	several bugs relating to RockRidge support; added Joliet support.
+;1.1.1  28-Dec-99
+;	Changed to ignore volumn descriptor blocks with read errors instead of
+;	reject the disk.
+
+;This driver supports the following CD-ROM formats:
+;	(CDHS)     High Sierra
+;	(CD9669)   ISO-9660 without extensions
+;	(CDRRIP)   ISO-9660 with Rock Ridge extensions
+;	(CDJOLIET) ISO-9660 with Joliet extensions
+
+;The long and DOS names are derived as follows:
+;	Format    Long name    DOS name
+;	CDHS      HS name      Truncated HS name
+;	CD9660    9660 name    Truncated 9660 name
+;	CDRRIP    RRIP name    Truncated 9660 name
+;	CDJOLIET  Joliet name  Truncated Joliet name
+
+;This versions provides minimal support for Unicode.  ASCII is converted to
+;  Unicode by 0 extension.  Unicode is converted to ASCII by discarding the
+;  high order byte!
+
+	LKEHEAD	CDRACLS, MAJV, MINV, EDITNUM, LKETYPE_CLASS
+
+;SVC dispatch table for CDR file system class devices
+
+	CODE
+
+cdrdsp:	.LONG	xosdskMount##	;sd_mount	= 0.   - Mount
+	.LONG	knlRtnZero##	;sd_cleardev	= 4.   - Clear device
+	.LONG	cdrcdcb		;sd_cleardcb	= 8.   - Clear DCB
+	.LONG	knlRtnZero##	;sd_commit	= 12.  - Commit data to disk
+	.LONG	knlRtnZero##	;sd_transold    = 16.  - Transfer device/old
+	.LONG	knlRtnZero##	;sd_transnew    = 20.  - Transfer device/new
+	.LONG	knlRtnZero##	;sd_opena	= 24.  - Open additional
+	.LONG	xosdskLclOpen##	;sd_open1	= 28.  - Open device/file
+	.LONG	xosdskLclParm##	;sd_devparm     = 32.  - Device parameters
+	.LONG	knlWPrErr##	;sd_delete	= 36.  - Delete file
+	.LONG	knlWPrErr##	;sd_rename	= 40.  - Rename file
+	.LONG	cdrinpblk	;sd_inblock	= 44.  - Input block
+	.LONG	knlWPrErrGQ##	;sd_outblock	= 48.  - Output block
+	.LONG	knlWPrErr##	;sd_outblockq	= 52.  - Output block (XFF)
+	.LONG	knlWPrErrGQ##	;sd_outstring	= 56.  - Output string
+	.LONG	knlRtnMOne##	;sd_getiosts	= 60.  - Get input/output status
+	.LONG	knlIFnDevGQ##	;sd_special     = 64.  - Special device function
+	.LONG	cdrclose	;sd_close	= 68.  - Close file
+	.LONG	cdrlabel	;sd_label       = 72.  - Get device label
+	.LONG	knlRtnZero##	;sd_commitfunc	= 76.  - Commit data to disk
+	.LONG	cdrinfo		;sd_devinfo     = 80.  - Return device info
+	.LONG	cdrvfychg	;dd_vfychg	= 84.  - Verify changed disk
+	.LONG	cdropen		;dd_opennornal	= 88.  - Open file
+	.LONG	cdropen		;dd_openddir	= 92.  - Open file/directory
+	.LONG	0		;dd_rename      = 96.  - Rename file
+	.LONG	cdrclose2	;dd_close       = 100. - Close file
+	.LONG	cdropenparms	;dd_openparms   = 104. - Offset of open parms
+	.LONG	cdrsetpath	;dd_setpath     = 108. - Set up path data
+	.LONG	ret008		;dd_chkpath     = 112. - Check path data
+	.LONG	ret008		;dd_clrpath     = 116. - Clear path data
+	.LONG	knlNullCharStr##;dd_gtrtprot    = 120. - Get root protection
+	.LONG	knlBadCharF##	;dd_strtprot    = 124. - Set root protection
+CDRDSPSZ=!{$-cdrdsp}/4
+.PAGE
+;IO parameter table for CD-ROM file system open operations
+
+	.LONG	OPARMMAX
+cdropenparms:
+	.LONG	opnpgenparms	  ;IOPAR_xxxxxx = 00xx - Generic IO parameters
+	.LONG	opnpfilparms	  ;IOPAR_FILxxx = 01xx - File system IO parms
+	.LONG	knlNullTrmParms## ;IOPAR_TRMxxx = 02xx - Terminal IO parameters
+	.LONG	xosdskIoDskParms##;IOPAR_DSKxxx = 03xx - Disk IO parameters
+OPARMMAX=!{$-cdropenparms}/4
+
+	.LONG	OPARMGENMAX
+opnpgenparms:
+	.LONG	0		;		   = 0000h
+	.LONG	knlIopDummyN##	;IOPAR_FILOPTN     = 0001h
+	.LONG	knlIopDummyS##	;IOPAR_FILSPEC     = 0002h
+	.LONG	knlIopDevSts##	;IOPAR_DEVSTS      = 0003h
+	.LONG	knlIopUnitNum##	;IOPAR_UNITNUM     = 0004h
+	.LONG	knlIopGlbId##	;IOPAR_GLBID       = 0005h
+	.LONG	knlIopDummyN##	;IOPAR_DELAY       = 0006h
+	.LONG	knlIopDummyN##	;IOPAR_TIMEOUT     = 0007h
+	.LONG	0		;IOPAR_INPSTS      = 0008h
+	.LONG	0		;IOPAR_OUTSTS	   = 0009h
+	.LONG	0		;IOPAR_INPQLMT	   = 000Ah
+	.LONG	0		;IOPAR_OUTQLMT	   = 000Bh
+	.LONG	knlIopDummyN##	;IOPAR_SIVECT1     = 000Ch
+	.LONG	knlIopDummyN##	;IOPAR_SIVECT2     = 000Dh
+	.LONG	knlIopDummyN##	;IOPAR_SIDATA      = 000Eh
+	.LONG	knlIopNumOpen##	;IOPAR_NUMOPEN     = 000Fh
+	.LONG	0		;IOPAR_BUFRLMT	   = 0010h
+OPARMGENMAX=!{$-opnpgenparms}/4
+
+	.LONG	OPARMFILMAX
+opnpfilparms:
+	.LONG	0		;		   = 0000h
+	.LONG	knlIopDummyN##	;IOPAR_DIRHNDL     = 0101h
+	.LONG	knlIopDummyN##	;IOPAR_SRCATTR     = 0102h
+	.LONG	cdriopfilattr	;IOPAR_FILATTR     = 0103h
+	.LONG	opnpdirofs	;IOPAR_DIROFS      = 0104h
+	.LONG	opnpiopos	;IOPAR_ABSPOS	   = 0105h
+	.LONG	opnpiopos	;IOPAR_RELPOS	   = 0106h
+	.LONG	opnpiopos	;IOPAR_EOFPOS	   = 0107h
+	.LONG	0		;		   = 0108h
+	.LONG	cdrioplength	;IOPAR_LENGTH      = 0109h
+	.LONG	cdriopalloc	;IOPAR_REQALLOC    = 010Ah
+	.LONG	cdriopalloc	;IOPAR_RQRALLOC    = 010Bh
+	.LONG	cdriopgrpsize	;IOPAR_GRPSIZE     = 010Ch
+	.LONG	cdriopadate	;IOPAR_ADATE       = 010Dh
+	.LONG	cdriopcdate	;IOPAR_CDATE       = 010Eh
+	.LONG	cdriopmdate	;IOPAR_MDATE       = 010Fh
+	.LONG	cdriopprot	;IOPAR_PROT        = 0110h
+	.LONG	cdriopowner	;IOPAR_OWNER       = 0111h
+	.LONG	0		;                  = 0112h
+	.LONG	0		;IOPAR_SETLOCK	   = 0113h
+	.LONG	0		;IOPAR_CLRLOCK	   = 0114h
+	.LONG	knlIopDummyN##	;IOPAR_CLSTIME     = 0115h
+	.LONG	knlIopDummyS##	;IOPAR_CLSNAME     = 0116h
+	.LONG	knlIopDummyT##	;IOPAR_CLSMSG	   = 0117h
+	.LONG	knlIopDummyN##	;IOPAR_SHRRETRY    = 0118h
+	.LONG	knlIopDummyN##	;IOPAR_SHRDELAY    = 0119h
+OPARMFILMAX=!{$-opnpfilparms}/4
+.PAGE
+;Device parameter table for CDR file system IO transfer operations
+
+	.LONG	PARMMAX
+cdrioparms:
+	.LONG	cdriogenparms	  ;IOPAR_xxxxxx = 00xx - Generic IO parameters
+	.LONG	cdriofilparms	  ;IOPAR_FILxxx = 01xx - File IO parameters
+	.LONG	knlNullTrmParms## ;IOPAR_TRMxxx = 02xx - Terminal IO parameters
+	.LONG	xosdskIoDskParms##;IOPAR_DSKxxx = 03xx - Disk IO parameters
+PARMMAX=!{$-cdrioparms}/4
+
+	.LONG	PARMGENMAX
+cdriogenparms:
+	.LONG	0		;		   = 0000h
+	.LONG	knlIoxFilOptn##	;IOPAR_FILOPTN     = 0001h
+	.LONG	knlIoxFilSpec##	;IOPAR_FILSPEC     = 0002h
+	.LONG	knlIopDevSts##	;IOPAR_DEVSTS      = 0003h
+	.LONG	knlIopUnitNum##	;IOPAR_UNITNUM     = 0004h
+	.LONG	knlIopGlbId##	;IOPAR_GLBID       = 0005h
+	.LONG	knlIopNullN##	;IOPAR_DELAY       = 0006h
+	.LONG	knlIopNullN##	;IOPAR_TIMEOUT     = 0007h
+	.LONG	knlIopIoSts##	;IOPAR_INPSTS	   = 0008h
+	.LONG	knlIopIoSts##	;IOPAR_OUTSTS	   = 0009h
+	.LONG	knlIopInpQLmt##	;IOPAR_INPQLMT	   = 000Ah
+	.LONG	knlIopOutQLmt##	;IOPAR_OUTQLMT	   = 000Bh
+	.LONG	0		;IOPAR_SIVECT1     = 000Ch
+	.LONG	0		;IOPAR_SIVECT2     = 000Dh
+	.LONG	0		;IOPAR_SIDATA      = 000Eh
+	.LONG	knlIopNumOpen##	;IOPAR_NUMOPEN     = 000Fh
+	.LONG	0		;IOPAR_BUFRLMT     = 0010h
+PARMGENMAX=!{$-cdriogenparms}/4
+
+	.LONG	PARMFILMAX
+cdriofilparms:
+	.LONG	0		;		   = 0100h
+	.LONG	0		;IOPAR_DIRHNDL     = 0101h
+	.LONG	0		;IOPAR_SRCATTR     = 0102h
+	.LONG	cdriopfilattr	;IOPAR_FILATTR     = 0103h
+	.LONG	0		;IOPAR_DIROFS      = 0104h
+	.LONG	cdriopabspos	;IOPAR_ABSPOS	   = 0105h
+	.LONG	cdrioprelpos	;IOPAR_RELPOS	   = 0106h
+	.LONG	cdriopeofpos	;IOPAR_EOFPOS	   = 0107h
+	.LONG			;		   = 0108h
+	.LONG	cdrioplength	;IOPAR_LENGTH      = 0109h
+	.LONG	cdriopalloc	;IOPAR_REQALLOC    = 010Ah
+	.LONG	cdriopalloc	;IOPAR_RQRALLOC    = 010Bh
+	.LONG	cdriopgrpsize	;IOPAR_GRPSIZE     = 010Ch
+	.LONG	cdriopcdate	;IOPAR_ADATE       = 010Dh
+	.LONG	cdriopcdate	;IOPAR_CDATE       = 010Eh
+	.LONG	cdriopcdate	;IOPAR_MDATE       = 010Fh
+	.LONG	cdriopprot	;IOPAR_PROT        = 0110h
+	.LONG	cdriopowner	;IOPAR_OWNER       = 0111h
+	.LONG	0		;                  = 0112h
+	.LONG	0		;IOPAR_SETLOCK	   = 0113h
+	.LONG	0		;IOPAR_CLRLOCK	   = 0114h
+	.LONG	knlIopDummyN##	;IOPAR_CLSTIME     = 0115h
+	.LONG	knlIopDummyS##	;IOPAR_CLSNAME     = 0116h
+	.LONG	knlIopDummyT##	;IOPAR_CLSMSG	   = 0117h
+	.LONG	knlIopDummyN##	;IOPAR_SHRRETRY    = 0118h
+	.LONG	knlIopDummyN##	;IOPAR_SHRDELAY    = 0119h
+PARMFILMAX=!{$-cdriofilparms}/4
+.PAGE
+	DATA
+
+lit10000000:
+	.LONG	10000000t
+
+	.MACRO	TBL
+	OS	type
+	OS	stdid
+	OS	version
+	OS	volume
+	OS	setsz
+	OS	blocksz
+	OS	rootdir
+	OS	spacesz
+	OS	volcdt
+	OS	volmdt
+	OS	volxdt
+	OS	voledt
+	TX	fsname  , CD96, CDHS
+	TX	        , 60  ,
+	TX	stdidval, CD00, CDRO
+	TX	        , 1   , M
+	.ENDM
+
+	.MACRO	OS  name
+os_'name=!$-setup9660
+	.LONG	pvd9660_'name
+	.ENDM
+
+	.MACRO	TX  name, t1, t2
+.IF NB {name}
+  os_'name=!$-setup9660
+.ENDC
+	.LONG	''t1''
+	.ENDM
+
+setup9660:
+	TBL
+
+	.MACRO	OS  name
+	.LONG	pvdhs_'name
+	.ENDM
+
+	.MACRO	TX  name, t1, t2
+	.LONG	''t2''
+	.ENDM
+
+setuphs:TBL
+.PAGE
+	.SBTTL	Initialization routine
+
+	INITSUB	initcdrfs
+
+initcdrfs:
+	MOVL	EBX, #cdrchk1		;Register the file system
+	MOVL	EDX, #cdrchk2
+	CALL	xosdskMakeFscb##
+	JC	10$.S			;This should not fail!
+	MOVL	ECX, #xcodetop#
+	CLRL	EDX
+	CLRL	EAX
+10$:	MOVL	EBX, #QSTS$DONE
+	RET
+
+	CODE
+.PAGE
+;Here for the IOPAR_DIROFS parameter for open - Directory offset for search
+
+	DPARMHDR  BOTH, DECV
+opnpdirofs:
+	TESTB	AH, #PAR$GET		;Want to get value?
+	JE	10$.S			;No
+	MOVL	EDX, opn_frame1.B[EBP]
+	MOVL	EAX, SS:opn_dirofs+0.B[EDX]
+	MOVL	EDX, SS:opn_dirofs+4.B[EDX]
+	JMP	knlStrParm8##
+
+;Here for the IOPAR_ABSPOS, IOPAR_RELPOS, or IOPAR_EOFPOS parameter for
+;  open - Position for IO
+
+	DPARMHDR  BOTH, DECV
+opnpiopos:
+	TESTB	AH, #PAR$GET		;Want to get value?
+	JE	10$.S			;No
+	MOVL	EAX, dcb_dkfpos.B[EDI]	;Yes - get value
+	JMP	knlStrParm4##		;Give it to the user
+
+10$:	RET
+.PAGE
+	.SBTTL	cdriopfilattr - IOPAR_FILATTR - Get attributes for file
+
+;Here for the IOPAR_FILATTR parameter for a CDR file system transfer - Get
+;  attributes for file
+
+	DPARMHDR  GET, HEXV
+cdriopfilattr:
+	MOVL	EAX, dcb_dkcdfdb.B[EDI]
+	MOVZBL	EAX, cdfdb_fileattr.B[EAX]
+	JMP	knlStrParm4##
+
+	.SBTTL	cdrioplength - CDR file IO parameter - Get written length
+
+;Here for the IOPAR_LENGTH parameter for a CDR file system transfer - Get
+;  written length of file
+
+	DPARMHDR  GET, DECV
+cdrioplength:
+	MOVL	EAX, dcb_dkcdflen.B[EDI] ;Get written length of file
+	JMP	knlStrParm4##		;Give it to the user
+
+	.SBTTL	cdriopalloc - CDR file IO parameter - Get amount allocated
+
+;Here for the IOPAR_REQALLOC or IOPAR_RQRALLOC parameter for a CDR file
+;  transfer - Get amount allocated
+
+	DPARMHDR  GET, DECV
+cdriopalloc:
+	MOVL	ESI, [EDI]		;Yes - get offset of the UCB
+	MOVL	EAX, dcb_dkcdflen.B[EDI] ;Get length of file
+	MOVL	EDX, ucb_bpclus.B[ESI]	;Get size of a cluster
+	DECL	EDX			;Change to a mask
+	ADDL	EAX, EDX		;Round up to whole clusters
+	NOTL	EDX
+	ANDL	EAX, EDX
+	JMP	knlStrParm4##		;Give it to the user
+
+	.SBTTL	cdriogrpsize - CDR file IO parameter - Get allocation group size
+
+;Here for the IOPAR_GRPSIZE parameter for a CDR file transfer - Get allocation
+;  group size
+
+	DPARMHDR  GET, DECV
+cdriopgrpsize:
+	CLRL	EAX
+	JMP	knlStrParm4##
+
+	.SBTTL	cdriopprot - CDR file IO parameter - Get file protection
+
+;Here for the IOPAR_PROT parameter for a CDR file transfer - Get file protection
+
+	DPARMHDR  GET, DECV
+cdriopprot:
+	CLRL	EAX
+	JMP	knlStrParm4##
+.PAGE
+	.SBTTL	cdriopadate - CDR file IO parameter - Get access date/time
+
+;Here for the IOPAR_ADATE parameter for a CDR file transfer - Get file access
+;  date and time
+
+	DPARMHDR  GET, HEXV
+cdriopadate:
+	JMP	cdriopcdate.S
+
+	.SBTTL	cdriopmdate - CDR file IO parameter - Get modify date/time
+
+;Here for the IOPAR_CDATE parameter for a CDR file transfer - Get file modify
+;  date and time
+
+	DPARMHDR  GET, HEXV
+cdriopmdate:
+	JMP	cdriopcdate.S
+
+	.SBTTL	cdriopcdate - CDR file IO parameter - Get creation date/time
+
+;Here for the IOPAR_CDATE parameter for a CDR file transfer - Get file creation
+;  date and time
+
+	DPARMHDR  GET, HEXV
+cdriopcdate:
+	CLRL	EAX
+	MOVL	EDX, dcb_dkcdfdb.B[EDI]
+	MOVL	EAX, cdfdb_filedt+0.B[EDX] ;Get date/time value for file
+	mOVL	EDX, cdfdb_filedt+4.B[EDX]
+	CMPL	ECX, #4.B		;Want date and time in DOS format?
+	JA	10$.S			;No
+	CALL	cdrdt2dos		;Yes
+	JMP	knlStrParm4##
+
+;Here if want date and time in system format
+
+10$:	CALL	cdrdt2sys
+	JMP	knlStrParm8##		;Go give it to the user
+.PAGE
+	.SBTTL	cdriopabspos - CDR file IO parameter - Get or set absolute position
+
+;Here for the IOPAR_ABSPOS parameter for a CDR file transfer - get or set
+;  absolute IO position
+
+	DPARMHDR  BOTH, DECV
+cdriopabspos:
+	TESTB	AH, #PAR$SET		;Want to change value?
+	JE	4$.S			;No
+	PUSHL	EAX			;Yes
+	CALL	knlGetParm##		;Get value for position
+	JC	6$.S
+2$:	MOVL	dcb_dkfpos.B[EDI], EAX	;Store value
+	POPL	EAX
+4$:	TESTB	AH, #PAR$GET		;Want value returned?
+	JE	8$.S			;No
+	MOVL	EAX, dcb_dkfpos.B[EDI]	;Yes - get value
+	JMP	knlStrParm4##		;Give it to him
+
+6$:	POPL	ECX			;Fix up the stack
+8$:	RET
+
+	.SBTTL	cdrioprelpos - CDR file IO parameter - Get or set relative position
+
+;Here for the IOPAR_RELPOS parameter for a CDR file transfer - Get or set
+;  relative IO position
+
+	DPARMHDR  BOTH, DECV
+cdrioprelpos:
+	TESTB	AH, #PAR$SET		;Want to change value?
+	JE	4$.S			;No
+	PUSHL	EAX			;Yes
+	CALL	knlGetParm##		;Get value for position
+	JC	6$.S
+	ADDL	EAX, dcb_dkfpos.B[EDI]	;Make it relative
+10$:	JNO	2$.S
+	POPL	ECX			;Report value error if overflow
+	MOVL	EAX, #ER_PARMV
+	STC
+	RET
+
+	.SBTTL	cdriopeofpos - CDR file IO parameter - Get or set position relative to EOF
+
+;Here for the IOPAR_EOFPOS parameter for a CDR file transfer - Get or set IO
+;  position relative to EOF
+
+	DPARMHDR  BOTH, DECV
+cdriopeofpos:
+	CMPL	dcb_dkfilepnt.B[EDI], #0.B ;Have a file open?
+	JE	13$.S			;No - say bad parameter
+	TESTB	AH, #PAR$SET		;Yes - want to change value?
+	JE	4$.S			;No
+	PUSHL	EAX			;Yes
+	CALL	knlGetParm##		;Get value for position
+	JC	6$.S
+	ADDL	EAX, dcb_dkcdflen.B[EDI] ;Make it relative to EOF
+	JMP	10$.S
+
+13$:	MOVL	EAX, #ER_PARMI
+	STC
+	RET
+
+;Here for the IOPAR_OWNER parameter for open - Owner name
+
+	DPARMHDR  GET, STR
+cdriopowner:
+	CLRL	EAX			;For now, we don't have an owner name!
+	JMP	knlStrParmLng##
+.PAGE
+	.SBTTL	cdrchk1 - File system check routine 1 for CDR file system
+
+;File system check routine 1 for CDR file system - this routine is called
+;  during the first file system identification scan.
+;	c{EDI} = Offset of DCB
+;	CALL	cdrchk1
+;	C:set = Error (match found)
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  Z:set = Match found
+;	    c{EAX} = 0
+;	  Z:clr = Not found
+
+;This routine first scans the volume descriptors and notes the position of
+;  the primary volume descritor and looks for a secondary volume descritor
+;  which specifies a Joliet disk.  If a Joliet volume descritor is found, it
+;  is used, otherwise the primary volume descritor is used. Any other
+;  secondary descritors are ignored.  If it is not a Joliet disk, a check is
+;  then made to see if Rock Ridge extensions are present.  If during the
+;  descriptor we find a High Sierra volume descriptor, we set up the disk
+;  as a High Sierra disk without any further checking.
+
+$$$=!0
+FRM chk_privol , 4t
+FRM chk_block  , 4t
+FRM chk_typetbl, 4t
+chk_SIZE=!$$$
+
+cdrchk1:CMPL	ucb_csecsz.B[ESI], #512t ;Does this disk have 512 byte blocks?
+	JNE	cdrchk2			;No - can't have a 9660 file structure
+	CMPL	ucb_baseucb.B[ESI], #0.B ;Yes - is this a partition?
+	JE	cdrchk2			;No
+	ENTER	chk_SIZE, 0		;Yes
+	CLRL	EAX
+	MOVL	chk_privol.B[EBP], EAX
+	MOVL	chk_typetbl.B[EBP], EAX
+	MOVL	chk_block.B[EBP], #64t
+chkloop:MOVL	EAX, chk_block.B[EBP]
+	MOVL	dcb_dkdblk.B[EDI], EAX	;Read first block of the volume
+	MOVL	EDX, #2*512t		;  descriptor (read ahead one block
+	CALL	xosdskFindSBufr##	;  since we will probably need it)
+	JC	nxtdes2			;If can't, advance to next descriptor
+	CMPL	pvd9660_stdid+0.B[EBX], #'CD00' ;Is this a 9660 disk?
+	JNE	8$.S			;No
+	CMPB	pvd9660_stdid+4.B[EBX], #'1' ;Maybe
+	JNE	8$.S			;No
+	CMPL	chk_typetbl.B[EBP], #0	;Yes - do we have the type yet?
+	JE	6$.S			;No
+	CMPL	chk_typetbl.B[EBP], #setup9660 ;Yes - is it the same?
+	JE	12$.S			;Yes - go on
+	JMP	14$.S			;No - bad disk!
+
+6$:	MOVL	chk_typetbl.B[EBP], #setup9660
+	MOVB	ucb_fsspec[ESI], #2
+	JMP	12$.S
+
+;Here if don't have a 9660 disk
+
+8$:	CMPL	pvdhs_stdid+0.B[EBX], #'CDRO' ;Is this a high sierra  disk?
+	JNE	14$.S			;No
+	CMPB	pvdhs_stdid+4.B[EBX], #'M' ;Maybe
+	JNE	14$.S			;No
+	CMPL	chk_typetbl.B[EBP], #0	;Yes - do we have the type yet?
+	JE	10$.S			;No
+	CMPL	chk_typetbl.B[EBP], #setuphs ;Yes - is it the same?
+	JE	12$.S			;Yes - go on
+	JMP	14$.S			;No - bad disk!
+
+10$:	MOVL	chk_typetbl.B[EBP], #setuphs
+	MOVB	ucb_fsspec[ESI], #1
+12$:	MOVL	EAX, chk_typetbl.B[EBP]
+	MOVL	EAX, os_type.B[EAX]
+	MOVB	AL, [EBX+EAX]		;Get descriptor type
+	CMPB	AL, #01h		;No - is it the primary volume
+					;  descriptor?
+	JNE	14$.S			;No
+	MOVL	EAX, chk_block.B[EBP]	;Yes - remember where it is
+	MOVL	chk_privol.B[EBP], EAX
+	JMP	nxtdesc.S		;Continue
+
+;Here if not the primary volume descritor
+
+14$:	CMPB	AL, #02h		;Is it a secondary volume descriptor?
+	JNE	18$.S			;No
+	CMPB	ucb_fsspec[ESI], #2	;Yes - is this a 9660 disk?
+	JB	nxtdesc.S		;No
+	CMPW	88t.B[EBX], #2F25h	;Yes - is it a Joliet descriptor?
+	JNE	16$.S			;No
+	CMPB	90t.B[EBX], #40h	;Maybe
+	JE	16$.S			;Yes
+	CMPB	90t.B[EBX], #43h
+	JE	16$.S			;Yes
+	CMPB	90t.B[EBX], #45h
+	JNE	nxtdesc.S		;No
+16$:	MOVB	ucb_fsspec[ESI], #4	;Indicate its a Joliet disk
+	JMP	voldesc.S		;Process the volume descriptor
+
+;Here if the a secondary volume descriptor
+
+18$:	CMPB	AL, #0FFh		;Is this the last one?
+	JNE	nxtdesc.S		;No
+	ADDL	chk_block.B[EBP], #100t.B ;Yes - all done with the scan
+nxtdesc:CALL	xosdskGiveLkBufr##
+nxtdes2:ADDL	chk_block.B[EBP], #4t.B	;Advance to next descriptor
+	CMPL	chk_block.B[EBP], #96t.B ;Can we have more?
+	JB	chkloop			;Yes - continue
+	MOVL	EAX, chk_privol.B[EBP]	;Did we find a primary volume desc?
+	TESTL	EAX, EAX
+	JE	badfs.S			;No
+	MOVL	dcb_dkdblk.B[EDI], EAX	;Yes - read the first block again
+	MOVL	EDX, #2*512t
+	CALL	xosdskFindSBufr##
+	JNC	voldesc.S		;Go on if OK
+badfs:	LEAVE
+cdrchk2:TESTL	ESP, ESP		;Clear Z to indicate not a valid
+	RET				;  file structure
+.PAGE
+;Here with the volume descriptor we will use
+
+voldesc:
+	MOVL	EDX, chk_typetbl.B[EBP]
+	MOVL	EAX, os_setsz.B[EDX]
+	CMPW	[EBX+EAX], #1.B		;Single disk volume?
+	JNE	badfs.S			;No - can't use it
+	MOVL	EAX, os_blocksz.B[EDX]	;Yes
+	CMPW	[EBX+EAX], #512t	;Is the logical block size valid?
+	JE	2$.S			;Yes
+	CMPW	[EBX+EAX], #1024t	;Maybe
+	JE	2$.S			;Yes
+	CMPW	[EBX+EAX], #2048t	;Maybe
+	JNE	badfs.S			;No
+
+;Here with a disk with a valid primary volume descriptor - now set up the file
+;  structure data
+
+2$:	MOVL	ECX, dcb_dkdblk.B[EDI]	;Store block number for the volume
+	MOVL	ucb_pvdblk.B[ESI], ECX	;  descriptor we are using
+	MOVZWL	EAX, [EBX+EAX]		;Get logical block size for structure
+	MOVL	ucb_bpclus.B[ESI], EAX	;Store it (bytes per cluster)
+	SHRL	EAX, #9t		;Change to number of disk blocks
+	MOVL	ucb_clussize.B[ESI], EAX ;Store as cluster size
+	BSFL	ECX, EAX		;Get power of two for conversions
+	MOVB	ucb_clusx.B[ESI], CL
+	MOVL	EAX, os_type.B[EDX]	;Get the descriptor type
+	MOVB	AL, [EBX+EAX]
+	MOVB	ucb_pvdtype.B[ESI], AL
+	MOVL	EAX, os_rootdir.B[EDX]
+	MOVZBL	ECX, dir_attrlen.B[EBX+EAX] ;Get cluster for root directory
+	ADDL	ECX, dir_filepnt.B[EBX+EAX]
+	IMULL	ECX, ucb_clussize.B[ESI]
+	SUBL	ECX, ucb_partnoff[ESI]
+	MOVL	ucb_rootpnt.B[ESI], ECX
+	MOVL	ECX, dir_filelen.B[EBX+EAX] ;Get length of root directory
+	MOVL	ucb_rootlen.B[ESI], ECX
+	MOVB	ucb_fstype.B[ESI], #50h	;Store "partition type"
+	CMPB	ucb_fsspec[ESI], #4	;Is this a Joliet disk?
+	JE	4$.S			;Yes
+	MOVL	EAX, os_fsname+0.B[EDX]	;No - store file system type name
+	MOVL	ucb_fsname+0[ESI], EAX
+	MOVL	EAX, os_fsname+4.B[EDX]
+	MOVL	ucb_fsname+4[ESI], EAX
+	JMP	6$.S
+
+4$:	MOVL	ucb_fsname+0[ESI], #'CDJO'
+	MOVL	ucb_fsname+4[ESI], #'L'
+6$:	MOVL	EAX, os_spacesz.B[EDX]
+	MOVL	EAX, [EBX+EAX]		;Get total space in the volume
+	MOVL	ucb_total.B[ESI], EAX
+	PUSHL	EDI
+	MOVL	EDI, ucb_ext.B[ESI]
+	ADDL	EDI, #ucbx_vollabel.B
+	PUSHL	DS
+	POPL	ES
+	CALL	copyvollbl		;Copy the volume label
+	MOVL	EDI, ucb_ext.B[ESI]
+	ADDL	EDI, #ucbx_volid.B
+	CLRL	EAX
+	STOSL	[EDI]
+	STOSL	[EDI]
+	STOSL	[EDI]
+	STOSL	[EDI]
+	POPL	EDI
+	PUSHL	EDX
+	CALL	xosdskGiveLkBufr##	;Give up the buffer
+	INCL	dcb_dkdblk.B[EDI]	;Get the next block
+	CLRL	EDX			;Don't read ahead
+	CALL	xosdskFindSBufr##
+	POPL	EDX
+	JC	badfs			;If error
+	MOVL	ECX, os_volcdt.B[EDX]	;Get the volume creation date and time
+	SUBB	CH, #2
+	CALL	cdrldt2sys
+	MOVL	ucb_volcdt+0[ESI], EAX
+	MOVL	ucb_volcdt+4[ESI], ECX
+	MOVL	ECX, os_volmdt.B[EDX]	;Get the volume modification date and
+	SUBB	CH, #2			;  time
+	CALL	cdrldt2sys
+	MOVL	ucb_volmdt+0[ESI], EAX
+	MOVL	ucb_volmdt+4[ESI], ECX
+	MOVL	ECX, os_volxdt.B[EDX]	;Get the volume expriation date and
+	SUBB	CH, #2			;  time
+	CALL	cdrldt2sys
+	MOVL	ucb_volxdt+0[ESI], EAX
+	MOVL	ucb_volxdt+4[ESI], ECX
+	MOVL	ECX, os_voledt.B[EDX]	;Get the volume effective date and time
+	SUBB	CH, #2
+	CALL	cdrldt2sys
+	MOVL	ucb_voledt+0[ESI], EAX
+	MOVL	ucb_voledt+4[ESI], ECX
+	CALL	xosdskGiveLkBufr##	;Give up the buffer
+	MOVB	ucb_sts1.B[ESI], #U1$VALID
+	ORB	ucb_sts1.B[ESI], #U1$MOUNT ;Indicate disk is mounted now
+	ANDB	ucb_sts2.B[ESI], #~U2$REQUNMNT
+	MOVL	EAX, #cdrdsp		;Use our dispatch tables
+	MOVL	dcb_sdisp.B[EDI], EAX
+	MOVL	ucb_sdisp.B[ESI], EAX
+	MOVL	ucb_unmount.B[ESI], #cdrunmount
+	MOVL	EAX, ucb_dsp.B[ESI]
+	ANDL	EAX, #DS$REMOVE.B
+	ORL	EAX, #DS$FILE|DS$NAMEEXT|DS$SODIR|DS$NOABORT|DS$LCLDISK|DS$QIN|DS$QOUT
+	MOVL	dcb_dsp.B[EDI], EAX
+	MOVL	ucb_dsp.B[ESI], EAX
+	CMPB	ucb_fsspec[ESI], #2	;Is this a 9660 disk?
+	JNE	10$.S			;No
+	CALL	chkrrip#		;Yes - check for Rockridge extensions
+	JNE	10$.S			;If not Rockridge
+	MOVB	ucb_fsspec[ESI], #3	;Indicate Rockridge
+	MOVL	ucb_fsname+0[ESI], #'CDRR'
+	MOVL	ucb_fsname+4[ESI], #'IP'
+10$:	CLRL	EAX			;Indicate have file system
+	LEAVE
+ret004:	RET
+.PAGE
+	.SBTTL	cdrvfychg - Verify changed disk
+
+;Here for the check for changed disk entry (dd_chkchg) - This routine is called
+;  for CDR file structured disks only.  It is called after we have made a
+;  reasonable determination that the disk may have been changed.  It rereads
+;  the primary volume descriptor and compares its contents to the values we
+;  have stored for the disk.  If it matches, we say the disk was not changed.
+;  If it does not match, we say it has been changed.
+;	c{EDI} = Offset of DCB
+;	CALL	cdrchkchg
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+
+cdrvfychg:
+	MOVL	EAX, ucb_disp.B[ESI]	;Do media verification and set up
+	CALLI	CS:ks_media.B[EAX]
+	JC	2$.S
+	PUSHL	ESI			;Get a 2K buffer
+	MOVL	ECX, #5t
+	CALL	knlGetXmb##
+	MOVL	EBX, ESI
+	POPL	ESI
+	JC	2$.S			;If error
+	MOVL	EAX, ucb_pvdblk.B[ESI]	;Read the primary volume descriptor
+	MOVL	dcb_dkdblk.B[EDI], EAX
+	PUSHL	DS
+	POPL	ES
+	MOVL	ECX, #2048t
+	PUSHL	EBX
+	MOVL	EAX, #kf_readdata	;Get function
+	CALL	xosdskXfer##		;Do the transfer
+	POPL	EBX
+2$:	JC	24$			;If error (buffer given up)
+	MOVL	EDX, #setup9660		;Assume we now have a 9660 disk
+	CMPB	ucb_fsspec[ESI], #2	;Right?
+	JAE	4$.S			;Yes
+	ADDL	EDX, #setuphs-setup9660.B ;No - its a High Sierra disk
+4$:	MOVL	EAX, os_type.B[EDX]	;Is the descriptor type right?
+	MOVB	CL, ucb_pvdtype.B[ESI]
+	CMPB	[EBX+EAX], CL
+	JNE	6$.S			;No
+	MOVL	EAX, os_stdid.B[EDX]	;Yes - is the standard ID right?
+	MOVL	ECX, os_stdidval+0.B[EDX]
+	CMPL	[EBX+EAX], ECX		;Is the header right?
+	JNE	6$.S			;No
+	MOVB	CL, os_stdidval+4.B[EDX] ;Maybe
+	CMPB	4.B[EBX+EAX], CL
+	JNE	6$.S			;No
+	MOVL	EAX, os_version.B[EDX]	;Yes - is the volume version right?
+	CMPB	[EBX+EAX], #1
+	JNE	6$.S			;No
+	MOVL	EAX, os_blocksz.B[EDX]	;Yes - get logical block size
+	MOVZWL	EAX, [EBX+EAX]
+	CMPL	EAX, ucb_bpclus.B[ESI]	;Is it the same?
+	JNE	6$.S			;No
+	MOVL	EAX, os_rootdir.B[EDX]
+	MOVZBL	ECX, dir_attrlen.B[EBX+EAX] ;Yes - get block for root directory
+	ADDL	ECX, dir_filepnt.B[EBX+EAX]
+	IMULL	ECX, ucb_clussize.B[ESI]
+	SUBL	ECX, ucb_partnoff[ESI]
+	CMPL	ECX, ucb_rootpnt.B[ESI]	;Is it the same?
+6$:	JNE	10$.S			;No
+	MOVL	ECX, dir_filelen.B[EBX+EAX] ;Yes - get length of root directory
+	CMPL	ECX, ucb_rootlen.B[ESI]	;Is it the same?
+	JNE	10$.S			;No
+	MOVL	EAX, os_spacesz.B[EDX]	;Yes - get total space in the volume
+	MOVL	EAX, [EBX+EAX]
+	CMPL	EAX, ucb_total.B[ESI]	;Is it the same?
+	JNE	10$.S			;No
+	PUSHL	EDI			;Yes
+	SUBL	ESP, #36t.B		;Get the volume label
+	MOVL	EDI, ESP
+	PUSHL	SS
+	POPL	ES
+	CALL	copyvollbl
+	MOVL	EDI, ESP
+	PUSHL	ESI
+	MOVL	ESI, ucb_ext.B[ESI]
+	ADDL	ESI, #ucbx_vollabel.B	;Is it the same?
+	MOVL	ECX, #32t
+8$:	LODSB	[ESI]
+	CMPB	SS:[EDI], AL
+	JNE	20$			;If different
+	INCL	EDI
+	CMPB	AL, #0
+	JNE	8$.S
+	POPL	ESI
+	ADDL	ESP, #36t
+	POPL	EDI
+	MOVL	ECX, os_volcdt.B[EDX]	;Check the volume creation date and
+	CALL	cdrldt2sys		;  time
+	CMPL	EAX, ucb_volcdt+0[ESI]
+	JNE	10$.S
+	CMPL	ECX, ucb_volcdt+4[ESI]
+	JNE	10$.S
+	MOVL	ECX, os_volmdt.B[EDX]	;Check the volume modification date
+	CALL	cdrldt2sys		;  and time
+	CMPL	EAX, ucb_volmdt+0[ESI]
+10$:	JNE	22$.S
+	CMPL	ECX, ucb_volmdt+4[ESI]
+	JNE	22$.S
+	MOVL	ECX, os_volxdt.B[EDX]	;Check the volume expriation date and
+	CALL	cdrldt2sys		;  time
+	CMPL	EAX, ucb_volxdt+0[ESI]
+	JNE	22$.S
+	CMPL	ECX, ucb_volxdt+4[ESI]
+	JNE	22$.S
+	MOVL	ECX, os_voledt.B[EDX]	;Check the volume effective date and
+	CALL	cdrldt2sys		;  time
+	CMPL	EAX, ucb_voledt+0[ESI]
+	JNE	22$.S
+	CMPL	ECX, ucb_voledt+4[ESI]
+	JNE	22$.S
+	PUSHL	ESI			;Give up our buffer
+	MOVL	ESI, EBX
+	MOVL	ECX, #5t
+	CALL	knlGiveXmb##
+	POPL	ESI
+	CLC				;Not changed
+	RET
+
+;Here if volume label is different
+
+20$:	POPL	ESI			;Restore registers and fix up the
+	ADDL	ESP, #36t		;  stack
+	POPL	EDI
+
+;Here if disk has been changed
+
+22$:	PUSHL	ESI			;Give up our buffer
+	MOVL	ESI, EBX
+	MOVL	ECX, #5t
+	CALL	knlGiveXmb##
+	POPL	ESI
+24$:	MOVL	EAX, #ER_MDCHG
+	STC
+	RET
+.PAGE
+	.SBTTL	cdrcdcb - sd_cleardcb - Clear DCB
+
+;Here for the sd_cleardcb device function - Clear DCB
+
+cdrcdcb:PUSHL	ESI
+	MOVL	ESI, dcb_dkcdfdb.B[EDI] ;Do we have a CDFDB?
+	TESTL	ESI, ESI
+	JE	4$.S
+	MOVZBL	ECX, [ESI]		;Yes - give it up
+	CALL	knlGiveXmb##
+4$:	POPL	ESI
+	JMP	xosdskCDcb##
+.PAGE
+	.SBTTL	cdrunmount - Unmount CDR file structured disk
+
+;Here for the unmount disk entry - this routine removes all of knowledge of
+;  a disk from the system without attempting to read or write to the disk
+;  - it is normally called when it is determined that a removable disk has
+;  been changed or when a serious IO error occures (such as an error when
+;  updating the FAT blocks) - all buffers for the disk are unhashed - if
+;  they are not in use, they are given up, if they are in use, they are
+;  marked with an error (ER_DKCHG or ER_???)
+;	c{EDI} = Offset of DCB
+;	c{ESI} = Offset of UCB
+;	c{EAX} = Error code for in use buffers
+;	CALL	cdrunmount
+;  EAX is preserved
+
+cdrunmount:
+	PUSHL	EAX			;Save error code
+	MOVB	ucb_fstype.B[ESI], #0	;Indicate unknown file structure type
+	MOVL	ucb_fsname+0[ESI], #'None'
+	CLRL	EAX
+	MOVL	ucb_fsname+4[ESI], EAX
+	MOVL	ucb_rootpnt.B[ESI], EAX
+	POPL	EAX			;Restore error code to use
+	JMP	xosdskUnmount##		;Go finish up
+.PAGE
+	.SBTTL	dfsunitinfo - CD-ROM file system get phyical unit information function
+
+;Here for the get physical unit information class function (CL_PUNITS) for the
+;  CD-ROM file system class to return detailed device information - For the
+;  CD-ROM file system, this consists of the complete path and name of the open
+;  file.
+;	c{ECX}    = Size of buffer
+;	c{ES:EDI} = Address of user buffer
+;	c{ESI}    = Offset of DCB
+;	CALL	cdrinfo
+;	c{EAX} = Error code (negative) or number of items returned (positive)
+
+cdrinfo:CLRL	EAX
+	MOVL	ESI, dcb_dkcdfdb.B[ESI]	;Get offset of the CDFDB
+	DECL	ECX
+	JS	4$.S
+	CMPL	ECX, cdfdb_fslonglen.B[ESI]
+	JLE	2$.S
+	MOVL	ECX, cdfdb_fslonglen.B[ESI]
+2$:	MOVL	EAX, ECX
+	ADDL	ESI, #cdfdb_fslongbfr.B
+	JREGZ	ECX, 4$
+	CLD
+	IFFAULT	knlRtnAdrEr##
+	RMOVSB	[EDI], [ESI]
+	IFFAULT	knlRtnAdrEr##
+	MOVB	ES:[EDI], #0
+4$:	CLC
+	RET
+.PAGE
+	.SBTTL	cdropen - Open device
+
+;Here for the open device entry
+;	c(AL)     = Prefix character for returned path string
+;	c{EDI}    = Offset of disk DCB
+;	c{SS:EDX} = Address of expanded file path and name
+;	CALL	cdropen
+
+cdropen:TESTL	SS:xffCmd##, #O$CREATE|O$TRUNCA|O$TRUNCW
+	JNE	knlWPrErr##
+	TESTL	SS:xffCmd##, #O$PHYS|O$RAW ;Want non-file IO?
+	JNE	2$.S			;Yes
+	CMPB	SS:[EDX], #0		;Maybe - have completely null name?
+	JNE	4$.S			;No - go on
+	ANDB	SS:xffCmd##, #~{O$IN|O$OUT} ;Yes - do non-file IO but don't
+2$:	JMP	xosdskForceDsk##	    ;  allow any input or output
+
+;Here for file IO
+
+4$:	ENTER	cdo_SIZE, 2		;Create our level 2 stack frame
+	PUSHL	EAX
+	PUSHL	EDI
+	PUSHL	SS			;Clear the stack frame
+	POPL	ES
+	LEAL	EDI, -12t.B[EBP]	;(this allows for a 2 item display)
+	CLRL	EAX
+	MOVL	ECX, #cdo_SIZE/4
+	STD
+	RSTOSL	[EDI]
+	POPL	EDI
+	MOVL	cdo_namep.B[EBP], EDX	;Store offset of file name buffer
+	LEAL	EAX, cdo_dirrec[EBP]	;Get offset of directory entry buffer
+	MOVL	cdo_actrec.B[EBP], EAX	;  to use
+	LEAL	EAX, cdo_dirname[EBP]
+	MOVL	cdo_actname.B[EBP], EAX
+	MOVB	AL, ucb_fsspec[ESI]	;Copy the file system spec.
+	MOVB	cdo_fsspec.B[EBP], AL
+	POPL	EAX
+	CALL	xosdskSetupSpec##	;Set up the file specification
+	JC	6$.S			;If error
+	MOVL	ESI, dcb_dkcdfdb.B[EDI]	;Do we already have a CDFDB?
+	TESTL	ESI, ESI
+	JNE	8$.S			;Yes
+	CLRL	ECX			;No - get a 64-byte exec buffer
+	CALL	knlGetXmb##
+6$:	JC	24$
+	MOVL	dcb_dkcdfdb.B[EDI], ESI
+	CLRL	EAX
+	MOVB	[ESI], AL		;Store size index
+	INCL	EAX
+	MOVL	cdfdb_fslonglen.B[ESI], EAX ;Initialize long file spec
+	MOVB	cdfdb_fslongbfr.B[ESI], #'\'
+8$:	MOVZBL	ECX, [ESI]
+	MOVL	EAX, #64t
+	SHLL	EAX, CL
+	SUBL	EAX, #cdfdb_fslongbfr.B
+	MOVL	cdo_fslongmax.B[EBP], EAX
+	BTL	SS:xffPVFilOpt##, #FO%PATHDOS ;Want DOS path returned?
+	JNC	12$.S			;No
+	BTL	SS:xffPVFilOpt##, #FO%NOPREFIX ;Yes - want prefix character?
+	JC	10$.S			;No
+	MOVB	AL, #FS_PATHDOS		;Yes
+	CALL	knlGivUChr##
+	JC	12$.S
+10$:	MOVB	AL, #'\'
+	CALL	knlGivUChr##
+12$:	BTL	SS:xffHvValue1##, #IOV1%DIRHNDL ;Want to search open directory?
+	JC	cdrsodir		;Yes
+	MOVL	dcb_dkcdentnum.B[EDI], #0 ;No
+	CALL	cdrnchar		;Get first character
+	CMPB	AL, #0			;Is the string null?
+	JE	26$.S			;Yes - must want to open the root
+	CMPB	AL, #'\'		;No - does path start at root?
+	JE	rtpath			;Yes
+	PUSHL	EAX			;No
+16$:	CALL	knlFindPath##		;Find default path for device
+	JC	22$.S			;If error (should only happen if disk
+					;  has been changed since path was set!)
+	JE	rtpath2			;If no path, start at root
+	PUSHL	ESI			;Save offset of the path block
+	ADDL	ESI, #pn_string.B	;Point to start of path string
+	CMPB	FS:[ESI], #'\'
+	JNE	18$.S
+	INCL	ESI
+18$:	MOVB	AL, FS:[ESI]		;Get path character
+	INCL	ESI
+	TESTB	AL, AL			;End?
+	JE	20$.S			;Yes
+	CALL	cdrputlongfs		;No - store character
+	JMP	18$.S			;Continue
+
+;;; NEED CODE TO GIVE USER DOS NAME PATH VERSION IF HE WANTS IT!!! (NEED TO
+;;;   CHANGE PATH STUFF TO KEEP TRACK OF THE DOS NAMES FIRST!)
+
+20$:	POPL	EDX
+	JMP	pathrdy
+
+;Here if error getting the path for the device
+
+22$:	POPL	EBX
+24$:	LEAVE
+	RET
+
+;Here to open root or current directory as a file
+
+26$:	CMPB	cdo_respath.B[EBP], #0	;Have we resolved the path?
+	JNE	opnroot			;Yes - go open the root
+	PUSHL	#0.B			;No - use current path
+	BTL	SS:xffHvValue1##, #IOV1%SRCATTR ;Did he specify attributes?
+	JNC	28$.S			;No - fail
+	MOVL	EDX, opn_frame1.B[EBP]	;Yes
+	TESTB	SS:opn_srcattr.B[EDX], #A$DIRECT ;Want a directory?
+	JNE	16$.S			;Yes - OK
+28$:	POPL	EAX
+opnfnf:	MOVL	EAX, #ER_FILNF		;No - fail
+	BTL	SS:xffCmd##, #O%ODF
+	JNC	opnerr.S
+	MOVB	AL, #ER_DIRNF
+opnerr:	LEAVE
+	STC
+	RET
+.PAGE
+;Here to search an open directory
+
+cdrsodir:
+	MOVL	ESI, [EDI]
+	TESTL	ESI, ESI
+	JE	knlNoUnitLv##
+	BTZL	SS:xffPVFilOpt##, #FO%PATHNAME
+	MOVL	ECX, cdo_namep.B[EBP]	;Initialize pointer to name part
+2$:	CALL	cdrnchar		;Get name character
+	JE	6$.S			;If end of name
+	CMPB	AL, #':'		;No - end of device part?
+	JE	4$.S			;Yes
+	CMPB	AL, #'\'		;No - end of directory name?
+	JNE	2$.S			;No - continue
+4$:	MOVL	ECX, cdo_namep.B[EBP]	;Yes - remember where name may start
+	JMP	2$.S			;Continue
+
+;Here with beginning of actual name part of file specification found
+
+6$:	MOVL	cdo_namep.B[EBP], ECX	;Point to start of name
+	CALL	cdrnchar		;Get first character
+	JE	badspc			;Error if null name here!
+	CALL	cpyname
+	JC	badspc			;If bad name
+
+;When we get here, we have done as much as we can without actually opening
+;  the file.  Inorder to open the file, we must clone the directory DCB so
+;  that we don't destroy its current state - we keep track of it so we can
+;  update dcb_dkfpos when we are finished
+
+	MOVL	ESI, [EDI]
+	TESTL	ESI, ESI
+	JE	28$
+	PUSHL	dcb_name+12t.B[EDI]
+	PUSHL	dcb_name+8.B[EDI]
+	PUSHL	dcb_name+4.B[EDI]
+	PUSHL	dcb_name+0.B[EDI]
+	MOVL	EDX, #xosdskCcb##
+	PUSHL	EDI			;Save offset of directory DCB
+	CALL	xosdskGetDcb##		;Get another disk DCB
+	POPL	EDX
+	JC	30$			;If error
+	ADDL	ESP, #16t.B
+	MOVL	dcb_sdisp.B[EDI], #cdrdsp
+	MOVW	AX, dcb_sesproc.B[EDX]	;Store owner process number in the new
+	MOVW	dcb_sesproc.B[EDI], AX	;  DCB
+	MOVL	EAX, dcb_outframe.B[EDX]
+	MOVW	dcb_outframe.B[EDI], AX
+	MOVW	dcb_outframe.B[EDX], #0
+	MOVL	EAX, dcb_dkfpos.B[EDX]
+	MOVL	cdo_dirpos.B[EBP], EAX
+	MOVL	EAX, dcb_dkcdentnum.B[EDX]
+	MOVL	dcb_dkcdentnum.B[EDI], EAX
+	MOVL	EAX, dcb_dkfilepnt.B[EDX]
+	MOVL	cdo_dirpnt.B[EBP], EAX
+	MOVL	EAX, dcb_dkcdflen.B[EDX]
+	MOVL	cdo_dirlen.B[EBP], EAX
+	PUSHL	ESI
+	MOVL	ECX, dcb_dkcdfdb.B[EDX]
+	MOVZBL	ECX, [ECX]		;Allocate an XMB for the CDFDB
+	CALL	knlGetXmb##
+	JC	31$.S			;If error
+	MOVL	dcb_dkcdfdb.B[EDI], ESI
+	PUSHL	EDI			;Copy the CDFDB
+	MOVL	EDI, ESI
+	PUSHL	DS
+	POPL	ES
+	MOVL	ESI, dcb_dkcdfdb.B[EDX]
+	MOVL	ECX, cdfdb_fslonglen.B[ESI]
+	ADDL	ECX, #cdfdb_fslongbfr+3.B
+	SHRL	ECX, #2t
+	CLD
+	RMOVSL	[EDI], [ESI]
+	POPL	EDI
+	POPL	ESI
+	PUSHL	EDX			;Store new DCB offset in the handle
+	CALL	knlStoreHnd2##		;  table, replacing directory DCB offset
+	CALL	cdrdirrec		;Get the first record
+	JC	26$.S			;If error
+	CALL	cdrffile		;Search for the file
+26$:	POPL	EDX
+	JC	32$.S			;If error
+	CALL	cdrclrbufr
+	CALL	sodfix
+	LEAVE
+	TESTL	EDI, EDI		;Clear Z
+	RET				;And return
+
+;Here if disk has been changed
+
+28$:	LEAVE
+	MOVL	EAX, #ER_MDCHG
+	STC
+	RET
+
+;Here if cannot allocate another disk DCB
+
+30$:	CALL	cdrclrbufr
+	LEAVE
+	MOVL	EDI, EDX		;Restore directory DCB
+	RET				;Return the error
+
+;Here if cannot allocate an XMB for the CDFDB
+
+31$:	POPL	ESI
+	CRASH	????
+
+;Here if error opening the file
+
+32$:	CALL	cdrclrbufr
+	PUSHL	EAX
+	CALL	sodfix
+	POPL	EAX
+	LEAVE
+	STC
+	RET
+.PAGE
+;Subroutine to fix up directory pointers after searching open directory
+;	c{EDX} = Offset of directory DCB or 0 if new name for rename
+;	c{EDI} = Offset of file DCB or of directory DCB if new name for
+;		   rename
+;	CALL	sodfix
+
+sodfix:	CMPL	dcb_opencnt.B[EDX], #1.B ;Is directory DCB still in use?
+	JNE	4$.S			;Yes
+	PUSHL	EDI			;No - close the directory
+	MOVL	EDI, EDX
+	CALL	cdrclose2
+	DECL	dcb_opencnt.B[EDI]	;Reduce use count on directory DCB
+	CALL	xosdskCDcb##		;Give up the DCB
+	POPL	EDI
+	RET
+
+;Here if directory DCB use count is not 1
+
+4$:	JB	10$.S			;Serious error if use count is 0!
+	DECL	dcb_opencnt.B[EDX]	;OK - reduce the use count
+	MOVL	ECX, cdo_frame1.B[EBP]	;Update position
+	MOVL	EAX, SS:opn_dirofs+0.B[ECX]
+	MOVL	dcb_dkfpos.B[EDX], EAX	;Store as position for next search
+	MOVL	EAX, SS:opn_dirofs+4.B[ECX]
+	MOVL	dcb_dkcdentnum.B[EDX], EAX
+	RET
+
+10$:	CRASH	BDUC			;[Bad Device Use Count]
+.PAGE
+;Here to really open the root if null name given
+
+opnroot:MOVL	ESI, [EDI]		;Get offset of UCB
+	TESTL	ESI, ESI
+	JE	opndc			;Fail if none
+	BTL	SS:xffHvValue1##, #IOV1%SRCATTR ;Did he specify attributes?
+2$:	JNC	opnfnf			;No - fail
+	MOVL	EDX, opn_frame1.B[EBP]	;Yes
+	TESTB	SS:opn_srcattr.B[EDX], #A$DIRECT ;Want a directory?
+	JE	opnfnf			;No - fail
+	MOVL	EAX, ucb_rootpnt.B[ESI] ;Get cluster for root directory
+	CLRL	EDX
+	DIVL	ucb_clussize.B[ESI]
+	MOVL	cdo_dirrec+dir_filepnt[EBP], EAX
+	MOVL	EAX, ucb_rootlen.B[ESI]
+	MOVL	cdo_dirrec+dir_filelen[EBP], EAX
+	JMP	findfil
+
+;Here with default path copied to user buffer if necessary
+
+pathrdy:CMPL	FS:pn_fpnt1.B[EDX], #0.B ;Do we have a starting cluster?
+	JNE	10$			;Yes - go on
+
+;Here if do not have a starting cluster for the default path directory - this
+;  will happen if a device is dismounted after a path is set or if there is an
+;  error on the directory - in this case we try to open the directory again - if
+;  this works, we just re-establish the directory FIB for the path and continue
+;  as if all is normal - if it fails, we return the error, leaving the path
+;  without a path table offset (he may put the disk back next time!)
+
+	PUSHL	SS:xffCmd##
+	MOVL	SS:xffCmd##, #O$ODF
+	PUSHL	SS:xffHvValue1##
+	PUSHL	SS:xffNdValue1##
+	PUSHL	SS:xffPVFilOpt##
+	CLRL	EAX
+	MOVL	SS:xffHvValue1##, EAX
+	MOVL	SS:xffNdValue1##, EAX
+	MOVL	SS:xffPVFilOpt##, EAX
+	PUSHL	ESI
+	PUSHL	FS
+	PUSHL	EDX
+	MOVL	ECX, FS:[EDX]		;Get length of the path string
+	SUBL	ECX, #pn_string.B
+	SUBL	ESP, ECX		;Allocate stack space for the name
+	PUSHL	ECX
+	PUSHL	EDI
+	PUSHL	SS
+	POPL	ES
+	LEAL	EDI, 12t.B[ESP]
+	LEAL	ESI, pn_string.B[EDX]
+	SHRL	ECX, #2
+	CLD
+	RMOVSL	[EDI], FS:[ESI]		;Copy name to our stack
+	POPL	ESI
+	POPL	EDI
+	LEAL	EDX, 4.B[ESP]
+	MOVL	EBX, dcb_sdisp.B[EDI]	;Open the last directory
+	CALL	cdropen
+	POPL	ECX
+	JC	24$
+	ADDL	ESP, ECX
+	POPL	ESI
+	POPL	ES
+	CALL	cdrsetpath
+	MOVL	EDX, ESI
+	PUSHL	ES
+	POPL	FS
+	POPL	ESI
+	POPL	SS:xffPVFilOpt##
+	POPL	SS:xffNdValue1##
+	POPL	SS:xffHvValue1##
+	POPL	SS:xffCmd##
+
+;Here with path table offset for the default directory
+
+10$:	MOVL	ECX, FS:pn_fpnt2.B[EDX]
+	MOVL	EDX, FS:pn_fpnt1.B[EDX]
+	MOVL	ESI, [EDI]		;Get offset of UCB
+	TESTL	ESI, ESI
+	JNE	rtpath4
+opndc:	POPL	EAX
+	LEAVE
+medchg:	MOVL	EAX, #ER_MDCHG
+	STC
+	RET
+
+;Here if have error opening the directory
+
+24$:	ADDL	ESP, ECX		;Fix up the stack
+	POPL	EDX
+	POPL	FS
+	POPL	SS:xffPVFilOpt##
+	POPL	SS:xffNdValue1##
+	POPL	SS:xffHvValue1##
+	POPL	SS:xffCmd##
+	POPL	EBX			;Discard first character
+retsc6:	LEAVE
+	STC				;Indicate error
+	RET
+.PAGE
+;Here if path should start at the root
+
+rtpath:	CALL	cdrnchar		;Get first character of name of first
+	PUSHL	EAX			;  directory and save it
+rtpath2:MOVL	ESI, [EDI]		;Get offset of UCB
+	TESTL	ESI, ESI
+	JE	opndc
+	MOVL	ECX, ucb_rootlen.B[ESI]	;Get length of root directory
+	MOVL	EAX, ucb_rootpnt.B[ESI] ;Get cluster for root directory
+	CLRL	EDX
+	DIVL	ucb_clussize.B[ESI]
+	MOVL	EDX, EAX
+
+;Here to start searching
+;	c{ECX} = Size of directory
+;	c{EDX} = Cluster for directory
+
+rtpath4:POPL	EAX
+finddir:MOVL	cdo_dirlen.B[EBP], ECX
+	IMULL	EDX, ucb_clussize.B[ESI]
+	MOVL	cdo_dirpnt.B[EBP], EDX
+	TESTB	AL, AL			;Have another name to search for?
+	JE	nulname			;No
+	CALL	cpyname			;Yes - set up the name
+	JC	direrr			;If error
+	JE	fileset			;If have final name
+	CLRL	EAX
+	MOVL	cdo_dirpos.B[EBP], EAX
+	MOVL	dcb_dkcdentnum.B[EDI], EAX
+4$:	CALL	cdrdirrec		;Get next directory entry
+	JC	direrr			;If error
+	CMPB	cdo_dirrec+dir_namelen[EBP], #1 ;Special 1 character name?
+	JNE	6$.S			;No
+	CMPB	cdo_dirrec+dir_name+0[EBP], #1 ;Yes - . or ..?
+	JBE	4$.S			;Yes - skip it (we have already
+					;  processed this!)
+
+6$:	MOVL	ECX, cdo_strlen.B[EBP]	;No - get length of long name
+	BTL	SS:xffCmd##, #O%NOLONG	;Should we use the long name?
+	JC	22$.S			;No
+	CMPL	ECX, cdo_dirnamelen.B[EBP] ;No - same as name length in entry?
+	JNE	22$.S			;No
+	CMPB	cdo_fsspec.B[EBP], #3	;Yes - is this a Rockridge disk?
+	JNE	8$.S			;No
+
+;Here to compare long directory names if we have a RockRidge disk - the
+;  compare is case sensitive
+
+	PUSHL	ESI
+	PUSHL	EDI
+	LEAL	ESI, cdo_string[EBP]	;Check the name
+	LEAL	EDI, cdo_dirname[EBP]
+	PUSHL	SS
+	POPL	ES
+	CLD
+	RECMPSB	[EDI], SS:[ESI]		;Compare the names
+	POPL	EDI
+	POPL	ESI
+	JNE	22$.S			;If no match
+	JMP	dirfound		;If this is it
+
+;Here to compare long directory names if do not have a Rockridge disk - the
+;  compare ignores case
+
+8$:	LEAL	EDX, cdo_dirname[EBP]	;Point to the name from the entry
+	CMPB	cdo_fsspec.B[EBP], #4	;Is this a Joliet disk?
+	JE	16$.S			;Yes
+	LEAL	EBX, cdo_string-1[EBP]	;No
+12$:	MOVB	AL, SS:[EDX]
+	INCL	EDX
+	INCL	EBX
+	CMPB	AL, #'a'
+	JB	14$.S
+	CMPB	AL, #'z'
+	JA	14$.S
+	SUBB	AL, #'a'-'A'
+14$:	CMPB	AL, SS:[EBX]
+	LOOPE	ECX, 12$
+	JNE	22$.S			;No this one
+	JMP	dirfound		;If this is it
+
+;Here to compare long directory names if we have a Joliet disk
+
+16$:	LEAL	EBX, cdo_string-2[EBP]	;Point to the name from the entry
+	SHRL	ECX, #1t		;Adjust the count
+18$:	MOVW	AX, SS:[EDX]
+	ADDL	EDX, #2t.B
+	ADDL	EBX, #2t.B
+	CMPW	AX, #'a'
+	JB	20$.S
+	CMPW	AX, #'z'
+	JA	20$.S
+	SUBB	AL, #'a'-'A'
+20$:	CMPW	AX, SS:[EBX]
+	LOOPE	ECX, 18$
+	JE	dirfound.S		;If this is it
+
+;Here if should not use the long name or it did not match
+
+22$:	BTL	SS:xffCmd##, #O%USEDOS	;Should we use the DOS name?
+	JC	4$			;No
+	CMPL	ECX, cdo_dosnamelen.B[EBP] ;Yes - same as name length in entry?
+	JNE	4$			;No
+	LEAL	EDX, cdo_dosname[EBP]	;Yes
+	LEAL	EBX, cdo_string-1[EBP]
+24$:	MOVB	AL, SS:[EDX]
+	INCL	EDX
+	INCL	EBX
+	CMPB	AL, #'a'
+	JB	26$.S
+	CMPB	AL, #'z'
+	JA	26$.S
+	SUBB	AL, #'a'-'A'
+26$:	CMPB	AL, SS:[EBX]
+	LOOPE	ECX, 24$
+	JE	dirfound.S		;If this is it
+	JMP	4$			;Not this one
+.PAGE
+;If if file was not found in the directory
+
+notthere:
+	MOVL	EAX, #ER_DIRNF
+direrr:	CMPL	EAX, #ER_EOF.B
+	JNE	24$.S
+	MOVL	EAX, #ER_DIRNF
+24$:	CALL	cdrclrbufr
+	LEAVE
+	STC
+ret008:	RET
+
+;Here with complete match on the directory name
+
+dirfound:
+	TESTB	cdo_dirrec+dir_fileflg[EBP], #02h ;Is this a directory?
+	JE	notthere.S		;No
+
+;Copy the name of this directory to the long name buffer in the CDFDB
+
+	MOVL	ECX, cdo_dirnamelen[EBP] ;Get length of name
+	CMPL	ECX, #1.B		;Single character name?
+	JNE	28$.S			;No
+	CMPB	cdo_dirname[EBP], #0	;Yes - is it the root?
+	JE	34$.S			;Yes
+28$:	LEAL	EBX, cdo_dirname[EBP]	;Get offset of directory name
+	CMPB	cdo_fsspec.B[EBP], #4
+	JE	33$.S
+30$:	MOVB	AL, SS:[EBX]		;Get next byte
+	INCL	EBX
+	CMPB	AL, #'.'
+	JNE	32$.S
+	CMPL	ECX, #1.B
+	JE	34$.S
+32$:	CALL	cdrputlongfs
+	LOOP	ECX, 30$		;Continue if more there
+	JMP	34$.S
+
+;Here if have a Joliet disk
+
+33$:	SHRL	ECX, #1t
+333$:	MOVB	AL, SS:[EBX]		;Get next byte
+	ADDL	EBX, #2t
+	CMPW	AX, #'.'
+	JNE	335$.S
+	CMPL	ECX, #1.B
+	JE	34$.S
+335$:	CALL	cdrputlongfs
+	LOOP	ECX, 333$		;Continue if more there
+34$:	MOVB	AL, #'\'
+	CALL	cdrputlongfs
+
+;Here to give the user the DOS name if he wants it
+
+	BTL	SS:xffPVFilOpt##, #FO%PATHDOS ;Want DOS path returned?
+	JNC	40$.S			;No
+	CALL	givedosname		;Yes
+	MOVB	AL, #'\'
+	CALL	knlGivUChr##
+40$:
+	MOVL	EAX, ucb_partnoff.B[ESI]
+	CLRL	EDX
+	DIVL	ucb_clussize.B[ESI]
+	SUBL	cdo_dirrec+dir_filepnt[EBP], EAX
+	CALL	cdrnchar
+	MOVL	EDX, cdo_dirrec+dir_filepnt[EBP]
+	MOVL	ECX, cdo_dirrec+dir_filelen[EBP]
+	JMP	finddir			;Continue
+.PAGE
+;Here when have found the final directory in the path table - now we have to
+;  search the directory
+
+nulname:BTL	SS:xffCmd##, #O%ODF	;Want to open last directory?
+	JC	findfil.S		;Yes
+badspc:	MOVL	EAX, #ER_BDSPC		;Error = BaD file SPeCification
+	CALL	cdrclrbufr
+	LEAVE
+	STC
+	RET
+
+;Here with name of file to find setup
+
+fileset:MOVL	EBX, cdo_dirbufr.B[EBP]
+	TESTL	EBX, EBX
+	JE	findfil.S
+	CALL	xosdskRelsLkBufr##	;Release the last path table block
+	MOVL	cdo_dirbufr.B[EBP], #0
+
+;Here when ready to search the final directory for the file.  When we get here
+;  all we know is the starting sector number for the directory and that the
+;  first entry in the directory points to the directory itself.  We initially
+;  "open" the directory as if it were a 512 byte file (one block).  This is
+;  always enough to read the first entry.  We then read the first entry and
+;  use it to again "open" the directory, this time with the correct length.
+
+findfil:CLRL	EAX
+	MOVL	cdo_dirpos.B[EBP], EAX	;Set position to 0
+	BTL	SS:xffCmd##, #O%ODF	;Want to open the final directory?
+	JC	22$.S			;Yes
+	MOVL	ECX, cdo_frame1.B[EBP]
+	BTL	SS:xffHvValue1##, #IOV1%DIROFS ;Was directory offset specified?
+	JNC	14$.S			;No
+	MOVL	EAX, SS:opn_dirofs+0.B[ECX] ;Yes - get the value
+	MOVL	cdo_dirpos.B[EBP], EAX
+	MOVL	EAX, SS:opn_dirofs+4.B[ECX]
+	DECL	EAX
+	MOVL	dcb_dkcdentnum.B[EDI], EAX
+14$:	MOVL	SS:opn_dirofs.B[ECX], #-1 ;Set directory offset to impossible
+					  ;  value in case search fails and
+					  ;  user wants the offset
+
+
+;;;;;	CMPL	dcb_dkfpos.B[EDI], #0.B	;Starting at beginning of directory?
+;;;;;	JE	18$.S			;Yes
+
+
+16$:	CALL	cdrdirrec		;No - get the right record
+	JC	20$.S			;If error
+18$:	CALL	cdrffile		;Find the file in the directory
+	JNC	26$.S
+20$:	CALL	cdrclrbufr
+	LEAVE
+	STC
+	RET
+
+;Here to open directory as a file
+
+22$:	CALL	givelongpath
+	MOVL	EAX, dcb_dkcdfdb.B[EDI]	;Remove last \ from saved path name
+	DECL	cdfdb_fslonglen.B[EAX]
+	CALL	cdrdirrec		;Read the . entry
+	JC	20$.S
+	CALL	cdropenfile		;Open the directory as a file
+26$:	MOVL	dcb_dkcdentnum.B[EDI], #0
+	CALL	cdrclrbufr
+	CLRL	EAX
+	LEAVE
+	RET
+.PAGE
+	.SBTTL	cdrffile - Subroutine to search for file in directory
+
+;Subroutine to search for a file in a directory
+;	CALL	cdrffile
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = File found
+
+cdrffile:
+	MOVL	ECX, cdo_frame1.B[EBP]	;Get search attributes
+	MOVB	AL, SS:opn_srcattr.B[ECX]
+	CMPB	AL, #0
+	JNE	2$.S
+	MOVB	AL, #A$NORMAL
+2$:	TESTB	cdo_dirrec+dir_fileflg[EBP], #01h ;Is this a hidden file?
+	JE	4$.S			;No
+	TESTB	AL, #A$HIDDEN		;Yes - do we want hidden files?
+	JE	20$			;No - skip this one
+4$:	TESTB	cdo_dirrec+dir_fileflg[EBP], #02h ;Is this a directory?
+	JE	6$.S			;No
+	TESTB	AL, #A$DIRECT		;Yes - do we want it?
+	JE	20$			;No
+	CMPW	cdo_dirname[EBP], #'.'	;Yes - skip it if its . or ..
+	JE	20$
+	CMPW	cdo_dirname[EBP], #'..'
+	JNE	8$.S
+	CMPB	cdo_dirname+2[EBP], #0
+	JNE	8$.S
+	JMP	20$
+
+;Here if not a directory
+
+6$:	TESTB	AL, #A$NORMAL		;Do we want non-directory files?
+	JE	20$			;No
+
+;Here with name and extension from the directory entry collected in cdo_dirname
+;  and the version number in cdo_dirnamever
+
+8$:	MOVL	EAX, cdo_namever.B[EBP]	;Was a version number specified?
+	TESTL	EAX, EAX
+	JLE	10$.S			;No - don't check it
+	CMPL	cdo_dirnamever.B[EBP], #0.B ;Does the file have a version
+					    ;  number?
+	JE	10$.S			;No - nothing to check!
+	CMPL	EAX, cdo_namever.B[EBP]	;Yes - compare to value specified
+	JNE	20$.S			;If different
+10$:	PUSHL	ESI			;Version matches or we don't care
+	PUSHL	EDI
+	PUSHL	EDX
+	BTL	SS:xffCmd##, #O%NOLONG	;Should we use the long name?
+	JC	14$.S			;No
+	LEAL	ESI, cdo_string[EBP]	;Yes
+	PUSHL	SS
+	POPL	ES
+	LEAL	EDI, cdo_dirname[EBP]
+	CLRL	EAX			;Assume should do mixed case compare
+	CMPB	cdo_fsspec.B[EBP], #4	;Have a Joliet disk?
+	JE	12$.S			;Yes
+	CMPB	cdo_fsspec.B[EBP], #3	;No - have a Rockridge disk?
+	JNE	11$.S			;No
+	INCL	EAX			;Yes - do exact case compare
+11$:	CALL	knlWildCmp8##		;Do wild-card compare
+	JE	found.S
+	JMP	14$.S
+
+;Here if have a Joliet disk - do 16 bit compare
+
+12$:	CALL	knlWildCmp16##
+	JE	found.S
+
+;Here if the long name did not match or we are not checking it
+
+14$:	BTL	SS:xffCmd##, #O%USEDOS	;Should we check the DOS name?
+	JNC	18$.S			;No
+	LEAL	ESI, cdo_string[EBP]	;Yes
+	PUSHL	SS
+	POPL	ES
+	LEAL	EDI, cdo_dosname[EBP]
+	CLRL	EAX			;Do mixed case compare
+16$:	CALL	knlWildCmp8##		;Do wild-card compare
+	JE	found.S
+18$:	POPL	EDX
+	POPL	EDI
+	POPL	ESI
+20$:	CALL	cdrdirrec		;Get the next record
+	JNC	cdrffile		;Continue if OK
+	RET				;Finished if error
+.PAGE
+;Here with matching directory entry - first give him the file name if he
+;  wants it
+
+found:	POPL	EDX
+	POPL	EDI
+	POPL	ESI
+	BTL	SS:xffPVFilOpt##, #FO%FILEDOS ;Should we give him the DOS name?
+	JNC	12$.S			;No
+	BTL	SS:xffPVFilOpt##, #FO%NOPREFIX ;Yes - want prefix characters?
+	JC	8$.S			;No
+	MOVB	AL, #FS_FILEDOS		;Yes - give him the prefix character
+	CALL	knlGivUChr##
+8$:	CALL	givedosname
+12$:	CALL	givelongpath
+
+;Now copy the long file name to the CDFDB
+
+18$:	MOVL	ECX, cdo_dirnamelen.B[EBP] ;Get length of directory entry
+	LEAL	EBX, cdo_dirname[EBP]	;Get offset of converted directory entry
+	MOVL	EAX, dcb_dkcdfdb.B[EDI]
+	PUSHL	cdfdb_fslonglen.B[EAX]
+	TESTL	ECX, ECX
+	JE	24$.S
+	CMPB	cdo_fsspec.B[EBP], #4	;Joliet disk?
+	JE	21$.S			;Yes
+20$:	MOVB	AL, SS:[EBX]		;Get next byte
+	INCL	EBX
+	CALL	cdrputlongfs
+	LOOP	ECX, 20$		;Continue if more
+	CMPB	SS:-1.B[EBX], #'.'	;No - was last character a period?
+	JNE	24$.S			;No
+	JMP	217$.S
+
+;Here if have a Joliet disk
+
+21$:	SHRL	ECX, #1t
+213$:	MOVB	AL, SS:[EBX]		;Get next byte
+	ADDL	EBX, #2t.B
+	CALL	cdrputlongfs
+	LOOP	ECX, 213$		;Continue if more
+	CMPW	SS:-2.B[EBX], #'.'	;No - was last character a period?
+	JNE	24$.S			;No
+217$:	CMPL	cdo_dirnamelen.B[EBP], #2 ;Two characters or less?
+	JG	22$.S			;No
+	CMPB	cdo_dirname[EBP], #'.'	;Yes - was first character a period?
+	JE	24$.S			;Yes
+22$:	MOVL	EAX, dcb_dkcdfdb.B[EDI]
+	DECL	cdfdb_fslonglen.B[EAX]	;No - discard the final period
+24$:	POPL	EDX
+	BTL	SS:xffPVFilOpt##, #FO%FILENAME ;Should we give him the long
+					       ;  name?
+	JNC	28$.S			;No
+	MOVL	EBX, dcb_dkcdfdb.B[EDI]
+	MOVL	ECX, cdfdb_fslonglen.B[EBX]
+	LEAL	EBX, cdfdb_fslongbfr.B[EBX+EDX]
+	SUBL	ECX, EDX
+	BTL	SS:xffPVFilOpt##, #FO%NOPREFIX ;Yes - want prefix characters?
+	JC	26$.S			;No
+	MOVB	AL, #FS_FILENAME	;Yes - give him the prefix character
+	CALL	knlGivUChr##
+26$:	MOVB	AL, [EBX]
+	INCL	EBX
+	CALL	knlGivUChr##		;No - store character
+	LOOP	ECX, 26$
+28$:	BTL	SS:xffPVFilOpt##, #FO%VERSION ;Does he want version numbers?
+	JNC	32$.S			;No
+	CMPL	cdo_dirnamever.B[EBP], #0.B ;Yes - did file have a version
+					    ;  number?
+	JE	32$.S			;No - nothing to give him
+	BTL	SS:xffPVFilOpt##, #FO%NOPREFIX ;Yes - want prefix characters?
+	JC	30$.S			;No
+	MOVB	AL, #FS_VERSION		;Yes - give him the prefix character
+	CALL	knlGivUChr##
+30$:	MOVL	EAX, cdo_dirnamever.B[EBP] ;Give him the version number
+	CALL	knlGivUNum##
+32$:	BTL	SS:xffPVFilOpt##, #FO%ATTR ;Does he want attributes?
+	JNC	found2.S		;No
+	MOVB	AL, #FS_ATTR		;Yes - give him the prefix character
+	CALL	knlGivUChr##
+	MOVB	AH, cdo_dirrec+dir_fileflg[EBP] ;The file flag bits
+	MOVB	AL, #A$NORMAL		;Assume normal file
+	TESTB	AH, #01h		;Hidden file?
+	JE	34$.S			;No
+	MOVB	AL, #A$HIDDEN		;Yes
+34$:	TESTB	AH, #02h		;Directory?
+	JE	36$.S			;No
+	ORB	AL, #A$DIRECT		;Yes
+	ANDB	AL, #{~A$NORMAL}&0FFh
+	MOVB	dcb_sts2.B[EDI], #D2$DIRECT
+36$:	CALL	knlGivUChr##		;Give him the first attribute byte
+	MOVB	AL, #0h			;Second attribute byte is always 0
+	CALL	knlGivUChr##		;  for CDs
+.PAGE
+;Now we must see if he is asking for the highest numbered version file and is
+;  doing some kind of repeated search.  In this case, we must skip any lower
+;  numbered versions of this file so we will not see them next time.
+
+found2:	CMPL	cdo_dirnamever.B[EBP], #0.B ;Does the file have a verson number?
+	JE	44$.S			;No
+	CMPL	cdo_namever.B[EBP], #0.B ;Yes - does he want only highest?
+	JNE	44$.S			;No
+	BTL	SS:xffCmd##, #O%REPEAT	;Yes - doing repeated operation?
+	JC	36$.S			;Yes
+	BTL	SS:xffHvValue1##, #IOV1%DIRHNDL ;No - searching open directory?
+	JC	36$.S			;Yes
+	BTL	SS:xffHvValue1##, #IOV1%DIROFS ;No - directory offset specified?
+	JNC	44$.S			;No
+
+;Here if need to skip all lowered number versions of this file
+
+36$:	LEAL	EAX, cdo_peekrec[EBP]	;Set to use the peek buffer for
+	MOVL	cdo_actrec.B[EBP], EAX	;  directory records
+	LEAL	EAX, cdo_peekname[EBP]
+	MOVL	cdo_actname.B[EBP], EAX
+38$:	PUSHL	cdo_dirpos.B[EBP]	;Save current directory position
+	CALL	cdrdirrec		;Get the next record
+	JC	40$.S
+	MOVZBL	ECX, cdo_peekrec+dir_namelen[EBP] ;Get length of this name
+	CMPB	CL, cdo_dirrec+dir_namelen[EBP] ;Same as current one?
+	JNE	40$.S			;No - can't be same file
+	PUSHL	ESI			;Yes - compare names
+	PUSHL	EDI
+	LEAL	ESI, cdo_dirname[EBP]
+	LEAL	EDI, cdo_peekname[EBP]
+	PUSHL	SS
+	POPL	ES
+	CLD
+	RECMPSB	[EDI], SS:[ESI]
+	POPL	EDI
+	POPL	ESI
+	JNE	40$.S			;If different
+	POPL	EAX			;Same - discard saved position	
+	JMP	38$.S			;Continue
+
+;Here if next entry is for a different file
+
+40$:	POPL	cdo_dirpos.B[EBP]	;Restore directory offset
+
+;Here with all lower numbered versions skipped if necessary
+
+44$:	MOVL	EAX, cdo_dirpos.B[EBP]	;Save directory offset in case user
+	MOVL	EDX, cdo_frame1.B[EBP]	;  wants it
+	MOVL	SS:opn_dirofs+0.B[EDX], EAX
+	MOVL	EAX, dcb_dkcdentnum.B[EDI]
+	MOVL	SS:opn_dirofs+4.B[EDX], EAX
+	CALL	cdropenfile		;Open the file
+	CLRL	EAX
+	MOVL	ECX, #1
+ret014:	RET
+.PAGE
+givedosname:
+	LEAL	EBX, cdo_dosname[EBP]	;Get offset of converted directory entry
+2$:	MOVB	AL, SS:[EBX]		;Get next byte
+	INCL	EBX
+	CMPB	AL, #0
+	JE	ret014.S
+	CMPB	AL, #'.'
+	JNE	4$.S
+	CMPB	SS:[EBX], #0
+	JE	ret014.S
+4$:	CALL	knlGivUChr##		;Store character
+	JMP	2$.S
+.PAGE
+givelongpath:
+	BTL	SS:xffPVFilOpt##, #FO%PATHNAME ;Want long path returned?
+	JNC	10$.S			;No
+	BTL	SS:xffPVFilOpt##, #FO%NOPREFIX ;Yes - want prefix character?
+	JC	4$.S			;No
+	MOVB	AL, #FS_PATHNAME	;Yes
+	CALL	knlGivUChr##
+	JC	10$.S
+4$:	MOVL	EBX, dcb_dkcdfdb.B[EDI]
+	MOVL	ECX, cdfdb_fslonglen.B[EBX]
+	ADDL	EBX, #cdfdb_fslongbfr.B
+6$:	MOVB	AL, [EBX]
+	INCL	EBX
+	CALL	knlGivUChr##
+	JC	10$.S
+	LOOP	ECX, 6$
+10$:	RET
+.PAGE
+;Subroutine to copy a directory record to our buffer
+;	CALL	cdrdirrec
+;	C:set = Error
+;	  c{EAX} = Error code, buffer given up
+;	C:clr = Normal
+
+cdrdirrec:
+	CALL	cdrdirrc2
+	JC	ret014.S
+	MOVL	EBX, cdo_actrec.B[EBP]	;Get length of this record
+	MOVZBL	EAX, SS:[EBX]
+	ADDL	EAX, cdo_dirbegin.B[EBP]
+	PUSHL	EAX
+	PUSHL	EDI
+	MOVL	EDI, EBX
+	LEAL	EBX, dir_name.B[EDI]
+	MOVL	EDX, cdo_actname.B[EBP]
+	CLRL	EAX
+	MOVL	cdo_dirnamever.B[EBP], EAX
+	CMPB	SS:dir_namelen.B[EDI], #1 ;Single byte name?
+	JNE	4$.S			;No
+	MOVB	AL, SS:[EBX]		;Yes
+	DECB	AL
+	JG	4$.S			;If not . or ..
+	JL	2$.S			;If .
+	MOVB	SS:[EDX], #'.'		;If ..
+	INCL	EDX
+2$:	MOVB	SS:[EDX], #'.'
+	INCL	EDX
+	JMP	12$.S
+
+;Here if don't have . or ..
+
+4$:	CLRL	EAX
+	CMPB	cdo_fsspec.B[EBP], #4	;Joliet disk?
+	JE	dirjoliet		;Yes
+6$:	DECB	SS:dir_namelen.B[EDI]	;No - have another character?
+	JS	8$.S			;No - finished
+	MOVB	AL, SS:[EBX]		;Yes - get it
+	INCL	EBX
+	CMPB	AL, #';'		;Semi-colon?
+	JE	8$.S			;Yes - go collect the version number
+	MOVB	SS:[EDX], AL
+	INCL	EDX
+	CMPB	AL, #'.'
+	JNE	6$.S
+	MOVB	AH, #1
+	JMP	6$.S			;Continue
+
+;Here at end of name
+
+8$:	CMPB	AH, #0
+	JNE	10$.S
+	MOVB	SS:[EDX], #'.'
+	INCL	EDX
+
+;Here with start of version number
+
+10$:	DECB	SS:dir_namelen.B[EDI]	;Have another character?
+	JS	12$.S			;No - finished
+	MOVB	AL, SS:[EBX]		;Yes - get it
+	INCL	EBX
+	CMPB	AL, #'0'		;Is it a digit?
+	JB	12$.S			;No!
+	CMPB	AL, #'9'
+	JA	12$.S
+	ANDL	EAX, #0Fh.B
+	IMULL	ECX, cdo_dirnamever.B[EBP], #10t.B
+	ADDL	ECX, EAX
+	MOVL	cdo_dirnamever.B[EBP], ECX
+	JMP	10$.S
+
+;Here at end of name
+
+12$:	MOVB	SS:[EDX], #0		;Put a null at the end of the name
+	POPL	EDI
+	SUBL	EDX, cdo_actname.B[EBP]	;Calculate length of name
+	MOVL	cdo_dirnamelen.B[EBP], EDX
+	INCL	dcb_dkcdentnum.B[EDI]	;Bump the directory entry number
+	MOVL	EAX, #get8bit		;Construct the DOS name if we need it
+	CALL	makedosname
+	CMPB	cdo_fsspec.B[EBP], #3	;Is this a Rockridge disk?
+	JNE	32$.S			;No
+rripnxt:CALL	rripgetrec#		;Yes - get a Rockridge record
+	JC	dirrdn.S		;If error
+	JE	dirrdn.S
+	MOVL	EAX, cdo_rriprec[EBP]	;Get the record header
+	CMPW	AX, #'NM'
+	JE	rripnm
+	CMPW	AX, #'PX'
+	JE	rrippx
+	CMPW	AX, #'PN'
+	JE	rrippn
+	CMPW	AX, #'SL'
+	JE	rripsl
+	CMPW	AX, #'CL'
+	JE	rripcl
+	CMPW	AX, #'PL'
+	JE	rrippl
+	CMPW	AX, #'RE'
+	JE	rripre
+	CMPW	AX, #'TF'
+	JE	rriptf
+	CMPW	AX, #'SF'
+	JE	rripsf
+	JMP	rripnxt.S
+
+32$:	CLC
+dirrdn:	POPL	cdo_dirpos.B[EBP]	;Advance to start of next record 
+	RET
+.PAGE
+;Here if have a Joliet disk
+
+dirjoliet:
+	SUBB	SS:dir_namelen.B[EDI], #2t ;Have another character?
+	JS	8$.S			;No - finished
+	MOVW	AX, SS:[EBX]		;Yes - get it
+	XCHGB	AL, AH
+	ADDL	EBX, #2t.B
+	CMPW	AX, #';'		;Semi-colon?
+	JE	8$.S			;Yes - go collect the version number
+	MOVW	SS:[EDX], AX
+	ADDL	EDX, #2t
+	CMPW	AX, #'.'
+	JNE	dirjoliet.S
+	BTSL	EAX, #31t
+	JMP	dirjoliet.S		;Continue
+
+;Here at end of name
+
+8$:	TESTL	EAX, EAX
+	JS	10$.S
+	MOVW	SS:[EDX], #'.'
+	ADDL	EDX, #2t.B
+
+;Here with start of version number
+
+10$:	SUBB	SS:dir_namelen.B[EDI], #2t.B ;Have another character?
+	JS	12$.S			;No - finished
+	MOVW	AX, SS:[EBX]		;Yes - get it
+	INCL	EBX
+	CMPW	AX, #'0'		;Is it a digit?
+	JB	12$.S			;No!
+	CMPW	AX, #'9'
+	JA	12$.S
+	ANDL	EAX, #0Fh.B
+	IMULL	ECX, cdo_dirnamever.B[EBP], #10t.B
+	ADDL	ECX, EAX
+	MOVL	cdo_dirnamever.B[EBP], ECX
+	JMP	10$.S
+
+;Here at end of name
+
+12$:	MOVW	SS:[EDX], #0		;Put a null at the end of the name
+	POPL	EDI
+	SUBL	EDX, cdo_actname.B[EBP]	;Calculate length of name
+	MOVL	cdo_dirnamelen.B[EBP], EDX
+	INCL	dcb_dkcdentnum.B[EDI]	;Bump the directory entry number
+	MOVL	EAX, #get16bit		;Construct the DOS name if we need it
+	CALL	makedosname
+	CLC
+	POPL	cdo_dirpos.B[EBP]	;Advance to start of next record 
+	RET
+.PAGE
+;Here for the Rockridge Extensions NM system use field - alternate file name
+
+rripnm:	MOVZBL	ECX, cdo_rriprec+2[EBP]
+	SUBL	ECX, #5t.B
+	JLE	8$
+	CMPL	ECX, #127t.B
+	JA	rripnxt
+	MOVL	cdo_dirnamelen.B[EBP], ECX
+	MOVB	AH, #0
+	PUSHL	EDI
+	PUSHL	ESI
+	LEAL	ESI, cdo_rriprec+5[EBP]
+	MOVL	EDI, cdo_actname.B[EBP]
+	PUSHL	SS
+	POPL	ES
+	CLD
+4$:	LODSB	SS:[ESI]		;Copy the alternate name
+	STOSB	[EDI]
+	CMPB	AL, #'.'
+	JNE	6$.S
+	MOVB	AH, #1
+6$:	LOOP	ECX, 4$
+	CMPB	AH, #0			;Have at least one period?
+	JNE	8$.S			;Yes
+	MOVB	ES:[EDI], #'.'		;No - put a period at the end
+	INCL	EDI
+	INCL	cdo_dirnamelen.B[EBP]
+8$:	MOVB	SS:[EDI], #0
+	POPL	ESI
+	POPL	EDI
+	MOVL	cdo_dirnamever.B[EBP], ECX
+	JMP	rripnxt
+
+rrippx:
+	CLC
+	JMP	rripnxt
+
+rrippn:
+	CLC
+	JMP	rripnxt
+
+rripsl:
+	CLC
+	JMP	rripnxt
+
+rriptf:
+	CLC
+	JMP	rripnxt
+
+rripsf:
+	CLC
+	JMP	rripnxt
+
+rripcl:
+	CLC
+	JMP	rripnxt
+
+rrippl:
+	CLC
+	JMP	rripnxt
+
+rripre:
+	CLC
+	JMP	rripnxt
+.PAGE
+cdrdirrc2::
+	MOVL	EDX, cdo_dirpos.B[EBP]	;Remember where directory entry starts
+2$:	MOVL	cdo_dirbegin.B[EBP], EDX
+	MOVL	EAX, ucb_bpclus.B[ESI]	;Calculate amount left in cluster
+	DECL	EAX
+	ANDL	EAX, EDX
+	SUBL	EAX, ucb_bpclus.B[ESI]
+	NEGL	EAX
+	CMPL	EAX, #dir_name+1	;Enough for a minimum directory entry?
+	JB	8$.S			;No - advance to next cluster
+	MOVL	EBX, cdo_actrec.B[EBP]	;Read first part of directory record
+	MOVL	ECX, #dir_name+1	;  (up through 1st character of name)
+	MOVL	cdo_dirleft.B[EBP], ECX
+	CALL	dirgetrec
+	JC	10$.S
+	MOVZBL	ECX, SS:-{dir_name+1}.B[EBX] ;Get entry length
+	JREGZ	ECX, 8$			;Advance to next cluster if 0
+	SUBL	ECX, #dir_name+1.B
+	JS	baddirf.S
+	MOVL	cdo_dirleft.B[EBP], ECX
+	MOVZBL	ECX, SS:-2.B[EBX]	;Get length of the name part
+	TESTL	ECX, ECX
+	JE	baddirf.S		;Can't be 0!
+	CMPL	ECX, #128t		;Can't be greater than 128
+	JA	baddirf.S
+	ORL	ECX, #01.B		;Round up to odd value
+	DECL	ECX			;Minus one
+	JE	4$.S
+	CALL	dirgetrec		;Get the rest of the name
+	JC	10$.S
+4$:	CMPB	cdo_fsspec.B[EBP], #1	;Is this a High Sierra disk?
+	JA	6$.S			;No
+	MOVL	EBX, cdo_actrec.B[EBP]
+	MOVB	AL, SS:dir_fileflg-1.B[EBX] ;Yes - put the file flags in the
+	MOVB	SS:dir_fileflg.B[EBX], AL   ;  right place
+6$:	CLC
+	RET
+
+;Here if have a zero count - advance to next cluster
+
+8$:	MOVL	EDX, ucb_bpclus.B[ESI]	;Get cluster mask
+	DECL	EDX
+	NOTL	EDX			;Get position of beginning of current
+	DECL	cdo_dirpos.B[EBP]	;  cluster
+	ANDL	EDX, cdo_dirpos.B[EBP]
+	ADDL	EDX, ucb_bpclus.B[ESI]	;Advance to next cluster
+	MOVL	cdo_dirpos.B[EBP], EDX
+	JMP	2$.S			;Try again
+
+;Here if error reading directory record
+
+10$:	CMPL	EAX, #ER_EOF.B
+	JNE	12$.S
+	MOVL	EAX, #ER_FILNF
+12$:	STC
+	RET
+
+;Here if have a bad directory record
+
+baddirf:MOVL	EAX, #ER_DRFER
+	STC
+	RET
+.PAGE
+;Subroutine to get directory record
+;	c{EBX} = Offset (on stack) of buffer to receive record
+;	c{ECX} = Length of record
+;	CALL	dirrecget
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  c{EBX} = Offset of next byte in buffer
+
+dirgetrec::
+	CMPL	cdo_dirleft.B[EBP], ECX	;Is there enough left in the record?
+	JS	baddirf.S		;No - fail
+	MOVL	EAX, cdo_dirpos.B[EBP]	;Yes
+	LEAL	EDX, [EAX+ECX]		;Trying to read past end of directory?
+	CMPL	EDX, cdo_dirlen.B[EBP]
+	JA	8$.S			;Yes
+	SHRL	EAX, #9t		;No - get relative block
+	ADDL	EAX, cdo_dirpnt.B[EBP]
+	PUSHL	EBX
+	PUSHL	ECX
+	MOVL	EBX, cdo_dirbufr.B[EBP]	;Get current block buffer
+	TESTL	EBX, EBX
+	JE	2$.S
+	CMPL	cb_block.B[EBX], EAX	;Do we have the right one?
+	JE	4$.S			;Yes
+	PUSHL	EAX			;No - read the block we need
+	CALL	xosdskRelsLkBufr##	;Give up the current block
+	POPL	EAX
+2$:	MOVL	dcb_dkdblk.B[EDI], EAX	;No
+	MOVL	EDX, cdo_dirlen.B[EBP]
+	SUBL	EDX, cdo_dirpos.B[EBP]
+	CALL	xosdskFindSBufr##	;Get next block
+	JC	10$.S			;If error
+	MOVL	cdo_dirbufr.B[EBP], EBX
+4$:	POPL	ECX
+	POPL	EBX
+	MOVL	EAX, cdo_dirpos.B[EBP]
+	ANDL	EAX, #1FFh
+	SUBL	EAX, #512t		;Get amount left in this block
+	NEGL	EAX
+	PUSHL	ECX
+	CMPL	ECX, EAX		;Want more than is available?
+	JB	6$.S			;No
+	MOVL	ECX, EAX		;Yes - just take what we have now
+6$:	SUBL	cdo_dirleft.B[EBP], ECX	;Reduce amount left in record
+	SUBL	[ESP], ECX		;Get amount left over
+	PUSHL	EDI
+	PUSHL	ESI
+	MOVL	ESI, cdo_dirpos.B[EBP]	;Copy the record to our buffer
+	ANDL	ESI, #1FFh
+	ADDL	ESI, cdo_dirbufr.B[EBP]
+	ADDL	cdo_dirpos.B[EBP], ECX
+	MOVL	EDI, EBX
+	PUSHL	SS
+	POPL	ES
+	ADDL	EBX, ECX
+	CLD
+	RMOVSB	[EDI], [ESI]
+	POPL	ESI
+	POPL	EDI
+	POPL	ECX
+	TESTL	ECX, ECX		;Need more?
+	JNE	dirgetrec.S		;Yes - continue
+	RET				;No - finished
+
+;Here if past end of directory or path table
+
+8$:	MOVL	EAX, #ER_EOF
+	STC
+	RET
+
+;Here if error reading buffer
+
+10$:	MOVL	cdo_dirbufr.B[EBP], #0
+	POPL	EBX
+	POPL	ECX
+ret020:	RET
+.PAGE
+;Subroutine to construct the DOS (short) version of the name - In most cases
+;  it will be the same, but will be truncated if the 9660 name is longer than
+;  8x3.  Also, for non-standard disks which have mixed case 9660 names, the
+;  DOS name is forced to all upper case.  The DOS name is not overwritten by
+;  the Rockridge name.
+;	c{EAX} = Offset of subroutine to get next name character
+;	CALL	makedosname
+
+makedosname:
+	BTL	SS:xffCmd#, #O%USEDOS
+	JC	2$.S
+	TESTB	SS:xffPVFilOpt##+1, #{FO$PATHDOS|FO$FILEDOS}>8t
+	JE	ret020.S
+2$:	PUSHL	ESI
+	MOVL	cdo_getdoschr.B[EBP], EAX
+
+;First try to construct a valid DOS name directly.  If we find an invalid
+;  character or if the name or extension is too long, we start over and
+;  construct a modified name containing the position of the directory
+;  entry.
+
+	MOVL	ECX, #9t
+	MOVL	ESI, cdo_actname.B[EBP]
+	LEAL	EBX, cdo_dosname[EBP]
+4$:	CALLI	cdo_getdoschr.B[EBP]	;Get next character
+	JE	6$.S			;If end of name
+	JC	12$.S			;If not a valid DOS name character
+	MOVB	SS:[EBX], AL		;OK - store the character
+	INCL	EBX
+	LOOP	ECX, 4$			;No - continue if can have more
+	JMP	12$.S			;If name is too long
+
+;Here at end of name
+
+6$:	MOVB	SS:[EBX], #'.'		;Store period at end of name
+	INCL	EBX
+	CMPB	AL, #0			;Have an extension?
+	JE	24$			;No - finished
+	MOVL	ECX, #4t
+8$:	CALLI	cdo_getdoschr.B[EBP]	;Get next character
+	JE	10$.S			;If end of extension
+	JC	12$.S			;If not a valid DOS name character
+	MOVB	SS:[EBX], AL		;OK - store the character
+	INCL	EBX
+	LOOP	ECX, 4$			;No - continue if can have more
+	JMP	12$.S			;If name is too long
+
+;Here at end of extension
+
+10$:	CMPB	AL, #0			;Really at end?
+	JE	24$			;Yes - finished
+
+;Here if do not have a directly valid DOS name
+
+12$:	MOVL	ESI, cdo_actname.B[EBP]
+	LEAL	EBX, cdo_dosname[EBP]
+	MOVL	EAX, dcb_dkcdentnum.B[EDI] ;Get directlry entry number
+	ADDL	EAX, EAX		;Times two
+	TESTB	cdo_dirrec+dir_fileflg[EBP], #02h ;Is this a directory?
+	JE	14$.S			;No
+	DECL	EAX			;Yes - adjust the value
+14$:	MOVL	ECX, #6t		;Assume need one digit for number
+	CMPL	EAX, #9t.B		;Right?
+	JBE	16$.S			;Yes
+	DECL	ECX			;No - assume need 2 digits
+	CMPL	EAX, #99t.B		;Right?
+	JBE	16$.S			;Yes
+	DECL	ECX			;No - assume need 3 digits
+	CMPL	EAX, #999t		;Right?
+	JBE	16$.S			;Yes
+	DECL	ECX			;No - assume need 4 digits
+	CMPL	EAX, #9999t		;Right?
+	JBE	16$.S			;Yes
+	DECL	ECX			;No - assume need 6 digits
+	CMPL	EAX, #99999t		;Right?
+	JBE	16$.S			;Yes
+	DECL	ECX			;No - use 7 digits
+16$:	PUSHL	EAX			;Save numeric value
+	JREGZ	ECX, 20$
+18$:	CALLI	cdo_getdoschr.B[EBP]
+	JE	20$.S			;If end of name
+	JC	18$.S			;Skip non-DOS characters
+	MOVB	SS:[EBX], AL
+	INCL	EBX
+	LOOP	ECX, 18$
+20$:	XCHGL	EAX, [ESP]		;Save stopper character, get number
+	CLRL	EDX			;Make sure no more than 7 digits
+	IDIVL	lit10000000
+	MOVL	EAX, EDX
+	MOVB	SS:[EBX], #'~'
+	INCL	EBX
+	CALL	strnumber
+	MOVB	SS:[EBX], #'.'
+	INCL	EBX
+	POPL	EAX
+	CMPB	AL, #0
+	JE	24$.S
+	CLRL	EDX
+21$:	CMPB	AL, #'.'
+	JNE	215$.S
+213$:	MOVL	EDX, ESI
+215$:	CALLI	cdo_getdoschr.B[EBP]
+	JNE	215$.S
+	CMPB	AL, #'.'
+	JE	213$.S
+219$:	TESTL	EDX, EDX
+	JE	24$.S
+	MOVL	ESI, EDX
+	MOVL	ECX, #3t
+22$:	CALLI	cdo_getdoschr.B[EBP]
+	JE	24$.S
+	JC	22$.S
+	MOVB	SS:[EBX], AL
+	INCL	EBX
+	LOOP	ECX, 22$
+24$:	MOVB	SS:[EBX], #0
+	SUBL	EBX, #cdo_dosname
+	SUBL	EBX, EBP
+	MOVL	cdo_dosnamelen.B[EBP], EBX
+	POPL	ESI
+	RET
+.PAGE
+;Subroutine to get next DOS name character from an ASCII name
+;	CALL	get16bit
+;	Z:set = End of name or extension
+;	  c(AL) = Stopper character (0 or '.')
+;	Z:clr = Not end
+;	  C:set = Not a valid DOS name character
+;	  C:clr = Valid DOS name character
+
+get8bit:
+	MOVZBL	EAX, SS:[ESI]
+	INCL	ESI
+	JMP	2$.S
+
+;Subroutine to get next DOS name character from a Unicode name
+;	CALL	get16bit
+;	Z:set = End of name or extension
+;	  c(AL) = Stopper character (0 or '.')
+;	Z:clr = Not end
+;	  C:set = Not a valid DOS name character
+;	  C:clr = Valid DOS name character
+
+get16bit:
+	MOVW	AX, SS:[ESI]
+	ADDL	ESI, #2t.B
+2$:	CMPW	AX, #'a'
+	JB	4$.S
+	CMPW	AX, #'z'
+	JA	4$.S
+	SUBB	AL, #'a'-'A'
+4$:	CMPW	AX, #0
+	JE	6$.S
+	CMPW	AX, #'.'
+	JE	6$.S
+	CMPB	AH, #0
+	JNE	8$.S
+	CMPB	AL, #'.'
+	JE	8$.S
+	CMPB	AL, #20h
+	JBE	8$.S
+	CMPB	AL, #7Fh
+	JAE	8$.S
+	CMPB	AL, #'~'
+	JE	8$.S
+	CMPB	AL, #'+'
+	JE	8$.S
+	CMPB	AL, #';'
+	JE	8$.S
+	CMPB	AL, #'['
+	JE	8$.S
+	CMPB	AL, #']'
+	JE	8$.S
+	CMPB	AL, #','
+	JE	8$.S
+	CLC
+6$:	RET
+
+8$:	STC
+	RET
+
+
+strnumber:
+	CLRL	EDX
+	IDIVL	knlLit10##
+	PUSHL	EDX
+	TESTL	EAX, EAX
+	JE	10$.S
+	CALL	strnumber
+10$:	POPL	EAX
+	ADDB	AL, #'0'
+	MOVB	SS:[EBX], AL
+	INCL	EBX
+	RET
+.PAGE
+;Subroutine to give up all buffers we are using
+;	CALL	cdrclrbufr
+
+cdrclrbufr:
+	MOVL	EBX, cdo_dirbufr.B[EBP]
+	TESTL	EBX, EBX
+	JE	8$.S
+	PUSHL	EAX
+	CALL	xosdskRelsLkBufr##
+	POPL	EAX
+8$:	RET
+.PAGE
+;Subroutine to calculate block and offset in block given file offset
+;	CALL	cdrfilepos
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  c{EDX} = Amount available at this position
+
+cdrfilepos:
+	MOVL	EAX, dcb_dkfpos.B[EDI]	;Get desired position in file
+	CMPL	EAX, dcb_dkcdflen.B[EDI] ;Past end of file?
+	JAE	10$.S			;Yes - fail
+
+	MOVL	EBX, dcb_dkcdfdb.B[EDI]
+
+	MOVL	ECX, cdfdb_fileils.B[EBX] ;No - get the interleave logical size
+	JREGZ	ECX, 4$			;If not interleaved
+	CLRL	EDX			;Interleaved - calculate physical
+	IDIVL	ECX			;  offset from beginning of file
+	IMULL	EAX, cdfdb_fileips.B[EBX]
+	SUBL	EDX, cdfdb_fileils.B[EBX] ;Calculate maximum amount available
+	NEGL	EDX			  ;  here
+	MOVL	ECX, dcb_dkcdflen.B[EDI]
+	SUBL	ECX, dcb_dkfpos.B[EDI]
+	CMPL	EDX, ECX
+	JB	6$.S
+	MOVL	EDX, ECX
+	JMP	6$.S
+
+;Here if not interleaved
+
+4$:	MOVL	EDX, dcb_dkcdflen.B[EDI] ;Calculate amount left in file (all of
+	SUBL	EDX, EAX		 ;  which is available)
+6$:	SHRL	EAX, #9t		;Change to block number
+	ADDL	EAX, dcb_dkfilepnt.B[EDI] ;Get block number
+	MOVL	dcb_dkdblk.B[EDI], EAX
+	CLC
+	RET
+
+;Here if at or past EOF
+
+10$:	MOVL	EAX, #ER_EOF
+	STC
+	RET
+.PAGE
+
+;Subroutine to open a CD-ROM file - directory record for the file must be in
+;  cdo_dirrec
+;	CALL	cdropenfile
+
+cdropenfile:
+	MOVZBL	EAX, cdo_dirrec+dir_fileusz[EBP] ;Get the file unit size
+	IMULL	EAX, ucb_bpclus.B[ESI]	;Change to bytes
+	MOVL	EBX, dcb_dkcdfdb.B[EDI]
+	MOVL	cdfdb_fileils.B[EBX], EAX
+	MOVZBL	EDX, cdo_dirrec+dir_fileigs[EBP] ;Get the interleave gap size
+	IMULL	EDX, ucb_bpclus.B[ESI]	;Change to bytes
+	ADDL	EAX, EDX
+	MOVL	cdfdb_fileips.B[EBX], EAX
+	MOVZBL	EAX, cdo_dirrec+dir_attrlen[EBP] ;Get extended attribute length
+	ADDB	AL, cdo_dirrec+dir_fileigs[EBP] ;Plus interleave gap length
+	ADDL	EAX, cdo_dirrec+dir_filepnt[EBP] ;Plus first sector in file
+	IMULL	EAX, ucb_clussize.B[ESI] ;Change to blocks
+	SUBL	EAX, ucb_partnoff.B[ESI]
+	MOVL	dcb_dkfilepnt.B[EDI], EAX ;Store file pointer
+	MOVL	EAX, cdo_dirrec+dir_filelen[EBP] ;Get file length
+	MOVL	dcb_dkcdflen.B[EDI], EAX
+	MOVL	EAX, cdo_dirrec+dir_filedt+0[EBP] ;Store file date and time
+	MOVL	cdfdb_filedt+0.B[EBX], EAX	  ;  and the file flag byte
+	MOVL	EAX, cdo_dirrec+dir_filedt+4[EBP]
+	MOVL	cdfdb_filedt+4.B[EBX], EAX
+	MOVB	dcb_sts2.B[EDI], #0	;Assume not a directory
+	SHRL	EAX, #16t		;Get the flag bits where we can test
+	MOVB	AL, #A$NORMAL		;  them easily
+	TESTB	AH, #01h		;Hidden file?
+	JE	4$.S			;No
+	MOVB	AL, #A$HIDDEN
+4$:	TESTB	AH, #02h		;Directory?
+	JE	6$.S			;No
+	ORB	AL, #A$DIRECT		;Yes
+	ANDB	AL, #{~A$NORMAL}&0FFh
+	MOVB	dcb_sts2.B[EDI], #D2$DIRECT
+6$:	MOVB	cdfdb_fileattr.B[EBX], AL ;Store the attribute byte
+	CLRL	EAX			;Set to beginning of file
+	MOVL	dcb_dkfpos.B[EDI], EAX
+	RET
+.PAGE
+	.SBTTL	cdrnchar - Subroutine to get next file name character
+
+;Subroutine to get next file name character
+;	CALL	cdrnchar
+;	Z:clr = Character available
+;	  c(AL) = ASCII character
+;	Z:set = End of name
+;  All registers are preserved
+
+cdrnchar:
+	PUSHL	EBX
+2$:	MOVL	EBX, cdo_namep.B[EBP]	;Get pointer
+	MOVB	AL, SS:[EBX]		;Get character
+	INCL	cdo_namep.B[EBP]	;Bump pointer
+	CMPB	AL, #'\'		;No - directory seperator character?
+	JNE	4$.S			;No
+	CMPB	SS:1.B[EBX], #'\'	;Yes - have two in a row?
+	JE	2$.S			;Yes - ignore one of them
+4$:	POPL	EBX			;Finished
+	TESTB	AL, AL			;Set Z if end of string
+	RET
+.PAGE
+	.SBTTL	cdrclose - Close device
+
+;Here for the close device entry
+;	c{EDI}    = Offset of disk DCB
+;	CALL	cdrclose
+
+cdrclose:
+	CMPL	iorb_parm.B[ESI], #0.B	;Have any device parameters?
+	JE	4$.S			;No
+	MOVL	EBX, #cdrioparms	;Yes - process parameters
+	MOVL	ECX, #knlComDPParms##
+	IFFAULT	8$
+	LFSL	EDX, iorb_parm.B[ESI]
+	CALL	knlProcDevParm##
+	JC	6$.S
+4$:	CLRL	EAX
+6$:	CALL	cdrclose2
+	TOFORK
+	JMP	knlCloseFin##
+
+	FAULTHDR
+8$:	MOVL	EAX, #ER_ADRER
+	JMP	6$.S
+
+cdrclose2:
+	CLRL	EDX
+	MOVL	dcb_dkfilepnt.B[EDI], EDX
+	MOVL	dcb_dkcdflen.B[EDI], EDX
+	RET
+.PAGE
+	.SBTTL	cdrinpblk - Queued input block
+
+;Here for the sd_qinpblk entry - Input block
+;	c{EDI} = Offset of DCB
+;	c{ESI} = Offset of IORB
+;	CALL	cdrinpblk
+;	c{EAX} = Error code
+;	c{ECX} = Amount output
+;	c{EBX} = Status bits
+
+cdrinpblk:
+	CALL	knlIoQabLock##		;Lock the QAB
+	JC	2$.S			;If error
+	CALL	knlIoReadLock##		;Lock the input buffer
+	JC	2$.S			;If error
+	MOVB	iorb_queue.B[ESI], #dcb_outframe
+	MOVL	iorb_routine.B[ESI], #cdrinpblk1
+	JMP	knlXfQueue##		;Switch to extended fork context
+
+2$:	TOFORK
+	RET
+
+4$:	CLRL	EAX
+6$:	CLRL	ECX
+	MOVL	EBX, #QSTS$DONE
+	RET
+
+;Here in extended fork context
+
+cdrinpblk1:
+	CMPL	SS:xffParm##, #0.B	;Have any device parameters?
+	JE	8$.S			;No
+	MOVL	EBX, #cdrioparms	;Yes - process parameters
+	MOVL	ECX, #knlComDPParms##
+	LFSL	EDX, SS:xffParm##
+	CALL	knlProcDevParm##
+	JC	6$.S			;If error
+8$:	MOVL	ECX, SS:xffCount##	;Get count
+	JREGZ	ECX, 4$
+	CMPB	SS:xffFunc##, #QFNC_INBLOCK ;Really input?
+	JNE	knlIllOut##		;No - fail
+	BTL	SS:xffCmd##, #O%IN	;Yes - input allowed?
+	JNC	knlIllInp##		;No - fail
+	LESL	EBX, SS:xffBuffer1##	;Get address of buffer
+	MOVL	ESI, #cdrrdpos		;Get offset of disk address calculate
+					;  subroutine
+	CALL	xosdskRead##		;Do the transfer
+	JC	10$.S
+	CLRL	EAX
+10$:	MOVL	EBX, #QSTS$DONE
+12$:	RET
+.PAGE
+	.SBTTL	cdrrdpos - Subroutine to get next disk position for read
+
+;Subroutine to get physical position for read - file must be open
+;	c{dcb_dkfpos{EDI}} = Desired position in file (bytes)
+;	c{EDI}             = Offset of DCB
+;	c{ESI}             = Offset of UCB
+;	CALL	cdrrdpos
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  Z:set = At end of file
+;	  Z:clr = Normal
+;	    c{dcb_dkdblk{EDI}} = Physical block on disk
+;	    c{ECX}             = Amount available from this position (bytes)
+
+cdrrdpos:
+	MOVL	EAX, dcb_dkfpos.B[EDI]	;Exactly at EOF?
+	CMPL	EAX, dcb_dkcdflen.B[EDI]
+	JE	4$.S			;Yes - return with Z set
+	CALL	cdrfilepos		;Get block number
+	JC	4$.S			;If error
+	MOVL	ECX, EDX		;Get amount available in right register
+	TESTL	ESP, ESP		;Make sure Z not set
+4$:	RET
+.PAGE
+	.SBTTL	cdrlabel - Label functions for CDR disks
+
+;Here for the sd_label entry - Label functions
+;	c{EDI} = Offset of DCB
+;	c{ESI} = Offset of IORB
+;	CALL	cdrinpblk
+;	c{EAX} = Error code
+;	c{ECX} = Amount
+;	c{EBX} = Status bits
+
+cdrlabel:
+	CMPB	iorb_option.B[ESI], #1	;Read function?
+	JNE	knlWPrErrGQ##		;No - fail
+	CALL	knlIoQabLock##		;Yes - lock the QAB
+	JC	2$.S			;If error
+	CALL	knlIoReadLock##		;Lock input buffer
+	JC	2$.S			;If error
+	MOVL	iorb_routine.B[ESI], #getlabel
+	MOVB	iorb_queue.B[ESI], #dcb_outframe
+	JMP	knlXfQueue##		;Switch to extended fork context
+
+2$:	TOFORK
+	RET
+.PAGE
+;Here in extended fork context to read a CDR disk label
+
+bo_label =!16t		;Buffer offset for returned label
+bo_length=!32t		;Buffer offset for length of label
+
+getlabel:
+	MOVL	ECX, SS:xffCount##	;Get size of his buffer
+	SUBL	ECX, #24t.B		;Is it big enought?
+	JLE	8$.S			;No
+	MOVL	ESI, [EDI]		;Yes - get offset of our UCB
+	TESTL	ESI, ESI
+	JE	12$.S			;If none
+	PUSHL	EDI
+	LESL	EDI, SS:xffBuffer1##	;Get address of buffer
+	CLD
+	MOVL	EAX, ucb_fsname+0[ESI]	;Fill in the header stuff
+	STOSL	[EDI]
+	MOVL	EAX, ucb_fsname+4[ESI]
+	STOSL	[EDI]
+	MOVL	EAX, ucb_volcdt+0[ESI]
+	STOSL	[EDI]
+	MOVL	EAX, ucb_volcdt+4[ESI]
+	STOSL	[EDI]
+	CLRL	EAX
+	STOSL	[EDI]
+	STOSL	[EDI]
+	MOVL	ESI, ucb_ext.B[ESI]
+	ADDL	ESI, #ucbx_vollabel.B	;Give him the label
+	CMPL	ECX, #32t.B
+	JBE	4$.S
+	MOVL	ECX, #32t
+4$:	LODSB	[ESI]
+	STOSB	[EDI]
+	CMPB	AL, #0
+	LOOPNE	ECX, 4$
+	SUBL	EDI, SS:xffBuffer1##
+	MOVL	ECX, EDI
+	CLRL	EAX
+	POPL	EDI
+6$:	MOVL	EBX, #QSTS$DONE
+	RET
+
+;Here if count is bad
+
+8$:	MOVL	EAX, #ER_ICDEV
+10$:	CLRL	ECX
+	JMP	6$.S
+
+12$:	MOVL	EAX, #ER_MDCHG
+	JMP	10$.S
+.PAGE
+	.SBTTL	copyvollbl - Subroutine to copy volume label
+
+;Subroutine to copy volume label
+;	c{EBX}    = Offset of buffer container first block of volume descriptor
+;	c{EDX}    = Offset of type table
+;	c{ES:EDI} = Address to copy label to
+;	CALL	copyvollbl
+
+copyvollbl:
+	PUSHL	ESI
+	PUSHL	EDX
+	PUSHL	EBX
+	CLRL	EAX			;Assume not a Joliet disk
+	CMPB	ucb_fsspec[ESI], #4	;Right?
+	JNE	2$.S			;Yes
+	INCL	EAX			;No - it is a Joliet disk
+2$:	MOVL	ESI, os_volume.B[EDX]
+	ADDL	ESI, EBX
+	MOVL	EDX, EDI
+	MOVL	EBX, EAX
+	MOVL	ECX, #32t
+	CLD
+4$:	LODSB	[ESI]			;Get a byte from the volume descriptor
+	ADDL	ESI, EBX
+	STOSB	[EDI]			;Store it in the UCB
+	CMPB	AL, #' '		;Space?
+	JE	6$.S			;Yes
+	MOVL	EDX, EDI		;No - remember where it is
+6$:	CMPB	AL, #0			;Null? (just to be safe!)
+	LOOPNE	ECX, 4$			;Continue if not null and more to do
+	MOVB	ES:[EDX], #0		;Terminate it after last non-blank
+	POPL	EBX			;  character (NOTE: this might overwrite
+	POPL	EDX			;  the next byte if the label is 32
+	POPL	ESI			;  bytes long, but that does not matter)
+	RET				;Clear the volume ID field which we do
+					;  not use (which is next in the UCB)
+.PAGE
+	.SBTTL	cpyname - Subroutine to set up next name element
+
+;Subroutine to set up next name element for directory search
+;	c(AL) = First character
+;	CALL	cpyname
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  c(AL) = Stopper character
+;	  Z:set = Have last name
+;	  Z:clr = More names follow
+
+cpyname:LEAL	EBX, cdo_string[EBP]	;Point to place to put string
+	CLRL	EDX
+	MOVB	cdo_wild.B[EBP], DL	;Assume no wild-card characters
+	MOVL	cdo_strlen.B[EBP], EDX
+	MOVL	cdo_namever.B[EBP], EDX
+	MOVL	ECX, #128t		;Allow up to 128 characters total
+	MOVB	AH, #0
+4$:	CMPB	AL, #'\'		;End of directory name?
+	JE	24$			;Yes
+	CMPB	AL, #'/'		;Maybe
+	JE	24$			;Yes
+	CMPB	AL, #'*'		;Wild-card character?
+	JE	6$.S			;Yes
+	CMPB	AL, #'?'		;Maybe
+	JNE	8$.S			;No
+6$:	ORB	cdo_wild.B[EBP], #1	;Indicate have wild card character
+	JMP	10$.S
+
+;Here if not wild-card character
+
+8$:	CMPB	AL, #';'		;Start of version number?
+	JE	16$.S			;Yes
+	CMPB	cdo_fsspec.B[EBP], #3	;No - is this a Rockridge disk?
+	JE	10$.S			;Yes
+	CMPB	AL, #'a'		;No - lower case letter?
+	JB	10$.S			;No
+	CMPB	AL, #'z'		;Maybe
+	JA	10$.S			;No
+	SUBB	AL, #20h		;Yes - convert to upper case
+10$:	DECL	ECX
+	JS	22$
+	MOVB	SS:[EBX], AL		;Store character
+	INCL	EBX			;Bump pointer
+	INCL	cdo_strlen.B[EBP]	;Increase length of name
+	CMPB	cdo_fsspec.B[EBP], #4	;Joliet disk?
+	JNE	12$.S			;No
+	BTL	SS:xffCmd#, #O%USEDOS	;Yes - using DOS name?
+	JC	12$.S			;Yes
+	MOVB	SS:[EBX], #0		;No - do quick and dirty Unicode
+	INCL	EBX			;  translation
+	INCL	cdo_strlen.B[EBP]
+12$:	CMPB	AL, #'.'
+	JNE	14$.S
+	MOVB	AH, #1
+14$:	CALL	cdrnchar		;Get character
+	JNE	4$.S			;Continue if more
+	JE	26$			;If end of name
+	CMPL	cdo_strlen.B[EBP], #128t ;No end - have room for more?
+	JLE	4$.S			;Yes - continue
+	MOVL	EAX, #ER_BDSPC		;No - fail!
+	STC
+	RET
+
+;Here with start of version number
+
+16$:	CLRL	EDX			;Clear the version
+	MOVL	cdo_namever.B[EBP], EDX
+	CALL	cdrnchar		;Get character
+	JE	26$.S			;If end of name
+	CMPB	AL, #'*'		;Want all versions?
+	JE	20$.S
+18$:	CMPB	AL, #'0'		;Digit?
+	JB	30$.S			;No
+	CMPB	AL, #'9'		;Maybe
+	JA	30$.S			;No
+	MOVL	EDX, EAX		;Yes - get value of digit
+	ANDL	EDX, #0Fh
+	IMULL	ECX, cdo_namever.B[EBP], #10t.B
+	ADDL	ECX, EDX		;Add it in
+	TESTL	ECX, #0FFFF8000h	;Is it too big?
+	JNE	30$.S			;Yes - fail
+	MOVL	cdo_namever.B[EBP], ECX	;No
+	CALL	cdrnchar		;Get next character
+	JNE	18$.S			;Continue if more
+	JMP	26$.S			;If end of name
+
+;Here if have ;*
+
+20$:	CALL	cdrnchar		;Get next character
+22$:	JNE	30$.S			;Error if not at end
+	MOVL	cdo_namever.B[EBP], #-1 ;Indicate want all versions
+	JMP	26$.S
+
+;Here at end of directory name
+
+24$:	CMPB	cdo_wild.B[EBP], #0	;Have wild-card character in name?
+	JG	30$.S			;Yes - fail
+26$:	CMPB	AH, #0			;Have at least 1 period in name?
+	JNE	28$.S			;Yes
+	CMPL	cdo_strlen.B[EBP], #0.B	;No - null name
+	JE	28$.S			;Yes
+	MOVB	SS:[EBX], #'.'		;No - add a period at the end
+	INCL	EBX
+	INCL	cdo_strlen.B[EBP]
+	CMPB	cdo_fsspec.B[EBP], #4	;Joliet disk?
+	JNE	28$.S			;No
+	BTL	SS:xffCmd#, #O%USEDOS	;Yes - using DOS name?
+	JC	28$.S			;Yes
+	MOVB	SS:[EBX], #0		;No - make it Unicode
+	INCL	EBX
+	INCL	cdo_strlen.B[EBP]
+28$:	MOVW	SS:[EBX], #0		;Put null at end
+	MOVL	EAX, cdo_namep.B[EBP]	;Get pointer
+	CMPB	SS:-1.B[EAX], #0	;Set Z if end of string, clear C always
+	RET
+
+;Here if have illegal specificaton
+
+30$:	MOVL	EAX, #ER_BDSPC
+	STC
+	RET
+.PAGE
+	.SBTTL	cdrsetpath - Set up path data for CD-ROM file structures
+
+;Here for the dd_setpath entry - Set up path data for CD-ROM file structures
+;	c{EDI}    = Offset of DCB
+;	c{ES:ESI} = Address of path data block
+;	CALL	cdrsetpath
+
+cdrsetpath:
+	MOVL	EDX, [EDI]		;Get offset of UCB
+	TESTL	EDX, EDX
+	JE	medchg
+	MOVL	EAX, dcb_dkfilepnt.B[EDI] ;Get block for directory
+	MOVB	CL, ucb_clusx.B[EDX]	;Change to cluster number
+	SHRL	EAX, CL
+	MOVL	ES:pn_fpnt1.B[ESI], EAX	;Store directory cluster
+	MOVL	EAX, dcb_dkcdflen.B[EDI] ;Get length of directory
+	MOVL	ES:pn_fpnt2.B[ESI], EAX
+	CLC
+	RET
+.PAGE
+	.SBTTL	cdrputdosfs - Subroutine to store DOS file specification byte
+
+;Subroutine to store DOS file specification byte to the CDFDB
+;	c(AL)  = Byte to store
+;	c{EDI} = Offset of DCB
+;	CALL	cdrputdosfs
+
+cdrputdosfs:
+	RET
+
+	.SBTTL	cdrputlongfs - Subroutine to store long file specification byte
+
+;Subroutine to store long file specification byte to the CDFDB
+;	c(AL)  = Byte to store
+;	c{EDI} = Offset of DCB
+;	CALL	cdrputlongfs
+
+cdrputlongfs:
+	PUSHL	ECX
+	MOVL	EDX, dcb_dkcdfdb.B[EDI]	;Get offset of the CDFDB
+	MOVL	ECX, cdfdb_fslonglen.B[EDX] ;Get current specification length
+	CMPL	ECX, cdo_fslongmax.B[EBP] ;Need to expand the CDFDB?
+	JL	2$.S			;No
+	MOVZBL	ECX, [EDX]		;Get the current size index
+	CMPL	ECX, #6t.B		;Can we make it bigger?
+	JAE	4$.S			;No - forget this!
+	PUSHL	ESI
+	INCL	ECX
+	CALL	knlGetXmb##
+	JC	6$.S
+	MOVL	ECX, cdo_fslongmax.B[EBP]
+	ADDL	ECX, #cdfdb_fslongbfr.B
+	SHRL	ECX, #2t
+	PUSHL	EDI
+	PUSHL	ESI
+	MOVL	EDI, ESI
+	PUSHL	DS
+	POPL	ES
+	MOVL	ESI, EDX
+	CLD
+	RMOVSL	[EDI], [ESI]
+	MOVL	ESI, EDX		;Give up the original CDFDB
+	MOVZBL	ECX, [ESI]
+	CALL	knlGiveXmb##
+	POPL	ESI
+	POPL	EDI
+	MOVL	dcb_dkcdfdb.B[EDI], ESI	;Point to the new, larger CDFDB
+	MOVL	ECX, cdo_fslongmax.B[EBP] ;Adjust maximum specification length
+	ADDL	ECX, #cdfdb_fslongbfr.B
+	LEAL	ECX, -cdfdb_fslongbfr.B[ECX+ECX]
+	MOVL	cdo_fslongmax.B[EBP], ECX
+	INCB	[ESI]			;Adjust size index
+	MOVL	EDX, ESI
+	POPL	ESI
+	MOVL	ECX, cdfdb_fslonglen.B[EDX] ;Restore specification length
+2$:	MOVB	cdfdb_fslongbfr.B[EDX+ECX], AL
+	INCL	cdfdb_fslonglen.B[EDX]
+4$:	POPL	ECX
+	RET
+
+;Here if error allocating a larger CDFDB
+
+6$:	POPL	ESI
+	POPL	ECX
+	RET
+.PAGE
+	.SBTTL	cdrdt2dos - Subroutine to convert CD-ROM date/time to DOS date/time
+
+;Subroutine to convert a 7-byte CD-ROM format date/time value to a DOS format
+;  date/time value
+;	c{EDX,EAX} = 7-byte CD-ROM format date/time value
+;	CALL	cdrdt2dos
+;	C{EAX} = DOS date/time value
+
+cdrdt2dos:
+	PUSHL	ECX
+	MOVL	ECX, EAX		;Save date
+	SHRL	EAX, #13t		;Get hour value in right place
+	ANDL	EAX, #0F800h
+	SHRB	DH, #1			;Get seconds value
+	ORB	AL, DH
+	SHLL	EDX, #5t		;Get minutes value in right place
+	ANDL	EDX, #3C0h
+	ORL	EAX, EDX		;Merge in minutes
+	MOVZBL	EDX, CL			;Get years value
+	SUBL	EDX, #80t		;Change bias to 1980
+	JS	4$.S			;If before 1980!
+	SHLL	EDX, #4t		;Make room for month value
+	ORB	DL, CH			;Merge in month
+	SHLL	EDX, #5t		;Make room for day value
+	SHRL	ECX, #8t
+	ORB	DL, CH			;Merge in day
+	SHLL	EDX, #16t
+	ORL	EAX, EDX
+	POPL	ECX
+	RET
+
+;Here if have date before 1980 - return 1-Jan-80
+
+4$:	MOVL	EAX, #210000h
+	POPL	ECX
+	RET
+
+	.SBTTL	cdrldt2sys - Subroutine to convert long CD-ROM date/time to system date/time
+
+;Subroutine to convert a 16-byte CD-ROM format date/time value to an knl format
+;  date/time value
+;	c{ECX} = Offset of 16-byte CD-ROM format date/time value in block
+;	c{EBX} = Offset of block buffer
+;	CALL	cdrldt2sys
+;	C{ECX,EAX} = System date/time value
+;  c{EDX} is respected
+
+cdrldt2sys:
+	PUSHL	EDX
+	LEAL	EDX, [ECX+EBX]
+	MOVL	ECX, #4t
+	CALL	getval
+	SUBL	EAX, #1600t
+	JNS	6$.S
+	CLRL	EAX
+6$:	SHLL	EAX, #9t
+	PUSHL	EAX
+	CALL	getval2
+	SHLL	EAX, #5t
+	ORL	[ESP], EAX
+	CALL	getval2
+	ORL	[ESP], EAX
+	POPL	EAX
+	CALL	knlBdv2SysDate##
+	PUSHL	EAX
+	CALL	getval2
+	SHLL	EAX, #24t
+	PUSHL	EAX
+	CALL	getval2
+	MOVB	2.B[ESP], AL
+	CALL	getval2
+	MOVB	1.B[ESP], AL
+	CALL	getval2
+	MOVB	[ESP], AL
+	POPL	EAX
+	CALL	knlDisc2SysTime##
+	POPL	ECX
+	POPL	EDX
+	RET
+
+getval2:MOVL	ECX, #2
+getval:	PUSHL	EBX
+	CLRL	EAX
+8$:	MOVB	BL, [EDX]
+	INCL	EDX
+	ANDL	EBX, #0Fh
+	IMULL	EAX, #10t
+	ADDL	EAX, EBX
+	LOOP	ECX, 8$
+	POPL	EBX
+	RET
+
+	.SBTTL	cdrdt2sys - Subroutine to convert CD-ROM date/time to system date/time
+
+;Subroutine to convert a 7-byte CD-ROM format date/time value to an system
+;  format date/time value
+;	c{EDX,EAX} = 7-byte CD-ROM format date/time value
+;	CALL	cdrdt2sys
+;	C{EDX,EAX} = System date/time value
+
+cdrdt2sys:
+	PUSHL	ECX
+	PUSHL	EAX			;Save date
+	SHLDL	EDX, EAX, #8t		;Get time in discrete format
+	XCHGB	DL, DH			;  (hours.minutes.seconds.hundreds)
+	RORL	EDX, #16t
+	MOVB	DH, DL
+	MOVB	DL, #0
+	MOVL	EAX, EDX
+	CALL	knlDisc2SysTime##
+	POPL	ECX			;Restore date
+	PUSHL	EAX			;Save converted time
+	MOVZBL	EAX, CL			;Get years value
+	ADDL	EAX, #300t		;Change bias to 1600
+	SHLL	EAX, #4t		;Make room for month value
+	ORB	AL, CH			;Merge in month
+	SHLL	EAX, #5t		;Make room for day value
+	SHRL	ECX, #8t
+	ORB	AL, CH			;Merge in day
+	CALL	knlBdv2SysDate##	;Convert to system format date
+	MOVL	EDX, EAX
+	POPL	EAX
+	POPL	ECX
+	RET
+
+	LKEEND

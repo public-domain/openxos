@@ -1,0 +1,747 @@
+	.TITLE	VESAADRV - Loadable driver extensions for VESA compliant displays
+
+;++++
+; This software is in the public domain.  It may be freely copied and used
+; for whatever purpose you see fit, including commerical uses.  Anyone
+; modifying this software may claim ownership of the modifications, but not
+; the complete derived code.  It would be appreciated if the authors were
+; told what this software is being used for, but this is not a requirement.
+
+;   THIS SOFTWARE IS PROVIDED BY THE AUTHORS "AS IS" AND ANY EXPRESS OR
+;   IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
+;   OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+;   IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+;   INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+;   BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS
+;   OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+;   ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR
+;   TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
+;   USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+;----
+
+	.PROC	80486
+	.INCLUD	XOSINC:\XMAC\XOS.PAR
+	.INCLUD	XOSINC:\XMAC\XOSX.PAR
+	.INCLUD	XOSINC:\XMAC\XOSERR.PAR
+	.INCLUD	XOSINC:\XMAC\XOSDOS.PAR
+	.INCLUD	XOSINC:\XMAC\XOSTRM.PAR
+	.INCLUD	XOSINC:\XMAC\XOSXTRM.PAR
+	.INCLUD	XOSINC:\XMAC\PCAT.PAR
+	.INCLUD	XOSINC:\XMAC\XOSLKE.PAR
+	.INCLUD	XOSINC:\XMAC\XOSXLKE.PAR
+	.INCLUD	VGAADRV.PAR
+	.INCLUD	VBE.PAR
+
+;This LKE provides routines to use the VESA VBE to initialize a compliant
+;  display adapter for linear graphics modes.  This driver may be used alone
+;  to provide minimal graphics support for any VESA compliant card (no
+;  acceration, software graphics cursor) or with an LKE for a specific card
+;  which implements acceration and a hardware graphics cursor.  It must be
+;  loaded after the standard VGA driver (VGAADRV) is loaded and before any
+;  card specific extension drivers are loaded.  Note that only one VGA
+;  extension driver and only one card specific extension driver can be loaded.
+
+;This LKE only supports PCI and AGP boards.
+
+MAJV   =!1t
+MINV   =!0t
+EDITNUM=!0t
+
+;Define offsets for modetbl entries
+
+$$$=!0
+BLK mtbl_vesamode , 4t
+BLK mtbl_xosmode  , 1t
+BLK               , 3t
+BLK mtbl_fbufrpa  , 4t
+BLK mtbl_maxpixclk, 4t
+BLK mtbl_xres     , 4t
+BLK mtbl_yres     , 4t
+BLK mtbl_pgsize   , 4t
+BLK mtbl_pixsize  , 4t
+mtbl_SIZE=!$$$
+
+MODETBLMAX=!40t
+
+	LKEHEAD  VESAADRV, MAJV, MINV, EDITNUM, LKETYPE_DEVICE
+
+;Once-only initizliation routine
+
+	INITSUB	vesaainit
+
+$$$=!0
+FRM vai_value  , 4t
+FRM vai_iorpnt , 4t
+FRM vai_colors , 4t		;Offset of color format info in the mode block
+FRM vai_bufrpa , 4t
+FRM vai_multpa , 1t
+FRM            , 3t
+FRM vai_dhdb   , 4t
+FRM vai_modepnt, 4t
+FRM vai_modecnt, 4t
+vai_SIZE=!$$$
+
+2$:	LEAVE
+	RET
+
+vesaainit:
+	ENTER	vai_SIZE, 0
+	MOVL	EDI, xosconFDhdb##	;Get offset of the first DHDB
+	ORL	EDI, EDI
+	JE	noconsole
+	MOVL	vai_dhdb.B[EBP], EDI
+	CLRL	EBX
+	MOVL	vai_bufrpa.B[EBP], EBX
+	MOVB	vai_multpa.B[EBP], BL
+4$:	MOVB	CL, #3			;Find the display device
+	CALLI	knxPciFindType##
+	JC	2$.S			;If not there
+
+;Here with a device we know about - read the PCI configuration registers
+;  to get the addresses we need.
+
+	MOVL	vai_iorpnt.B[EBP], #iortblx
+8$:	MOVB	dhdb_pciaddr.B[EDI], BH	;Save the device/function number
+	MOVL	dhdb_pciid.B[EDI], EAX	;Save the device ID
+
+;;;	MOVL	dhdb_qqqq.B[EDI], EDX	;Save the class code
+
+	MOVB	BL, #10h		;Get the display aperture address
+10$:	CALLI	knxPciReadConfig##
+	TESTB	AL, #01h		;IO area?
+	JE	12$.S			;No
+	MOVL	vai_value.B[EBP], EAX	;Yes
+	MOVL	EAX, #0FFFFFFFFh	;Get size of area the strange PCI way!
+	CLI				;Don't allow interrupts while the
+	CALLI	knxPciWriteConfig##	;  value is messed up
+	IOPAUSE
+	CALLI	knxPciReadConfig##
+	ANDB	AL, #0FCh
+	NEGL	EAX
+	MOVL	EDX, vai_iorpnt.B[EBP]
+	MOVW	[EDX], AX
+	MOVL	EAX, vai_value.B[EBP]
+	CALLI	knxPciWriteConfig##
+	STI
+	MOVL	EDX, vai_iorpnt.B[EBP]
+	CMPW	[EDX], #0.B		;Make sure not zero length
+	JE	12$.S
+	MOVL	EAX, vai_value.B[EBP]	;Add this to our IO register table
+	ANDB	AL, #0FCh
+	MOVW	2.B[EDX], AX
+	ADDL	vai_iorpnt.B[EBP], #4t	
+12$:	ADDB	BL, #4
+	CMPB	BL, #24h
+	JBE	10$.S
+
+;;;	MOVL	dhdb_pgaddr.B[EDI], EAX
+;;;	MOVL	dhdb_praddr.B[EDI], EAX
+;;;	MOVL	dhdb_xioreg.B[EDI], EAX
+.PAGE
+;Get the VBE mode information
+
+	MOVL	EAX, #2000h
+	CALL	knlRealBiosSetup##
+	JC	initerrorff
+	TOFORK
+	MOVL	EBX, #realcode		;Execute a VBE function 0 in real mode
+	MOVL	ECX, #rcsize		;  to obtain the basic Vesa VBE
+	MOVL	EDX, #realregs		;  information
+	MOVL	xrr_EAX.B[EDX], #4F00h
+	MOVL	xrr_ES.B[EDX], #0
+	MOVL	xrr_EDI.B[EDX], #1000h
+	PUSHL	#GS_REAL16.B
+	POPL	FS
+	MOVL	FS:1000h+vbe_info_signature, #'VBE2'
+	PUSHL	EDI
+	MOVL	EDI, #iortbl
+	CALL	knlExecReal##
+	JC	initerrorff.S
+	POPL	EDI
+	FROMFORK
+	CMPW	realregs+xrr_EAX, #004Fh ;Did it work?
+	JNE	vbeerror.S		;No - can't go on!
+	PUSHL	#GS_REAL16.B
+	POPL	FS
+	CMPL	FS:1000h+vbe_info_signature, #'VESA' ;Is the data block correct?
+	JNE	vbeerror.S
+	MOVL	EAX, #1400h+vbe_mode_lnredmasksz ;Assume version 3.x
+	CMPB	FS:1000h+vbe_info_version + 1, #03 ;Right?
+	JE	12$.S			;Yes
+	CMPB	FS:1000h+vbe_info_version + 1, #02 ;No - is it 2.x?
+	JNE	vbeerror.S		;No - fail!
+	ADDL	EAX, #vbe_mode_redmasksz-vbe_mode_lnredmasksz ;Yes
+12$:	MOVL	vai_colors.B[EBP], EAX
+
+	MOVZWL	EAX, FS:1000h+vbe_info_memory ;Get total memory size
+	SHLL	EAX, #16t
+	MOVL	dhdb_gbfrsize.B[EDI], EAX
+	JMP	getmodes.S
+
+noconsole:
+	MOVL	EAX, #ER_NOCON
+	JMP	initerror.S
+
+initerrorff:
+	FROMFORK
+	JMP	initerror.S
+
+vbeerror:
+	MOVL	EAX, #ER_PDTYP
+initerror:
+	LEAVE
+	STC
+	RET
+.PAGE
+;Now loop through all of the valid modes, determine which ones we might be
+;  able to use, and build our mode table.
+
+getmodes:
+	MOVL	vai_modepnt.B[EBP], #modetbl
+	MOVL	vai_modecnt.B[EBP], #MODETBLMAX
+	MOVZWL	ESI, FS:1000+vbe_info_modelist+0
+	CMPW	FS:1000+vbe_info_modelist+2, #0C000h
+	JNE	4$.S
+	PUSHL	#GS_BIOSCODE.B
+	POPL	FS
+4$:	MOVL	EBX, #realcode		;Execute a VBE function 1 in real mode
+	MOVL	ECX, #rcsize		;  to obtain mode information
+	MOVL	EDX, #realregs
+	MOVL	xrr_EAX.B[EDX], #4F01h
+	MOVZWL	EAX, FS:[ESI]
+	CMPW	AX, #0FFFFh		;End of list?
+	JE	modesdone		;Yes - finished here
+	MOVL	xrr_ECX.B[EDX], EAX
+	MOVL	xrr_ES.B[EDX], #0
+	MOVL	xrr_EDI.B[EDX], #1400h
+	TOFORK
+	PUSHL	FS
+	PUSHL	EDI
+	MOVL	EDI, #iortbl
+	CALL	knlExecReal##
+	POPL	EDI
+	POPL	FS
+	FROMFORK
+	CMPW	realregs+xrr_EAX, #004Fh ;Did it work?
+	JNE	vbeerror		;No - can't go on!
+	PUSHL	#GS_REAL16.B
+	POPL	ES
+	MOVB	AL, ES:1400h+vbe_mode_attrib ;Is this is a valid RGB graphics
+	NOTB	AL			     ;  mode?
+	TESTB	AL, #VBE_ATTR_MODEOK|VBE_ATTR_COLOR|VBE_ATTR_GRAPHICS|VBE_ATTR_LINEAR
+	JNE	30$			;No - skip it
+	CMPB	ES:1400h+vbe_mode_memmodel, #VBE_MODEL_RGB ;Maybe
+	JNE	30$			;No
+
+;Now determine if it conforms to one of the pixel formats that we support
+
+	MOVL	EBX, vai_colors.B[EBP]
+	CMPB	ES:1400h+vbe_mode_bitsperpix, #32t ;Is this a 32-bit/pixel mode?
+	JNE	10$			;No
+
+;Here if have a 32-bit/pixel mode - We support 2 32-bit formats, both are
+;  8-8-8-8. One is xRGB and the other is RGBx
+
+;First determine that all elements are 8 bits
+
+	CMPB	ES:[EBX], #8
+	JNE	30$
+	CMPB	ES:vbe_mode_grnmasksz-vbe_mode_redmasksz.B[EBX], #8
+	JNE	30$
+	CMPB	ES:vbe_mode_blumasksz-vbe_mode_redmasksz.B[EBX], #8
+	JNE	30$
+	CMPB	ES:vbe_mode_rsvmasksz-vbe_mode_redmasksz.B[EBX], #8
+	JNE	30$
+
+;Now determine that the elements are where we want them
+
+	CMPB	ES:vbe_mode_redmaskpos-vbe_mode_redmasksz.B[EBX], #24t
+	JNE	8$.S
+
+;If get here this must be RGBx
+
+	CMPB	ES:vbe_mode_grnmaskpos-vbe_mode_redmasksz.B[EBX], #16t
+	JNE	30$
+	CMPB	ES:vbe_mode_blumaskpos-vbe_mode_redmasksz.B[EBX], #8t
+	JNE	30$
+	CMPB	ES:vbe_mode_rsvmaskpos-vbe_mode_redmasksz.B[EBX], #0t
+	JNE	30$
+	MOVL	EAX, #DM_TCG24x
+	JMP	20$
+
+;If get here this must be xRGB
+
+8$:	CMPB	ES:vbe_mode_redmaskpos-vbe_mode_redmasksz.B[EBX], #16t
+	JNE	30$
+	CMPB	ES:vbe_mode_grnmaskpos-vbe_mode_redmasksz.B[EBX], #8t
+	JNE	30$
+	CMPB	ES:vbe_mode_blumaskpos-vbe_mode_redmasksz.B[EBX], #0t
+	JNE	30$
+	CMPB	ES:vbe_mode_rsvmaskpos-vbe_mode_redmasksz.B[EBX], #24t
+	JNE	30$
+	MOVL	EAX, #DM_TCGx24
+	JMP	20$
+
+;Here if this is not a 32-bit/pixel mode
+
+10$:	CMPB	ES:1400h+vbe_mode_bitsperpix, #16t ;is this a 16-bit/pixel mode?
+	JNE	30$			;No - can't use it!
+
+;Here if have a 16-bit/pixel mode - We support 2 16-bit formats 1-5-5-5 (xRGB)
+;  and 5-6-5 (RGB).
+
+	CMPB	ES:[EBX], #5
+	JNE	30$
+	CMPB	ES:vbe_mode_blumasksz-vbe_mode_redmasksz.B[EBX], #5t
+	JNE	30$
+	CMPB	ES:vbe_mode_blumaskpos-vbe_mode_redmasksz.B[EBX], #0t
+	JNE	30$
+	CMPB	ES:vbe_mode_grnmaskpos-vbe_mode_redmasksz.B[EBX], #5t
+	JNE	30$
+	CMPB	ES:vbe_mode_grnmasksz-vbe_mode_redmasksz.B[EBX], #5t
+	JNE	14$.S
+
+;If get here this must be 1-5-5-5 (xRGB)
+
+	CMPB	ES:vbe_mode_rsvmasksz-vbe_mode_redmasksz.B[EBX], #1t
+	JNE	30$
+	CMPB	ES:vbe_mode_redmaskpos-vbe_mode_redmasksz.B[EBX], #10t
+	JNE	30$
+	CMPB	ES:vbe_mode_rsvmaskpos-vbe_mode_redmasksz.B[EBX], #15t
+	JNE	30$
+	MOVL	EAX, #DM_HCGx15
+	JMP	20$.S
+
+;If get here this must be 5-6-5 (xRGB)
+
+14$:	CMPB	ES:vbe_mode_grnmasksz-vbe_mode_redmasksz.B[EBX], #6
+	JNE	30$
+	CMPB	ES:vbe_mode_rsvmasksz-vbe_mode_redmasksz.B[EBX], #0
+	JNE	30$
+	CMPB	ES:vbe_mode_redmaskpos-vbe_mode_redmasksz.B[EBX], #11t
+	JNE	30$.S
+	MOVL	EAX, #DM_HCG16
+
+;Here if have a mode we can use
+
+20$:	MOVL	EBX, vai_modepnt.B[EBP]
+	MOVL	mtbl_xosmode.B[EBX], EAX ;Store the XOS mode
+	MOVZWL	EAX, FS:[ESI]		;Store the Vesa mode
+	MOVL	mtbl_vesamode.B[EBX], EAX
+	MOVZBL	ECX, ES:1400h+vbe_mode_bitsperpix ;Get pixel size
+	SHRL	ECX, #3
+	MOVL	mtbl_pixsize.B[EBX], ECX
+	MOVXWL	EAX, ES:1400h+vbe_mode_xres ;Store the X resolution
+	MOVL	mtbl_xres.B[EBX], EAX
+	MOVXWL	EDX, ES:1400h+vbe_mode_yres ;Store the Y resolution
+	MOVL	mtbl_yres.B[EBX], EDX
+	IMULL	EAX, ECX		;Convert to bytes
+	IMULL	EAX, EDX		;Calculate page size
+	ADDL	EAX, #0FFFFh		;Round up to 64KB boundry
+	ANDL	EAX, #0FFFF0000h
+	MOVL	mtbl_pgsize.B[EBX], EAX ;Store the page size
+	MOVL	EAX, ES:1400h+vbe_mode_maxpixelclk ;Store the maximum pixel
+	MOVL	mtbl_maxpixclk.B[EBX], EAX	   ;  clock
+	MOVL	EAX, ES:1400h+vbe_mode_fbufrpa ;Store the phycial buffer
+	MOVL	mtbl_fbufrpa.B[EBX], EAX       ;  address
+	CMPL	vai_bufrpa.B[EBP], EAX	;Same addres?
+	JE	28$.S			;Yes
+	CMPL	vai_bufrpa.B[EBP], #0.B ;First mode found?
+	JNE	26$.S			;No
+	MOVL	vai_bufrpa.B[EBP], EAX	;Yes - just store the address
+	JMP	28$.S
+
+26$:	MOVB	vai_multpa.B[EBP], #1	;Remember have different addresses
+28$:	DECL	vai_modecnt.B[EBP]	;Have too many modes?
+	JLE	modesdone.S		;Yes - stop now
+	ADDL	vai_modepnt.B[EBP], #mtbl_SIZE.B ;No
+30$:	ADDL	ESI, #2t.B		;Advance to next VBE mode entry
+	JMP	4$
+.PAGE
+modesdone:
+	CMPL	vai_bufrpa.B[EBP], #0.B	;Did we find at least one usable mode?
+	JE	vbeerror		;No - can't use it!
+	MOVL	ECX, #xddb_SIZE		;Yes - allocate an XDDB
+	CALL	knlGetXMem##
+	JC	initerror
+	MOVL	ESI, EDI
+	MOVL	EDI, vai_dhdb.B[EBP]
+	MOVL	dhdb_dispname.B[EDI], #vesatype ;Store pointer to type string
+	MOVL	dhdb_xddb.B[EDI], ESI
+	PUSHL	#GS_REAL16.B		;Store version number string
+	POPL	FS
+	LEAL	EBX, xddb_version.B[ESI]
+	MOVZBL	EAX, FS:1000+vbe_info_version+1
+	CALL	knlPutDecNmbr##
+	MOVB	[EBX], #'.'
+	INCL	EBX
+	MOVZBL	EAX, FS:1000+vbe_info_version+0
+	CALL	knlPutDecNmbr##
+	MOVB	[EBX], #0
+	PUSHL	#GS_REAL16.B		;Store description string
+	POPL	FS
+	MOVZWL	EAX, FS:1000+vbe_info_oemstring+0
+	CMPW	FS:1000+vbe_info_oemstring+2, #0C000h
+	JNE	8$.S
+	PUSHL	#GS_BIOSCODE.B
+	POPL	FS
+8$:	LEAL	EDI, xddb_desc.B[ESI]
+	PUSHL	DS
+	PUSHL	ES
+	PUSHL	ESI
+	MOVL	ESI, EAX
+	MOVL	ECX, #64t/4
+	RMOVSL	[EDI], FS:[ESI]
+	POPL	ESI
+	MOVB	xddb_desc+63.B[ESI], #0
+
+
+getedid:TOFORK
+	MOVL	EBX, #realcode		;Execute a VBE function 15 in real mode
+	MOVL	ECX, #rcsize		;  to obtain the EDID data
+	MOVL	EDX, #realregs
+	MOVL	xrr_EAX.B[EDX], #4F15h
+	MOVL	xrr_EBX.B[EDX], #1
+	MOVL	xrr_ECX.B[EDX], #0
+	MOVL	xrr_EDX.B[EDX], #0
+	MOVL	xrr_ES.B[EDX], #0
+	MOVL	xrr_EDI.B[EDX], #1600h
+	PUSHL	#GS_REAL16.B
+	POPL	FS
+	PUSHL	EDI
+	MOVL	EDI, #iortbl
+	CALL	knlExecReal##
+	POPL	EDI
+	JC	initerrorff
+	FROMFORK
+	CMPW	realregs+xrr_EAX, #004Fh ;Did it work?
+
+;;; ADD STUFF HERE LATER!!!
+
+.PAGE
+;If all modes use the same physical buffer address we map it here once and
+;  for all.  If different modes use a different address, we skip mapping
+;  here.  The buffer will be mapped when the mode is set if necessary.
+
+mapbufr:MOVL	EDI, vai_dhdb.B[EBP]
+	CMPB	vai_multpa.B[EBP], #0	;Have a single address?
+	JNE	10$.S			;No - skip this
+	MOVL	ECX, dhdb_gbfrsize.B[EDI] ;Yes - get number of pages to map
+	SHRL	ECX, #12t
+	MOVL	EBX, #la_graphdisp	;Linear address for screen buffer
+	MOVL	EDX, vai_bufrpa.B[EBP]	;Physical address
+	MOVL	dhdb_pgaddr.B[EDI], EDX
+	PUSHL	EDI
+	MOVL	EDI, #-1
+	MOVL	EAX, #27h
+	CALL	knlMapPhyPages##	;Map the pages
+	POPL	EDI
+	JC	initerror		;If error
+
+;Update all current TDBs for the display with our values
+
+10$:	MOVL	dhdb_vgaddr.B[EDI], #graphdisp
+	LEAL	EDX, dhdb_tdbtbl[EDI]
+	MOVL	ECX, #VDSPMAX
+12$:	MOVL	ESI, [EDX]
+	ADDL	EDX, #4t.B
+	TESTL	ESI, ESI
+	JE	14$.S
+	MOVL	tdb_vgaddr.B[ESI], #graphdisp
+	MOVL	tdb_vraddr.B[ESI], #0
+	MOVL	EAX, dhdb_gbfrsize.B[EDI]
+	MOVL	tdb_gbfrsize[ESI], EAX
+14$:	LOOP	ECX, 12$
+
+;Now change the basic VGA driver's links to point to our routines
+
+	MOVL	xosvgaSetGraphic##, #vesasetgraphic
+	MOVL	xosvgaSetDHS##, #vesasetdhs
+	MOVL	xosvgaSetPage##, #vesasetpage
+	MOVL	xosvgaClrBuffer##, #vesaclrbuffer
+	MOVL	EAX, #vesasetgvf
+	MOVL	EBX, #xosvgaSetGVF##
+	CALL	knlStoreCode##
+	MOVL	EAX, #vesagetgvf
+	MOVL	EBX, #xosvgaGetGVF##
+	CALL	knlStoreCode##
+	MOVL	EAX, #vesagetcurpos
+	MOVL	EBX, #xosvgaGGetCurPos##
+	CALL	knlStoreCode##
+	MOVL	EAX, #vesasetcurpos
+	MOVL	EBX, #xosvgaGSetCurPos##
+	CALL	knlStoreCode##
+	MOVL	EAX, #vesasetcurcol
+	MOVL	EBX, #xosvgaGSetCurCol##
+	CALL	knlStoreCode##
+	MOVL	EAX, #vesasetcurpat
+	MOVL	EBX, #xosvgaGSetCurPat##
+	CALL	knlStoreCode##
+	CLRL	EAX
+	CLRL	EDX
+	MOVL	ECX, #codetop
+	LEAVE
+	RET
+
+	CODE
+.PAGE
+;Subroutine to do first part of setting to a graphic display mode - in this
+;  case we attempt to make both the horizontal and vertical resolution at
+;  least as great as specified.  Note that we only support whatever modes
+;  are available from the VESA BIOS.  We support 4 XOS modes which specify
+;  the color depth:
+;    mode 2: hi-color   - 1-5-5-5 (xRGB) using 16 bits
+;    mode 3: hi-color   - 5-6-5   (RGB)  using 16 bits
+;    mode 4: true-color - 8-8-8-8 (xRGB) using 32 bits
+;    mode 5: true-color - 8-8-8-8 (RGBx) using 32 bits
+;  We DO NOT support any palette based modes!
+;	CALL	vesasetgraphic
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+
+vesasetgraphic:
+	MOVL	EBX, #modetbl
+4$:	CMPL	[EBX], #0.B		;End of the table?
+	JE	10$.S			;Yes
+	MOVB	AL, adm_bits.B[EBP]	;No - is this entry the right mode?
+	CMPB	mtbl_xosmode.B[EBX], AL
+	JNE	6$.S			;No - skip it
+	MOVL	EAX, adm_dv+dm_horiz.B[EBP] ;Get desired horizontal resolution
+	CMPL	EAX, mtbl_xres.B[EBX]	;Is this config OK?
+	JA	6$.S			;Yes
+	MOVL	EAX, adm_dv+dm_vert.B[EBP] ;Get desired vertical resolution
+	CMPL	EAX, mtbl_yres.B[EBX]	;Is this config OK?
+	JBE	8$.S			;Yes
+6$:	ADDL	EBX, #mtbl_SIZE.B	;No - go on
+	JMP	4$.S
+
+;Here with a usuable mode
+
+8$:	MOVL	EAX, mtbl_xres.B[EBX]	;Store actual X and Y resolutions
+	MOVL	tdb_horiz[ESI], EAX
+	MOVL	EAX, mtbl_yres.B[EBX]
+	MOVL	tdb_vert[ESI], EAX
+	MOVL	EAX, mtbl_pgsize.B[EBX]
+	MOVL	tdb_pgsize[ESI], EAX
+	MOVB	AL, mtbl_pixsize.B[EBX]
+	MOVB	tdb_pixsize[ESI], AL
+	CLC
+	RET
+
+;Here if no usuable mode was found
+
+10$:	MOVL	EAX, #ER_VALUE
+	STC
+ret008:	RET
+.PAGE
+;Subroutine to set extended registers for the current mode
+
+vesasetdhs:
+	CMPB	tdb_mode[ESI], #DM_TEXT	;In text mode?
+	JA	6$			;No
+	MOVL	EAX, tdb_dhdb.B[ESI]	;Yes
+	CMPB	dhdb_hwmode[EAX], #DM_TEXT ;Currently in a text mode?
+	JBE	ret008.S		;Yes - nothing needed here
+	MOVL	EAX, #8003h		;No - switch to a text mode
+	JMP	8$.S
+
+4$:	POPL	ECX
+	POPL	EBX
+	RET
+
+;Here if in a graphic mode
+
+6$:	MOVL	EAX, tdb_table.B[ESI]	;Get the current Vesa mode
+	MOVL	EAX, mtbl_vesamode.B[EAX]
+	ORB	AH, #0C0h
+8$:	PUSHL	EBX
+	PUSHL	EAX
+	MOVL	ECX, #2000h
+	CALL	knlRealBiosSetup##
+	JC	4$.S
+	POPL	EAX
+	MOVL	EBX, #realcode
+	MOVL	ECX, #rcsize
+	MOVL	EDX, #realregs
+	MOVL	xrr_EAX.B[EDX], #4F02h	;Set the mode
+	MOVL	xrr_EBX.B[EDX], EAX
+	PUSHL	EDI
+	MOVL	EDI, #iortbl
+	CALL	knlExecReal##
+	POPL	EDI
+	POPL	EBX
+	MOVB	AL, tdb_mode[ESI]
+	MOVL	EDX, tdb_dhdb.B[ESI]
+	MOVB	dhdb_hwmode[EDX], AL
+	RET
+.PAGE
+	.SBTTL	vesasetpage - Subroutine to set high order display start bits
+
+;Subroutine to set graphic mode display start bits - This function will only
+;  be called for a graphic mode.
+;	c{EBX} = Display start value (bytes)
+;	c{ESI} = Offset of TDB
+;	CALL	vesasetpage
+
+vesasetpage:
+	MOVL	realregs+xrr_EAX, #4F07h
+	MOVL	realregs+xrr_EBX, #0000h
+	MOVL	EAX, EBX		;Convert byte offset to pixed offset
+	CLRL	EDX
+	MOVZBL	ECX, tdb_pixsize[ESI]
+	IDIVL	ECX
+	CLRL	EDX
+	DIVL	tdb_horiz[ESI]		;Get row and column values
+	MOVL	realregs+xrr_EDX, EAX
+	MOVL	realregs+xrr_ECX, EDX
+	MOVL	EDX, #realregs
+	MOVL	EBX, #realcode
+	MOVL	ECX, #rcsize
+	PUSHL	EDI
+	MOVL	EDI, #iortbl
+	CALL	knlExecReal##
+	POPL	EDI
+	RET
+.PAGE
+	.SBTTL	vesaclrbuffer - Subroutine to clear the display buffer
+
+;Subroutine to clear the display buffer
+;	c{ESI} = Offset of TDB
+;	CALL	vesaclrbuffer
+
+vesaclrbuffer:
+	MOVL	ECX, tdb_horiz[ESI]	;Get number of pixels in the buffer
+	IMULL	ECX, tdb_vert[ESI]
+	SHRL	ECX, #1t		;Change to number of longs to store
+	CLRL	EAX
+	MOVL	EDI, tdb_vgaddr.B[ESI]	;Get offset of the buffer
+	PUSHL	DS
+	POPL	ES
+	CLD
+	RSTOSL	[EDI]
+	RET
+.PAGE
+	.SBTTL	vesasetgvf - Subroutine to set vertical frequency
+
+;Subroutine to set vertical frequency
+;	c{EAX} = Desired frequency
+;	c{ESI} = Offset of TDB
+;	CALL	vesasetgvf
+
+vesasetgvf:
+	CMPL	EAX, #80t.B		;Want highest possible frequency?
+	JA	10$.S			;Yes
+
+
+10$:	MOVB	tdb_vertfreq[ESI], #6
+	RET
+
+	.SBTTL	vesagetgvf - Subroutine to get vertical frequency
+
+;Subroutine to set vertical frequence
+;	c{ESI} = Offset of TDB
+;	CALL	vesagetgvf
+;	c{EAX} = Current value
+
+vesagetgvf:
+	MOVZBL	EAX, tdb_vertfreq[ESI]
+
+	CLC
+	RET
+.PAGE
+	.SBTTL	vesagetcurpos - Subroutine to get the current cursor postion
+
+vesagetcurpos:
+	MOVL	EAX, tdb_gcxpos[ESI]
+	IFFAULT	knlRtnAdrEr##
+	MOVL	ES:[EBX], EAX
+	MOVL	EAX, tdb_gcypos[ESI]
+	IFFAULT	knlRtnAdrEr##
+	MOVL	ES:4.B[EBX], EAX
+	MOVZBL	EAX, tdb_gcenable[ESI]
+	RET
+
+	.SBTTL	vesasetcurpos - Subroutine to set the cursor postion
+
+;Subroutine to set the cursor postion
+;	c{EAX} = Function bits
+;	c{ECX} = X position
+;	c{EDX} = Y position
+;	c{ESI} = Offset of TDB
+;	CALL	vesasetcurpos
+;	C{EAX} = 0 if normal, negative error code if error
+
+vesasetcurpos:
+
+
+	RET
+.PAGE
+	.SBTTL	vesasetcurcol - Subroutine to get the cursor colors
+
+;Subroutine to get the cursor colors (only the first two colors are used)
+;	c{ECX}    = Number of colors to set
+;	c{ES:EBX} = Address of color array
+;	c{ESI}    = Offset of TDB
+;	CALL	atisetcurcol
+;	C{EAX} = 0 if normal, negative error code if error
+
+vesasetcurcol:
+
+
+	RET
+.PAGE
+	.SBTTL	vesasetcurpat - Subroutine to set the cursor pattern
+
+;Subroutine to set the graphics cursor pattern - the graphics cursor is
+;  left disabled
+;	c(AL)     = Width
+;	c(AH)     = Height
+;	c(CL)     = X hot offset
+;	c(CH)     = Y hot offset
+;	c{FS:EBX} = Address of pattern map
+;	c{GS:EDX} = Address of mask map
+;	c{ESI}    = Offset of TDB
+;	CALL	vesasetcurpat
+;	C{EAX} = 0 if normal, negative error code if error
+
+;The bit-maps we are given are single pixel bit-maps with each line starting
+;  at a byte boundry.
+
+vesasetcurpat:
+
+	RET
+.PAGE
+	DATA
+
+ioports:.WORD	100h, 0FEF0h, 0, 0
+
+
+modetbl:.BLKB	mtbl_SIZE*MODETBLMAX
+
+	.SEG16
+
+realcode:
+	INT	10H
+	HLT
+	HLT
+	.WORD	349h
+rcsize=!{{$-realcode}+3}/4
+
+	.SEG32
+
+	.MOD	4
+realregs:.BLKB	xrr_SIZE
+
+	.MOD	2
+iortbl:	.WORD	100, 0000
+	.WORD	30 , 03B0
+	.WORD	8  , 0CF8
+iortblx:.BLKW	13t		;Allow for 6 expansion entires (there are up
+				;  to 6 PCI address registers)
+.PAGE
+	DATA
+
+vesatype:.ASCIZ "VESA VGA"
+
+	LKEEND

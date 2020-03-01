@@ -1,0 +1,206 @@
+	.TITLE	IPSSRVXE - Internet general purpose server for XOS
+	.SBTTL	Routines for extended echo protocol
+
+;++++
+; This software is in the public domain.  It may be freely copied and used
+; for whatever purpose you see fit, including commerical uses.  Anyone
+; modifying this software may claim ownership of the modifications, but not
+; the complete derived code.  It would be appreciated if the authors were
+; told what this software is being used for, but this is not a requirement.
+
+;   THIS SOFTWARE IS PROVIDED BY THE AUTHORS "AS IS" AND ANY EXPRESS OR
+;   IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
+;   OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+;   IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+;   INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+;   BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS
+;   OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+;   ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR
+;   TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
+;   USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+;----
+
+	.PROC	80386
+
+	.INCLUD	XOSINC:\XMAC\STDIO.PAR
+	.INCLUD	XOSINC:\XMAC\XOS.PAR
+	.INCLUD	XOSINC:\XMAC\XOSERR.PAR
+	.INCLUD	XOSINC:\XMAC\XOSNET.PAR
+	.INCLUD	IPSSRV.PAR
+
+	.STDSEGS
+
+	.PSECT	_TEXT_p
+
+	.SBTTL	udpxechosetup - Subroutine to initialize the UDP extended echo server
+
+;Subroutine to initialize the UDP extended echo server
+;	c{EDI] = Offset of UCB
+;	CALL	xechosetup
+
+udpxechosetup::
+	PUSHL	DS			;Get the XOS version number
+	PUSHL	#sysname
+	PUSHL	DS
+	PUSHL	#xvclschar
+	CALLF	svcIoClsChar#
+	MOVL	EAX, xosverx		;Convert value to network byte order
+	XCHGB	AL, AH
+	RORL	EAX, #16t
+	XCHGB	AL, AH
+	MOVL	xosver, EAX
+	MOVL	EAX, ucb_xechoport.B[EDI] ;Make the UDB
+	CALL	makeudb#
+	JC	6$.S			;If error
+	PUSHL	EDI			;Save offset of the UCB
+
+	PUSHL	ucb_xechodata.B[EDI]	;Save the data value
+
+	PUSHL	ucb_xechonum.B[EDI]	;Get number of IDBs needed
+	LEAL	EBX, ucb_xechoidb.B[EDI]
+	MOVL	EDI, ESI		;Get UDB offset in right register
+4$:	PUSHL	EBX
+	MOVL	EBX, #udpxechooutputdone
+	MOVL	EDX, #udpxechoinputdone
+	MOVL	ECX, #idb_xechoSIZE+idb_mSIZE
+	CALL	makeidb#
+	JC	6$.S
+	POPL	EBX
+	MOVL	[EBX], ESI
+	MOVL	EBX, ESI
+	MOVL	idb_outqab+qab_count.B[ESI], #20t ;Store output count
+	MOVL	EAX, 4.B[ESP]		;Get data value
+	XCHGB	AL, AH			;Change to network byte order
+	RORL	EAX, #16t
+	XCHGB	AL, AH
+	MOVL	idb_data.B[ESI], EAX	;Store in the IDB
+	DECL	[ESP]
+	JNE	4$.S			;Continue if more to do
+	POPL	EAX			;Fix up the stack
+	POPL	EAX
+	MOVL	[EBX], #0
+	POPL	EDI			;Restore UCB offset
+	MOVL	EBX, #xechomsg
+	JMP	ireport#
+
+;Here if error while doing set up
+
+6$:	MOVL	EBX, #xechomsg
+	JMP	sfail#
+.PAGE
+	.SBTTL	udpxechoinputdone - Signal routine for UDP echo input available
+
+;Signal routine for UDP echo input available
+;	c{ESI} = Offset of IDB
+
+;The echo packet is 20 bytes long as follows (note that all items are stored
+;  using netork byte order (high order byte first)):
+;   Item    Length     Description
+;    ID       4      First 4 bytes from the input packet
+;   Data      4      Value specified for UDPXECHOD
+;   Time      8      Current date and time in XOS format
+;   Ver       4      XOS version number
+
+udpxechoinputdone:
+	TESTB	idb_inpqab+qab_status+1.B[ESI], #QSTS$DONE>8t;Really have input?
+	JE	6$.S			;No!
+	CMPL	idb_inpqab+qab_error.B[ESI], #0.B ;Error?
+	JS	8$.S			;Yes
+	MOVL	ECX, idb_inpqab+qab_amount.B[ESI] ;Get length of the packet
+	SUBL	ECX, #4.B		;Have at least 4 bytes?
+	JGE	4$.S			;Yes - go on
+	NEGL	ECX			;No - zero any bytes we didn't get
+	LEAL	EDI, idb_buffer.B[ESI]
+	ADDL	EDI, idb_inpqab+qab_amount.B[ESI]
+	PUSHL	DS
+	POPL	ES
+	STC
+	CLRL	EAX
+	RSTOSB	[EDI]
+4$:	MOVL	EAX, idb_data.B[ESI]	;Get data value
+	MOVL	idb_buffer+4t.B[ESI], EAX	
+	PUSHL	#11t.B			;Get current date and time (high
+	PUSHL	DS			;  resolution)
+	PUSHL	#datetime
+	CALLF	svcSysDateTime#
+	MOVL	EAX, datetime+4		;Change to network byte order and store
+	XCHGB	AL, AH			;  it in the buffer
+	RORL	EAX, #16t
+	XCHGB	AL, AH
+	MOVL	idb_buffer+8t.B[ESI], EAX
+	MOVL	EAX, datetime+0
+	XCHGB	AL, AH
+	RORL	EAX, #16t
+	XCHGB	AL, AH
+	MOVL	idb_buffer+12t.B[ESI], EAX
+	MOVL	EAX, xosver		;Get XOS version
+	MOVL	idb_buffer+16t.B[ESI], EAX
+	MOVL	EAX, idb_inpparms+4t.B[ESI] ;Copy network address and port
+	MOVL	idb_outparms+4t.B[ESI], EAX ;  number
+	MOVL	EAX, idb_inpparms+12t.B[ESI]
+	MOVL	idb_outparms+12t.B[ESI], EAX
+	PUSHL	DS			;Output it
+	LEAL	EAX, idb_outqab.B[ESI]
+	PUSHL	EAX
+	CALLF	svcIoQueue#
+	TESTL	EAX, EAX
+	JS	10$.S			;If error
+	RET
+
+;Here if don't really have input done
+
+6$:	HLT
+
+;Here if have error on input
+
+8$:	HLT
+
+;Here if have error queueing output
+
+10$:	HLT
+.PAGE
+	.SBTTL	udpxechooutputdone - Signal routine for UDP echo output done
+
+;Signal routine for UDP echo input available
+
+udpxechooutputdone:
+	TESTB	idb_outqab+qab_status+1.B[ESI], #QSTS$DONE>8t
+					;Really have output?
+	JE	6$.S			;No!
+	CMPL	idb_outqab+qab_error.B[ESI], #0.B ;Error?
+	JS	8$.S			;Yes
+	PUSHL	DS
+	LEAL	EAX, idb_inpqab.B[ESI]	;OK - queue another input request
+	PUSHL	EAX
+	CALLF	svcIoQueue#
+	TESTL	EAX, EAX
+	JS	10$.S
+	RET
+
+;Here if don't really have output done
+
+6$:	HLT
+
+;Here if have error on output
+
+8$:	HLT
+
+;Here if have error queueing next input request
+
+10$:	HLT
+.PAGE
+	.SBTTL	Local data
+
+	.PSECT	_DATA_p
+
+datetime: .LONG  0, 0		;Date/time value
+xosver:   .LONG  0
+
+xvclschar:DCHAR  XOSVER, GET, HEXV, 4t
+xosverx:  .LONG	 0		;XOS version number
+	  .BYTE  0
+
+sysname:  .ASCIZ "SYSTEM:"
+xechomsg: .ASCIZ "UDP extended echo (UDPXECHO)"
+
+	.END

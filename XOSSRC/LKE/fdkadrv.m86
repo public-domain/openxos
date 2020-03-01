@@ -1,0 +1,2544 @@
+	.TITLE	FDKADRV - Floppy disk device driver type A
+
+;++++
+; This software is in the public domain.  It may be freely copied and used
+; for whatever purpose you see fit, including commerical uses.  Anyone
+; modifying this software may claim ownership of the modifications, but not
+; the complete derived code.  It would be appreciated if the authors were
+; told what this software is being used for, but this is not a requirement.
+
+;   THIS SOFTWARE IS PROVIDED BY THE AUTHORS "AS IS" AND ANY EXPRESS OR
+;   IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
+;   OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+;   IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+;   INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+;   BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS
+;   OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+;   ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR
+;   TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
+;   USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+;----
+
+	.PROC	80486
+	.INCLUD	XOSINC:\XMAC\XOS.PAR
+	.INCLUD	XOSINC:\XMAC\XOSX.PAR
+	.INCLUD	XOSINC:\XMAC\XOSERR.PAR
+	.INCLUD	XOSINC:\XMAC\PCAT.PAR
+	.INCLUD	XOSINC:\XMAC\XOSDISK.PAR
+	.INCLUD	XOSINC:\XMAC\XOSXDISK.PAR
+	.INCLUD	XOSINC:\XMAC\XOSTIME.PAR
+	.INCLUD	XOSINC:\XMAC\XOSLKE.PAR
+	.INCLUD	XOSINC:\XMAC\XOSXLKE.PAR
+
+;This is the device driver for the PC/AT floppy disk controller.  It supports
+;  up to 4 drives on each controller and any number of controllers.  Each
+;  controller must have a unique IO register address but all controllers must
+;  use IRQ 6 and DMA 2.  The use of the IRQ and DMA lines is treated as a
+;  shared resource and only one controller can actually be transfering data
+;  at a time.
+
+MAJV   =!1t
+MINV   =!1t
+EDITNUM=!3t
+
+;v1.0.0  19-JuL-94
+;	Initial version
+;v1.1.0  28-Aug-94
+;	Fixed problem with counting some device errors.
+;v1.1.1  29-Dec-94
+;	Added code to check status register before reading first status byte
+;	after interrupt.  Some Dell machines don't have the byte ready
+;	immediately and trying to read it too soon really messes up the
+;	controller!
+;v1.1.2  23-Jan-94
+;	Fixed problem with hardware errors with no corresponding counters,
+;	such errors incremented UCB link pointer and name!
+;v1.1.3  20-Nov-99
+;	Removed the BOOT load-time characteristic.  This is no longer needed
+;	since DISKINST is now used to set up boot-time devices.
+
+	LKEHEAD	FDKADRV, MAJV, MINV, EDITNUM, LKETYPE_DEVICE
+
+;Following table describes the supported drives types:
+;    Size     TrackDen DataDen Mod  RotSpeed   Freq
+;    8"DD     48tpi    Single  FM    360rpm   500KHz
+;    8"DD     48tpi    Double  MFM   360rpm   500KHz
+;    5.25"DD  48tpi    Single  FM    300rpm   250KHz
+;    5.25"DD  48tpi    Double  MFM   300rpm   250KHz
+;    5.25"HD  48tpi    Single  FM    360rpm   300KHz
+;    5.25"HD  48/96tpi Double  MFM   360rpm   300KHz
+;    5.25"HD  96tpi    High    MFM   360rpm   500KHz
+;    3.5"DD   135tpi   Double  MFM   300rpm   250KHz
+;    3.5"HD   135tpi   Double  MFM   300rpm   250KHz
+;    3.5"HD   135tpi   High    MFM   300rpm   500KHz
+
+;Following table gives the default initial parameters for each supported drive
+;  type:
+;Type TrackDen DataDen Mod   Freq  MS Rmv SecSz Sect Hd Trk SRT HUT HLT MST
+; DD8  48tpi   Double  MFM  500KHz  N  Y   512    8   2  77  8  240  1  1000
+; DD5  48tpi   Double  MFM  300KHz  N  Y   512    9   2  40  6  240  1  1000
+; HD5  96tpi   High    MFM  500KHz  Y  Y   512   15   2  80  3  240  1  1000
+; DD3  135tpi  Double  MFM  250KHz  Y  Y   512    9   2  80  6  240  1  1000
+; HD3  135tpi  High    MFM  500KHz  Y  Y   512   18   2  80  6  240  1  1000
+
+;When attempting to mount a disk, the sector size is first determined by
+;  reading a header on track 0, head 0.  The initial parameters are then first
+;  used to attempt to read sector 1, track 0, head 0 if the disk is not
+;  mounted.  If it is mounted, the current parameter values are used first,
+;  followed by the use of the initial parameters.  If this fails, the next
+;  lowest density is used (the initial density is assumed to be the highest
+;  density the drive supports), except that single density is never used on
+;  5.25" drives.  If this sector is a valid boot block for a supported file
+;  system, the disk is mounted and the current parameters are set from data in
+;  the boot block.  If the disk does not contain a valid boot block, it is
+;  mounted as a non-file structured disk with the initial parameters for the
+;  drive.
+
+;Some floppy controllers reverse the sense of the media change bit in the
+;  digital input register.  To handle this, we do not use this bit until we
+;  have done a succesful access of a floppy on other than track 0 (which should
+;  insure that the media change bit has been reset).  We then check the media
+;  change bit and assume that the sense it has at that time means that a disk
+;  is present.
+
+;Define offsets in the device dependent part of the KCB for floppy disks
+
+$$$=!kcb_devdep
+BLK kcb_fdmoto  , 1t	;Motor on bits for controller
+BLK kcb_fdtrkd  , 1t	;Current track density (value for P_DC1FDCTL)
+BLK kcb_fdselect, 1t	;Current drive select value
+BLK kcb_fdtype  , 1t	;Floppy controller type
+BLK kcb_fdspcfy , 2t	;Current specify command value
+BLK kcb_fdmssen , 1t	;Media sensor sense
+BLK             , 1
+kcb_fdSIZE=!$$$
+
+;Define offsets in the stack frame used by all routines which access the floppy
+;  controller
+
+$$$=!0
+FRM fdk_retry1, 1t		;Retry counter for restore during data transfer
+FRM fdk_retry2, 1t		;Retry counter for restore during seek
+FRM fdk_retry3, 1t		;Retry counter for seek operation
+FRM fdk_retry4, 1t		;Retry counter for data transfer operation
+				;Following three items must be in this order!
+FRM           , 2t		;Reserved (must not be used)
+FRM fdk_mode  , 1t		;Mode bits for transfer
+FRM fdk_func  , 1t		;Function value for interface
+FRM fdk_daddr , 4t		;Disk address
+FRM fdk_buffer, 8t		;Address of buffer for transfer
+FRM fdk_count , 4t		;Amount to transfer
+FRM fdk_block , 4t		;Disk block number
+FRM fdk_amount, 4t		;Total amount transfered
+fdk_SIZE=!$$$
+
+;Define values for fdk_mode
+
+FM$LIST=!04h			;Transfering buffer list
+FM$READ=!02h			;Reading data
+
+	CODE
+
+;Floppy disk device driver dispatch table
+
+fdkdsp:	.LONG	fdkinit		;kf_init     =  0. - Initialize controller
+	.LONG	0		;kf_getparms =  4. - Get drive parameters
+	.LONG	0		;kf_getaparms=  8. - Get alternate drive
+				;		       parameters
+	.LONG	0		;kf_setparms = 12. - Set drive parameters
+	.LONG	fdkreadraw	;kf_readraw  = 16. - Read raw block
+	.LONG	fdkreaddata	;kf_readdata = 20. - Read block
+	.LONG	fdkreadlist	;kf_readlist = 24. - Read buffer list
+	.LONG	fdkreadid	;kf_readid   = 28. - Read ID field
+	.LONG	fdkwritraw	;kf_writraw  = 32. - Write raw block
+	.LONG	fdkwritdata	;kf_writdata = 36. - Write block
+	.LONG	fdkwritlist	;kf_writlist = 40. - Write buffer list
+	.LONG	fdkformat	;kf_format   = 44. - Format track
+	.LONG	fdkchkwpf	;kf_chkwp    = 48. - Check write protect status
+				;		       at fork level
+	.LONG	fdkchkchgf	;kf_chkchg   = 52. - Check for possible disk
+				;		       change at fork level
+	.LONG	0		;kf_sessions = 56. - Get CD-ROM session list
+	.LONG	0		;kf_tracks   = 60. - Get CD-ROM track list
+	.LONG	fdkmedia	;ks_media    = 64. - Determine media type
+	.LONG	fdkchkwp	;ks_chkwp    = 68. - Check write protect status
+	.LONG	fdkchkchg	;ks_chkchg   = 72. - Check for possible disk
+				;		       change
+	.LONG	fdkchkchg	;ks_senchg   = 76. - Sense disk change
+	.LONG	fdkaddunit	;ks_addunit  = 80. - Add disk unit
+	.LONG	fdkunmount	;ks_unmount  = 84. - Unmount disk
+
+;Floppy disk device characteristics table
+
+	DATA
+
+	.MOD	4
+fdkdchartbl:
+ DCHARBGN  1, knlDCharValCom##
+ DCHARENT  CLASS   , TEXT, ,   8, knlDcMsgClass##    , knlDcGetClass##  , knlDcSetClass##   , 0
+ DCHARENT  TYPE    , TEXT, ,   4, knlDcMsgType##     , knlDcGet4Byte##  , 0                 , dcb_type
+ DCHARENT  CONDESP , TEXT, ,   4, xosdskMsgConDsp##  , getcondesp       , 0                 , 0
+ DCHARENT  IOREG   , HEXV, ,   2, knlDcMsgIoReg##    , xosdskGtU2Byte## , 0                 , ucb_ioreg1
+ DCHARENT  INDEX   , DECV, ,   1, knlDcMsgIndex##    , xosdskGtU1Byte## , 0                 , ucb_index
+ DCHARENT  INT     , DECV, ,   1, knlDcMsgInt##      , xosdskGtK1Byte## , 0                 , kcb_intlvl
+ DCHARENT  UNITTYPE, TEXT, ,   4, knlDcMsgUnitType## , xosdskUnitType## , setunittype       , 0
+ DCHARENT  MSENSOR , TEXT, ,   4, xosdskMsgMSensor## , xosdskGetBits##  , xosdskSetBits##   , UB$MEDIAC
+ DCHARENT  REMOVE  , TEXT, ,   4, xosdskMsgRemove##  , xosdskGetRemove##, 0                 , 0
+ DCHARENT  VOLNAME , TEXT, ,  16, xosdskMsgVolName## , xosdskGtU16Byte##, xosdskStU8Byte##  , ucb_volname
+ DCHARENT  DOSNAME , TEXT, ,  16, xosdskMsgDosName## , xosdskGtU16Byte##, xosdskStU8Byte##  , ucb_dosname
+ DCHARENT  PARTN   , HEXV, ,   1, xosdskMsgPartn##   , xosdskGtU1Byte## , 0                 , ucb_partnx
+ DCHARENT  PARTOFF , DECV, ,   4, xosdskMsgPartOff## , xosdskGtU4Byte## , 0                 , ucb_partnoff
+ DCHARENT  TRKDEN  , DECV, ,   1, xosdskMsgTrkDen##  , gettrkden        , settrkden         , 0
+ DCHARENT  DATADEN , TEXT, ,   8, xosdskMsgDataDen## , getdataden       , setdataden        , 0
+ DCHARENT  CBLKSZ  , DECV, ,   2, xosdskMsgCBlkSz##  , xosdskGtU4Byte## , setcblksz         , ucb_csecsz
+ DCHARENT  CHEADS  , DECV, ,   1, xosdskMsgCHeads##  , xosdskGtU1Byte## , setsizecparm      , ucb_cheads
+ DCHARENT  CSECTS  , DECV, ,   4, xosdskMsgCSects##  , xosdskGtU4Byte## , setsizecparm      , ucb_csects
+ DCHARENT  CCYLNS  , DECV, ,   4, xosdskMsgCCylns##  , xosdskGtU4Byte## , setsizecparm      , ucb_ccylns
+ DCHARENT  CBLOCKS , DECV, ,   4, xosdskMsgCBlocks## , xosdskGtU4Byte## , 0                 , ucb_cblocks
+ DCHARENT  IBLKSZ  , DECV, ,   2, xosdskMsgIBlkSz##  , xosdskGtU4Byte## , setiblksz         , ucb_isecsz
+ DCHARENT  IHEADS  , DECV, ,   1, xosdskMsgIHeads##  , xosdskGtU1Byte## , setsizeiparm      , ucb_iheads
+ DCHARENT  ISECTS  , DECV, ,   4, xosdskMsgISects##  , xosdskGtU4Byte## , setsizeiparm      , ucb_isects
+ DCHARENT  ICYLNS  , DECV, ,   4, xosdskMsgICylns##  , xosdskGtU4Byte## , setsizeiparm      , ucb_icylns
+ DCHARENT  IBLOCKS , DECV, ,   4, xosdskMsgIBlocks## , xosdskGtU4Byte## , 0                 , ucb_iblocks
+ DCHARENT  XGAPLEN , DECV, ,   2, msgxgpl            , xosdskGtU2Byte## , xosdskStU2Byte##  , ucb_fdxgpl
+ DCHARENT  SRTIME  , DECV, ,   1, msgsrt             , xosdskGtU1Byte## , setsrt            , ucb_fdsrt
+ DCHARENT  HUTIME  , DECV, ,   2, msghut             , xosdskGtU2Byte## , sethut            , ucb_fdhut
+ DCHARENT  HLTIME  , DECV, ,   2, msghlt             , xosdskGtU2Byte## , sethlt            , ucb_fdhlt
+ DCHARENT  MSTIME  , DECV, ,   4, msgmst             , xosdskGtU4Byte## , xosdskStU4Byte##  , ucb_fdmst
+ DCHARENT  MOTIME  , DECV, ,   1, msgmot             , xosdskGtU1Byte## , setmot            , ucb_fdmot
+ DCHARENT  WTMAX   , DECV, ,   4, knlDcMsgWTMax##    , xosdskGtU4Byte## , xosdskSetWTMax##  , ucb_wtmax
+ DCHARENT  RAMAX   , DECV, ,   4, knlDcMsgRAMax##    , xosdskGtU4Byte## , xosdskSetRAMax##  , ucb_ramax
+ DCHARENT  DTHLIMIT, DECV, ,   4, knlDcMsgDTHLimit## , xosdskGtU4Byte## , 0                 , ucb_dthlimit
+ DCHARENT  BLOCKIN , DECV, ,   4, xosdskMsgBlockIn## , xosdskGtU4Byte## , xosdskStU4Byte##  , ucb_blockin
+ DCHARENT  BLOCKOUT, DECV, ,   4, xosdskMsgBlockOut##, xosdskGtU4Byte## , xosdskStU4Byte##  , ucb_blockout
+ DCHARENT  BYTEIN  , DECV, ,   4, knlDcMsgByteIn##   , xosdskGtU4Byte## , xosdskStU4Byte##  , ucb_bytein
+ DCHARENT  BYTEOUT , DECV, ,   4, knlDcMsgByteOut##  , xosdskGtU4Byte## , xosdskStU4Byte##  , ucb_byteout
+ DCHARENT  TDEVERR , DECV, ,   4, knlDcMsgTDevErr##  , xosdskGtU4Byte## , xosdskStU4Byte##  , ucb_tdeverr
+ DCHARENT  HDEVERR , DECV, ,   4, knlDcMsgHDevErr##  , xosdskGtU4Byte## , xosdskStU4Byte##  , ucb_hdeverr
+ DCHARENT  TDATAERR, DECV, ,   4, knlDcMsgTDataErr## , xosdskGtU4Byte## , xosdskStU4Byte##  , ucb_tdataerr
+ DCHARENT  HDATAERR, DECV, ,   4, knlDcMsgHDataErr## , xosdskGtU4Byte## , xosdskStU4Byte##  , ucb_hdataerr
+ DCHARENT  TSEEKERR, DECV, ,   4, xosdskMsgTSeekErr##, xosdskGtU4Byte## , xosdskStU4Byte##  , ucb_tseekerr
+ DCHARENT  HSEEKERR, DECV, ,   4, xosdskMsgHSeekErr##, xosdskGtU4Byte## , xosdskStU4Byte##  , ucb_hseekerr
+ DCHARENT  TIDFERR , DECV, ,   4, xosdskMsgTIdFErr## , xosdskGtU4Byte## , xosdskStU4Byte##  , ucb_tidferr
+ DCHARENT  HIDFERR , DECV, ,   4, xosdskMsgHIdFErr## , xosdskGtU4Byte## , xosdskStU4Byte##  , ucb_hidferr
+ DCHARENT  TRNFERR , DECV, ,   4, xosdskMsgTRNFErr## , xosdskGtU4Byte## , xosdskStU4Byte##  , ucb_trnferr
+ DCHARENT  HRNFERR , DECV, ,   4, xosdskMsgHRNFErr## , xosdskGtU4Byte## , xosdskStU4Byte##  , ucb_hrnferr
+ DCHARENT  TOVRNERR, DECV, ,   4, knlDcMsgTOvrnErr## , xosdskGtU4Byte## , xosdskStU4Byte##  , ucb_tovrnerr
+ DCHARENT  HOVRNERR, DECV, ,   4, knlDcMsgHOvrnErr## , xosdskGtU4Byte## , xosdskStU4Byte##  , ucb_hovrnerr
+ DCHARENT  HUNGERR , DECV, ,   4, knlDcMsgHungErr##  , xosdskGtU4Byte## , xosdskStU4Byte##  , ucb_hungerr
+ DCHARENT  FSTYPE  , TEXT, ,   8, xosdskMsgFSType##  , xosdskGtU8Byte## , 0                 , ucb_fsname
+ DCHARENT  CLSSZ   , DECV, ,   4, xosdskMsgClsSz##   , xosdskGtU4Byte## , 0                 , ucb_clussize
+ DCHARENT  CLUSTERS, DECV, ,   4, xosdskMsgClsters## , xosdskGtU4Byte## , 0                 , ucb_total
+ DCHARENT  AVAIL   , DECV, ,   4, xosdskMsgAvail##   , xosdskGtU4Byte## , 0                 , ucb_avail
+ DCHARENT  FATMODE , HEXV, ,   1, xosdskMsgFatMode## , xosdskGtU1Byte## , 0                 , ucb_fatmode
+ DCHARENT  DUPFAT  , TEXT, ,   4, xosdskMsgDupFat##  , xosdskGetBits##  , xosdskSetBits##   , UB$DUPFAT
+ DCHARENT  FATSIZE , DECV, ,   4, xosdskMsgFatSize## , xosdskGtU4Byte## , 0                 , ucb_satsize
+ DCHARENT  NUMFATS , DECV, ,   4, xosdskMsgNumFats## , xosdskGtU4Byte## , 0                 , ucb_numsat
+ DCHARENT  ROOTBLK , DECV, ,   4, xosdskMsgRootBlk## , xosdskGtU4Byte## , 0                 , ucb_rootblk
+ DCHARENT  ROOTSIZE, DECV, ,   4, xosdskMsgRootSize##, xosdskGtU4Byte## , 0                 , ucb_rootsize
+ DCHARENT  ROOTPROT, STR , , 100, xosdskMsgRootProt##, xosdskGtRtProt## , xosdskStRtProt##  , 0
+
+	CODE
+
+msgxgpl:DCHARINFO  {Gap length for transfers}
+msgsrt: DCHARINFO  {Step rate timing in milliseconds}
+msghut: DCHARINFO  {Head unload time in milliseconds}
+msghlt: DCHARINFO  {Head load time in milliseconds}
+msgmst: DCHARINFO  {Motor start time in milliseconds}
+msgmot: DCHARINFO  {Motor off time in seconds}
+.PAGE
+	.SBTTL	Initialization
+
+	INITSUB	initfdka
+
+	DATA
+
+	.MOD	4
+fdkinitblk:					;Characteristics description
+ DCHARBGN  2, knlDCharValCom##			;  block for initialization
+ DCHARENT  RESULT, STR , , 0, 0, knlGetDcNullS##, 0       , 0
+
+	ONCE
+
+initfdka::
+	PUSHL	FS
+	PUSHL	EDX
+	MOVL	EBX, #'FDKA'		;Get disk driver name
+	MOVL	EDX, #fdkdsp		;Get offset of dispatch table
+	CALL	xosdskNewDriver##	;Register this disk driver
+	POPL	EDX
+	POPL	FS
+	JC	6$.S
+	TESTL	EDX, EDX		;Have a characteristics list?
+	JE	2$.S			;No
+	MOVB	AL, #0			;Yes - fail on errors
+	MOVL	EBX, #fdkinitblk	;Point to characteristics table
+	CALL	knlAddUnitChar##	;Process characteristics
+	JC	10$.S			;If error
+2$:	CLRL	EAX			;OK
+	CLRL	EDX
+	MOVL	ECX, #codetop
+6$:	RET
+
+;Here if error after driver has been registered
+
+10$:	CALL	xosdskUnlinkDriver##	;Unlink the driver
+	STC				;Return failure
+	RET
+
+	CODE
+.PAGE
+	.SBTTL	fdkaddunit - Subroutine to add disk unit
+
+;Subroutine to add disk unit
+;	c{EAX}    = Unit number
+;	c{EBX}    = Offset of KCB for controller (0 if none)
+;	c{ECX}    = Index on controller
+;	c{FS:EDX} = Address of characteristics list
+;	c{ESI}    = Base IO register
+;	CALL	fdkaddunit
+;	c{EAX} = Error code
+;	c{EBX} = Status bits
+;	c{ECX} = Item count (number of units added)
+
+$$$=!0
+FRM fau_char , 8t	;Address of characteristics list
+FRM fau_ioreg, 4t	;Base IO register number
+FRM fau_index, 4t	;Index on controller
+FRM fau_bits , 1t	;Value for ubc_bits
+FRM fau_type , 1t
+FRM fau_unit , 1t	;Unit number
+FRM fau_info , 1t	;Information about drive
+FRM fau_cdsp , 1t	;Controller description
+FRM fau_srt  , 1t	;Step rate time value
+FRM fau_xgpl , 1t	;Transfer gap length
+FRM          , 1t
+FRM fau_head , 4t	;Heads per track (1 or 2)
+FRM fau_ssize, 4t	;Default sector size (bytes)
+FRM fau_tsize, 4t	;Default track size (sectors)
+FRM fau_cyln , 4t	;Default number of cylinders
+FRM fau_kcb  , 4t	;Offset of KCB
+fau_SIZE=!$$$
+
+;Define bits for fau_info
+
+INFO$NEWOAS=!02h	;New once-a-second routine set up
+INFO$NEWKCB=!01h	;New KCB created
+
+	DATA
+
+	.MOD	4
+fdkaublk:				;Characteristics description block
+ DCHARBGN  3, knlDCharValCom##		;  for addunit
+ DCHARENT  TYPE    , TEXT, , 8, 0, 0, knlRtnZero##, 0
+ DCHARENT  UNIT    , DECV, , 4, 0, 0, knlRtnZero##, 0
+ DCHARENT  CONDESP , TEXT, , 8, 0, 0, fdkaucdsp   , 0
+ DCHARENT  IOREG   , HEXV, , 4, 0, 0, knlRtnZero##, 0
+ DCHARENT  INDEX   , DECV, , 4, 0, 0, fdkauindex  , 0
+ DCHARENT  UNITTYPE, TEXT, , 8, 0, 0, fdkauutyp   , 0
+
+	CODE
+
+;Values for the CONDESP parameter
+
+cdspval:.LONG	'PCAT', 0, FCT_PCAT
+	.LONG	'CMPT', 0, FCT_CMPT
+CDSPVALSZ=!{$-cdspval}/12t
+
+;Values for the UNITTYPE parameter
+
+utypval:.LONG	'HD3', 0, {DT_HD3<8}|DD_HIGH|UB$MEDIAC
+	.LONG	'DD3', 0, {DT_DD3<8}|DD_DOUBLE|UB$MEDIAC
+	.LONG	'HD5', 0, {DT_HD5<8}|DD_HIGH|UB$MEDIAC
+	.LONG	'DD5', 0, {DT_DD5<8}|DD_DOUBLE|UB$48TPI
+	.LONG	'DD8', 0, {DT_DD8<8}|DD_DOUBLE
+UTYPVALSZ=!{$-utypval}/12t
+
+;Values for the DDEN parameter
+
+ddenval:.LONG	'S'   , 0   , DD_SINGLE
+	.LONG	'SING', 'LE', DD_SINGLE
+	.LONG	'D'   , 0   , DD_DOUBLE
+	.LONG	'DOUB', 'LE', DD_DOUBLE
+	.LONG	'H'   , 0   , DD_HIGH
+	.LONG	'HIGH', 0   , DD_HIGH
+	.LONG	0
+DDENVALSZ=!{$-ddenval}/12t
+
+;Generate table which gives default values as a function of drive type
+
+	.MACRO	XX  srt, nmcyl, xgpl, fgpl, nsec, nhds, secsz
+	.BYTE	srt, nmcyl't, xgpl'h, fgpl'h, nsec't, nhds
+	.WORD	secsz't
+	.ENDM
+
+;	   SRT NmCyl XGpl FGpl #Sec#Hds SecSz
+dvaltbl:XX  6,  80,  1B,  60,   9,  2,  512 ;DT_DD3 = 1 - 3.5" double density
+	XX  6,  80,  1B,  6C,  18,  2,  512 ;DT_HD3 = 2 - 3.5" high density
+	XX  6,  40,  2A,  50,  15,  2,  512 ;DT_DD5 = 3 - 5.25" double density
+	XX  3,  80,  2A,  54,   9,  2,  512 ;DT_HD5 = 4 - 5.25" high density
+	XX  8,  77,  0F,  1B,  26,  1,  128 ;DT_DD8 = 5 - 8" double density
+
+	CODE
+
+2$:	LEAVE
+	RET
+
+fdkaddunit:
+	ENTER	fau_SIZE, 0		;Allocate our stack frame
+	MOVB	fau_unit.B[EBP], AL	;Store unit number
+	MOVL	fau_kcb.B[EBP], EBX	;Store possible KCB offset
+	MOVL	fau_ioreg.B[EBP], ESI	;Store base IO register
+	MOVL	fau_char+0.B[EBP], EDX	;Store address of characteristis list
+	MOVL	fau_char+4.B[EBP], FS
+	MOVB	fau_info.B[EBP], #0
+	MOVL	fau_index.B[EBP], #-1
+	MOVB	fau_cdsp.B[EBP], #FCT_PCAT
+	MOVL	EAX, #{DT_HD5<8}|DD_HIGH|UB$MEDIAC
+	CALL	fdkauutyp2		;Set up default drive type
+	MOVL	EBX, #fdkaublk		;Point to our characteristics table
+	IFFAULT	knlQAdrErr0Lv##
+	LFSL	EDX, fau_char.B[EBP]	;Point to caller's characteristics list
+	MOVB	AL, #0			;Fail on bad names
+	CALL	knlAddUnitChar##	;Process characteristics
+	JC	10$			;If error
+	CMPL	fau_index.B[EBP], #-1.B
+	JE	14$
+	MOVB	AL, #'F'		;OK - see if this unit is defined now
+	MOVB	AH, fau_unit.B[EBP]
+	CALL	xosdskSrchUnit##
+	JE	15$			;Defined - fail
+	CALL	knlGetXRes##		;Get the exec memory resource
+	MOVL	EBX, fau_kcb.B[EBP]	;Is there a KCB now?
+	TESTL	EBX, EBX
+	JNE	28$			;Yes - go on
+	MOVB	CL, #{ID_FDISK-ID_HBASE}/8 ;No - see if our vector is available
+	CALL	knlChkIRqAvl##
+	JC	8$.S
+	MOVL	EDX, fau_ioreg.B[EBP]	;See if our IO registers are available
+	LEAL	ECX, 5.B[EDX]
+	CALL	knlChkIORegs##
+	JC	8$.S
+	MOVL	EDX, fau_ioreg.B[EBP]
+	ADDL	EDX, #7.B
+	MOVL	ECX, EDX
+	CALL	knlChkIORegs##
+	JC	8$
+	CMPB	fau_cdsp.B[EBP], #FCT_CMPT ;Is this a ComptiCard?
+	JNE	6$.S			;No
+	MOVL	EDX, fau_ioreg.B[EBP]	;Yes - register its extra register
+	ADDL	EDX, #P_DCFDCR2
+	MOVL	ECX, EDX
+	CALL	knlChkIORegs##
+	JC	8$
+6$:	MOVL	EDX, fau_ioreg.B[EBP]
+	A2IOP	P_DCFDDOR		;Set reset
+	MOVB	AL, #00h
+	OUTB	[DX]
+	IOPAUSE
+	MOVL	ECX, #10t
+	CALL	knlSDelay##
+	MOVB	AL, #04h		;Remove reset
+	OUTB	[DX]
+	IOPAUSE
+	MOVL	ECX, #50t		;Wait for a while
+	CALL	knlSDelay##
+	A2IOP	P_DCFDSTS-P_DCFDDOR	;Try to read status reg
+	INB	[DX]
+	IOPAUSE
+	TESTB	AL, #7Fh		;Is it right?
+	JE	22$.S			;Yes
+	MOVL	EAX, #ER_PDNAV		;No - fail
+8$:	CALL	knlGiveXRes##
+10$:	LEAVE
+	CLRL	ECX
+	MOVL	EBX, #QSTS$DONE
+	TOFORK
+	RET
+
+14$:	MOVL	EAX, #ER_CHARM
+	JMP	10$.S
+
+15$:	MOVL	EAX, #ER_DUADF
+	JMP	10$.S
+
+;Here if error after once-a-second routine is set up
+
+16$:	TESTB	fau_info.B[EBP], #INFO$NEWOAS
+	JE	18$.S
+	MOVL	EDX, #fdkoas
+	CALL	knlUnlinkOAS##
+
+;Here if error after KCB is set up
+
+18$:	TESTB	fau_info.B[EBP], #INFO$NEWKCB
+	JE	22$.S
+20$:	MOVL	EBX, EDI
+	CALL	xosdskGiveupKcb2##
+	JMP	8$.S
+
+;Here if controller exists
+
+22$:	MOVL	ECX, #kcb_fdSIZE		;Make a KCB
+	MOVL	EBX, #fdkdsp
+	MOVB	AL, #KB$AHEAD+KB$DEFER
+	MOVL	EDX, #'FDKA'
+	CLRL	ESI
+	CALL	xosdskMakeKcb##
+	JC	8$.S
+	MOVL	fau_kcb.B[EBP], EDI	;Remember where our KCB is
+	ORB	fau_info.B[EBP], #INFO$NEWKCB
+	MOVL	kcb_fdisp.B[EDI], #fdkfork
+	MOVL	EAX, fau_ioreg.B[EBP]	;Store base IO register number in the
+	MOVL	kcb_ioreg1.B[EDI], EAX	;  KCB
+	MOVB	AL, fau_cdsp.B[EBP]	;Store floppy controller type in the
+	MOVB	kcb_fdtype.B[EDI], AL	;  KCB
+	CMPL	fdkakcb, #0.B		;Is this the first floppy KCB?
+	JNE	24$.S			;No
+	MOVL	EBX, #fdkoas		;Yes - setup our once-a-second routine
+	PUSHL	EDI
+	CALL	knlSetupOAS##
+	POPL	EDI
+	JC	20$.S			;If error
+	ORB	fau_info.B[EBP], #INFO$NEWOAS
+24$:	MOVL	EAX, fdkakcb		;OK - link into our list of KCBs
+	MOVL	fdkakcb, EDI
+	MOVL	kcb_nexts.B[EDI], EAX
+	MOVL	EBX, EDI
+	MOVB	kcb_fdtrkd.B[EBX], #0FFh ;Force data rate to be set first time
+	MOVB	kcb_fdmoto.B[EBX], #0Ch
+	TESTB	knlMachType##+3, #02h	;Is this a PS/2?
+	JE	26$.S			;No
+	MOVB	kcb_fdmoto.B[EBX], #04h	;Yes - use correct value
+26$:	MOVL	kcb_dmachnl.B[EBX], #2	;Store DMA channel
+	PUSHL	EBX
+	MOVL	EBX, #hwname+8		;Construct the hardware name
+	MOVL	EAX, fau_ioreg.B[EBP]
+	CALL	knlPutHex4Nmbr##
+	MOVL	EDX, #hwname
+	MOVL	EBX, #fdkint
+	MOVB	CL, #{ID_FDISK-ID_HBASE}/8 ;Set up our vector
+	MOVB	CH, #DT_TRAP
+	CALL	knlSetIRq##
+	JC	275$.S
+	MOVL	EBX, #hwname
+	MOVL	EDX, fau_ioreg.B[EBP]
+	LEAL	ECX, 5.B[EDX]
+	CALL	knlRegIORegs##
+	JC	275$.S
+	MOVL	EDX, fau_ioreg.B[EBP]
+	ADDL	EDX, #7.B
+	MOVL	ECX, EDX
+	CMPB	fau_cdsp.B[EBP], #FCT_CMPT ;Is this a ComptiCard?
+	JNE	273$.S			;No
+	CALL	knlRegIORegs##
+	JC	275$.S
+	MOVL	EDX, fau_ioreg.B[EBP]	;Yes - register its extra register
+	ADDL	EDX, #P_DCFDCR2
+	MOVL	ECX, EDX
+273$:	CALL	knlRegIORegs##
+275$:	POPL	EBX
+	JC	8$
+
+;Here with KCB setup or if already have a KCB
+
+28$:	MOVB	AL, #0
+	MOVB	AH, #'F'		;Get first letter of our name
+	MOVZBL	EDX, fau_unit.B[EBP]	;Get unit number
+	MOVL	ECX, #ucb_fdSIZE
+	CALL	xosdskMakeUcb##		;Make a UCB
+	JC	16$			;If error
+	CALL	knlGiveXRes##		;Give up the exec memory resource
+	MOVL	ucb_devchar.B[ESI], #fdkdchartbl ;Store offset of our device
+						 ;  characteristics table
+	MOVL	ucb_ramax[ESI], #16t	;Store initial read-ahead limit (note
+					;  that there is no hardware limit for
+					;  floppies)
+	MOVL	ucb_wtmax[ESI], #16t	;Also store the initial write transfer
+	MOVB	AL, fau_bits.B[EBP]	;  maximum
+	ORB	AL, #UB$DUPFAT
+	MOVB	ucb_bits.B[ESI], AL	;Store value for ucb_bits
+	ORB	ucb_dsp.B[ESI], #DS$REMOVE ;All floppies are removeable
+	MOVB	AL, fau_type.B[EBP]
+	MOVB	ucb_unittype.B[ESI], AL
+	CALL	setmdfq			;Set the mode and frequency values
+	MOVB	AL, fau_head.B[EBP]	;Store number of heads
+	MOVB	ucb_cheads.B[ESI], AL
+	MOVB	ucb_iheads.B[ESI], AL
+	MOVL	EAX, fau_tsize.B[EBP]	;Store initial number of sectors/track
+	MOVL	ucb_csects.B[ESI], EAX
+	MOVL	ucb_isects.B[ESI], EAX
+	MOVL	EAX, fau_ssize.B[EBP]	;Store sector size
+	MOVL	ucb_csecsz.B[ESI], EAX
+	MOVL	ucb_isecsz.B[ESI], EAX
+	BSFL	EBX, EAX		;Get power of 2
+	SUBL	EBX, #7.B		;Minus 7 gives length code
+	CMPB	BL, #6			;Make sure legal value
+	JBE	32$.S
+	MOVB	BL, #0
+32$:	MOVB	ucb_fdsecs[ESI], BL	;Store for controller
+	CALL	setnumsec		;Store active number of sector/track
+	MOVL	EAX, fau_cyln.B[EBP]	;Store number of cylinders
+	MOVL	ucb_ccylns.B[ESI], EAX
+	MOVL	ucb_icylns.B[ESI], EAX
+	IMULL	EAX, ucb_isects.B[ESI]	;Store total number of blocks
+	IMULL	EAX, ucb_iheads.B[ESI]
+	MOVL	ucb_cblocks.B[ESI], EAX
+	MOVL	ucb_iblocks.B[ESI], EAX
+	MOVZBL	EAX, fau_xgpl.B[EBP]	;Store transfer gap length value
+	MOVW	ucb_fdxgpl[ESI], AX
+	MOVB	AL, fau_srt.B[EBP]	;Store step rate time value
+	MOVB	ucb_fdsrt[ESI], AL
+	MOVW	ucb_fdhut[ESI], #240t	;Store head unload timer value
+	MOVW	ucb_fdhlt[ESI], #1	;Store head load time value
+	MOVB	ucb_fdmot[ESI], #4	;Store motor off time value
+	MOVL	ucb_fdmst[ESI], #1000t	;Store motor start timer value
+	CALL	setspcfy		;Update specify command value
+	MOVL	EAX, fau_index.B[EBP]	;Store unit index and select values
+	MOVB	ucb_index.B[ESI], AL
+	DECL	EAX
+	MOVB	ucb_select.B[ESI], AL
+	MOVB	AL, CS:motoron[EAX]	;Store motor on bit
+	MOVB	ucb_fdmoto[ESI], AL
+	MOVL	EAX, fau_ioreg.B[EBP]	;Store base IO register number in the
+	MOVL	ucb_ioreg1.B[ESI], EAX	;  UCB
+	MOVB	ucb_sts1.B[ESI], #U1$RECAL ;Indicate should recalibrate first
+	TESTB	fau_info.B[EBP], #INFO$NEWKCB ;Did we just make a KCB?
+	JNE	40$.S			;Yes - go on
+34$:	TOFORK				;No - finished now
+36$:	LEAVE
+	CLRL	EAX
+	CLRL	ECX
+	INCL	ECX
+	MOVL	EBX, #QSTS$DONE
+	RET
+
+;Here if have just created a KCB - now we must initialize the controller
+
+40$:	MOVL	EDX, ESI
+	CALL	knlGetQel##		;Get an IORB
+	JC	34$.S
+	MOVL	EDI, ESI
+	PUSHL	DS
+	POPL	ES
+	MOVL	ECX, #16t
+	CLRL	EAX
+	CLD
+	RSTOSL	[EDI]
+	MOVL	iorb_count.B[ESI], EDX	;Store UCB offset where we can find it
+	MOVL	iorb_finish.B[ESI], #initfin
+	MOVL	iorb_routine.B[ESI], #initcon
+	MOVL	SS:pdaResponse##, EAX
+	CLRL	EDI
+	CALL	knlXfBegin##
+42$:	PUSHL	SS			;Set up to wait
+	POPL	ES
+	MOVB	AL, #knlQX_DW2##
+	CALL	knlWRequeue##
+	FROMFORK
+	CALLF	schedule		;Call the scheduler (this is an
+	TOFORK				;  uninterruptable wait!)
+	MOVL	EAX, SS:pdaResponse##	;Note that we ignore errors here
+	TESTL	EAX, EAX		;  (this is probably not really
+	JE	42$.S			;  right but it is very hard to
+	JMP	36$.S			;  undo adding the device at this
+					;  point, which we would have to do
+					;  inorder to report an error.  If
+					;  the reset of the controller fails
+					;  floppies will not be usable, but
+					;  the addunit will appear to work!)
+.PAGE
+;Extended fork context routine to initialize a floppy controller
+
+initcon:MOVL	EDX, #xosdskCcb##	;Get a disk DCB
+	MOVL	ESI, SS:xffCount##
+	PUSHL	#0.B
+	PUSHL	#0.B
+	PUSHL	#'INIT'
+	PUSHL	#'FDKA'
+	MOVL	EBX, ESP
+	CALL	xosdskGetDcb##
+	JC	6$.S			;If can't get one
+	ADDL	ESP, #16t.B
+	MOVW	dcb_outframe.B[EDI], SS	;OK - store XFF selector
+	MOVL	SS:xffDcb##, EDI
+	MOVL	EBX, ucb_kcb.B[ESI]
+	MOVB	kcb_itimer.B[EBX], #3t	;Start interrupt timer
+	CLRL	EAX			;Just to be safe, clear some vectors
+	MOVL	dcb_sdisp.B[EDI], EAX
+	MOVB	AL, #kf_init		;Do initialization
+	CALL	xosdskXfer##
+	JNC	4$.S			;If OK
+	PUSHL	EAX			;If error
+	CALL	xosdskCDcb##
+	INB	P_INC1P1		;Disable our interrupt
+	IOPAUSE
+	ORB	AL, #40h
+	OUTB	P_INC1P1
+	IOPAUSE
+	MOVL	EBX, ucb_kcb.B[ESI]
+	MOVB	AL, kcb_fdmoto.B[EBX]
+	MOVL	EDX, kcb_ioreg1.B[EBX]
+	A2IOP	P_DCFDDOR
+	OUTB	[DX]
+	IOPAUSE
+	ORB	kcb_bits.B[EBX], #KB$ERROR ;Indicate controller not usable
+	CLRL	EAX			;Clear UCB pointer in the KCB to make
+	MOVL	kcb_fucb.B[EBX], EAX	;  floppies unusable!
+	MOVL	SS:xffDcb##, EAX
+	POPL	EAX			;Restore error code
+	JMP	6$.S
+
+4$:	CALL	xosdskCDcb##		;Give up the DCB we were using
+	CLRL	EAX
+	MOVL	SS:xffDcb##, EAX
+	INCL	EAX
+	RET
+
+;Here if error creating a disk DCB
+
+6$:	ADDL	ESP, #16t.B
+	STC
+	RET
+
+;Here when finished with the XFF
+
+initfin:MOVW	ES, SS:xffPda##
+	MOVL	ES:pdaResponse##, EAX
+	CALL	knlRRequeue##
+	JMP	knlXfFinish##
+.PAGE
+;Subroutine called by adduparms for the INDEX parameter
+
+fdkauindex:
+	TESTL	EAX, EAX		;Valid index on controller?
+	JE	knlBadParmV##		;No
+	CMPL	EAX, #4.B		;Maybe
+	JA	knlBadParmV##		;No
+	MOVL	fau_index.B[EBP], EAX	;Yes - store index
+	CLC
+	RET
+
+;Subroutine called by adduparms for the "CONDESP" parameter
+
+fdkaucdsp:
+	MOVL	EBX, #cdspval
+	MOVL	ECX, #CDSPVALSZ
+	CALL	knlGetDcVal2##
+	JC	4$.S
+	MOVB	fau_cdsp.B[EBP], AL
+4$:	RET
+
+;Subroutine called by adduparms for the "UNITTYPE" parameter
+
+fdkauutyp:
+	MOVL	EBX, #utypval
+	MOVL	ECX, #UTYPVALSZ
+	CALL	knlGetDcVal2#
+	JC	4$.S
+fdkauutyp2:
+	MOVB	fau_bits.B[EBP], AL
+	MOVB	fau_type.B[EBP], AH
+	MOVZBL	EAX, AH
+	MOVZBL	EDX, CS:dvaltbl-8+0[EAX*8] ;Get SRT value
+	MOVB	fau_srt.B[EBP], DL
+	MOVB	DL, CS:dvaltbl-8+1[EAX*8] ;Get number of cylinders value
+	MOVL	fau_cyln.B[EBP], EDX
+	MOVB	DL, CS:dvaltbl-8+2[EAX*8] ;Get transfer gap length value
+	MOVB	fau_xgpl.B[EBP], DL
+	MOVB	DL, CS:dvaltbl-8+4[EAX*8] ;Get number of sectors value
+	MOVL	fau_tsize.B[EBP], EDX
+	MOVB	DL, CS:dvaltbl-8+5[EAX*8] ;Get number of heads value
+	MOVL	fau_head.B[EBP], EDX
+	MOVW	DX, CS:dvaltbl-8+6[EAX*8] ;Get sector size value
+	MOVL	fau_ssize.B[EBP], EDX
+	RET
+.PAGE
+	.SBTTL	Subroutines for QFNC_DEVCHAR functions
+
+;Here to get the value of the CONDESP characteristic
+
+getcondesp:
+	MOVL	ESI, [EDI]
+	MOVL	EBX, ucb_kcb.B[ESI]
+	MOVL	EAX, #'PCAT'		;Assume standard floppy controller
+	CMPB	kcb_fdtype.B[EBX], #FCT_CMPT ;Is this a ComptiCard?
+	JNE	2$.S			;No
+	MOVL	EAX, #'CMPT'
+2$:	CLRL	EDX
+	RET
+
+;Here to get the value of the TRKDEN characteristic - for 3.5" disks, track
+;  density is always 135tpi - for 5.25" disks, track density can be either
+;  48tpi or 96tpi - for 8" disks, track density is always 48tpi
+
+gettrkden:
+	MOVL	ESI, [EDI]
+	CLRL	EDX
+	MOVB	CL, ucb_unittype.B[ESI]	;Get disk type
+	MOVL	EAX, #48t		;Assume 48tpi disk
+	CMPB	CL, #DT_DD8		;Is it an 8" disk?
+	JE	6$.S			;Yes - its 48tpi
+	CMPB	CL, #DT_DD5		;Is it a DD 5.25" disk?
+	JE	6$.S			;Yes - this is also 48tpi
+	JB	8$.S			;If 3.5" disk, its 135tpi
+	TESTB	ucb_bits.B[ESI], #UB$48TPI ;Must be HD 5.25" disk - is it at
+					   ;  48tpi now?
+	JNE	6$.S			;Yes
+4$:	MOVB	AL, #96t		;No - its 96tpi
+6$:	RET
+
+;Here if have 3.5" disk - its 135tpi
+
+8$:	ADDL	EAX, #135t-48t.B
+ret004:	RET
+
+;Here to get the value of the DATADEN characteristic
+
+getdataden:
+	MOVL	ESI, [EDI]
+	MOVB	DL, ucb_bits.B[ESI]	;Get density value
+	ANDL	EDX, #UB$DENSITY.B
+	MOVL	EAX, CS:denname+0[EDX]
+	MOVL	EDX, CS:denname+4[EDX]
+	RET
+
+	.MOD	4
+denname:.LONG	'SING','LE'	;DT_SINGLE = 0t<3 - Single density
+	.LONG	'DOUB','LE'	;DT_DOUBLE = 1t<3 - Double density
+	.LONG	'HIGH',''	;DT_HIGH   = 2t<3 - High density
+.PAGE
+;Here to set the value of the UNITTYPE characteristic
+
+setunittype:
+	MOVL	EBX, #utypval
+	MOVL	ECX, #UTYPVALSZ
+	CALL	knlGetDcVal2##
+	JC	ret004.S
+	MOVL	ESI, [EDI]
+	ORB	ucb_bits.B[ESI], AL
+	MOVB	ucb_unittype.B[ESI], AH
+	MOVZBL	EAX, AH
+	MOVZBL	EDX, dvaltbl-8+0[EAX*8]	;Get SRT value
+	MOVZBL	EDX, dvaltbl-8+0[EAX*8]	;Get SRT value
+	MOVB	ucb_fdsrt[ESI], DL
+	MOVB	DL, dvaltbl-8+1[EAX*8]	;Get number of cylinders value
+	MOVL	ucb_ccylns.B[ESI], EDX
+	MOVL	ucb_icylns.B[ESI], EDX
+	MOVB	DL, dvaltbl-8+2[EAX*8]	;Get transfer gap length value
+	MOVB	ucb_fdxgpl[ESI], DL
+	MOVB	DL, dvaltbl-8+4[EAX*8]	;Get number of sectors value
+	MOVL	ucb_csecsz.B[ESI], EDX
+	MOVL	ucb_isecsz.B[ESI], EDX
+	MOVB	DL, dvaltbl-8+5[EAX*8]	;Get number of heads value
+	MOVL	ucb_cheads.B[ESI], EDX
+	MOVL	ucb_iheads.B[ESI], EDX
+	IMULL	EDX, ucb_csects.B[ESI]	;Get total number of blocks value
+	IMULL	EDX, ucb_ccylns.B[ESI]
+	MOVL	ucb_cblocks.B[ESI], EAX
+	MOVL	ucb_iblocks.B[ESI], EAX
+	MOVW	DX, dvaltbl-8+6[EAX*8]	;Get sector size value
+	MOVL	ucb_csecsz.B[ESI], EDX
+	MOVL	ucb_isecsz.B[ESI], EDX
+	MOVL	ucb_fdmst[ESI], #1000t	;Get motor start timer value
+	MOVB	ucb_fdmot[ESI], #4	;Get motor off timer value
+	MOVL	ucb_fdhut[ESI], #240t	;Get head unload timer value
+	MOVL	ucb_fdhlt[ESI], #1	;Get head load timer value
+	CALL	setmdfq			;This should never fail here since we
+	CLC				;  are using standard values!
+	RET
+
+;Here to set the value of the TRKDEN characteristic
+
+settrkden:
+	MOVL	ESI, [EDI]
+	CMPL	EAX, #48t		;Want 48tpi?
+	JA	6$.S			;No
+	ORB	ucb_bits.B[EBP], #UB$48TPI ;Yes
+	RET
+
+6$:	ANDB	ucb_bits.B[EBP], #~UB$48TPI
+	RET
+
+;Here to set the value of the DATADEN characteristic
+
+setdataden:
+	MOVL	EBX, #ddenval
+	MOVL	ECX, #DDENVALSZ
+	CALL	knlGetDcVal2##
+	JC	10$.S
+	MOVL	ESI, [EDI]
+	CMPB	AL, #DD_HIGH		;Want high density?
+	JNE	8$.S			;No
+	TESTB	ucb_unittype.B[ESI], #01h ;Yes - have high density drive?
+	JNE	14$.S			;No - fail
+8$:	ANDB	ucb_bits.B[ESI], #~UB$DENSITY ;OK - store new density value
+	ORB	ucb_bits.B[ESI], AL
+10$:	RET
+
+;Here to set the value of the CBLKSZ characteristic
+
+setcblksz:
+	BSFL	ECX, EAX		;Find power of 2
+12$:	JE	knlBadParmV##
+	SUBL	ECX, #7.B
+	CMPB	CL, #6
+	JA	14$.S
+	MOVL	EDX, #128t
+	SHLL	EDX, CL
+	CMPL	EDX, EAX		;Is it a power of 2?
+14$:	JNE	knlBadParmV##		;No - fail
+	MOVL	ESI, [EDI]		;Yes
+	MOVL	ucb_csecsz.B[ESI], EAX	;Store it
+	MOVB	ucb_fdsecs[ESI], CL	;Also store index
+	CALL	setnumsec		;Store active number of sector/track
+	CLC
+	RET
+
+;Here to set the value of the DBLKSZ characteristic
+
+setiblksz:
+	BSFL	ECX, EAX		;Find power of 2
+	JE	12$.S
+	SUBL	ECX, #7.B
+	JL	14$.S
+	MOVL	EDX, #128t
+	SHLL	EDX, CL
+	CMPL	EDX, EAX		;Is it a power of 2?
+	JNE	14$.S			;No - fail
+	MOVL	ESI, [EDI]		;Yes
+	MOVL	ucb_isecsz.B[ESI], EAX	;Store it
+	RET
+
+;Here to set value of the ISECTS, IHEADS, or ICYLNS characteristic
+
+setsizeiparm:
+	MOVL	ESI, [EDI]
+	MOVL	[ESI+EBX], EAX		;Update value
+	MOVL	EAX, ucb_iheads.B[ESI]	;Update total blocks value
+	IMULL	EAX, ucb_isects.B[ESI]
+	IMULL	EAX, ucb_icylns.B[ESI]
+	MOVL	ucb_iblocks.B[ESI], EAX
+	CLC
+	RET
+
+;Here to set value of the CSECTS, CHEADS, or CCYLNS characteristic
+
+setsizecparm:
+	MOVL	ESI, [EDI]
+	MOVL	[ESI+EBX], EAX		;Update value
+	MOVL	EAX, ucb_cheads.B[ESI]	;Update total blocks value
+	IMULL	EAX, ucb_csects.B[ESI]
+	IMULL	EAX, ucb_ccylns.B[ESI]
+	MOVL	ucb_cblocks.B[ESI], EAX
+	CLC
+	RET
+
+;Here to set the value of the SRTIME characteristic
+
+setsrt:	CMPL	EAX, #16t
+	JB	16$.S
+	MOVB	AL, #16t
+16$:	TESTL	EAX, EAX
+	JNE	18$.S
+	INCL	EAX
+18$:	MOVL	ESI, [EDI]
+	MOVB	ucb_fdsrt[ESI], AL
+	RET
+
+;Here to set the value of the HUTIME characteristic
+
+sethut:	CMPL	EAX, #240t
+	JB	20$.S
+	MOVL	EAX, #240t
+20$:	ADDL	EAX, #15t
+	SHRL	EAX, #4
+	JNE	22$.S
+	INCL	EAX
+22$:	MOVL	ESI, [EDI]
+	MOVB	ucb_fdhut[ESI], AL
+	CLC
+	RET
+
+;Here to set the value of the HLTIME characteristic
+
+sethlt:	CMPL	EAX, #254t
+	JB	24$.S
+	MOVL	EAX, #254t
+24$:	INCL	EAX
+	SHRL	EAX, #1
+	JNE	26$.S
+	INCL	EAX
+26$:	MOVL	ESI, [EDI]
+	MOVB	ucb_fdhlt[ESI], AL
+	CLC
+	RET
+
+;Here to set the value of the MOTIME characteristic
+
+setmot:	CMPL	EAX, #255t		;Too big?
+	JB	32$.S			;No
+	MOVL	EAX, #255t		;Yes - just use maximum
+32$:	TESTL	EAX, EAX		;Make sure not 0
+	JNE	34$.S
+	INCL	EAX
+34$:	MOVL	ESI, [EDI]
+	MOVB	ucb_fdmot[ESI], AL
+	RET
+.PAGE
+	.SBTTL	setmdfq - Subroutine to set mode and frequency when density changed
+
+;Subroutine to set modulation mode and frequency when data denity is changed
+;	c{ESI} = Offset of UCB
+;	CALL	setmdfq
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+
+setmdfq:MOVB	BL, ucb_bits.B[ESI]
+	ANDL	EBX, #UB$DENSITY.B
+	ORB	BL, ucb_unittype.B[ESI]
+	MOVB	AL, CS:freqtbl[EBX]	;Get frequency value
+	CMPB	AL, #0			;Is this combination legal?
+	JS	knlBadParmV##		;No
+	MOVB	ucb_fdtrkd[ESI], AL	;Yes - store in UCB
+	MOVB	AL, #0			;Assume single density (FM)
+	ANDB	BL, #UB$DENSITY		;Get just density value
+	CMPB	BL, #DD_SINGLE		;Single density?
+	JE	4$.S			;Yes
+	MOVB	AL, #40h		;No - its double or high density (MFM)
+4$:	MOVB	ucb_fdmode[ESI], AL	;Store in UCB
+	ANDB	ucb_sts1.B[ESI], #~U1$HFTRK ;Assume not half track mode
+	TESTB	ucb_bits.B[ESI], #UB$48TPI ;Want 48tpi?
+	JE	6$.S			;No
+	CMPB	ucb_unittype.B[ESI], #DT_HD5 ;Yes - is this a HD5 drive?
+	JNE	6$.S			;No
+	ORB	ucb_sts1.B[ESI], #U1$HFTRK ;Yes - indicate half track mode
+6$:	CLC
+	RET
+
+X=!0FFh
+
+;		   DD3 HD3 DD5 HD5 DD8
+freqtbl:.BYTE	X,  2,  2,  2,  1,  0,  X,  X	;DD_SINGLE
+	.BYTE	X,  2,  2,  2,  1,  0,  X,  X	;DD_DOUBLE
+	.BYTE	X,  X,  0,  X,  0,  X,  X,  X	;DD_HIGH
+	.BYTE	X,  X,  X,  X,  X,  X,  X,  X
+.PAGE
+	.SBTTL	setnumsec - Subroutine to determine number of sectors
+
+;Subroutine to determine number of sectors per track, given the drive type
+;  and the data density
+
+setnumsec:
+	MOVZBL	EAX, ucb_unittype.B[ESI] ;Get drive type
+	MOVB	DL, ucb_bits.B[ESI]	;Get density
+	ANDL	EDX, #UB$DENSITY.B
+	DECL	EAX			;Calculate table index
+	SHRL	EAX, #1
+	IMULL	EAX, #3
+	SHRL	EDX, #3
+	ADDL	EDX, EAX
+	MOVB	AL, ucb_fdsecs[ESI]	;Get sector size code
+	MOVB	AL, CS:numsectbl[EDX+EAX*8] ;Get number of sectors per track
+	MOVL	ucb_csects.B[ESI], EAX	;Store it
+	RET
+
+numsectbl:
+;		SD3  DD3  HD3  SD5  DD5  HD5  SD8  DD8	 Sector size
+	.BYTE	16t, 30t, 60t, 16t, 30t, 56t, 26t, 48t	;128 bytes
+	.BYTE	 9t, 16t, 32t,  9t, 16t, 30t, 15t, 26t	;256 bytes
+	.BYTE	 4t,  9t, 18t,  4t,  9t, 15t,  8t, 15t	;512 bytes
+	.BYTE	 2t,  4t,  8t,  2t,  4t,  7t,  4t,  8t	;1024 bytes
+	.BYTE	 1t,  2t,  4t,  1t,  2t,  4t,  2t,  4t	;2048 bytes
+	.BYTE	 0 ,  1t,  2t,  0 ,  1t,  2t,  1t,  2t	;4096 bytes
+	.BYTE	 0 ,  0 ,  1t,  0 ,  0 ,  1t,  0 ,  1t	;8192 bytes
+.PAGE
+	.SBTTL	setgaplen - Subroutine to set gap lengths for current parameters
+
+;Subroutine to set gap lengths for current parameters
+;	CALL	setgaplen
+
+setgaplen:
+	RET
+
+	.SBTTL	setspcfy - Subroutine to set values for specify command
+
+;Subroutine to set values for the specify command
+;	CALL	setspcfy
+
+setspcfy:
+	MOVZWL	EAX, ucb_fdhut[ESI]	;Get head unload time
+	CALL	spcadj			;Adjust it for transfer rate
+	ADDL	EAX, #31t.B		;Round up
+	SHRL	EAX, #5t
+	CMPL	EAX, #15t.B		;Too big?
+	JB	2$.S			;No
+	MOVB	AL, #15t		;Yes
+2$:	MOVB	ucb_fdspcfy+0[ESI], AL	;Store in UCB
+	MOVZBL	EAX, ucb_fdsrt[ESI]	;Get step rate time
+	CALL	spcadj			;Adjust it for transfer rate
+	INCL	EAX			;Round up
+	SHRL	EAX, #1t
+	JNE	4$.S			;Make sure not 0
+	INCL	EAX
+4$:	CMPL	EAX, #16t.B		;Make sure not too big
+	JB	6$.S
+	MOVB	AL, #16t
+6$:	NEGB	AL			;1ms = 0Fh, 2ms = 0Eh, etc.
+	ADDB	AL, #16t
+	SHLB	AL, #4
+	ORB	ucb_fdspcfy+0[ESI], AL	;Store in UCB
+	MOVZWL	EAX, ucb_fdhlt[ESI]	;Get head load time
+	CALL	spcadj			;Adjust it for transfer rate
+	ADDL	EAX, #3.B		;Round up
+	SHRL	EAX, #2
+	JNE	8$.S			;Make sure not 0
+	INCL	EAX
+8$:	CMPL	EAX, #127t.B		;Make sure not too big
+	JB	10$.S
+	MOVB	AL, #127t
+10$:	ADDL	EAX, EAX
+	MOVB	ucb_fdspcfy+1[ESI], AL	;Store in UCB
+	RET
+
+;Subroutine to adjust value based on data rate
+;	c{EAX} = Value to adjust
+;	CALL	spcadj
+;	c{EAX} = Adjusted value
+
+spcadj:	CMPB	ucb_fdtrkd[ESI], #1	;Check density
+	JA	12$.S			;If 250KHz (no adjustment needed)
+	JE	14$.S			;If 300KHz
+	ADDL	EAX, EAX		;500KHz, double value
+12$:	RET
+
+;Here if 300KHz
+
+14$:	MULL	lit6			;Multiply by 6/5
+	DIVL	lit5
+	RET
+.PAGE
+	.SBTTL	vinbflpy - INB instruction for floppy disk from virtual DOS mode
+
+vinbflpy::
+	UNIMOP	0E4h, 00h, 00h, 00h
+
+	.SBTTL	voutbflpy - OUTB instruction for floppy disk from virtual DOS mode
+
+voutbflpy::
+	UNIMOP	0E6h, 00h, 00h, 00h
+.PAGE
+	.SBTTL	ks_media - Subroutine to determine media type
+
+;Subroutine to determine media type - must be called in extended fork context
+;	c{EDI} = Address of DCB
+;	CALL	fdkmedia
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  Z:set = Disk may be file structured
+;	  Z:clr = Disk cannot be file structured
+
+fdkmedia:
+	MOVL	EAX, #kf_chkwp		;Check write protect status
+	CALL	xosdskXfer##
+	JC	2$.S			;If error
+	TESTB	ucb_unittype.B[ESI], #01h ;OK - is this a high density drive?
+	JNE	8$.S			;No - just use the current density
+	TESTB	ucb_sts1.B[ESI], #U1$MOUNT ;Is the disk mounted now?
+	JNE	4$.S			;Yes - use current density first
+	ANDB	ucb_bits.B[ESI], #~{UB$DENSITY|UB$48TPI}
+	ORB	ucb_bits.B[ESI], #DD_HIGH ;No - force high density
+	CALL	setmdfq
+2$:	JC	14$.S
+	CALL	setnumsec
+	CALL	setgaplen
+	CALL	setspcfy
+4$:	MOVL	dcb_dkdblk.B[EDI], #1	;Read an ID field on track 0
+	MOVL	EAX, #kf_readid
+	CALL	xosdskXfer##
+	JNC	10$.S			;If this worked
+	CMPL	EAX, #ER_NTRDY.B	;Error - is it "not ready"?
+	JE	12$.S			;Yes - report it (NEED TO CHANGE DEN)
+	CMPL	EAX, #ER_ABORT		;Or abort?
+	JE	12$.S			;Yes - report this too
+	XORB	ucb_bits.B[ESI], #UB$DENSITY ;No - try other density
+	ANDB	ucb_bits.B[ESI], #~UB$48TPI
+	TESTB	ucb_bits.B[ESI], #DD_HIGH ;High density now?
+	JNE	6$.S			;Yes
+	CMPB	ucb_unittype.B[ESI], #DT_HD5 ;No - is this a 5 1/4" drive?
+	JNE	6$.S			;No
+	ORB	ucb_bits.B[ESI], #UB$48TPI ;Yes - indicate 48 tracks
+6$:	CALL	setmdfq
+	JC	14$.S
+	CALL	setnumsec
+	CALL	setgaplen
+	CALL	setspcfy
+8$:	MOVL	dcb_dkdblk.B[EDI], #1	;Read an ID field on track 0
+	MOVL	EAX, #kf_readid
+	CALL	xosdskXfer##
+	JC	14$.S			;If error
+10$:	CALL	xosdskGetSBufr##	;Get a system buffer
+	JNC	16$.S			;If OK
+12$:	STC
+14$:	RET
+
+;Here with a buffer
+
+16$:	CLRL	EAX
+	MOVL	dcb_dkdblk.B[EDI], EAX	;Try to read block 0
+	MOVL	cb_xnext.B[EBX], EAX
+	PUSHL	DS
+	POPL	ES
+	PUSHL	EBX
+	MOVL	ECX, #512t		;Get amount to read
+	MOVL	EAX, #kf_readlist	;Read a block
+	CALL	xosdskXfer##
+	POPL	EBX
+	JC	20$.S			;If error
+	CALL	xosdskGiveBufr##
+	ORB	ucb_sts1.B[ESI], #U1$VALID ;Indicate disk contains valid data
+	CLRL	EAX			;Set Z, clear C
+	RET				;Thats all
+
+;Here if error reading block from disk
+
+20$:	PUSHL	EAX
+	CALL	xosdskGiveBufr##
+
+;CODE HERE TO SET DISK TO BE PREFERRED TYPE (HD)
+
+	POPL	EAX
+	STC
+	RET
+.PAGE
+	.SBTTL	ks_chkwp - Check write protect status at main program level
+
+;Subroutine to check write protect status - must be called at main program level
+;	c{EDI} = Address of DCB
+;	CALL	fdkchkwp
+
+fdkchkwp:
+	MOVL	EAX, #kf_chkwp		;Yes - must finish checking at device
+	JMP	xosdskXfer##		;  fork level
+.PAGE
+	.SBTTL	ks_unmount - Subroutine to reset parameters when disk unmounted
+
+;Subroutine to reset drive parameters when disk is unmounted
+;	c{EBX} = Offset of KCB
+;	c{EDI} = Offset of DCB
+;	c{ESI} = Offset of UCB
+;	CALL	fdkunmount
+
+fdkunmount:
+	MOVW	kcb_fdspcfy.B[EBX], #0	;Force specify command next time
+	MOVB	kcb_fdtrkd.B[EBX], #0FFh ;Force setting density next time
+	RET				;Thats all
+.PAGE
+	.SBTTL	ks_chkchg - Subroutine to check for possible disk change
+
+;Subroutine to check for possible disk change.  If the drive has a media
+;  sensor, it is used.  If it does not have a media sensor and the motor is
+;  not running, a possible change is reported, if the motor is running, not
+;  changed is reported.
+;	c{EDI} = Offset of DCB
+;	CALL	fdkchkchg
+;	c{EDX} = Return value:
+;		   0 - Error, c{EAX} = Error code
+;		   1 - Disk not changed
+;		   2 - Might be changed (no MS)
+;		   3 - Probably changed (try to assume changed)
+;		   4 - Probably changed (always verify) - never returned here
+;		   5 - Definately changed (never returned here)
+
+fdkchkchg:
+	TESTB	ucb_sts1.B[ESI], #U1$MOTON ;Is the motor on?
+	JNE	2$.S			;Yes - say not changed
+	TESTB	ucb_bits.B[ESI], #UB$MEDIAC ;No - does drive have a media
+					    ;  sensor?
+	JE	10$.S			;No
+	PUSHL	EBX			;Yes
+	MOVL	EBX, ucb_kcb.B[ESI]
+	TESTB	kcb_sts2.B[EBX], #K2$MSENSOR ;Are we using it now?
+	JE	8$.S			;No
+	MOVL	EAX, #kf_chkchg		;Yes - must get the controller to check
+	CALL	xosdskXfer##		;  the sensor state
+	POPL	EBX
+	JC	4$.S			;If error
+2$:	MOVL	EDX, #1			;OK - return 1 to say not changed
+	RET
+
+;Here if error when checking media sensor state
+
+4$:	CLRL	EDX			;Assume will report error
+	CMPL	EAX, #ER_MDCHG.B	;Was the error disk changed?
+	JNE	6$.S			;No - report as error
+	MOVB	DL, #3			;Yes - indicate media changed
+6$:	RET
+
+;Here to report that disk may have been changed if no media sensor
+
+8$:	POPL	EBX
+10$:	MOVL	EDX, #2
+	RET
+.PAGE
+	.SBTTL	kf_init - Initialize controller
+
+;Here for the initialize controller function at fork level
+;	c{ESI} = Offset of UCB
+;	c{EDI} = Offset of DCB
+;	CALL	fdkinit
+
+fdkinit:ENTER	fdk_SIZE, 0
+	MOVL	EBX, ucb_kcb.B[ESI]
+	ORB	kcb_sts1.B[EBX], #K1$INT ;Indicate expecting interrupt now
+	MOVB	dcb_dmachnl.B[EDI], #2	;Store DMA channel number
+	MOVL	EDX, ucb_ioreg1.B[ESI]	;Point to the digital output register
+	A2IOP	P_DCFDDOR
+	MOVB	AL, #0			;Reset the floppy controller
+	OUTB	[DX]
+	IOPAUSE
+	MOVL	EBX, ucb_kcb.B[ESI]	;Get the DMA channel (must get it here
+	CALL	getcont			;  even though we don't use it since
+	JC	8$.S			;  the controller enables DMA and
+	MOVL	EDX, kcb_ioreg1.B[EBX]	;  interrupts together)
+	A2IOP	P_DCFDDOR		;Make sure interrupts are enabled
+	MOVB	AL, #0Ch		;  (getcont will not enable interrupts
+	OUTB	[DX]			;  if running on a PS/2)
+	IOPAUSE
+	INB	P_INC1P1
+	IOPAUSE
+	ANDB	AL, #~40h
+	OUTB	P_INC1P1
+	IOPAUSE
+	MOVL	EAX, #-1
+	CALL	knlXfWait##
+	JC	8$.S
+	MOVL	ESI, [EDI]		;Get UCB offset
+	CALL	floprslt
+	JC	8$.S
+	DECL	EBX			;Did we get at least one result byte?
+	JS	8$.S			;No
+	CMPB	ucb_fdrslt[ESI], #0C0	;Yes - is ST0 correct?
+	JNE	8$.S			;No
+	CLRL	EAX
+	JMP	10$.S			;If normal
+
+;Here if error
+
+8$:	INCL	ucb_tdeverr[ESI]	;Count the error
+	INCL	ucb_hdeverr[ESI]
+	MOVL	EAX, #ER_DEVER
+10$:	CLRL	ECX
+	JMP	fdkdone
+.PAGE
+	.SBTTL	kf_readid - Read ID field
+
+;Here for the read ID field function at fork level
+;	c{EDI} = Offset of DCB
+;	CALL	fdkreadid
+
+fdkreadid:
+	ENTER	fdk_SIZE, 0
+	MOVB	fdk_mode.B[EBP], #0
+	MOVL	EBX, ucb_kcb.B[ESI]
+	CALL	getcont
+	JC	1$.S
+	MOVL	fdk_daddr.B[EBP], #1
+	CALL	doseek			;Seek to right track
+1$:	JC	fdkdone
+	MOVB	fdk_retry1.B[EBP], #3	;Initialize retry count
+2$:	MOVL	EBX, ucb_kcb.B[ESI]
+	ORB	kcb_sts1.B[EBX], #K1$INT|K1$RESULT ;Indicate result phase next
+	MOVB	AH, #0Ah		;Get read ID function
+	ORB	AH, ucb_fdmode[ESI]
+	CALL	flopcmdi
+	JC	6$.S
+	MOVB	AH, ucb_select.B[ESI]	;Head and unit select
+	CALL	flopcmda
+	JC	6$.S
+	MOVL	EBX, ucb_kcb.B[ESI]
+	MOVB	kcb_itimer.B[EBX], #3t	;Start interrupt timer
+	MOVL	EAX, #-1
+	CALL	knlXfWait##
+	JC	6$.S
+	CALL	knlDmaDisable##		;Disable our DMA channel
+	ANDB	kcb_sts1.B[EBX], #~K1$DMAINUSE
+	CALL	floprslt2		;Get remaining result bytes
+6$:	JC	fdkdone
+	CMPB	BL, #6			;Did we get 6 bytes?
+	JNE	xfdverr			;No - fail
+	MOVB	BL, ucb_fdrslt+0[ESI]	;Check ST0 result value
+	CMPB	BL, ucb_select.B[ESI]
+	JNE	10$.S			;If error
+	MOVB	CL, ucb_fdrslt+6[ESI]	;OK - get sector size code
+	CMPB	CL, #6			;Is it legal?
+	JBE	8$.S			;Yes
+	MOVB	CL, #0			;No - assume 128 bytes!
+8$:	MOVB	ucb_fdsecs[ESI], CL	;Store it sector size code
+	MOVL	EAX, #128t		;Convert to number of bytes
+	SHLL	EAX, CL
+	MOVL	ucb_csecsz.B[ESI], EAX	;And store that too
+	CALL	setnumsec		;Update number of sectors per track
+	CLRL	EAX			;  to match
+	JMP	fdkdone
+
+;Here if error
+
+10$:	MOVL	EBX, ucb_kcb.B[ESI]	;Is this the read-ahead DCB?
+	MOVW	ES, dcb_outframe.B[EDI]	;No - is this request being cancelled?
+	TESTB	ES:xffStatus1##, #XF1$ABORT
+	JNE	xfabort			;Yes
+12$:	MOVW	AX, ucb_fdrslt+1[ESI]	;Get error status bits
+	CALL	xlaterror		;Translate the error indication
+	DECB	fdk_retry1.B[EBP]	;No - have we done this enough?
+	JNS	2$			;No - go try again
+	JMP	xferr			;Yes - go fail
+.PAGE
+	.SBTTL	kf_format - Format track
+
+;Here for the format track function
+;	c{ES:EBX} = Address of buffer
+;	c{ECX}    = Amount to transfer
+;	c{ESI}    = Offset of UCB
+;	c{EDI}    = Offset of DCB
+;	CALL	fdkformat
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  c{EAX} = 0
+
+fdkformat:
+	MOVB	AH, #0
+	MOVL	EDX, dcb_dkdblk.B[EDI]
+	MOVB	AL, #0Dh		;Get format command
+	JMP	fdkxfer.S		;Continue
+
+	.SBTTL	kf_readlist - Read buffer list
+
+;Here for the read buffer list function at fork level
+;	c{ES:EBX} = Address of buffer
+;	c{ECX}    = Amount to transfer
+;	c{ESI}    = Offset of UCB
+;	c{EDI}    = Offset of DCB
+;	CALL	fdkreadlist
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  c{EAX} = 0
+
+fdkreadlist:
+	MOVB	AH, #FM$LIST|FM$READ
+	MOVL	ECX, #512t
+	JMP	2$.S
+
+	.SBTTL	kf_readdata - Read block
+
+;Here for the read raw block function at fork level
+;	c{ES:EBX} = Address of buffer
+;	c{ECX}    = Amount to transfer
+;	c{ESI}    = Offset of UCB
+;	c{EDI}    = Offset of DCB
+;	CALL	fdkreadraw
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  c{EAX} = 0
+
+fdkreadraw:
+	MOVB	AH, #FM$READ
+	MOVL	EDX, dcb_dkdblk.B[EDI]
+	JMP	4$.S
+
+;Here for the read block function at fork level
+;	c{ES:EBX} = Address of buffer
+;	c{ECX}    = Amount to transfer
+;	c{ESI}    = Offset of UCB
+;	c{EDI}    = Offset of DCB
+;	CALL	fdkreaddata
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  c{EAX} = 0
+
+fdkreaddata:
+	MOVB	AH, #FM$READ
+2$:	CALL	fdkbk2phy
+4$:	MOVB	AL, #26h		;Get read command
+	JMP	fdkxfer.S		;Continue
+
+	.SBTTL	kf_writlist - Write buffer list
+
+;Here for the write buffer list function
+;	c{ES:EBX} = Address of buffer
+;	c{ECX}    = Amount to transfer
+;	c{ESI}    = Offset of UCB
+;	c{EDI}    = Offset of DCB
+;	CALL	fdkwritlist
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  c{EAX} = 0
+
+fdkwritlist:
+	MOVB	AH, #FM$LIST
+	MOVL	ECX, #512t
+	JMP	6$.S
+
+	.SBTTL	kf_writraw - Write raw block
+
+;Here for the write raw block function
+;	c{ES:EBX} = Address of buffer
+;	c{ECX}    = Amount to transfer
+;	c{ESI}    = Offset of UCB
+;	c{EDI}    = Offset of DCB
+;	CALL	fdkwritraw
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  c{EAX} = 0
+
+fdkwritraw:
+	MOVB	AH, #0
+	MOVL	EDX, dcb_dkdblk.B[EDI]
+	JMP	8$.S
+
+	.SBTTL	kf_writdata - Write block
+
+;Here for the write block function
+;	c{ES:EBX} = Address of buffer
+;	c{ECX}    = Amount to transfer
+;	c{ESI}    = Offset of UCB
+;	c{EDI}    = Offset of DCB
+;	CALL	fdkwritdata
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  c{EAX} = 0
+
+fdkwritdata:
+	MOVB	AH, #0
+6$:	CALL	fdkbk2phy
+8$:	MOVB	AL, #05h		;Get write command
+.PAGE
+;Here when ready to start transfer
+;	c(AL)     = Function for controller
+;	c{ES:EBX} = Address of buffer
+;	c{ECX}    = Amount to transfer
+;	c{EDX}    = Physical disk address
+;	c{ESI}    = Offset of UCB
+;	c{EDI}    = Offset of DCB
+
+fdkxfer:ENTER	fdk_SIZE, 0
+	MOVL	fdk_func.B[EBP], EAX	;This also stores fdk_mode
+	MOVL	fdk_buffer+0.B[EBP], EBX ;Store buffer address
+	MOVL	fdk_buffer+4.B[EBP], ES
+	MOVL	fdk_count.B[EBP], ECX	;Store count
+	MOVL	EAX, dcb_dkdblk.B[EDI]	;Store disk block number
+	MOVL	fdk_block.B[EBP], EAX
+	CLRL	EAX			;Clear amount transfered
+	MOVL	fdk_amount.B[EBP], EAX
+	MOVL	fdk_daddr.B[EBP], EDX	;Store physical disk address
+	MOVL	EBX, ucb_kcb.B[ESI]	;Get offset of the KCB
+	TESTB	ucb_sts1.B[ESI], #U1$MOUNT ;Is the disk mounted now?
+	JE	10$.S			;No - don't check for media change
+	TESTB	ucb_sts1.B[ESI], #U1$MOTON ;Yes - is the motor on?
+	JNE	10$.S			;Yes - assume not changed
+	TESTB	ucb_bits.B[ESI], #UB$MEDIAC ;No - does drive have a media
+					    ;  sensor?
+	JE	2$.S			;No
+	PUSHL	EBX			;Yes
+	MOVL	EBX, ucb_kcb.B[ESI]
+	TESTB	kcb_sts2.B[EBX], #K2$MSENSOR ;Are we using it now?
+	JNE	4$.S			;Yes
+2$:	TESTB	dcb_dsp.B[EDI], #DS$FILE ;No - is this a physical disk?
+	JNE	6$.S			;No - treat this as if its media sensor
+					;  just went off!
+	JMP	12$.S			;Yes - say not changed
+
+;Here if we have a media sensor
+
+4$:	CALL	fdkchkchgf		;See if the media sensor is set
+	JNC	12$.S			;If its not set
+	CMPL	EAX, #ER_MDCHG		;Error - was it "media changed"?
+	JNE	8$.S			;No - fail
+6$:	TESTB	dcb_sts2.B[EDI], #D2$CHKCHG ;Yes - are we checking for a changed
+					    ;  disk now?
+	JNE	12$.S			;Yes - don't be recusive!
+	ORB	dcb_sts2.B[EDI], #D2$CHKCHG ;No - but we are now
+	MOVL	EAX, dcb_sdisp.B[EDI]	;See if it is really changed
+	CALLI	dd_vfychg.B[EAX]
+	JNC	10$.S			;If not changed
+	ANDB	dcb_sts2.B[EDI], #~D2$CHKCHG
+8$:	LEAVE				;Media changed - return the error
+	STC
+	RET
+
+;Here if media was not changed
+
+10$:	ANDB	dcb_sts2.B[EDI], #~D2$CHKCHG
+12$:	CALL	getcont			;Get use of the controller
+doxfer0:MOVB	fdk_retry3.B[EBP], #2	;Initialize restore retry count
+doxfer2:MOVL	EBX, ucb_kcb.B[ESI]
+	CALL	doseek			;Seek to right track
+14$:	JC	fdkdone			;If error
+	MOVB	fdk_retry1.B[EBP], #3	;Initialize transfer retry count
+doxfer4:MOVL	ECX, fdk_count.B[EBP]	;Get transfer count
+
+	CMPB	fdk_mode.B[EBP], #FM$LIST ;Transfering buffer list?
+	JE	16$.S			;No
+	MOVL	EBX, fdk_buffer+0.B[EBP] ;Yes
+	MOVL	EBX, cb_paddr.B[EBX]
+	CALL	knlDmaSetPhy##
+	JMP	18$.S
+
+16$:	LESL	EBX, fdk_buffer.B[EBP]	;Get virtual address for transfer
+	MOVW	FS, SS:xffPda##
+	CALL	knlDmaSetVir##		;Set up DMA controller
+18$:	MOVL	EBX, ucb_kcb.B[ESI]
+	JC	14$.S			;If error
+	TESTB	fdk_mode.B[EBP], #FM$READ ;Read operation?
+	JNE	20$.S			;Yes
+	INCL	ucb_blockout[ESI]	;No
+	ADDL	ucb_byteout[ESI], ECX
+	CALL	knlDmaOutput##		;start write
+	JMP	22$.S
+
+20$:	INCL	ucb_blockin[ESI]
+	ADDL	ucb_bytein[ESI], ECX
+	CALL	knlDmaInput##		;Start input
+22$:	ORB	kcb_sts1.B[EBX], #K1$DMAINUSE
+	MOVL	EBX, ucb_kcb.B[ESI]	;Restore offset of our KCB
+	ORB	kcb_sts1.B[EBX], #K1$INT|K1$RESULT ;Indicate result phase next
+	MOVB	AH, fdk_func.B[EBP]	;Get read, write, or format function
+	ORB	AH, ucb_fdmode[ESI]
+	CALL	flopcmdi
+24$:	JC	14$.S
+	MOVB	AH, ucb_select.B[ESI]	;Head and unit select
+	CALL	flopcmda
+	JC	24$.S
+	CMPB	fdk_func.B[EBP], #0Dh	;Is this a format operation?
+	JE	dofmt.S			;Yes
+	MOVB	AH, fdk_daddr+2.B[EBP]	;No - set cylinder number
+	CALL	flopcmda
+	JC	24$.S
+	MOVB	AH, fdk_daddr+1.B[EBP]	;Set head number
+	CALL	flopcmda
+	JC	24$.S
+	MOVB	AH, fdk_daddr+0.B[EBP]	;Set sector number
+	CALL	flopcmda
+	JC	24$.S
+	MOVB	AH, ucb_fdsecs[ESI]	;Set sector size
+	CALL	flopcmda
+	JC	24$.S
+	MOVB	AH, ucb_csects.B[ESI]	;Get end of track value (assume want
+					;  multi-sector operation)
+	BTL	SS:xffCmd##, #O%NORDAH	;Want single sector transfer?
+	JNC	26$.S			;No
+	MOVB	AH, fdk_daddr+0.B[EBP]	;Yes - get right value
+26$:	CALL	flopcmda
+	JC	30$.S
+	MOVB	AH, ucb_fdxgpl[ESI]	;GPL value
+	CALL	flopcmda
+	JC	30$.S
+	MOVB	AH, #0FFh		;DTL value
+28$:	CALL	flopcmda
+	JC	30$.S
+	MOVL	EBX, ucb_kcb.B[ESI]
+	MOVB	kcb_itimer.B[EBX], #3t	;Start interrupt timer
+	MOVL	EAX, #-1
+	CALL	knlXfWait##
+	JNC	xferdone.S
+	JMP	xferder.S
+
+;Here if doing format operation
+
+dofmt:	MOVB	AH, ucb_fdsecs[ESI]	;Sector size
+	CALL	flopcmda
+30$:	JC	fdkdone
+	MOVB	AH, 0			;GPL value for format
+	CALL	flopcmda
+	JC	30$.S
+	MOVB	AH, #0F6h		;Data fill value
+	JMP	28$.S			;Continue
+.PAGE
+;Here when transfer is complete
+
+xferdone:
+	CALL	knlDmaDisable##		;Disable our DMA channel
+	ANDB	kcb_sts1.B[EBX], #~K1$DMAINUSE
+	CALL	floprslt2		;Get remaining result bytes
+xferder:JC	fdkdone
+	CMPB	BL, #6			;Did we get 6 bytes?
+	JNE	xfdverr			;No - fail
+	MOVB	BL, ucb_fdrslt+0[ESI]	;Check ST0 result value
+	CMPB	BL, ucb_select.B[ESI]
+	JE	xfgood.S		;If no error
+	CMPW	ucb_fdrslt+1[ESI], #0080h ;Is the error end of cylinder?
+	JE	xfgood.S		;Yes - this is OK
+	MOVW	AX, ucb_fdrslt+1[ESI]	;No - get error status bits
+	CALL	xlaterror		;Translate the error indication
+	CMPL	EAX, #ER_WPRER		;Write protect error?
+	JE	xferr.S			;Yes - don't bother retrying that
+	MOVL	EBX, ucb_kcb.B[ESI]	;No - is this the read-ahead DCB?
+	TESTB	SS:xffStatus1##, #XF1$ABORT ;No - this request being cancelled?
+	JNE	xfabort.S		;Yes
+	DECB	fdk_retry1.B[EBP]	;No - have we done this enough?
+	JNS	doxfer4			;No - go try again
+	ORB	ucb_sts1.B[ESI], #U1$RECAL ;Yes - recalibrate next time
+	DECB	fdk_retry3.B[EBP]	;Should we try a restore?
+	JS	xferr.S			;No - its time to give up!
+	JMP	doxfer2			;Go try again
+
+;Here if transfer has been aborted
+
+xfabort:MOVL	EAX, #ER_ABORT
+	JMP	fdkdone
+
+;Here if fatal error
+;	c{EAX} = Error code
+;	c{EDX} = Offset of error counter pair
+
+xferr:	TESTL	EDX, EDX		;Do we have an error counter?
+	JE	fdkdone.S		;No
+	INCL	4.B[EDX]		;Yes - bump the hard error counter
+	JMP	fdkdone.S
+
+;Here with good transfer complete
+
+xfgood:	CALL	knlDmaGetCnt##		;Get the transfer count
+	MOVL	EBX, ucb_kcb.B[ESI]
+	SUBL	EAX, fdk_count.B[EBP]	;Calculate amount actually transfered
+	NEGL	EAX
+	ADDL	fdk_amount.B[EBP], EAX	;Add in to total amount transfered
+	TESTB	ucb_bits.B[ESI], #UB$MEDIAC ;Does drive have a media sensor?
+	JE	4$.S			;No
+	TESTB	kcb_sts2.B[EBX], #K2$MSENSOR ;Yes - are we using it now?
+	JNE	4$.S			;Yes
+	CMPW	fdk_daddr+2.B[EBP], #0.B ;No - on track 0 now?
+	JE	4$.S			;Yes
+	MOVL	EDX, ucb_ioreg1.B[ESI]	;No - get current media change bit
+	A2IOP	P_DCFDDIR		;  state
+	INB	[DX]
+	IOPAUSE
+	ANDB	AL, #80h
+	MOVB	kcb_fdmssen.B[EBX], AL
+	ORB	kcb_sts2.B[EBX], #K2$MSENSOR
+4$:	TESTB	fdk_mode.B[EBP], #FM$LIST ;Do we have a buffer list?
+	JE	6$.S			;No - all done
+	MOVL	EAX, fdk_buffer+0.B[EBP] ;Yes
+	ORB	cb_sts.B[EAX], #CB$FULL	;Indicate this buffer is full
+	MOVL	EAX, cb_xnext.B[EAX]	;Get next buffer
+	TESTL	EAX, EAX
+	JE	fdkdone.S		;Done if no more
+	MOVL	fdk_buffer+0.B[EBP], EAX ;More - advance buffers
+	INCL	fdk_block.B[EBP]	;Bump disk block number
+	MOVL	EDX, fdk_block.B[EBP]
+	CALL	fdkbk2phy2		;Convert to physical disk address
+	MOVL	fdk_daddr.B[EBP], EDX
+	JMP	doxfer0			;Go transfer next buffer
+
+;Here when finished with a good transfer
+
+6$:	CLRL	EAX			;Indicate no error
+fdkdone:MOVL	EBX, ucb_kcb.B[ESI]
+	TESTB	kcb_sts1.B[EBX], #K1$DMAALLOC ;Do we have the DMA channel?
+	JE	10$.S			;No
+	PUSHL	EAX			;Yes
+	TESTB	kcb_sts1.B[EBX], #K1$DMAINUSE ;Is it in use?
+	JE	8$.S			;No
+	CALL	knlDmaDisable##		;Yes - disable it
+8$:	MOVL	ECX, #fdkclnup
+	PUSHL	EDI
+	MOVL	EDI, EBX
+	CALL	knlDmaGiveChn##		;Give up DMA channel
+	ANDB	kcb_sts1.B[EBX], #~{K1$DMAALLOC|K1$DMAINUSE}
+	POPL	EDI
+	POPL	EAX
+10$:	TESTB	ucb_sts1.B[ESI], #U1$MOTON ;Is our motor running now?
+	JE	12$.S			;No
+	MOVB	CL, ucb_fdmot[ESI]	;Yes - start motor off timer
+	MOVB	ucb_fdmoc[ESI], CL
+12$:	TESTL	EAX, EAX
+	JNS	16$.S			;If no error
+	ORB	ucb_sts1.B[ESI], #U1$RECAL ;Error - recalibrate next time
+	MOVL	ECX, fdk_amount.B[EBP]
+	STC				;Indicate error
+16$:	LEAVE
+	RET
+
+;Here to report hard device error
+
+xfdverr:INCL	ucb_tdeverr[ESI]	;Count the error
+	INCL	ucb_hdeverr[ESI]
+	MOVL	EAX, #ER_DEVER		;Get error code
+	JMP	fdkdone.S
+.PAGE
+;Subroutine to translate error indication from the drive and to increment the
+;  total error counter
+;	c[AX] = Error bits from the drive
+;	CALL	xlaterror
+;	c{EAX} = knl error code
+;	c{EDX} = Offset of error counter pair (total error count followed by
+;		   hard error count)
+
+xlaterror:
+	MOVL	EDX, #errtable		;Point to error table
+	MOVL	ECX, #6
+4$:	TESTW	CS:[EDX], AX		;Check for this error
+	JNE	6$.S			;Found it
+	ADDL	EDX, #6t.B
+	LOOP	ECX, 4$
+6$:	MOVXWL	EAX, CS:2t.B[EDX]	;Get error code
+	MOVZWL	EDX, CS:4t.B[EDX]	;Get relative offset of error counter
+	TESTL	EDX, EDX		;Do we have one?
+	JE	8$.S			;No
+	ADDL	EDX, ESI		;Yes - get its actual offset
+	INCL	[EDX]			;Increment the soft error counter
+8$:	RET
+.PAGE
+	.SBTTL	kf_chkwp - Check write protect status
+
+;Here for the check write protect status function at fork level
+;	c{EDI} = Offset of DCB
+;	CALL	fdkchkwp
+
+fdkchkwpf:
+	ENTER	fdk_SIZE, 0
+	MOVB	fdk_mode.B[EBP], #0
+	MOVL	EBX, ucb_kcb.B[ESI]
+	MOVB	AL, kcb_fdmoto.B[EBX]	;Get current motor on bits
+	ORB	AL, ucb_fdmoto[ESI]	;Plus our motor on bit
+	ORB	AL, ucb_select.B[ESI]	;Include our select value
+	MOVL	EDX, ucb_ioreg1.B[ESI]	;Give it to the controller
+	A2IOP	P_DCFDDOR
+	OUTB	[DX]
+	IOPAUSE
+	ANDB	AL, #3
+	MOVB	kcb_fdselect.B[EBX], AL
+	MOVB	AH, #04h		;Do a sense drive status command
+	CALL	flopcmdi
+	JC	10$.S
+	MOVB	AH, ucb_select.B[ESI]	;Head and unit select
+	CALL	flopcmda
+	JC	10$.S
+	CALL	floprslt
+	JC	10$.S
+	DECL	EBX
+	JNE	8$.S
+	MOVL	EBX, ucb_kcb.B[ESI]
+	MOVB	AL, kcb_fdmoto.B[EBX]	;Restore correct motor states
+	ORB	AL, ucb_select.B[ESI]	;Include our select value
+	MOVL	EDX, ucb_ioreg1.B[ESI]
+	A2IOP	P_DCFDDOR
+	OUTB	[DX]
+	IOPAUSE
+	ANDB	ucb_sts1.B[ESI], #{~U1$WPROT}&0FFh ;Assume not write protected
+	TESTB	ucb_fdrslt[ESI], #40h	;Is the drive write protected?
+	JE	6$.S			;No
+	ORB	ucb_sts1.B[ESI], #U1$WPROT ;Yes - remember that
+6$:	CLRL	EAX
+	JMP	fdkdone
+
+;Here if error while have drive selected
+
+8$:	INCL	ucb_tdeverr[ESI]	;Count the error
+	INCL	ucb_hdeverr[ESI]
+	MOVL	EAX, #ER_DEVER
+10$:	PUSHL	EAX			;Save error code
+	MOVL	EBX, ucb_kcb.B[ESI]
+	MOVB	AL, kcb_fdmoto.B[EBX]	;Restore correct motor states
+	ORB	AL, ucb_select.B[ESI]	;Include our select value
+	MOVL	EDX, ucb_ioreg1.B[ESI]
+	A2IOP	P_DCFDDOR
+	OUTB	[DX]
+	IOPAUSE
+	POPL	EAX			;Restore error code
+	JMP	fdkdone
+.PAGE
+	.SBTTL	kf_chkchg - Check for possible disk change at fork level
+
+;Here for the check for possible disk change function at fork level
+;	c{EDI} = Offset of DCB
+;	CALL	fdkchkchf
+
+fdkchkchgf:
+	ENTER	fdk_SIZE, 0
+	MOVB	fdk_mode.B[EBP], #0
+	MOVL	EBX, ucb_kcb.B[ESI]
+	CALL	chgbit			;Is the disk changed bit set?
+	JNC	8$.S			;No - nothing to do here!
+	CALL	getcont			;Yes - disk may have been changed
+	MOVB	fdk_retry3.B[EBP], #8t	;Initialize retry count
+2$:	MOVL	fdk_daddr.B[EBP], #1	;Assume should seek to track 0
+	CMPB	ucb_fdctrk[ESI], #0	;On track 0 now?
+	JNE	4$.S			;No
+	INCB	fdk_daddr+2.B[EBP]	;Yes - seek to track 1
+4$:	CALL	doseek			;Do seek to try and clear disk change
+					;  indication
+	JC	8$.S			;If error
+	CALL	chgbit			;Did disk change indication go away?
+	JNC	6$.S			;Yes
+	DECB	fdk_retry3.B[EBP]	;No - have we done this enough?
+	JNE	2$.S			;No - go try again
+	JMP	8$.S			;Yes - go report the error
+
+;Here if the disk changed indication was cleared - indicate disk changed
+
+6$:	MOVL	EAX, #ER_MDCHG
+8$:	JMP	fdkdone
+.PAGE
+	.SBTTL	chgbit - Subroutine to check disk change bit
+
+;Subroutine to check disk change bit
+;	CALL	chgbit
+;	C:set = Error (bit set, reported as not ready)
+;	  c{EAX} = Error code
+;	C:clr = Normal (bit clear)
+;	  c{EAX}  = 0
+
+chgbit:	MOVB	AL, kcb_fdmoto.B[EBX]	;Get current motor on bits
+	ORB	AL, ucb_fdmoto[ESI]	;Plus our motor on bit
+	ORB	AL, ucb_select.B[ESI]	;Include our select value
+	MOVL	EDX, ucb_ioreg1.B[ESI]	;Give it to the controller
+	A2IOP	P_DCFDDOR
+	OUTB	[DX]
+	IOPAUSE
+	ANDB	AL, #3
+	MOVB	kcb_fdselect.B[EBX], AL
+	A2IOP	P_DCFDDIR-P_DCFDDOR
+	INB	[DX]			;Get the disk change bit
+	IOPAUSE
+	MOVB	AH, AL
+	MOVB	AL, kcb_fdmoto.B[EBX]	;Restore correct motor states
+	ORB	AL, ucb_select.B[ESI]	;Include our select value
+	A2IOP	P_DCFDDOR-P_DCFDDIR
+	OUTB	[DX]
+	IOPAUSE
+	XORB	AH, kcb_fdmssen.B[EBX]
+	JS	6$.S			;If set
+	CLRL	EAX			;Not set
+	RET
+
+6$:	MOVL	EAX, #ER_NTRDY		;No - say may have been changed
+	STC
+	RET
+.PAGE
+	.SBTTL	doseek - Device fork level subroutine to do seek
+
+;Device fork level subroutine to do seek
+;	CALL	doseek
+;	C:set = Error
+;	  c{EAX} = Error code (do not have DMA channel)
+;	C:clr = Normal (DMA channel allocated)
+
+doseek:	MOVB	ucb_fdmoc[ESI], #0	;Stop motor off timer
+	MOVW	AX, ucb_fdspcfy[ESI]	;Do we need to do a specify command?
+	CMPW	kcb_fdspcfy.B[EBX], AX
+	JE	4$.S			;No
+	MOVW	kcb_fdspcfy.B[EBX], AX	;Yes - remember new value
+	MOVB	AH, #3			;Yes - issue specify command
+	CALL	flopcmdi
+	JC	2$.S
+	MOVB	AH, kcb_fdspcfy+0.B[EBX] ;Step rate time and head unload time
+	CALL	flopcmda
+	JC	2$.S
+	MOVB	AH, kcb_fdspcfy+1.B[EBX] ;Head load time and DMA mode
+	CALL	flopcmda
+	JNC	4$.S			;Go on if OK
+2$:	MOVW	kcb_fdspcfy.B[EBX], #0	;Error - force specify command next time
+	JMP	done4
+
+4$:	MOVB	AL, ucb_fdtrkd[ESI]	;Get our track density
+	CMPB	kcb_fdtrkd.B[EBX], AL	;Do we need to change it?
+	JE	10$.S			;No
+	MOVB	kcb_fdtrkd.B[EBX], AL	;Yes - remember new value
+	MOVL	EDX, ucb_ioreg1.B[ESI]
+	CMPB	kcb_fdtype.B[EBX], #FCT_CMPT ;Is this a ComptiCard?
+	JNE	6$.S			;No
+	A2IOP	P_DCFDCR2		;Yes
+	MOVB	AL, CS:cmptcr2[EAX]	;Get right value
+	JMP	8$.S			;Continue
+
+;Here if have normal AT floppy controller
+
+6$:	A2IOP	P_DCFDCTL		;Give it to the controller
+8$:	OUTB	[DX]
+	IOPAUSE
+10$:	MOVB	AL, ucb_fdmoto[ESI]	;Get our motor on bit
+	ORB	kcb_fdmoto.B[EBX], AL	;Set in in the KCB
+	MOVB	AL, kcb_fdmoto.B[EBX]	;Get all motor on bits
+	ORB	AL, ucb_select.B[ESI]	;Put in our select value
+	MOVL	EDX, ucb_ioreg1.B[ESI]	;Give it to the controller (this
+	A2IOP	P_DCFDDOR		;  selects drive and turns its motor
+	OUTB	[DX]			;  on if it was off)
+	IOPAUSE
+	ANDB	AL, #3
+	MOVB	kcb_fdselect.B[EBX], AL	;Save just the select bits
+	TESTB	ucb_sts1.B[ESI], #U1$MOTON ;Is the motor on now?
+	JNE	motoro4.S		;Yes
+	MOVL	EAX, ucb_fdmst[ESI]
+	IMULL	EAX, #XT_MILLISEC
+	CALL	knlXfTimeWait##
+	JNC	12$.S
+	MOVB	ucb_fdmoc[ESI], #1	;Make sure we turn the motor off soon
+	JMP	done4
+
+12$:	ORB	ucb_sts1.B[ESI], #U1$MOTON ;Indicate motor is on now
+motoro4:MOVB	AL, ucb_fdmot[ESI]
+	MOVB	ucb_fdmoc[ESI], AL
+	MOVL	EBX, ucb_kcb.B[ESI]
+	MOVW	ES, dcb_outframe.B[EDI]	;Is this request being cancelled?
+	TESTB	ES:xffStatus1##, #XF1$ABORT
+	JNE	fdkcan.S		;Yes
+	TESTB	ucb_sts1.B[ESI], #U1$RECAL ;No - Need to recalibrate now?
+	JE	rstrdn2			;No
+	ANDB	ucb_sts1.B[ESI], #~U1$RECAL ;Yes
+	MOVB	fdk_retry2.B[EBP], #3	;Set retry count for seek
+again2:	MOVB	fdk_retry1.B[EBP], #3	;Set retry count for restore
+again4:	MOVB	ucb_fdctrk[ESI], #0	;Going to track 0
+	ORB	kcb_sts1.B[EBX], #K1$INT ;Indicate expecting interrupt now
+	MOVB	AH, #7h			;Start a restore operation
+	CALL	flopcmdi
+	JC	done2.S			;If error
+	MOVB	AH, ucb_select.B[ESI]	;Unit select
+	ANDB	AH, #3
+	CALL	flopcmda
+	JC	done2.S			;If error
+	MOVL	EBX, ucb_kcb.B[ESI]	;OK
+	MOVB	kcb_itimer.B[EBX], #3t	;Start interrupt timer
+	MOVL	EAX, #-1
+	CALL	knlXfWait##
+	JNC	rstrdone.S
+	JMP	done2.S
+
+;Here if request is being cancelled
+
+fdkcan:	MOVL	EAX, #ER_ABORT
+	JMP	done2.S
+.PAGE
+;Here if error on seek (from below)
+
+2$:	INCL	ucb_tseekerr[ESI]	;Count the seek error
+	DECB	fdk_retry1.B[EBP]	;Should we try the restore again?
+	JG	again4.S		;Yes
+	INCL	ucb_hseekerr[ESI]	;No - count it as a hard error
+done2:	JMP	done8			;Fail!
+
+;Here at device fork level after restore is complete
+
+rstrdone:
+	MOVW	ES, dcb_outframe.B[EDI]	;Is this request being cancelled?
+	TESTB	ES:xffStatus1##, #XF1$ABORT
+	JNE	fdkcan.S		;Yes
+	CALL	chkseek			;No - check for seek error
+	MOVL	EBX, ucb_kcb.B[ESI]	;Restore KCB offset
+	JC	2$.S			;If error
+rstrdn2:ORB	kcb_sts1.B[EBX], #K1$INT ;Indicate expecting interrupt now
+	CMPB	fdk_daddr+1.B[EBP], #0	;Which side?
+	JNE	6$.S			;Side 1
+	ANDB	ucb_select.B[ESI], #~4	;Side 0 - clear head select bit
+	JMP	8$.S
+
+6$:	ORB	ucb_select.B[ESI], #4	;Set head select bit
+8$:	MOVB	AL, fdk_daddr+2.B[EBP]	;Are we on the right track now?
+	CMPB	ucb_fdctrk[ESI], AL
+	JE	done4.S			;Yes - finished now
+	MOVB	AH, #0Fh		;No - start a seek operation
+	CALL	flopcmdi
+	JC	done8.S
+	MOVB	AH, ucb_select.B[ESI]	;Head and unit select
+	CALL	flopcmda
+	JC	done8.S
+	MOVB	AH, fdk_daddr+2.B[EBP]	;Get requested track
+	TESTB	ucb_sts1.B[ESI], #U1$HFTRK ;Is this a 48 tpi disk in a 96 tpi
+					   ;  drive?
+	JE	10$.S			;No
+	ADDB	AH, AH			;Yes - adjust the track number
+10$:	CALL	flopcmda		;Give final command byte to the
+	JC	done8.S			;  controller
+	MOVL	EBX, ucb_kcb.B[ESI]
+	MOVB	kcb_itimer.B[EBX], #3t	;Start interrupt timer
+	MOVL	EAX, #-1		;Wait for the seek to finish
+	CALL	knlXfWait##
+	JC	done4.S			;If error
+	CALL	chkseek			;Check for seek error
+	MOVL	EBX, ucb_kcb.B[ESI]	;Restore KCB offset
+	JC	14$.S			;If error
+	MOVB	AL, fdk_daddr+2.B[EBP]	;OK - store new current track
+	MOVB	ucb_fdctrk[ESI], AL
+done4:	MOVL	EBX, ucb_kcb.B[ESI]
+	RET
+
+;Here if error on the seek
+
+14$:	INCL	ucb_tseekerr[ESI]	;Count the seek error
+	DECB	fdk_retry2.B[EBP]	;Should we try again?
+	JG	again2			;Yes - go restore and then seek
+	INCL	ucb_hseekerr[ESI]	;No - count as hard seek error
+done8:	STC
+	JMP	done4.S
+.PAGE
+	.SBTTL	flopcmdi - Subroutine to send initial command byte to floppy controller
+
+;Subroutine to send initial command byte to the floppy controller
+;	c(AH) = Command byte value
+;	CALL	flopcmdi
+;	C:clr = Normal
+;	C:set = Error
+;	  c{EAX} = Error code
+;  EBX is respected
+
+flopcmdi:
+	MOVL	EDX, ucb_ioreg1.B[ESI]	;Get IO port
+	A2IOP	P_DCFDSTS
+	INB	[DX]			;Get controller status
+	IOPAUSE
+	ANDB	AL, #0C0h		;Just high 2 bits
+	CMPB	AL, #80h		;Is it ready for data?
+	JE	8$.S			;Yes
+	PUSHL	EAX			;No - wait for a short time
+	MOVL	EAX, #XT_MILLISEC
+	CALL	knlXfTimeWait##
+	POPL	EAX
+	INB	[DX]			;Is it ready now?
+	IOPAUSE
+	ANDB	AL, #0C0h
+	CMPB	AL, #80h
+	JE	8$.S			;Yes
+	PUSHL	EBX			;No
+	CALL	floprslt		;Assume need to get some result bytes!
+	POPL	EBX
+	JC	6$.S			;If error
+					;OK - fall into flopcmda to try again
+
+	.SBTTL	flopcmda - Subroutine to send additional command byte to floppy controller
+
+;Subroutine to send additional command byte to the floppy controller
+;	c(AH) = Command byte value
+;	CALL	flopcmda
+;	C:clr = Normal
+;	C:set = Error
+;	  c{EAX} = Error code
+
+flopcmda:
+	MOVL	EDX, ucb_ioreg1.B[ESI]	;Get IO port
+	A2IOP	P_DCFDSTS
+	MOVL	ECX, #30000h		;Initialize retry counter
+4$:	INB	[DX]			;Get controller status
+	IOPAUSE
+	ANDB	AL, #0C0h		;Just high 2 bits
+	CMPB	AL, #80h		;Is it ready for data?
+	JE	8$.S			;Yes
+	LOOP	ECX, 4$			;No - wait some more!
+	INCL	ucb_tdeverr[ESI]	;Count the error
+	INCL	ucb_hdeverr[ESI]
+	MOVL	EAX, #ER_DEVER		;Indicate device error
+	STC
+6$:	RET
+
+;Here when controller is ready for data
+
+8$:	MOVB	AL, AH			;Get value
+	INCL	EDX			;Point to data port
+	OUTB	[DX]			;Output the byte
+	IOPAUSE
+	RET				;Finished (C is clear)
+.PAGE
+	.SBTTL	chkseek - Subroutine to check for error after seek
+
+;Subroutine to check for error after seek is complete
+;	c{EBX} = Offset of KCB
+;	c{ESI} = Offset of UCB
+;	CALL	chkseek
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+
+chkseek:CALL	floprslt		;Get result bytes
+	JC	2$.S
+	DECL	EBX
+	JS	2$.S
+	MOVB	AL, ucb_fdrslt+0[ESI]	;Check ST0 value
+	ANDB	AL, #0F8h
+	CMPB	AL, #20h
+	JE	4$.S			;OK
+2$:	MOVL	EAX, #ER_SEKER		;Indicate seek error
+	STC
+4$:	RET
+.PAGE
+	.SBTTL	floprslt - Subroutine to get result bytes from floppy controller
+
+;Subroutine to get result bytes from the floppy controller
+;	CALL	floprslt
+;	C:set = Error
+;	  c{EAX} = Error code
+;	  c{EBX} = Number of result bytes obtained
+;	C:clr = Normal
+
+floprslt:
+	MOVL	EDX, ucb_ioreg1.B[ESI]
+	PUSHL	ESI			;Save UCB offset
+	ADDL	ESI, #ucb_fdrslt	;Point to buffer for the result bytes
+	JMP	2$.S
+					;Enter here if already have first
+floprslt2:				;  result byte
+	MOVL	EDX, ucb_ioreg1.B[ESI]
+	PUSHL	ESI			;Save UCB offset
+	ADDL	ESI, #ucb_fdrslt+1	;Point to buffer for the result bytes
+2$:
+	MOVL	ECX, #10
+	CALL	knlSDelay##
+
+	CLRL	EBX
+	A2IOP	P_DCFDSTS
+4$:	MOVL	ECX, #30000h		;Get loop count
+6$:	INB	[DX]			;Get controller status
+	IOPAUSE
+	ANDB	AL, #0C0h		;Only high 2 bits
+	CMPB	AL, #0C0h		;Is a result byte ready?
+	JE	8$.S			;Yes
+	LOOP	ECX, 6$			;No - wait some more
+	JMP	12$			;Go report device error
+
+;Here with result byte ready
+
+8$:	INCL	EDX			;Point to the data port
+	INCL	EBX
+	INB	[DX]			;Get the result byte
+	IOPAUSE
+	MOVB	[ESI], AL		;Store the byte
+	INCL	ESI			;Bump pointer
+	MOVL	ECX, #3t
+	CALL	knlSDelay##		;Wait for at least 12us
+	DECL	EDX			;Point to the status port
+	INB	[DX]			;Get status
+	IOPAUSE
+	TESTB	AL, #10h		;More result bytes available?
+	JE	14$.S			;No - all finished here
+	CMPB	BL, #8			;Yes - is this too many?
+	JB	4$.S			;No - go get another
+12$:	POPL	ESI			;Yes
+	INCL	ucb_tdeverr[ESI]	;Report the hard device error
+	INCL	ucb_hdeverr[ESI]
+	MOVL	EAX, #ER_DEVER
+	STC
+	RET
+
+;Here if OK (C is clear)
+
+14$:	POPL	ESI
+	RET
+.PAGE
+	.SBTTL	getcont - Subroutine to fully allocate floppy controller
+
+;Subroutine to fully allocate floppy controller
+;	CALL	getcont
+
+getcont:MOVB	dcb_dmachnl.B[EDI], #2	;Make sure have DMA channel number
+	PUSHL	EDI
+	MOVL	EDI, EBX
+	CALL	knlXfDmaGetChn##	;Get the DMA channel
+	POPL	EDI
+	JC	4$.S			;If error
+	ORB	kcb_sts1.B[EBX], #K1$DMAALLOC ;Indicate DMA channel allocated
+	MOVL	curkcb, EBX		;This is now the current KCB
+	TESTB	knlMachType##+3, #02h	;Is this a PS/2?
+	JNE	4$.S			;Yes
+	ORB	kcb_fdmoto.B[EBX], #08h	;No - enable interrupts and DMA
+	MOVB	AL, kcb_fdmoto.B[EBX]
+	MOVL	EDX, ucb_ioreg1.B[ESI]
+	A2IOP	P_DCFDDOR
+	OUTB	[DX]
+	IOPAUSE
+	INB	P_INC1P1		;Enable our interrupt
+	IOPAUSE
+	ANDB	AL, #~40h
+	OUTB	P_INC1P1
+	IOPAUSE
+	CLC
+4$:	RET
+.PAGE
+	.SBTTL	fdkclnup - Subroutine to do clean-up after using DMA channel
+
+;Subroutine to do clean-up after using DMA channel - this subroutine is
+;  called after we have given up the DMA channel but before it is given to
+;  anyone else - the only valid register is EDI, which points to our DCB -
+;  all registers except EAX must be preserved
+;	c{EDI} = Offset of KCB
+;	CALL	fdkclnup
+
+fdkclnup:
+	PUSHL	EDX
+	INB	P_INC1P1		;Disable our interrupt
+	IOPAUSE
+	ORB	AL, #40h
+	OUTB	P_INC1P1
+	IOPAUSE
+	ANDB	kcb_fdmoto.B[EDI], #~08	;Disable interrupts and DMA at
+	MOVB	AL, kcb_fdmoto.B[EDI]	;  interface
+	MOVL	EDX, kcb_ioreg1.B[EDI]
+	A2IOP	P_DCFDDOR
+	OUTB	[DX]
+	IOPAUSE
+	POPL	EDX
+	RET				;Thats all
+.PAGE
+	.SBTTL	fdkbk2phy - Subroutine to convert block number to physical disk address
+
+;Subroutine to convert block number to physical disk address.  A file structured
+;  double density floppy disk has the following format:
+;    Tracks:        40 (0-39) or 80 (0-79)
+;    Heads/Track:   2
+;    Sectors/Track: 9
+;    Byte/sector:   512
+;  A file structured high density floppy disk has the following format:
+;    Tracks:        80 (0-79)
+;    Heads/Track:   2
+;    Sectors/Track: 15
+;    Byte/sector:   512
+;	c{dcb_dkdblk{EDI}} = Block number on disk
+;	c{EDI}             = Offset of DCB
+;	CALL	fdkbk2phy
+;	c{EDX} = Sector number (8) Head number (8) Track number (16)
+;  All registers except EDX are preserved
+
+fdkbk2phy:
+	MOVL	EDX, dcb_dkdblk.B[EDI]	;Get block number on disk
+fdkbk2phy2:
+	PUSHL	EAX
+	PUSHL	ECX
+	MOVL	EAX, EDX
+	MOVL	ECX, ucb_csects.B[ESI]	;Get sectors per track
+	TESTL	ECX, ECX		;Make sure not 0!
+	JNE	2$.S
+	INCL	ECX
+2$:	CLRL	EDX
+	DIVL	ECX			;Get sector number
+	INCB	DL
+	PUSHL	EDX			;Save sector number
+	MOVB	DL, #0
+	CMPB	ucb_cheads.B[ESI], #1	;Double sided disk?
+	JE	4$.S			;No
+	SHRL	EAX, #1			;Yes - get head and track numbers
+	RCLB	DL, #1
+4$:	MOVB	1.B[ESP], DL		;Store head number
+	MOVW	2.B[ESP], AX		;Store track number
+	POPL	EDX			;Get in right register
+	POPL	ECX
+	POPL	EAX
+	RET
+.PAGE
+	.SBTTL	fdkoas - Floppy disk once-a-second routine
+
+;Here once-a-second.  If we detect a hung controller, we reset the controller
+;  and restart the timer.  It should interrupt immediately, which we will
+;  detect as a hung controller interrupt because the K1$RESET bit will be set.
+;  If it times out again, we fake the interrupt directly from here and hope
+;  for the best.  In this case, the controller is probably dead!
+
+fdkoas:	MOVL	EBX, fdkakcb		;Get our first KCB
+2$:	TOFORK
+	CMPB	kcb_itimer.B[EBX], #0	;Are we timing an interrupt now?
+	JE	6$			;No
+	DECB	kcb_itimer.B[EBX]	;Yes - reduce count
+	JNE	6$.S			;If not out yet
+	MOVL	EDI, kcb_curdcb.B[EBX]	;Timed-out - get DCB
+	TESTL	EDI, EDI
+	JE	6$.S
+	MOVL	ESI, [EDI]		;And get UCB
+	CALL	knlDmaDisable##		;Disable our DMA channel
+	CALL	knlDmaGetCnt##		;Get the transfer count
+	MOVL	EDX, ucb_ioreg1.B[ESI]
+	A2IOP	P_DCFDSTS
+	INB	[DX]
+	IOPAUSE
+	TESTB	kcb_sts1.B[EBX], #K1$RESET ;Already doing reset?
+	JE	4$.S			;No - go on
+	PUSHL	EBX			;Yes
+	CALL	fdkfrk2			;Do timeout stuff now
+	POPL	EBX
+	JMP	6$.S			;Continue
+
+;Here if not already resetting timed out controller
+
+4$:	ORB	kcb_sts1.B[EBX], #K1$RESET ;Indicate doing reset
+	ANDB	kcb_sts1.B[EBX], #~K1$RESULT
+	MOVL	EDX, ucb_ioreg1.B[ESI]	;Reset the floppy controller
+	A2IOP	P_DCFDDOR
+	MOVB	AL, #8
+	OUTB	[DX]
+	IOPAUSE
+	MOVB	ucb_fdmoc[ESI], #0	;Clear motor off timer
+	ANDB	ucb_sts1.B[ESI], #~U1$MOTON
+	MOVB	AL, ucb_fdmoto[ESI]	;Clear our motor on bit
+	NOTB	AL
+	ANDB	kcb_fdmoto.B[EBX], AL
+	MOVB	AL, kcb_fdmoto.B[EBX]
+	ORB	AL, ucb_select.B[ESI]	;Remove the reset state (this should
+	ORB	AL, #0Ch		;  cause an interrupt)
+	OUTB	[DX]
+	IOPAUSE
+	MOVB	kcb_itimer.B[EBX], #2t	;Restart the timer
+6$:	FROMFORK
+	MOVL	ESI, kcb_fucb.B[EBX]	;Get first UCB
+	TESTL	ESI, ESI
+	JE	16$.S			;If none
+10$:	TOFORK
+	CMPB	ucb_fdmoc[ESI], #0	;Are we timing the motor?
+	JE	12$.S			;No
+	DECB	ucb_fdmoc[ESI]		;Yes - count it down
+	JNE	12$.S			;Time to turn it off?
+	MOVB	AL, ucb_fdmoto[ESI]	;Yes - get the motor bit
+	NOTB	AL
+	ANDB	kcb_fdmoto.B[EBX], AL	;Clear the bit in the KCB
+	MOVB	AL, kcb_fdmoto.B[EBX]	;And turn off the motor
+	ORB	AL, kcb_fdselect.B[EBX]	;Preserve current select value
+	MOVL	EDX, ucb_ioreg1.B[ESI]
+	A2IOP	P_DCFDDOR
+	OUTB	[DX]
+	IOPAUSE
+	ANDB	ucb_sts1.B[ESI], #~U1$MOTON
+12$:	FROMFORK
+	MOVL	ESI, [ESI]		;Advance to next UCB
+	TESTL	ESI, ESI
+	JNE	10$.S			;Continue if another
+16$:	MOVL	EBX, kcb_nexts.B[EBX]	;Advance to next KCB
+	TESTL	EBX, EBX
+	JNE	2$			;Continue if another
+	RET
+.PAGE
+	.SBTTL	fdkint - Floppy disk interrupt routine
+
+fdkint:	PUSHAL				;Save all registers
+	PUSHL	DS
+	PUSHL	ES
+	PUSHL	FS
+	PUSHL	GS
+	PUSHL	#GS_DATA.B
+	POPL	DS
+	MOVL	EDI, curkcb		;Get our current KCB
+	MOVL	EDX, kcb_ioreg1.B[EDI]	;Point to data register
+	A2IOP	P_DCFDDATA
+	TESTB	kcb_sts1.B[EDI], #K1$INT ;Expecting interrupt now?
+	JE	18$.S			;No
+	TESTB	kcb_sts1.B[EDI], #K1$RESULT ;Yes - in result phase now?
+	JNE	2$.S			;Yes
+	MOVB	AL, #08h		;No - do sense interrupt command
+	OUTB	[DX]
+	IOPAUSE
+	JMP	8$.S
+
+;Here if in result phase now
+
+2$:	MOVL	ECX, #1000h
+	DECL	EDX
+4$:	INB	[DX]
+	ANDB	AL, #0C0h
+	CMPB	AL, #0C0h
+	LOOPNE	ECX, 4$
+	INCL	EDX
+	INB	[DX]			;Get first result byte
+	IOPAUSE
+	MOVL	EDX, kcb_curdcb.B[EDI]	;Get current DCB
+	MOVL	ESI, [EDX]
+	MOVB	ucb_fdrslt+0[ESI], AL	;Store first result byte
+8$:	CALL	knlReqFork##		;Yes - request fork
+	TESTB	knlMachType##+3, #02h	;Is this a PS/2?
+	JE	14$.S			;No - don't wait for interrupt to go
+	MOVL	EDX, kcb_ioreg1.B[EDI]	;  away
+	MOVL	ECX, #1000h		;Yes - must wait for interrupt request
+12$:	INB	[DX]			;  to go away before dismissing the
+	IOPAUSE
+	TESTB	AL, #80h		;  interrupt!
+	LOOPNE	ECX, 12$
+	JNE	20$.S
+14$:	CLI
+	MOVB	AL, #INT_EOI		;Release interrupt controller
+	OUTB	P_INC1P0
+	IOPAUSE
+	JMP	knlDismissInt2##	;And dismiss interrupt
+
+;Here if not expecting interrupt.  If not running on a PS/2, we just dismiss it
+;  and hope everything will continue to work (this is likely to happen when we
+;  first enable a controller).  If running on a PS/2, we crash, since we can't
+;  ignore a level triggered interrupt!
+
+18$:	TESTB	knlMachType##+3, #02h	;Is this a PS/2?
+	JE	14$.S			;No - just dismiss the interrupt
+	CRASH	SPRI			;[SPuRious Interrupt]
+
+;Here if can't clear the interrupt request on a PS/2.  There is nothing we can
+;  do in this case, since we can't dismiss a PS/2 interrupt while the request
+;  is still active!
+
+20$:	CRASH	HNGI			;[HuNG Interrupt request]
+.PAGE
+;Device fork level routine for floppys
+
+fdkfork:MOVL	EBX, EDI
+fdkfrk2:MOVL	EDI, kcb_curdcb.B[EBX]
+	MOVL	ESI, [EDI]		;Get UCB offset
+	TESTL	ESI, ESI
+	JE	8$.S
+	MOVB	kcb_itimer.B[EBX], #0	;Clear interrupt timer
+	TESTB	kcb_sts1.B[EBX], #K1$RESET ;Doing reset now?
+	JNE	4$.S			;Yes - this is a timeout
+	ANDB	kcb_sts1.B[EBX], #{~{K1$INT|K1$RESULT}}&0FFh ;No
+	CLRL	EAX			;Everything is normal
+2$:	JMP	knlResumeOutput##
+
+;Here if doing reset - this means we had a time-out
+
+4$:	ANDB	kcb_sts1.B[EBX], #{~{K1$RESET|K1$INT|K1$RESULT}}&0FFh
+	CALL	floprslt		;Get result bytes
+	MOVL	EBX, ucb_kcb.B[ESI]
+	ORB	ucb_sts1.B[ESI], #U1$RECAL ;Recalculate next time
+	MOVL	EAX, #ER_NTRDY		;Assume should report as not ready
+	TESTB	ucb_bits.B[ESI], #UB$MEDIAC ;Does it have a media sensor?
+	JE	2$.S			;No
+	TESTB	kcb_sts2.B[EBX], #K2$MSENSOR ;Yes - are we using it now?
+	JE	2$.S			;No
+	INCL	ucb_hungerr[ESI]	;Yes
+8$:	MOVL	EAX, #ER_NORSP		;Report this as a timeout
+	JMP	2$.S
+.PAGE
+	.SBTTL	Data
+
+;Table which gives correspondense between result byte values and error codes
+
+	.MOD	2
+errtable:
+	.WORD	0020h, ER_DATER, ucb_tdataerr
+	.WORD	0101h, ER_IDFER, ucb_tidferr
+	.WORD	0004h, ER_RNFER, ucb_trnferr
+	.WORD	1200h, ER_SEKER, ucb_tseekerr
+	.WORD	0002h, ER_WPRER, 0
+	.WORD	0010h, ER_LSTER, ucb_tovrnerr
+	.WORD	0000h, ER_DEVER, ucb_tdeverr
+
+;Table which gives motor on bits as a function of drive on controller
+
+motoron:.BYTE	10h		;Drive 1
+	.BYTE	20h		;Drive 2
+	.BYTE	40h		;Drive 3
+	.BYTE	80h		;Drive 4
+
+;Table giving values for the ComptiCard control register 2
+
+cmptcr2:.BYTE	0Fh	; 0 - 500kb
+	.BYTE	1	; 1 - 300kb
+	.BYTE	0	; 2 - 250kb
+	.BYTE	0	; 3 - Illegal
+
+	DATA
+
+	.MOD	4
+fdkakcb:.LONG	0		;Offset of first floppy KCB
+curkcb: .LONG	0		;Offset of current floppy KCB
+lit5:	.LONG	5t
+lit6:	.LONG	6t
+hwname: .LONG	'DISK', 'fdka', '03F0', 0
+
+	LKEEND

@@ -1,0 +1,1256 @@
+	.SBTTL	OPIN - Opcode input routines for GECKO
+
+;++++
+; This software is in the public domain.  It may be freely copied and used
+; for whatever purpose you see fit, including commerical uses.  Anyone
+; modifying this software may claim ownership of the modifications, but not
+; the complete derived code.  It would be appreciated if the authors were
+; told what this software is being used for, but this is not a requirement.
+
+;   THIS SOFTWARE IS PROVIDED BY THE AUTHORS "AS IS" AND ANY EXPRESS OR
+;   IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
+;   OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+;   IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+;   INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+;   BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS
+;   OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+;   ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR
+;   TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
+;   USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+;----
+
+;This module contains routines for inputing operands for the opcodes.  All
+;  routines are entered from the dispatch in GETATM after a match is found
+;  on the opcode string with the opcode table.  At entry, EDI contains the
+;  offset (in the code segment) of the opcode table entry.  The format of
+;  the opcode table is as follows:
+;     Offset  Name       Use
+;	 0/  opi_opcode  1st character of opcode
+;	 1/		 2nd character of opcode
+;	 2/		 3rd character of opcode
+;	 3/		 4th character of opcode
+;	 4/		 5th character of opcode
+;	 5/		 6th character of opcode
+;	 6/		 7th character of opcode
+;	 7/  opi_val1    1st value byte
+;	 8/  opi_val2    2nd value byte
+;	 9/  opi_val3    3rd value byte
+;	10/  opi_val4    4th value byte
+;	11/  opi_size    Size of instruction (0, 1, 2, or 4)
+;	12/  opi_disp    Low order byte of dispatch address
+;	13/		 High order byte of dispatch address
+.PAGE
+	.SBTTL	ionebyt - One byte instructions with no operands
+
+;Here for instructions which generate one byte and have no operands.
+;	c{EDI} = Address of opcode table entry
+;	  The value bytes in the opcode table are used as follows:
+;		1st byte:  Opcode byte value
+;		2nd byte:  Not used
+;		3rd byte:  Not used
+;		4th byte:  Not used
+
+ionebyt:MOVB	AL, CS:opi_val1.B[EDI]	;Get value for the byte
+ioneby2:CALL	str1byt
+	JMP	strdon.S
+
+	.SBTTL	itwobyt - Two byte instructions with no operands
+
+;Here for instructions which generate two bytes and have no operands.
+;	c{EDI} = Offset of opcode table entry
+;	  The value bytes in the opcode table are used as follows:
+;		1st byte:  Opcode byte value
+;		2nd byte:  Value for second byte
+;		3rd byte:  Not used
+;		4th byte:  Not used
+
+itwobyt:MOVW	AX, CS:opi_val1.B[EDI]	;Get value for the two bytes
+itwoby2:CALL	str2byt
+strdon:	CMPB	segovr, #0		;Do we need a segment override?
+	JE	4$.S			;No
+	PUSHL	DS			;Yes - make room for the segment
+	POPL	ES			;  prefix byte
+	MOVZBL	ECX, valsiz
+	MOVL	ESI, #value-1
+	ADDL	ESI, ECX
+	MOVL	EDI, #value
+	ADDL	EDI, ECX
+	STD
+	RMOVSB	[EDI], [ESI]
+	INCB	valsiz			;Adjust size
+	MOVB	BL, segovr		;Get prefix byte
+	MOVB	BH, #0
+	MOVB	AL, CS:regbits[BX]
+	ORB	AL, #26h
+	MOVB	value, AL		;Store it
+4$:	MOVB	valtyp, #VL_INS		;Indicate instruction
+	MOVB	notnul, #1
+	MOVB	AL, stoper		;Get stopper character
+	CLC				;And return with C clear
+ret500:	RET
+.PAGE
+	.SBTTL	ioneopr - Instructions which have one operand
+
+;Here for instructions which have one operand
+;	c{EDI} = Address of opcode table entry
+;	  The value bytes in the opcode table are used as follows:
+;		1st byte:  Opcode byte for mem/reg form
+;		2nd byte:  Opcode byte for reg form if non-zero
+;		3rd byte:  Extra bits for mode byte
+;		4th byte:  Opcode byte for segreg form if non-zero
+
+ioneopr:CALL	ioneopx
+	JC	ret500.S
+	JMP	strdon
+
+ioneopx:CALL	getopr			;Get operand
+	JC	ret500.S		;If error
+	JMPIL	CS:ionedsp[EBX]		;Dispatch on operand type
+
+;Dispatch table for operand for one operand instructions
+
+	.MOD	4
+ionedsp:.LONG	ionemem		;OP_ADDR =  0. - Memory address
+	.LONG	ionereg		;OP_REG  =  4. - Register
+	.LONG	ionemem		;OP_IRG  =  8. - Indexed by register(s)
+	.LONG	ionemem		;OP_IRO  = 12. - Indexed by register(s) with
+				;		   offset
+	.LONG	givsye		;OP_IMED = 16. - Immediate value
+
+;Here if operand for one operand instructions is a register
+
+ionereg:TESTB	CS:opi_flag.B[EDI], #OF$RS ;Is this valid for this
+					   ;  instruction?
+	JE	getse1.S		;No - fail
+	MOVL	ESI, value		;Is this a "general register"?
+	MOVW	BX, CS:regbits[ESI]
+	TESTB	BH, #RB$2OP/100h
+	JE	ioner2.S		;No
+	MOVB	AL, CS:opi_val2.B[EDI]	;Yes - see if have special form for
+	ORB	AL, AL			;  this
+	JE	ionemm2.S		;No - just use general form
+	ANDB	BL, #07h		;Yes - get register bits
+	JMP	ioner6.S		;Continue
+
+;Here if not "general register"
+
+ioner2:	TESTB	BH, #RB$SEG/100h	;Is it a segment register?
+	JE	getse1.S		;No - error
+	MOVB	AL, CS:opi_val4.B[EDI]	;Yes - see if have special form for
+	ORB	AL, AL			;  this
+	JNE	ioner4.S		;Yes - continue	
+getse1:	JMP	givsye			;No - error
+
+ioner4:	ANDB	BL, #18h		;Yes - get segment register bits
+ioner6:	ORB	AL, BL			;Combine with opcode bits
+str1byt:MOVB	valsiz, #1
+	MOVB	value, AL		;Store one byte
+	RET
+
+;Here for general address operand (also for register operand if instruction
+;  does not support special register form)
+
+ionemem:TESTB	CS:opi_flag.B[EDI], #OF$MS ;Is this valid for this
+					   ;  instruction?
+	JE	getse1.S		;No - fail
+ionemm2:MOVB	AH, CS:opi_val3.B[EDI]	;Get extra bits for the mode byte
+	MOVB	AL, #0			;Get extra bits for opcode byte (none)
+	JMP	stropr			;Go store instruction
+.PAGE
+	.SBTTL	 itwoopr - Instructions which have two operands
+
+;Here for the general case of instructions which have two operands which do
+;  not use a size bit
+;	c{EDI} = Offset of opcode table entry
+;	  The value bytes in the opcode table are used as follows:
+;		1st byte:  Opcode byte for mem/reg,reg or reg,mem/reg form
+;		2nd byte:  Opcode byte for mem/reg,#immed form
+;		3rd byte:  Extra bits for mode byte for mem/reg,#immed form
+;		4th byte:  Opcode byte for AX,#immed form
+
+itwoopr:CALL	itwoopx
+	JC	ret504.S
+	JMP	strdon
+
+itwoopx:CALL	getopr			;Get first operand
+	JC	ret504.S		;If error
+	CMPB	stoper, #','		;Must be stopped by comma
+	JNE	givsye			;Otherwise error
+	JMPIL	CS:itwodsp[EBX]		;Dispatch on operand type
+
+;Dispatch table for first operand for two operand operations
+
+	.MOD	4
+itwodsp:.LONG	itwomem		;OP_ADDR =  0. - Memory address
+	.LONG	itworeg		;OP_REG  =  4. - Register
+	.LONG	itwomem		;OP_IRG  =  8. - Indexed by register(s)
+	.LONG	itwomem		;OP_IRO  = 12. - Indexed by register(s) with
+				;		   offset
+	.LONG	givsye		;OP_IMED = 16. - Immediate value
+
+;Here if first operand for arithmetic operation is register
+
+itworeg:MOVL	ESI, valofs		;Is this a valid register?
+	TESTW	CS:regbits[ESI], #RB$2OP
+	JE	givsye			;No - error
+	PUSHL	ESI			;Save register
+	CALL	getopr			;Get second operand
+	POPL	ESI
+	JC	ret504.S		;If error
+	JMPIL	CS:i2rgdsp[EBX]		;Dispatch on type of second operand
+
+ret504:	RET
+
+;Dispatch table for second operand for two operand instructions when first
+;  operand is a register
+
+	.MOD	4
+i2rgdsp:.LONG	i2rgmem		;OP_ADDR =  0. - Memory address
+	.LONG	i2rgreg		;OP_REG  =  4. - Register
+	.LONG	i2rgmem		;OP_IRG  =  8. - Indexed by register(s)
+	.LONG	i2rgmem		;OP_IRO  = 12. - Indexed by register(s) with
+				;		   offset
+	.LONG	i2rgimm		;OP_IMED = 16. - Immediate value
+
+;Here for two operand instructions of form ins reg,reg (d = 1)
+
+i2rgreg:TESTB	CS:opi_flag.B[EDI], #OF$RS ;Is this valid for this instruction?
+	JNE	i2rgmm1.S		;Yes - go on
+	JMP	getse1			;No - fail
+
+;Here for two operand instructions of form ins reg,mem (d = 1)
+
+i2rgmem:TESTB	CS:opi_flag.B[EDI], #OF$MS ;Is this valid for this instruction?
+	JE	getse1			;No - fail
+i2rgmm1:MOVB	AL, #2			;Set the direction bit
+	TESTB	CS:opi_flag.B[EDI], #OF$DB ;Do we really want the direction bit?
+	JNE	i2rgmm2.S		;Yes
+	MOVB	AL, #0			;No
+i2rgmm2:MOVB	AH, CS:regbits[ESI]	;Get reg bits for the mode word
+	ANDB	AH, #7
+	SHLB	AH, #3
+stropr:	ORB	AL, CS:opi_val1.B[EDI]	;Get opcode byte value
+strop2:	ORB	AH, mode		;Combine rest of the bits
+	MOVB	valsiz, #2		;Base size is 2 bytes
+	MOVL	EDX, value		;Get offset value
+	CALL	adexsize		;See how many additional bytes we need
+	JE	str2byt			;If only need 2
+	JC	str3byt.S
+str4byt:MOVB	valsiz, #4
+	MOVL	value+0, EAX
+	RET
+
+str3byt:MOVB	valsiz, #3
+	MOVL	value+0, EAX
+	RET
+
+;Here for two operand instructions of form ins reg,#immed
+
+i2rgimm:CMPB	CS:opi_val2.B[EDI], #0	;Is this valid?
+	JNE	i2rgim2.S		;Yes
+getse4:	JMP	givsye			;No - fail
+
+i2rgim2:TESTW	CS:regbits[ESI], #RB$AX	;Is the register AX or AL?
+	JNE	i2aximm.S		;Yes - us special format for this
+	MOVB	AL, CS:opi_val2.B[EDI]	;Get opcode byte
+	MOVW	AX, value		;Get immediate value
+	SHLL	EAX, #16t
+	MOVB	AH, mode		;Get mode bits
+	ORB	AH, CS:opi_val3.B[EDI]	;Put in the extra bits
+	CALL	immedsz			;Do we want a 1 byte immediate value?
+	JNC	str3byt.S		;Yes - go store 3 bytes
+	JMP	str4byt.S		;No - store 4 bytes
+
+;Here for two operand instructions of the form ins AX,#immed
+
+i2aximm:MOVW	AX, value		;Get immediate value
+	SHLL	EAX, #8t
+	MOVB	AL, CS:opi_val4.B[EDI]	;Get the opcode byte
+	CMPB	CS:opi_size.B[EDI], #1	;Byte instruction?
+	JNE	str3byt			;No
+str2byt:MOVB	valsiz, #2
+	MOVW	value, AX		;Store two bytes
+ret508:	RET
+
+;Here if first operand for two operand instruction is memory
+
+itwomem:TESTB	CS:opi_flag.B[EDI], #OF$MD ;Is this legal for this instruction?
+	JE	getse4.S		;No
+	PUSHL	value			;Yes - save value
+	MOVB	AL, mode		;And save mode byte
+	PUSHL	EAX
+	CALL	getopr			;Get second operand
+	POPL	EAX			;Restore mode byte
+	MOVB	mode, AL
+	POPL	EDX			;And restore value
+	JC	ret508.S		;If error
+	JMPIL	CS:i2mmdsp[EBX]		;Dispatch on type of second operand
+
+;Dispatch table for second operand for two operand instructions when first
+;  operand is a memory address
+
+	.MOD	4
+i2mmdsp:.LONG	givsye		;OP_ADDR =  0. - Memory address
+	.LONG	i2mmreg		;OP_REG  =  4. - Register
+	.LONG	givsye		;OP_IRG  =  8. - Indexed by register(s)
+	.LONG	givsye		;OP_IRO  = 12. - Indexed by register(s) with
+				;		  offset
+	.LONG	i2mmimm		;OP_IMED = 16. - Immediate value
+
+;Here for two operand instructions of the form inst mem,reg (d = 0)
+
+i2mmreg:MOVW	DI, value		;Get two operands in right places
+i2mmrg2:MOVW	value, DX
+	MOVB	AL, #0			;Get value for direction bit
+	JMP	i2rgmm2			;Now its just like inst reg,mem!
+
+;Here for two operand instructions of the form inst mem,#immed
+
+i2mmimm:MOVB	AL, CS:opi_val2.B[EDI]	;Get opcode byte
+i2mmim2:MOVB	AH, CS:opi_val3.B[EDI]	;Get extra bits for mode byte
+i2mmim3:ORB	AH, mode		;Put in the mode bits
+	CALL	adexsize		;No - see how many address bytes we need
+	JE	i2m0ab.S		;No more
+	JC	i2m1ab.S		;One more
+	MOVW	CX, value		;Two more - get immediate value
+	CALL	immedsz			;See how many bytes needed for value
+	JNC	str5byt.S		;Need 1 byte for immediate valud
+str6byt:MOVB	valsiz, #6
+	MOVL	value+0, EAX
+	MOVW	value+4, CX
+	RET
+
+;Here if only need one byte for address
+
+i2m1ab:	SHLL	EAX, #8t
+	MOVB	AL, value+0
+	RORL	EAX, #8t
+	CALL	immedsz			;Only need 1 byte for immediate value?
+	JNC	str4byt			;Yes
+	MOVB	CL, value+1		;No
+str5byt:MOVB	valsiz, #5
+	MOVL	value+0, EAX
+	MOVB	value+4, CL
+	RET
+
+;Here if don't need any address bytes
+
+i2m0ab:	SHLL	EAX, #16t
+	MOVW	AX, value
+	RORL	EAX, #16t
+	CALL	immedsz			;Only need 1 byte for immediate value?
+	JNC	str3byt			;Yes - store 3 bytes
+	JMP	str4byt			;No - store 4 bytes
+.PAGE
+	.SBTTL	iimul - IMUL instruction
+
+;Here for the IMUL instruction
+;	c{EDI} = Offset of opcode table entry
+;	  The value bytes in the opcode table are used as follows:
+;		1st byte:  Opcode byte for mem/reg form
+;		2nd byte:  Not used, must be 0
+;		3rd byte:  Extra bits for mode byte
+;		4th byte:  Not used, must be 0
+;  This instruction is unique in that it is the only 3 operand instruction
+;  available!  It is also unique in that it may have 1, 2, or 3 operands!!
+;  The possible forms are:
+;	IMULB	mem/reg
+;	IMULW	mem/reg
+;	IMULL	mem/reg
+;	IMULW	reg,#immed
+;	IMULW	reg,mem/reg,#immed
+;	IMULL	reg,#immed
+;	IMULL	reg,mem/reg,#immed
+;  The immediate operand may be followed by .B to specify an 8 bit value.
+
+iimul:	CALL	getopr			;Get operand
+	JC	ret510.S		;If error
+	CMPB	stoper, #','		;Stopped by a comma?
+	JE	iimul02.S		;Yes
+	CALLI	ionedsp[EBX]		;No - same as other single operand
+	JMP	strdon			;  instructions
+
+;Here if first operand followed by a comma
+
+iimul02:CMPW	BX, #OP_REG		;Is first operand a register?
+	JNE	iimul04.S		;No - error
+	MOVW	BX, value		;Yes - get register index
+	TESTB	CS:regbits+1[EBX], #RB$2OP/100h ;Valid register?
+	JNE	iimul06.S		;Yes
+iimul04:JMP	givsye			;No
+
+iimul06:PUSHL	EBX			;Save index for register
+	CALL	getopr			;Get 2nd operand
+	POPL	EDI
+	JC	ret510.S
+	CMPB	stoper, #','		;Stopped by a comma?
+	JNE	iimul10.S		;No
+	CMPB	BL, #OP_IMED		;Yes - immediate operand?
+	JE	iimul04.S		;Yes - error
+	PUSHL	value			;No - save value
+	MOVB	AL, mode		;And save mode
+	PUSHL	EAX
+	PUSHL	EDI
+	CALL	getopr			;Get 3rd operand
+	POPL	EDI
+	POPL	EAX
+	MOVB	mode, AL
+	POPL	EDX
+	JNC	iimul14.S
+ret510:	RET
+
+;Here if only have 2 operands
+
+iimul10:MOVL	EDX, EDI		;Make dummy 2nd operand same as 1st
+	MOVB	AL, CS:regbits[ESI]	;Make up a mode byte referencing
+	ORB	AL, #0C0h		;  the first operand
+	MOVB	mode, AL
+
+;Here with last operand
+
+iimul14:CMPB	BL, #OP_IMED		;Is last operand immediate?
+	JNE	iimul04.S		;No - error
+	MOVB	AH, CS:regbits[ESI]	;Get reg field value for 1st operand
+	SHLB	AH, #3
+	MOVB	AL, #69h		;Get value for opcode byte
+	CALL	i2mmim3
+	JMP	strdon
+.PAGE
+	.SBTTL	iintins - INT instruction
+
+;Here for the INT instruction
+;	c{EDI} = Address of opcode table entry
+;	  The value bytes in the opcode table are used as follows:
+;		1st byte:  Opcode byte value
+;		2nd byte:  Not used
+;		3rd byte:  Not used
+;		4th byte:  Not used
+
+iintins:CALL	getopr			;Get operand
+	JC	ret512.S		;If error
+iinti2:	CALL	chkbyte			;Make sure have byte value
+	JC	ret512.S
+	MOVB	AL, CS:opi_val1.B[EDI]	;Get opcode byte
+	MOVB	AH, value		;Get value for second byte
+	JMP	itwoby2			;Go store 2 bytes
+
+ret512:	RET
+.PAGE
+	.SBTTL	ibranch - Conditional and short jump instructions
+
+;Here for conditional and short jump instructions
+;	c[SI] = Address of opcode table entry
+;	  The value bytes in the opcode table are used as follows:
+;		1st byte:  Opcode byte value
+;		2nd byte:  Not used
+;		3rd byte:  Not used
+;		4th byte:  Not used
+
+ibranch:CALL	getjadr			;Get branch offset
+	SUBL	EAX, #2.B		;Minus 2
+	MOVL	ECX, EAX		;Is the offset too large?
+	CMPL	ECX, EAX
+	JNE	givrge			;No - give R error
+	MOVB	AH, AL			;Yes - get offset in right register
+	MOVB	AL, CS:opi_val1.B[EDI]	;Get opcode byte value
+	JMP	itwoby2			;Go store 2 bytes
+
+	.SBTTL	ijumpn - JMP and CALL instructions
+
+;Here for JMP, and CALL instructions
+;	c{EDI} = Address of opcode table entry
+;	  The value bytes in the opcode table are used as follows:
+;		1st byte:  Opcode byte value
+;		2nd byte:  Not used
+;		3rd byte:  Not used
+;		4th byte:  Not used
+
+ijumpn:	CALL	getjadr			;Get branch offset
+	JC	ret512.S
+	SUBL	EAX, #3			;Minus 3
+	SHLL	EAX, #8			;Get in right registers
+	MOVB	AL, CS:opi_val1.B[EDI]	;Get value for opcode byte
+	CALL	str3byt			;Store 3 bytes
+	JMP	strdon
+.PAGE
+	.SBTTL	ijumpf - JMPF and CALLF instructions
+
+;Here for JMPF and CALLF instructions
+;	c{EDI} = Address of opcode table entry
+;	  The value bytes in the opcode table are used as follows:
+;		1st byte:  Opcode byte value
+;		2nd byte:  Not used
+;		3rd byte:  Not used
+;		4th byte:  Not used
+
+ijumpf:	CALL	getopx			;Get operand (allow any segment)
+	JC	ret516.S		;If error
+	CMPB	BL, #VL_WADDR		;Must be memory address
+	JA	givsye			;Error
+	CMPB	valtyp, #VL_WADDR	;Address given?
+	JA	ijmpf4.S		;No
+	MOVL	EAX, valseg		;Yes - get segment
+	JMP	ijmpf6.S
+
+;Here if operand not an address - assume current segment!
+
+ijmpf4:	MOVL	EAX, opnseg
+ijmpf6:	MOVB	CL, AH			;Get in right registers
+	SHLL	EAX, #16t
+	MOVW	AX, valofs+0
+	SHLL	EAX, #8t
+	MOVB	AL, CS:opi_val1.B[EDI]	;Get value for opcode byte
+	CALL	str5byt			;Store 5 bytes
+	JMP	strdon
+.PAGE
+	.SBTTL	ilng1opr - Long format instructions with one operand (80286)
+
+;Here for long format instructions with one operand
+;	c{EDI} = Address of opcode table entry
+;	  The value bytes in the opcode table are used as follows:
+;		1st byte:  Second opcode byte value
+;		2nd byte:  Not used (must be 0)
+;		3rd byte:  Extra bits for mode byte
+;		4th byte:  Not used (must be 0)
+
+ilng1opr:
+	CALL	ioneopx			;Fetch the instruction
+	JMP	ilngopr.S		;Continue
+
+	.SBTTL	ilng2opr - Long format instruction with two opoerands (80286)
+
+;Here for long format instructions with two operands
+
+ilng2opr:
+	CALL	itwoopx			;Fetch the instruction
+ilngopr:JC	ret516.S		;If error
+	PUSHL	ESI
+	MOVZBL	ECX, valsiz		;Get current length
+	MOVL	ESI, #value-1		;Move value up one byte
+	ADDL	ESI, ECX
+	MOVL	EDI, #value
+	ADDL	EDI, ECX
+	PUSHL	DS
+	POPL	ES
+	STD
+	RMOVSB	[EDI], [ESI]
+	POPL	ESI
+	MOVB	value, #0Fh		;Store prefix byte
+	INCB	valsiz			;Increase size
+	JMP	strdon
+
+ret516:	RET
+.PAGE
+	.SBTTL	iinout - IN and OUT instructions
+
+;Here for the IN and OUT instructions
+;	c{EDI} = Address of opcode table entry
+;	  The value bytes in the opcode table are used as follows:
+;		1st byte:  Opcode byte for "IN/OUT port" form
+;		2nd byte:  Opcode byte for "IN/OUT [DX]" form
+;		3rd byte:  Not used
+;		4th byte:  Not used
+
+iinout:	MOVB	xdxflg, #1		;Allow [DX] operand
+	CALL	getopr			;Get operand
+	MOVB	xdxflg, #0
+	JC	ret516.S		;If error
+	JMPIL	CS:iiodsp[EBX]		;Dispatch on operand type
+
+;Dispatch table for operand for IO instructions
+
+	.MOD	4
+iiodsp:	.LONG	iinti2		;OP_ADDR =  0. - Memory address (just like INT)
+	.LONG	givsye		;OP_REG  =  4. - Register
+	.LONG	iioreg		;OP_IRG  =  8. - Indexed by register(s)
+	.LONG	givsye		;OP_IRO  = 12. - Indexed by register(s) with
+				;		   offset
+	.LONG	givsye		;OP_IMED = 16. - Immediate value
+
+;Here if operand for IO instruction is register index
+
+iioreg:	CMPB	mode, #0FFh		;Is operand [DX]?
+	JNE	givsye			;No - error
+	MOVB	AL, CS:opi_val2.B[EDI]	;Yes - get opcode byte
+	JMP	ioneby2			;Go store it
+.PAGE
+	.SBTTL	imovins - MOV instruction
+
+;Here for the MOV instruction
+;	c{EDI} = Offset of opcode table entry
+;	  The value bytes in the opcode table are used as follows:
+;		1st byte:  Opcode byte for mem/reg,reg or reg,mem/reg form
+;		2nd byte:  Opcode byte for mem/reg,#immed form
+;		3rd byte:  Extra bits for mode byte for mem/reg,#immed form
+;		4th byte:  Not used
+
+imovins:CALL	getopr			;Get first operand
+	JC	ret520.S		;If error
+	CMPB	stoper, #','		;Must be stopped by comma
+	JNE	givsye			;Otherwise error
+	JMPIL	CS:imovdsp[EBX]		;Dispatch on operand type
+
+ret520:	RET
+
+;Dispatch table for first operand for MOV instruction
+
+	.MOD	4
+imovdsp:.LONG	imovmem		;OP_ADDR =  0. - Memory address
+	.LONG	imovreg		;OP_REG  =  4. - Register
+	.LONG	imovmem		;OP_IRG  =  8. - Indexed by register(s)
+	.LONG	imovmem		;OP_IRO  = 12. - Indexed by register(s) with
+				;		  offset
+	.LONG	givsye		;OP_IMED = 16. - Immediate value
+
+;Here if first operand for MOV instruction is a register
+
+imovreg:PUSHL	value			;Save register
+	CALL	getopr			;Get second operand
+	POPL	EDI
+	JC	ret520.S		;If error
+	JMPIL	CS:imrgdsp[EBX]		;Dispatch on type of second operand
+
+;Dispatch table for second operand for MOV instruction when first operand
+;  is a register
+
+	.MOD	4
+imrgdsp:.LONG	imrgmem		;OP_ADDR =  0. - Memory address
+	.LONG	imrgreg		;OP_REG  =  4. - Register
+	.LONG	imrgmem		;OP_IRG  =  8. - Indexed by register(s)
+	.LONG	imrgmem		;OP_IRO  = 12. - Indexed by register(s) with
+				;		  offset
+	.LONG	imrgimm		;OP_IMED = 16. - Immediate value
+
+;Here if first operand for MOV instruction is a register and second operand
+;  also a register
+
+imrgreg:TESTB	CS:regbits+1[ESI], #RB$2OP/100h ;Is first register a general
+						;   register?
+	JNE	imrgr4.S		;Yes
+	TESTB	CS:regbits+1[ESI], #RB$SEG/100h ;No - is it a segment register?
+	JE	givsye			;No - error
+
+;Here if both operands are registers and first operand is a segment register
+
+	MOVL	EBX, value		;Is second register valid?
+	TESTB	CS:regbits+1[EBX], #RB$2OP/100h
+	JE	givsye			;No - error
+	MOVB	AH, CS:regbits[ESI]	;Yes - get bits for segreg field
+	MOVB	AL, #8Eh		;Get value for opcode byte
+	JMP	imrgr6.S		;Continue
+
+;Here if both operands are registers and first operand is a general register
+
+imrgr4:	MOVL	EBX, value		;Get index for second register
+	TESTB	CS:regbits+1[EBX], #RB$SEG/100h ;Is it a segment register?
+	JE	imrgm1.S		;No - just like general case
+
+;Here if both operands are registers and first operand is a general register
+;  and secod operand is a segment register
+
+	MOVB	AL, CS:regbits[ESI]	;Make mode byte for first operand
+	ORB	AL, #0C0h
+	MOVB	mode, AL
+	MOVL	value, EDI		;Restore value for first operand
+	MOVB	AH, CS:regbits[EBX]	;Get bits for segreg field
+	MOVB	AL, #8Ch		;Get value for opcode byte
+imrgr6:	CALL	strop2
+	JMP	strdon
+.PAGE
+;Here if first operand for MOV instruction is a register and second operand
+;  is a memory address
+
+imrgmem:TESTB	CS:regbits+1[ESI], #{RB$SEG+RB$AX}/100h
+					;Is the first register special?
+	JNE	imrgm4.S		;Yes
+imrgm1:	TESTB	CS:regbits+1[ESI], #RB$2OP/100h ;No - is it valid?
+	JNE	imrgm2.S		;Yes
+	JMP	givsye			;No - error
+
+imrgm2:	CALL	i2rgmm1			;Just like general case
+	JNC	strdon
+	RET
+
+;Here if first register is AL, AX or a segment register
+
+imrgm4:	TESTB	CS:regbits+1[ESI], #RB$AX/100h ;Is it AL or AX?
+	JNE	imrgm6.S		;Yes
+	MOVB	AL, #8Eh		;No - segment register
+	MOVB	AH, CS:regbits[ESI]	;Get value for register field
+	CALL	strop2
+	JMP	strdon
+
+;Here if first register is AL or AX
+
+imrgm6:	CMPB	BL, #OP_ADDR		;Simple memory address?
+	JNE	imrgm2.S		;No - use general case
+	MOVB	AL, #0A0h		;Yes - get opcode byte value
+	MOVW	DX, value		;And address value
+	JMP	imvmrg3			;Continue
+
+.PAGE
+;Here if first operand for MOV instruction is a register and second operand
+;  is an immediate value
+
+imrgimm:TESTB	CS:regbits+1[ESI], #RB$2OP/100h ;Is the register valid?
+	JNE	imrgi2.S		;Yes
+	JMP	givsye			;No - error
+
+imrgi2:	MOVB	AL, CS:regbits[ESI]	;Get value for register field
+	ORB	AL, #0B0h		;Plus other bits for opcode byte
+	MOVB	AH, value+0
+	CMPB	CS:opi_size.B[EDI], #2	;Word MOV?
+	JNE	itwoby2			;No
+	ORB	AL, #08h		;Yes - fix up opcode byte
+	RORL	EAX, #8t
+	MOVB	AH, value+1		;Get rest of value
+	ROLL	EAX, #8t
+	CALL	str3byt			;Store 3 bytes
+	JMP	strdon			;Finished
+.PAGE
+;Here if first operand for MOV instruction is a memory address
+
+imovmem:PUSHL	value			;Save value
+	MOVB	AL, mode		;And save mode byte
+	PUSHL	EAX
+	CALL	getopr			;Get second operand
+	POPL	EAX			;Restore mode byte
+	MOVB	mode, AL
+	POPL	EDX			;And restore value
+	JC	ret524.S		;If error
+	JMPIL	CS:imvmdsp[EBX]		;Dispatch on type of second operand
+
+ret524:	RET
+
+;Dispatch table for second operand for MOV instruction when first operand
+;  is a memory address
+
+	.MOD	4
+imvmdsp:.LONG	givsye		;OP_ADDR =  0. - Memory address
+	.LONG	imvmreg		;OP_REG  =  4. - Register
+	.LONG	givsye		;OP_IRG  =  8. - Indexed by register(s)
+	.LONG	givsye		;OP_IRO  = 12. - Indexed by register(s) with
+				;		   offset
+	.LONG	imvmimm		;OP_IMED = 16. - Immediate value (same as
+				;		   general two operand case)
+
+;Here for MOV instruction of the form MOV mem,reg
+
+imvmreg:MOVL	EDI, value		;Get two operands in right places
+	TESTB	CS:regbits+1[ESI], #{RB$SEG+RB$AX}/100h
+					;Is this AL, AX or a segment register?
+	JNE	imvmrg2.S		;Yes
+	CALL	i2mmrg2			;No - just like the general case
+	JC	ret524.S
+	JMP	strdon
+
+;Here if have MOV mem,AX or MOV mem,segreg
+
+imvmrg2:TESTB	CS:regbits+1[ESI], #RB$SEG/100h ;Is this a segment register?
+	JNE	imvmrg6.S		;Yes
+	MOVB	AL, #0A2h		;No - must be AX or AL
+imvmrg3:MOVB	AH, DL			;Get values in right registers
+	MOVB	DL, DH
+	CMPB	CS:opi_size.B[EDI], #2	;Word MOV?
+	JNE	imvmrg4.S		;No
+	INCB	AL			;Yes - fix up opcode value
+imvmrg4:CALL	str3byt			;Store 3 byte instruction
+	JMP	strdon
+
+;Here if have MOV mem,segreg
+
+imvmrg6:MOVW	value, DX		;Put address in right place
+	MOVB	AH, CS:regbits[ESI]	;Get segment register field value
+	MOVB	AL, #8Ch		;Get opcode byte value
+	CALL	strop2			;Store the instruction
+	JMP	strdon			;Finished
+
+;Here if have MOV mem,#immed
+
+imvmimm:CALL	i2mmimm			;Just like general case
+	JMP	strdon
+.PAGE
+	.SBTTL	ishrot - Shift and rotate instructions
+
+;Here for the shift and rotate instructions
+;	c{EDI} = Address of opcode table entry
+;	  The value bytes in the opcode table are used as follows:
+;		1st byte:  Opcode byte for single bit shifts and rotates
+;		2nd byte:  Opcode byte for variable length shifts and
+;			     rotates (count in CL)
+;		3rd byte:  Extra bits for mode byte
+;		4th byte:  Opcode byte for fixed length shifts and rotates
+
+ishrot:	CALL	getopr			;Get first operand
+	JC	ret528			;If error
+	CMPB	stoper, #','		;Must be stopped by comma
+	JNE	getse8.S		;Otherwise error
+	CMPB	BL, #OP_IMED		;Immediate operand?
+	JE	getse8.S		;Yes - error
+	PUSHL	value			;No - save value
+	MOVB	AL, mode		;Save mode byte
+	PUSHL	EAX
+	MOVB	rszflg, #1		;Don't check register size here
+	CALL	getopr			;Get second operand
+	MOVB	rszflg, #0
+	POPL	EAX			;Restore mode byte
+	MOVB	mode, AL
+	POPL	EDX			;And restore value
+	JC	ret528.S		;If error
+	JMPIL	CS:ishrdsp[EBX]		;Dispatch on operand type
+
+;Dispatch table for second operand for shift and rotate instructions
+
+	.MOD	4
+ishrdsp:.LONG	givsye		;OP_ADDR =  0. - Memory address
+	.LONG	ishrreg		;OP_REG  =  4. - Register
+	.LONG	givsye		;OP_IRG  =  8. - Indexed by register(s)
+	.LONG	givsye		;OP_IRO  = 12. - Indexed by register(s) with
+				;		  offset
+	.LONG	ishrimm		;OP_IMED = 16. - Immediate value
+
+;Here if second operand for shift or rotate is a register
+
+ishrreg:CMPB	valreg, #RG_CL		;Is the register CL?
+	JE	ishrrg2.S		;OK
+getse8:	JMP	givsye			;No - error
+
+;Here if shift count is in CL
+
+ishrrg2:MOVB	AL, CS:opi_val2.B[EDI] 	;Get opcode byte value
+	JMP	ishrim2.S		;Continue
+
+;Here if second operand for shift or rotate is an immediate value
+
+ishrimm:CMPB	value, #1		;Single bit shift?
+	JNE	ishrim4.S		;No
+	MOVB	AL, CS:opi_val1.B[EDI]	;Yes - get opcode byte value
+ishrim2:MOVW	value, DX		;Put first operand value in right place
+	MOVB	AH, CS:opi_val3.B[EDI]	;Get bits for the mode word
+	CALL	strop2			;Go store instruction
+	JMP	strdon
+
+;Here if not single bit shift
+
+ishrim4:MOVB	AL, CS:opi_val4.B[EDI]	;Get value for opcode byte
+	CALL	i2mmim2			;Continue
+	JMP	strdon
+
+ret528:	RET
+.PAGE
+	.SBTTL	ientrins - ENTER instruction
+
+;Here for the ENTER instruction
+;	c{EDI} = Offset of opcode table entry
+;	  The value bytes in the opcode table are used as follows:
+;		1st byte:  Not used
+;		2nd byte:  Not used
+;		3rd byte:  Not used
+;		4th byte:  Not used
+
+ientrins:
+	CALL	getopr			;Get operand
+	JC	ret528.S		;If error
+	CMPB	stoper, AL		;Stopped by comma?
+	JNE	2$.S			;Error
+	CMPB	BL, #OP_ADDR		;Must be "memory address"
+2$:	JNE	givsye
+	PUSHL	value			;Save value
+	CALL	getopr			;Get next operand
+	POPL	EAX
+	CALL	chkbyte			;Make sure have byte value
+	JC	ret528.S
+	MOVB	DL, AH			;Get first operand value
+	MOVB	AH, AL
+	MOVB	AL, #0C8h		;Get opcode byte
+	MOVB	DH, value		;Get value for second operand
+	CALL	str4byt			;Store 4 bytes
+	JMP	strdon			;All done
+.PAGE
+	.SBTTL	istrins - String instructions
+
+;Here for string instructions
+;	c{EDI} = Address of opcode table entry
+;	  The value bytes in the opcode table are used as follows:
+;		1st byte:  Opcode byte value
+;		2nd byte:  Value for second byte (0 if single byte)
+;		3rd byte:  Not used
+;		4th byte:  Not used
+
+istrins:CMPB	stoper, #' '		;Operand follows?
+	JNE	givsye			;No
+	PUSHL	ESI
+	CALL	getfld			;Yes - get it
+	POPL	ESI
+	JC	ret528.S		;If error
+	CMPB	notnul, #0		;Null field
+	JE	givsye			;Yes
+	CMPB	CS:opi_val2.B[EDI], #0	;Two byte instruction?
+	JNE	itwobyt			;Yes
+	JMP	ionebyt			;No - go store single byte
+.PAGE
+	.SBTTL	ifltjmp - FLTJMP "instruction"
+
+;Here for the FLTJMP "instruction" - this is not really an instruction but is
+;  a sequence used by X-OS/386 to indicate an address to transfer to if the
+;  preceeding instruction causes a memory exception - it is the sequence:
+;	JMP	$+7.B
+;	NOP
+;	.LONG	address
+
+ifltjmp:				;Do this later (maybe!)
+	JMP	givsye
+.PAGE
+	.SBTTL	icrash - CRASH "instruction"
+
+;Here for the CRASH "instruction" - this is really an INT 1F followed in-line by
+;  four ASCII characters!
+
+icrash:
+	JMP	givsye
+.PAGE
+	.SBTTL	getjadr - Subroutine to get relative offset for transfer
+
+;Subroutine to get relataive offset for transfer instructions
+;	CALL	getjadr
+;	C:set = Error
+;	C:clr = Normal
+;	  c{EAX} = Relative offset
+
+getjadr:CALL	getopr			;Get operand
+	JC	ret532.S		;If error
+	CMPB	BL, #VL_WADDR		;Must be memory address
+	JA	givsye			;Error
+	CMPB	valtyp, #VL_WADDR	;Address given?
+	JA	4$.S			;No - always OK - assume current CS
+	MOVL	EAX, valseg		;Yes - get segment
+	CMPL	opnseg, EAX		;Same as current CS?
+	JE	4$.S			;Yes - OK
+givrge:	MOVL	EBX, #rngmsg		;No - complain
+	CALL	outstrc
+	STC				;Indicate error
+ret532:	RET
+
+;Here if operand is OK
+
+4$:	MOVL	EAX, valofs		;Get offset
+	SUBL	EAX, opnofs		;Minus offset for instruction
+	CLC
+	RET
+.PAGE
+;Subroutine to determine how many bytes are needed for immediate value
+;	c(AL) = Value for opcode byte
+;	CALL	immedsz
+;	C:set = Need 2 byte immediate value
+;	C:clr = Need 1 byte immediate value
+
+immedsz:CMPB	CS:opi_size.B[EDI], #1	;Byte instruction?
+	JE	immeds1.S		;Yes - just need 1 byte
+	TESTB	CS:opi_flag.B[EDI], #OF$BI ;No - is this a "short immediate"
+					   ;  instruction?
+	JNE	immeds1.S		;Yes - just need 1 byte
+	TESTB	CS:opi_flag.B[EDI], #OF$SB ;No - is the size bit available?
+	JE	immeds2.S		;No - need 2 bytes
+	CMPB	valsiz, #1		;Yes - do we have a byte value?
+	JNE	immeds2.S		;No - need 2 bytes
+	ORB	AL, #2			;Set the size bit in the opcode byte
+immeds1:CLC				;Indicate only need 1 byte value
+	RET
+
+;Here if need 2 byte immediate value
+
+immeds2:STC				;C:set indicates need 2 byte value
+	RET
+.PAGE
+	.SBTTL	chkbyte - Subroutine to check that value is a byte
+
+;Subroutine to check that value is a byte
+;	CALL	chkbyte
+;	C:clr = Normal
+;	C:set = Error, error message already output
+;  All registers are respected
+
+chkbyte:CMPB	BL, #OP_ADDR		;Must be "memory address"
+	JNE	4$.S
+	CMPB	valtyp, #VL_WORD	;Word value?
+	JNE	4$.S			;No
+	CMPB	value+1, #0		;Yes - must be less than 0FFh
+	JNE	6$.S			;Else range error
+4$:	CMPB	valtyp, #VL_BYTE	;Byte value?
+6$:	JNE	givrge			;No - error
+	RET
+.PAGE
+	.SBTTL	getopr - Subroutine to get operand for instruction
+
+;Subroutine to get operand for instruction - address operand is checked to
+;  see if it is for the current code segment
+;	c{EDI} = Offset of opcode input table entry
+;	CALL	getopr
+;	C:clr = Normal
+;	  c[value]  = Value, register number, or offset
+;	  c[mode]   = Mode byte for instruction
+;	  c{EBX}    = c(oprtyp)
+;	  c(oprtyp) = Field type:
+;		        OP_ADDR = 16 bit address
+;		        OP_REG  = Register
+;		        OP_IRG  = Indexed by register(s)
+;		        OP_IRO  = Indexed by register(s) with offset
+;		        OP_IMED = Immediate value (mode value is not valid)
+;	C:set = Error
+
+getopr:	CALL	getopx			;Get operand without checking segment
+	JC	ret536.S		;If error
+	CMPB	BL, #OP_ADDR		;Address?
+	JNE	getor4.S		;No
+	CMPB	valtyp, #VL_WADDR	;Yes - is it really an address?
+	JA	getor4.S		;No - must be just offset
+	MOVL	EAX, valseg		;Yes - is the segment part right?
+	CMPL	opnseg, EAX
+	JE	ret536.S		;Yes
+	JMP	givrge			;No - complain and fail
+
+getor4:	CLC
+ret536:	RET
+
+;Subroutine to get operand for instruction - no check is made for code segment
+;	c{EDI} = Offset of opcode input table entry
+;	CALL	getopx
+;	C:clr = Normal
+;	  c{value}  = Value, register number, or offset
+;	  c[mode]   = Mode byte for instruction
+;	  c{EBX}    = c(oprtyp)
+;	  c(oprtyp) = Field type:
+;		        OP_ADDR = 16 bit address
+;		        OP_REG  = Register
+;		        OP_IRG  = Indexed by register(s)
+;		        OP_IRO  = Indexed by register(s) with offset
+;		        OP_IMED = Immediate value (mode value is not valid)
+;	C:set = Error
+
+getopx:	PUSHL	ESI			;Must respect ESI here
+	CALL	getfld			;Collect a field
+	POPL	ESI
+	JC	geto06.S		;If error
+	CMPB	notnul, #0		;Null field?
+	JE	geto10.S		;Yes
+	CMPB	valtyp, #VL_BYTE	;No - is value a word or a byte?
+	JBE	geto14			;Yes - go handle that case
+	CMPB	valtyp, #VL_REG		;No - register?
+	JNE	givsye			;No - error
+	MOVL	EBX, value		;Yes - get bits for register
+	MOVW	BX, CS:regbits[EBX]
+	CMPB	CS:opi_size.B[EDI], #0	;Does the instruction have a size?
+	JE	geto08.S		;No - skip the size check
+	CMPB	rszflg, #0		;Yes - should we skip this anyway?
+	JNE	geto08.S		;Yes
+	CMPB	CS:opi_size.B[EDI], #2	;No - word instruction?
+	JNE	geto04.S		;No
+	NOTB	BH			;Yes
+geto04:	TESTB	BH, #RB$8B/100h		;Does the register size match?
+	JNE	geto08.S		;Yes - OK
+	MOVL	EBX, #szemsg		;No - complain
+	CALL	outstrc
+	STC				;Indicate error
+geto06:	RET
+
+;Here if register size matches instruction size of if instruction does not
+;  have a size
+
+geto08:	ANDB	BL, #7
+	ORB	BL, #0C0h
+	MOVB	mode, BL
+	MOVL	EBX, #OP_REG		;Return with field type
+	JMP	geto16.S
+
+;Here if first field is null
+
+geto10:	CMPB	stoper, #'['		;Stopped by left bracket?
+	JNE	geto12.S		;No
+	PUSHL	ESI
+	CALL	getinx			;Get index field
+	POPL	ESI
+	JC	geto18.S		;If error
+	CMPB	mode, #6		;Did he say "[BP]"?
+	JE	givsye			;Yes - error
+	MOVW	BX, #OP_IRG		;No - OK
+	JMP	geto16.S
+
+;Here if null field not stopped by left bracket
+
+geto12:	CMPB	stoper, #'#'		;Stopped by pound sign?
+	JNE	givsye			;No - error
+	PUSHL	ESI
+	CALL	getfld			;Yes - get value following
+	POPL	ESI
+	CMPB	notnul, #0		;Null field?
+	JE	givsye			;Yes - error
+	CMPB	valtyp, #VL_BYTE	;Simple value?
+	JA	givsye			;No - error
+	MOVW	BX, #OP_IMED		;Yes - return immediate value
+	JMP	geto16.S
+
+;Here if initial field contains a word or a byte
+
+geto14:	CMPB	stoper, #'['		;Stopped by left bracket?
+	JE	geto20.S		;Yes - have index with offset
+	MOVB	mode, #06h		;No - have 16 bit address operand
+	MOVL	EBX, #OP_ADDR
+geto16:	MOVB	oprtyp, BL
+	CLC
+geto18:	RET
+
+;Here if have index with offset
+
+geto20:	MOVB	AL, #80h		;Assume have 16 bit offset?
+	CMPB	valtyp, #VL_BYTE	;Right?
+	JNE	geto22.S		;Yes
+	MOVB	AL, #40h		;No - really have 8 bit offset
+geto22:	PUSHL	EAX			;Save initial mode bits
+	PUSHL	value			;And save offset value
+	PUSHL	ESI
+	CALL	getinx			;Get index part
+	POPL	ESI
+	POPL	value
+	POPL	EAX
+	JC	geto18.S		;If error
+	ORB	mode, AL		;Put in initial mode bits
+	MOVL	EBX, #OP_IRO		;Type is index with offset
+	JMP	geto16.S
+.PAGE
+	.SBTTL	getinx - Subroutine to fetch index specification
+
+;Subroutine to fetch index specification
+;	CALL	getinx
+
+getinx:	CALL	getfld			;Yes - get next field
+	JC	4$.S			;If error
+	CMPB	valtyp, #VL_REG		;Register?
+	JNE	2$.S			;No - error
+	MOVL	EBX, value		;Yes - get register number
+	TESTW	CS:regbits[EBX], #{RB$IX1|RB$IX2} ;Is it valid as an index?
+	JNE	6$.S			;Yes - go on
+	CMPB	BL, #RG_DX		;No - is it DX?
+2$:	JNE	givsye			;No - always bad
+	CMPB	xdxflg, #0		;Yes - do we want this?
+	JE	givsye			;No
+	MOVB	DL, #0FFh		;Yes - store special mode value
+	JMP	12$
+
+4$:	RET				;And return
+
+;Here if item after left bracket is a valid index register
+
+6$:	CMPB	stoper, #'+'		;Stopped by plus?
+	JNE	10$.S			;No
+	PUSHL	CS:regbits[EBX]		;Yes - save register bits
+	CALL	getfld			;Yes - get next field
+	POPL	EDX			;Restore bits for first register
+	JC	4$.S			;If bad field
+	CMPB	valtyp, #VL_REG		;Is it a register?
+	JNE	8$.S			;No - error
+	MOVW	BX, value		;Yes - get register number
+	TESTW	CS:regbits[EBX], #{RB$IX1|RB$IX2}
+					;Is it valid as an index register?
+	JE	givsye			;No - error
+	MOVW	AX, DX			;Yes - valid combination?
+	XORW	AX, CS:regbits[EBX]
+	ANDW	AX, {RB$IX1|RB$IX2}
+	CMPW	AX, {RB$IX1|RB$IX2}
+8$:	JNE	givsye			;No - error
+	ORW	DX, CS:regbits[EBX]	;Yes - determine r/m bits
+	SHRB	DL, #3
+	ANDB	DL, #3
+	JMP	12$.S
+
+;Here if first operand not stopped by plus
+
+10$:	CMPB	stoper, #']'		;Stopped by right bracket?
+	JNE	4$.S			;No - error
+	MOVB	DL, CS:regbits[EBX]	;Yes - get r/m bits
+	SHRB	DL, #5
+	ORB	DL, #4
+12$:	MOVB	mode, DL
+	CALL	getchr			;Get actual stopper character
+	MOVB	stoper, AL
+	CLC
+	RET
+.PAGE
+;Subroutine to determine number of address extension bytes needed
+;	c(AH) = Mode byte
+;	CALL	adexsize
+;	Z:set       = No additional bytes needed
+;	Z:clr,C:set = One additional byte needed
+;	Z:clr,C:clr = Two additional bytes needed
+;  All registers are preserved
+
+adexsize:
+	PUSHL	EAX
+	ANDB	AH, #0C7h		;Remove register or opcode bits
+	CMPB	AH, #6			;Direct address?
+	JE	4$.S			;Yes - need 4 bytes
+	ANDB	AH, #0C0h		;No - get just the mod bits
+	JE	2$.S			;If mod = 00, just 2 bytes
+	CMPB	AH, #0C0h		;If mod	= 11, also just 2 bytes
+	JE	2$.S
+	CMPB	AH, #080h		;If mod = 10, need 4 bytes
+	JE	4$.S
+	INCB	valsiz
+	STC				;Otherwise need 3 bytes
+2$:	POPL	EAX
+	RET
+
+4$:	ADDB	valsiz, #2		;This will clear both Z and C
+	POPL	EAX
+	RET
+.PAGE
+;Define the register bits table - each 16 bit entry describes a register
+;  as follows:
+; Bit	Name		Meaning
+;  15	RB$IX1	Set if register is valid as "first" index register (set for
+;		  BX and BP)
+;  14	RB$IX2	Set if register is valid as "second" index register (set for
+;		  SI and DI)
+;  13	RB$2OP	Set if register is valid for operand for general two operand
+;		  instruction
+;  12	RB$SEG	Set if register is a segment register
+;  11	RB$8B	Set if 8 bit register
+;  10	RB$48B	Set if 48 bit register
+;  9	RB$AX	Set if register is AL or AX
+;  8		Not used
+;  7		Not used
+;  6-5  	Low 2 bits for r/m field to specify index register when
+;		  using single index register
+;  4-3		Low 2 bits for r/m field to specify index register when
+;		  using two index registers, also contains value for segreg
+;		  field when RB_SEG is set
+;  2-0		Value for r/m field to specify register when mod = 11, also
+;		  gives for reg field
+
+regbits:.WORD	RB$2OP+RB$8B+RB$AX+00h	;RG_AL   = 0
+	.WORD	RB$2OP+RB$8B +04h	;RG_AH   = 2
+	.WORD	RB$2OP+RB$8B +03h	;RG_BL   = 4
+	.WORD	RB$2OP+RB$8B +07h	;RG_BH   = 6
+	.WORD	RB$2OP+RB$8B +01h	;RG_CL   = 8
+	.WORD	RB$2OP+RB$8B +05h	;RG_CH   = 10
+	.WORD	RB$2OP+RB$8B +02h	;RG_DL   = 12
+	.WORD	RB$2OP+RB$8B +06h	;RG_DH   = 14
+	.WORD	RB$2OP+RB$AX +00h	;RG_AX   = 16
+	.WORD	RB$2OP+RB$IX1+63h	;RG_BX   = 18
+	.WORD	RB$2OP       +01h	;RG_CX   = 20
+	.WORD	RB$2OP       +02h	;RG_DX   = 22
+	.WORD	RB$2OP+RB$IX2+06h	;RG_SI   = 24
+	.WORD	RB$2OP+RB$IX2+2Fh	;RG_DI   = 26
+	.WORD	RB$2OP+RB$IX1+55h	;RG_BP   = 28
+	.WORD	RB$2OP       +04h	;RG_SP   = 30
+	.WORD	RB$SEG+08h		;RG_CS   = 32
+	.WORD	RB$SEG+18h		;RG_DS   = 34
+	.WORD	RB$SEG+10h		;RG_SS   = 36
+	.WORD	RB$SEG+00h		;RG_ES   = 38
+	.WORD	0			;RG_IP   = 40
+	.WORD	0			;RG_FR   = 42
+	.WORD	0			;RG_LDTR = 44
+	.WORD	0			;RG_MSW  = 46
+	.WORD	0			;RG_TR   = 48
+	.WORD	RB$48B			;RG_GDTR = 50
+	.WORD	RB$48B			;RG_IDTR = 52
+.PAGE

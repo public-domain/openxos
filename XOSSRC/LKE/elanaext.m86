@@ -1,0 +1,538 @@
+	.TITLE	ELANAEXT - Elan (AMD SC-300) kernel extensions for XOS, type A
+
+;*--------------------------------------------------------------------------*
+;* ELANAEXT.M86
+;*
+;* Written by: John Goltz
+;*
+;* Edit History:
+;*
+;*--------------------------------------------------------------------------*
+
+;++++
+; This software is in the public domain.  It may be freely copied and used
+; for whatever purpose you see fit, including commerical uses.  Anyone
+; modifying this software may claim ownership of the modifications, but not
+; the complete derived code.  It would be appreciated if the authors were
+; told what this software is being used for, but this is not a requirement.
+
+;   THIS SOFTWARE IS PROVIDED BY THE AUTHORS "AS IS" AND ANY EXPRESS OR
+;   IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
+;   OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+;   IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+;   INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+;   BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS
+;   OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+;   ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR
+;   TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
+;   USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+;----
+
+	.PROC	80486
+	.INCLUD	XOSINC:\XMAC\XOS.PAR
+	.INCLUD	XOSINC:\XMAC\XOSX.PAR
+	.INCLUD	XOSINC:\XMAC\XOSTIME.PAR
+	.INCLUD	XOSINC:\XMAC\XOSERR.PAR
+	.INCLUD	XOSINC:\XMAC\XOSLKE.PAR
+	.INCLUD	XOSINC:\XMAC\XOSXLKE.PAR
+	.INCLUD	XOSINC:\XMAC\XOSXELAN.PAR
+
+MAJV   =!1t
+MINV   =!0t
+EDITNUM=!0t
+
+	LKEHEAD	ELANAEXT, MAJV, MINV, EDITNUM, LKETYPE_XOSEXT
+
+;This LKE provides a few support routines for features unique to the SC-300
+;  Elan chip, mainly the MMS.  A future version may provide support for
+;  power management.
+
+;This routine configures the Elan MMSA to start at 0C0000h.  It provides
+;  access to all 12 MMS pages, but it should be noted that enabling pages
+;  0 - 3 (MMSB) conflicts with the lower 64K of display memory and may
+;  cause problems with the display.  Also pages 4 and 5 (MMSA first two
+;  pages) may conflict with the VGA ROM and may cause problems.  Generally,
+;  only pages 6 - 11 should be used unless something is done to handle the
+;  conflicts which will result.  Note that for this reason, only pages 6 - 11
+;  can be allocated automatically.
+;  Internally, the pages are numbered as follows:
+;	 0 = MMSB page 0 @ A0000h
+;	 1 = MMSB page 1 @ A4000h
+;	 2 = MMSB page 2 @ A8000h
+;	 3 = MMSB page 3 @ AC000h
+;	 4 = MMSA page 0 @ C0000h
+;	 5 = MMSA page 1 @ C4000h
+;	 6 = MMSA page 2 @ C8000h
+;	 7 = MMSA page 3 @ CC000h
+;	 8 = MMSA page 4 @ D0000h
+;	 9 = MMSA page 5 @ D4000h
+;	10 = MMSA page 6 @ D8000h
+;	11 = MMSA page 7 @ DC000h
+
+	.EXPORT	xoselnMMSEnbPage
+	.EXPORT	xoselnMMSGetPage
+	.EXPORT	xoselnMMSGivePage
+	.EXPORT xoselnMMSSetPage
+	.EXPORT	xoselnMMSMapPage
+	.EXPORT xoselnRegA
+
+;Define relative port addresses for the IO registers with programmable
+;  addresses.  Note that these values are private to this module.  Nothing
+;  outside of this module knows about these registers.
+
+P_ELANPCCRA=!00000h	;PC-card REGA address register
+P_ELANPCCRB=!00004h	;PC-card REGB address register
+P_ELANMMSP0=!00008h	;MMS page 0 register
+P_ELANMMSP1=!02008h	;MMS page 1 register
+P_ELANMMSP2=!04008h	;MMS page 2 register
+P_ELANMMSP3=!06008h	;MMS page 3 register
+P_ELANMMSP4=!08008h	;MMS page 4 register
+P_ELANMMSP5=!0A008h	;MMS page 5 register
+P_ELANMMSP6=!0C008h	;MMS page 6 register
+P_ELANMMSP7=!0E008h	;MMS page 7 register
+.PAGE
+	DATA
+
+	.MOD	4
+elaninitblk:				;Characteristics description
+ DCHARBGN  3, knlDCharValCom##		;  block for initialization
+ DCHARENT  IOREG , DECV, , 4, 0, 0              , initioreg, 0
+ DCHARENT  RESULT, STR , , 0, 0, knlGetDcNullS##, 0        , 0
+
+	INITSUB	initelana
+
+initelana:
+	TESTL	EDX, EDX		;Have a characteristics list?
+	JE	2$.S			;No
+	MOVL	EBX, #elaninitblk	;Yes - point to characteristics table
+	CALL	knlAddUnitChar##	;Process characteristics
+	JC	10$			;If error
+2$:	MOVB	AL, #CX_MMSBSOC		;Disable all SMI/NMI interrupts
+	OUTB	P_CFGINDEX
+	MOVB	AL, #0
+	OUTB	P_CFGDATA
+	MOVB	AL, #CX_NMIENB
+	OUTB	P_CFGINDEX
+	MOVB	AL, #0
+	OUTB	P_CFGDATA
+	MOVB	AL, #CX_ROMCFG1		;Enable MMSA
+	OUTB	P_CFGINDEX
+	INB	P_CFGDATA
+	XORB	AL, #01h
+	ORB	AL, #40h
+	OUTB	P_CFGDATA
+	MOVB	AL, #CX_PWRCTRL4	;Set power management outputs PMC0 and
+	OUTB	P_CFGINDEX		;  PMC1 to 0
+	MOVB	AL, #0
+	OUTB	P_CFGDATA
+	MOVB	AL, #CX_PWRCTRL3	;Set power management outputs PMC3 and
+	OUTB	P_CFGINDEX		;  PMC4 to 0 (note that PMC3 is
+	MOVB	AL, #0Fh		;  inverted)
+	OUTB	P_CFGDATA
+
+; NOTE: May need to initialize some more stuff here depending on what the
+;	  BIOS does or does not set up!
+
+	MOVB	AL, #CX_MMSADDR		;Set the base address for the MMS page
+	OUTB	P_CFGINDEX		;  address registers and for MMSA
+	MOVL	EAX, xoselnRegA
+	SHRL	EAX, #4t
+	ANDL	EAX, #0Fh.B
+	OUTB	P_CFGDATA
+	MOVB	AL, #CX_PCCREGA		;Set the address for the PC-card REGA
+	OUTB	P_CFGINDEX		;  register
+	MOVL	EAX, xoselnRegA
+;	ADDL	EAX, #P_ELANPCCRA	;(this is 0!)
+	SHRL	EAX, #2t
+	OUTB	P_CFGDATA
+	MOVB	AL, #CX_PCCREGB		;Set the address for the PC-card REGB
+	OUTB	P_CFGINDEX		;  registser
+	MOVL	EAX, xoselnRegA
+	ADDL	EAX, #P_ELANPCCRB
+	SHRL	EAX, #2t
+	OUTB	P_CFGDATA
+	CLRL	EAX
+	MOVL	ECX, #4t
+	CALL	disablepages
+	MOVL	EDX, xoselnRegA
+	MOVB	AH, #02h
+	MOVL	ECX, #8t
+	CALL	disablepages
+	CLRL	EAX			;OK
+	CLRL	EDX
+	MOVL	ECX, #codetop
+	CLC
+10$:	RET
+.PAGE
+;Subroutine to disable all MMSA or MMSB pages
+;	c(AH)  = Bank select (0 = MMSB, 2 = MMSA)
+;	c{ECX} = Number of pages to disable
+
+disablepages:
+	MOVL	EDX, xoselnRegA
+	ADDL	EDX, #P_ELANMMSP0.B
+	MOVB	AL, #CX_MMSBCTRL	;Select the register bank (this also
+	OUTB	P_CFGINDEX		;  makes sure MMSB is enabled)
+	INB	P_CFGDATA
+	ANDB	AL, #0FDh
+	ORB	AL, AH
+	ORB	AL, #01h
+	OUTB	P_CFGDATA
+	CLRL	EAX
+4$:	OUTB	[DX]
+	ADDB	DH, #20h
+	LOOP	ECX, 4$
+	RET
+.PAGE
+initioreg:
+	TESTL	EAX, #0Fh
+	JNE	4$.S
+	CMPL	EAX, #200h
+	JB	4$.S
+	CMPL	EAX, #2F0h
+	JA	4$.S
+	MOVL	xoselnRegA, EAX
+	CLC
+	RET
+
+4$:	MOVL	EAX, #ER_CHARV
+	STC
+	RET
+
+	CODE
+.PAGE
+	.SBTTL	xoselnMMSGetPage - Subroutine to allocate an MMS page
+
+;Subroutine to allocate an MMS page
+;	c(AL)  = Page number (-1 means to allocate a page)
+;	c{EBX} = Offset of start of LKE issueing call
+;	CALL	xoselnMMSGetPage
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  c{EAX} = Page number
+;	  c{EBX} = Physical address of MMS page
+
+xoselnMMSGetPage:
+	CMPB	AL, #-1			;Want to allocate a page?
+	JNE	10$.S
+	MOVL	EAX, #6t
+2$:	CMPL	mmsuser[EAX*4], #0.B	;This page in use?
+	JE	12$.S			;No
+	INCL	EAX			;Yes - advance to next
+	CMPL	EAX, #11t.B		;More to check?
+	JLE	2$.S			;Yes - continue
+	MOVL	EAX, #ER_NEDMA		;No - fail
+	STC
+	RET
+
+4$:	MOVL	EAX, #ER_IMEMA
+	STC
+	RET
+
+6$:	MOVL	EAX, #ER_MACFT
+	STC
+	RET
+
+;Here if a page was specified
+
+10$:	CMPB	AL, #11t		;Valid page number?
+	JA	4$.S			;No - fail
+	MOVZBL	EAX, AL
+	CMPL	mmsuser[EAX*4], #0.B
+	JNE	6$.S
+
+;Here with an available page
+
+12$:	MOVL	mmsuser[EAX*4], EBX	;Store his LKE offset
+	MOVL	EBX, mmsaddr[EAX*4]	;Get the page address
+	CLC
+	RET
+.PAGE
+	.SBTTL	xoselnMMSGivePage - Subroutine to give up an MMS page
+
+;Subroutine to give up an MMS page
+;	c(AL)  = Page number
+;	c{EBX} = Offset of start of LKE issueing call
+;	CALL	xoselnMMSGivePage
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+
+xoselnMMSGivePage:
+	CMPB	AL, #11t		;Valid page number?
+	JA	4$.S			;No - fail
+	MOVZBL	EAX, AL
+	CMPL	mmsuser[EAX*4], EBX
+	JNE	6$.S
+	MOVL	mmsuser[EAX*4], #0
+	RET
+
+4$:	MOVL	EAX, #ER_IMEMA
+	STC
+	RET
+
+6$:	MOVL	EAX, #ER_NOMEM
+	STC
+	RET
+.PAGE
+	.SBTTL	xoselnMMSSetPage - Subroutine to set up an MMS page
+
+;Subroutine to set up an MMS page
+;	c(AL) = Page number
+;	c(AH) = Page type:
+;		  00h = Disabled
+;		  01h = DOS ROM
+;		  02h = BIOS ROM
+;		  03h = On-board RAM
+;		  04h = PC-card socket A
+;		  05h = PC-card socket B
+;	CALL	xoselnMMSSetPage
+
+;Note:	MMSB pages 0 to 3 are controlled by the CX_MMSBDEV (73h) register and
+;	MMSA pages 0 to 3 are controlled by the CX_MMSADEV1 (71h) register.
+;	MMSA pages 4 to 7 are controlled by the CX_MMSADEV2 (72h) register.
+;	Each page is controled by two bits as follows:
+;	  00 = MMS DOS ROM
+;	  01 = MMS on-board main memory
+;	  10 = PC-card socket
+;	  11 = MMS BIOS ROM
+;	If PC-card socket is selected, the socket is selected for MMSB pages 0
+;	to 3 by the CX_MMSBSOC (0A9h) register and for MMSA pages 0 to 7 by
+;	the CX_MMSASOC (0A8h) register.  Each page is controled by 1 bit as
+;	follows:
+;	  0 = Socket A
+;	  1 = Socket B
+;	Individual pages are enabled or disabled with bit 7 of the page
+;	register for the page.
+
+;	The physical address for each MMS page is set using several different
+;	registers.  The low order 7 bits of the address (address bits 14 to 20)
+;	and the page enable bit are written into the "page register" which is
+;	directly accessed as an IO port.  Address bits 21 and 22 for pages
+;	0 to 3 are set in the CX_MMSAX21A (6Eh) register.  Address bits 21 and
+;	22 for pages 4 to 7 are set in the CX_MMSAX21B (67h) register. Address
+;	bit 23 for all pages is set in the CX_MMSAX23 (6Ch) register.  All of
+;	the CX_xxxx registers are configuration file registers.  The same set
+;	of registers is used for MMSA and MMSB with the bank selected by bit 1
+;	of the CX_MMSBCTRL (74h) register.
+
+xoselnMMSSetPage:
+	MOVZBL	ESI, AL
+	MOVZBL	EDX, AH
+	MOVL	mmstype[ESI*4], EDX	;Save the type for later
+	MOVB	AL, typereg[ESI]	;Get register for page type
+	OUTB	P_CFGINDEX
+	MOVZBL	ECX, bitspos[ESI]	;Get amount to shift page type field
+	MOVB	AH, #0FCh		;Make a mask for clearing the bits
+	ROLB	AH, CL
+	INB	P_CFGDATA		;Get current value
+	ANDB	AL, AH			;Mask it
+	MOVB	AH, typebits[EDX]	;Get the type bits
+	SHLB	AH, CL
+	ORB	AL, AH			;Merge them in
+	OUTB	P_CFGDATA		;Write them out
+	MOVB	AL, #CX_MMSBSOC		;Assume MMSB page
+	MOVL	ECX, ESI		;Get amount to shift the bit
+	CMPL	ESI, #4.B		;Right?
+	JB	4$.S			;Yes
+	MOVB	AL, #CX_MMSASOC		;No - its an MMSA page
+	SUBL	ECX, #4t.B		;Adjust the shift amount
+4$:	OUTB	P_CFGINDEX
+	MOVB	AH, #0FEh		;Make a mask for clearing the bit
+	ROLB	AH, CL
+	INB	P_CFGDATA		;Get current value
+	ANDB	AL, AH			;Mask it
+	MOVB	AH, socbits[EDX]	;Get our bit
+	ROLB	AH, CL
+	ORB	AL, AH			;Merge it in
+	OUTB	P_CFGDATA		;Write them out
+	RET
+.PAGE
+	.SBTTL	xoselnMMSEnbPage - Subroutine to enable or disable an MMS page
+
+;Subroutine to enable or disable an MMS page
+;	c(AL)  = Page number
+;	c(AH)  = 0 to disable page, 1 to enable it, other values are reserved
+;	c{EBX} = Physical address to map to (bit 31 set for PC-card attribute
+;		   space)
+;	CALL	xoselnMMSEnbPage
+
+xoselnMMSEnbPage:
+	MOVZBL	ESI, AL
+	CMPB	AH, #0
+	JE	4$.S
+	MOVB	AH, #80h
+4$:	MOVB	mmsenb[ESI], AH		;Store new value for the enable bit
+	MOVL	EDX, ESI		;Get register address for the page
+	SHLL	EDX, #13t		;  register
+	ADDL	EDX, xoselnRegA
+	ADDL	EDX, #P_ELANMMSP0.B
+	INB	[DX]			;Get current bits
+	ANDB	AL, #7Fh		;Minus the enable bit
+	ORB	AL, AH			;Set new enable bit value
+	OUTB	[DX]			;Write it out
+	RET
+.PAGE
+	.SBTTL	xoselnMMSMapPage - Subroutine to change mapping for an MMS page
+
+;Subroutine to change mapping for an MMS page
+;	c(AL)  = Page number
+;	c{EBX} = Physical address to map to (bit 31 set for PC-card attribute
+;		   space)
+;	CALL	xoselnMMSMapPage
+
+;Note that this routine does NOT change any system memory mapping.  It is up
+;  to the caller to ensure that the MMS page itself is mapped correctly in
+;  the linear address space.
+
+xoselnMMSMapPage:
+	MOVZBL	ESI, AL
+	MOVL	mmsphys[ESI*4], EBX	;Remember the address
+	MOVB	AL, #CX_MMSBCTRL	;First, select MMSA or MMSB
+	OUTB	P_CFGINDEX
+	INB	P_CFGDATA
+	ANDB	AL, #0FDh		;Assume MMSB
+	CMPL	ESI, #4t.B		;Right?
+	JB	2$.S			;Yes
+	ORB	AL, #02h		;No - its MMSA
+2$:	OUTB	P_CFGDATA
+	SHRL	EBX, #14t
+	MOVL	EDX, ESI		;Get register address for the page
+	CMPL	EDX, #4t.B		;  register
+	JB	4$.S
+	SUBL	EDX, #4t.B
+4$:	SHLL	EDX, #13t
+	ADDL	EDX, xoselnRegA
+	ADDL	EDX, #P_ELANMMSP0.B
+	MOVB	AL, BL			;Get address bits 14 to 20
+	ORB	AL, #80h		;Set the enable bit
+	OUTB	[DX]
+	SHRL	EBX, #7t		;Get address bits 21 and 22
+	MOVB	AL, b21b22reg[ESI]	;Get register for bits 21 and 22
+	OUTB	P_CFGINDEX
+	MOVZBL	ECX, bitspos[ESI]	;Get amount to shift bits 21 and 22
+	MOVB	AH, #0FCh		;Make a mask for clearing the bits
+	ROLB	AH, CL
+	INB	P_CFGDATA		;Get current value
+	ANDB	AL, AH			;Mask it
+	MOVB	AH, BL			;Get our bits
+	ANDB	AH, #03h
+	SHLB	AH, CL
+	ORB	AL, AH			;Merge them in
+	OUTB	P_CFGDATA		;Write them out
+	SHRL	EBX, #2t		;Get bit 23
+	MOVL	ECX, ESI		;Get its position
+	MOVB	AL, #CX_MMSAX23		;Get register for bit 23
+	OUTB	P_CFGINDEX
+	MOVL	ECX, ESI		;Get amount to shift bit 32
+	MOVB	AH, #0FEh		;Make a mask for clearing the bit
+	ROLB	AH, CL
+	INB	P_CFGDATA		;Get current value
+	ANDB	AL, AH			;Mask it
+	MOVB	AH, BL			;Get our bit
+	ANDB	AH, #01h
+	SHLB	AH, CL
+	ORB	AL, AH			;Merge it in
+	OUTB	P_CFGDATA		;Write them out
+	RET
+.PAGE
+	.SBTTL	Data
+
+	DATA
+
+;Table which give the MMS physical page addresses as a function of page number
+
+mmsaddr:.LONG	0A0000h		;Physical address for MMSB page 0
+	.LONG	0A4000h		;Physical address for MMSB page 1
+	.LONG	0A8000h		;Physical address for MMSB page 2
+	.LONG	0AC000h		;Physical address for MMSB page 3
+	.LONG	0C0000h		;Physical address for MMSA page 0
+	.LONG	0C4000h		;Physical address for MMSA page 1
+	.LONG	0C8000h		;Physical address for MMSA page 2
+	.LONG	0CC000h		;Physical address for MMSA page 3
+	.LONG	0D0000h		;Physical address for MMSA page 4
+	.LONG	0D4000h		;Physical address for MMSA page 5
+	.LONG	0D8000h		;Physical address for MMSA page 6
+	.LONG	0DC000h		;Physical address for MMSA page 7
+
+;Table which gives the values for the CX_MMSxDEVn registers as a function of
+;  page type
+
+typebits:
+	.BYTE	00h		;00h = Disabled
+	.BYTE	00h		;01h = DOS ROM
+	.BYTE	03h		;02h = BIOS ROM
+	.BYTE	01h		;03h = On-board RAM
+	.BYTE	02h		;04h = PC-card socket A
+	.BYTE	02h		;05h = PC-card socket B
+
+;Table which gives the values for the CX_MMSxSOC registers as a function of
+;  page type
+
+socbits:.BYTE	00h		;00h = Disabled
+	.BYTE	00h		;01h = DOS ROM
+	.BYTE	00h		;02h = BIOS ROM
+	.BYTE	00h		;03h = On-board RAM
+	.BYTE	00h		;04h = PC-card socket A
+	.BYTE	01h		;05h = PC-card socket B
+
+;Table which gives configuration register for page type
+
+typereg:.BYTE	CX_MMSBDEV	;Page 0  (MMSB page 0)
+	.BYTE	CX_MMSBDEV	;Page 1  (MMSB page 1)
+	.BYTE	CX_MMSBDEV	;Page 2  (MMSB page 2)
+	.BYTE	CX_MMSBDEV	;Page 3  (MMSB page 3)
+	.BYTE	CX_MMSADEV1	;Page 4  (MMSA page 0)
+	.BYTE	CX_MMSADEV1	;Page 5  (MMSA page 1)
+	.BYTE	CX_MMSADEV1	;Page 6  (MMSA page 2)
+	.BYTE	CX_MMSADEV1	;Page 7  (MMSA page 3)
+	.BYTE	CX_MMSADEV2	;Page 8  (MMSA page 4)
+	.BYTE	CX_MMSADEV2	;Page 9  (MMSA page 5)
+	.BYTE	CX_MMSADEV2	;Page 10 (MMSA page 6)
+	.BYTE	CX_MMSADEV2	;Page 11 (MMSA page 7)
+
+;Table which gives configuration register for address bits 21 and 22 as
+;  a function of page number
+
+b21b22reg:
+	.BYTE	CX_MMSAX21A	;Page 0  (MMSB page 0)
+	.BYTE	CX_MMSAX21A	;Page 1  (MMSB page 1)
+	.BYTE	CX_MMSAX21A	;Page 2  (MMSB page 2)
+	.BYTE	CX_MMSAX21A	;Page 3  (MMSB page 3)
+	.BYTE	CX_MMSAX21A	;Page 4  (MMSA page 0)
+	.BYTE	CX_MMSAX21A	;Page 5  (MMSA page 1)
+	.BYTE	CX_MMSAX21A	;Page 6  (MMSA page 2)
+	.BYTE	CX_MMSAX21A	;Page 7  (MMSA page 3)
+	.BYTE	CX_MMSAX21B	;Page 8  (MMSA page 4)
+	.BYTE	CX_MMSAX21B	;Page 9  (MMSA page 5)
+	.BYTE	CX_MMSAX21B	;Page 10 (MMSA page 6)
+	.BYTE	CX_MMSAX21B	;Page 11 (MMSA page 7)
+
+;Table which gives bit position for bits 21 and 22 and for the page type
+;  field as a function of page number
+
+bitspos:.BYTE	0		;Page 0  (MMSB page 0)
+	.BYTE	2		;Page 1  (MMSB page 1)
+	.BYTE	4		;Page 2  (MMSB page 2)
+	.BYTE	6		;Page 3  (MMSB page 3)
+	.BYTE	0		;Page 4  (MMSA page 0)
+	.BYTE	2		;Page 5  (MMSA page 1)
+	.BYTE	4		;Page 6  (MMSA page 2)
+	.BYTE	6		;Page 7  (MMSA page 3)
+	.BYTE	0		;Page 8  (MMSA page 4)
+	.BYTE	2		;Page 9  (MMSA page 5)
+	.BYTE	4		;Page 10 (MMSA page 6)
+	.BYTE	6		;Page 11 (MMSA page 7)
+
+
+	.MOD	4
+mmsuser:.BLKL	12t		;Offset of LKE using page
+mmstype:.BLKL	12t		;Page type
+mmsphys:.BLKL	12t		;Address page is mapped to
+mmsenb:	.BLKB	12t
+xoselnRegA:			;IO address used to change RegA (the RegB
+	.LONG	200h		;  address is 4 higher) Also this is the
+				;  base IO register for the Elan registers
+
+	LKEEND

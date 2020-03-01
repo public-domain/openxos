@@ -1,0 +1,1099 @@
+	.TITLE	IDEACLS - IDE controller class driver (type A) for XOS
+
+;*--------------------------------------------------------------------------*
+;* IDEACLS.M86
+;*
+;* Written by: John Goltz
+;*
+;* Edit History:
+;* 9-May-00 - Cloned from SCSICLS and HDKADRV
+;*
+;*--------------------------------------------------------------------------*
+
+;++++
+; This software is in the public domain.  It may be freely copied and used
+; for whatever purpose you see fit, including commerical uses.  Anyone
+; modifying this software may claim ownership of the modifications, but not
+; the complete derived code.  It would be appreciated if the authors were
+; told what this software is being used for, but this is not a requirement.
+
+;   THIS SOFTWARE IS PROVIDED BY THE AUTHORS "AS IS" AND ANY EXPRESS OR
+;   IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
+;   OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+;   IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+;   INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+;   BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS
+;   OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+;   ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR
+;   TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
+;   USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+;----
+
+	.PROC	80486
+	.INCLUD	XOSINC:\XMAC\XOS.PAR
+	.INCLUD	XOSINC:\XMAC\XOSX.PAR
+	.INCLUD	XOSINC:\XMAC\XOSTIME.PAR
+	.INCLUD	XOSINC:\XMAC\XOSERR.PAR
+	.INCLUD	XOSINC:\XMAC\XOSLKE.PAR
+	.INCLUD	XOSINC:\XMAC\XOSXLKE.PAR
+	.INCLUD	IDE.PAR
+
+MAJV   =!1t
+MINV   =!0t
+EDITNUM=!0t
+
+	LKEHEAD	IDECLS, MAJV, MINV, EDITNUM, LKETYPE_CLASS
+
+	.EXPORT	xosideCcb
+	.EXPORT	xosideCDcb
+	.EXPORT	xosideCopyInq
+	.EXPORT	xosideDevFind
+	.EXPORT	xosideGet1Byte
+	.EXPORT xosideGet2Byte
+	.EXPORT	xosideGet4Byte
+	.EXPORT	xosideGetDcb
+	.EXPORT	xosideGetDev
+	.EXPORT	xosideGetYesNo
+	.EXPORT	xosideGiveDev
+	.EXPORT	xosideLinkIcb
+	.EXPORT	xosideMakeIcb
+	.EXPORT	xosideMapError
+	.EXPORT	xosideModeSense
+	.EXPORT	xosideMsgIdeDev
+	.EXPORT	xosideMsgIdeIndex
+	.EXPORT	xosideNewInterface
+	.EXPORT	xosideSet4Byte
+	.EXPORT	xosideUnitInit
+
+;This device class implements the low-level raw interface to an IDE disk
+;  controller.  It does not directly implement data transfers but provides
+;  the low level functions used by the IDSKDRV disk device driver.  Even
+;  though this driver only supports a single higher level driver, it is
+;  implemented as a seperate LKE to maintain the overall structure which
+;  uses a seperate LKE to support a multiple unit controller which uses
+;  one or more common resources (in this case IO registers and interrupt).
+;  While the IDEn device does not support data transfers, it can be used to
+;  read and set various device characteristics which apply to the controller
+;  in general rather than to individual disk units. This class driver also
+;  only supports a single low level IDE driver.  They are kept seperate to
+;  maintain the standard driver structure.
+
+	.SBTTL	SVC dispatch table for IDE class devices
+
+;SVC dispatch table for IDE class devices
+
+	CODE
+
+idedsp:	.LONG	knlRtnZero##	;sd_mount	=  0. - Mount
+	.LONG	knlRtnZero##	;sd_cleardev	=  4. - Clear device
+	.LONG	xosideCDcb	;sd_cleardcb	=  8. - Clear DCB
+	.LONG	knlRtnZero##	;sd_commit	= 12. - Commit data to disk
+	.LONG	knlRtnZero##	;sd_transold    = 16. - Transfer device/old
+	.LONG	knlRtnZero##	;sd_transnew    = 20. - Transfer device/new
+	.LONG	knlNullQio##	;sd_opena	= 24. - Open additional
+	.LONG	ideopen		;sd_open1	= 28. - Open device/file
+	.LONG	ideopen		;sd_devparm     = 32. - Device parameters
+	.LONG	knlIFnDev##	;sd_delete	= 36. - Delete file
+	.LONG	knlIFnDev##	;sd_rename	= 40. - Rename file
+	.LONG	knlIFnDevGQ##	;sd_inblock	= 44. - Input block
+	.LONG	knlIFnDevGQ##	;sd_outblock	= 48. - Output block
+	.LONG	knlIFnDevGQ##	;sd_outblockq	= 52. - Output block (XFF)
+	.LONG	knlIFnDevGQ##	;sd_outstring	= 56. - Output string
+	.LONG	knlRtnMOne##	;sd_getiosts	= 60. - Get input/output status
+	.LONG	knlIFnDevGQ##	;sd_special     = 64. - Special device function
+	.LONG	ideclose	;sd_close	= 68. - Close file
+	.LONG	knlNullLabel##	;sd_getlabel    = 72. - Get device label
+	.LONG	knlNullQioGQ##	;sd_commitfunc	= 76. - Commit data to disk
+	.LONG	knlInfoNone##	;sd_devinfo     = 80. - Get device info
+IDEDSPSZ=!{$-idedsp}/4
+
+;Class function dispatch table for IDE class devices
+
+	.LONG	CLSFMX
+idecls:	.LONG	ideaddunit	;CF_ADDUNIT = 1. - Add unit
+	.LONG	ideunitinfo	;CF_PUNITS  = 2. - Get information about
+				;		     physical units
+	.LONG	knlIFnDev##	;CF_AUNITS  = 3. - Get information about active
+				;		     units
+CLSFMX=!{$-idecls}/4
+.PAGE
+;Device characteristics tables for IDE devices are defined in the IDE
+;  interface driver modules
+
+;Class characteristics tables for the IDE device class
+
+	DATA
+
+	.MOD	4
+idecctbl:
+ DCHARBGN  1, knlDCharValCom##
+ DCHARENT  NUMBER , DECV, , 4, msgnumber , knlGetSysVal##, 0             , idedcbnum
+ DCHARENT  MAXIMUM, DECV, , 4, msgmaximum, knlGetSysVal##, knlSetSysVal##, idedcbmax
+ DCHARENT  LIMIT  , DECV, , 4, msglimit  , knlGetSysVal##, knlSetSysVal##, idedcblmt
+
+	CODE
+
+msgnumber:  DCHARINFO  {Number of in use IDE devices}
+msgmaximum: DCHARINFO  {Maximum number of in use IDE devices}
+msglimit:   DCHARINFO  {Maximum number of IDE devices allowed}
+
+idemsgblkout:     DCHARINFO  {Number of blocks output}
+idemsgbyteout:    DCHARINFO  {Number of bytes output}
+idemsgblkin:      DCHARINFO  {Number of blockss input}
+idemsgbytein:     DCHARINFO  {Number of bytes input}
+idemsgparerr:     DCHARINFO  {Number of parity errors}
+xosideMsgIdeDev:  DCHARINFO  {IDE device}
+xosideMsgIdeIndex:DCHARINFO  {IDE unit index}
+.PAGE
+;Device parameter table for IDEn: opens
+
+	.MOD	4
+	.LONG	OPARMMAX	;Size of table
+ideopnparms:
+	.LONG	ideopngenparms	 ;IOPAR_xxxxxx = 00xx - Generic IO parameters
+	.LONG	knlNullFilParms##;IOPAR_FILxxx = 01xx - File system IO
+				 ;			  parameters
+	.LONG	knlNullTrmParms##;IOPAR_TRMxxx = 02xx - Terminal IO parameters
+OPARMMAX=!{$-ideopnparms}/4
+
+	.LONG	OPARMGENMAX	;Size of table
+ideopngenparms:
+	.LONG	0		;	       = 0000h
+	.LONG	knlIopFilOptn##	;IOPAR_FILOPTN = 0001h
+	.LONG	knlIopFilSpec##	;IOPAR_FILSPEC = 0002h
+	.LONG	knlIopDevSts##	;IOPAR_DEVSTS  = 0003h
+	.LONG	knlIopUnitNum##	;IOPAR_UNITNUM = 0004h
+	.LONG	knlIopGlbId##	;IOPAR_GLBID   = 0005h
+	.LONG	0		;IOPAR_DELAY   = 0006h
+	.LONG	knlIopTimeOut##	;IOPAR_TIMEOUT = 0007h
+	.LONG	0		;IOPAR_INPSTS  = 0008h
+	.LONG	0		;IOPAR_OUTSTS  = 0009h
+	.LONG	knlIopInpQLmt##	;IOPAR_INPQLMT = 000Ah
+	.LONG	knlIopOutQLmt##	;IOPAR_OUTQLMT = 000Bh
+	.LONG	0		;IOPAR_SIVECT1 = 000Ch
+	.LONG	0		;IOPAR_SIVECT2 = 000Dh
+	.LONG	0		;IOPAR_SIDATA  = 000Eh
+	.LONG	knlIopNumOpen##	;IOPAR_NUMOPEN = 000Fh
+	.LONG	0		;IOPAR_BUFRLMT = 0010h
+OPARMGENMAX=!{$-ideopngenparms}/4
+
+;Device parameter table for IDE: IO operations
+
+	.LONG	PARMMAX		;Size of table
+ideioparms:
+	.LONG	ideiogenparms	 ;IOPAR_xxxxxx = 00xx - Generic IO parameters
+	.LONG	knlNullFilParms##;IOPAR_FILxxx = 01xx - File system IO
+				 ;			  parameters
+	.LONG	knlNullTrmParms##;IOPAR_TRMxxx = 02xx - Terminal IO parameters
+PARMMAX=!{$-ideioparms}/4
+
+	.LONG	PARMGENMAX	;Size of table
+ideiogenparms:
+	.LONG	0		;	       = 0000h
+	.LONG	knlIopFilOptn##	;IOPAR_FILOPTN = 0001h
+	.LONG	knlIopFilSpec##	;IOPAR_FILSPEC = 0002h
+	.LONG	knlIopDevSts##	;IOPAR_DEVSTS  = 0003h
+	.LONG	knlIopUnitNum##	;IOPAR_UNITNUM = 0004h
+	.LONG	knlIopGlbId##	;IOPAR_GLBID   = 0005h
+	.LONG	knlIopNumOpen##	;IOPAR_NUMOPN  = 0006h
+	.LONG	knlIopTimeOut##	;IOPAR_TIMEOUT = 0007h
+	.LONG	0		;IOPAR_INPSTS  = 0008h
+	.LONG	0		;IOPAR_OUTSTS  = 0009h
+	.LONG	knlIopInpQLmt##	;IOPAR_INPQLMT = 000Ah
+	.LONG	knlIopOutQLmt##	;IOPAR_OUTQLMT = 000Bh
+	.LONG	0		;IOPAR_SIVECT1 = 000Ch
+	.LONG	0		;IOPAR_SIVECT2 = 000Dh
+	.LONG	0		;IOPAR_SIDATA  = 000Eh
+	.LONG	knlIopNumOpen##	;IOPAR_NUMOPN  = 000Fh
+	.LONG	knlIopBufrLmt##	;IOPAR_BUFRLMT = 0010h
+PARMGENMAX=!{$-ideioparms}/4-1
+.PAGE
+	.SBTTL	Initialization routine
+
+	INITSUB	initide
+
+initide:MOVL	EDI, #idechk		;Install our class
+	MOVL	EBX, #idecls		;Offset of class function dispatch table
+	MOVL	EAX, #'IDE'
+	CLRL	EDX
+	MOVL	ECX, #idecctbl
+	MOVL	ESI, #xosideCcb
+	CALL	knlNewClass##		;Create the IDE class
+	JC	10$.S			;If error
+	MOVL	ECX, #codetop
+	CLRL	EDX
+	CLRL	EAX
+10$:	MOVL	EBX, #QSTS$DONE
+	RET
+
+	CODE
+.PAGE
+	.SBTTL	xosideNewInterface - Subroutine to register low level IDE driver
+
+;Subroutine to register low level IDE driver - must be called with the
+;  exec memory resource
+;	c{EBX} = Name of driver (4 characters)
+;	c{EDX} = Offset of addunit subroutine
+;	CALL	xosideNewInterface
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+
+xosideNewInterface:
+	MOVL	EAX, fidedrv
+2$:	TESTL	EAX, EAX
+	JE	6$.S
+	CMPL	4.B[EAX], EBX
+	JE	4$.S
+	MOVL	EAX, [EAX]
+	JMP	2$.S
+
+;Here if interface is defined
+
+4$:	MOVL	EAX, #ER_TYPAD
+	STC
+	RET
+
+;Here if interface not already defined
+
+6$:	MOVL	ECX, #12t
+	CALL	knlGetXMem##		;Get memory for the driver data block
+	JC	8$.S			;If error
+	MOVL	4.B[EDI], EBX		;OK - store name
+	MOVL	8.B[EDI], EDX		;Store offset of addunit subroutine
+	MOVL	EAX, fidedrv		;Link into list of IDE drivers
+	MOVL	[EDI], EAX
+	MOVL	fidedrv, EDI
+	CLRL	EAX			;Make sure C is clear and return 0
+8$:	RET
+.PAGE
+	.SBTTL	ideaddunit - Class function to add unit
+
+;Here for the CL_ADDUNIT function - for this device the add unit function
+;  actually sets up a single IDE interface.  It does this by calling
+;  the apropriate IDE device driver.
+;	c{ES:EDI} = Address of parameter block
+;	CALL	ideaddunit
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  c{EAX}  = 0
+
+;Description block for knlAddUnitChar:
+
+	DATA
+
+	.MOD	4
+ideaublk:
+ DCHARBGN  2, knlDCharValCom##
+ DCHARENT  UNIT , DECV, , 1, 0, 0, auunit, 0
+ DCHARENT  TYPE , TEXT, , 4, 0, 0, autype, 0
+ DCHARENT  IOREG, DECV, , 4, 0, 0, aureg , 0
+
+	CODE
+
+$$$=!0
+FRM au_ioreg , 4t		;IO register number
+FRM au_unit  , 4t		;Unit number
+FRM au_type  , 4t		;Controller type
+FRM au_char  , 8t		;Address of characteristics list
+au_SIZE=!$$$
+
+ideaddunit:
+	ENTER	au_SIZE, 0		;Set up and initialize our stack frame
+	CLRL	EAX
+	DECL	EAX
+	MOVL	au_unit.B[EBP], EAX
+	MOVL	au_type.B[EBP], EAX
+	MOVL	au_ioreg.B[EBP], EAX
+	IFFAULT	6$
+	LFSL	EDX, iorb_buffer2.B[ESI]
+	MOVL	au_char+0.B[EBP], EDX
+	MOVL	au_char+4.B[EBP], FS
+	CALL	knlGiveQel##		;Give up the IORB
+	MOVL	EBX, #ideaublk		;Process the characteristics
+	MOVB	AL, #1			;Ignore bad names here
+	CALL	knlAddUnitChar##
+	JNC	8$.S			;If no error
+4$:	CLRL	ECX
+	MOVL	EBX, #QSTS$DONE
+	LEAVE				;Fail
+	TOFORK
+	STC
+	RET
+
+;Here if address error with IORB
+
+	FAULTHDR
+6$:	CALL	knlGiveQel##
+	MOVL	EAX, #ER_ADRER
+	JMP	4$.S
+
+;Here with all parameters processed - make sure we got everything we need
+
+8$:	MOVL	EAX, au_unit.B[EBP]
+	ORL	EAX, au_type.B[EBP]
+	ORL	EAX, au_ioreg.B[EBP]
+	INCL	EAX
+	JNE	12$.S
+10$:	MOVL	EAX, #ER_CHARM
+	JMP	4$.S
+
+;Here with all needed parameters found
+
+12$:	MOVL	EAX, au_type.B[EBP]	;Get type name
+	MOVL	ECX, fidedrv		;Point to first disk driver data block
+	JREGZ	ECX, 16$
+14$:	CMPL	4.B[ECX], EAX		;Yes - is this the one we want?
+	JE	20$.S			;Yes
+	MOVL	ECX, [ECX]		;No - advance to next
+	TESTL	ECX, ECX
+	JNE	14$.S
+16$:	MOVL	EAX, #ER_NSTYP
+18$:	JMP	4$.S
+
+;Here with data block for IDE interface driver
+
+20$:	MOVL	EBX, idefirsticb	;Point to first IDE ICB
+	MOVL	EAX, au_unit.B[EBP]	;Get unit number
+	MOVL	ESI, au_ioreg.B[EBP]	;Get base IO register for interface
+22$:	TESTL	EBX, EBX		;Have another ICB to check?
+	JE	28$.S			;No
+	CMPL	icb_unit.B[EBX], EAX	;Yes - same unit?
+	JE	24$.S			;Yes - fail!
+	CMPL	icb_ioreg.B[EBX], ESI	;No - same base IO register?
+	JE	26$.S			;Yes - fail
+	MOVL	EBX, icb_next.B[EBX]	;No - advance to next ICB/DCB
+	JMP	22$.S			;Continue
+
+;Here if unit is already defined
+
+24$:	MOVL	EAX, #ER_DUADF
+	JMP	18$.S
+
+;Here if physical unit is already set up
+
+26$:	MOVL	EAX, #ER_PDADF
+	JMP	18$.S
+
+;Here if unit is not now defined
+
+28$:	LFSL	EDX, au_char.B[EBP]	;Get address of the characteristics
+	LEAVE				;  list
+	JMPIL	8.B[ECX]		;Dispatch to addunit routine for driver
+.PAGE
+;Subroutine called by adduchar when "UNIT" characteristics found
+
+auunit:	CMPL	EAX, #99t
+	JA	4$.S
+	MOVL	au_unit.B[EBP], EAX
+	CLC
+	RET
+
+;Subroutine called by adduchar when "TYPE" characteristics found
+
+autype:	MOVL	au_type.B[EBP], EAX
+	RET
+
+;Subroutine called by adduchar when "IOREG" characteristics found
+
+aureg:	CMPL	EAX, #0.B
+	JE	4$.S
+	CMPL	EAX, #0FFFFh
+	JA	4$.S
+	MOVL	au_ioreg.B[EBP], EAX
+	CLC
+	RET
+
+4$:	MOVL	EAX, #ER_CHARV
+	STC
+	RET
+.PAGE
+xosideGet1Byte:
+	ADDL	EBX, dcb_ideicb.B[EDI]
+	MOVZBL	EAX, [EBX]
+	CLRL	EDX
+	RET
+
+xosideGet2Byte:
+	ADDL	EBX, dcb_ideicb.B[EDI]
+	MOVZWL	EAX, [EBX]
+	CLRL	EDX
+	RET
+
+xosideGet4Byte:
+	ADDL	EBX, dcb_ideicb.B[EDI]
+	MOVL	EAX, [EBX]
+	CLRL	EDX
+	RET
+
+xosideGetYesNo:
+	ADDL	EBX, dcb_ideicb.B[EDI]
+	CMPB	[EBX], #0
+	MOVL	EAX, #'Yes'
+	JNE	4$.S
+	MOVL	EAX, #'No'
+4$:	RET
+
+xosideSet4Byte:
+	ADDL	EBX, dcb_ideicb.B[EDI]
+	MOVL	[EBX], EAX
+	CLC
+	RET
+.PAGE
+	.SBTTL	xosideMapError - Subroutine to map IDE error to knl error code
+
+;Subroutine to map IDE error information to an knl error code
+;	c(AL)     = Target status value
+;	c{ES:EBX} = Address of 18 byte sense data buffer
+;	CALL	xosideMapError
+;	c{EAX} = knl error code (may be 0 to indicate no real error)
+;	c{EDX} = Residue value
+
+;For this version, this routine only uses the sense key field to determine the
+;  error code to report.  It is expected this will be enhanced in future
+;  versions!
+
+xosideMapError:
+	ANDB	AL, #3Eh		;Mask off the reserved bits
+	CMPB	AL, #02h		;Is it "CHECK CONDITION"?
+	JNE	4$.S			;No - indicate generic error
+	MOVB	AL, ES:2.B[EBX]		;Yes - get the sense key value
+	ANDL	EAX, #0Fh.B
+	MOVL	EDX, #-1		;Assume residue will be 0
+	TESTB	[EBX], #80h		;Do we have a residue value?
+	JE	2$.S			;No
+	MOVL	EDX, 3.B[EBX]		;Yes - get it
+	XCHGB	DL, DH			;Fix up the byte order
+	RORL	EDX, #16t
+	XCHGB	DL, DH
+2$:	JMPIL	errdsp[EAX*4]		;Dispatch on the sense key value
+
+generic:MOVL	EAX, #ER_ERROR
+	RET
+
+	DATA
+
+errdsp:	.LONG	nosense		;0 - NO SENSE
+	.LONG	recovered	;1 - RECOVERED ERROR
+	.LONG	notready	;2 - NOT READY
+	.LONG	dataerr		;3 - MEDIUM ERROR
+	.LONG	deverr		;4 - HARDWARE ERROR
+	.LONG	illreq		;5 - ILLEGAL REQUEST
+	.LONG	unitatten	;6 - UNIT ATTENTION
+	.LONG	protect		;7 - DATA PROTECT
+	.LONG	blank		;8 - BLANK CHECK
+	.LONG	generic		;9 - VENDOR-SPECIFIC
+	.LONG	generic		;A - COPY ABORTED
+	.LONG	cmdabtd		;B - ABORTED COMMAND
+	.LONG	generic		;C - EQUAL
+	.LONG	devfull		;D - VOLUME OVERFLOW
+	.LONG	generic		;E - MISCOMPARE
+	.LONG	generic		;F - RESERVED
+
+	CODE
+
+;Here if sense key = 0 - No sense information available
+
+nosense:MOVB	AL, 2.B[EBX]
+	TESTB	AL, #80h		;Have filemark or setmark?
+	JNE	4$.S			;Yes
+	TESTB	AL, #40h		;No - have end of media?
+	JNE	10$.S			;Yes
+	TESTB	AL, #20h		;No - have illegal length?
+	JE	generic.S		;No - report generic error
+	MOVL	EAX, #ER_ICDEV		;Yes
+	RET
+
+;Here if have filemark or setmark indication
+
+4$:	CMPB	7.B[EBX], #6		;Have an additional sense code?
+	JB	6$.S			;No
+	CMPB	12t.B[EBX], #0		;Yes - additional sense code should be 0
+	JNE	6$.S
+	CMPB	13t.B[EBX], #3		;Does the qualifier indicate setmark?
+	JE	8$.S			;Yes
+6$:	MOVL	EAX, #ER_EOF		;No - report file mark (EOF)
+	RET
+
+8$:	MOVL	EAX, #ER_EOS
+	RET
+
+;Here if have end of media indication
+
+10$:	MOVL	EAX, #ER_EOM
+	RET
+
+;Here if sense key = 1 - Recovered error
+
+recovered:
+	CLRL	EAX
+	RET
+
+;Here if sense key = 2 - Not ready
+
+notready:
+	MOVL	EAX, #ER_NTRDY
+	RET
+
+;Here if sense key = 3 - Medium (data) error
+
+dataerr:MOVL	EAX, #ER_DATER
+	RET
+;Here if sense key = 4 - Hardware (device) error
+
+deverr:	MOVL	EAX, #ER_DEVER
+	RET
+
+;Here if sense key = 5 - Illegal request
+
+illreq:	MOVL	EAX, #ER_DVDER
+	RET
+
+;Here if sense key = 6 - Unit attention
+
+unitatten:
+	MOVL	EAX, #ER_MDCHG
+	RET
+
+;Here if sense key = 7 - Data protect
+
+protect:MOVL	EAX, #ER_WPRER
+	RET
+
+;Here if sense key = 8 - Blank check
+
+blank:	MOVL	EAX, #ER_BLANK
+	RET
+
+;Here if sense key = 0A - Copy aborted
+
+copyabtd:
+	MOVL	EAX, #ER_DVDER
+	RET
+
+;Here if sense key = 0B - Command aborted
+
+cmdabtd:MOVL	EAX, #ER_DVDER
+	RET
+
+;Here if sense key = 0D - Volume overflow
+
+devfull:MOVL	EAX, #ER_DEVFL
+ret002:	RET
+.PAGE
+	.SBTTL	ideunitinfo - IDE class get phyical unit information function
+
+;Here for the get physical unit information class function (CL_PUNITS) for the
+;  IDE class
+;	c{EBX} = Offset of CCB
+;	c{ESI} = Offset of IORB
+;	CALL	ideunitinfo
+;	c{EAX} = Error code
+;	c{EBX} = Status bits
+;	c{ECX} = Item count
+;  A zero count (iorb_count) requests that the number of units only be returned
+;    in qab_amount.  A non-zero count indicates that a buffer is available for
+;    that many unit names (8 characters each, null padded).
+
+ideunitinfo::
+	MOVL	EAX, #ER_NIYT
+	CLRL	EAX
+	MOVL	EBX, #QSTS$DONE
+	RET
+.PAGE
+	.SBTTL	xosideMakeIcb - Subroutine to create IDE ICB
+
+;Subroutine to create IDE interface control block (ICB) - must be called
+;  with the exec memory resource
+;	c{EAX} = Unit number
+;	c{EBX} = Type name
+;	c{ECX} = Size of ICB
+;	c{EDX} = Offset of device characteristics table for IDE: device
+;	c{ESI} = Base IO register
+;	CALL	xosideMakeIcb
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  c{ESI} = Address of ICB just created
+
+xosideMakeIcb::
+	PUSHL	EAX			;Save unit number
+	PUSHL	EBX			;Save type name
+	PUSHL	EDX			;Save device characteristics offset
+	PUSHL	ESI
+	CALL	knlGetXMem##		;Allocate exec memory for the ICB
+	LEAL	ESI, icb_mSIZE.B[EDI]
+	POPL	EDI
+	POPL	ECX			;Restore device characteristics offset
+	POPL	EBX			;Restore type name
+	POPL	EDX			;Restore unit number
+	JC	ret002.S		;If error
+	MOVL	icb_typename.B[ESI], EBX ;Store type name
+	MOVL	icb_devchar.B[ESI], ECX	;Store device characteristics offset
+	MOVL	icb_unit.B[ESI], EDX	;Store unit number
+	MOVL	icb_ioreg.B[ESI], EDI
+	LEAL	EBX, icb_name+4.B[ESI]	;Construct unit name
+	MOVL	EAX, #'IDE'
+	MOVL	-4.B[EBX], EAX
+	MOVL	EAX, EDX
+	CALL	knlPutDecNmbr##
+	CLRL	ECX
+	MOVL	EDX, #idefirsticb
+					;Fall into xosideLinkIcb on next page
+.PAGE
+	.SBTTL	xosideLinkIcb - Subroutine to link an ICB into an ICB list
+
+;Subroutine to link an ICB into an ICB list
+;	c{ESI} = Offset of ICB
+;	c{ECX} = Offset of link pointer in ICB
+;	c{EDX} = Offset of ICB list head pointer (tail pointer must be next)
+;	CALL	xosideLinkIcb
+;	C:clr always
+
+xosideLinkIcb:
+	PUSHL	EDI
+	PUSHL	EBX
+	MOVL	EAX, icb_unit.B[ESI]	;Get this unit number
+	MOVL	EDI, EDX
+4$:	MOVL	EBX, [EDI]
+	TESTL	EBX, EBX
+	JE	8$.S
+	CMPL	EAX, icb_unit.B[EBX]
+	JB	6$.S
+	LEAL	EDI, [EBX+ECX]
+	JMP	4$.S
+
+;Here with place to insert this ICB
+
+6$:	MOVL	[ESI+ECX], EBX
+	JMP	10$.S
+
+;Here to insert ICB at end of list
+
+8$:	MOVL	4.B[EDX], ESI
+10$:	MOVL	[EDI], ESI
+	POPL	EBX
+	POPL	EDI
+	CLC
+	RET
+.PAGE
+	.SBTTL	xosideDevFind - Subroutine to find a IDE driver
+
+;Subroutine to find a IDE driver - this is called by the addunit routine for
+;  an interface module which wants to use the IDE interface.  May be called at
+;  any level.
+;	c{EDX,EAX} = Device name (8 bytes)
+;	CALL	xosideDevFind
+;	C:set = Error (no error code is returned)
+;	C:clr = Normal
+;	  c{ESI} = Offset of ICB for interface
+
+xosideDevFind::
+	CMPL	EAX, #'IDE'
+	JNE	8$.S
+	MOVL	ESI, idefirsticb	;Point to first IDE ICB
+4$:	TESTL	ESI, ESI		;More to check?
+	JE	8$.S			;No - fail
+	CMPL	icb_name+4.B[ESI], EDX	;Yes - this one?
+	JE	10$.S			;Yes - found it
+6$:	MOVL	ESI, icb_next.B[ESI]	;No - advance to next
+	JMP	4$.S			;Continue
+
+;Here if can't find the device
+
+8$:	STC
+10$:	RET
+.PAGE
+	.SBTTL	xosideGetDcb - Subroutine to allocate IDE DCB
+
+;Subroutine to allocate IDE DCB
+;	c{ESI}     = Offset of ICB
+;	CALL	xosideGetDcb
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  c{EDI} = Offset of IDE DCB allocated (all other registers are
+;		     preserved)
+
+xosideGetDcb::
+	PUSHL	EDX
+	MOVL	EDX, idedcbnum
+	CMPL	EDX, idedcblmt
+	JAE	10$.S
+	PUSHL	ECX
+	PUSHL	EBX
+	PUSHL	icb_name+12t.B[ESI]	;Get the device name
+	PUSHL	icb_name+8.B[ESI]
+	PUSHL	icb_name+4.B[ESI]
+	PUSHL	icb_name+0.B[ESI]
+	MOVL	EBX, ESP
+	MOVL	EDI, #DS$PHYS
+	MOVL	ECX, #dcb_ideINDEX
+	CALL	knlGetDymDcb##
+	JC	6$.S
+	ADDL	ESP, #16t.B
+	PUSHL	ESI
+	MOVL	ESI, #xosideCcb
+	CALL	knlLinkDcb##
+	POPL	ESI
+	INCL	idedcbnum
+	MOVL	EAX, idedcbnum
+	CMPL	EAX, idedcbmax
+	JB	4$.S
+	MOVL	idedcbmax, EAX
+4$:	POPL	EBX
+	POPL	ECX
+	POPL	EDX
+	MOVL	dcb_sdisp.B[EDI], #idedsp ;Store offset of SVC dispatch table
+	MOVL	EAX, icb_typename.B[ESI] ;Copy type name
+	MOVL	dcb_type.B[EDI], EAX
+	MOVL	EAX, icb_devchar.B[ESI]	;Copy offset of device characteristics
+	MOVL	dcb_devchar.B[EDI], EAX	;  table of interface device
+	MOVL	dcb_ideicb.B[EDI], ESI	;Store ICB offset in the DCB
+	CLC				;Make sure C is clear
+	RET
+
+;Here if error allocating the DCB
+
+6$:	ADDL	ESP, #16t.B
+	POPL	EBX
+	POPL	ECX
+	POPL	EDX
+	STC
+	RET
+
+;Here if no IDE DCB is available
+
+10$:	MOVL	EAX, #ER_TMDVC		;Error = Too Many DVices open for
+	POPL	EDX			;  class
+	STC
+	RET
+.PAGE
+	.SBTTL	xosideUnitInit - Subroutine to initialize a IDE logical unit
+
+;Subroutine to initialize a IDE logical unit - this is called by the addunit
+;  routine for an interface module which wants to use the IDE interface to
+;  make a connection to a IDE device.  Must be called in extended fork context
+;	c(AL)     = Device type expected
+;	c(AH)     = Inquiry flag
+;	c{DL}     = IDE target ID
+;	c{DH}     = IDE logical unit number
+;	c{SS:EBX} = Address of 256 byte buffer for inquiry data
+;	c{EDI}    = Offset of DCB (for device which will use the interface)
+;	c{ESI}    = Offset of ICB
+;	CALL	xosideUnitInit
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+
+$$$=!0
+FRM ui_type  , 4t		;Desired device type and inquiry flag
+FRM ui_xcb   , xcb_SIZE		;XCB
+ui_SIZE=!$$$
+
+xosideUnitInit:
+	ENTER	ui_SIZE, 0
+	MOVL	ui_type.B[EBP], EAX
+	MOVL	ui_xcb+xcb_target.B[EBP], EDX
+	MOVL	ui_xcb+xcb_buffer+0.B[EBP], EBX
+	MOVW	ui_xcb+xcb_buffer+4.B[EBP], SS
+	MOVZBL	EAX, DL
+	BTL	icb_tarinuse.B[ESI], EAX ;Is this IDE target in use now?
+	JC	10$.S			;Yes - fail
+	MOVL	ui_xcb+xcb_task.B[EBP], EAX
+
+;;;;;;	JMP	4$.S		;;;;;;;;; PUT THIS IN TO BYPASS THE INQUIRY!
+
+	MOVL	ui_xcb+xcb_count.B[EBP], #255t
+	LEAL	EBX, ui_xcb.B[EBP]
+	MOVB	AL, ui_type+1.B[EBP]	;Get the inquiry flag
+	CALL	doinquiry		;Get the inquiry data from the device
+	JC	12$.S			;If error
+	MOVB	AL, ui_type.B[EBP]	;Get desired device type
+	LESL	EDX, ui_xcb+xcb_buffer.B[EBP] ;Get actual device
+	MOVB	AH, ES:[EDX]
+	ANDB	AH, #1Fh
+	CMPB	AL, #SDT_GDISK		;Do we want a generic disk?
+	JE	6$.S			;Yes
+	CMPB	AL, AH			;No - do we have what we want?
+	JNE	8$.S			;No - fail
+4$:	MOVL	EAX, ui_xcb+xcb_task.B[EBP] ;Yes - indicate this target is
+	BTSL	icb_tarinuse.B[ESI], EAX    ;  in-use now
+	LEAVE
+	CLRL	EAX
+	RET
+
+;Here if want a generic disk
+
+6$:	CMPB	AH, #SDT_MDISK
+	JE	4$.S
+	CMPB	AH, #SDT_CDROM
+	JE	4$.S
+	CMPB	AH, #SDT_ODISK
+	JE	4$.S
+8$:	MOVL	EAX, #ER_SDVTI
+	LEAVE
+	STC
+	RET
+
+;Here if the IDEI target is already in use
+
+10$:	MOVL	EAX, #ER_STIIU
+12$:	LEAVE
+	RET
+.PAGE
+	.SBTTL	xosideCopyInq - Subroutine to copy device information to data block
+
+
+;Subroutine to copy device inquiry information to the data block for the device
+;	c{ECX} = Maximum number of bytes to copy
+;	c{EDX} = Source offset
+;	c{EBX} = Destination offset
+;	CALL	xosideCopyInq
+
+xosideCopyInq:
+	MOVB	AL, SS:[EDX]
+	INCL	EDX
+	CMPB	AL, #0
+	JE	10$.S
+	CMPB	AL, #20h
+	JBE	xosideCopyInq.S
+	DECL	EDX
+	PUSHL	ESI
+	MOVL	ESI, EBX
+4$:	MOVB	AL, SS:[EDX]
+	INCL	EDX
+	CMPB	AL, #0
+	JE	8$.S
+	MOVB	[EBX], AL
+	INCL	EBX
+	CMPB	AL, #20h
+	JBE	6$.S
+	MOVL	ESI, EBX
+6$:	LOOP	ECX, 4$
+8$:	MOVL	EBX, ESI
+	MOVB	[EBX], #0
+	POPL	ESI
+10$:	RET
+.PAGE
+	.SBTTL	xosideModeSense - Subroutine to do mode sense command
+
+;Subourtine to do mode sense command
+;	c(AL)     = Target
+;	c(AH)     = Logical unit number
+;	c(DL)     = Page number
+;	c(DH)     = DBD bit (00h or 08h)
+;	c{SS:EBX} = Address of 256 byte buffer for data
+;	c{ESI}    = Offset of ICB
+;	CALL	xosideModeSense
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+
+$$$=!0
+FRM ms_xcb, xcb_SIZE
+ms_SIZE=!$$$
+
+xosideModeSense:
+	ENTER	ms_SIZE, 0
+	MOVL	ms_xcb+xcb_target.B[EBP], EAX
+	MOVZBL	EAX, AL
+	MOVL	ms_xcb+xcb_task.B[EBP], EAX
+	MOVB	ms_xcb+xcb_mode.B[EBP], #0
+	MOVL	ms_xcb+xcb_buffer+0.B[EBP], EBX
+	MOVW	ms_xcb+xcb_buffer+4.B[EBP], SS
+	MOVL	ms_xcb+xcb_count.B[EBP], #255t
+	MOVB	ms_xcb+xcb_cdb+0.B[EBP], #CMD_MODESEN6 ;Set up the CDB
+	MOVB	ms_xcb+xcb_cdb+1.B[EBP], DH
+	MOVB	ms_xcb+xcb_cdb+2.B[EBP], DL ;Store page number
+	MOVB	ms_xcb+xcb_cdb+3.B[EBP], #0
+	MOVL	ms_xcb+xcb_cdb+4.B[EBP], #255t
+	MOVL	ms_xcb+xcb_cdblen.B[EBP], #6t
+	LEAL	EBX, ms_xcb.B[EBP]
+	CALLI	icb_doio.B[ESI]
+	JC	16$.S
+	MOVL	EDX, ms_xcb+xcb_buffer.B[EBP] ;Get the length of the returned
+	MOVZBL	ECX, SS:4.B[EDX]	      ;  data
+	ADDL	ECX, #5.B
+	CMPL	ECX, ms_xcb+xcb_count.B[EBP]
+	JBE	12$.S
+	MOVL	ECX, ms_xcb+xcb_count.B[EBP]
+12$:	CLRL	EAX
+14$:	LEAVE
+	RET
+
+;Here if error
+
+16$:	CLRL	ECX
+	LEAVE
+	STC
+	RET
+.PAGE
+	.SBTTL	idechk - Device check routine for IDE class devices
+
+;Device check routine for IDE class devices
+;	c{SS:EBX} = Address of device name (16 bytes)
+;	CALL	idechk
+;	C:set = Error (match found)
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  Z:set = Match found
+;	    c{EDI} = Offset of DCB
+;	  Z:clr = Not found
+;  EBX and ESI are preserved
+
+idechk:	MOVL	EAX, SS:[EBX]
+	ANDL	EAX, #0FFFFFFh
+	CMPL	EAX, #'IDE'		;Is this IDE*?
+	JNE	6$.S			;No
+	MOVL	EDI, idefirsticb	;Yes - point to first IDE ICB
+	TESTL	EDI, EDI
+	JE	6$.S			;If none at all
+2$:	MOVL	EAX, icb_name+4.B[EDI]	;Does name match?
+	CMPL	SS:4.B[EBX], EAX
+	JNE	4$.S
+	MOVL	EAX, icb_name+8.B[EDI]
+	CMPL	SS:8.B[EBX], EAX
+	JNE	4$.S
+	MOVL	EAX, icb_name+12t.B[EDI] ;Does name match?
+	CMPL	SS:12t.B[EBX], EAX
+	JE	10$.S			;Yes - this is it!
+4$:	MOVL	EDI, [EDI]		;No - try next
+	TESTL	EDI, EDI
+	JNE	2$.S			;Continue if another
+6$:	TESTL	ESP, ESP		;No more - clear Z
+8$:	RET
+
+;Here with match on name
+
+10$:	PUSHL	ESI
+	MOVL	ESI, EDI
+	CALL	xosideGetDcb		;Get a IDE DCB
+	POPL	ESI
+	JC	8$.S			;If error
+	CLRL	EAX			;Set Z
+	RET
+.PAGE
+	.SBTTL	sd_cleardcb - Clear DCB
+
+;Here for the clear DCB entry
+;	c{EDI} = Offset of DCB
+
+xosideCDcb:
+	DECL	idedcbnum		;Reduce in-use count
+	MOVL	ECX, #dcb_ideINDEX
+	JMP	knlGiveDymDcb##		;Give up the DCB
+.PAGE
+	.SBTTL	sd_open - Open device
+
+;Here for the open device entry (sd_open) - also used for the device parameters
+;  entry (sd_parm)
+;	c{EDI} = Offset of DCB
+
+ideopen::
+	CMPL	SS:xffParm##, #0.B
+	JE	4$.S
+	MOVL	EBX, #ideopnparms	;Process device parameters
+	MOVL	ECX, #knlComDPParms##
+	IFFAULT	knlRtnAdrEr##
+	LFSL	EDX, SS:xffParm##
+	CALL	knlProcDevParm##
+	JC	8$.S
+4$:	MOVL	EAX, idedcbnum
+	CMPL	EAX, idedcblmt
+	JAE	10$.S
+	INCL	EAX
+	CMPL	idedcbmax, EAX
+	JAE	6$.S
+	MOVL	idedcbmax, EAX
+6$:	MOVL	idedcbnum, EAX
+	CLRL	EAX
+8$:	RET
+
+;Here if have too many IDE devices open
+
+10$:	MOVL	EAX, #ER_TMDVC
+	STC
+	RET
+.PAGE
+	.SBTTL	sd_close - Close device
+
+;Here for the close device entry
+;	c{ECX} = Close option bits
+;	c{EDI} = Offset of DCB
+;	c{ESI} = Offset of device table entry
+;	CALL	ideclose
+;	C:set = Error or not ready
+;	  c{EAX} = Error code (0 means not ready)
+;	C:clr = Normal
+
+ideclose::
+	CLRL	EAX
+	TOFORK
+	JMP	knlCloseFin##
+.PAGE
+;Subroutine to get access to the IDE device for single threaded IO operations
+;	CALL	xosideGetDev
+
+xosideGetDev:
+	CMPL	icb_curdcb.B[ESI], #0.B	;Is the IDE device busy now?
+	JE	8$.S			;No
+	MOVL	EAX, icb_reqtail.B[ESI]	;Put us on the wait list
+	TESTL	EAX, EAX
+	JE	2$.S
+	MOVL	dcb_idereqnext.B[EAX], EDI
+	JMP	4$.S
+
+2$:	MOVL	icb_reqhead.B[ESI], EDI
+4$:	MOVL	icb_reqtail.B[ESI], EDI
+	MOVL	EAX, #-1
+	CALL	knlXfWait##		;Wait until device is available
+	JC	10$.S			;If error while waiting
+	CMPL	icb_curdcb.B[ESI], EDI	;Did we really get it?
+	JE	10$.S			;Yes - go on
+	CRASH	SDSE			;[IDE Device Scheduling Error]
+
+;Here if device was available
+
+8$:	MOVL	icb_curdcb.B[ESI], EDI
+10$:	RET
+
+xosideGiveDev:
+	CMPL	icb_reqhead.B[ESI], #0.B ;Have anyone waiting?
+	JE	14$.S			;No - nothing more needed here
+	PUSHL	EAX			;Save error code
+	PUSHL	ECX
+	PUSHL	EDI
+	MOVL	EDI, icb_reqhead.B[ESI]
+	MOVL	icb_curdcb.B[ESI], EDI
+	MOVL	EAX, dcb_idereqnext.B[EDI]
+	MOVL	icb_reqhead.B[ESI], EAX
+	TESTL	EAX, EAX
+	JNE	12$.S
+	MOVL	icb_reqtail.B[ESI], EAX
+12$:	CLRL	EAX
+	CALL	knlResumeOutput##
+	POPL	EDI
+	POPL	ECX
+	POPL	EAX
+	RET
+
+;Here if the IDE device is idle now
+
+14$:	MOVL	icb_curdcb.B[ESI], #0
+	RET
+.PAGE
+	.SBTTL	IDE class driver data
+
+	DATA
+
+idedcbnum:  .LONG 0		;Number of in use IDE DCBs
+idedcbmax:  .LONG 0		;Maximum in use IDE DCBs
+idedcblmt:  .LONG 10000t	;Maximum number of IDE DCBs allowed
+xosideCcb:  .BLKB ccb_SIZE	;IDE CCB
+idefirsticb:.LONG 0		;Offset of first IDE ICB
+idelasticb: .LONG 0		;Offset of last IDE ICB
+fidedrv:    .LONG 0		;Offset of first IDE driver data block
+
+	LKEEND

@@ -1,0 +1,243 @@
+	.TITLE	CDRACLS2 - CD-ROM (ISO-9660) file system class driver
+
+;++++
+; This software is in the public domain.  It may be freely copied and used
+; for whatever purpose you see fit, including commerical uses.  Anyone
+; modifying this software may claim ownership of the modifications, but not
+; the complete derived code.  It would be appreciated if the authors were
+; told what this software is being used for, but this is not a requirement.
+
+;   THIS SOFTWARE IS PROVIDED BY THE AUTHORS "AS IS" AND ANY EXPRESS OR
+;   IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
+;   OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+;   IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+;   INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+;   BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS
+;   OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+;   ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR
+;   TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
+;   USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+;----
+
+	.PROC	80486
+	.INCLUD	XOSINC:\XMAC\XOS.PAR
+	.INCLUD	XOSINC:\XMAC\XOSX.PAR
+	.INCLUD	XOSINC:\XMAC\XOSERR.PAR
+	.INCLUD	XOSINC:\XMAC\XOSDISK.PAR
+	.INCLUD	XOSINC:\XMAC\XOSXDISK.PAR
+	.INCLUD	XOSINC:\XMAC\XOSTIME.PAR
+	.INCLUD	XOSINC:\XMAC\XOSLKE.PAR
+	.INCLUD	XOSINC:\XMAC\XOSXLKE.PAR
+	.INCLUD	CDRACLS.PAR
+
+	LKECONT
+
+;This module contains routines which implement support for the Rockridge
+;  extensions
+
+	CODE
+
+	.SBTTL	chkrrip - Subroutine to check for Rockridge extensions
+
+;Subroutine to check for the Rockridge extensions for a 9660 disk
+;	CALL	chkrrip
+;	Z:set = Disk has Rockridge extensions
+;	Z:clr = Disk does not have Rockridge extensions
+
+chkrrip::
+	ENTER	cdo_SIZE, 2		;Create our level 2 stack frame
+	PUSHL	EDI
+	PUSHL	SS			;Clear the stack frame
+	POPL	ES
+	LEAL	EDI, -12t.B[EBP]	;(this allows for a 2 item display)
+	CLRL	EAX
+	MOVL	ECX, #cdo_SIZE/4
+	STD
+	RSTOSL	[EDI]
+	POPL	EDI
+	LEAL	EAX, cdo_dirrec[EBP]
+	MOVL	cdo_actrec.B[EBP], EAX
+	LEAL	EAX, cdo_dirname[EBP]
+	MOVL	cdo_actname.B[EBP], EAX
+	MOVL	EAX, ucb_rootpnt.B[ESI] ;Read the first block of the root
+	MOVL	cdo_dirpnt.B[EBP], EAX	;  directory
+	MOVL	cdo_dirlen.B[EBP], #512t
+	CALL	cdrdirrc2#		;Read the . entry
+	JC	4$.S
+	CMPB	cdo_dirrec+dir_reclen[EBP], #47t ;Is the . entry long enough?
+	JB	1$.S			;No
+	CMPW	cdo_dirrec+dir_name-1[EBP], #0001h ;Yes - make sure the
+						   ;  first entry is right
+	CALL	rripgetrec		;Get possible RRIP record
+	JC	8$.S
+	JE	8$.S
+	CMPW	cdo_rriprec+0[EBP], #'SP' ;Is this an SP record?
+1$:	JNE	8$.S			;No
+	CMPB	cdo_rriprec+2[EBP], #7t	;Yes - is it the right length?
+	JNE	8$.S			;No
+	CMPW	cdo_rriprec+4[EBP], #0EFBEh ;Yes - are the check bytes right?
+	JNE	8$.S			;No
+	MOVZBL	EAX, cdo_rriprec+6[EBP] ;Yes - get the skip length
+	MOVL	ucb_rripskp.B[ESI], EAX	;Store it
+
+;Here with an SP record which looks OK - Now we must find the ER record and
+;  verify that it contains the correct extension ID.  If we can't find it or
+;  if the contents is wrong, we say this is not a Rockridge disk!
+
+2$:	CALL	rripgetrec		;Get next record
+4$:	JC	8$.S
+	JE	8$.S
+	CMPW	cdo_rriprec+0t[EBP], #'ER' ;Is this an ER record?
+	JNE	2$.S			;No - keep looking
+	CMPB	cdo_rriprec+2t[EBP], #18t ;Yes - is it big enough?
+	JB	8$.S			;No
+	CMPB	cdo_rriprec+4t[EBP], #10t ;Yes - is the extension ID the right
+					 ;  length
+	JNE	8$.S			;No
+	CMPL	cdo_rriprec+8t[EBP], #'RRIP' ;Yes - is the contents right?
+	JNE	8$.S			;No
+	CMPL	cdo_rriprec+12t[EBP], #'_199' ;Maybe
+	JNE	8$.S			;No
+	CMPW	cdo_rriprec+16t[EBP], #'1A' ;Maybe
+	JNE	8$.S			;No
+	CALL	chkgivebufr
+	LEAVE
+	CLRL	EAX			;Return with Z set to indicate this
+	RET				;  is a Rockridge disk
+
+;Here if this is not a Rockridge disk
+
+8$:	CALL	chkgivebufr
+	LEAVE
+	TESTL	ESP, ESP		;Clear Z
+12$:	RET
+
+chkgivebufr:
+	CALL	rripgivebufr
+	MOVL	EBX, cdo_dirbufr.B[EBP]
+	TESTL	EBX, EBX
+	JE	12$.S
+	JMP	xosdskRelsLkBufr##
+.PAGE
+;Subroutine to get next Rockridge extensions record
+;	CALL	rripgetrec
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  Z:set = No more records available
+;	  Z:clr = Have another record
+
+rripgetrec::
+	CMPL	cdo_dirleft.B[EBP], #4t.B ;Have room for another record
+	JB	10$			;No
+	MOVL	ECX, #4t		;Yes - get the header
+	LEAL	EBX, cdo_rriprec[EBP]
+	CALL	dirgetrec#
+	JC	8$
+	CMPB	cdo_rriprec+3[EBP], #1	;Is the version number right?
+	JNE	6$.S			;No!
+	MOVZBL	ECX, cdo_rriprec+2[EBP]	;Yes - get length of record
+	SUBL	ECX, #4t.B
+	JE	2$.S
+	JL	6$.S
+	LEAL	EBX, cdo_rriprec+4[EBP]	;Get the rest of it
+	CALL	dirgetrec#
+	JC	8$.S
+2$:	CMPW	cdo_rriprec+0[EBP], #'ST' ;Is this the end of this area?
+	JE	10$.S			;Yes
+	CMPW	cdo_rriprec+0[EBP], #'CE' ;Is this a continuation entry?
+	JNE	4$.S			;No - return this record
+	CMPB	cdo_rriprec+2[EBP], #28t ;Yes - is it big enough?
+	JB	6$.S			;No!
+	CMPL	cdo_rripcontb.B[EBP], #0.B ;Yes - already have continuation?
+	JNE	6$.S			;Yes - serious problem!
+	MOVL	EAX, cdo_rriprec+12t[EBP] ;No - get offset in cluster
+	CLRL	EDX			;Calculate block increment and offset
+	IDIVL	ucb_bpclus.B[ESI]	;  in block
+	MOVL	cdo_rripconto.B[EBP], EAX ;Store offset in block
+	MOVL	EAX, cdo_rriprec+4[EBP]	;Get cluster number
+	IMULL	EAX, ucb_clussize.B[ESI] ;Change to block number
+	ADDL	EAX, EDX
+	MOVL	cdo_rripcontb.B[EBP], EAX ;Store block number
+	MOVL	EAX, cdo_rriprec+20t[EBP] ;Get length
+	MOVL	cdo_rripconts.B[EBP], EAX
+	JMP	rripgetrec		;Continue
+
+;Here with record to return
+
+4$:	TESTL	ESP, ESP		;Clear Z and C
+	RET
+
+;Here if have illegal format
+
+6$:	MOVL	EAX, #ER_DRFER
+8$:	PUSHL	EAX
+	CALL	rripgivebufr
+	POPL	EAX
+	STC
+9$:	RET
+
+;Here at end of the extension area - see if we have a continuation area to
+;  process
+
+10$:
+;;;;;;	JMP	14$.S
+
+	CMPL	cdo_rripcontb.B[EBP], #0.B ;Do we have a continuation area?
+	JE	14$.S			;No - all done here
+	CMPL	cdo_savbufr.B[EBP], #0.B ;Yes - already have a saved buffer?
+	JNE	102$.S			;Yes
+	MOVL	EAX, cdo_dirbufr.B[EBP]	;No - save the current buffer
+	MOVL	cdo_savbufr.B[EBP], EAX
+	MOVL	EAX, cdo_dirpos.B[EBP]
+	MOVL	cdo_savpos.B[EBP], EAX
+	MOVL	EAX, cdo_dirlen.B[EBP]
+	MOVL	cdo_savlen.B[EBP], EAX
+	MOVL	EAX, cdo_dirpnt.B[EBP]
+	MOVL	cdo_savpnt.B[EBP], EAX
+	JMP	104$.S
+
+;Here if already have a saved buffer - give up the current buffer
+
+102$:	MOVL	EBX, cdo_dirbufr.B[EBP]
+	CALL	xosdskRelsLkBufr##
+104$:	CLRL	EAX
+	MOVL	cdo_dirbufr.B[EBP], EAX
+	MOVL	EAX, cdo_rripcontb.B[EBP] ;Get block for continuation
+	MOVL	cdo_dirpnt.B[EBP], EAX
+	MOVL	EAX, cdo_rripconto.B[EBP]
+	MOVL	cdo_dirpos.B[EBP], EAX
+	ADDL	EAX, cdo_rripconts.B[EBP] ;Get continuation size
+	MOVL	cdo_dirlen.B[EBP], EAX
+	MOVL	cdo_dirleft.B[EBP], EAX
+	CLRL	EAX
+	MOVL	cdo_rripcontb[EBP], EAX
+	JMP	rripgetrec		;Continue
+
+;Here when finished with this extension area
+
+14$:	CALL	rripgivebufr		;Give up our buffer
+	CLRL	EAX
+	RET				;Return with Z set
+.PAGE
+
+rripgivebufr:
+	CMPL	cdo_savbufr.B[EBP], #0.B ;Did we save a buffer?
+	JE	4$.S			;No - nothing needed here
+	MOVL	EBX, cdo_dirbufr.B[EBP]	;Yes - give up the current buffer
+	TESTL	EBX, EBX
+	JE	2$.S
+	CALL	xosdskRelsLkBufr##
+2$:	MOVL	EAX, cdo_savbufr.B[EBP]	;Restore the saved buffer
+	MOVL	cdo_dirbufr.B[EBP], EAX
+	MOVL	EAX, cdo_savlen.B[EBP]
+	MOVL	cdo_dirlen.B[EBP], EAX
+	MOVL	EAX, cdo_savpos.B[EBP]
+	MOVL	cdo_dirpos.B[EBP], EAX
+	MOVL	EAX, cdo_savpnt.B[EBP]
+	MOVL	cdo_dirpnt.B[EBP], EAX
+	CLRL	EAX
+	MOVL	cdo_savbufr.B[EBP], EAX
+4$:	RET
+
+	LKEEND

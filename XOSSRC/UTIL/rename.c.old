@@ -1,0 +1,554 @@
+//--------------------------------------------------------------------------*
+// RENAME.C - Combined MOVE/RENAME utility for Forte
+//
+// Written by: Tom Goltz
+//
+// Edit History:
+// 08/20/92(brn) - Change reference to global.h from local to library
+// 05/02/93(brn) - Fix Error message when rename with device on destination
+// 05/12/94(brn) - Fix command abbreviations and version number for 32 bit
+// 04/03/95(sao) - Added progasst package.
+// 05/14/95(sao) - Changed example, added mute option
+// 05/16/95(sao) - Changed exit codes to reflect XOSRTN
+// 18May95 (fpj) - Changed names from progasst.h to proghelp.h, and from
+//                 optusage() to opthelp().
+//--------------------------------------------------------------------------*
+
+//++++
+// This software is in the public domain.  It may be freely copied and used
+// for whatever purpose you see fit, including commerical uses.  Anyone
+// modifying this software may claim ownership of the modifications, but not
+// the complete derived code.  It would be appreciated if the authors were
+// told what this software is being used for, but this is not a requirement.
+
+//   THIS SOFTWARE IS PROVIDED BY THE AUTHORS "AS IS" AND ANY EXPRESS OR
+//   IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
+//   OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+//   IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+//   INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+//   BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS
+//   OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+//   ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR
+//   TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
+//   USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+//----
+
+#include <STDIO.H>
+#include <STDLIB.H>
+#include <STRING.H>
+#include <CTYPE.H>
+#include <XOS.H>
+#include <XOSSVC.H>
+#include <XOSERR.H>
+#include <XOSRTN.H>
+#include <PROGARG.H>
+#include <PROGHELP.H>
+#include <GLOBAL.H>
+#include <XOSstr.h>
+
+#define SIZE 8*1024
+
+#define VERSION 3
+#define EDITNO  2
+
+char copymsg[] = "";
+
+uchar  nulls[] = "";
+uchar *device  = nulls;	/* Poniter to device name */
+uchar *srcpath = nulls;	/* Pointer to source path */
+uchar *dstpath = nulls;	/* Pointer to destination path */
+uchar *srcname = nulls;	/* Pointer to source file name */
+uchar *dstname = nulls;	/* Pointer to destination file name */
+uchar *pnt;		/* Character pointer */
+
+Prog_Info pib;
+int    do_sort = TRUE;
+long   confirm = FALSE;
+long   quiet   = FALSE;
+long   mute    = FALSE;
+long   verbose = FALSE;
+
+int    renwild = FALSE;	/* Flag for wildcard RENAME/MOVE	*/
+
+long   total;		/* Total files processed	*/
+long   seen;		/* Total files seen		*/
+uchar  prefix;
+char   srcspfd;		/* TRUE if source name fully specified in returned */
+			/*    string */
+
+int  get_filespec(char *name);
+
+#define AF(func) (int (*)(arg_data *))func
+
+arg_spec options[] =
+{
+    {"C*ONFIRM", ASF_BOOL|ASF_STORE, NULL, &confirm , TRUE, "Ask for confirmation before taking action."},
+    {"V*ERBOSE", ASF_BOOL|ASF_STORE, NULL, &verbose , TRUE, "Show full file names." },
+    {"Q*UIET"  , ASF_BOOL|ASF_STORE, NULL, &quiet   , TRUE, "Suppress all but error messages."},
+    {"M*UTE"   , ASF_BOOL|ASF_STORE, NULL, &mute    , TRUE, "Suppress all messages."},
+    {"?"       , 0, NULL, AF(opthelp), 0, "This message." },
+    {"H*ELP"   , 0, NULL, AF(opthelp), 0, "This message." },
+    {NULL      , 0, NULL, AF(NULL)    , 0, NULL}
+};
+
+struct				/* Paramters for device information	*/
+{
+    byte4_parm  options;
+    lngstr_parm spec;
+    byte1_parm  attrib;
+    byte4_parm  offset;
+    char        end;
+} parm_ren =
+{
+    {(PAR_SET|REP_HEXV)        , 4, IOPAR_FILOPTN, FO_VOLNAME|FO_PATHNAME|
+            FO_FILENAME},
+    {(PAR_GET|REP_STR)         , 0, IOPAR_FILSPEC, NULL, 0, SIZE, 0},
+    {(PAR_SET|REP_HEXV)        , 1, IOPAR_SRCATTR, A_NORMAL|A_DIRECT},
+    {(PAR_GET|PAR_SET|REP_HEXV), 4, IOPAR_DIROFS , 0},
+    0
+};
+
+type_qab cnfqab =
+{
+    QFNC_WAIT|QFNC_DEVPARM,	// qab_func     - Function
+    0,				// qab_status   - Returned status
+    0,				// qab_error    - Error code
+    0,				// qab_amount   - Number of items processed
+    0,				// qab_handle   - Device handle
+    0,				// qab_vector   - Vector for interrupt
+    0,	        		// qab_level    - Signal level for direct I/O
+    0,  			// qab_prvlevel - Previous signal level (int.)
+    O_REQFILE,			// qab_option   - Options or command
+    0,				// qab_count    - Count
+    NULL, 0,			// qab_buffer1  - Pointer to file spec
+    0, 0,			// qab_buffer2  - Unused
+    &parm_ren, 0		// qab_parm     - Pointer to parameter area
+};
+
+type_qab renqab =
+{
+    QFNC_WAIT|QFNC_RENAME,	// qab_func     - Function
+    0,				// qab_status   - Returned status
+    0,				// qab_error    - Error code
+    0,				// qab_amount   - Number of items processed
+    0,				// qab_handle   - Device handle
+    0,				// qab_vector   - Vector for interrupt
+    0,	        		// qab_level    - Signal level for direct I/O
+    0,  			// qab_prvlevel - Previous signal level (int.)
+    O_REQFILE,			// qab_option   - Options or command
+    0,				// qab_count    - Count
+    NULL, 0,			// qab_buffer1  - Pointer to file spec
+    0, 0,			// qab_buffer2  - Unused
+    &parm_ren, 0		// qab_parm     - Pointer to parameter area
+};
+
+#ifdef MOVE
+  char  prgname[] = "MOVE";
+  char  envname[] = "^XOS^MOVE^OPT";
+  char  description[] = "This command acts like a COPY command which " \
+    "deletes the source file or files.  Move will only work within the " \
+    "same physical device or partition.  It will not, for example, move " \
+    "files from a floppy disk to a hard disk, or between partitions on " \
+    "a hard disk.  MOVE will not accept ellipsis, but will accept other " \
+    "wildcards.";
+#else /* RENAME */
+  char  prgname[] = "RENAME";
+  char  envname[] = "^XOS^RENAME^OPT";
+  char  description[] = "This function is used to change the name of a " \
+    "file without copying or moving it.  Only the files's name and " \
+    "extension can be changed; all other information about the file " \
+    "(date and time stamp, attribute bytes, etc.) remain the same.  " \
+    "Note that hidden, read-only, and system fiels can be renamed.  " \
+    "RENAME does not support ellipsis, but does support other wildcards.";
+#endif
+
+char example[] = "{/option} source_file_spec dest_file_spec";
+
+
+char *source_filespec = NULL;
+char *destination_filespec = NULL;
+
+uchar *getblock(unsigned char *, unsigned char *);
+void   getnames(void);
+void   renmsg(long code);
+void   report(void);
+
+main(argc, argv)
+int   argc;
+char *argv[];
+
+{
+    char *pnt1, *fspec1;
+    char *pnt2, *fspec2;
+    long  rtn;		/* Returned value */
+    long  count;
+    char  chr;
+    char *foo[2];
+    char  strbuf[256];		/* String buffer */
+#ifdef MOVE
+    int   newdir = FALSE;
+#endif
+
+	reg_pib(&pib);
+
+	init_Vars();
+
+    if (argc <= 1)		/* Was something specified?		*/
+	{
+		if ( !mute )
+		fprintf(stderr,"? ERROR %s:  File name parameters must be included\n",prgname);
+		exit(EXIT_INVSWT);
+	}
+
+/*
+ * Process global configuration parameters
+ */
+
+    global_parameter(TRUE);
+
+/*
+ * Process enviroment variable defaults
+ */
+
+    if(svcSysFindEnv(0, envname, NULL, strbuf, sizeof(strbuf), NULL) > 0)
+    {
+	foo[0] = strbuf;
+	foo[1] = '\0';
+    progarg(foo, 0, options, NULL, (int (*)(char *))NULL,
+                (void (*)(char *, char *))NULL, (int (*)(void))NULL, NULL);
+    }
+
+/*
+ * Process command-line options
+ */
+
+    argv++;
+    progarg(argv, 0, options, (arg_spec *)NULL, get_filespec,
+            (void (*)(char *, char *))NULL, (int (*)(void))NULL, NULL);
+
+    if (gcp_dosdrive)
+        parm_ren.options.value = FO_DOSNAME|FO_PATHNAME|FO_FILENAME;
+
+/*
+ * Do actual move operation
+ */
+
+    if (source_filespec == NULL)
+    {
+	if (!mute) fprintf(stderr, "? %s: No source filename specified\n", prgname);
+	exit(EXIT_INVSWT);
+    }
+    if (destination_filespec == NULL)
+    {
+	if (!mute) fprintf(stderr, "? %s: No destination specified\n", prgname);
+	exit(EXIT_INVSWT);
+    }
+
+    parm_ren.spec.buffer = (char *)getspace(SIZE); /* Allocate buffer for returned */
+					     	   /*   text */
+
+
+
+//    pnt1 = destination_filespec;	/* See if have device or path for new */
+
+//    while ((chr=*pnt1++) != '\0')	/*   name and fail if so */
+//    {
+//#ifdef MOVE
+//	if (chr == '/' || chr == '\\')
+//	    newdir = TRUE;
+//        if (chr == ':')
+//        {
+//            if (!mute) fputs("? MOVE: Device cannot be specified for new name - use the\n"
+//                  "          COPY command to move file to a different device\n", stderr);
+//            exit(EXIT_INVSWT);
+//        }
+//#else /* RENAME */
+//        if (chr == ':' || chr == '/' || chr == '\\')
+//        {
+//            if (!mute) fputs("? RENAME: Device or path cannot be specified for new name - use the\n"
+//                  "          MOVE command to rename files to a different directory,\n"
+//		  "          or the COPY command to copy files to a different device\n", stderr);
+//            exit(EXIT_INVSWT);
+//        }
+//#endif
+//    }
+
+//#ifdef MOVE
+//    if (newdir == FALSE)
+//    {
+//	if (!mute) fputs("? MOVE: A new directory path must be specified for the destination, use\n"
+//	      "        the RENAME command to rename files within a directory\n", stderr);
+//	exit(EXIT_INVSWT);
+//    }
+//#endif
+
+
+
+    fspec1 = pnt1 = source_filespec;
+    fspec2 = pnt2 = destination_filespec;
+
+    while ((chr = *pnt1) != '\0')	/* Find beginning of filename in old name */
+    {
+        if (!confirm && (chr == '*' || chr == '?' || chr == '{'))
+	{
+	    renwild = TRUE;
+            renqab.qab_option |= O_REPEAT;	 /* Have wild character! */
+	}
+	if (chr == ':' || chr == '/' || chr == '\\')
+	    fspec1 = pnt1;
+	++pnt1;
+    }
+    if ((chr = *fspec1) == ':' || chr == '/' || chr == '\\')
+	++fspec1;			/* Advance to first character of filename */
+
+    while ((chr = *pnt2) != '\0')
+    {
+	if (chr == ':' || chr == '/' || chr == '\\')
+	    fspec2 = pnt2;
+	++pnt2;
+    }
+    if ((chr = *fspec2) == ':' || chr == '/' || chr == '\\')
+	++fspec2;			/* Advance to first character of filename */
+
+    if (*fspec2 == '\0')
+    {
+	pnt1 = malloc(strlen(fspec1) + strlen(destination_filespec) + 1); /* Get buffer for new spec */
+	strmov(strmov(pnt1, destination_filespec), fspec1);	/* Build complete destination specification */
+	destination_filespec = pnt1;		/* Point to new destination spec */
+    }
+
+    seen = total = 0;
+    cnfqab.qab_buffer1 = renqab.qab_buffer1 = source_filespec;
+    renqab.qab_buffer2 = destination_filespec;
+    for (;;)
+    {
+	if (confirm)
+	{
+        if ((rtn = svcIoQueue(&cnfqab)) < 0 || (rtn = cnfqab.qab_error) < 0)
+	    {
+		if (rtn != ER_FILNF || (total == 0 && seen == 0))
+		{
+		    if (total)
+			report();
+		    renmsg(rtn);
+		}
+		else
+		    break;
+	    }
+	    ++seen;
+	    pnt = (uchar *)parm_ren.spec.buffer;
+#ifdef MOVE
+	    fputs("Move ", stdout);
+#else
+	    fputs("Rename ", stdout);
+#endif
+	    while ((chr = *pnt++) != 0)
+	    {
+		if (chr < 0)
+		    continue;
+		fputc(chr, stdout);
+	    }
+	    fputs(" (y/N/q)?", stdout);
+	    while ((chr = toupper(getch())) != 'Y' && chr != 'N' && chr != 'Q')
+		fputc('\007', stdout);
+	    printf("%c\n", chr);
+	    switch (chr)
+	    {
+		case 'Y':
+		    break;		/* Fall through and move file	*/
+		case 'Q':
+		    if (total)
+			report();	/* Do totals and exit */
+		    exit(EXIT_NORM);
+		case 'N':		/* No - go around and get next name */
+		    continue;
+
+	    }
+	    parm_ren.offset.value -= 1;	/* Move directory position back */
+
+	}
+        rtn    = svcIoQueue(&renqab);
+        pnt    = (uchar *)parm_ren.spec.buffer;
+        prefix = *pnt++;
+        count  = renqab.qab_amount & 0x7FFFFFFFL;
+        total += count;
+
+	if (!quiet)
+	{
+	    while (--count >= 0)
+	    {
+		getnames();
+#ifdef MOVE
+		printf("File %s%s%s moved to %s%s\n", device, srcpath, srcname,
+                    dstpath, dstname);
+#else /* RENAME */
+		printf("File %s%s%s renamed to %s%s\n", device, srcpath, srcname,
+                    dstpath, dstname);
+#endif
+	    }
+	}
+        if (rtn < 0 || (rtn = renqab.qab_error) < 0)	/* If error */
+        {
+            if (rtn != ER_FILNF || total == 0)
+            {
+                if (total)
+                    report();
+                getnames();
+                renmsg(rtn);
+            }
+	    else
+		break;
+        }
+	if (renwild == FALSE)		/* Non-wildcard rename only done once */
+	    break;
+    }
+	report();
+    return (0);
+}
+
+//***************************************************
+// Function: init_Vars - Set up the program information block
+// Returned: none
+//***************************************************
+void init_Vars(void)
+{
+	// set Program Information Block variables
+	pib.opttbl=options; 		// Load the option table
+    pib.kwdtbl=NULL;
+	pib.build=__DATE__;
+	pib.majedt = VERSION; 			// major edit number
+	pib.minedt = EDITNO; 			// minor edit number
+	pib.copymsg=copymsg;
+	pib.prgname=prgname;
+	pib.desc=description;
+	pib.example=example;
+	pib.errno=0;
+	getTrmParms();
+	getHelpClr();
+};
+
+void getnames(void)
+{
+    uchar *tmp;
+
+    for (;;)
+    {
+        tmp = pnt;
+	while (*pnt && *pnt < 0x80)
+	    ++pnt;
+	switch (prefix)
+	{
+	    case FS_XOSNAME:
+            case FS_DOSNAME:
+            case FS_VOLNAME:
+                device = getblock(tmp, pnt);
+		break;
+	    case FS_PATHNAME:
+		srcpath = getblock(tmp, pnt);
+		break;
+	    case FS_FILENAME:
+		srcname = tmp;
+		break;
+	    case FS_NPATHNAME:
+		dstpath = getblock(tmp, pnt);
+		break;
+	    case FS_NFILENAME:
+		dstname = tmp;
+		prefix  = *pnt;
+		*pnt++  = '\0';
+		return;
+        }
+        if ((prefix = *pnt) == '\0')
+            return;
+        *pnt++ = '\0';
+    }
+}
+
+uchar *getblock(str, end)
+uchar *str;
+uchar *end;
+{
+    uchar *rtn;
+    int    size;
+    uchar chr;
+
+    size = (int)(end - str);
+    rtn = end = (uchar *)malloc(size + 2); /* Allocate space */
+    while (--size >= 0)			/* Copy string */
+    {
+        chr = *str++;
+        if (chr == 0xFF)
+        {
+            if (--size >= 0)
+                chr = *str++;
+            else
+                break;
+        }
+        *end++ = chr;
+    }
+    *end = '\0';
+    return (rtn);
+}
+
+/*
+ * Function to report number of files renamed
+ */
+
+void report(void)
+{
+	if ( !mute && !quiet )
+#ifdef MOVE
+    printf("\n%ld file%s moved\n", total, (total==1)? "": "s");
+#else
+    printf("\n%ld file%s renamed\n", total, (total==1)? "": "s");
+#endif
+}
+
+/*
+ * Function to display general fatal error message for rename
+ */
+
+void renmsg(code)
+long  code;
+{
+    static char fmt1[] = "%s\n";
+    static char fmt2[] = "%s%s\n";
+    char buffer[80];		/* Buffer to receive error message */
+
+	if ( mute )
+		exit(EXIT_NORM);
+
+    svcSysErrMsg(code, 3, buffer); /* Get error message */
+    fprintf(stderr, "\n? %s: %s, file ", prgname, buffer);
+					/* Output error message */
+    if (*dstname)			/* Have destination name? */
+        fprintf(stderr, fmt2,  dstpath, dstname); /* Yes */
+    else if (srcspfd)
+        fprintf(stderr, fmt1, destination_filespec);
+    else if (*srcname)			/* No - output source name if have it */
+        fprintf(stderr, fmt2, srcpath, srcname);
+    else
+        fprintf(stderr, fmt1, source_filespec);
+    exit(EXIT_SVCERR);
+}
+
+int get_filespec(
+    char *name)
+
+{
+    if (source_filespec == NULL)
+    {
+	source_filespec = getspace(strlen(name) + 1);
+	strcpy(source_filespec, name);
+	return (TRUE);
+    }
+    if (destination_filespec != NULL)
+    {
+        if (!mute) fprintf(stderr, "? %s: Syntax error, too many filenames specified\n",
+                prgname);
+        exit(EXIT_INVSWT);
+    }
+    destination_filespec = getspace(strlen(name) + 1);
+    strcpy(destination_filespec, name);
+    return (TRUE);
+}

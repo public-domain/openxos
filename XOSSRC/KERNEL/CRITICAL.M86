@@ -1,0 +1,262 @@
+	.TITLE	CRITICAL - User critical region scheduling routines
+
+;++++
+; This software is in the public domain.  It may be freely copied and used
+; for whatever purpose you see fit, including commerical uses.  Anyone
+; modifying this software may claim ownership of the modifications, but not
+; the complete derived code.  It would be appreciated if the authors were
+; told what this software is being used for, but this is not a requirement.
+
+;   THIS SOFTWARE IS PROVIDED BY THE AUTHORS "AS IS" AND ANY EXPRESS OR
+;   IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
+;   OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+;   IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+;   INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+;   BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS
+;   OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+;   ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR
+;   TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
+;   USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+;----
+
+	.PROC	80486
+	.INCLUD	XOSINC:\XMAC\XOS.PAR
+	.INCLUD	XOSINC:\XMAC\XOSX.PAR
+	.INCLUD	XOSINC:\XMAC\XOSERR.PAR
+	.INCLUD	XOSINC:\XMAC\XOSDOS.PAR
+	.INCLUD	XOSINC:\XMAC\XOSXTRM.PAR
+	.INCLUD	XOSINC:\XMAC\PCAT.PAR
+
+	CODE
+
+;This module implements the user critical region scheduling system calls.
+;  These calls are intended to be used with the following user mode code to
+;  implement an efficient critical region scheduling mechanism.
+
+;Each critcal region must have a single key in a shared data section.  The key
+;  contains 16 bytes used as follows:
+;      Name    Offset Size       Use
+;    lck_bits     0     1    Flag bits
+;                 1     1    Reserved
+;    lck_signal   2     2    Interrupt numer
+;    lck_timeout  4     4    Time-out value
+;    lck_head     8     4    Process ID for first process waiting
+;    lck_tail    12     4    Process ID for last process waiting
+;  The structure should be long aligned.  Only the flag bits should be modified
+;  by a user process during operation.  The time-out field should be initialized
+;  by the first process which intializes the key structure and not modified
+;  after that.  The process ID fields MUST NOT BE modified by any user process.
+
+;WARNING: The operation of this call can be affected by other processes which
+;	  modify the key structure incorrectly!  Other than the provision for
+;	  a time-out, there is no protection from deadlock conditions.  In
+;	  partictular, there is no protection from a process attempting to
+;	  lock a critical region when it already has it locked.  There is also
+;	  no protection for the classic double critical region scernerio.
+;	  There are no restrictions on locking multiple critical regions.  If
+;	  the process which owns a critical region terminates without giving
+;	  up the critical region, the critical section will NOT be released.
+;	  If the memory containing the key is deallocated, any processe trying
+;	  to access the key will incure a page or segment fault error.
+
+;  The system is fully protected from damage by incorrect use of this call,
+;  except for incorrect operation of the partictular critical region affected.
+
+;  The design of this call purposely trades off protection for speed!  It is
+;  designed to be very fast in the usual case where where is no contention
+;  for the critical region.  System calls are only made when absolutely
+;  necesary when there is contention for the critical region.
+
+;The following code begins a critical region:
+
+;	BTSL	key+lck_bits, #LCK%BUSY
+;	JC	waitbusy.S
+;	CMPL	key+lck_head, #0.B
+;	JNC	havecrit.S
+;	PUSHL	#!key
+;	PUSHL	#key
+;	CALLF	svcSchCritWaitR##
+;	JMP	havelock.S
+
+;waitbusy:
+;	PUSHL	#!key
+;	PUSHL	#key
+;	CALLF	svcSchCritWaitB##
+;havecrit:
+
+;The following code ends a critical region:
+
+;	ANDL	key+lck_bits, #LCK$BUSY.B
+;	CMPL	key+lck_head, #0.B
+;	JE	critdone.S
+;	PUSHL	#!key
+;	PUSHL	#key
+;	CALLF	svcSchCritDone##
+;critdone:
+
+;Note that the svcSchCritWaitR and svcSchCritWaitB calls modify the argument
+;  if they must wait.  The segment part of the address is set to -1 as a
+;  flag and the offset part is set to the system tick value for the time-out.
+;  This allows the timeout to work correctly if the call is interrupted.
+.PAGE
+	.SBTTL	svcSchCritWaitR - SVC to wait for requested critical region
+
+;Here for the svcSchCritWaitB system call - Wait for requested critical region.
+
+;  This function is called when the LCK$BUSY bit is not set but there is one
+;  or more processes waiting for access to the critical region.  It returns
+;  (with the LCK$BUSY bit set) when the  critical region is given to the caller.
+;  The wait is interruptable.  This should only occure when a request sneaks in
+;  between the clearing of the LCK$BUSY bit and the call to svcSchCritDone.
+;  released.
+
+;	CRITKEY *key;			// Critical region key item
+;	svcSchCritWaitR(keyitem);
+;  Value returned is always 0.
+
+rsvcSchCritWaitR::
+	MOVL	EBP, #pdaArg2#
+	CALL	vfixaddr#
+	JMP	2$.S
+
+psvcSchCritWaitR::
+	SVCENTR	CNTSchCritWaitR#
+	ORB	SS:pdaArg1#, #03
+	IFFAULT	lckae
+2$:	LESL	EBX, SS:pdaArg2#	;Get address of the key
+	IFFAULT	lckae
+	CMPL	ES:lck_head.B[EBX], #0.B ;Is it really being requested now?
+	JE	20$			;No - false alarm!
+	IFFAULT	lckae
+	ORB	ES:[EBX], #LCK$BUSY	;Yes - set the busy bit
+	JMP	6$.S			;Continue
+
+	.SBTTL	svcSchCritWaitB - SVC to wait for busy critical region
+
+;Here for the svcSchCritWaitB system call - Wait for busy critical region.
+;  This function is called when the LCK$BUSY bit is found set in the key item
+;  for a critical region.  It returns (with the LCK$BUSY bit still set) when
+;  the critical region is given to the caller.  The wait is interruptable
+
+;	long	keyitem;		// Critical region key item
+;	svcSchCritWaitB(&keyitem);
+;  Value returned is always 0.
+
+rsvcSchCritWaitB::
+	MOVL	EBP, #pdaArg2#
+	CALL	vfixaddr#
+	JMP	4$.S
+
+psvcSchCritWaitB::
+	SVCENTR	CNTSchCritWaitB#
+	ORB	SS:pdaArg1#, #03
+	IFFAULT	lckae
+4$:	LESL	EBX, SS:pdaArg2#	;Get address of the key
+	BTSL	ES:[EBX], #LCK%BUSY	;Is it really busy now?
+	JNC	20$.S			;No - false alarm!
+	IFFAULT	lckae
+6$:	MOVL	EDX, ES:lck_tail.B[EBX]	;Yes - get tail process
+	TESTL	EDX, EDX
+	JNE	8$.S
+	MOVL	EAX, SS:pdaPid#		;Get our process ID
+	IFFAULT	lckae
+	MOVL	ES:lck_head.B[EBX], EAX
+	JMP	10$.S
+
+;Here if someone is now waiting
+
+8$:	MOVZWL	ECX, DX
+	CMPL	ECX, knlProcHigh#	;Valid process?
+	JA	lckerr.S		;No
+	MOVZWL	ECX, knlProcTable#[ECX*2] ;Yes - get the PDA selector
+	CMPL	ECX, #10h		;Really a selector?
+	JBE	lckerr.S		;No
+	MOVL	FS, ECX
+	CMPL	FS:pdaMagic#, #PDA_MAGIC ;Really a PDA?
+	JNE	lckerr.S		;No!
+	CMPL	FS:pdaPid#, EDX		;Still the right one?
+	JNE	lckerr.S		;No!
+	CMPW	FS:pdaCritNext#, #0.B	;Yes - is it at the end of a lock list?
+	JNE	lckerr.S		;No!
+	MOVW	FS:pdaCritNext#, SS	;Yes - link us to the end of the list
+10$:	MOVL	ES:lck_tail.B[EBX], EAX
+
+;SET UP TIME-OUT HERE
+
+20$:	CLRL	EAX			;Return 0
+	RET
+
+;Here if have address error when accessing the key
+
+lckae:	CRASH	????
+
+;Here if lock data is inconsistant
+
+lckerr:	CRASH	????
+
+.PAGE
+	.SBTTL	svcSchCritDone - SVC to release critical region
+
+;Here for the svcSchCritdone system call - Release critical region.  This
+;  function is called when the LCK$REQ bit is found set when releasing a
+;  critical region.  It wakes up the first process waiting for the critical
+;  region.
+
+;	long	keyitem;		// Critical region key item
+;	svcSchCritDone(&keyitem);
+;  Value returned is always 0.
+
+rsvcSchCritDone::
+	MOVL	EBP, #pdaArg2#
+	CALL	vfixaddr#
+	JMP	2$.S
+
+psvcSchCritDone::
+	SVCENTR	CNTSchCritDone#
+	ORB	SS:pdaArg1#, #03
+	IFFAULT	lckae
+2$:	LESL	EBX, SS:pdaArg2#	;Get address of the key
+	IFFAULT	lckae
+	MOVL	EDX, ES:lck_head.B[EBX]	;Really have someone waiting?
+	TESTL	EDX, EDX
+	JE	20$.S			;No - false alarm!
+	MOVZWL	ECX, DX
+	CMPL	ECX, knlProcHigh#	;Valid process?
+	JA	lckerr.S		;No
+	MOVZWL	ECX, knlProcTable#[ECX*2] ;Yes - get the PDA selector
+	CMPL	ECX, #10h		;Really a selector?
+	JBE	lckerr.S		;No
+	MOVL	FS, ECX
+	CMPL	FS:pdaMagic#, #PDA_MAGIC ;Really a PDA?
+4$:	JNE	lckerr			;No!
+	CMPL	FS:pdaPid#, EDX		;Still the right one?
+	JNE	4$.S			;No!
+	MOVZWL	EAX, FS:pdaCritNext#	;Yes
+	CMPL	EAX, #0FFFFh		;Is it in a lock list?
+	JE	lckerr			;No!
+	TESTL	EAX, EAX		;Yes - last one?
+	JNE	6$.S			;No
+	IFFAULT	lckae
+	MOVL	ES:lck_tail.B[EBX], EAX
+	JMP	8$.S
+
+6$:	MOVL	GS, EAX
+	CMPL	GS:pdaMagic#, #PDA_MAGIC ;Really a PDA?
+	JNE	4$.S			;No!
+	MOVL	EAX, GS:pdaPid#		;Yes
+	IFFAULT	lckae
+8$:	MOVL	ES:lck_head.B[EBX], EAX
+
+
+
+
+
+
+20$:	CLRL	EAX
+	RET
+
+
+
+
+
+	END

@@ -1,0 +1,584 @@
+	.TITLE	ONCECON - Minimum console device driver for XOS
+
+;++++
+; This software is in the public domain.  It may be freely copied and used
+; for whatever purpose you see fit, including commerical uses.  Anyone
+; modifying this software may claim ownership of the modifications, but not
+; the complete derived code.  It would be appreciated if the authors were
+; told what this software is being used for, but this is not a requirement.
+
+;   THIS SOFTWARE IS PROVIDED BY THE AUTHORS "AS IS" AND ANY EXPRESS OR
+;   IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
+;   OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+;   IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+;   INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+;   BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS
+;   OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+;   ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR
+;   TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
+;   USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+;----
+
+;This module is the initial resident console driver.  It provides a minimum
+;  level of console support during system startup.  It must be superceeded by
+;  a full console driver for the particular display being used (Monochrome,
+;  EGA, VGA, etc.).  Since this module is loaded entirely in the once-only 
+;  psect, it will go away completely at the end of the once-only phase.  This
+;  driver is implemented as a complete stand-alone device.  It does not use
+;  any of the console driver routines.  This driver operates the display in
+;  80x25 text mode (the mode the real mode code leaves it in).  The ONLY
+;  control characters supported are CR and LF.  All other characters are
+;  displayed.  There are no provisions for changing any display attributes.
+;  Keyboard support is restricted to detecting that the ENTER key was typed.
+;  No real keyboard input is done.  All keys except ENTER are ignored, ENTER
+;  causes a LF character to be input.  This is intended to provide the absolute
+;  minimum support required for the once-only code only!  Keyboard input is not
+;  scheduled.  When a program asks for keyboard input, this driver will wait in
+;  a CPU loop in exec mode (main program level, interrupts and forks are
+;  allowed) until a key is typed!!
+
+	.PROC	80486
+	.INCLUD	XOSINC:\XMAC\XOS.PAR
+	.INCLUD	XOSINC:\XMAC\XOSX.PAR
+	.INCLUD	XOSINC:\XMAC\XOSERR.PAR
+	.INCLUD	XOSINC:\XMAC\XOSTRM.PAR
+	.INCLUD	XOSINC:\XMAC\XOSXTRM.PAR
+	.INCLUD	XOSINC:\XMAC\XOSDOS.PAR
+	.INCLUD	XOSINC:\XMAC\PCAT.PAR
+
+;Define offsets in the OOCD DCB
+
+$$$=!4
+BLK dcb_oocdline , 4t		;Current line number
+BLK dcb_oocdcol  , 4t		;Current column number
+BLK dcb_oocdkbsts, 1t		;Keyboard status
+BLK              , 3t
+BLK dcb_oocdkbput, 4t		;Keyboard ring buffer putter pointer
+BLK dcb_oocdkbtak, 4t		;Keyboard ring buffer taker pointer
+BLK dcb_oocdkbcnt, 4t		;Keyboard ring buffer count
+BLK dcb_oocdkbend, 4t		;Offset of end of keyboard ring buffer
+BLK dcb_oocdkbbfr, 50t		;Keyboard ring buffer
+dcb_oocdSIZE=!$$$
+
+;Define values for dcb_oocdkbsts
+
+OOCDKB$CTL=!02h			;Control key is pressed
+OOCDKB$ALT=!01h			;Alt key is pressed
+
+$$$=oocddata
+GBK oocddcb, dcb_oocdSIZE
+BLK oocdccb, ccb_SIZE
+
+	ONCE
+
+;SVC dispatch table for OOCD device
+
+oocddsp:.LONG	knlRtnZero#	;sd_mount	=  0. - Mount
+	.LONG	knlRtnZero#	;sd_cleardev	=  4. - Clear device
+	.LONG	knlRtnZero#	;sd_cleardcb	=  8. - Clear DCB
+	.LONG	knlRtnZero#	;sd_commit	= 12. - Commit data to disk
+	.LONG	knlRtnZero#	;sd_transold    = 16. - Transfer device/old
+	.LONG	knlRtnZero#	;sd_transnew    = 20. - Transfer device/new
+	.LONG	knlRtnZero#	;sd_opena	= 24. - Open additional
+	.LONG	knlRtnZero#	;sd_open1	= 28. - Open device/file
+	.LONG	knlRtnZero#	;sd_devparm     = 32. - Device parameters
+	.LONG	knlIFnDev#	;sd_delete	= 36. - Delete file
+	.LONG	knlIFnDev#	;sd_rename	= 40. - Rename file
+	.LONG	oocdinpblk	;sd_inblock	= 44. - Input block
+	.LONG	oocdoutblk	;sd_outblock	= 48. - Output block
+	.LONG	knlIllOut#	;sd_outblockq	= 52. - Output block (XFF)
+	.LONG	oocdoutstr	;sd_outstring	= 56. - Output string
+	.LONG	knlRtnZero#	;sd_getiosts	= 60. - Get input/output status
+	.LONG	knlIFnDevGQ#	;sd_special     = 64. - Special device function
+	.LONG	oocdclose	;sd_close	= 68. - Close file
+	.LONG	knlNullLabel#	;sd_getlabel    = 72. - Get device label
+	.LONG	knlNullQioGQ#	;sd_commitfunc	= 76. - Commit data to disk
+	.LONG	knlInfoNone#	;sd_devinfo     = 80. - Get device info
+
+
+	.LONG	PARMIOMAX
+oocdioparms::
+	.LONG	oocdiogenparms	;IOPAR_xxxxxx = 00xx - Generic IO parameters
+	.LONG	knlNullFilParms#;IOPAR_FILxxx = 01xx - File system IO parameters
+	.LONG	knlNullTrmParms#;IOPAR_TRMxxx = 02xx - Terminal IO parameters
+PARMIOMAX=!{$-oocdioparms}/4
+
+	.LONG	PARMIOGENMAX	;Size of table
+oocdiogenparms:
+	.LONG	0
+	.LONG	knlIoxFilOptn#	;IOPAR_FILOPTN     = 0001h
+	.LONG	knlIoxFilSpec#	;IOPAR_FILSPEC     = 0002h
+	.LONG	knlIopDevSts#	;IOPAR_DEVSTS      = 0003h
+	.LONG	knlIopUnitNum#	;IOPAR_UNITNUM     = 0004h
+	.LONG	knlIopGlbId#	;IOPAR_GLBID       = 0005h
+	.LONG	0		;IOPAR_DELAY       = 0006h
+	.LONG	0		;IOPAR_TIMEOUT	   = 0007h
+	.LONG	0		;IOPAR_INPSTS      = 0008h
+	.LONG	0		;IOPAR_OUTSTS	   = 0009h
+	.LONG	0		;IOPAR_INPQLMT	   = 000Ah
+	.LONG	0		;IOPAR_OUTQLMT	   = 000Bh
+	.LONG	0		;IOPAR_SIVECT1     = 000Ch
+	.LONG	0		;IOPAR_SIVECT2     = 000Dh
+	.LONG	0		;IOPAR_SIDATA      = 000Eh
+	.LONG	knlIopNumOpen#	;IOPAR_NUMOPEN     = 000Fh
+	.LONG	0		;IOPAR_BUFRLMT	   = 0010h
+PARMIOGENMAX=!{$-oocdiogenparms}/4
+.PAGE
+	.SBTTL	oocdinit - Once-only console device initialization routine
+
+;@@@@@@@ IOPAUSE
+; Relacement for IOPAUSE macro using knlSDelay.
+;
+; Notes:
+;  1) IOPAUSE uses old ISA 'trick' to delay 0.5 to 1.0 uS.
+;     This is not sufficient (nor works properly) with many new
+;     busses / architectures.
+;  2) The Keyboard controller is especially sensitive to back to back
+;     I/O operations. (uController based...)
+;  3) knlSDelay is overkill - delay granularity is approximately 10 uS
+;  4) Could implement the delay based on knlDelFactor inline. Since
+;     most modern Pentimum+ machines have factor 500+, 1 uS granularity
+;     could be 'safely' implemented by dividing the SDelay loop count
+;     by 10. This could even be determined run-time to support slow
+;     machines...
+;
+.IF EQ 1
+	;
+	; Use original definition
+	;
+	.MACRO IOPAUSEKBD
+	 IOPAUSE
+	.ENDM
+.IFF
+	.MACRO IOPAUSEKBD
+
+	pushl	ecx
+	movl	ecx, #1
+	call	knlSDelay#
+	popl	ecx
+
+	.ENDM
+.ENDC
+
+
+;Once-only console device initialization routine
+;	c(AL) = Initial cursor column
+;	c(AH) = Initial cursor line
+;	CALL	oocdinit
+
+oocdinit::
+	PUSHL	EAX			;Save cursor position
+	MOVL	EDI, #oocdchk		;Install our class
+	CLRL	EBX
+	MOVL	EAX, #'OOCD'
+	CLRL	EDX
+	CLRL	ECX
+	MOVL	ESI, #oocdccb
+	CALL	knlNewClass#
+	JC	4$.S
+	MOVL	EDI, #oocddcb		;Set up our single DCB
+	MOVL	dcb_name+0.B[EDI], #'OOCD'
+	MOVL	dcb_name+4.B[EDI], #'0'
+	MOVL	dcb_dsp.B[EDI],#DS$PHYS|DS$CONTROL|DS$UNBFRD|DS$DUPLEX|-
+			DS$DIN|DS$DOUT
+	MOVL	dcb_sdisp.B[EDI], #oocddsp
+	DECL	dcb_fnext.B[EDI]
+	MOVL	ESI, #oocdccb
+	CALL	knlLinkDcb#
+	JC	4$.S
+	POPL	EAX			;Restore cursor position
+	MOVB	dcb_oocdcol.B[EDI], AL
+	MOVB	dcb_oocdline.B[EDI], AH
+
+	MOVL	EDX, #P_EGAGCINDX
+	MOVB	AL, #06h
+	OUTB	[DX]
+	IOPAUSE
+	INCL	EDX
+	MOVB	AL, #06h
+	OUTB	[DX]
+	MOVL	EBX, #ookbint
+	MOVL	ECX, #1<3t
+	MOVB	AL, #DT_INT+PL_0	;Set up our interrupt vector
+	CALL	setirqs#
+	LEAL	EAX, dcb_oocdkbbfr.B[EDI] ;Set up the keyboard input buffer
+	MOVL	dcb_oocdkbput.B[EDI], EAX
+	MOVL	dcb_oocdkbtak.B[EDI], EAX
+	ADDL	EAX, #50t.B
+	MOVL	dcb_oocdkbend.B[EDI], EAX
+	INB	P_INC1P1		;Enable keyboard interrupt
+	IOPAUSE
+	ANDB	AL, #~02h
+	OUTB	P_INC1P1
+	RET
+
+;Here if error setting up the device (this should not happen!)
+
+4$:	CRASH	CICD
+.PAGE
+	.SBTTL	oocdchk - Device check routine for OOCD device
+
+;Device check routine for OOCD class device
+;	c{SS:EBX} = Address of device name (16 bytes)
+;	CALL	oocdchk
+;	C:set = Error (match found)
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  Z:set = Match found
+;	    c{EDI} = Offset of DCB
+;	  Z:clr = Not found
+;  EBX and ESI are preserved
+
+oocdchk:CMPL	SS:[EBX], #'OOCD'	;Is this OOCD0?
+	JNE	2$.S			;No
+	CMPB	SS:4.B[EBX], #'0'.B	;Maybe
+	JNE	2$.S			;No
+	MOVL	EDI, #oocddcb		;Yes - point to our DCB
+	RET				;Return with Z set
+
+;Here if not OORD0, return with Z and C clear
+
+2$:	CLC
+	RET
+.PAGE
+	.SBTTL	sd_close - Close device
+
+;Here for the close entry
+;	c{EDI} = Offset of DCB
+;	c{ESI} = Offset of IORB
+;	CALL	oocdclose
+
+oocdclose:
+	CMPL	dcb_opencnt.B[EDI], #1.B ;Is this the last close?
+	JNE	4$.S			;No
+	PUSHL	ESI			;Yes
+	MOVZWL	EAX, dcb_id.B[EDI]	;Give up the DCB's global ID
+	CALL	knlGiveDcbId#
+	MOVL	ESI, #oocdccb		;Remove the device class
+	CALL	knlRmvClass#
+	POPL	ESI
+4$:	JMP	knlNullClose#
+
+.PAGE
+	.SBTTL	sd_inpblock - Input block
+
+;Here for the input block entry
+;	c{EDI} = Offset of DCB
+;	c{ESI} = Offset of IORB
+;	CALL	oocdinpblk
+;	C:set = Error
+;	  c{EAX} = Error code
+;	  c{EBX} = Status bits
+;	  c{ECX} = Amount output
+;	C:clr = Normal
+;	  c{EBX} = Status bits
+;	  c{ECX} = Amount output
+
+oocdinpblk:
+	PUSHL	iorb_count.B[ESI]
+	PUSHL	iorb_buffer1+4.B[ESI]
+	PUSHL	iorb_buffer1+0.B[ESI]
+	PUSHL	iorb_parm+4.B[ESI]
+	PUSHL	iorb_parm+0.B[ESI]
+	CALL	knlGiveIorb#
+	POPL	EDX
+	POPL	EAX
+	TESTL	EDX, EDX
+	JE	2$.S
+	MOVL	FS, EAX
+	MOVL	EBX, #oocdioparms	;Process the parameters
+	MOVL	ECX, #knlComDPParms#
+	CALL	knlProcDevParm#
+	JC	14$.S
+2$:	POPL	EBX
+	POPL	EAX
+	POPL	ECX
+	JREGZ	ECX, 10$
+	MOVL	ES, EAX
+	CLI
+	LEAL	EAX, dcb_oocdkbbfr.B[EDI] ;Clear the keyboard input buffer
+	MOVL	dcb_oocdkbput.B[EDI], EAX
+	MOVL	dcb_oocdkbtak.B[EDI], EAX
+	CLRL	EAX
+	MOVL	dcb_oocdkbcnt.B[EDI], EAX
+	STI
+
+4$:	CMPL	dcb_oocdkbcnt.B[EDI], #0.B ;Have anything from the keyboard?
+	JE	4$.S			;No - wait until we do!
+	MOVL	EDX, dcb_oocdkbtak.B[EDI] ;Yes - get taker pointer
+	MOVB	AL, [EDX]		;Get scan code
+	INCL	EDX			;Bump pointer
+	CMPL	EDX, dcb_oocdkbend.B[EDI] ;Check for wrap-around
+	JB	6$.S
+	LEAL	EDX, dcb_oocdkbbfr.B[EDI]
+6$:	MOVL	dcb_oocdkbtak.B[EDI], EDX
+	DECL	dcb_oocdkbcnt.B[EDI]
+	CMPB	AL, #37
+	JNE	8$.S
+sysint_key_oo::
+	INT3
+	JMP	4$.S
+
+8$:	CMPB	AL, #1Ch		;Is it an enter?
+	JNE	4$.S			;No - ignore it!
+	MOVB	ES:[EBX], #LF		;Yes - give him a LF!
+	MOVL	ECX, #1
+10$:	CLRL	EAX
+12$:	MOVL	EBX, #QSTS$DONE
+	TOFORK
+	RET
+
+14$:	POPL	ECX
+	POPL	ECX
+	CLRL	ECX
+	JMP	12$.S
+.PAGE
+	.SBTTL	sd_outstring - Output string
+
+;Here for the output string entry
+;	c{EDI} = Offset of DCB
+;	c{ESI} = Offset of IORB
+;	CALL	oocdoutstr
+;	C:set = Error
+;	  c{EAX} = Error code
+;	  c{EBX} = Status bits
+;	  c{ECX} = Amount output
+;	C:clr = Normal
+;	  c{EBX} = Status bits
+;	  c{ECX} = Amount output
+
+oocdoutstr:
+	CALL	knlIoStringLock#	;Lock the string (we don't really need
+	JC	10$.S			;  to lock it, but this is a convient
+					;  way to get the length of the string!
+					;Fall into the outblock routine
+
+	.SBTTL	sd_outblock - Output block
+
+;Here for the output block entry (note that if a count of -1 is specified, no
+;  output is done and the current cursor position is returned in qab_amount
+;  as column + line*256)
+;	c{EDI} = Offset of DCB
+;	c{ESI} = Offset of IORB
+;	c{ECX} = IO command bits
+;	CALL	oocdoutblk
+;	C:set = Error
+;	  c{EAX} = Error code
+;	  c{EBX} = Status bits
+;	  c{ECX} = Amount output
+;	C:clr = Normal
+;	  c{EBX} = Status bits
+;	  c{ECX} = Amount output
+
+oocdoutblk:
+	PUSHL	iorb_count.B[ESI]
+	PUSHL	iorb_buffer1+4.B[ESI]
+	PUSHL	iorb_buffer1+0.B[ESI]
+	PUSHL	iorb_parm+4.B[ESI]
+	PUSHL	iorb_parm+0.B[ESI]
+	CALL	knlGiveIorb#
+	POPL	EDX
+	POPL	EAX
+	TESTL	EDX, EDX
+	JE	2$.S
+	MOVL	FS, EAX
+	MOVL	EBX, #oocdioparms	;Process the parameters
+	MOVL	ECX, #knlComDPParms#
+	CALL	knlProcDevParm#
+	JC	12$.S
+2$:	POPL	EBX
+	POPL	EAX
+	POPL	ECX
+	JREGZ	ECX, 6$
+	CMPL	ECX, #-1.B
+	JE	14$.S
+	MOVL	FS, EAX
+	PUSHL	#GS_DISPLAY.B
+	POPL	ES
+	PUSHL	ECX
+4$:	MOVB	AL, FS:[EBX]
+	INCL	EBX
+	CALL	oocddispchr
+	LOOP	ECX, 4$
+	POPL	ECX
+6$:	CLRL	EAX
+8$:	MOVL	EBX, #QSTS$DONE
+10$:	TOFORK
+	RET
+
+12$:	POPL	ECX
+	POPL	ECX
+	CLRL	ECX
+	JMP	8$.S
+
+;Here if count is -1 - just return the cursor position
+
+14$:	MOVL	ECX, dcb_oocdcol.B[EDI]
+	MOVB	CH, dcb_oocdline.B[EDI]
+	JMP	6$.S
+.PAGE
+oocddispchr::
+	CMPB	AL, #CR
+	JE	10$.S
+	CMPB	AL, #LF
+	JE	12$.S
+	CMPL	dcb_oocdcol.B[EDI], #80t.B
+	JB	6$.S
+	PUSHL	EAX
+	MOVB	AL, #CR
+	CALL	oocddispchr
+	MOVB	AL, #LF
+	CALL	oocddispchr
+	POPL	EAX
+6$:	MOVL	EDX, dcb_oocdline.B[EDI]
+	IMULL	EDX, #80t.B
+	ADDL	EDX, dcb_oocdcol.B[EDI]
+	ADDL	EDX, EDX
+	MOVB	AH, #07h
+	MOVW	ES:[EDX], AX
+	INCL	dcb_oocdcol.B[EDI]
+	JMP	16$.S
+
+;Here on CR
+
+10$:	MOVB	dcb_oocdcol.B[EDI], #0
+	JMP	16$.S
+
+;Here on LF
+
+12$:	CMPB	dcb_oocdline.B[EDI], #24t
+	JB	14$.S
+	PUSHL	EDI
+	PUSHL	ECX
+	CLRL	EDI
+	MOVL	ESI, #160t
+	CLD
+	MOVL	ECX, #40t*24t
+	RMOVSL	[EDI], ES:[ESI]
+	MOVL	EAX, #07200720h
+	MOVL	ECX, #40t
+	RSTOSL	[EDI]
+	POPL	ECX
+	POPL	EDI
+	JMP	16$.S
+
+14$:	INCB	dcb_oocdline.B[EDI]
+16$:	PUSHL	ECX			;Save count
+	MOVL	ECX, dcb_oocdline.B[EDI] ;Calculate character offset
+	IMULL	ECX, #80t.B
+	ADDL	ECX, dcb_oocdcol.B[EDI]
+	MOVL	EDX, #P_EGACCRTINDX	;Update hardware state
+	MOVB	AL, #15t		;Point to cursor register in CRTC
+	OUTB	[DX]
+	IOPAUSE
+	INCL	EDX
+	MOVB	AL, CL
+	OUTB	[DX]
+	IOPAUSE
+	DECL	EDX
+	MOVB	AL, #14t
+	OUTB	[DX]
+	IOPAUSE
+	INCL	EDX
+	MOVB	AL, CH
+	OUTB	[DX]
+	CLC				;Make sure C is clear
+	POPL	ECX			;Restore count
+	RET				;And return
+.PAGE
+	.SBTTL	ookbint - Keyboard interrupt routine
+
+;Keyboard interrupt routine
+
+ookbint::
+	PUSHAL				;Save general registers
+	PUSHL	DS			;Save segment regsiters
+	PUSHL	ES
+	PUSHL	FS
+	PUSHL	GS
+	PUSHL	#GS_DATA.B		;Make normal data addressable
+	POPL	DS
+	MOVL	EDI, #oocddcb
+	MOVL	ECX, #10000h
+2$:	INB	P_KEYSTS		;Have anything from the keyboard?
+	 IOPAUSEKBD			;@@@ CEY
+	ANDB	AL, #1
+	LOOPE	ECX, 2$
+	JE	10$.S			;No - false alarm!
+
+	INB	P_KEYDATA		;Get keyboard code
+	 IOPAUSEKBD			;@@@ CEY
+
+	CMPB	AL, #54h		;Is this the GECKO escape key?
+	JE	12$.S			;Yes
+	CMPB	AL, #0E0h		;Is this the prefix code?
+	JE	2$.S			;Yes - ignore it
+	CMPB	AL, #1Dh		;Is this the make of a control key?
+	JE	ctlmak.S		;Yes
+	CMPB	AL, #9Dh		;Is this the break of a control key?
+	JE	ctlbrk.S		;Yes
+	CMPB	AL, #38h		;Is this the make of an alt key?
+	JE	altmak.S		;Yes
+	CMPB	AL, #0B8h		;Is this the break of an alt key?
+	JE	altbrk.S		;Yes
+	CMPB	AL, #53h		;Is this a DEL key?
+	JE	delkey.S		;Yes
+4$:	CMPB	dcb_oocdkbcnt.B[EDI], #50t ;No - room for more in the keyboard
+					   ;  interrupt ring buffer?
+	JA	8$.S			;No - forget it!
+	MOVL	EBX, dcb_oocdkbput.B[EDI] ;Yes - get putter pointer
+	MOVB	[EBX], AL		;Store code in ring
+	INCL	EBX			;Bump pointer
+	CMPL	EBX, dcb_oocdkbend.B[EDI] ;Past end of ring?
+	JB	6$.S			;No
+	LEAL	EBX, dcb_oocdkbbfr.B[EDI] ;Yes - reset pointer
+6$:	MOVL	dcb_oocdkbput.B[EDI], EBX ;Update pointer
+	INCL	dcb_oocdkbcnt.B[EDI]	;Bump count
+8$:	CLI
+	MOVB	AL, #INT_EOI		;Release interrupt controller
+	OUTB	P_INC1P0
+	JMP	knlDismissInt2#		;Check for scheduling and dismiss
+
+;Here if have interrupt without an input character - This sometimes happens on
+;  some machines after startup.  We read the input register anyway to make sure
+;  the state of the keyboard interface is OK and just discard what we get!
+
+10$:	INB	P_KEYDATA
+	 IOPAUSEKBD			;@@@ CEY
+	JMP	8$.S
+
+;Here if have GECKO escape key
+
+12$:	CMPL	102Ch, #'GECKO$'	;Is GECKO loaded?
+	JNE	4$.S			;No - this is not special
+oo_sysint_key::
+	INT3				;Invoke GECKO
+	JMP	8$.S			;Dismiss this interrupt
+
+;Here if have make of a control key
+
+ctlmak:	ORB	dcb_oocdkbsts.B[EDI], #OOCDKB$CTL
+	JMP	8$.S
+
+;Here if have break of a contorl key
+
+ctlbrk:	ANDB	dcb_oocdkbsts.B[EDI], #~OOCDKB$CTL
+	JMP	8$.S
+
+;Here if have make of an alt key
+
+altmak:	ORB	dcb_oocdkbsts.B[EDI], #OOCDKB$ALT
+	JMP	8$.S
+
+;Here if have break of an alt key
+
+altbrk:	ANDB	dcb_oocdkbsts.B[EDI], #~OOCDKB$ALT
+	JMP	8$.S
+
+;Here if have a DEL key
+
+delkey:	CMPB	dcb_oocdkbsts.B[EDI], #OOCDKB$CTL|OOCDKB$ALT
+	JNE	4$.S
+	JMP	knlReboot#
+
+	END

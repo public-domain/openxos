@@ -1,0 +1,972 @@
+	.TITLE	LCLFILE - Local file system routines for XOS
+
+;++++
+; This software is in the public domain.  It may be freely copied and used
+; for whatever purpose you see fit, including commerical uses.  Anyone
+; modifying this software may claim ownership of the modifications, but not
+; the complete derived code.  It would be appreciated if the authors were
+; told what this software is being used for, but this is not a requirement.
+
+;   THIS SOFTWARE IS PROVIDED BY THE AUTHORS "AS IS" AND ANY EXPRESS OR
+;   IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
+;   OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+;   IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+;   INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+;   BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS
+;   OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+;   ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR
+;   TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
+;   USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+;----
+
+	.PROC	80486
+	.INCLUD	XOSINC:\XMAC\XOS.PAR
+	.INCLUD	XOSINC:\XMAC\XOSX.PAR
+	.INCLUD	XOSINC:\XMAC\XOSDISK.PAR
+	.INCLUD	XOSINC:\XMAC\XOSXDISK.PAR
+	.INCLUD	XOSINC:\XMAC\XOSDOS.PAR
+	.INCLUD	XOSINC:\XMAC\XOSERR.PAR
+	.INCLUD	XOSINC:\XMAC\XOSLKE.PAR
+	.INCLUD	XOSINC:\XMAC\XOSXLKE.PAR
+
+	LKECONT
+
+	.EXPORT	xosdskLclDelete
+	.EXPORT	xosdskLclDone
+	.EXPORT	xosdskLclOpen
+	.EXPORT	xosdskLclParm
+	.EXPORT xosdskLclRename
+	.EXPORT	xosdskSetupSpec
+
+;Define stack frame offsets for the repeat and rename routines
+
+$$$=!0
+FRM rp_frame1  , 4t	;Offset of level 1 stack frame
+FRM rp_frame2  , 4t	;Offset of level 2 stack frame
+FRM rp_close   , 4t
+FRM rp_buffer  , 4t
+FRM rp_count   , 4t
+FRM rp_ddcb    , 4t
+FRM rp_dirpos  , 4t	;Saved position in directory
+FRM rp_hvvalue1, 4t	;Saved value of xffHvValue1
+FRM rp_hvvalue2, 4t	;Saved value of xffHvValue2
+FRM rp_pvfilopt, 4t	;Saved value of xffPVFilOpt
+FRM rp_cmd     , 4t	;Saved value of xffCmd
+FRM rp_sts2    , 1t
+FRM            , 3t
+rp_SIZE=!$$$-8
+FRM rn_retry   , 1t	;Deadlock retry count
+FRM            , 3t
+FRM rn_idcb    , 4t	;Offset of initial DCB specified for rename
+FRM rn_odcb    , 4t	;Offset of DCB for old file
+FRM rn_ndcb    , 4t	;Offset of DCB for new directory
+FRM rn_nname   , 4t	;Offset of new name buffer
+FRM rn_nnbgn   , 4t	;Pointer to beginning of place for name part
+FRM rn_nncnt   , 4t	;Bytes left to store name part
+FRM rn_newname , 40t	;Buffer for constructed new name
+FRM rn_buffer  , 2*FILESPCSIZE+4 ;Buffer for found file specification
+rn_SIZE=!$$$-8
+
+	CODE
+
+;Device dependent parameter table for file operations
+
+	.MOD	4
+	.LONG	1
+filedpparms:
+	.LONG	filedp0parms
+
+	.LONG	DPPARMMAX
+filedp0parms:
+	.LONG	knlIoparClass##	;IOPAR_CLASS      = 8000h  - Device class
+	.LONG	0		;		  = 8001h  - Reserved
+	.LONG	xosdskUnitName#	;IOPAR_DKUNITNAME = 8002h  - Disk physical name
+	.LONG	xosdskDosName#	;IOPAR_DKDOSNAME  = 8003h  - Disk DOS name
+	.LONG	xosdskVolName#	;IOPAR_DKVOLNAME  = 8004h  - DIsk volume name
+DPPARMMAX=!{$-filedpparms}/4
+.PAGE
+	.SBTTL	xosdskLclOpen - Open file
+
+;Here for the open function - the stack frame has already been set up by the
+;  caller and the standard open parameter processing has been done with the
+;  values for the standard parameters stored in the stack frame
+;	c{EDI}    = Offset of DCB
+;	c{SS:EDX} = Address of expanded file path and name
+;	CALL	xosdskLclOpen
+;	C:set = Error
+;	  c{EAX} = Error code
+;	  c{ECX} = Item count
+;	C:clr = Normal
+;	  c{ECX} = Item count
+
+xosdskLclOpen:
+	MOVL	ESI, [EDI]
+	TESTL	ESI, ESI
+	JE	knlNoUnit##
+	CALL	opensub			;Open the file
+	JC	4$.S			;If error
+	MOVL	ESI, [EDI]
+	MOVL	ECX, #1			;OK - item count = 1
+	CLRL	EAX
+xosdskLclDone::
+	MOVL	ESI, [EDI]
+	TESTL	ESI, ESI
+	JE	2$.S
+	TESTB	ucb_sts2.B[ESI], #U2$REQUNMNT
+	JE	2$.S
+	ANDB	ucb_sts2.B[ESI], #~U2$REQUNMNT
+	PUSHL	#ER_MDCHG.B
+	PUSHL	EBX
+	PUSHL	ECX
+	CALL	xosdskGetDiskRes#
+	CALL	xosdskChanged#		;Unmount the disk
+	PUSHL	ESI
+	MOVL	ESI, [EDI]
+	CALL	xosdskGiveDiskRes#
+	POPL	ESI
+	POPL	ECX
+	POPL	EBX
+	POPL	EAX
+2$:	BTL	EAX, #31t
+	RET
+
+;Here if error on open
+
+4$:	MOVL	ESI, [EDI]
+	CLRL	ECX			;Item count = 0
+	JMP	xosdskLclDone.S
+.PAGE
+
+.PAGE
+	.SBTTL	xosdskLclParm - Device parameters
+
+;Here for the device parameters function - the stack frame has already been set
+;  up by the caller and the standard open parameter processing has been done
+;  with the values for the standard parameters stored in the stack frame
+;	c{EDI}    = Offset of DCB
+;	c{SS:EDX} = Address of expanded file path and name
+;	CALL	xosdskLclParm
+;	C:set = Error
+;	  c{EAX} = Error code
+;	  c{ECX} = Item count
+;	C:clr = Normal
+;	  c{ECX} = Item count
+
+xosdskLclParm:
+	MOVL	ESI, [EDI]
+	TESTL	ESI, ESI
+	JE	knlNoUnit##
+	BTL	SS:xffCmd##, #O%REPEAT	;Want repeated operation?
+	JNC	6$.S			;No
+	ENTER	rp_SIZE, 2		;Yes - set up our stack frame
+	MOVL	rp_close.B[EBP], #lclocls ;Get address of subroutine to close
+	MOVL	rp_buffer.B[EBP], EDX	  ;  file
+	CALL	lclrepeat		;Repeat this
+	JC	2$.S
+	CLRL	EAX
+2$:	LEAVE
+4$:	MOVL	ESI, [EDI]
+	JMP	xosdskLclDone.S
+
+;Here if do not want repeated device parameter function
+
+6$:	CALL	opensub			;Open the file
+	JC	10$.S			;If error
+	MOVL	EAX, dcb_sdisp.B[EDI]	;OK - close the file
+	CALLI	CS:dd_close.B[EAX]
+	MOVL	ECX, #1			;Item count = 1
+	JC	4$.S
+	CLRL	EAX
+	JMP	4$.S
+
+;Here if error
+
+10$:	CLRL	ECX			;Item count = 0
+	JMP	4$.S
+
+;Subroutine to close file for device parameter function
+;	CALL	lclocls
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+
+lclocls:MOVL	EAX, dcb_sdisp.B[EDI]	;Call device driver routine
+	JMPIL	CS:dd_close.B[EAX]
+.PAGE
+	.SBTTL	opensub - Subroutine to open file
+
+;Subroutine to open file
+;	c{EDI}    = Offset of DCB
+;	c{ES:EDX} = Address of expanded file path and name
+;	CALL	opensub
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  c{EDI}    = Offset of DCB
+;	  c{SS:ESI} = Address of set up file specification
+
+opensub:MOVW	FS, SS:xffPda##
+	BTL	SS:xffHvValue1##, #IOV1%DIRHNDL ;Want to search open directory?
+	JNC	6$.S			;No
+	PUSHL	EDI			;Yes - save offset of the directory DCB
+	MOVL	ECX, dcb_sdisp.B[EDI]	;Call device driver routine
+	CALLI	CS:dd_opendir.B[ECX]
+	POPL	EDX			;Restore offset of directory DCB
+	JNC	8$.S			;If OK
+	CMPL	EDI, EDX		;Do we still have the directory DCB?
+	JE	2$.S			;Yes
+	BTZL	SS:xffHvValue1##, #IOV1%DIRHNDL ;No - clear search open
+						;  directory bit
+2$:	PUSHL	EAX			;Save error code
+	CMPL	SS:xffParm##+0, #0.B	;Have a parameter list?
+	JE	4$.S			;No
+
+	MOVL	EBX, dcb_sdisp.B[EDI]	    ;Yes - process device parameters as
+	MOVL	EBX, CS:dd_openparms.B[EBX] ;  best as we can - ignore errors
+	MOVL	ECX, #filedpparms	    ;  since we already have an error
+	IFFAULT	4$
+	LFSL	EDX, SS:xffParm##
+	CALL	knlProcDevParm##
+	FAULTHDR
+4$:	POPL	EAX
+	STC
+	RET
+
+;Here if do not want to search open directory
+
+6$:	MOVL	ECX, dcb_sdisp.B[EDI]	;Call device driver routine
+	CALLI	CS:dd_opennorm.B[ECX]
+	JC	2$.S			;If error
+8$:	CMPL	SS:xffParm##+0, #0.B	;Have a parameter list?
+	JE	10$.S			;No
+	MOVL	EBX, dcb_sdisp.B[EDI]	;Yes - process device parameters
+	MOVL	EBX, CS:dd_openparms.B[EBX]
+	MOVL	ECX, #filedpparms
+	IFFAULT	10$
+	LFSL	EDX, SS:xffParm##
+	CALL	knlProcDevParm##
+	JC	12$.S			;If error with device parameters
+	FAULTHDR
+10$:	ANDL	SS:xffHvValue1##, #~IOV1$DIRHNDL
+					;Clear open directory indication since
+	RET				;  we now have a file DCB (this also
+					;  clears C)
+
+;Here if error while processing device parameters after file is open
+
+12$:	PUSHL	EAX			;Save error code
+	MOVL	EAX, dcb_sdisp.B[EDI]	;Close the file
+	CALLI	CS:dd_close.B[EAX]
+	POPL	EAX			;Restore error code
+	STC				;Indicate error
+ret006:	RET				;Return
+.PAGE
+	.SBTTL	xosdskLclRename - Rename file
+
+;Here for sd_rename function - rename file
+;  When get here registers are set up as follows:
+;	c{EDI}    = Offset of DCB for old file or directory
+;	c{SS:EDX} = Address of old expanded file path and name
+;	c{SS:ESI} = Address of buffer containing expanded new name
+;	CALL	xosdskLclRename
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  c{EAX} = 0
+
+1$:	POPL	ESI
+	JMP	knlNoUnit##
+
+xosdskLclRename:
+	TESTL	SS:xffCmd##, #O$RAW|O$PHYS|O$REPEAT
+	JNE	knlIFnDev##		;Cannot have raw or physical IO or
+					;  or repeated operation requested here
+	ANDL	SS:xffCmd##, #~{O$CREATE|O$TRUNCW|O$TRUNCA|O$FAILEX}
+	LEAL	EBX, opn_devname.B[EBP]	;Point to the new device
+	PUSHL	ESI
+	MOVL	ESI, [EDI]		;Get offset of our UCB
+	TESTL	ESI, ESI
+	JE	1$.S
+	MOVL	EAX, SS:[EBX]		;Same device?
+	CMPL	ucb_name+0.B[ESI], EAX
+	JNE	4$.S			;No
+	MOVL	EAX, SS:4.B[EBX]
+	CMPL	ucb_name+4.B[ESI], EAX
+	JNE	2$.S
+	MOVL	EAX, SS:8.B[EBX]
+	CMPL	ucb_name+8.B[ESI], EAX
+	JNE	2$.S
+	MOVL	EAX, SS:12t.B[EBX]
+	CMPL	ucb_name+12t.B[ESI], EAX
+	JE	12$.S
+2$:	MOVL	EAX, SS:[EBX]		;Now see if it matches the DOS name
+4$:	CMPL	ucb_dosname+0.B[ESI], EAX
+	JNE	8$.S
+	MOVL	EAX, SS:4.B[EBX]
+	CMPL	ucb_dosname+4.B[ESI], EAX
+	JNE	6$.S
+	MOVL	EAX, SS:8.B[EBX]
+	CMPL	ucb_dosname+8.B[ESI], EAX
+	JNE	6$.S
+	MOVL	EAX, SS:12t.B[EBX]
+	CMPL	ucb_dosname+12t.B[ESI], EAX
+	JE	12$.S
+6$:	MOVL	EAX, SS:[EBX]		  ;Now see if it matches the volume
+8$:	CMPL	ucb_volname+0.B[ESI], EAX ;  name
+	JNE	10$.S
+	MOVL	EAX, SS:4.B[EBX]
+	CMPL	ucb_volname+4.B[ESI], EAX
+	JNE	10$.S
+	MOVL	EAX, SS:8.B[EBX]
+	CMPL	ucb_volname+8.B[ESI], EAX
+	JNE	10$.S
+	MOVL	EAX, SS:12t.B[EBX]
+	CMPL	ucb_volname+12t.B[ESI], EAX
+	JE	12$.S
+10$:	MOVL	EAX, #ER_DFDEV
+	POPL	ESI
+rndone2:CLRL	ECX
+	JMP	xosdskLclDone
+
+;Here if the new name is the same as the old name
+
+12$:	POPL	ESI
+	ENTER	rn_SIZE, 2		;Set up our stack frame
+	BTSL	SS:xffCmd##, #O%XWRITE	;Make sure exclusive write requested
+	MOVL	rn_idcb.B[EBP], EDI	;Save initial DCB
+	MOVL	rp_buffer.B[EBP], EDX	;Save offset of old name
+	MOVL	rn_nname.B[EBP], ESI	;Save offset of new name
+	CLRL	EAX
+	MOVL	rn_ndcb.B[EBP], EAX
+	MOVL	ESI, [EDI]		;Get the disk resource
+	TESTL	ESI, ESI
+	JNE	rename2.S
+	LEAVE
+	MOVL	EAX, #ER_MDCHG
+	JMP	rndone2.S
+.PAGE
+;First scan the new name to see if it contains any wild-card characters and
+;  fail if so.  This loop also finds the beginning of the name part
+
+rename2:MOVL	ESI, rn_nname.B[EBP]	;Point to new name
+	MOVL	ECX, #FILESPCSIZE+4
+	MOVL	EBX, ESI
+	MOVL	EDX, ECX
+4$:	LODSB	SS:[ESI]		;Get character from new name
+	TESTB	AL, AL
+	JE	14$.S			;If finished
+	CMPB	AL, #'/'
+	JNE	6$.S
+	MOVL	EBX, ESI
+	MOVL	EDX, ECX
+6$:	CMPB	AL, #'*'		;Wild-card character?
+	JE	8$.S			;Yes
+	CMPB	AL, #'?'
+	JE	8$.S
+	LOOP	ECX, 4$
+8$:	MOVL	EAX, #ER_BDSPC
+10$:	CALL	renerr			;Process error
+	CALL	rendone			;Do final cleanup
+	LEAVE
+	JMP	rndone2.S
+
+12$:	MOVL	EAX, ER_IFDEV
+	JMP	10$.S
+
+;Here at end of name
+
+14$:	MOVL	rn_nnbgn.B[EBP], EBX	;Remember where name part starts
+	MOVL	rn_nncnt.B[EBP], ECX
+	MOVL	ESI, EBX
+	MOVL	EDI, rn_idcb.B[EBP]	;Restore DCB
+	MOVL	SS:xffDcb##, EDI
+	BTL	SS:xffCmd##, #O%REPEAT	;Want repeated rename?
+	JC	12$.S			;Yes - FAIL!!!!
+	MOVL	EDX, rp_buffer.B[EBP]	;Get offset of old name
+	CALL	opensub			;Open the file
+	JC	rener2			;If error
+	CMPL	dcb_dkfilepnt.B[EDI], #0.B ;Did we really open a file?
+	JE	rennoopn		;No
+	MOVL	rn_odcb.B[EBP], EDI	;Save DCB offset for old name
+	MOVL	EAX, SS:xffPCFilSpc##	;Update string error reset point
+	MOVL	SS:xffPXFilSpc##, EAX
+	MOVL	SS:xffCmd##, #O$ODF
+	MOVL	EDX, rn_nname.B[EBP]
+	MOVB	AL, #DH_FV		;Find a DCB for the directory for the
+	CALL	knlFindDcb##		;  new name
+	JC	renerr			;If error
+	MOVW	dcb_outframe.B[EDI], SS
+	MOVL	SS:xffDcb##, EDI
+	MOVL	rn_ndcb.B[EBP], EDI	;Save offset of the DCB
+	INCL	dcb_opencnt.B[EDI]
+	MOVL	ES, SS:xffPda##
+	MOVW	AX, ES:pdaSesProc##	;Store number of session process in
+	MOVW	dcb_sesproc.B[EDI], AX	;  the DCB
+	MOVB	dcb_sts2.B[EDI], #0	;Clear device dependent bits
+	MOVB	dcb_sts1.B[EDI], #0	;And clear the common device status bits
+	MOVL	EDI, rn_ndcb.B[EBP]	;Make sure using DCB for new file
+	MOVL	SS:xffDcb##, EDI
+	MOVL	EDX, rn_nname.B[EBP]
+	BTSL	SS:xffHvValue1##, #IOV1%RENAME
+	PUSHL	SS:xffPVFilOpt##
+	ANDL	SS:xffPVFilOpt##, #~{FO$PATHNAME|FO$PATHDOS|FO$FILENAME|FO$FILEDOS}
+	CALL	opensub			;Open the directory for the new name
+	POPL	SS:xffPVFilOpt##
+	JC	renero			;If error
+	MOVL	EDI, rn_ndcb.B[EBP]	;Get DCB for new file's directory
+	MOVL	SS:xffDcb##, EDI
+	MOVL	ESI, rn_odcb.B[EBP]	;Get DCB for old file
+	MOVL	EDX, rn_nnbgn.B[EBP]	;Get offset of new name
+	ANDL	SS:xffCmd##, #O$REPEAT
+	ORL	SS:xffCmd##, #O$XWRITE|O$CREATE|O$FAILEX
+	MOVL	EAX, dcb_sdisp.B[EDI]	;Dispatch to file system driver to
+	CALLI	CS:dd_rename.B[EAX]	;  finish this
+	JC	rener4			;If error
+	CALL	rendone
+	LEAVE
+	JMP	xosdskLclDone
+
+;Here if did not really open a file
+
+rennoopn:
+	LEAVE
+	PUSHL	EAX
+	MOVL	EAX, dcb_sdisp.B[EDI]	;Close the file
+	CALLI	CS:dd_close.B[EAX]
+	POPL	EAX
+	CLRL	ECX
+	JMP	rndone2
+.PAGE
+;Here if error opening directory for new name after DCB allocated
+
+renero:	PUSHL	EAX
+	PUSHL	SS:xffHandle##
+	MOVW	SS:xffHandle##, #-1
+	MOVL	ESI, #0FFFh
+	CALL	knlXfClose8##		;Give up the DCB for the directory
+	CLRL	EAX
+	MOVL	rn_ndcb.B[EBP], EAX
+	POPL	EAX
+	MOVW	SS:xffHandle##, AX
+	POPL	EAX			;Fall into renerr
+
+;Here with error before call to device driver rename routine
+
+renerr:	PUSHL	EAX			;Save error code
+	CLRL	EAX
+	MOVL	SS:xffParm##+0, EAX
+	MOVL	EDI, rn_odcb.B[EBP]	;Close the old file but keep the DCB
+	MOVL	SS:xffDcb##, EDI
+	MOVL	EAX, dcb_sdisp.B[EDI]
+	CALLI	CS:dd_close.B[EAX]
+	POPL	EAX			;Restore error code
+rener2:	CLRL	ECX
+rener4:	CALL	rendone
+	LEAVE
+	JMP	rndone2
+.PAGE
+;Subroutine to do cleanup for rename
+;	CALL	rendone
+
+rendone:PUSHL	EAX			;Save error code and item count
+	PUSHL	ECX
+	MOVL	EDI, rn_ndcb.B[EBP]	;Have directory for new name?
+	TESTL	EDI, EDI
+	JE	4$.S			;No
+	MOVL	SS:xffDcb##, EDI	;Yes
+	CLRL	EAX			;Store parameters for close
+	MOVL	SS:xffOption##, EAX
+	MOVL	SS:xffParm##+0, EAX
+	PUSHL	SS:xffCmd##
+	MOVL	SS:xffCmd##, EAX
+	PUSHL	SS:xffHandle##
+	MOVW	SS:xffHandle##, #-1
+	CMPL	dcb_dkfilepnt.B[EDI], #0.B ;Is it still open?
+	JE	2$.S			;No - just give up the DCB
+	MOVL	EAX, dcb_sdisp.B[EDI]	;Yes - call device driver routine
+	CALLI	CS:dd_close.B[EAX]	;  to close it
+	MOVL	EAX, dcb_sdisp.B[EDI]
+	CALLI	CS:sd_commit.B[EAX]
+2$:	MOVL	ESI, #0FFFh
+	CALL	knlXfClose8##		;Give up the DCB
+	POPL	EAX
+	MOVW	SS:xffHandle##, AX
+	POPL	SS:xffCmd##
+4$:	MOVL	EDI, rn_idcb.B[EBP]	;Restore DCB offset
+	MOVL	SS:xffDcb##, EDI
+	TESTB	dcb_sts2.B[EDI], #D2$COMMIT ;Need to commit data to disk?
+	JE	6$.S			;No
+	MOVL	EAX, dcb_sdisp.B[EDI]	;Yes - update disk
+	CALLI	CS:sd_commit.B[EAX]
+6$:	POPL	ECX			;Restore error code and item count
+	POPL	EAX
+	RET
+
+10$:	CRASH	BDOC			;[Bad Device Open Count]
+.PAGE
+;Subroutine to copy returned string component for rename
+;	CALL	copyspc
+
+copyspc:CALL	knlGivUChr##
+	LODSB	SS:[ESI]
+	TESTB	AL, AL
+	JE	2$.S
+	CMPB	AL, #FS_ESC
+	JE	4$.S
+	CMPB	AL, #FS_MIN
+	JB	copyspc.S
+2$:	RET
+
+4$:	LODSB	SS:[ESI]
+	JMP	copyspc.S
+.PAGE
+	.SBTTL	xosdskLclDelete - Delete file
+
+;Here for sd_delete function - delete file
+;	c{SS:EDX} = Address of expanded file name
+;	c{EDI}    = Offset of DCB for file to delete or its directory
+;	CALL	xosdskLclDelete
+;	C:set = Error
+;	  c{EAX} = Error code
+;	  c{ECX} = Item count
+;	C:clr = Normal
+;	  c{EAX} = 0
+;	  c{ECX} = Item count
+
+xosdskLclDelete:
+	MOVL	ESI, [EDI]
+	TESTL	ESI, ESI
+	JE	knlNoUnit##
+	BTL	SS:xffCmd##, #O%REPEAT	;Want repeated delete?
+	JNC	2$.S			;No
+	ENTER	rp_SIZE, 2		;Yes
+	MOVL	rp_close.B[EBP], #lcldcls ;Get address of subroutine to
+					  ;  delete file
+	MOVL	rp_buffer.B[EBP], EDX
+	CALL	lclrepeat		;Repeat this
+	LEAVE
+	BTZL	SS:xffCmd##, #O%REPEAT	;Clear repeat indication so will update
+	JMP	4$.S			;  FATs
+
+;Here if do not want repeated delete
+
+2$:	CALL	opensub			;Open the file
+	JC	8$.S			;If error
+	CALL	lcldcls
+4$:	PUSHL	EAX
+	PUSHL	ECX
+	MOVL	EAX, dcb_sdisp.B[EDI]	;Call disk update routine
+	CALLI	CS:sd_commit.B[EAX]
+	MOVL	ESI, [EDI]
+	POPL	ECX
+	POPL	EAX
+6$:	JMP	xosdskLclDone
+
+8$:	CLRL	ECX
+	JMP	6$.S
+
+;Subroutine to do the work for delete
+
+lcldcls:PUSHL	SS:xffOption##
+	MOVL	SS:xffOption##, #C$DELETE ;Delete the file (but keep the DCB
+	MOVL	EAX, dcb_sdisp.B[EDI]	 ;  which the calling routine will
+	CALLI	CS:dd_close.B[EAX]	 ;  give up
+	POPL	SS:xffOption##
+ret020:	RET
+.PAGE
+	.SBTTL	lclrepeat - Subroutine to do repeated functions
+
+;Subroutine to do repeated functions (devparm or delete).  This routine
+;  always does its directory searches using an open directory - if an open
+;  directory is provided, that directory is used.  If an open directory is
+;  not provided, the directory is opened using the calling DCB.  After the
+;  search, it is closed.  In all cases, the calling DCB is returned (even if
+;  an open directory was provided)
+;	c{rp_close{EBP]} = Offset of subroutine to call to close file
+;	c{SS:EDX}        = Address of file specification
+;	c{EDI}           = Offset of DCB
+;	CALL	lclrepeat
+;	C:set = Error
+;	  c{EAX} = Error code
+;	  c{ECX} = Item count
+;	C:clr = Normal
+;	  c{EAX} = 0
+;	  c{ECX} = Item count
+
+lclrepeat:
+	MOVL	EAX, SS:xffHvValue1##	;Save the value bits we were given
+	MOVL	rp_hvvalue1.B[EBP], EAX
+	MOVL	EAX, SS:xffPVFilOpt##
+	MOVL	rp_pvfilopt.B[EBP], EAX
+lclrepeat2:
+	MOVL	EAX, SS:xffCmd##	;Also save the command bits
+	MOVL	rp_cmd.B[EBP], EAX
+	MOVB	rp_sts2.B[EBP], #0	;Clear saved dcb_sts2 bits
+	MOVL	rp_count.B[EBP], #0
+	MOVL	rp_ddcb.B[EBP], EDI	;Save DCB offset
+	BTL	SS:xffHvValue1##, #IOV1%DIRHNDL ;Open directory for search?
+	JC	reptlp.S		;Yes - go on
+	PUSHL	SS:xffCmd##
+	MOVL	SS:xffCmd##, #O$ODF	;No
+	MOVL	EDX, rp_buffer.B[EBP]	;Finish opening the directory
+	CALL	opensub
+	POPL	SS:xffCmd##
+	JC	ret020.S		;If error
+	INCL	dcb_opencnt.B[EDI]
+	BTSL	SS:xffHvValue1##, #IOV1%DIRHNDL ;Search open directory
+					;Fall into reptlp on next page
+.PAGE
+;This is the main loop for repeated operations
+
+reptlp:	MOVL	EDI, rp_ddcb.B[EBP]	;Restore directory DCB offset
+	MOVL	SS:xffDcb##, EDI
+	ORB	dcb_sts2.B[EDI], #D2$REPEAT ;Indicate repeated operation
+	MOVL	EAX, rp_hvvalue1.B[EBP]	;Restore value bits
+	BTSL	EAX, #IOV1%DIRHNDL
+	MOVL	SS:xffHvValue1##, EAX	         ;Only use the directory offset
+	BTZL	rp_hvvalue1.B[EBP], #IOV1%DIROFS ;  the first time
+	MOVL	EAX, rp_pvfilopt.B[EBP]	;Restore file option bits
+	MOVL	SS:xffPVFilOpt##, EAX
+	MOVL	EAX, rp_cmd.B[EBP]	;Restore command bits
+	MOVL	SS:xffCmd##, EAX
+	MOVL	EAX, dcb_dkfpos.B[EDI]	;Save position in directory in case the
+	MOVL	rp_dirpos.B[EBP], EAX	;  returned name overflows his buffer
+	MOVL	EDX, rp_buffer.B[EBP]	;Get offset of processed file name
+	CALL	opensub
+	JC	reptope			;If error
+	TESTL	rp_pvfilopt.B[EBP], #FO$PHYNAME|FO$DOSNAME|FO$VOLNAME|FO$XOSNAME|FO$PATHNAME|FO$PATHDOS|FO$FILENAME|FO$FILEDOS|FO$VERSION|FO$ATTR
+					;Need name returned?
+	JE	6$.S			;No - continue
+	MOVL	EAX, SS:xffPCFilSpc##	;Yes - has it overflowed?
+	CMPL	EAX, SS:xffPSFilSpc##
+	JB	6$.S			;No - continue
+	MOVL	EAX, dcb_sdisp.B[EDI]	;Yes - close the file quietly
+	CALLI	CS:dd_close.B[EAX]
+	MOVB	AL, dcb_sts2.B[EDI]	;Save bits from dcb_sts2
+	ORB	rp_sts2.B[EBP], AL
+	CALL	giveupfile
+	MOVL	EAX, rp_dirpos.B[EBP]	;Backup to previous directory entry
+	MOVL	dcb_dkfpos.B[EDI], EAX
+
+;;;	SHRL	EAX, #5
+;;;	INCL	EAX
+;;;	MOVL	EDX, rp_frame1.B[EBP]
+;;;	MOVL	SS:opn_dirofs.B[EDX], EAX
+
+	MOVL	EAX, SS:xffPXFilSpc##	;Reset to start of last name
+	MOVL	SS:xffPCFilSpc#, EAX
+	MOVL	EAX, rp_pvfilopt.B[EBP]	;Restore file option bits
+	MOVL	SS:xffPVFilOpt##, EAX
+	CMPL	rp_count.B[EBP], #0.B	;Did any names at all fit?
+	JE	4$.S			;No
+	ORB	rp_count+3.B[EBP], #80h	;Yes - indicate list is incomplete by
+					;  setting bit 31 in the item count
+	JMP	reptery.S		;Go finish up
+
+;Here if did not have room for at least one name
+
+4$:	MOVL	EAX, #ER_NMBTS
+	JMP	repterr
+
+;Here if did not overflow the name buffer
+
+6$:	PUSHL	EDI
+	ORB	dcb_sts2.B[EDI], #D2$REPEAT ;Indicate repeated operation
+	CALLI	rp_close.B[EBP]		;Do something to the file (this will
+	POPL	EDI			;  always close the file, even if there
+					;  is an error - the DCB will always be
+					;  left allocated)
+	JC	repterx			;If error
+	MOVB	AL, dcb_sts2.B[EDI]	;Save bits from dcb_sts2
+	ORB	rp_sts2.B[EBP], AL
+	CALL	giveupfile
+	INCL	rp_count.B[EBP]		;Bump item count
+	TESTL	rp_pvfilopt.B[EBP], #FO$PHYNAME|FO$DOSNAME|FO$VOLNAME|FO$XOSNAME|FO$PATHNAME|FO$PATHDOS|FO$FILENAME|FO$FILEDOS|FO$VERSION|FO$ATTR
+					;Need name returned?
+	JE	8$.S			;No - continue
+	MOVL	EAX, SS:xffPCFilSpc##	;Yes - update string error reset point
+	MOVL	SS:xffPXFilSpc##, EAX
+	ANDL	SS:xffPVFilOpt##, #~{FO$PHYNAME|FO$DOSNAME|FO$VOLNAME|FO$XOSNAME|FO$PATHNAME|FO$PATHDOS}
+					;Only give him the device and path once
+
+8$:	TESTB	SS:xffStatus1##, #XF1$ABORT ;Has this operation been aborted?
+	JE	reptlp			;No - go do it again
+	MOVL	EAX, #ER_ABORT
+	JMP	repterr.S
+.PAGE
+;Here if error return from open - a file is never open here but a file DCB may
+;  be allocated
+
+reptope:CMPL	EDI, rp_ddcb.B[EBP]	;Do we have a file DCB now?
+	JE	4$.S			;No
+	MOVL	SS:xffDcb##, EDI	;Yes
+	PUSHL	EAX			;Save error code
+	CALL	giveupfile		;Get rid of the file
+	POPL	EAX			;Restore error code
+4$:	CMPL	EAX, #ER_FILNF.B	;Is error "file not found"?
+	JNE	repterr.S		;No
+	CMPL	rp_count.B[EBP], #0.B	;Yes - did we do anything at all?
+	JE	repterr.S		;No - just return the error
+reptery:CALL	reptdone
+	CLRL	EAX			;Give good return
+	RET
+
+;Here with real error
+
+repterx:PUSHL	EAX
+	CALL	giveupfile
+	POPL	EAX
+repterr:PUSHL	EAX
+	CALL	reptdone
+	POPL	EAX
+	STC				;Indicate error
+	RET				;And return
+.PAGE
+;Subroutine to give up file DCB and restore directory DCB
+;	c{EDI} = Offset of file DCB
+;	CALL	giveupfile
+
+giveupfile:
+	MOVL	ESI, #0FFFh
+	CALL	knlXfClose8##		;First give up the file DCB
+	MOVL	EDI, rp_ddcb.B[EBP]	;Point to directory DCB
+	CMPW	dcb_outframe.B[EDI], #0.B
+	JNE	4$.S
+	MOVW	dcb_outframe.B[EDI], SS
+	CALL	knlStoreHndl##		;Store in handle table and return
+	JC	6$.S
+	RET
+
+4$:	CRASH	XFFE			;[eXtended Fork Frame Error]
+
+6$:	CRASH	DHTE			;[Device Handle Table Error]
+.PAGE
+;Subroutine to do final cleanup for repeated function
+;	CALL	reptdone
+
+reptdone:
+	MOVL	EDI, rp_ddcb.B[EBP]	;Get directory DCB
+	MOVL	SS:xffDcb##, EDI
+	ANDB	dcb_sts2.B[EDI], #~D2$REPEAT
+	MOVB	AL, dcb_sts2.B[EDI]
+	ORB	rp_sts2.B[EBP], AL
+	TESTB	rp_sts2.B[EBP], #D2$COMMIT ;Need to commit data to disk?
+	JE	2$.S			;No
+	MOVL	EAX, dcb_sdisp.B[EDI]	;Yes - update disk
+	CALLI	CS:sd_commit.B[EAX]
+2$:	BTL	rp_hvvalue1.B[EBP], #IOV1%DIRHNDL ;Did he give us an open
+						  ;  directory?
+	JC	4$.S			;Yes - don't close it
+	PUSHL	SS:xffCmd##		;No - close the directory now
+	MOVL	SS:xffCmd##, #O$ODF
+	CLRL	EAX
+	MOVL	SS:xffOption##, EAX
+	CMPL	dcb_opencnt.B[EDI], #0.B
+	JE	10$.S
+	DECL	dcb_opencnt.B[EDI]
+	MOVL	EAX, dcb_sdisp.B[EDI]
+	CALLI	CS:dd_close.B[EAX]
+	POPL	SS:xffCmd##
+4$:	MOVL	EAX, rp_hvvalue1.B[EBP]	;Restore given value bits
+	MOVL	SS:xffHvValue1##, EAX
+	MOVL	ECX, rp_count.B[EBP]	;Get repeat count
+	RET				;Thats all
+
+10$:	CRASH	BDOC			;[Bad Device Open Count]
+.PAGE
+	.SBTTL	xosdskSetupSpec - Subroutine to set up file specification for open
+
+;Subroutine to set up file specification for open
+;	CALL	xosdskSetupSpec
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+
+xosdskSetupSpec::
+	MOVL	ESI, of_namepnt.B[EBP]
+	CLD
+
+;The following code scans the file specification and resolves . and .. items
+
+4$:	LODSB	SS:[ESI]		;Get first character of specification
+	CMPB	AL, #'\'		;Does it start at the root?
+	JNE	8$.S			;No
+6$:	LODSB	SS:[ESI]		;Get next character
+8$:	CMPB	AL, #'.'		;Does it start with a period?
+	JE	14$.S			;Yes - go check some more
+10$:	CMPB	AL, #'\'		;No - scan to end of name
+	JE	6$.S
+	TESTB	AL, AL
+	JE	16$.S
+12$:	LODSB	SS:[ESI]
+	JMP	10$.S
+
+;Here with name which begins with a period
+
+14$:	LODSB	SS:[ESI]		;Get character
+	CMPB	AL, #'.'		;Another period?
+	JE	22$.S			;Yes
+	CMPB	AL, #'\'		;No - end of this name?
+	JE	20$.S			;Yes
+	TESTB	AL, AL			;Maybe
+	JNE	12$.S			;No
+	SUBL	ESI, #2.B		;Point to the period
+	CMPL	ESI, of_namepnt.B[EBP]	;Is it the first character?
+	JE	18$.S			;Yes
+	MOVB	SS:[ESI], #0		;No - just delete the .
+	MOVL	EAX, of_namepnt.B[EBP]
+	CMPW	SS:[EAX], #'\'
+	JNE	15$.S
+	MOVB	SS:[EAX], #0
+15$:	CLC
+16$:	RET
+
+;Here with single . - this can only happen when an isolated . is used to
+;  reference the current directory
+
+18$:	CALL	insdpath		;Insert default path
+	JC	31$.S
+	ADDL	ESI, #2.B
+	JMP	14$.S
+
+;Here with .\ as directory
+
+20$:	MOVL	ECX, ESI
+	SUBL	ESI, #2.B
+	JMP	38$.S			;Go move up rest of string
+
+;Here if have ..
+
+22$:	LODSB	SS:[ESI]		;Get next character
+	CMPB	AL, #'\'
+	JE	24$.S
+	TESTB	AL, AL
+	JNE	12$.S
+24$:	MOVL	ECX, ESI		;Remember where this ends
+	DECL	ECX
+	SUBL	ESI, #4.B		;Point to beginning
+	CMPL	ESI, of_namepnt.B[EBP]	;At beginning of specification?
+	JE	42$.S			;Yes - begins with \.. - fail
+	JB	30$.S			;Begins with .. - get default path
+	PUSHL	ESI
+	DECL	ESI
+	STD
+26$:	LODSB	SS:[ESI]		;See if have a \ before the \..
+	CMPB	AL, #'\'
+	JE	28$.S
+	CMPL	ESI, of_namepnt.B[EBP]
+	JAE	26$.S
+	POPL	ESI
+	JMP	30$.S			;No - must insert default path here
+
+;Here if have \ preceeding .. - don't need to insert default path here
+
+28$:	POPL	ESI
+	JMP	32$.S
+
+;Here if do not have \ preceeding .. - must insert default path before string
+
+30$:	INCL	ESI
+	CALL	insdpath		;Insert default path
+31$:	JC	44$.S			;If error
+	CMPL	ESI, of_namepnt.B[EBP]	;Did we have a path?
+	JE	42$.S			;No - fail
+	LEAL	ECX, 3.B[ESI]		;Yes
+
+;Here with \.. following a name - remove the name and the following \..
+;	c{ECX} = Offset of character following \..
+;	c{ESI} = Offset of the \ in \..
+
+32$:	DECL	ESI			;First find beginning of directory
+	STD				;  name before the \..
+34$:	LODSB	SS:[ESI]
+	CMPB	AL, #'\'
+	JE	36$.S
+	CMPL	ESI, of_namepnt.B[EBP]
+	JAE	34$.S
+36$:	INCL	ESI			;Now copy everything following over
+38$:	CLD				;  the name before the \..
+	PUSHL	EDI
+	PUSHL	ESI
+	MOVL	EDI, ESI
+	PUSHL	SS
+	POPL	ES
+	MOVL	ESI, ECX
+40$:	LODSB	SS:[ESI]
+	STOSB	[EDI]
+	CMPB	AL, #0
+	JNE	40$.S
+	POPL	ESI
+	POPL	EDI
+	JMP	6$
+
+42$:	MOVL	EAX, #ER_DIRNF
+	STC
+44$:	RET
+
+rootnm:	.ASCIZ	"\"
+.PAGE
+	.SBTTL	insdpath - Subroutine to insert default path string
+
+;Subroutine to insert default path string at beginning of name
+;	CALL	insdpath
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  c{ESI} = Offset of last character inserted
+
+2$:	MOVL	EAX, #ER_DIRNF
+	STC
+4$:	RET
+
+insdpath:
+	CMPB	of_respath.B[EBP], #0	;Have we already resolved the path?
+	JNE	2$.S			;Yes - fail
+	CALL	knlFindPath##		;No - get default path
+	JC	4$.S
+	MOVB	of_respath.B[EBP], #1
+	JNE	10$.S			;Go on if have a default path
+	CMPL	4.B[ESP], #0.B		;No default path - is this OK?
+	JE	2$.S			;No - fail
+	PUSHL	CS			;Yes - fake it up
+	POPL	FS
+	MOVL	ESI, #rootnm-pn_string
+10$:	PUSHL	EDI
+	LEAL	EDI, pn_string.B[ESI]
+	PUSHL	EDI
+	PUSHL	FS
+	POPL	ES
+	MOVL	EDX, EDI
+	CLRL	EAX
+	CLRL	ECX
+	DECL	ECX
+	CLD
+	RNSCASB	[EDI]			;Find end of string
+	SUBL	EDX, EDI		;Calculate length of string + 1
+	NOTL	EDX
+	MOVL	EDI, of_namepnt.B[EBP]	;Find length of our name string + 1
+	PUSHL	SS
+	POPL	ES
+	MOVL	ESI, EDI
+	MOVL	EBX, EDI
+	RNSCASB	[EDI]
+	SUBL	EBX, EDI
+	NEGL	EBX
+	MOVL	ECX, EBX		;Get amount to move
+	ADDL	ESI, ECX		;Calculate offset of first byte to move
+	DECL	ESI
+	LEAL	EDI, [ESI+EDX]		;Calculate offset of first destination
+	STD				;  byte
+	RMOVSB	[EDI], SS:[ESI]		;Copy given string to make room for
+					;  the default path
+	POPL	ESI			;Get offset of default path string
+	MOVL	EDI, of_namepnt.B[EBP]	;Get place to put it
+	MOVL	ECX, EDX
+	CLD
+	RMOVSB	[EDI], FS:[ESI]		;Copy default path string
+	LEAL	ESI, -1.B[EDI]
+	POPL	EDI
+	CLC
+	RET
+
+	LKEEND

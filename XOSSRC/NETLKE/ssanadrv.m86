@@ -1,0 +1,1651 @@
+	.TITLE	SSANADRV - Network driver for Arnet SYNC/570i (Bit-synchronous)
+
+;++++
+; This software is in the public domain.  It may be freely copied and used
+; for whatever purpose you see fit, including commerical uses.  Anyone
+; modifying this software may claim ownership of the modifications, but not
+; the complete derived code.  It would be appreciated if the authors were
+; told what this software is being used for, but this is not a requirement.
+
+;   THIS SOFTWARE IS PROVIDED BY THE AUTHORS "AS IS" AND ANY EXPRESS OR
+;   IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
+;   OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+;   IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+;   INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+;   BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS
+;   OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+;   ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR
+;   TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
+;   USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+;----
+
+	.PROC	80486
+	.INCLUD	XOSINC:\XMAC\XOS.PAR
+	.INCLUD	XOSINC:\XMAC\XOSX.PAR
+	.INCLUD	XOSINC:\XMAC\XOSERR.PAR
+	.INCLUD	XOSINC:\XMAC\XOSTIME.PAR
+	.INCLUD	XOSINC:\XMAC\XOSNET.PAR
+	.INCLUD	XOSINC:\XMAC\XOSXNET.PAR
+	.INCLUD XOSINC:\XMAC\XOSXEN.PAR
+	.INCLUD XOSINC:\XMAC\PCAT.PAR
+	.INCLUD	XOSINC:\XMAC\XOSLKE.PAR
+	.INCLUD	XOSINC:\XMAC\XOSXLKE.PAR
+	.INCLUD	HD64570.PAR
+
+;This driver supports the Arnet SYNC/570i synchronous serial interface
+;  (HD64570 chip) in bit-synchronous mode.  This board comes in two versions:
+;  a 2 port version using 1 HD64570 chip and a 4 port version using 2 HD64570
+;  chips.  This version of the driver only supports the 2 port board because
+;  of the extra overhead involved in selecting the chip, especially when
+;  servicing interrupts.  (Actually, the four port board can be used, but only
+;  the first two ports will be available.) Each of the two ports is treated as
+;  a seperate network interface device.
+
+MAJV   =!1t
+MINV   =!0t
+EDITNUM=!0t
+
+;v1.0.0  25-May-95
+;	First version
+
+	LKEHEAD	SSANADRV, MAJV, MINV, EDITNUM, LKETYPE_DEVICE
+
+;Define offsets in the device dependent part of the IDB for the SSANA serial
+;  interface driver
+
+$$$=!idb_SIZE
+BLK idb_ssanforkfnc , 1t	;Fork level function bits
+BLK idb_ssanotimer  , 1t	;Output timer
+BLK                 , 2t
+BLK idb_ssanbdb     , 4t	;Offset of the BDB
+BLK idb_ssanmemaddr , 4t	;Physical address of shared memory area
+BLK idb_ssanmemofs  , 4t	;Offset of shared memory area
+BLK idb_ssanmemsize , 4t	;Size of shared memory area (KB)
+BLK idb_ssanbufrsz  , 4t	;Buffer size (bytes)
+BLK idb_ssannumxmtbr, 4t	;Number of transmit buffers
+BLK idb_ssannumrcvbr, 4t	;Number of receive buffers
+BLK idb_ssanrate    , 4t	;Baud rate
+BLK idb_ssanport    , 4t	;Port on board
+BLK idb_ssanscirxs  , 1t	;Value for SCI_RXS register
+BLK idb_ssanscitxs  , 1t	;Value for SCI_TXS register
+BLK idb_ssanscimd2  , 1t	;Value for SCI_MD2 register
+BLK idb_ssanscictl  , 1t	;Value for SCI_CTL register
+
+				;Following offsets are all CPU offsets (not
+				;  64570 offsets)
+BLK idb_ssanbase    , 4t	;Offset of base of the shared memory
+BLK idb_ssansci     , 4t	;Offset of base of the SCI registers
+BLK idb_ssandmarcv  , 4t	;Offset of base of the receive DMA registers
+BLK idb_ssandmaxmt  , 4t	;Offset of base of the transmit DMA registers
+
+				;Following offsets are all 64570 offsets
+BLK idb_ssandescrcv , 4t	;Offset of first receive buffer descriptor
+BLK idb_ssanbasercv , 4t	;Base offset for receive buffer descriptors
+BLK idb_ssanputrrcv , 4t	;Receive buffer descriptor putter pointer
+BLK idb_ssantakrrcv , 4t	;Receive buffer descriptor taker pointer
+BLK idb_ssandescxmt , 4t	;Offset of first transmit buffer descriptor
+BLK idb_ssanbasexmt , 4t	;Base offset for transmit buffer descriptors
+BLK idb_ssanputrxmt , 4t	;Transmit buffer descriptor putter pointer
+BLK idb_ssantakrxmt , 4t	;Transmit buffer descriptor taker pointer
+idb_ssanSIZE=!$$$
+
+;Define offsets in the board description block (BDB)
+
+$$$=!0
+BLK bdb_next    , 4t		;Offset of next SSANA BDB
+BLK bdb_ioreg   , 4t		;Base IO register for board
+BLK bdb_intlvl  , 1t		;Interrupt level
+BLK bdb_numports, 1t		;Number of ports on board
+BLK bdb_comtype , 1t
+BLK             , 1t
+BLK bdb_xcdtra  , 1t		;Value for the ANA_XCDTRA register
+BLK bdb_xcdtrb  , 1t		;Value for the ANA_XCDTRB register
+BLK             , 2t
+BLK bdb_memsca  , 4t		;Value for the ANA_MEMSCA register
+BLK bdb_memsize , 4t		;Total amount of memory on board (bytes)
+BLK bdb_memaddr , 4t		;Memory address for board
+BLK bdb_memofs  , 4t		;Offset of shared memory (CPU address space)
+BLK bdb_memavail, 4t		;Offset of next available shared memory location
+				;  (HD64570 address space)
+BLK bdb_idb     , 0t		;IDB offset table
+bdb_SIZE=!$$$
+
+;Define IO register offsets (values are relative to the base IO register
+
+ANA_SIG1  =!00h			;(read)  First signature register
+ANA_SIG2  =!01h			;(read)  Second signature register
+ANA_SIG3  =!02h			;(read)  Third signature register
+ANA_CONFIG=!03h			;(read)  Bus, memory and interface type
+ANA_ADPREV=!04h			;(read)  Adapter revision
+ANA_PORTS =!05h			;(read)  Number of ports supported
+ANA_HNDSHK=!06h			;(read)  Supported handshake
+ANA_INTSTS=!07h			;(read)  DCD and interrupt status
+ANA_MEMSCA=!08h			;(write) Memory and SCA enable
+ANA_XCDTRA=!09h			;(write) Transmit clock and DTR control (chip A)
+ANA_SECPAL=!0Ah			;(both)  Security PAL
+ANA_INTA  =!0Bh			;(read)  Interrupt acknowledge (chip A)
+ANA_INTSEL=!0Ch			;(both)  Interrupt select register
+ANA_MEMADR=!0Dh			;(both)  Memory address register
+ANA_INTB  =!0Eh			;(read)  Interrupt acknowledge (chip B)
+ANA_XCDTRB=!0Eh			;(write) Transmit clock and DTR control (chip B)
+.PAGE
+;Device characteristics for SSANA NET devices
+
+	DATA
+
+	.MOD	4
+ssanadctbl:
+ DCHARBGN  1, knlDCharValCom##
+ DCHARENT  CLASS   , TEXT, , 8, knlDcMsgClass##   , knlDcGetClass##, knlDcSetClass##, 0
+ DCHARENT  TYPE    , TEXT, , 4, knlDcMsgType##    , knlDcGet4Byte##, 0              , dcb_type
+ DCHARENT  IOREG   , HEXV, , 4, knlDcMsgIoReg##   , dcgetioreg     , 0              , 0
+ DCHARENT  INT     , DECV, , 1, knlDcMsgInt##     , dcgetint       , 0              , 0
+ DCHARENT  MEMADDR , HEXV, , 4, msgmemaddr        , dcgetvalue     , 0              , idb_ssanmemaddr
+ DCHARENT  MEMSIZE , DECV, , 4, msgmemsize        , dcgetvalue     , 0              , idb_ssanmemsize
+ DCHARENT  PORT    , DECV, , 1, msgport           , dcgetvalue     , 0              , idb_ssanport
+ DCHARENT  ENCODING, TEXT, , 4, msgencoding       , dcgetencoding  , dcsetencoding  , 0
+ DCHARENT  IDLE    , TEXT, , 4, msgidle           , dcgetidle      , dcsetidle      , 0
+ DCHARENT  RCVCLK  , TEXT, , 4, msgrcvclk         , dcgetrcvclk    , dcsetrcvclk    , 0
+ DCHARENT  XMTCLK  , TEXT, , 4, msgxmtclk         , dcgetxmtclk    , dcsetxmtclk    , 0
+ DCHARENT  RATE    , DECV, , 4, msgrate           , dcgetvalue     , dcsetrate      , idb_ssanrate
+ DCHARENT  RFIFOL  , DECV, , 1, msgrfifol         , dcgetfifo      , dcsetfifo      , SCI_RRC
+ DCHARENT  XFIFOL  , DECV, , 1, msgxfifol         , dcgetfifo      , dcsetfifo      , SCI_TRC0
+ DCHARENT  XFIFOH  , DECV, , 1, msgxfifoh         , dcgetfifo      , dcsetfifo      , SCI_TRC1
+ DCHARENT  BUFRSIZE, DECV, , 4, msgbufrsize       , dcgetvalue     , 0              , idb_ssanbufrsz
+ DCHARENT  NUMXBUFR, DECV, , 4, msgnumxbufr       , dcgetvalue     , 0              , idb_ssannumxmtbr
+ DCHARENT  NUMRBUFR, DECV, , 4, msgnumrbufr       , dcgetvalue     , 0              , idb_ssannumrcvbr
+ DCHARENT  PKTIN   , DECV, , 4, xosnetMsgPktIn##  , dcgetvalue     , dcsetvalue     , idb_cntpktin
+ DCHARENT  BYTEIN  , DECV, , 4, knlDcMsgByteIn##  , dcgetvalue     , dcsetvalue     , idb_cntbytein
+ DCHARENT  PKTOUT  , DECV, , 4, xosnetMsgPktOut## , dcgetvalue     , dcsetvalue     , idb_cntpktout
+ DCHARENT  BYTEOUT , DECV, , 4, knlDcMsgByteOut## , dcgetvalue     , dcsetvalue     , idb_cntbyteout
+ DCHARENT  INOPROT , DECV, , 4, msgnoprot         , dcgetvalue     , dcsetvalue     , idb_cntnosap
+ DCHARENT  IBADSIZE, DECV, , 4, xosnetMsgBadSize##, dcgetvalue     , dcsetvalue     , idb_cntbadsize
+ DCHARENT  ICRC    , DECV, , 4, xosnetMsgCrcErr## , dcgetvalue     , dcsetvalue     , idb_cntcrc
+ DCHARENT  INOSBFR , DECV, , 4, xosnetMsgNoSBfr## , dcgetvalue     , dcsetvalue     , idb_cntnosbfr
+ DCHARENT  IOVRRN  , DECV, , 4, xosnetMsgOvrErr## , dcgetvalue     , dcsetvalue     , idb_cntrover
+ DCHARENT  OHUNG   , DECV, , 4, xosnetMsgXHung##  , dcgetvalue     , dcsetvalue     , idb_cntxhung
+
+	CODE
+
+msgmemaddr: DCHARINFO  {Shared memory address}
+msgmemsize: DCHARINFO  {Shared memory size (KB)}
+msgport:    DCHARINFO  {Port number on board}
+msgencoding:DCHARINFO  {Data encoding (NRZ or NRZI)}
+msgidle:    DCHARINFO  {Idle state (MARK or FLAG)}
+msgrate:    DCHARINFO  {Baud rate}
+msgrfifol:  DCHARINFO  {Receive FIFO low level}
+msgxfifol:  DCHARINFO  {Transmit FIFO low level}
+msgxfifoh:  DCHARINFO  {Transmit FIFO high level}
+msgrcvclk:  DCHARINFO  {Receive clock (EXT or PLL)}
+msgxmtclk:  DCHARINFO  {Transmit clock (EXT or INT)}
+msgbufrsize:DCHARINFO  {Buffer size (bytes)}
+msgnumxbufr:DCHARINFO  {Number of transmit buffers}
+msgnumrbufr:DCHARINFO  {Number of receive buffers}
+msgnoprot:  DCHARINFO  {Discarded - no protocol for input}
+.PAGE
+	.SBTTL	Initialization routine
+
+	INITSUB	ssanainit
+
+ssanainit:
+	MOVL	EBX, #'SANA'		;Get network driver name
+	MOVL	EDX, #ssanaaddunit	;Get offset of addunit subroutine
+	CALL	xosnetNewDrive##	;Register this network driver
+	JC	4$.S
+	MOVL	ECX, #codetop
+	CLRL	EDX
+	CLRL	EAX
+4$:	MOVL	EBX, #QSTS$DONE
+	RET
+
+	CODE
+.PAGE
+	.SBTTL	ssanaaddunit - Subroutine to add serial port interface unit
+
+;Subroutine to add serial port interface unit
+;	c(AL) = Unit number
+;	CALL	ssanaaddunit
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+
+$$$=!0
+FRM ssau_unit    , 4t		;Unit number
+FRM ssau_irout   , 4t		;Interrupt routine offset
+FRM ssau_ioreg   , 4t		;Base IO register number
+FRM ssau_intlvl  , 4t		;Interrupt level
+FRM ssau_port    , 4t		;Port number on board
+FRM ssau_idb     , 4t
+FRM ssau_memaddr , 4t		;Address of shared memory area
+FRM ssau_memavail, 4t		;Copy of initial bdb_memavail
+FRM ssau_bufrsz  , 4t		;Buffer size
+FRM ssau_numrcvbr, 4t		;Number of receive buffers
+FRM ssau_numxmtbr, 4t		;Number of transmit buffers
+ssau_SIZE=!$$$
+
+	DATA
+
+	.MOD	4
+ssanaaublk:			;Parameter block for addunitchar
+ DCHARBGN  2, knlDCharValCom##
+ DCHARENT  UNIT    , DECV, , 1, 0, 0, retclc         , 0
+ DCHARENT  TYPE    , TEXT, , 4, 0, 0, retclc         , 0
+ DCHARENT  IOREG   , HEXV, , 4, 0, 0, ssanaauioreg   , 0
+ DCHARENT  INT     , DECV, , 1, 0, 0, ssanaauint     , 0
+ DCHARENT  MEM     , HEXV, , 4, 0, 0, ssanaaumem     , 0
+ DCHARENT  PORT    , DECV, , 1, 0, 0, ssanaauport    , 0
+ DCHARENT  BUFRSIZE, DECV, , 4, 0, 0, ssanaaubufrsz  , 0
+ DCHARENT  NUMXBUFR, DECV, , 4, 0, 0, ssanaaunumxmtbr, 0
+ DCHARENT  NUMRBUFR, DECV, , 4, 0, 0, ssanaaunumrcvbr, 0
+
+	CODE
+
+ssanaaddunit::
+	ENTER	ssau_SIZE, 0		;Allocate our stack frame
+	MOVL	ssau_unit.B[EBP], EAX	;Store unit number
+	CLRL	EAX
+	MOVL	ssau_idb.B[EBP], EAX
+	DECL	EAX
+	MOVL	ssau_ioreg.B[EBP], EAX	;Store illegal values for IO register,
+	MOVL	ssau_intlvl.B[EBP], EAX	;  port, interrupt level, and memory
+	MOVL	ssau_port.B[EBP], EAX	;  address
+	MOVL	ssau_memaddr.B[EBP], EAX
+	MOVL	ssau_bufrsz.B[EBP], #1024t ;Store default buffer size
+	MOVL	ssau_numxmtbr.B[EBP], #2t ;Store default number of transmit
+					  ;  buffers
+	MOVL	ssau_numrcvbr.B[EBP], #8t ;Store default number of receive
+					  ;  buffers
+	MOVL	EBX, #ssanaaublk	;Process the characteristics
+	MOVB	AL, #0			;Fail if have a bad name
+	CALL	knlAddUnitChar##
+	JC	14$.S			;If error
+	MOVL	EAX, ssau_ioreg.B[EBP]	;Did we get all of the values we need?
+	ORL	EAX, ssau_intlvl.B[EBP]
+	ORL	EAX, ssau_port.B[EBP]
+	ORL	EAX, ssau_memaddr.B[EBP]
+	JS	6$.S			;No - fail
+
+;First see if we already have a BDB for this board
+
+	MOVL	EAX, ssau_ioreg.B[EBP]	;Get IO register value
+	MOVL	EDX, ssau_port.B[EBP]	;Get port number
+	CLRL	ECX
+	MOVL	ESI, ssanafbdb		;Point to first BDB
+2$:	TESTL	ESI, ESI
+	JE	18$.S			;If no more
+	CMPL	bdb_ioreg.B[ESI], EAX	;This one?
+	JE	16$.S			;Yes
+4$:	MOVL	ESI, [ESI]		;No - advance to next IDB
+	JMP	2$.S
+
+;Here if a required characteristic is missing
+
+6$:	MOVL	EAX, #ER_CHARM
+	JMP	14$.S
+
+;Here if device is already defined
+
+10$:	MOVL	EAX, #ER_PDADF
+	JMP	14$.S
+
+;Here if have bad value
+
+12$:	MOVL	EAX, #ER_VALUE
+14$:	JMP	aufail
+
+;Here with match on the base IO register number
+
+16$:	CMPB	DL, bdb_numports.B[ESI]	;Valid port number for board?
+	JA	12$.S			;No - fail
+	CMPL	bdb_idb-4.B[ESI+EDX*4], #0.B ;Yes - is it defined now?
+	JNE	10$.S			;Yes - fail
+	MOVB	AL, ssau_intlvl.B[EBP]	;No - is the interrupt level right?
+	CMPB	AL, bdb_intlvl.B[ESI]
+	JNE	12$.S			;No - fail
+	MOVL	EAX, ssau_memaddr.B[EBP] ;Yes - is the memory address right?
+	CMPL	EAX, bdb_memaddr.B[ESI]
+	JNE	12$.S
+	CALL	knlGetXRes##		;Get exec memory resource
+	MOVL	EBX, ESI		;Get BDB offset in right register
+	JMP	setdev			;Continue
+
+;Here if the board is not yet in use - check to see if the board exists
+
+18$:	MOVL	EDX, ssau_ioreg.B[EBP]	;Read and check the signature registers
+	A2IOP	ANA_SIG1
+	INB	[DX]
+	CMPB	AL, #'5'
+	JNE	22$.S
+	A2IOP	ANA_SIG2-ANA_SIG1
+	INB	[DX]
+	CMPB	AL, #'7'
+	JNE	22$.S
+	A2IOP	ANA_SIG3-ANA_SIG2
+	INB	[DX]
+	CMPB	AL, #'0'
+	JNE	22$.S
+	A2IOP	ANA_CONFIG-ANA_SIG3	;Read the configuration register
+	INB	[DX]
+	MOVB	AH, AL
+	ANDB	AH, #03h
+	CMPB	AH, #03h
+	JE	22$.S
+	MOVB	AH, AL
+	ANDB	AH, #1Ch
+	CMPB	AH, #1Ch
+	JE	22$.S
+	ANDB	AL, #0E0h
+	CMPB	AL, #0E0h
+	JE	22$.S
+	A2IOP	ANA_PORTS-ANA_CONFIG	;Read the number of ports register
+	INB	[DX]
+	CMPB	AL, #2			;Is it a valid number
+	JE	20$.S			;Yes
+	CMPB	AL, #4			;Maybe
+	JNE	22$.S			;No
+20$:	A2IOP	ANA_INTSEL-ANA_PORTS	;Try writing the interrupt select
+	MOVB	AL, #2Ch		;  register (this also insures that
+	OUTB	[DX]			;  the board is disabled)
+	IOPAUSE
+	INB	[DX]			;Read it back
+	ANDB	AL, #3Fh
+	CMPB	AL, #2Ch		;Is it right?
+	JNE	22$.S			;No
+	IOPAUSE
+	MOVB	AL, #0			;Yes - now try setting it to 0
+	OUTB	[DX]
+	IOPAUSE
+	INB	[DX]
+	ANDB	AL, #3Fh
+	JE	havbrd.S
+22$:	MOVL	EAX, #ER_PDNAV		;Error - no interface!
+aufail:	LEAVE
+	CLRL	ECX
+	MOVL	EBX, #QSTS$DONE
+	STC
+	TOFORK
+ret002:	RET
+
+aufailgc:
+	CLRL	EDX
+	MOVL	ES, EDX
+	MOVB	gdtable+GS_CODEALS+5, DL ;Disable the aliased code space
+aufailgx:
+	CALL	knlGiveXRes##
+	JMP	aufail.S
+.PAGE
+;Here when we have determined that we have a board
+
+havbrd:	MOVB	CL, ssau_intlvl.B[EBP]	;Get interrupt number
+	CALL	knlChkIRqAvl##		;See if its available
+	JC	aufail.S		;If not available
+	MOVL	EDX, ssau_ioreg.B[EBP]
+	A2IOP	ANA_XCDTRA
+	MOVB	AL, #0			;Reset the SCA(s)
+	OUTB	[DX]
+	MOVL	ECX, #2
+	CALL	knlSDelay##
+	MOVB	AL, #40h		;Remove reset
+	OUTB	[DX]
+	CALL	knlGetXRes##		;Get exec memory resource
+	MOVL	ECX, #bdb_SIZE
+	CALL	knlGetXMem##		;Allocate space for the BDB
+	JC	aufailgx.S
+	MOVL	EBX, EDI
+	MOVL	EAX, ssau_memaddr.B[EBP] ;Initialize the BDB
+	MOVL	bdb_memaddr.B[EBX], EAX
+	MOVB	AL, ssau_intlvl.B[EBP]
+	MOVB	bdb_intlvl.B[EBX], AL
+	MOVL	EDX, ssau_ioreg.B[EBP]
+	MOVL	bdb_ioreg.B[EBX], EDX
+	A2IOP	ANA_PORTS
+	INB	[DX]
+	CMPB	AL, #2
+	JBE	2$.S
+	MOVB	AL, #2
+2$:	MOVB	bdb_numports.B[EBX], AL
+	A2IOP	ANA_CONFIG-ANA_PORTS	;Get configuration information from
+	CLRL	EAX			;  the board
+	INB	[DX]
+	MOVB	CL, AL
+	ANDL	ECX, #1Ch.B
+	MOVL	ECX, CS:memsize[ECX]	;Get memory size
+	MOVL	bdb_memsize.B[EBX], ECX
+	SHRL	EAX, #5t
+	CMPB	AL, #4t
+	JB	4$.S
+	MOVB	AL, #4t
+4$:	MOVB	bdb_comtype.B[EBX], AL
+	MOVL	ECX, #SSANAINTSZ	;Get space for interrupt code
+	CALL	knlGetXCode##
+	JC	aufailgc		;If error
+	MOVL	ssau_irout.B[EBP], EDI	;Remember where code is going
+	MOVL	ESI, #ssanaint		;Copy prototype
+	SHRL	ECX, #2
+	MOVB	gdtable+GS_CODEALS+5, #DT_RWDATA+PL_0 ;Enable aliased code space
+	MOVW	AX, #GS_CODEALS
+	MOVL	ES, EAX
+	CLD
+	PUSHL	EDI
+	RMOVSL	[EDI], CS:[ESI]
+	POPL	EDI
+	PUSHL	#GS_CODEALS
+	POPL	ES
+	LEAL	EAX, bdb_idb.B[EBX]		  ;Store offset of BDB IDB table
+	MOVL	ES:{fix01-ssanaint}+1.B[EDI], EAX ;  in the interrupt routine
+	MOVL	EDX, ssau_ioreg.B[EBP]	;Store interrupt status register
+	A2IOP	ANA_INTSTS		;  number in the interrupt routine
+	MOVL	ES:{fix02-ssanaint}+1.B[EDI], EDX
+	MOVL	EAX, EDI		;Fix up the CALL
+	SUBL	EAX, #ssanaint
+	SUBL	ES:{fix03-ssanaint}+1.B[EDI], EAX
+	SUBL	ES:{fix05-ssanaint}+1.B[EDI], EAX ;Fix up the JMP
+	CMPB	ssau_intlvl.B[EBP], #7	;Using low interrupt?
+	JA	6$.S			;No
+	MOVW	AX, ES:{fix04-ssanaint}+2.B[EDI] ;Yes - fix up the dismiss code
+	MOVW	ES:{fix04-ssanaint}+0.B[EDI], AX
+	MOVB	AL, ES:{fix04-ssanaint}+4.B[EDI]
+	MOVB	ES:{fix04-ssanaint}+2.B[EDI], AL
+	MOVL	EAX, ES:{fix04-ssanaint}+5.B[EDI]
+	ADDL	EAX, #2.B
+	MOVL	ES:{fix04-ssanaint}+3.B[EDI], EAX
+6$:	CLRL	EAX
+	MOVL	ES, EAX
+	MOVB	gdtable+GS_CODEALS+5, AL ;Disable the aliased code space
+
+;The SYNC570 maps its memory through a 16K window.  This memory can be mapped
+;  anywhere in the 16MB ISA bus address space
+
+	MOVL	ECX, #4000h		;Get the amount of address space we
+	CALL	knlGetXSpace##		;  need (16KB)
+	JC	aufailgx		;If can't get it
+	MOVL	bdb_memofs.B[EBX], EDI	;Store offset of shared memory area
+	PUSHL	EBX
+	MOVL	EDX, bdb_memaddr.B[EBX]
+	LEAL	EBX, la_data[EDI]	;Map the shared memory area into the
+	MOVL	ECX, #4t		;  address space we just got
+	MOVL	EAX, #3Fh
+	MOVL	EDI, #-1
+	PUSHL	EDX
+	PUSHL	EBX
+	CALL	knlMapPhyPages##
+	POPL	EBX
+	POPL	EDX
+	POPL	EBX
+	JC	aufailgx
+	MOVL	bdb_memavail.B[EBX], #100h ;Initialize available memory offset
+	MOVL	EAX, ssanalbdb		;Link this BDB into the BDB list
+	MOVL	[EAX], EBX
+	MOVL	ssanalbdb, EBX
+
+;;;;;DO OTHER BOARD SETUP HERE!!!!
+
+	MOVL	EDX, ssau_ioreg.B[EBP]	;Set the memory address register
+	A2IOP	ANA_MEMADR
+	MOVB	AL, bdb_memaddr+2.B[EBX]
+	OUTB	[DX]
+	A2IOP	ANA_INTSEL-ANA_MEMADR
+	MOVB	AL, bdb_memaddr+1.B[EBX] ;Set the interrupt select register
+	SHRB	AL, #2			 ;  (note that this also enables the
+	MOVL	ECX, ssau_intlvl.B[EBP]	 ;  board)
+	ORB	AL, CS:inttbl[ECX]
+	OUTB	[DX]
+	MOVB	AL, #7Fh		;Initialize the ANA_XCDTRx registers
+	MOVB	bdb_xcdtra.B[EBX], AL	;  for clock input, DTR active, and
+	A2IOP	ANA_XCDTRA-ANA_INTSEL	;  output enabled for all ports and
+	OUTB	[DX]			;  reset the HD64570 chips
+	MOVB	bdb_xcdtrb.B[EBX], AL
+	A2IOP	ANA_XCDTRB-ANA_XCDTRA
+	OUTB	[DX]
+	MOVB	AL, #0C0h		;Initialize bdb_memsca and finish
+	MOVB	bdb_memsca.B[EBX], AL	;  enabling the board
+	A2IOP	ANA_MEMSCA-ANA_XCDTRB
+	CALL	setupchip		;Set up the first HD64570
+	MOVL	ECX, ssau_intlvl.B[EBP]	;Enable our interrupt
+	CALL	knlEnableInt##
+	JMP	setdev.S		;Continue
+.PAGE
+;Here with BDB setup (either we just created it or it was already there) - have
+;  exec memory resource when get here
+;	c{EBX} = Offset of BDB
+
+2$:	MOVL	EAX, #ER_NEDMA
+4$:	JMP	aufailgx
+
+setdev:	MOVL	ECX, #idb_mSIZE+idb_ssanSIZE ;Get size for our IDB
+	MOVL	EDX, #ssanadctbl	;Get offset of device characteristics
+	MOVL	EAX, ssau_unit.B[EBP]	;Get unit number
+	PUSHL	EBX
+	CALL	xosnetMakeIdb##		;Make our IDB
+	POPL	EBX
+	JC	5$.S			;If error
+	MOVL	idb_ssanbdb[ESI], EBX	;Store offset of the BDB in the IDB
+	MOVL	EAX, ssau_port.B[EBP]	;Store offset of the IDB in the BDB
+	MOVL	bdb_idb-4.B[EBX+EAX*4], ESI
+	MOVL	EAX, bdb_memofs.B[EBX]   ;Store offset of shared memory area
+	MOVL	idb_ssanmemofs[ESI], EAX ;  in the IDB
+	MOVL	EAX, bdb_memaddr.B[EBX]
+	MOVL	idb_ssanmemaddr[ESI], EAX
+	MOVL	EAX, bdb_memsize.B[EBX]
+	SHRL	EAX, #10t
+	MOVL	idb_ssanmemsize[ESI], EAX
+	MOVL	EAX, ssau_bufrsz.B[EBP]
+	MOVL	idb_ssanbufrsz[ESI], EAX
+	MOVL	EAX, ssau_numrcvbr.B[EBP]
+	MOVL	idb_ssannumrcvbr[ESI], EAX
+	MOVL	EAX, ssau_numxmtbr.B[EBP]
+	MOVL	idb_ssannumxmtbr[ESI], EAX
+	MOVL	EAX, bdb_memavail.B[EBX]  ;Remember current device memory
+	MOVL	ssau_memavail.B[EBP], EAX ;  allocation in case of error
+	MOVL	ECX, ssau_numrcvbr.B[EBP] ;Set up the receive buffers
+	CALL	makebuffers
+5$:	JC	20$
+	MOVL	idb_ssandescrcv[ESI], EAX
+	MOVL	idb_ssanputrrcv[ESI], EAX
+	MOVL	idb_ssantakrrcv[ESI], EAX
+	ANDL	EAX, #0FFFF0000h
+	MOVL	idb_ssanbasercv[ESI], EAX
+	MOVL	ECX, ssau_numxmtbr.B[EBP] ;Set up the transmit buffers
+	CALL	makebuffers
+	JC	5$.S
+	MOVL	idb_ssandescxmt[ESI], EAX
+	MOVL	idb_ssanputrxmt[ESI], EAX
+	MOVL	idb_ssantakrxmt[ESI], EAX
+	ANDL	EAX, #0FFFF0000h
+	MOVL	idb_ssanbasexmt[ESI], EAX
+	MOVL	idb_typname.B[ESI], #'SANA';Store type name
+	MOVB	idb_hwhdrsz.B[ESI], #0t ;Store hardware header size
+	MOVL	idb_hwpktsz.B[ESI], #1500t ;Store maximum packet size
+	MOVB	idb_hlen.B[ESI], #0	;Store hardware address size
+	MOVB	idb_hwtype+1.B[ESI], #0	;Store hardware type value for APR
+	MOVL	idb_iopprotocol.B[ESI], #xossnpNetIopSapAddr##
+	MOVL	idb_makedcb.B[ESI], #xossnpMakeDcb##
+	MOVL	idb_netclose1.B[ESI], #xossnpNetClose1##
+	MOVL	idb_setpkt.B[ESI], #setpkt
+	MOVL	idb_setecho.B[ESI], #setpkt
+	MOVL	idb_sendpkt.B[ESI], #sendpkt
+	MOVL	idb_getetype.B[ESI], #knlRtnZero##
+	MOVL	EAX, #knlRtnZero##
+	MOVL	idb_sethwa.B[ESI], EAX
+	MOVL	idb_gethwa.B[ESI], EAX
+	MOVL	idb_lnkctl.B[ESI], #knlIFnDev##
+	MOVL	idb_icmpecho.B[ESI], #ret002
+	MOVB	idb_state.B[ESI], #LNKS_ESTAB
+	MOVZBL	EAX, ssau_numxmtbr.B[EBP]
+	MOVL	idb_xmtavail.B[ESI], EAX
+	MOVL	idb_fdisp.B[ESI], #ssanafork ;Store offset of fork routine
+	MOVL	EAX, ssanalidb		;Link into our list of IDBs
+	MOVL	ssanalidb, ESI
+	PUSHL	EBX
+	TESTL	EAX, EAX
+	JE	6$.S
+	MOVL	idb_nextd.B[EAX], ESI
+	JMP	8$.S
+
+6$:	MOVL	ssanafidb, ESI
+	MOVL	EBX, #ssanaoas		;Set up our once-a-second routine the
+	CALL	knlSetupOAS##		;  first time though here
+8$:	MOVL	EBX, #temp+3		;Build name for interrupt table
+	CLRL	EAX
+	MOVL	1.B[EBX], EAX
+	MOVL	EAX, ssau_unit.B[EBP]
+	CALL	knlPutDecNmbr##
+	MOVL	EDX, #temp
+	MOVL	EBX, ssau_irout.B[EBP]	;Get address of interrupt routine
+	MOVB	CL, ssau_intlvl.B[EBP]	;Get interrupt number
+	MOVB	idb_intlvl.B[ESI], CL	;Remember it
+	MOVB	CH, #DT_TRAP+PL_0	;Set up our interrupt vector
+	CALL	knlSetIRq##
+	CALL	knlGiveXRes##		;Give up the exec memory resource
+	POPL	EBX
+	MOVL	EDX, ssau_ioreg.B[EBP]
+	MOVL	idb_bioreg.B[ESI], EDX	;Store base IO register number
+	MOVL	ECX, ssau_port.B[EBP]	;Store port number on board in the IDB
+	MOVL	idb_ssanport[ESI], ECX
+	MOVL	EAX, bdb_memofs.B[EBX]	;Store offset of the shared memory
+	MOVL	idb_ssanbase[ESI], EAX	;  area in the IDB
+	LEAL	EDX, HD_SCI0.B[EAX]	;Calculate and store offsets of the
+	TESTB	CL, #01h		;  various HD64570 register blocks in
+	JNE	10$.S			;  the IDB
+	ADDL	EDX, #HD_SCI1-HD_SCI0.B
+10$:	MOVL	idb_ssansci[ESI], EDX
+	ADDL	EAX, #HD_DMAR0
+	TESTB	CL, #01h
+	JNE	12$.S
+	ADDL	EAX, #HD_DMAR1-HD_DMAR0.B
+12$:	MOVL	idb_ssandmarcv[ESI], EAX
+	ADDL	EAX, #HD_DMAX0-HD_DMAR0.B
+	MOVL	idb_ssandmaxmt[ESI], EAX
+
+;Now initialize the SCA channel
+
+	MOVB	idb_ssanscictl[ESI], #SCICTL$IDLEMD ;Default if flag idle
+	MOVL	idb_ssanrate[ESI], #250000t ;Store initial baud rate
+	MOVB	idb_ssanscirxs[ESI], #SCIRXSSRC_EXT|SCIRXSDIV_2
+	MOVB	idb_ssanscitxs[ESI], #SCITXSSRC_EXT|SCITXSDIV_2
+	MOVB	idb_ssanscimd2[ESI], #SCIMD2CODE_NRZ
+	MOVB	SCI_CTL.B[EBX], #SCICTL$URUNMD|SCICTL$IDLEMD|SCICTL$RTS
+	CALL	reset			;Reset the channel/chip
+	CLRL	EAX			;Finished - get our return value
+	MOVL	ECX, #1
+	MOVL	EBX, #QSTS$DONE
+	LEAVE
+	TOFORK
+	RET
+
+;Here if error allocating board shared memory space - put the allocation
+;  back to the way it was when we started
+
+20$:	MOVL	EDX, ssau_memavail.B[EBP]
+	MOVL	bdb_memavail.B[EBX], EDX
+	JMP	aufailgx
+
+;Table which gives SYNC570i memory size as a function of the memory size
+;  value obtained from the board
+
+	.MOD	4
+memsize:.LONG	 10000h		; 0 = 64K
+	.LONG	 20000h		; 1 = 128K
+	.LONG	 40000h		; 2 = 256K
+	.LONG	 80000h		; 3 = 512K
+	.LONG	100000h		; 4 = 1M (?)
+	.LONG	200000h		; 5 = 2M (?)
+	.LONG	400000h		; 6 = 4M (?)
+	.LONG	800000h		; 7 = 8M (?)
+
+;Table which gives the SYNC570i interrupt select value as a function of the
+;  IRQ number (the value here also includes the card enable bit)
+
+inttbl:	.BYTE	0		; 0 = Illegal
+	.BYTE	0		; 1 = Illegal
+	.BYTE	0		; 2 = Illegal
+	.BYTE	03h		; 3 = OK
+	.BYTE	0		; 4 = Illegal
+	.BYTE	05h		; 5 = OK
+	.BYTE	0		; 6 = Illegal
+	.BYTE	07h		; 7 = OK
+	.BYTE	0		; 8 = Illegal
+	.BYTE	0		; 9 = Illegal
+	.BYTE	09h		;10 = OK
+	.BYTE	0Bh		;11 = OK
+	.BYTE	0Dh		;12 = OK
+	.BYTE	0		;13 = Illegal
+	.BYTE	0		;14 = Illegal
+	.BYTE	0		;15 = OK
+.PAGE
+;Subroutine to create a buffer ring
+;	c{EBX} = Offset of BDB
+;	c{ECX} = Number of buffers in ring - 1
+;	c{ESI} = Offset of IDB
+;	CALL	makebuffers
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  c{EAX} = Offset (in 64570 address space) of first descriptor set up
+
+;  When setting up a buffer ring, we allocate all descriptor blocks for the
+;    buffers in the ring in a single block first. This ensures that all
+;    descriptors will be in the same 16KB memory area, as is required by the
+;    HD64570.  Note that we allocate 16 bytes for each descriptor, even though
+;    the chip only uses the first 10 bytes.  We skip the next two bytes and
+;    use the last 4 to store the offset of the packet associated with the
+;    buffer.
+
+makebuffers:
+	TOFORK
+	INCL	ECX			;Always set up 1 more than we are
+	PUSHL	ECX			;  asking for!
+	IMULL	ECX, #bd_SIZE.B		;Allocate space for the descriptors
+	CALL	getshrmem
+	POPL	ECX
+	JC	8$.S			;If not enough memory left!
+	PUSHL	EDI			;Save value to return
+	MOVL	EDX, EDI
+	CALL	accessshrmem
+	ADDL	EDX, bdb_memofs.B[EBX]
+	PUSHL	ECX
+2$:	ADDL	EDI, #bd_SIZE.B
+	MOVW	[EDX], DI
+	PUSHL	EDI
+	PUSHL	EDX
+	MOVL	ECX, ssau_bufrsz.B[EBP]	;Allocate a buffer
+	CALL	getshrmem
+	POPL	EDX
+	JC	6$.S			;If error
+	MOVL	bd_buffer.B[EDX], EDI
+	CLRL	EAX
+	MOVL	bd_length.B[EDX], EAX
+	MOVL	bd_packet.B[EDX], EAX
+	POPL	EDI
+	ADDL	EDX, #bd_SIZE.B
+	DECL	[ESP]
+	JNE	2$.S			;Yes - continue
+	POPL	EAX			;Discard the counter value
+	POPL	EAX			;Get offset of first descriptor
+	MOVW	-bd_SIZE.B[EDX], AX	;Fix up the last descriptor link
+	FROMFORK
+	CLC
+	RET				;Finished
+
+;Here if error allocating buffer
+
+6$:	POPL	EDX			;Fix up the stack
+	POPL	EDX
+	POPL	EDX
+8$:	FROMFORK
+	STC
+	RET
+.PAGE
+;Subroutine to initialize a HD64570 chip
+;	c(AL)  = Value for HD_MEMSCA
+;	c{EDX} = Register number for HD_MEMSCA
+;	CALL	setupchip
+
+setupchip:
+	OUTB	[DX]
+	MOVL	EDX, bdb_memofs.B[EBX]
+	MOVB	HD_PABR0.B[EDX], #0	;Make sure the wait control boundry
+	MOVB	HD_PABR1.B[EDX], #0	;  registers are all 0
+	MOVB	HD_WCRL.B[EDX], #0
+	MOVB	HD_PCR.B[EDX], #02h
+	MOVB	HD_DMER.B[EDX], #80h
+	MOVB	HD_IMVR.B[EDX], #0	;Initialize the interrupt vector
+	MOVB	HD_ITCR.B[EDX], #0B0	;Initialize the interrupt configuration
+	MOVB	HD_IER0.B[EDX], #0FF	;Enable all SCI interrupts
+	MOVB	HD_IER1.B[EDX], #0FF	;Enable all DMA interrupts
+	MOVB	HD_IER2.B[EDX], #0	;Disable all timer interrupts
+	RET
+.PAGE
+;Subroutine called by addunitchar for the "IOREG" characteristic
+
+ssanaauioreg:
+	CMPL	EAX, #100h		;Reasonable value?
+	JB	6$.S			;No
+	TESTL	EAX, #0FFFF000Fh	;Maybe
+	JNE	6$.S			;No
+	MOVL	ssau_ioreg.B[EBP], EAX	;Yes - store value
+	RET
+
+;Subroutine called by addunitchar for the "INT" characteristic
+
+ssanaauint:
+	CMPL	EAX, #15t.B
+	JA	6$.S
+	CMPB	CS:inttbl[EAX], #0
+	JE	6$.S
+	MOVL	ssau_intlvl.B[EBP], EAX	;Store interrupt level
+retclc:	CLC
+	RET
+
+6$:	JMP	knlBadCharV##
+
+;Subroutine called by addunitchar for the "MEM" characteristic
+
+ssanaaumem:
+	TESTL	EAX, #0FF003FFFh	;Valid value?
+	JNE	6$.S			;No
+	MOVL	ssau_memaddr.B[EBP], EAX ;Yes - store value
+	RET
+
+;Subroutine called by addunitchar for the "PORT" characteristic
+
+ssanaauport:
+	CMPL	EAX, #4			;Valid value? (must be between 1 and 4)
+	JA	6$.S			;No
+	TESTL	EAX, EAX		;Maybe
+	JE	6$.S			;No
+	MOVL	ssau_port.B[EBP], EAX	;Yes - store value
+	RET
+
+;Subroutine called by addunitchar for the "BUFRSIZE" characteristic
+
+ssanaaubufrsz:
+	CMPL	EAX, #3F00h		;Too large?
+	JA	6$.S			;Yes - fail
+	CMPL	EAX, #07Fh.B		;Too small?
+	JA	8$.S			;No
+	MOVL	EAX, #80h		;Yes - make it the minimum
+8$:	MOVL	ssau_bufrsz.B[EBP], EAX
+	CLC
+	RET
+
+;Subroutine called by addunitchar for the "NUMXBUFR" characteristic
+
+ssanaaunumxmtbr:
+	CMPL	EAX, #2t.B		;Too small?
+	JA	10$.S			;No
+	MOVB	AL, #2t			;Yes - make it the minimum
+10$:	MOVL	ssau_numxmtbr.B[EBP], EAX
+	CLC
+	RET
+
+;Subroutine called by addunitchar for the "NUMRBUFR" characteristic
+
+ssanaaunumrcvbr:
+	CMPL	EAX, #2t.B		;Too small?
+	JA	12$.S			;No
+	MOVB	AL, #2t			;Yes - make it the minimum
+12$:	MOVL	ssau_numrcvbr.B[EBP], EAX
+	CLC
+	RET
+.PAGE
+	.SBTTL	getshrmem - Subroutine to allocate shared device memory
+
+;Subroutine to allocate shared device memory - Only called from the addunit
+;  routine.  Note that this is a perminate allocation - this memory cannot
+;  be given up once allocated!
+;	c{EBX} = Offset of BDB
+;	c{ECX} = Amount of memory needed
+;	CALL	getshrmem
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  c{EDI} = Offset (in HD64570 address space) of memory allocated
+
+getshrmem:
+	CALL	chkshrmem
+	JC	2$.S
+	LEAL	EAX, [EDI+ECX]		;Calculate new available offset
+	MOVL	bdb_memavail.B[EBX], EAX
+2$:	RET
+
+;Subroutine to ensure that an area of shared memory will be allocated in a
+;  single bank.
+;	c{EBX} = Offset of BDB
+;	c{ECX} = Size of area
+;	CALL	chkshrmem
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  c{EDI} = Offset (in HD64570 address space) of next space to allocate
+
+;No memory is allocated, but bdb_memavail is updated if necessary to ensure
+;  that the requested amount of memory will be allocated in the same bank
+
+chkshrmem:
+	MOVL	EDI, bdb_memavail.B[EBX] ;Get next offset to use
+	MOVL	EAX, EDI		;Get amount left in this bank
+	NEGL	EAX
+	ANDL	EAX, #3FFFh
+	CMPL	ECX, EAX		;Is there enough for this request?
+	JBE	4$.S			;Yes
+	ADDL	EDI, #3FFFh		;No - advance to next bank
+	ANDL	EDI, #0FFFFC000h
+	ADDL	EDI, #100h
+	CMPL	EDI, bdb_memsize.B[EBX]	;Do we have another bank?
+	JAE	6$.S			;No - fail!
+4$:	CLC
+	RET
+
+;Here if can't get memory
+
+6$:	MOVL	EAX, #ER_NEDMA
+	STC
+	RET
+.PAGE
+;Here to get the value of the IOREG characteristic
+
+dcgetioreg:
+	MOVL	ESI, dcb_netidb.B[EDI]
+	MOVL	EAX, idb_bioreg.B[ESI]
+	ANDB	AL, #0FCh
+	CLRL	EDX
+	RET
+
+;Here to get the value of the INT characteristic
+
+dcgetint:
+	MOVL	ESI, dcb_netidb.B[EDI]
+	MOVZBL	EAX, idb_intlvl.B[ESI]
+	CLRL	EDX
+4$:	RET
+
+;Here to get the value of the IDLE characteristic.  This indicates if we are
+;  to send flags or marks when the line is idle.
+
+dcgetidle:
+	MOVL	ESI, dcb_netidb.B[EDI]
+	MOVL	EAX, #'MARK'		;Assume mark idle
+	TESTB	idb_ssanscictl[ESI], #SCICTL$IDLEMD ;Right?
+	JE	4$.S			;Yes
+	MOVL	EAX, #'FLAG'		;No
+	RET
+
+;Here to set the value of the IDLE characteristic.
+
+dcsetidle:
+	MOVL	ESI, dcb_netidb.B[EDI]
+	MOVL	EBX, #idletbl
+	MOVL	ECX, #2
+	CALL	knlGetDcVal1##
+	JC	4$.S
+	TESTL	EAX, EAX
+	JE	6$.S			;If mark
+	ORB	idb_ssanscictl[ESI], #SCICTL$IDLEMD ;If flag
+	JMP	8$.S
+
+6$:	ANDB	idb_ssanscictl[ESI], #~SCICTL$IDLEMD
+8$:	JMP	reset
+
+;Here to get the value of the ENCODING characteristic
+
+dcgetencoding:
+	MOVL	ESI, dcb_netidb.B[EDI]
+	MOVL	EBX, #encoding
+	MOVL	ECX, #ENCODINGSZ
+	MOVZBL	EAX, idb_ssanscimd2[ESI]
+	JMP	knlGetDcName##
+
+;Here to set the value of the ENCODING characteristic
+
+dcsetencoding:
+	MOVL	ESI, dcb_netidb.B[EDI]
+	MOVL	EBX, #encoding
+	MOVL	ECX, #ENCODINGSZ
+	CALL	knlGetDcVal2##
+	JC	14$.S
+	MOVB	idb_ssanscimd2[ESI], AL
+	MOVL	EBX, idb_ssansci[ESI]
+	MOVB	SCI_MD2.B[EBX], AL
+14$:	RET
+
+	.MOD	4
+encoding:
+	.LONG	'NRZ' , 0    , SCIMD2CODE_NRZ
+	.LONG	'NRZI', 0    , SCIMD2CODE_NRZI
+	.LONG	'FM0' , 0    , SCIMD2CODE_FM0
+	.LONG	'FM1' , 0    , SCIMD2CODE_FM1
+	.LONG	'MANC', 'HST', SCIMD2CODE_MAN
+ENCODINGSZ=!{$-encoding}/12t
+.PAGE
+;Here to get the value of the RCVCLK characteristic
+
+dcgetrcvclk:
+	MOVL	ESI, dcb_netidb.B[EDI]
+	MOVB	AL, idb_ssanscirxs[ESI]
+	ANDL	EAX, #SCIRXS$SRC.B
+	MOVL	EBX, #rcvclkv
+	MOVL	ECX, #RCVCLKVSZ
+	JMP	knlGetDcName##
+
+;Here to set the value of the RCVCLK characteristic
+
+dcsetrcvclk:
+	MOVL	ESI, dcb_netidb.B[EDI]
+	MOVL	EBX, #rcvclkv
+	MOVL	ECX, #RCVCLKVSZ
+	CALL	knlGetDcVal2##
+	JC	2$.S
+setrclk:ANDB	idb_ssanscirxs[ESI], #~SCIRXS$SRC
+	ORB	idb_ssanscirxs[ESI], AL
+	MOVL	EBX, idb_ssansci[ESI]
+	MOVB	SCI_RXS.B[EBX], AL
+	CLC
+2$:	RET
+
+;Here to get the value of the XMTCLK characteristic
+
+dcgetxmtclk:
+	MOVL	ESI, dcb_netidb.B[EDI]
+	MOVB	AL, idb_ssanscitxs[ESI]
+	ANDL	EAX, #SCITXS$SRC.B
+	MOVL	EBX, #xmtclkv
+	MOVL	ECX, #XMTCLKVSZ
+	JMP	knlGetDcName##
+
+;Here to set the value of the XMTCLK characteristic
+;NOTE: Changing this characteristic will generally require that the hardware
+;      be changed to treat the TRxC pin as an input or output as specified
+
+dcsetxmtclk:
+	MOVL	ESI, dcb_netidb.B[EDI]
+	MOVL	EBX, #xmtclkv
+	MOVL	ECX, #XMTCLKVSZ
+	CALL	knlGetDcVal2##
+	JC	2$.S
+setxclk:TESTB	AL, #SCITXS$SRC		;Changing TXC pin to be an output?
+	JE	4$.S			;No
+	PUSHL	EAX			;Yes
+	MOVB	AL, #0
+	CALL	settxs			;Set the board for output
+	POPL	EAX
+4$:	ANDB	idb_ssanscitxs[ESI], #~SCITXS$SRC
+	ORB	idb_ssanscitxs[ESI], AL
+	MOVL	EBX, idb_ssansci[ESI]
+	MOVB	SCI_TXS.B[EBX], AL
+
+	TESTB	AL, #SCITXS$SRC		;Is the pin an input now?
+	JNE	6$.S			;No
+	MOVB	AL, #0FF
+	CALL	settxs			;Yes - set board for input
+	CLC
+6$:	RET
+
+;Subroutine to set direction of the transmit clock pin on the board
+;	c(AL) = Direction (0 = output, 0FFh = input)
+;	CALL	settxs
+
+settxs:	MOVB	CL, idb_ssanport[ESI]	;Get mask for bit to set (bit 4 for
+	MOVB	AH, #08h		;  port 1 or bit 5 for port 2)
+	SHLB	AH, CL
+	ANDB	AL, AH
+	NOTB	AH
+	MOVL	EBX, idb_ssanbdb[ESI]
+	ANDB	bdb_xcdtra.B[EBX], AH
+	ORB	AL, bdb_xcdtra.B[EBX]
+	MOVB	bdb_xcdtra.B[EBX], AL
+	MOVL	EDX, idb_bioreg.B[ESI]
+	A2IOP	ANA_XCDTRA
+	OUTB	[DX]
+	RET
+
+;Here to get the value of a FIFO limit value
+
+dcgetfifo:
+	MOVL	ESI, dcb_netidb.B[EDI]
+	MOVL	EAX, idb_ssansci[ESI]
+	MOVB	AL, [EBX+EAX]
+	CLRL	EDX
+	RET
+
+;Here to set the value of a FIFO limit value
+
+dcsetfifo:
+	CMPL	EAX, #31t.B
+	JA	knlBadCharV##
+	MOVL	ESI, dcb_netidb.B[EDI]
+	MOVL	EDX, idb_ssansci[ESI]
+	MOVB	[EBX+EDX], AL
+	CLC
+	RET
+.PAGE
+;Here to get the value of an error counter or other value which does not
+;  require special handling
+
+dcgetvalue:
+	ADDL	EBX, dcb_netidb.B[EDI]	;Point to the count value
+	MOVL	EAX, [EBX]		;Get it
+	CLRL	EDX			;Only 32 bits
+	RET
+
+;Here to set the value of an error counter or other value
+
+dcsetvalue:
+	ADDL	EBX, dcb_netidb.B[EDI]	;Point to the count value
+	MOVL	[EBX], EAX		;Set it
+	RET				;Thats all
+.PAGE
+;Here to set the vaue of the RATE characteristic
+
+dcsetrate:
+	MOVL	ESI, dcb_netidb.B[EDI]	;Get offset of our IDB
+	CMPL	EAX, #19607t		;Is it too small?
+	JA	brcalc.S		;No
+	MOVL	EAX, #19607t		;Yes - use minimum
+brcalc:	MOVL	ECX, EAX		;Calculate baud rate divisor
+	TESTL	ECX, ECX
+	JNE	2$.S
+	INCL	ECX
+2$:	SHRL	EAX, #1
+	ADDL	EAX, #5000000t
+	CLRL	EDX
+	DIVL	ECX
+	ANDL	EAX, #0FF
+	JNE	4$.S
+	INCL	EAX
+4$:	MOVL	EBX, idb_ssansci[ESI]
+	MOVB	SCI_TMC.B[EBX], AL	;Set the baud rate divisor
+	MOVL	ECX, EAX
+	MOVL	EAX, #5000000t		;Calculate actual baud rate
+	CLRL	EDX
+	DIVL	ECX
+	MOVL	idb_ssanrate[ESI], EAX	;Store it
+	CLC
+	RET
+.PAGE
+	.SBTTL	Serial interface interrupt routines
+
+;The following is a prototype for the interrupt service routine entry code
+;  - this code is copied for each unit by ssanaaddunit
+
+ssanaint:
+	PUSHAL				;Save all registers
+	PUSHL	DS
+	PUSHL	ES
+	PUSHL	FS
+	PUSHL	GS
+	PUSHL	#GS_DATA.B		;Make our data addressable
+	POPL	DS
+fix01:
+2$:	MOVL	EBX, #0			;Get offset of the BDB + bdb_idb
+fix02:	MOVL	EDX, #0			;Get the interrupt status bits
+	INB	[DX]
+	TESTB	AL, #60h		;Have an interrupt now?
+	JE	10$.S			;No - finished
+	A2IOP	ANA_INTA-ANA_INTSTS	;Yes
+	TESTB	AL, #20h		;For chip A?
+	JNE	4$.S			;Yes
+	ADDL	EBX, #8t.B		;No - adjust BDB offset
+	A2IOP	ANA_INTB-ANA_INTA	;Adjust interrupt acknowledge register
+4$:	INB	[DX]			;Get interrupt vector byte
+	TESTB	AL, #20h		;For channel 1?
+	JE	6$.S			;No
+	ADDL	EBX, #4t.B		;Yes
+fix03:
+6$:	CALL	intcom
+	JMP	2$.S
+
+;Here if don't have any interrupts pending
+
+10$:	MOVB	AL, #INT_EOI		;Release the interrupt controller
+	CLI
+fix04:	OUTB	P_INC2P0		;Release 2nd interrupt controller
+	OUTB	P_INC1P0		;Release 1st interrupt controller
+					;If we are using a low interrupt, the
+					;  OUTB P_INC2P0 instruction is removed
+					;  and the following two instructions
+					;  are moved up 2 bytes when this code
+					;  is copied!
+fix05:	JMP	knlDismissInt2##	;Check for scheduling and dismiss
+SSANAINTSZ=!{{$-ssanaint}+3}&~03h
+.PAGE
+;Common interrupt routine
+;	c(AL)  = Interrupt vector byte
+;	c{EBX} = Offset of BDB pointer to the IDB
+
+intcom:	MOVL	EDI, [EBX]		;Get offset of the IDB
+	ANDL	EAX, #1Eh.B		;Remove junk from the vector bits
+	JMPIL	CS:intdsp[EAX*2]	;Dispatch on the interrupt
+
+	.MOD	4
+intdsp:	.LONG	intbad		;x00000 - Illegal
+	.LONG	intbad		;x00010 - Illegal
+	.LONG	intrcvready	;x00100 - Receive buffer ready
+	.LONG	intxmtready	;x00110 - Transmit buffer ready
+	.LONG	intrcvstatus	;x01000 - Receive status
+	.LONG	intxmtstatus	;x01010 - Transmit status
+	.LONG	intbad		;x01100 - Illegal
+	.LONG	intbad		;x01110 - Illegal
+	.LONG	intbad		;x10000 - Illegal
+	.LONG	intbad		;x10010 - Illegal
+	.LONG	intrcvdmaerr	;x10100 - Receive DMA error
+	.LONG	intrcvdmaend	;x10110 - Receive DMA complete
+	.LONG	intxmtdmaerr	;x11000 - Transmit DMA error
+	.LONG	intxmtdmaend	;x11010 - Transmit DMA complete
+	.LONG	inttimer0	;x11100 - Timer 0
+	.LONG	inttimer1	;x11110 - Timer 1
+
+;Here if have illegal interrupt condition
+
+intbad:	CRASH	ICON
+.PAGE
+	.SBTTL	intrxready - Receive buffer ready interrupt routine
+
+intrcvready:
+	CRASH	????
+
+	.SBTTL	inttxready - Transmit buffer ready interrupt routine
+
+intxmtready:
+	CRASH	????
+
+	.SBTTL	intrxstatus - Receive status interrupt routine
+
+intrcvstatus:
+	CRASH	????
+
+	.SBTTL	inttxstatus - Transmit status interrupt routine
+
+intxmtstatus:
+	CRASH	????
+
+	.SBTTL	intrxdmaerr - Receive DMA error interrupt routine
+
+intrcvdmaerr:
+	CRASH	????
+
+	.SBTTL	intrxdmaend - Receive DMA complete interrupt routine
+
+intrcvdmaend:
+	MOVL	ECX, idb_ssandmarcv[EDI] ;Clear the hardware interrupt
+	MOVB	DMA_DSR.B[ECX], #DMADSR$EOT|DMADSR$EOM|DMADSR$BOF|DMADSR$DEBWD
+	ORB	idb_ssanforkfnc[EDI], #08h
+	JMP	knlReqFork#		;Request a device fork
+
+	.SBTTL	inttxdmaerr - Transmit DMA error interrupt routine
+
+intxmtdmaerr:
+	CRASH	????
+
+	.SBTTL	inttxdmaend - Transmit DMA complete interrupt routine
+
+intxmtdmaend:
+	MOVL	ECX, idb_ssandmaxmt[EDI] ;Clear the hardware interrupt
+	MOVB	DMA_DSR.B[ECX], #DMADSR$EOT|DMADSR$EOM|DMADSR$BOF|DMADSR$DEBWD
+	ORB	idb_ssanforkfnc[EDI], #04h
+	JMP	knlReqFork##		;Request a device fork
+
+	.SBTTL	inttimer0 - Timer 0 interrupt routine
+
+inttimer0:
+	CRASH	????
+
+	.SBTTL	inttimer1 - Timer 1 interrupt routine
+
+inttimer1:
+	CRASH	????
+.PAGE
+	.SBTTL	ssanafork - Fork level routine
+
+;Here for device fork requests
+
+ssanafork:
+	MOVL	ESI, EDI
+forklp:	MOVZBL	EAX, idb_ssanforkfnc[ESI]
+	JMPIL	CS:forkdsp[EAX]
+
+	.MOD	4
+forkdsp:.LONG	ret002		;00000000 - Idle
+	.LONG	forkxmt		;00000100 - Output done
+	.LONG	forkrcv		;00001000 - Input done
+	.LONG	forkrcv		;00001100 - Both input and output done
+
+;Here for input done
+
+;  It should be noted that because of the way the HD64570 tests for
+;  termination, it is not possible to use every buffer in a fixed ring.
+;  Instead of continually modifying the buffer ring, we just tell the chip
+;  to stop one buffer early.  We have enough buffer memory that this is not
+;  really a problem.
+
+forkrcv:ANDB	idb_ssanforkfnc[ESI], #~08h
+2$:	MOVL	EDX, idb_ssantakrrcv[ESI] ;Get offset of buffer descriptor
+	MOVL	ECX, idb_ssandmarcv[ESI] ;Do we have a buffer to process now?
+	MOVZWL	EAX, DMA_CDA.B[ECX]
+	CMPL	EAX, EDX
+	JE	forklp.S		;No
+	PUSHL	EDX
+	CALL	accessshrmem		;Yes - convert to CPU offset
+	MOVZWL	EAX, [EDX]		;Advance our taker pointer
+	MOVL	idb_ssantakrrcv[ESI], EAX
+	MOVB	AL, bd_status.B[EDX]	;Get buffer status byte
+	TESTB	AL, #7Ch		;Any errors indicated?
+	JNE	14$			;Yes
+	CLRL	EDI			;No
+	MOVZWL	ECX, bd_length.B[EDX]	;Get length of frame
+	CALL	xosnetGetBufr##		;Get a network buffer
+	JC	12$			;If can't get one
+	ADDL	idb_cntbytein.B[ESI], ECX
+	INCL	idb_cntpktin.B[ESI]
+	MOVL	npb_count.B[EBX], ECX	;Store total count in packet
+	MOVB	npb_lpofs.B[EBX], #0	;Store header offsets
+	MOVB	npb_npofs.B[EBX], #0
+	MOVL	EDX, bd_buffer.B[EDX]	;Get offset of buffer
+	CALL	accessshrmem		;Change to CPU offset
+	PUSHL	ECX
+	PUSHL	ESI
+	MOVL	ESI, EDX		;Copy data to the packet buffer
+	MOVL	EDI, EBX
+	PUSHL	DS
+	POPL	ES
+	CLD
+	CMPL	ECX, #8t
+	JB	6$.S
+	MOVL	EAX, ECX
+	SHRL	ECX, #2
+	RMOVSL	[EDI], [ESI]
+	MOVL	ECX, EAX
+	ANDL	ECX, #03h.B
+6$:	RMOVSB	[EDI], [ESI]
+	POPL	ESI
+	POPL	ECX
+	MOVL	npb_count.B[EBX], ECX	;Store total count in packet
+	MOVB	npb_lpofs.B[EBX], #0	;Store header offsets
+	MOVB	npb_npofs.B[EBX], #0
+	PUSHL	ESI
+	MOVL	ESI, idb_sdbhead.B[ESI]
+	TESTL	ESI, ESI
+	JE	115$.S
+	MOVL	EDX, EBX		;Point to start of data
+	CALLI	sdb_receive.B[ESI]	;Dispatch to the service routine
+	POPL	ESI
+10$:	POPL	EDX			;Restore offset of this descriptor
+	MOVL	ECX, idb_ssandmarcv[ESI] ;Make it available to the hardware
+	MOVW	DMA_EDA.B[ECX], DX
+	MOVL	EBX, idb_ssandmarcv[ESI]
+	TESTB	DMA_DSR.B[EBX], #DMADSR$DMAENB ;Is DMA enabled?
+	JNE	2$			;Yes
+	MOVL	EDX, idb_ssansci[ESI]	;No
+	TESTB	SCI_STS3.B[EDX], #SCISTS3$RXE ;Is the receiver enabled?
+	JNE	11$			;Yes
+	MOVB	SCI_CMD.B[EDX], #SCICMD_RXENB ;NO - start the receiver
+11$:	MOVB	DMA_DSR.B[EBX], #DMADSR$DMAENB ;Enable the DMA channel
+	JMP	2$			;Continue
+
+;Here if no protocol device is set up
+
+115$:	POPL	ESI
+	INCL	idb_cntnosap.B[ESI]	;Count the error
+	CALL	xosnetGiveBufr##	;Give up the packet
+	JMP	10$.S			;Continue
+
+;Here if can't allocate a packet buffer
+
+12$:	INCL	idb_cntnosbfr.B[EDI]	;Count the error
+	JMP	10$.S			;Discard the frame
+
+;Here if have error(s) on the frame
+
+$$$$err::
+14$:	BTL	EAX, #6t		;Short frame?
+	ADCL	idb_cntrunt.B[ESI], #0.B
+	BTL	EAX, #5t		;Aborted frame?
+	ADCL	idb_cntfa[ESI], #0.B
+	BTL	EAX, #4t		;Residual bit(s)?
+	ADCL	idb_cntbadsize.B[ESI], #0.B
+	BTL	EAX, #3t		;Overrun?
+	ADCL	idb_cntrover.B[ESI], #0.B
+	BTL	EAX, #2t		;CRC error?
+	ADCL	idb_cntcrc[ESI], #0.B
+	JMP	10$.S			;Discard the frame
+.PAGE
+;Here for output done
+
+forkxmt:ANDB	idb_ssanforkfnc[ESI], #~04h ;Clear the fork request
+	MOVL	EDX, idb_ssantakrxmt[ESI] ;Get offset of buffer descriptor
+10$:	MOVL	ECX, idb_ssandmaxmt[ESI]
+	MOVZWL	ECX, DMA_CDA.B[ECX]	;Have a buffer to process here?
+	CMPL	EDX, ECX
+	JE	12$.S			;No - finished here
+	CALL	accessshrmem		;Yes
+	MOVL	EBX, bd_packet.B[EDX]	;Get offset of output packet
+	CLRL	EAX			;Just to be safe, clear the pointer!
+	MOVL	bd_packet.B[EDX], EAX
+	PUSHL	EDX
+	CALL	xosnetFinXmit2##	;Do output done packet processing
+	POPL	EDX			;  (WARNING: this can call our sendpkt)
+	MOVZWL	EDX, [EDX]		;Get device offset of next descriptor
+	MOVL	idb_ssantakrxmt[ESI], EDX ;Update our taker pointer
+	JMP	10$.S			;Continue
+
+;Here with all complete output handled
+
+12$:	TESTB	idb_sts.B[ESI], #IS$REXMIT ;Doing forced retransmit now?
+	JE	forklp			;No - continue
+	MOVB	AL, idb_xmtavail.B[ESI]	;Yes - are we completely idle now?
+	CMPB	AL, idb_ssannumxmtbr[ESI]
+	JB	forklp			;No
+	PUSHL	ESI			;Yes - call frame level routine for
+	MOVL	ESI, idb_sdbhead.B[ESI]	;  this
+	CALLI	sdb_frcrexmit.B[ESI]
+	POPL	ESI
+	JC	forklp
+	ANDB	idb_sts.B[ESI], #IS$REXMIT
+	JMP	forklp
+.PAGE
+	.SBTTL	sendpkt - Subroutine to send a packet
+
+;Subroutine to send a packet over the network - must be called from fork level,
+;  does not wait for completion
+;	c{EBX} = Offset of packet buffer (may be chained)
+;	c{ESI} = Offset of IDB
+;	CALL	sendpkt
+;	C:set = Error
+;	  c{EAX} = Error code
+;	  c{EBX} = Offset of packet buffer
+;	C:clr = Normal
+;	  c{EBX} = 0
+
+sendpkt:PUSHL	EDI
+	MOVL	EDX, idb_ssanputrxmt[ESI] ;Get offset of transmit descriptor
+	PUSHL	EDX
+	CALL	accessshrmem		;Set up to access the shared memory
+	MOVL	ECX, npb_count.B[EBX]	;Get size of the packet
+	MOVW	bd_length.B[EDX], CX	;Store data length in descriptor
+	MOVB	bd_status.B[EDX], #80h	;Store buffer status bits
+	MOVL	bd_packet.B[EDX], EBX	;Store offset of our packet
+	MOVZWL	EAX, [EDX]		;Get offset of next descriptor
+	PUSHL	EAX
+	MOVL	EDX, bd_buffer.B[EDX]	;Get offset of buffer
+	CALL	accessshrmem
+	MOVL	EDI, EDX
+	PUSHL	DS
+	POPL	ES
+	CLD
+	PUSHL	ESI
+	MOVL	ESI, EBX
+	CMPL	ECX, #8.B		;Very small packet?
+	JB	4$.S			;Yes
+	MOVL	EAX, ECX		;No - copy whole longs first
+	SHRL	ECX, #2t
+	CLD
+	RMOVSL	[EDI], [ESI]
+	ANDL	EAX, #3t.B
+	MOVL	ECX, EAX
+4$:	RMOVSB	[EDI], [ESI]		;Copy any bytes left over
+	POPL	ESI
+	POPL	EAX
+	POPL	EDX
+	POPL	EDI
+	MOVL	ECX, idb_ssandmaxmt[ESI]
+	MOVW	DMA_EDA.B[ECX], AX
+	MOVL	idb_ssanputrxmt[ESI], EAX
+	TESTB	DMA_DSR.B[ECX], #DMADSR$DMAENB ;Is DMA enabled?
+	JNE	6$.S			;Yes
+	MOVW	DMA_CDA.B[ECX], DX	;No - start it now
+	MOVB	DMA_DSR.B[ECX], #DMADSR$DMAENB
+6$:	RET				;Finished for now
+.PAGE
+	.SBTTL	setpkt - Subroutine to set up packet header
+
+;Subroutine to set up hardware level packet header (Note: this driver does
+;  not use a hardware level header)
+;	c[AX]  = Ethertype value
+;	c{EBX} = Offset of packet buffer
+;	c{ESI} = Offset of IDB
+;	CALL	setpkt
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  c{EDX} = Offset of start of software part of packet
+
+setpkt:	MOVB	npb_lpofs.B[EBX], #0	;Store offset of next level
+	MOVL	npb_count.B[EBX], #0	;Store initial total size
+	MOVL	EDX, EBX		;Get pointer to next header
+	CLC
+	RET
+.PAGE
+	.SBTTL	accessshrmem - Subroutine to set up to access the shared memory
+
+;Subroutine to set up to access the shared device memory
+;	c{EDX} = Offset of shared memory to access (board offset)
+;	c{ESI} = Offset of IDB
+;	CALL	accessshrmem
+;	c{EDX} = Offset of shared memory to access (CPU offset)
+;  All registers except EDX are preserved
+
+accessshrmem:
+	REQUIREFORK
+	PUSHL	EAX			;Save registers we need
+	PUSHL	EBX
+	MOVL	EBX, idb_ssanbdb[ESI]	;Get offset of the BDB
+	MOVL	EAX, EDX
+	SHRL	EAX, #14t
+	ORB	AL, #0C0h		;Set memory and SCA enable bits
+	MOVB	bdb_memsca.B[EBX], AL
+	PUSHL	EDX
+	MOVL	EDX, bdb_ioreg.B[EBX]
+	A2IOP	ANA_MEMSCA
+	OUTB	[DX]
+	POPL	EDX
+	POPL	EBX
+	POPL	EAX
+	ANDL	EDX, #03FFFh
+	ADDL	EDX, idb_ssanbase[ESI]	;Change to CPU offset
+	RET
+.PAGE
+	.SBTTL	reset - Subroutine to reset the interface
+
+;Subroutine to reset the interface
+;	c{ESI} = Offset of IDB
+;	CALL	reset
+
+reset:	TOFORK	reset2
+	CALL	reset2
+	FROMFORK
+	RET
+
+reset2:	MOVL	EBX, idb_ssansci[ESI]	;Point to the SCI registers
+	MOVB	SCI_CMD.B[EBX], #SCICMD_RESET ;Reset the channel
+	MOVL	ECX, #10t		;Wait for a short time
+	CALL	knlSDelay##
+
+;Reset the transmit and receive buffers
+
+	MOVL	ECX, idb_ssannumxmtbr[ESI] ;Get actual number of transmit
+	INCL	ECX			   ;  buffers
+	MOVL	EDX, idb_ssandescxmt[ESI] ;Point to 1st transmit buffer
+	CALL	accessshrmem		  ;  descriptor
+4$:	MOVL	bd_length.B[EDX], #800000 ;Initialize the transmit buffer
+	ADDL	EDX, #bd_SIZE.B		  ;  descriptors
+	LOOP	ECX, 4$
+	MOVL	ECX, idb_ssannumrcvbr[ESI] ;Get actual number of receive buffers
+	INCL	ECX
+	MOVL	EDX, idb_ssandescrcv[ESI] ;Point to 1st receive buffer
+	CALL	accessshrmem		  ;  descriptor
+6$:	MOVL	bd_length.B[EDX], #0	;Initialize the receive buffer
+	ADDL	EDX, #bd_SIZE.B		;  descriptors
+	LOOP	ECX, 6$
+
+;Initialize the transmit DMA channel
+
+	MOVL	EBX, idb_ssandmaxmt[ESI] ;Point to the transmit DMA registers
+	MOVB	DMA_DMR.B[EBX], #DMADMR$CHAIN|DMADMR$MULT
+					;Set for chained-multiple-block mode
+	MOVL	EAX, idb_ssandescxmt[ESI] ;Get offset of first transmit
+					  ;  descriptor
+	MOVW	DMA_CDA.B[EBX], AX	;Store low 16 bits
+	SHRL	EAX, #16t		;Get the high 8 bits
+	MOVB	DMA_SARB.B[EBX], AL	;Store them
+	MOVL	EAX, idb_ssanbufrsz[ESI] ;Get buffer length
+	MOVW	DMA_BFL.B[EBX], AX	;Store it
+	MOVB	DMA_DIR.B[EBX], #DMADIR$EOME ;Enable frame transfer end
+					     ;  interrupt
+
+;Initialize the receive DMA channel
+
+	MOVL	EBX, idb_ssandmarcv[ESI] ;Point to the receive DMA registers
+	MOVB	DMA_DMR.B[EBX], #DMADMR$CHAIN|DMADMR$MULT
+					;Set for chained-multiple-block mode
+	MOVL	EAX, idb_ssandescrcv[ESI] ;Get offset of first receive
+					  ;  descriptor
+	MOVW	DMA_CDA.B[EBX], AX	;Store low 16 bits
+	IMULL	ECX, idb_ssannumrcvbr[ESI], #bd_SIZE.B
+	ADDL	EAX, ECX		;Get offset of last descriptor
+	MOVW	DMA_EDA.B[EBX], AX	;Store it as the stop descriptor
+	SHRL	EAX, #16t		;Get the high 8 bits
+	MOVB	DMA_SARB.B[EBX], AL	;Store them
+	MOVL	EAX, idb_ssanbufrsz[ESI] ;Get buffer length
+	MOVW	DMA_BFL.B[EBX], AX	;Store it
+	MOVB	DMA_DSR.B[EBX], #DMADSR$DMAENB ;Enable DMA channel
+	MOVB	DMA_DIR.B[EBX], #DMADIR$EOME ;Enable frame transfer end
+					     ;  interrupt
+	MOVB	AL, #0Ah		;Assume channel 0 on chip
+	TESTB	idb_ssanport[ESI], #1	;Right?
+	JNE	10$.S			;Yes
+	MOVB	AL, #0A0h		;No
+10$:	MOVL	EDX, idb_ssanbase[ESI]
+	ORB	HD_IER1.B[EDX], AL	;Enable DMA interurpts
+
+;Initialize the SCI and start the receiver
+
+	MOVL	EBX, idb_ssansci[ESI]	;Point to the SCI registers
+	MOVB	SCI_MD0.B[EBX], #SCIMD0PROT_HDLC|SCIMD0$CRCENB|SCIMD0$CRCSEL|-
+			SCIMD0$CRCINV
+	MOVB	SCI_MD1.B[EBX], #0
+	MOVB	AL, idb_ssanscimd2[ESI]	;Set encoding method
+	MOVB	SCI_MD2.B[EBX], AL
+	MOVB	AL, idb_ssanscictl[ESI] ;Set control modes
+	MOVB	SCI_CTL.B[EBX], AL
+	MOVB	SCI_IDL.B[EBX], #0FFh
+	MOVB	AL, idb_ssanscirxs[ESI]	;Set up receive clock selection
+	CALL	setrclk
+	MOVB	AL, idb_ssanscitxs[ESI]	;Set up transmit clock selection
+	CALL	setxclk
+	MOVL	EAX, idb_ssanrate[ESI]	;Set the baud rate
+	CALL	brcalc
+	MOVL	EBX, idb_ssansci[ESI]
+	MOVB	SCI_CMD.B[EBX], #SCICMD_RXENB ;Start the receiver
+	MOVB	SCI_CMD.B[EBX], #SCICMD_TXENB ;Start the transmitter
+	ANDB	idb_sts.B[ESI], #~IS$RESET ;Indicate not resetting now
+	RET
+.PAGE
+	.SBTTL	ssanaoas - Once-a-second routine
+
+;Once-a-second routine
+
+ssanaoas:
+	MOVL	ESI, ssanafidb		;Point to our first IDB
+2$:	CLI				;No interrupts here
+	CMPB	idb_ssanotimer[ESI], #0 ;Is the output timer running?
+	JE	10$.S			;No
+	DECB	idb_ssanotimer[ESI]	;Yes - has it run out?
+	JNE	10$			;No
+
+;Here if have hung serial output
+
+	INCL	idb_cntxhung[ESI]	;Count the error
+	TOFORK
+	ORB	idb_sts.B[ESI], #IS$RESET ;Indicate resetting
+	MOVL	EDX, idb_ssantakrxmt[ESI] ;Get offset of current buffer
+4$:	CALL	accessshrmem		  ;  descriptor
+	MOVL	EBX, bd_packet.B[EDX]	;Get offset of output packet
+	TESTL	EBX, EBX
+	JE	6$.S			;Finished if none
+	CLRL	EAX			;Clear the pointer
+	MOVL	bd_packet.B[EDX], EAX
+	PUSHL	EDX
+	MOVL	EAX, #ER_DEVER		;Report this as a device error
+	STC
+	CALL	xosnetFinXmit2##	;Do output done packet processing
+	POPL	EDX
+	MOVZWL	EDX, [EDX]		;Get device offset of next descriptor
+	JMP	4$.S			;Continue
+
+6$:	FROMFORK
+	CALL	reset			;Reset the channel
+10$:	MOVL	ESI, idb_nextd.B[ESI]	;Advance to next IDB
+	TESTL	ESI, ESI		;Any more?
+	JNE	2$			;Yes - continue
+	RET				;No - finished
+.PAGE
+	.SBTTL	Data
+
+	.MOD	4
+idletbl:.LONG	'MARK', 0
+	.LONG	'FLAG', 0
+
+rcvclkv:.LONG	'EXT' , 0   , SCIRXSSRC_EXT<4t
+	.LONG	'EXTN', 'S' , SCIRXSSRC_EXTNS<4t
+	.LONG	'INT' , 0   , SCIRXSSRC_INT<4t
+	.LONG	'PLLI', 'NT', SCIRXSSRC_PLLINT<4t
+	.LONG	'PLLE', 'XT', SCIRXSSRC_PLLEXT<4t
+RCVCLKVSZ=!{$-rcvclkv}/12t
+
+xmtclkv:.LONG	'EXT', 0, SCITXSSRC_EXT<4t
+	.LONG	'INT', 0, SCITXSSRC_INT<4t
+	.LONG	'REC', 0, SCITXSSRC_REC<4t
+XMTCLKVSZ=!{$-xmtclkv}/12t
+
+	DATA
+
+	   .MOD  4
+ssanafidb: .LONG 0		;Offset of first SSAN IDB
+ssanalidb: .LONG 0		;Offset of last SSAN IDB
+ssanafbdb: .LONG 0		;Offset of first SSAN BDB
+ssanalbdb: .LONG ssanafbdb	;Offset of last SSAN BDB
+thissapsdb:.LONG 0
+temp:	   .LONG 'NET', 0
+
+	LKEEND
+

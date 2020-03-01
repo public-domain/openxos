@@ -1,0 +1,1262 @@
+	.TITLE	PCNCLS2 - Pseudo-console device class driver for XOS
+
+;++++
+; This software is in the public domain.  It may be freely copied and used
+; for whatever purpose you see fit, including commerical uses.  Anyone
+; modifying this software may claim ownership of the modifications, but not
+; the complete derived code.  It would be appreciated if the authors were
+; told what this software is being used for, but this is not a requirement.
+
+;   THIS SOFTWARE IS PROVIDED BY THE AUTHORS "AS IS" AND ANY EXPRESS OR
+;   IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
+;   OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+;   IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+;   INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+;   BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS
+;   OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+;   ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR
+;   TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
+;   USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+;----
+
+	.PROC	80486
+	.INCLUD	XOSINC:\XMAC\XOS.PAR
+	.INCLUD	XOSINC:\XMAC\XOSX.PAR
+	.INCLUD	XOSINC:\XMAC\XOSERR.PAR
+	.INCLUD	XOSINC:\XMAC\XOSTIME.PAR
+	.INCLUD	XOSINC:\XMAC\XOSDOS.PAR
+	.INCLUD	XOSINC:\XMAC\XOSNET.PAR
+	.INCLUD	XOSINC:\XMAC\XOSXNET.PAR
+	.INCLUD	XOSINC:\XMAC\XOSTRM.PAR
+	.INCLUD	XOSINC:\XMAC\XOSXTRM.PAR
+	.INCLUD	XOSINC:\XMAC\XOSLKE.PAR
+	.INCLUD	XOSINC:\XMAC\XOSXLKE.PAR
+	.INCLUD	XOSINC:\XMAC\XOSDDSP.PAR
+	.INCLUD	PCNCLS.PAR
+
+	LKECONT
+
+;This file contains the main client side routines.  The client side device
+;  operates in three distinct modes: stream, mapped, and blocked.  When
+;  operating in stream mode, all data output to the TRMPn device is written to
+;  both the display and shadow buffers and is sent to the server device as
+;  input data.  The display buffer is mapped read-only for all processes which
+;  have it mapped.  When operating in mapped mode, data is written to the
+;  display buffer only. No data is sent to the server device.  When operating
+;  in blocked mode, any attempt to modify the display contents, either by a
+;  system call or by writting directly to the screen buffer or to change the
+;  display mode, causes the client program to be suspended until the device
+;  leaves blocked mode.
+
+;  The device initially operates in stream mode.  It stays in stream mode until
+;  a user process attempts to write directly to the display buffer, when it
+;  switches to mapped mode and starts a timer.  It also forces any buffered
+;  server device input to be made immediately available to the server device.
+;  It stays in mapped mode until the timer expires or until a display output
+;  function for the client device will cause the screen (or part of the screen)
+;  to be scrolled, at which time it enters blocked mode (which implies changing
+;  all user mapped buffers to read-only) and sends a notification to the server
+;  device (signal).  It stays in blocked mode until a special device function
+;  is issued for the server device switching it to stream mode (PCSF_UNBLOCK).
+;  This action also wakes up any processes which were suspended while the
+;  client device was in blocked mode.
+
+;  The intent of all of this is to provide reasonable performance for both
+;  character stream display output and direct screen writes.  Note that once
+;  a user program writes directly to the screen, all writes to the screen,
+;  either by a user program or by the system routines which implement terminal
+;  output, are treated exactly the same, except that any system call which
+;  causes scrolling receives special treatment.
+
+;  When the server program receives a notification that the mapped mode timer
+;  has expired or that a scrolling operation has been requested when in mapped
+;  mode, it must compare the display and shadow buffers to determine what data
+;  has been changed while in mapped mode.  The device does indicate which pages
+;  have been changed.  The server program must update the shadow buffer to be
+;  the same as the display buffer before switching the client side device back
+;  to stream mode.
+
+	CODE
+
+;Terminal function dispatch table for PCNA client devices
+
+	.LONG	knlIFnDev##	;tf_ggetcurpos= -72. - Get graphics cursor
+				;			 postion
+	.LONG	knlIFnDev##	;tf_gsetcurpos= -68. - Set graphics cursor
+				;			 positon
+	.LONG	knlIFnDev##	;tf_gsetcurcol= -64. - Set graphics cursor
+				;			 colors
+	.LONG	knlIFnDev##	;tf_gsetcurpat= -60. - Set graphics cursor
+				;			 pattern
+	.LONG	knlRtnZero##	;tf_setgvf    = -56. - Set graphics vert. freq.
+	.LONG	knlRtnZero##	;tf_getgvf    = -52. - Get graphics vert. freq.
+	.LONG	pcnloadfont#	;tf_loadfont  = -48. - Load font
+	.LONG	pcnselfont#	;tf_selfont   = -44. - Select font table & mode
+	.LONG	knlIFnDev##	;tf_enable    = -40. - Enable video
+	.LONG	knlIFnDev##	;tf_disable   = -36. - Disable video
+	.LONG	pcnsetcurtype	;tf_curtyp    = -32. - Get/set cursor type
+	.LONG	pcncurpos	;tf_curpos    = -28. - Get/set cursor position
+	.LONG	pcndsppage	;tf_dsppag    = -24. - Set display page
+	.LONG	pcnscroll#	;tf_scroll    = -20. - Scroll window
+	.LONG	pcngetatrchr	;tf_getatc    = -16. - Get attribute and char.
+	.LONG	pcnsetatrchr	;tf_setatc    = -12. - Set attribute and char.
+	.LONG	pcnsetchr	;tf_setchr    =  -8. - Set character only
+	.LONG	pcnattrib	;tf_attrib    =  -4. - Get or set attributes
+pcntrmdsp::
+	.LONG	knlRtnZero##	;tf_transfer  =   0. - Transfer device
+	.LONG	knlRtnZero##	;tf_opena     =   4. - Open additional
+	.LONG	xosconOpen1##	;tf_open1     =   8. - Open first time
+	.LONG	knlRtnZero##	;tf_stop      =  12. - Stop output
+	.LONG	ret002		;tf_clrout    =  16. - Clear output buffer
+	.LONG	pcnechchr	;tf_echchr    =  20. - Echo character
+	.LONG	pcnoutchr	;tf_doutchr   =  24. - Direct output character
+	.LONG	pcnoutblk	;tf_doutblk   =  28. - Direct output block
+	.LONG	pcnoutstr	;tf_doutstr   =  32. - Direct output string
+	.LONG	0		;tf_qoutchr   =  36. - Queued output character
+	.LONG	0		;tf_qoutblk   =  40. - Queued output block
+	.LONG	0		;tf_qoutstr   =  44. - Queued output string
+	.LONG	pcnidle		;tf_idle      =  48. - Set to idle state
+	.LONG	knlTrmDoEcho##	;tf_resume    =  52. - Resume output
+	.LONG	pcnmapscreen	;tf_mapscn    =  56. - Map screen buffer
+	.LONG	pcndosset	;tf_dosset    =  60. - Set up terminal for DOS
+	.LONG	pcndosupd	;tf_dosupd    =  64. - Update page 0 for DOS
+	.LONG	ret002		;tf_dosuse    =  68. - Use DOS page 0 data
+	.LONG	pcndspmode	;tf_dspmode   =  72. - Get or set display mode
+	.LONG	knlIFnDev##	;tf_addunit   =  76. - Add unit
+	.LONG	knlIFnDev##	;tf_sstrans   =  80. - Screen symbiont transfer
+	.LONG	knlIFnDev##	;tf_ssmaskwrt =  84. - Screen symbiont masked
+				;			 write
+	.LONG	knlIFnDev##	;tf_ssmapbufr =  88. - Screen symbiont map
+				;			 screen buffer
+	.LONG	knlIFnDev##	;tf_sspageflt =  92. - Display page page fault
+	.LONG	knlIFnDev##	;tf_ssstatus  =  96. - Report screen status to
+				;			 screen symbiont
+	.LONG	knlIFnDev##	;tf_ssutil    = 100. - Screen symbiont utility
+				;			 functions
+	.LONG	0		;             = 104. - Reserved
+	.LONG	0		;             = 108. - Reserved
+	.LONG	0		;             = 112. - Reserved
+	.LONG	pcndspcur	;tf_dspcur    = 116. - Display cursor on screen
+	.LONG	0		;	      = 120. - Reserved
+	.LONG	ret002		;tf_setdtr    = 124. - Set or clear DTR output
+	.LONG	ret002		;tf_setrts    = 128. - Set or clear RTS output
+	.LONG	ret002		;tf_getdsb    = 132. - Get data set bits
+	.LONG	ret002		;tf_finout    = 136. - Ensure output is finished
+	.LONG	ret002		;tf_imodechng = 140. - Input mode change
+	.LONG	ret002		;tf_omodechng = 144. - Output mode change
+	.LONG	pcnmapphys	;tf_mapphys   = 148. - Map physical display
+
+pcnkeydsp::
+	.LONG	knlRtnZero##	;kf_open    =  0.
+	.LONG	xosconKeyVInB##	;kf_vkinb   =  4. - INB instruction for
+				;		      keyboard in real mode
+	.LONG	xosconKeyVOutB##;kf_vkoutb  =  8. - OUTB instruction for
+				;		      keyboard in real mode
+	.LONG	xosconKeyVInt##	;kf_keyint  = 12. - Attempt to execute keyboard
+				;		      interrupt routine in real
+				;		      mode
+	.LONG	xosconClrKeyI##	;kf_clrkeyi = 16. - Clear keyboard interrupt
+	.LONG	ret002		;kf_tolites = 20. - Update keyboard lites
+	.LONG	process		;kf_process = 24. - Process held scan codes
+	.LONG	ret002		;kf_beep    = 28. - Beep
+	.LONG	knlRtnZero##	;kl_enable  = 32. - Enable keyboard
+.PAGE
+;Device characteristics tables for the PCNA client side devices
+
+	DATA
+
+	.MOD	4
+pcndctbl::
+ DCHARBGN  1, knlDCharValCom##
+ DCHARENT  CLASS   , TEXT, ,  8, knlDcMsgClass##   , knlDcGetClass##   , knlDcSetClass##, 0
+ DCHARENT  TYPE    , TEXT, ,  4, knlDcMsgType##    , knlDcGet4Byte##   , 0              , dcb_type
+ DCHARENT  SESSION , TEXT, ,  8, knlTrmMsgSession##, knlTrmGetSession##, 0              , 0
+ DCHARENT  MSGDST  , STR , , 16, knlTrmMsgMsgDst## , knlTrmGetText##   , 0              , tdb_msgdst
+ DCHARENT  PROGRAM , STR , , 16, knlTrmMsgProgram##, knlTrmGetText##   , 0              , tdb_program
+ DCHARENT  PASSWORD, STR , , 12, knlTrmMsgPWrd##   , knlTrmGetText##   , 0              , tdb_password
+ DCHARENT  ACCESS  , TEXT, ,  4, knlDcMsgAccess##  , knlTrmGet4Byte##  , 0              , tdb_access
+ DCHARENT  INRBS   , DECV, ,  2, knlTrmMsgInRBS##  , knlTrmGet4Byte##  , 0              , tdb_irsize
+ DCHARENT  INLBS   , DECV, ,  2, knlTrmMsgInLBS##  , knlTrmGet4Byte##  , 0              , tdb_ibsize
+
+	CODE
+.PAGE
+	.SBTTL	kf_process - Process held scan codes
+
+;Here when done processing scan code after a real mode keyboard interrupt to
+;  process any additional scan codes
+
+process:CMPW	dcb_pcnkidxff-dcb_pcntdb[ESI], #0.B ;Waiting for this?
+	JE	ret002.S		;No
+	MOVW	ES, dcb_pcnkidxff-dcb_pcntdb[ESI] ;Yes
+	MOVW	dcb_pcnkidxff-dcb_pcntdb[ESI], #0
+	CLRL	EAX			;Wake him up
+	JMP	knlResumeXf##
+.PAGE
+	.SBTTL	tf_idle - pcnidle - Set to idle state
+
+;Here for the tf_idle dispatch - Set to idle state
+;	c{ESI} = Offset of TDB
+;	CALL	pcnidle
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+
+pcnidle:PUSHL	EDI
+	LEAL	EDI, -dcb_pcntdb[ESI]
+	CMPL	dcb_pcndsptak.B[EDI], #0.B ;Have any data for the server?
+	JE	2$.S			;No
+	CMPW	dcb_inpframe.B[EDI], #0.B ;Is someone waiting for input?
+	JE	2$.S			;No
+	CALL	knlResumeInput##	;Yes - wake him up
+2$:	MOVZBL	EAX, dcb_pcnhuvect.B[EDI] ;Get vector number
+	TESTL	EAX, EAX
+	JE	6$.S			;If no signal wanted
+	PUSHL	ESI
+	CALL	knlGetQel##		;Get a QEL
+	JC	4$.S			;Forget it if error
+	MOVB	slb_szindx.B[ESI], #0
+	MOVB	BL, #SIGT_NORMAL
+	MOVL	ECX, #1			;We have 1 data item
+	MOVL	EDX, dcb_pcnintdata.B[EDI] ;Store the data item
+	MOVL	slb_data.B[ESI], EDX
+	MOVW	ES, dcb_pcnhupda.B[EDI]	;Get PDA selector
+	CLRL	EDX
+	CALL	knlReqSignal##		;Request the signal
+4$:	POPL	ESI
+6$:	POPL	EDI
+	CLC
+ret002:	RET
+.PAGE
+	.SBTTL	tf_clrout - pcnclrout - Clear output ring buffer
+
+;Here for the tf_clrout dispatch - Clear output ring buffer
+
+pcnclrout:
+	CRASH	????
+.PAGE
+	.SBTTL	pcndosset - Function to set up console for DOS
+
+;Function to set up console for DOS - sets up the screen mapping and the data
+;  block needed for keyboard interrupts
+;	c{EDI} = Offset of controlling terminal DCB
+;	c{ESI} = Offset of controlling terminal TDB
+;	CALL	pcndosset
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  c{EAX} = Size of currently mapped buffer (0 means not mapped)
+;	  c{EDX} = Offset of currently mapped buffer (meaningless if not mapped)
+
+pcndosset:
+	CMPB	dcb_pcnbufslot-dcb_pcntdb[ESI], #0 ;Have a display buffer now?
+	JE	ifndv2.S		;No
+	JMP	xosconDosSet##		;Yes
+.PAGE
+	.SBTTL	pcndosupd - Function to update page 0 for real mode
+
+pcndosupd:
+	CMPB	dcb_pcnbufslot-dcb_pcntdb[ESI], #0 ;Have a display buffer now?
+	JE	ifndv2.S		;No
+	JMP	xosconDosUpd##		;Yes
+.PAGE
+	.SBTTL	pcnmapscreen - Function to map screen buffer
+
+;Function to map screen buffer
+;	c{ES:EBX} = Address for msect
+;	c{ECX}    = Size for msect
+;	c{EDX}    = Offset for part of screen to map
+;	c{EDI}    = Offset of DCB
+;	c{ESI}    = Offset of TCB
+;	CALL	pcnmapscreen
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  c{EAX} = Size of msect
+
+pcnmapscreen:
+	CMPB	dcb_pcnbufslot-dcb_pcntdb[ESI], #0 ;Have a display buffer now?
+ifndv2:	JE	knlIFnDev##		;No
+	JMP	xosconMapScreen##	;Yes
+.PAGE
+	.SBTTL	pcnmapphys - Subroutine to physically map console screen
+
+;Subroutine to physically map console screen
+;	c(BL)     = Page bits
+;	c{ECX}    = Amount to map
+;	c{BP:EDX} = Virtual address
+;	C{ESI}    = Offset of TDB
+;	CALL	pcnmapphys
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+
+pcnmapphys:
+	CMPB	dcb_pcnbufslot-dcb_pcntdb[ESI], #0 ;Have a display buffer now?
+	JE	ifndv2.S		;No
+	PUSHL	ESI			;Save offset of our TDB
+	MOVL	ESI, knlNonExMem##	;First, map some non-existant memory!
+	MOVL	EDI, #0FFFFFFFFh
+	CALL	knlMapPhysMem##		;Map physical memory
+	MOVL	EDX, EDI
+	POPL	ESI
+	JC	8$.S			;If error
+	MOVB	mdb_devtype.B[EDX], #1
+	MOVL	mdb_remove.B[EDX], #pcnunmap ;Store offset of subroutine to
+					     ;  call when msect is given up
+	ORB	mdb_sts.B[EDX], #MSS$FIXED ;Indicate now fixed size
+	MOVL	mdb_devpnt.B[EDX], ESI	;Link TDB to the MDB
+	TOFORK
+	MOVL	EAX, tdb_mdb.B[ESI]	;Link the MDB into the list of MDBs
+	MOVL	tdb_mdb.B[ESI], EDX	;  which map this display
+	MOVL	mdb_devnext.B[EDX], EAX
+	MOVL	ECX, mdb_size.B[EDX]	;Get number of pages
+	LEAL	EBX, dcb_pcnbufpte-dcb_pcntdb[ESI] ;Get offset of first buffer
+						   ;  page table entry
+	MOVL	EDX, mdb_la.B[EDX]	;Get linear address for msect
+	SHRL	EDX, #10t		;Change to page table index
+4$:	MOVL	EAX, [EBX]		;Get map entry for buffer page
+	TESTB	dcb_pcnsts1-dcb_pcntdb[ESI], #PCNS1$MAPPED ;In mapped mode?
+	JNE	6$.S			;Yes - leave pages as read-write
+	TESTB	AL, #01h		;No - is this page allocated?
+	JE	6$.S			;No
+	ANDB	AL, #0FDh		;Yes - make it read-only
+6$:	MOVL	pgtable[EDX], EAX	;Store in our page table
+	ADDL	EBX, #4t.B		;Bump pointers
+	ADDL	EDX, #4t.B
+	LOOP	ECX, 4$			;Continue if more pointers
+	FROMFORK
+	CLC
+8$:	RET
+.PAGE
+	.SBTTL	pcnunmap - Subroutine called when a mapped display buffer is given  up
+
+;Subroutine called when a mapped display buffer is given up - we first modify
+;  the page table entries to indicate non-managed pages so they will not be
+;  given up (we have to have private locked pages so the read-only page fault
+;  will work right), then we just call the standard console unmap routine
+;	c{EDI} = Offset of MDB
+;	CALL	pcnunmap
+
+pcnunmap:
+	PUSHL	ECX			;Save registers we need here
+	PUSHL	EBX
+	MOVL	EBX, mdb_la.B[EDI]	;Get linear address of msect
+	SHRL	EBX, #12t		;Change to page table index
+	MOVL	ECX, mdb_size.B[EDI]	;Get number of pages
+4$:	ANDB	pgtable+1[EBX*4], #0F1h	;Indicate physical page
+	INCL	EBX			;Bump pointer
+	LOOP	ECX, 4$			;Continue if more
+	POPL	EBX			;Restore registers
+	POPL	ECX
+	JMP	xosconUnmap##		;Call standard console unmap routine
+.PAGE
+	.SBTTL	pcndspmode - Function to get and set display mode
+
+;Function to get and set display mode
+;	c{EAX}    = Display mode bits
+;	c{ES:EBX} = Address of data block
+;	CALL	pcndspmode
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  c{EAX} = Current display mode
+
+;Since the display characteristics are determined by the server's display,
+;  we just send the values to the server and wait for it to tell us what it
+;  did with them.  Requests for current values only (without changing any
+;  values) are handled locally.
+
+$$$=!0
+FRM adm_dataadr, 8t	;Address of data block
+FRM adm_dv     , 20t	;Data values
+FRM adm_bits   , 4t
+dm_SIZE=!$$$
+
+pcndspmode:
+	REQUIREFORK
+	CMPB	dcb_pcnbufslot-dcb_pcntdb[ESI], #0 ;Have a screen buffer?
+	JNE	10$.S			;Yes
+	CMPB	AL, #0FFh		;No - setting to "serial port" mode?
+	JE	2$.S			;Yes - thats OK
+	TESTB	AL, AL			;No - just want current mode?
+	JNE	knlBadValue##		;No - fail
+2$:	BTL	EAX, #DM%RTNDATA	;Want values returned?
+	JNC	4$.S			;No
+	CLRL	EAX			;Yes - zero stuff we don't support
+	IFFAULT	knlRtnAdrEr##		;Clear dm_textres, dm_prifont, and
+	MOVL	ES:[EBX], EAX		;  dm_secfont
+	IFFAULT	knlRtnAdrEr##
+	MOVL	ES:dm_disptype.B[EBX], EAX
+	MOVL	ES:dm_horiz.B[EBX], EAX
+	MOVL	ES:dm_vert.B[EBX], EAX
+	MOVL	ES:dm_columns.B[EBX], #80t ;THESE SHOULD BE DYNAMIC!!!!!
+	MOVL	ES:dm_rows.B[EBX], #24t
+4$:	MOVL	EAX, #0FFh		;Yes - indicate "serial port" mode
+	RET				;Thats all
+
+;Here if illegal parameter value
+
+6$:	MOVL	EAX, #ER_PARMV
+8$:	LEAVE
+	STC
+	RET
+
+;Here if have a screen buffer set up
+
+10$:	ENTER	dm_SIZE, 0		;Yes - almost like a console!
+	CALL	xosconChkBiosMd##	;Convert BIOS mode requests
+	JC	8$.S			;If error
+	MOVL	adm_dataadr+0.B[EBP], EBX ;Store address of caller's data block
+	MOVL	adm_dataadr+4.B[EBP], ES
+	TESTB	AL, AL			;Changing the mode?
+	JE	rtnonly			;No - just return the current values
+	CMPB	AL, #DM_TEXT		;Yes - valid mode?
+	JA	6$.S			;No - fail
+	MOVL	adm_bits.B[EBP], EAX	;Yes
+	MOVB	tdb_mode[ESI], AL
+	PUSHL	EDI			;Copy new data values
+	PUSHL	ESI
+	MOVL	ESI, EDX
+	LEAL	EDI, adm_dv.B[EBP]
+	PUSHL	SS
+	POPL	ES
+	CLD
+	MOVL	ECX, #5
+	IFFAULT	knlRtnAdrErLv##
+	RMOVSL	[EDI], FS:[ESI]
+	POPL	ESI
+	LEAL	ECX, adm_dv.B[EBP]
+	CMPB	knlForkLvl##, #FORK_MFORK ;At main program level now?
+	JBE	12$.S			;Yes - go on
+	MOVL	EBX, #dspmdmain		;No - request exec software interrupt
+	MOVL	EDX, SS
+	MOVL	EDI, ESI
+	MOVW	ES, SS:xffPda##
+	PUSHL	ESI
+	CALL	knlReqXSig##
+	POPL	ESI
+	MOVL	EDI, SS:xffDcb##
+	MOVL	EAX, #2*XT_SECOND
+
+	MOVL	EAX, #-1		;;;;;;;;;
+
+	CALL	knlXfWait##
+	POPL	EDI
+	JMP	14$.S
+
+;Here if at main program level
+
+12$:	PUSHL	SS
+	POPL	ES
+	CALL	dodspmd
+14$:	TESTL	EAX, EAX
+	JNS	rtnmode
+	LEAVE
+	RET
+.PAGE
+;Here to return current values only
+
+rtnonly:ANDL	EAX, #DM$BIOSMODE|DM$RTNDATA
+	MOVB	AL, tdb_mode[ESI]
+	JMP	4$.S
+
+rtnmode:MOVZBL	EAX, tdb_mode[ESI]
+	ANDB	adm_bits+1.B[EBP], #{DM$RTNDATA|DM$BIOSMODE}/100h
+	MOVB	AH, adm_bits+1.B[EBP]
+4$:	BTL	EAX, #DM%RTNDATA	;Want data values returned?
+	JNC	6$.S			;No
+	LESL	EBX, adm_dataadr.B[EBP]	;Yes - get address of his data block
+	MOVL	EDX, tdb_disptype.B[ESI]
+	IFFAULT	knlRtnAdrErLv##
+	MOVL	ES:dm_disptype.B[EBX], EDX
+	MOVL	EDX, tdb_columns[ESI]
+	IFFAULT	knlRtnAdrErLv##
+	MOVL	ES:dm_columns.B[EBX], EDX
+	MOVZBL	EDX, tdb_rows[ESI]
+	IFFAULT	knlRtnAdrErLv##
+	MOVL	ES:dm_rows.B[EBX], EDX
+	MOVL	EDX, tdb_horiz[ESI]
+	IFFAULT	knlRtnAdrErLv##
+	MOVL	ES:dm_horiz.B[EBX], EDX
+	MOVL	EDX, tdb_vert[ESI]
+	IFFAULT	knlRtnAdrErLv##
+	MOVL	ES:dm_vert.B[EBX], EDX
+6$:	BTL	EAX, #DM%BIOSMODE	;Want BIOS value?
+	JNC	8$.S			;No
+	CALL	xosconGetBiosMd##	;Yes - get equivalent BIOS mode
+8$:	ANDL	EAX, #~{DM$BIOSMODE|DM$USEDATA|DM$RTNDATA}
+	LEAVE
+	RET
+.PAGE
+;	c{EDI} = Offset of TDB
+;	c{ECX} = Offset of data block (on stack)
+;	c{EDX} = Selector for XFF
+
+dspmdmain:
+	MOVL	ESI, EDI
+	MOVL	ES, EDX
+	TOFORK
+	PUSHL	ES
+	CALL	dodspmd
+	POPL	ES
+	CALL	knlResumeXf##
+	FROMFORK
+	RET
+
+dodspmd:TESTB	dcb_pcnsts1-dcb_pcntdb[ESI], #PCNS1$MAPPED ;In mapped mode?
+	JE	6$.S			;No - go on
+	TESTB	ES:-3.B[ECX], #DM$NOCLEAR>8t ;Yes - want to clear the screen?
+	JNE	6$.S			;No
+	PUSHL	ECX
+	CALL	pcntostream		;Yes - switch to stream mode
+	POPL	ECX
+6$:	MOVB	AL, #0			;Construct the mode set function
+	CALL	putdsplist#
+	MOVB	AL, #DDSF_VIDMODE
+	CALL	putdsplist#
+	MOVB	AL, ES:-1.B[ECX]
+	CALL	putdsplist#
+	MOVB	AL, ES:-2.B[ECX]
+	CALL	putdsplist#
+	MOVB	AL, ES:-3.B[ECX]
+	CALL	putdsplist#
+	MOVB	AL, ES:-4.B[ECX]
+	CALL	putdsplist#
+
+;;;;;	MOVB	AL, ES:dm_prifont.B[ECX]
+	MOVB	AL, #0
+	CALL	putdsplist#
+
+;;;;;	MOVB	AL, ES:dm_secfont.B[ECX]
+	MOVB	AL, #0
+	CALL	putdsplist#
+
+	MOVB	AL, ES:dm_columns.B[ECX]
+	CALL	putdsplist#
+	MOVB	AL, ES:dm_rows.B[ECX]
+	CALL	putdsplist#
+	MOVB	AL, ES:dm_horiz+1.B[ECX]
+	CALL	putdsplist#
+	MOVB	AL, ES:dm_horiz+0.B[ECX]
+	CALL	putdsplist#
+	MOVB	AL, ES:dm_vert+1.B[ECX]
+	CALL	putdsplist#
+	MOVB	AL, ES:dm_vert+0.B[ECX]
+	CALL	putdsplist#
+	TESTB	ES:-3.B[ECX], #DM$NOCLEAR>8t ;Want to clear the screen?
+	JNE	8$.S			;No
+	MOVB	AL, #' '		;Yes - construct value for clearing the
+	MOVB	AH, tdb_tattrval[ESI]	;  buffers
+	MOVL	ECX, EAX
+	SHLL	EAX, #16t
+	MOVW	AX, CX
+	MOVL	ECX, #8t		;Get number of pages
+	SHLL	ECX, #11t		;Change to number of longs in both
+					;  buffers (screen and shadow buffers)
+	MOVW	ES, dcb_pcnbufsel-dcb_pcntdb[ESI]
+	CLRL	EDI
+	RSTOSL	[EDI]			;Clear the screen and shadow buffers
+8$:	ORB	dcb_pcnsts1-dcb_pcntdb[ESI], #PCNS1$MODEWT
+					;Indicate waiting for mode set response
+10$:	MOVL	EAX, ESI		;Use offset of the TDB as the wait
+	CALL	knlSetWait##		;  index
+	PUSHL	SS
+	POPL	ES
+	MOVB	AL, #knlQX_DW2##
+	CALL	knlWRequeue##		;Requeue to an IO wait queue
+	FROMFORK			;Call the scheduler (this is an
+	CALLF	schedule		;  uninterruptable wait!)
+	TOFORK
+	TESTB	dcb_pcnsts1-dcb_pcntdb[ESI], #PCNS1$MODEWT ;Finished?
+	JE	12$.S			;Yes
+	TESTB	SS:pdaStatus1##, #P1$KILL ;No - is process being killed?
+	JE	10$.S			;No - keep waiting
+	MOVL	EAX, #ER_ABORT		;Yes - return abort error
+	RET
+
+;Here with response to the mode set request
+
+12$:	CALL	xosconDosChk##		;Is this terminal for a DOS process?
+	JE	14$.S			;No
+	CLRL	EAX			      ;Yes - clear page number and
+	MOVB	GS:pdaRMPage0##+bda_vdsppage, AL ;  cursor positions on page 0
+	MOVL	GS:pdaRMPage0##+bda_vcurpos+0t, EAX
+	MOVL	GS:pdaRMPage0##+bda_vcurpos+4t, EAX
+	MOVL	GS:pdaRMPage0##+bda_vcurpos+8t, EAX
+	MOVL	GS:pdaRMPage0##+bda_vcurpos+12t, EAX
+14$:	CLRL	EAX
+	MOVB	tdb_dsppage[ESI], AL
+	MOVL	tdb_curpos+0t.B[ESI], EAX
+	MOVL	tdb_curpos+4t.B[ESI], EAX
+	MOVL	tdb_curpos+8t.B[ESI], EAX
+	MOVL	tdb_curpos+12t.B[ESI], EAX
+	RET
+.PAGE
+	.SBTTL	pcngetchng - Subroutine to update buffer page changed bits
+
+;Subroutine to update buffer page changed bits
+;	c{ESI} = Offset of TDB for terminal
+;	CALL	pcngetchngd
+
+pcngetchngd::
+	MOVZWL	ECX, dcb_pcnbufsel-dcb_pcntdb[ESI] ;Get selector
+	MOVB	BH, gdtable+st_baseh[ECX]  ;Get linear address for buffer
+	MOVB	BL, gdtable+st_base+2[ECX] ;  segment
+	SHLL	EBX, #16t
+	MOVW	BX, gdtable+st_base+0[ECX]
+	SHRL	EBX, #12t		;Get index table index
+	MOVL	ECX, #8t		;Get number of exec mapped pages
+	CLRL	EAX
+2$:	TESTB	pgtable[EBX*4], #40h	;Has this page been changed?
+	JE	4$.S			;No
+	ANDB	pgtable[EBX*4], #~40h	;Yes - clear the dirty bit
+	BTSL	dcb_pcnpgchngd-dcb_pcntdb[ESI], EAX ;Set the page changed bit
+4$:	INCL	EAX			;Bump page number
+	INCL	EBX			;Bump page table index
+	LOOP	ECX, 2$			;Continue if more to check
+	MOVL	ECX, #getchngd		;Update bits and block pages from any
+	JMP	xosconScanMs##		;  other msects which are mapped
+
+getchngd:
+	MOVL	EBX, mdb_la.B[EDX]	;Get linear address of msect
+	MOVL	ECX, mdb_size.B[EDX]	;Get size of msect
+	SHRL	EBX, #12t		;Get index into page map
+	CLRL	EAX			;Clear page number
+6$:	TESTB	pgtable[EBX*4], #40h	;Has this page been changed?
+	JE	8$.S			;No
+	ANDB	pgtable[EBX*4], #~40h	;Yes - clear the dirty bit
+	BTSL	dcb_pcnpgchngd-dcb_pcntdb[ESI], EAX ;Set the page changed bit
+8$:	INCL	EAX			;Bump page number
+	INCL	EBX			;Bump page table index
+	LOOP	ECX, 6$			;Continue if more to do
+	RET
+.PAGE
+	.SBTTL	pcntostream - Subroutine to switch to stream mode
+
+;Subroutine to switch to stream mode.  Can be called when PCN device is in
+;  either mapped or blocked mode.  When called in mapped mode, anything
+;  written to the screen since entering mapped mode will probably be lost.
+;  This is normally done only just before clearing the screen buffer when in
+;  mapped mode.  Must be called at fork level.
+
+pcntostream::
+	REQUIREFORK
+	ANDB	dcb_pcnsts1-dcb_pcntdb[ESI], #~PCNS1$MAPPED ;Not mapped mode
+	CMPL	dcb_pcnmapwake-dcb_pcntdb[ESI], #0.B
+	JE	2$.S
+	PUSHL	ESI
+	MOVL	ESI, dcb_pcnmapwake-dcb_pcntdb[ESI]
+	CALL	knlWakeRemove##
+	POPL	ESI
+	CLRL	EAX
+	MOVL	dcb_pcnmapwake-dcb_pcntdb[ESI], EAX
+2$:	MOVL	ECX, #strmpages		;Make all mapped buffer pages read-only
+	JMP	xosconScanMs##
+
+strmpages:
+	PUSHL	EDX
+	MOVL	EBX, mdb_la.B[EDX]	;Get linear address of msect
+	MOVL	ECX, mdb_size.B[EDX]	;Get size of msect
+	SHRL	EBX, #12t		;Get index into page map
+	LEAL	EDX, dcb_pcnbufpte-dcb_pcntdb[ESI] ;Point to first page table
+						   ;  entry for buffer
+6$:	MOVL	EAX, [EDX]		;Get page table entry
+	ANDB	AL, #~02h		;Make it read-only
+	MOVL	pgtable[EBX*4], EAX	;Store it
+	ADDL	EDX, #4t.B
+	INCL	EBX			;Bump page table index
+	LOOP	ECX, 6$			;Continue if more to do
+	POPL	EDX
+	RET
+.PAGE
+	.SBTTL	pcndspcur - (tf_dspcur) Display cursor on screen
+
+;Function to display cursor on the screen - This function is not really needed
+;  here since the cursor position is only updated when leaving mapped mode to
+;  reduce overhead.  It does have to update the real mode page 0 cursor position
+;  words, however.
+
+pcndspcur:
+	PUSHL	EAX
+	CALL	xosconDosChk##		;Is this terminal for a DOS process?
+	JE	8$.S			;No
+	MOVZBL	EBX, tdb_dsppage[ESI]	;Yes - get page number
+	MOVW	AX, tdb_curpos.B[ESI+EBX*2]	       ;Update cursor position
+	MOVW	GS:pdaRMPage0##+bda_vcurpos[EBX*2], AX ;  on virtual page 0
+	CLC				;Make sure C is clear
+8$:	POPL	EAX			;Restore count
+	RET				;And return
+.PAGE
+	.SBTTL	pcnsetcurtype - Function to set cursor type (INT 10, function 1)
+
+;Function to set cursor type (INT 10, function 1)
+;	c(CL) = Ending scan line for cursor (0 - 127)
+;	c(CH) = Starting scan line for cursor (0 - 127), high bit set to
+;		  indicate invisible cursor
+;	CALL	pcnsetcurtype
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  c(AL) = Previous ending line for cursor (0 - 127)
+;	  c(AH) = Previous starting scan line for cursor (0 - 127)
+;	  High 16 bits of EAX are 0
+
+pcnsetcurtype:
+	CMPB	dcb_pcnbufslot-dcb_pcntdb[ESI], #0 ;Have a display buffer now?
+	JE	knlIFnDev##		;No
+	MOVZWL	EAX, tdb_curmode[ESI]	;Yes - get previous value to return
+	PUSHL	EAX
+	MOVW	tdb_curmode[ESI], CX	;Save new cursor mode
+	ANDW	CX, #7F7Fh
+	MOVZBL	EBX, tdb_charch[ESI]	;Get number of scan rows per character
+	ANDB	BL, #1Fh
+	INCL	EBX
+	MOVZBL	EAX, CH			;Scale beginning line
+	MULL	EBX
+	ADDL	EAX, #64t.B
+	ADCL	EDX, #0.B
+	DIVL	lit128#
+	CMPB	AL, BL			;Beginning line too large?
+	JB	4$.S			;No
+	MOVB	AL, BL			;Yes - use maximum
+	DECL	EAX
+4$:	MOVB	CH, AL
+	MOVZBL	EAX, CL			;Scale ending line
+	MULL	EBX
+	ADDL	EAX, #64t.B
+	ADCL	EDX, #0.B
+	DIVL	lit128#
+	CMPB	AL, BL			;Endling line too large?
+	JB	6$.S			;No
+	MOVB	AL, BL			;Yes - use maximum
+	DECL	EAX
+6$:	MOVL	ECX, EAX
+	ANDW	CX, #1F1Fh		;Make sure no extra bits
+	TESTB	tdb_curmode+1[ESI], #80h ;Is cursor invisible now?
+	JE	8$.S			;No
+	ORB	CH, #20h		;Yes
+8$:	MOVW	tdb_dstart[ESI], CX
+	TESTB	dcb_pcnsts1-dcb_pcntdb[ESI], #PCNS1$MAPPED ;Mapped mode?
+	JNE	10$.S			;Yes - finished now
+	MOVZWL	EAX, tdb_curmode[ESI]	;Get cursor mode
+	CMPW	dcb_pcncurmode-dcb_pcntdb[ESI], AX ;Have it changed?
+	JE	10$.S			;No
+	MOVW	dcb_pcncurmode-dcb_pcntdb[ESI], AX ;Yes
+	MOVB	AL, #0			;Send message to server side
+	CALL	putdsplist#
+	MOVB	AL, #DDSF_CURTYPE
+	CALL	putdsplist#
+	MOVB	AL, tdb_curmode+1[ESI]
+	CALL	putdsplist#
+	MOVB	AL, tdb_curmode+0[ESI]
+	CALL	putdsplist#
+10$:	POPL	EAX			;Restore previous value
+	RET
+.PAGE
+	.SBTTL	pcncurpos - Func. to set and get cursor pos. (INT 10, func. 02)
+
+;Function to set and get cursor position (INT 10, function 02)
+;	c{EBX} = Page number
+;	c{ECX} = Character number
+;	c{EDX} = Line number
+;	CALL	pcncurpos
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  c(AL) = Previous character number
+;	  c(AH) = Previous line number
+
+pcncurpos:
+	CMPB	dcb_pcnbufslot-dcb_pcntdb[ESI], #0 ;Have a display buffer now?
+	JE	knlIFnDev##		;No
+	PUSHL	EDX			;Yes
+	CALL	xosconDosUpdCP##	;Update cursor position for real mode
+	POPL	EDX
+	JC	16$.S			;If error
+	SETNE	AL
+	PUSHL	EAX			;Remember if real mode
+	MOVW	AX, tdb_curpos.B[ESI+EBX*2]
+	CMPL	ECX, #-1.B		;Want to change character position
+	JE	8$.S			;No
+	TESTL	ECX, ECX		;Yes - relative?
+	JNS	6$.S			;No
+	ADDB	tdb_curpos+0.B[ESI+EBX*2], CL ;Yes
+	JMP	8$.S
+
+6$:	MOVB	tdb_curpos+0.B[ESI+EBX*2], CL
+8$:	CMPL	EDX, #-1.B		;Want to change line position?
+	JE	12$.S			;No
+	TESTL	EDX, EDX		;Yes - relative?
+	JNS	10$.S			;No
+	ADDB	tdb_curpos+1.B[ESI+EBX*2], DL ;Yes
+	JMP	12$.S
+
+10$:	MOVB	tdb_curpos+1.B[ESI+EBX*2], DL
+12$:	POPL	EDX
+	CMPB	DL, #0			;Is this terminal for a DOS process?
+	JE	14$.S			;No
+	MOVW	CX, tdb_curpos.B[ESI+EBX*2]	       ;Yes - update cursor
+	MOVW	SS:pdaRMPage0##+bda_vcurpos[EBX*2], CX ;  position on virtual
+						       ;  page 0
+14$:	CMPW	tdb_curpos.B[ESI+EBX*2], AX ;Did we really change it?
+	JE	16$.S			;No
+	PUSHL	EAX			;No - send to value to server side
+	CALL	pcnsendcurpos
+	POPL	EAX
+	CLC
+16$:	RET
+.PAGE
+	.SBTTL	pcndsppage - Function to select display page (INT 10, func. 05)
+
+;Function to select display page (INT 10, function 05)
+;	c{EBX} = Display page number
+;	CALL	pcndsppage
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  c{EAX} = Previous display page number
+
+pcndsppage:
+	MOVZBL	EAX, tdb_dsppage[ESI]	;Get current page
+	CMPB	dcb_pcnbufslot-dcb_pcntdb[ESI], #0 ;Have a display buffer now?
+	JE	knlIFnDev##		;No
+	CMPL	EBX, #-1.B		;Yes - want to change value?
+	JE	8$.S			;No
+	CMPB	BL, #8t			;Yes - valid page number?
+	JAE	10$.S			;No
+	PUSHL	EAX			;Yes - save current value
+	MOVB	tdb_dsppage[ESI], BL	;Store new value
+	MOVZBL	EBX, BL
+	IMULL	EBX, tdb_pgsize[ESI]	;Get offset of start of page
+	SHRL	EBX, #1
+	XCHGB	BH, BL			;Store page offset value in shadow
+	MOVW	tdb_dstart[ESI], BX	;  registers
+	TESTB	dcb_pcnsts1-dcb_pcntdb[ESI], #PCNS1$MAPPED ;In mapped mode?
+	JNE	4$.S			;Yes - don't send message now
+	MOVB	AL, #0			;No - send message to server side
+	CALL	putdsplist
+	MOVB	AL, #DDSF_DSPPAGE
+	CALL	putdsplist
+	MOVB	AL, tdb_dsppage[ESI]
+	CALL	putdsplist
+4$:	CALL	xosconDosChk##		;Is this terminal for a DOS process?
+	JE	6$.S			;No
+	MOVZBL	EDX, tdb_dsppage[ESI]	   ;Yes - update cursor position in
+	MOVW	AX, tdb_curpos.B[ESI+EDX*2] ;  virtual page 0
+	MOVW	GS:pdaRMPage0##+bda_vcurpos[EDX*2], AX
+	MOVB	GS:pdaRMPage0##+bda_vdsppage, DL
+6$:	POPL	EAX
+8$:	RET
+
+10$:	MOVL	EAX, #ER_PARMV
+	STC
+	RET
+.PAGE
+	.SBTTL	pcnoutstr - Function to output string
+
+;Function to output null terminated string
+;	c{ES:EBX} = Address of string
+;	c{ECX}    = Maximum number to output (0 means no limit)
+;	c{ESI}    = Offset of PCN TDB
+;	CALL	pcnoutstr
+;	c{EAX} = Error code
+;	c{EBX} = Queued IO status bits
+;	c{ECX} = Number of characters output this time
+
+pcnoutstr:
+	TESTL	ECX, ECX
+	JNE	2$.S
+	DECL	ECX
+2$:	PUSHL	EDI
+	MOVL	EDI, EBX
+	MOVB	AL, #0
+	CLD
+	IFFAULT	24$
+	RNSCASB	[EDI]
+	JNE	4$.S
+	DECL	EDI
+4$:	MOVL	ECX, EDI
+	SUBL	ECX, EBX
+	POPL	EDI
+
+	.SBTTL	pcnoutblk - Function to output block
+
+;Function to output block - must be called at main program level raised to
+;  fork level
+;	c{ECX}    = Number of characters to output
+;	c{ES:EBX} = Address of block
+;	c{ESI}    = Offset of PCN TDB
+;	CALL	pcnoutblk
+;	c{EAX} = Error code
+;	c{EBX} = Queued IO status bits
+;	c{ECX} = Number of characters output this time
+
+pcnoutblk:
+	CMPB	dcb_pcnbufslot-dcb_pcntdb[ESI], #0 ;Have a display buffer now?
+	JNE	6$.S			;Yes
+	PUSHL	#QSTS$DONE		;No - get final status bits
+	JMP	10$.S			;Continue
+
+;Here if have a display buffer allocated - do full console emulation
+
+6$:	PUSHL	EBX
+	MOVZBL	EBX, tdb_dsppage[ESI]
+	CALL	xosconDosUpdCP##	;Update cursor position for real mode
+	CALL	pcnsendcurpos		;Send cursor position message to the
+	POPL	EBX			;  server side if need to
+	MOVL	EAX, #PCNOMAX		;Get amount we can output now
+	SUBL	EAX, dcb_pcndspcnt-dcb_pcntdb[ESI]
+	JLE	22$.S			;If can't output anything now
+	PUSHL	#QSTS$DONE		;Save default final status bits
+	CMPL	ECX, EAX		;Can we output everything now?
+	JBE	8$.S			;Yes
+	MOVL	ECX, EAX		;No - just do as much as we can
+	ORB	1.B[ESP], #{QSTS$DONE|QSTS$WAIT}>8t
+8$:	ORB	dcb_pcnsts1-dcb_pcntdb[ESI], #PCNS1$LCLSCR ;Indicate local
+	PUSHL	EBX					   ;  scrolling mode
+	PUSHL	ES			;Put characters in our buffer(s)
+	CALL	xosconOutBlk2##
+	ORL	8.B[ESP], EBX		;Merge in the status bits
+	POPL	ES
+	POPL	EBX			;Restore buffer offset
+	ANDB	dcb_pcnsts1-dcb_pcntdb[ESI], #~PCNS1$LCLSCR
+	TESTL	ECX, ECX		;Was anything processed?
+	JE	16$.S			;No
+	TESTB	dcb_pcnsts1-dcb_pcntdb[ESI], #PCNS1$MAPPED ;Yes - mapped mode?
+	JNE	16$.S			;Yes - don't send data now
+10$:	PUSHL	ECX			;No - save count
+12$:	MOVB	AL, ES:[EBX]		;Send the string to the server side
+	INCL	EBX			;  device
+	CMPB	AL, #0			;Zero byte?
+	JNE	14$.S			;No
+	CALL	putdsplist#		;Yes - double it
+14$:	CALL	putdsplist#
+	LOOP	ECX, 12$		;Continue if more characters
+	POPL	ECX			;Restore count
+	MOVZBL	EBX, tdb_dsppage[ESI]	;Update remote cursor position
+	MOVZWL	EAX, tdb_curpos.B[ESI+EBX*2]
+	MOVW	dcb_pcncurpos-dcb_pcntdb[ESI+EBX*2], AX
+16$:	POPL	EBX			;Restore status bits
+	TESTB	BH, #QSTS$WAIT>8t	;Need to wait?
+	JE	18$.S			;No
+	MOVB	BH, #QSTS$WAIT>8t	;Yes - clear other bits
+18$:	TESTB	BH, #QSTS$REDO>8t	;Need to redo the operation?
+	JE	20$.s			;No
+	MOVB	BH, #QSTS$REDO>8t	;Yes - clear other bits
+20$:	CLRL	EAX			;Indicate normal
+	RET
+
+;Here if cannot output anything now
+
+22$:	MOVL	EBX, #QSTS$WAIT
+	CLRL	ECX
+	JMP	20$.S
+
+;Here if have address error while scanning string for the pcnoutstr function
+
+	FAULTHDR
+24$:	POPL	EDI
+	CLRL	ECX
+	MOVL	EBX, #QSTS$DONE
+	MOVL	EAX, #ER_ADRER		;Get error code
+	RET
+.PAGE
+	.SBTTL	pcnoutchr - Function to output single character
+
+;Function to output single character
+;	c(AL)  = Character to output
+;	c{ESI} = Offset of PCN TDB
+;	CALL	pcnoutchr
+;	C:set = Error
+;	  c{EAX} = Error code (0 means should redo IO, c{EDX} = amount so far)
+;	C:clr = Normal
+;	  c{EAX} = Number of characters output this time (always 0 or 1)
+;  Note: Console output always completes without waiting unless output is
+;	 held; no errors are possible
+
+pcnoutchr:
+	PUSHL	EAX
+	CMPB	dcb_pcnbufslot-dcb_pcntdb[ESI], #0 ;Have a display buffer now?
+	JE	2$.S			;No
+	MOVZBL	EBX, tdb_dsppage[ESI]	;Yes
+	TESTB	dcb_pcnsts1-dcb_pcntdb[ESI], #PCNS1$MAPPED ;In mapped mode?
+	JNE	10$.S			;Yes
+	CALL	xosconDosUpdCP##	;Update cursor position for real mode
+	CALL	pcnsendcurpos		;Yes - send cursor position message to
+	MOVL	EAX, [ESP]		;  the server side if need to
+2$:	CMPB	AL, #0
+	JNE	6$.S
+	CALL	putdsplist
+6$:	CALL	putdsplist
+10$:	POPL	EAX
+	CMPB	dcb_pcnbufslot-dcb_pcntdb[ESI], #0 ;Have a display buffer now?
+	JE	12$.S			;No
+	ORB	dcb_pcnsts1-dcb_pcntdb[ESI], #PCNS1$LCLSCR ;Yes - indicate local
+							   ;  scrolling mode
+	CALL	xosconOutChr2##		;Put character in our buffer(s)
+	ANDB	dcb_pcnsts1-dcb_pcntdb[ESI], #~PCNS1$LCLSCR
+	TESTB	dcb_pcnsts1-dcb_pcntdb[ESI], #PCNS1$MAPPED
+	JNE	12$.S			;Yes
+	MOVZBL	EBX, tdb_dsppage[ESI]	;No - update remote cursor position
+	MOVZWL	EDX, tdb_curpos.B[ESI+EBX*2]
+	MOVW	dcb_pcncurpos-dcb_pcntdb[ESI+EBX*2], DX
+12$:	RET
+.PAGE
+	.SBTTL	pcnechchr - Function to echo single character
+
+;Function to echo single character - must be called at fork level
+;	c(AL)  = Character to output
+;	c{ESI} = Offset of PCN TDB
+;	CALL	pcnechchr
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  c{EAX} = Number of characters output this time (always 1)
+
+pcnechchr:
+	TESTB	dcb_pcnsts1-dcb_pcntdb[ESI], #PCNS1$MAPPED ;In mapped mode?
+	JNE	4$.S			;Yes - don't send message to server
+	CMPB	AL, #0			;No
+	JNE	2$.S
+	CALL	putdsplist#
+2$:	CALL	putdsplist#
+	CMPB	dcb_pcnbufslot-dcb_pcntdb[ESI], #0 ;Have a display buffer now?
+	JE	6$.S			;No
+4$:	ORB	dcb_pcnsts1-dcb_pcntdb[ESI], #PCNS1$LCLSCR ;Yes - indicate local
+							   ;  scrolling mode
+	CALL	xosconEchChr##		;Put character in our buffer(s)
+	ANDB	dcb_pcnsts1-dcb_pcntdb[ESI], #~PCNS1$LCLSCR
+	TESTB	dcb_pcnsts1-dcb_pcntdb[ESI], #PCNS1$MAPPED ;In mapped mode?
+	JNE	6$.S			;Yes
+	MOVZBL	EBX, tdb_dsppage[ESI]	;Update remote cursor position
+	MOVZWL	EDX, tdb_curpos.B[ESI+EBX*2]
+	MOVW	dcb_pcncurpos-dcb_pcntdb[ESI+EBX*2], DX
+6$:	RET
+.PAGE
+	.SBTTL	pcngetatrchr - Func. to get attrib. and char. (INT 10, func. 08)
+
+;Function to get attributes and character at cursor (INT 10, function 08)
+;	c{EBX} = Display page
+;	CALL	pcngetatrchr
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  c(AL) = Character
+;	  c(AH) = Attribute byte
+;	  High 16 bits of EAX are 0
+
+pcngetatrchr:
+	CMPB	dcb_pcnbufslot-dcb_pcntdb[ESI], #0 ;Have a display buffer now?
+ifndv4:	JE	knlIFnDev##		;No
+	CALL	xosconDosUpdCP##	;Update cursor position for real mode
+	JC	4$.S			;If error
+	MOVL	ECX, EBX		;Calculate offset of start of page
+	IMULL	ECX, tdb_pgsize[ESI]
+	MOVZBL	EAX, tdb_curpos+1.B[ESI+EBX*2] ;Calculate offset on screen for
+	IMULL	EAX, tdb_columns[ESI]
+	ADDL	EAX, EAX
+	ADDL	ECX, EAX
+	MOVZBL	EAX, tdb_curpos+0.B[ESI+EBX*2] ;Add in position in line
+	ADDL	EAX, EAX
+	ADDL	ECX, EAX
+	MOVW	ES, dcb_pcnbufsel-dcb_pcntdb[ESI] ;Get screen buffer selector
+	MOVZWL	EAX, ES:[ECX]		;Get character and attribute from screen
+4$:	RET				;Finished
+.PAGE
+	.SBTTL	pcnsetchr - Function to set character (INT 10, function 0A)
+
+;Function to set character only at cursor (INT 10, function 0A)
+;	c(AL)   = ASCII character
+;	c{EBX}  = Display page
+;	c{ECX} = Count
+;	c(DL)  = Forgound color (graphics modes only)
+;	c(DH)  = Background color (graphics modes only)
+;	CALL	pcnsetchr
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  c{EAX} = 0
+
+pcnsetchr:
+	CMPB	dcb_pcnbufslot-dcb_pcntdb[ESI], #0 ;Have a display buffer now?
+	JE	ifndv4.S		;No
+	PUSHL	EAX			;Save character and extended attr bits
+	CALL	xosconDosUpdCP##	;Update cursor position for real mode
+	JC	retp1.S			;If error
+	TESTB	dcb_pcnsts1-dcb_pcntdb[ESI], #PCNS1$MAPPED ;In mapped mode?
+	JNE	4$.S			;Yes - don't send new position now
+	CALL	pcnsendcurpos		;Yes - send cursor position message to
+					;  the server side
+	MOVB	AL, #0			;Store prefix
+	CALL	putdsplist#
+	MOVB	AL, #DDSF_WCHAR		;Store function
+	CALL	putdsplist#
+	MOVB	AL, CL			;Store count
+	CALL	putdsplist#
+	MOVB	AL, [ESP]		;Store character
+	CALL	putdsplist#
+4$:	MOVL	EAX, [ESP]		;Get character
+	PUSHL	ECX
+	PUSHL	EDX
+	CALL	pcnchr#			;Put character on screen
+	POPL	EDX
+	POPL	ECX
+	INCL	EDX			;Advance position
+	LOOP	ECX, 4$			;Continue if more to do
+	POPL	EAX			;Discard junk on the stack
+	CLRL	EAX
+	RET
+
+;Here if have bad page number
+
+retp1:	POPL	EDX
+	RET
+.PAGE
+	.SBTTL	pcnsetatrchr - Function to set attr. & char. (INT 10, func. 09)
+
+;Function to set attributes and character at cursor (INT 10, function 09)
+;	c(AL)  = ASCII character
+;	c(AH)  = Attribute byte
+;	c{EBX} = Display page
+;	c{ECX} = Repeat count
+;	CALL	pcnsetatrchr
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  c{EAX} = 0
+
+pcnsetatrchr:
+	CMPB	dcb_pcnbufslot-dcb_pcntdb[ESI], #0 ;Have a display buffer now?
+	JE	knlIFnDev##		;No
+	PUSHL	EAX			;Yes - save character and attribute
+	CALL	xosconDosUpdCP##	;Update cursor position for real mode
+	JC	retp1.S
+	TESTB	dcb_pcnsts1-dcb_pcntdb[ESI], #PCNS1$MAPPED ;In mapped mode?
+	JNE	10$.S			;Yes - don't send new position now
+	CALL	pcnsendcurpos		;Send cursor position message to the
+	MOVB	AL, #0			;  server side if need to
+	CALL	putdsplist#		;Store prefix
+	MOVB	AL, #DDSF_WACHAR	;Store function
+	CALL	putdsplist#
+	MOVB	AL, CL			;Store count
+	CALL	putdsplist#
+	MOVB	AL, [ESP]		;Store character
+	CALL	putdsplist#
+	MOVB	AL, 1.B[ESP]		;Store attribute byte
+	CALL	putdsplist#
+10$:	MOVL	EAX, [ESP]		;Get character and attribute
+	PUSHL	ECX
+	PUSHL	EDX
+	CALL	pcnchratr#		;Put character and attribute on screen
+	POPL	EDX
+	POPL	ECX
+	INCL	EDX			;Advance position
+	LOOP	ECX, 10$		;Continue if more to do
+	POPL	EAX			;Discard junk on the stack
+	CLRL	EAX
+	RET
+.PAGE
+	.SBTTL	pcnattrib - Subroutine to get or set display attributes
+
+;Subroutine to get or set display attributes
+;	c(AL)     = Function value:
+;		      Bit 7 set to change current values
+;		      Bit 6 set to return previous values
+;		      Bits 0-5 specify set of values:
+;			1 - Text mode base values
+;			2 - Graphics mode base values
+;			3 - Current text mode values
+;			4 - Current graphics mode values
+;	c{ESI}    = Offset of TDB
+;	c{ES:EDI} = Address of data block
+;	CALL	pcnattrib
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  c{EAX} = 0
+
+;Format of the data block:
+;	long forground;		/* Forground color */
+;	long background;	/* Background color */
+;	long forgndfill;	/* Forground fill color */
+;	long backgndfill;	/* Background fill color */
+
+pcnattrib:
+	CMPB	dcb_pcnbufslot-dcb_pcntdb[ESI], #0 ;Have a display buffer now?
+	JE	knlIFnDev##		;No
+	PUSHL	#0.B
+	MOVZWL	EDX, tdb_tattrval[ESI]	;Save current attribute values
+	PUSHL	EDX
+	MOVZWL	EDX, tdb_battrval[ESI]	;Save base attribute values
+	PUSHL	EDX
+	CALL	xosconAttrib##		;Do the function
+	MOVL	8.B[ESP], EAX		;Save return value
+	POPL	EAX			;Get previous base attribute values
+	CMPW	tdb_battrval[ESI], AX	;Were they changed?
+	JE	4$.S			;No
+	MOVB	AL, #0			;Yes - tell the server
+	CALL	putdsplist#
+	MOVB	AL, #DDSF_BATTRIB
+	CALL	putdsplist#
+	MOVB	AL, tdb_battrval[ESI]
+	CALL	putdsplist#
+	MOVB	AL, tdb_battrfil[ESI]
+	CALL	putdsplist#
+4$:	POPL	EAX			;Get previous current attribute values
+	CMPW	tdb_tattrval[ESI], AX	;Were they changed?
+	JE	6$.S			;No
+	MOVB	AL, #0			;Yes - tell the server
+	CALL	putdsplist#
+	MOVB	AL, #DDSF_CATTRIB
+	CALL	putdsplist#
+	MOVB	AL, tdb_tattrval[ESI]
+	CALL	putdsplist#
+	MOVB	AL, tdb_tattrfil[ESI]
+	CALL	putdsplist#
+6$:	POPL	EAX			;Restore return value
+	BTL	EAX, #31t		;Set C if error
+ret010:	RET				;Finished
+.PAGE
+	.SBTTL	pcnsendcurpos - Send cursor position message to server side
+
+;Subroutine to send cursor position message to server side
+;	c{EBX} = Page number
+;	c{ESI} = Offset of PCN TDB
+;	CALL	pcnsendcurpos
+
+pcnsendcurpos::
+	TESTB	dcb_pcnsts1-dcb_pcntdb[ESI], #PCNS1$MAPPED ;Mapped mode?
+	JNE	ret010.S		;Yes - nothing needed here
+	MOVZWL	EAX, tdb_curmode[ESI]	;Get cursor mode
+	CMPW	dcb_pcncurmode-dcb_pcntdb[ESI], AX ;Have it changed?
+	JE	4$.S			;No
+	MOVW	dcb_pcncurmode-dcb_pcntdb[ESI], AX ;Yes
+	MOVB	AL, #0			;Send message to server side
+	CALL	putdsplist#
+	MOVB	AL, #DDSF_CURTYPE
+	CALL	putdsplist#
+	MOVB	AL, tdb_curmode+1[ESI]
+	CALL	putdsplist#
+	MOVB	AL, tdb_curmode+0[ESI]
+	CALL	putdsplist#
+4$:	MOVZWL	EAX, tdb_curpos.B[ESI+EBX*2] ;Get actual cursor position
+	CMPW	dcb_pcncurpos-dcb_pcntdb[ESI+EBX*2], AX ;Has it changed?
+	JE	ret010.S		;No - nothing needed here
+	MOVW	dcb_pcncurpos-dcb_pcntdb[ESI+EBX*2], AX; Yes
+	PUSHL	EAX
+	MOVB	AL, #0			;Store prefix
+	CALL	putdsplist#
+	MOVB	AL, #DDSF_CURPOS	;Assume current display page
+	CMPB	dcb_pcndsppage+dcb_pcntdb[ESI], BL ;Right?
+	JE	6$.S			;Yes
+	INCL	EAX			;No
+	CALL	putdsplist#		;Store function
+	MOVB	AL, BL			;Store page number
+6$:	CALL	putdsplist
+	MOVB	AL, [ESP]		;Store x value
+	CALL	putdsplist#
+	POPL	EAX
+	MOVB	AL, AH			;Store y value
+	JMP	putdsplist#
+
+	END

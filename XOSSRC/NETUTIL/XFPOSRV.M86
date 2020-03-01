@@ -1,0 +1,2259 @@
+	.TITLE	XFPOSRV - XFPO file server for XOS
+
+;++++
+; This software is in the public domain.  It may be freely copied and used
+; for whatever purpose you see fit, including commerical uses.  Anyone
+; modifying this software may claim ownership of the modifications, but not
+; the complete derived code.  It would be appreciated if the authors were
+; told what this software is being used for, but this is not a requirement.
+
+;   THIS SOFTWARE IS PROVIDED BY THE AUTHORS "AS IS" AND ANY EXPRESS OR
+;   IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
+;   OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+;   IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+;   INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+;   BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS
+;   OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+;   ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR
+;   TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
+;   USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+;----
+
+	.PROC	80386
+	.INCLUD	XOSINC:\XMAC\XOS.PAR
+	.INCLUD	XOSINC:\XMAC\XOSX.PAR
+	.INCLUD	XOSINC:\XMAC\XOSERR.PAR
+	.INCLUD	XOSINC:\XMAC\XOSTIME.PAR
+	.INCLUD	XOSINC:\XMAC\XOSNET.PAR
+	.INCLUD	XOSINC:\XMAC\XOSXNET.PAR
+
+STACKBASE=!10000h	;Base offset for virtual stack area
+DATABASE =!20000h	;Base offset for main data section
+CDBBASE  =!30000h	;Base offset for first CDB
+CODEBASE =!1000h	;Base offset for code section
+
+	.SEG	code_s, CODE, 32BIT
+	.MSECT	code_m, code_s, ADDR=CODEBASE
+	.PSECT	code_p, code_m
+	.PSECT	once_p, code_m
+	.SEG	data_s, DATA, 32BIT
+	.MSECT	data_m, data_s, ADDR=DATABASE
+	.PSECT	data_p, data_m
+
+;This program is the XFPO file server.  It is initialized as a symbiont with
+;  the following command:
+;	SYMBIONT XFPOSRV tcp on cn ll lf
+;	  Where tcp = Name of the TCP device to use for network communications
+;			(required)
+;		on  = Maximum number of network opens to queue (default is 3)
+;		cn  = Maximum number of open conections (default is 30)
+;		ll  = Log level: 0 = No local logging (default)
+;				 1 = Log major events
+;				 2 = Log all network messages
+;		lf  = Log file name (default is to use DH_STDERR)
+
+;Note that each possible open connection uses 8 bytes of memory.  Each actual
+;  open connection uses 4KB of memory.  Also, two additional system queue
+;  elements (QELs) should be allocated for each open connection and an
+;  additonal extended fork frame (XFF) should be allocated for each queued
+;  open and for each 4 open connections.  In round numbers, each possible open
+;  connection consumes about 2KB of memory all of which is locked in physical
+;  memory.  Each actual open connection consumes an additional 4KB of pagable
+;  memory.
+
+IV_OPEN   =!24t		;TCP open done software interrupt
+IV_INPUT  =!25t		;TCP input available software interrupt
+IV_OUTPUT =!26t		;TCP output complete software interrupt
+IV_CLOSE  =!27t		;TCP close done
+IV_DISK   =!28t		;Disk IO done software interrupt
+
+NUMHNDL   =!4t		;Maximum number of open files per connection
+DFLT_OPENS=!3t		;Default number of queued opens
+DFLT_CONTS=!30t		;Default number of open connections
+
+BUFRSIZE  =!1600t
+PARMSIZE  =!1600t
+
+;Define offsets in the ODBs (Open Data Blocks)
+
+$$$=!0
+BLK odb_qab  , qab_SIZE		;QAB for open function
+BLK odb_parms, 24t		;Parameter list for open
+odb_SIZE=!$$$
+
+;Define offsets in the CDBs (Connections Data Blocks)
+
+cdb_MSIZE=!36t
+$$$=!-cdb_MSIZE
+BLK cdb_curhndl , 1t		;Current XFPO handle
+BLK cdb_response, 1t		;Non-zero if need response for data
+BLK cdb_header  , 1t		;Non-zero if inputting header
+BLK             , 1t
+BLK cdb_parmsize, 4t		;Size of parameter
+BLK cdb_parmbits, 4t		;Bits for parameter
+BLK cdb_parmend , 4t		;Offset of end of parameter list
+BLK cdb_string  , 4t		;Offset for allocating string buffers
+BLK cdb_reqtotal, 4t		;Total amount requested
+BLK cdb_cmdcnt  , 4t		;Command byte count
+BLK cdb_diskdsp , 4t		;Dispatch for disk io done
+BLK cdb_index   , 4t		;CDB slot table index
+BLK cdb_tcpqab  , qab_SIZE	;QAB for TCP IO
+.IF NE cdb_tcpqab
+	.IRP	q, >cdb_tcpqab
+	.ERROR	CDB starting offset is wrong, cdb_tcpqab = q'h
+	.ENDR
+.ENDC
+
+BLK cdb_diskqab , qab_SIZE	;QAB for disk IO
+BLK cdb_hndltbl , NUMHNDL*4	;XFPO handle table
+BLK cdb_hndlamnt, NUMHNDL*4	;Amount output table
+BLK cdb_buffer  , BUFRSIZE	;Data buffer
+BLK cdb_parm    , PARMSIZE	;Parameter list buffer
+cdb_SIZE=!$$$
+.PAGE
+	.SBTTL	Initial stack
+
+	.PSECT	data_p
+	.STACK	stack
+	.BLKB	256t	;Initial stack space for program - this must provide
+stack:			;  enough stack space to use to allocate our full
+			;  virtual stack
+
+	.SBTTL	Start of program
+
+	.PSECT	once_p
+	.START	start
+
+start:	PUSHL	#!data_p
+	POPL	DS
+	PUSHL	DS			;Allocate memory for our full stack
+	PUSHL	#STACKBASE
+	PUSHL	#PG$WRITE|PG$READ|PG$VIRTUAL.B
+	PUSHL	#DATABASE-STACKBASE
+	CALLF	svcMemChange#
+	TESTL	EAX, EAX		;Did we get it?
+	JNS	2$.S			;Yes - go on
+	MOVL	EBX, #nostkmsg		;No - fail
+	JMP	fail
+
+2$:	PUSHL	DS			;Change our process name
+	PUSHL	#ourname
+	CALLF	svcSysSetPName#
+	MOVL	ESI, ES:arg_cmdofs	;Get offset of argument string
+4$:	LODSB	ES:[ESI]		;Find first whitespace
+	TESTB	AL, AL
+	JNE	6$.S
+	MOVL	EBX, #noargmsg
+	JMP	fail
+
+6$:	CMPB	AL, #' '
+	JE	8$.S
+	CMPB	AL, #HT
+	JNE	4$.S
+8$:	CALL	skipwsp
+	MOVL	EDI, #dststr
+9$:	MOVB	AL, ES:[ESI]
+	INCL	ESI
+	CMPB	AL, #0
+	JE	havepid.S
+	CMPB	AL, #' '
+	JE	havepid.S
+	MOVB	[EDI], AL
+	INCL	EDI
+	JMP	9$.S
+
+;Here if no arguments at all
+
+10$:	MOVL	ESI, #noargmsg		;Complain as best as we can!
+12$:	CLRL	EAX
+	CALL	logsyslog
+	PUSHL	#1
+	CALLF	svcSchExit#
+.PAGE
+;Here with requestor PID
+
+havepid:TESTB	AL, AL			;End here?
+	JNE	4$.S			;No - go on
+	MOVL	EBX, #notodomsg		;Yes - nothing to do!
+fail:	SUBL	ESP, #100t.B		;Allocate a buffer
+	MOVL	EAX, DS
+	MOVL	ES, EAX
+	MOVL	EDI, ESP
+	MOVL	ESI, #failmsg1
+	MOVL	ECX, #FAILSZ1
+	RMOVSB	[EDI], [ESI]
+	MOVL	ESI, EBX
+2$:	LODSB	[ESI]
+	STOSB	[EDI]
+	TESTB	AL, AL
+	JNE	2$.S
+	DECL	EDI
+	MOVL	ESI, #failmsg2
+	MOVL	ECX, #FAILSZ2
+	RMOVSB	[EDI], [ESI]
+	MOVL	ECX, EDI
+	SUBL	ECX, ESP
+	MOVL	EDI, ESP
+	CALL	response
+	PUSHL	#1.B
+	CALLF	svcSchExit#
+
+4$:	CALL	getstrarg		;Get TCP device name
+	JC	badarg.S
+	CMPL	ECX, #10t.B		;Is it too long?
+	JB	8$.S			;No
+badarg:	MOVL	EBX, #badargmsg		;Yes - fail
+	JMP	fail.S
+
+8$:	PUSHL	ES
+	POPL	FS
+	PUSHL	DS
+	POPL	ES
+	PUSHL	ESI
+	MOVL	ESI, EBX
+	MOVL	EDI, #devname		;Copy the name
+	CLD
+	RMOVSB	[EDI],FS:[ESI]
+	POPL	ESI
+	PUSHL	FS
+	POPL	ES
+	CMPB	-1.B[EDI], #':'		;Did it end with a colon?
+	JE	10$.S			;Yes
+	MOVB	[EDI], #':'		;No - add one
+	INCL	EDI
+10$:	MOVL	[EDI], #'*::'		;Indicate want passive open
+	PUSHL	#O$PHYS			;Check the TCP device to make sure it
+	PUSHL	DS			;  really is a TCP device
+	PUSHL	#devname
+	PUSHL	DS
+	PUSHL	#openparms
+	CALLF	svcIoDevParm#
+	TESTL	EAX, EAX
+	JNS	14$.S
+12$:	MOVL	EBX, #tcperrmsg
+	JMP	fail
+
+14$:	CMPL	devclass+0, #'TCP'	;Is this really a TCP device?
+	JE	havedev.S		;Yes
+	MOVL	EBX, #nottcpmsg		;No
+	JMP	fail
+.PAGE
+;Here when have a TCP device to use
+
+havedev:CALL	getdecarg		;Get number of opens to queue
+2$:	JC	badarg.S
+	TESTL	EDX, EDX		;Is it 0?
+	JNE	4$.S			;No
+	MOVB	DL, #DFLT_OPENS		;Yes - use default
+4$:	MOVL	numopens, EDX
+	CALL	getdecarg		;Get maximum number of open connections
+	JC	2$.S
+	TESTL	EDX, EDX		;Is it 0?
+	JNE	6$.S			;No
+	MOVB	DL, #DFLT_CONTS		;Yes - use default
+6$:	MOVL	numconts, EDX
+	CMPL	numopens, EDX		;Have more opens than connections?
+	JBE	8$.S			;No
+	MOVL	numopens, EDX		;Yes - reduce the number of opens
+8$:	CALL	getdecarg		;Get the local logging level
+	JC	2$.S			;If error
+	MOVB	loglevel, DL		;Store it
+	CALL	getstrarg		;Get local log file name
+	JC	2$.S
+	JREGZ	ECX, 10$
+	PUSHL	#O$TRUNCA|O$CREATE|O$OUT ;Open the log file
+	PUSHL	ES
+	PUSHL	EBX
+	PUSHL	#0.B
+	PUSHL	#0.B
+	CALLF	svcIoOpen#
+	MOVL	loghndl, EAX
+	MOVL	EBX, #nologmsg
+	TESTL	EAX, EAX
+	JS	20$.S
+10$:	PUSHL	ES			;Give up the argument segment
+	CALLF	svcMemRemove#
+	PUSHL	#IV_OPEN.B		;Set the open done vector
+	PUSHL	#84h+{VT_XOSS<8}
+	PUSHL	CS
+	PUSHL	#opendone
+	CALLF	svcSchSetVector#
+	TESTL	EAX, EAX
+	JS	18$.S
+	PUSHL	#IV_INPUT.B		;Set the input ready vector
+	PUSHL	#84h+{VT_XOSS<8}
+	PUSHL	CS
+	PUSHL	#inputdone
+	CALLF	svcSchSetVector#
+	TESTL	EAX, EAX
+	JNS	22$.S
+18$:	MOVL	EBX, #sivfmsg
+20$:	JMP	fail
+
+22$:	PUSHL	#IV_OUTPUT.B		;Set the output complete vector
+	PUSHL	#84h+{VT_XOSS<8}
+	PUSHL	CS
+	PUSHL	#outputdone
+	CALLF	svcSchSetVector#
+	TESTL	EAX, EAX
+	JS	18$.S
+	PUSHL	#IV_CLOSE.B		;Set the close done vector
+	PUSHL	#84h+{VT_XOSS<8}
+	PUSHL	CS
+	PUSHL	#closedone
+	CALLF	svcSchSetVector#
+	TESTL	EAX, EAX
+	JS	18$.S
+	PUSHL	#IV_DISK.B		;Set the disk IO done vector
+	PUSHL	#84h+{VT_XOSS<8}
+	PUSHL	CS
+	PUSHL	#diskdone
+	CALLF	svcSchSetVector#
+	TESTL	EAX, EAX
+	JS	18$.S
+	IMULL	EAX, numconts, #12t.B	 ;Calculate amount of static memory
+	IMULL	EDX, numopens, #odb_SIZE ;  needed
+	ADDL	EAX, EDX
+	PUSHL	EAX			;Save additional amount needed
+	ADDL	EAX, #firstodb-DATABASE
+	PUSHL	DS			;Allocate memory if necessary
+	PUSHL	#DATABASE
+	PUSHL	#PG$READ|PG$WRITE.B
+	PUSHL	EAX
+	CALLF	svcMemChange#
+	TESTL	EAX, EAX
+	JNS	24$.S			;Go on if OK
+	MOVL	EBX, #nomemmsg		;Get offset of message
+	JMP	fail			;Go fail
+
+;Here with necesary memory allocated
+
+24$:	MOVL	ESI, #finalmsg		;Construct final response message
+	MOVL	EDI, #msgbfr
+	PUSHL	DS
+	POPL	ES
+	MOVL	ECX, #FINALSZ
+	CLD
+	RMOVSB	[EDI], [ESI]
+	MOVL	ESI, #phyname+1
+	MOVB	CL, phylength
+	RMOVSB	[EDI], [ESI]
+	MOVL	ECX, EDI
+	MOVL	EDI, #msgbfr
+	SUBL	ECX, EDI
+	CALL	response
+	IMULL	EAX, numopens, #odb_SIZE
+	ADDL	EAX, #firstodb		;Set pointers to the various arrays
+	MOVL	ipatable, EAX
+	MOVL	ECX, numconts
+	SHLL	ECX, #2
+	ADDL	EAX, ECX
+	MOVL	ipptable, EAX
+	ADDL	EAX, ECX
+	MOVL	cdbtable, EAX
+	POPL	ECX			;Clear out the additional memory (this
+	SHRL	ECX, #2			;  destroys the once-only data which
+	CLD				;  we don't need any more)
+	CLRL	EAX
+	MOVL	EDI, #firstodb
+	RSTOSL	[EDI]
+	MOVL	EDX, numopens		;Set up the ODBs
+	MOVL	EBX, #firstodb
+30$:	MOVW	odb_qab+qab_func.B[EBX], #QFNC_OPEN
+	MOVL	odb_qab+qab_option.B[EBX], #O$IN|O$OUT
+	MOVB	odb_qab+qab_vector.B[EBX], #IV_OPEN
+	MOVL	odb_qab+qab_buffer1+0.B[EBX], #devname
+	MOVL	odb_qab+qab_buffer1+4.B[EBX], DS
+	LEAL	EDI, odb_parms.B[EBX]
+	MOVL	odb_qab+qab_parm+0.B[EBX], EDI
+	MOVL	odb_qab+qab_parm+4.B[EBX], DS
+	MOVL	ESI, #odbparms		;Copy the parameter list
+	MOVL	ECX, #{ODBPSIZE+3}/4
+	CLD
+	RMOVSL	[EDI], CS:[ESI]
+	ADDL	EBX, #odb_SIZE
+	DECL	EDX
+	JNE	30$.S
+	MOVL	ECX, numopens		;Queue each open
+	MOVL	EDI, #firstodb
+32$:	PUSHL	ECX
+	CALL	qopen
+	POPL	ECX
+	ADDL	EDI, #odb_SIZE
+	LOOP	ECX, 32$
+	MOVL	ECX, numconts		;Set up the CDB free list
+	DECL	ECX
+	JE	36$.S			;In case only 1!
+	MOVL	EAX, #2
+	MOVL	EDI, ipptable
+34$:	STOSL	[EDI]
+	INCL	EAX
+	LOOP	ECX, 34$
+36$:	MOVL	freecont, #1
+	MOVL	ECX, numconts		;Store offsets for each CDB
+	MOVL	EAX, #CDBBASE
+	MOVL	EDI, cdbtable
+38$:	STOSL	[EDI]
+	ADDL	EAX, #4000h
+	LOOP	ECX, 38$
+	PUSHL	CS			;Set up arguments to give up the
+	PUSHL	#CODEBASE		;  once-only code (the actual call
+	PUSHL	#0.B			;  is done at ready since this area
+	PUSHL	#start-CODEBASE		;  will be given up!)
+	JMP	ready
+
+	.MOD	4
+odbparms:
+	.BYTE	PAR$SET|REP_HEXV, 4
+	.WORD	IOPAR_NETLCLPORT
+	.LONG	TCPP_XFPO+40000000h
+	.BYTE	PAR$GET|REP_HEXV, 4
+	.WORD	IOPAR_NETRMTNETAR
+odb_rmtnode=!odb_parms+{$-odbparms}
+	.LONG	0
+	.BYTE	PAR$GET|REP_HEXV, 2
+	.WORD	IOPAR_NETRMTPORTR
+odb_rmtport=!odb_parms+{$-odbparms}
+	.WORD	0
+	.BYTE	0
+ODBPSIZE=!$-odbparms
+.PAGE
+	.SBTTL	response - Subroutine to generate response message
+
+;Subroutine to generate response message
+;	c{EDI} = Offset of message
+;	c{ECX} = Length of message
+;	CALL	response
+
+response:
+	CMPW	dststr, #'0'.B		;Running from a terminal?
+	JNE	2$.S			;No - go on
+	INCL	EDI			;Yes - output message to the terminal
+	PUSHL	#DH_STDERR.B
+	PUSHL	DS
+	PUSHL	EDI
+	PUSHL	ECX
+	CALLF	svcIoOutString#
+	PUSHL	#DH_STDERR.B
+	PUSHL	DS
+	PUSHL	#crlfmsg
+	PUSHL	#0.B
+	CALLF	svcIoOutString#
+	RET
+
+;Here if not running from a terminal - send response message to requestor
+
+2$:	CMPL	msgqab+qab_handle, #0.B	;Is the message device open?
+	JNE	4$.S			;Yes - us it
+	PUSHL	#O$IN|O$OUT		;No - must open it now
+	PUSHL	DS
+	PUSHL	#msgname
+	PUSHL	#0.B
+	PUSHL	#0.B
+	CALLF	svcIoOpen#
+	TESTL	EAX, EAX
+	JS	8$.S
+	MOVL	msgqab+qab_handle, EAX
+4$:	PUSHL	EAX
+	PUSHL	DS
+	PUSHL	EDI
+	PUSHL	ECX
+	PUSHL	DS
+	PUSHL	#moparm
+	CALLF	svcIoOutBlockP#
+8$:	RET
+.PAGE
+	.SBTTL	getdecarg - Subroutine to get decimal argument value
+
+;Subroutine to get decimal argument value
+;	c{ES:ESI} = Pointer to argument string
+;	CALL	getdecarg
+;	C:set = Error
+;	C:clr = Normal
+;	  c(AL)     = Stopper character
+;	  c{EDX}    = Value
+;	  c{ES:ESI} = Updated pointer
+
+getdecarg:
+	CALL	skipwsp			;Skip leading whitespace
+	CLRL	EDX			;Clear value
+	CLRL	EAX
+2$:	LODSB	ES:[ESI]		;Get character
+	CMPB	AL, #0
+	JE	getnul.S
+	CMPB	AL, #' '		;Whitespace?
+	JE	ret004.S		;Yes - done
+	CMPB	AL, #HT
+	JE	ret004.S
+	CMPB	AL, #'0'		;Digit?
+	JB	8$.S
+	CMPB	AL, #'9'
+	JA	8$.S			;No - error
+	ANDB	AL, #0F			;Yes - get value of digit
+	IMULL	EDX, #10t.B		;Merge it in
+	ADDL	EDX, EAX
+	JMP	2$.S			;Continue
+
+;Here with non-digit - error
+
+8$:	STC
+ret004:	RET
+
+getnul:	DECL	ESI
+	RET
+.PAGE
+	.SBTTL	getstrarg - Subroutine to get string argument value
+
+;Subroutine to get string argument value
+;	c{ES:ESI} = Pointer to argument string
+;	CALL	getstrarg
+;	C:set = Error
+;	C:clr = Normal
+;	  c{ECX} = Length of the string
+;	  c{EBX} = Offset of the string
+
+getstrarg:
+	CALL	skipwsp			;Skip leading whitespace
+	CLRL	ECX			;Clear the count
+	MOVL	EBX, ESI		;Get offset of the string
+2$:	LODSB	ES:[ESI]		;Get character
+	CMPB	AL, #0			;End of argument?
+	JE	getnul.S		;Yes
+	CMPB	AL, #' '		;Maybe
+	JE	ret004.S		;Yes
+	CMPB	AL, #HT			;Maybe
+	JE	ret004.S		;Yes
+	INCL	ECX			;No - count the character	
+	JMP	2$.S			;Continue
+.PAGE
+	.SBTTL	skipwsp - Subroutine to skip leading whitespace
+
+;Subroutine to skip leading whitespace
+;	CALL	skipwsp
+
+2$:	INCL	ESI
+skipwsp:MOVB	AL, ES:[ESI]
+	CMPB	AL, #0
+	JE	4$.S
+	CMPB	AL, #' '
+	JE	2$.S
+	CMPB	AL, #HT
+	JE	2$.S
+4$:	RET
+.PAGE
+	.SBTTL	Main program loop
+
+	.PSECT	code_p
+
+;Here with all initialization complete
+
+ready:	CALLF	svcMemChange#		;Give up the once-only code
+	PUSHL	#0.B			;Set software interrupt level to 0
+	CALLF	svcSchSetLevel#	;  to allow interrupts
+
+;CODE GOES HERE TO START SOME OPENS
+
+mainloop:
+	PUSHL	#0.B			;Wait for interrupt
+	PUSHL	#0.B
+	PUSHL	#-1.B
+	CALLF	svcSchSuspend#
+.PAGE
+	.SBTTL	qopen - Subroutine to queue TCP open
+
+;Subroutine to queue TCP open
+;	c{EDI} = Offset of ODB
+;	CALL	qopen
+
+qopen:	PUSHL	DS			;Queue an open
+	PUSHL	EDI
+	CALLF	svcIoQueue#
+	TESTL	EAX, EAX
+	JS	4$.S			;If error
+	INCL	cntopens		;OK - count it
+	RET				;Thats all
+
+;Here if error
+
+4$:	MOVL	ESI, #opnemsg
+	JMP	logsyslog
+.PAGE
+	.SBTTL	qinhdr - Subroutine to queue TCP header input
+
+;Subroutine to queue TCP header input
+;	c{EDI} = Offset of CDB
+;	CALL	qinhdr
+
+qinhdr:	MOVB	cdb_tcpqab+qab_vector.B[EDI], #IV_INPUT
+	MOVB	cdb_header.B[EDI], #1
+	MOVL	ECX, #4
+	MOVL	cdb_tcpqab+qab_parm+0.B[EDI], #notoparm
+	MOVL	cdb_tcpqab+qab_parm+4.B[EDI], DS
+	CLRL	EAX			;No data offset, fall into qinput
+
+	.SBTTL	qinput - Subroutine to queue TCP input
+
+;Subroutine to queue TCP input
+;	c{EAX} = Offset for input
+;	c{ECX} = Maximum amount to input
+;	c{EDI} = Offset of CDB
+;	CALL	qinput
+
+qinput:	MOVW	cdb_tcpqab+qab_func.B[EDI], #QFNC_INBLOCK ;Set up the QAB
+	LEAL	EAX, cdb_buffer[EDI+EAX]
+	MOVL	cdb_tcpqab+qab_buffer1.B[EDI], EAX
+	MOVL	cdb_tcpqab+qab_count.B[EDI], ECX
+	PUSHL	DS			;Queue an input
+	PUSHL	EDI
+	CALLF	svcIoQueue#
+	TESTL	EAX, EAX
+	JS	4$.S			;If error
+	INCL	cntopens		;OK - count it
+	RET				;Thats all
+
+;Here if error queueing input
+
+4$:	MOVL	EBX, #qinmsg
+	JMP	logsyslog
+.PAGE
+	.SBTTL	opendone - Software interrupt routine for open complete
+
+;Subroutine software interrupt routine for open complete
+
+$$$$oe::
+1$:	JMP	10$
+
+opendone:
+	PUSHAL				;Save registers
+	DECL	cntopens		;Reduce queued open count
+	MOVL	EDI, 64t.B[ESP]		;Get offset of the ODB
+	CMPL	odb_qab+qab_error.B[EDI], #0.B ;Error on the open?
+	JS	1$.S			;Yes - just queue another one (this
+	PUSHL	EDI			;  is normal for some network errors!)
+	MOVL	ECX, freecont		;Get a free CDB slot
+	MOVL	EBX, ipptable
+	MOVL	EAX, -4.B[EBX+ECX*4]	;Remove it from the free list
+	MOVL	freecont, EAX
+	MOVL	EDX, cdbtable		;Get offset for the CDB
+	MOVL	EDX, -4.B[EDX+ECX*4]
+
+	CMPL	EDX, #30000h
+	JAE	2$.S
+$$$$ba::NOP
+2$:
+
+	CMPB	loglevel, #1		;Should we log this?
+	JB	4$.S			;No
+	PUSHL	EBX			;Yes
+	PUSHL	EDX
+	PUSHL	ECX
+	MOVL	EBX, #strcnx		;Display initial string
+	CALL	logstr
+	MOVL	EAX, [ESP]		;Display index
+	MOVL	ECX, #2
+	MOVB	DL, #' '	
+	CALL	logdecval
+	CALL	logspace
+	MOVL	EAX, 4.B[ESP]		;Display hex address of the CDB
+	MOVL	ECX, #8
+	MOVB	DL, #'0'
+	CALL	loghexval
+	CALL	logspace
+	MOVL	EAX, odb_qab+qab_handle.B[EDI]
+	CALL	logdecvalv
+	CALL	logout
+	POPL	ECX
+	POPL	EDX
+	POPL	EBX
+4$:	PUSHL	DS			;Allocate memory for the CDB
+	PUSHL	EDX
+	PUSHL	#PG$WRITE|PG$READ
+	PUSHL	#cdb_SIZE
+	CALLF	svcMemChange#
+	TESTL	EAX, EAX
+	JS	14$.S			;If error!
+	ADDL	EDX, #cdb_MSIZE.B
+	MOVL	cdb_index.B[EDX], ECX	;Store index
+	MOVL	cdb_tcpqab+qab_buffer1+4.B[EDX], DS
+	MOVL	cdb_diskqab+qab_buffer1+4.B[EDX], DS
+	MOVL	cdb_diskqab+qab_buffer2+4.B[EDX], DS
+	MOVL	cdb_diskqab+qab_parm+4.B[EDX], DS
+	MOVL	cdb_diskqab+qab_vector.B[EDX], #IV_DISK
+	MOVL	EAX, odb_qab+qab_handle.B[EDI] ;Store handle
+	MOVL	cdb_tcpqab+qab_handle.B[EDX], EAX
+	MOVZWL	EAX, odb_rmtport.B[EDI] ;Store remote port number
+	MOVL	-4.B[EBX+ECX*4], EAX
+	MOVL	EBX, ipatable
+	MOVL	EAX, odb_rmtnode.B[EDI] ;And store remote IP address
+	MOVL	-4.B[EBX+ECX*4], EAX
+	MOVL	EDI, EDX
+	CALL	qinhdr			;Queue an input for this connection
+	POPL	EDI
+10$:	MOVL	EAX, cntconts		;Do we have the maximum number of
+	CMPL	numconts, EAX		;  connections now?
+	JBE	12$.S			;Yes - don't queue an open now
+	CALL	qopen			;No - queue another open on this ODB
+12$:	POPAL				;Restore registers
+	CALLF	svcSchDismiss#		;And dismiss
+
+;Here if cannot allocate memory for the CDB
+
+14$:	MOVL	ESI, #nomcdbmsg
+	CALL	logsyslog
+	JMP	12$.S
+.PAGE
+	.SBTTL	inputdone - Software interrupt routine for TCP input complete
+
+;Software interrupt routine for TCP input complete
+
+inputdone:
+	PUSHAL				;Save registers
+	MOVL	EDI, 64t.B[ESP]		;Get offset of the CDB
+	TESTB	cdb_tcpqab+qab_status+1.B[EDI], #QSTS$DONE>8 ;Really finished?
+	JE	6$.S			;No - false alarm!
+2$:	CMPL	cdb_tcpqab+qab_error.B[EDI], #0.B ;Yes - any errors?
+	JS	tcperr			;Yes
+	CMPB	cdb_header.B[EDI], #0	;Inputting header now?
+	JE	10$.S			;No - go handle data
+	MOVZWL	ECX, cdb_buffer+2[EDI]	;Yes - get message length
+	XCHGB	CL, CH			;Fix up the byte order
+	CMPL	ECX, #BUFRSIZE		;Legal length?
+	JA	faterr			;No - error
+	MOVL	cdb_cmdcnt.B[EDI], ECX	;Yes
+	JREGZ	ECX, 10$
+	CLRL	EAX
+	MOVL	cdb_header.B[EDI], EAX
+	MOVB	cdb_tcpqab+qab_vector.B[EDI], AL
+	MOVL	cdb_tcpqab+qab_parm+0.B[EDI], EAX
+	MOVB	AL, #4
+	CALL	qinput			;Queue input for the data part
+	JC	tcper2
+	MOVB	cdb_tcpqab+qab_vector.B[EDI], #IV_INPUT
+	TESTB	cdb_tcpqab+qab_status+1.B[EDI], #QSTS$DONE>8
+	JNE	2$.S
+6$:	POPAL
+	CALLF	svcSchDismiss#
+
+;Here when data input is done
+
+10$:	CMPB	loglevel, #2
+	JB	12$.S
+	MOVL	EBX, #strtcpi
+	MOVL	EDX, #tablei
+	CALL	logmsg
+12$:	LEAL	ESI, cdb_buffer+4[EDI]
+	MOVZBL	EAX, -4.B[ESI]		;Get the function value
+	ANDB	AL, #0Fh
+	JMPIL	cmddsp[EAX*4]		;Dispatch on the function
+
+	.PSECT	data_p
+
+cmddsp:	.LONG	clrcon		;		= 0  - Illegal
+	.LONG	msgdata		;XFPOF_DATA	= 1  - Data message/resp
+	.LONG	msgdataparm	;XFPOF_DATAPAR	= 2  - Data message/para/resp
+	.LONG	msgdatanr	;XFPOF_DATANR   = 3  - Data message/no resp
+	.LONG	msgdataparmnr	;XFPOF_DATAPARNR= 4  - Data message/para/no resp
+	.LONG	clrcon		;		= 5  - Illegal
+	.LONG	clrcon		;		= 6  - Illegal
+	.LONG	clrcon		;		= 7  - Illegal
+	.LONG	msgdatareq	;XFPOF_DATAREQ	= 8  - Data request
+	.LONG	msgopen		;XFPOF_OPEN	= 9  - Open
+	.LONG	msgdevparm	;XFPOF_PARM	= 10 - Parmeter function
+	.LONG	msgclose	;XFPOF_CLOSE	= 11 - Close
+	.LONG	msgdelete	;XFPOF_DELETE	= 12 - Delete file
+	.LONG	msgrename	;XFPOF_RENAME	= 13 - Rename file
+	.LONG	msgcommit	;XFPOF_COMMIT	= 14 - Commit data to file
+	.LONG	clrcon		;		= 15 - Illegal
+
+	.PSECT	code_p
+.PAGE
+;Here on fatal protocol error
+
+faterr:	MOVL	EAX, #ER_NPERR
+	JMP	tcper2.S
+
+;Here if error on input - all errors reported here indicate a serious problem
+;  with the network connection - an ER_NCCLR error is the normal indication
+;  of the other end clearing the connection
+
+tcperr:	MOVL	EAX, cdb_tcpqab+qab_error.B[EDI]
+tcper2:	CMPL	EAX, #ER_NCCLR		;Normal clearing?
+	JE	clrcon.S		;Yes - go on
+	CMPB	loglevel, #1		;Should we log this?
+	JB	clrcon.S		;No
+	PUSHL	EAX
+	MOVL	EBX, #strerx		;Yes
+	CALL	logstr
+	MOVL	EAX, cdb_index.B[EDI]
+	MOVL	ECX, #2
+	MOVB	DL, #' '
+	CALL	logdecval
+	CALL	logspace
+	POPL	EAX
+	CALL	loghexvalv
+	CALL	logspace
+	MOVL	EAX, cdb_tcpqab+qab_handle.B[EDI]
+	CALL	logdecvalv
+	CALL	logout
+clrcon:	CMPB	loglevel, #1		;Should we log this?
+	JB	2$.S			;No
+	MOVL	EBX, #strcrx		;Yes
+	CALL	logstr
+	MOVL	EAX, cdb_index.B[EDI]
+	MOVL	ECX, #2
+	MOVB	DL, #' '
+	CALL	logdecval
+	CALL	logspace
+	MOVL	EAX, cdb_tcpqab+qab_handle.B[EDI]
+	CALL	logdecvalv
+	CALL	logout
+2$:	MOVL	cdb_tcpqab+qab_func.B[EDI], #QFNC_CLOSE ;Close the TCP device
+	CLRL	EAX
+	MOVL	cdb_tcpqab+qab_option.B[EDI], EAX
+	MOVL	cdb_tcpqab+qab_parm.B[EDI], EAX
+	MOVB	cdb_tcpqab+qab_vector.B[EDI], #IV_CLOSE
+	PUSHL	DS
+	PUSHL	EDI
+
+
+	CMPB	loglevel, #1		;Should we log this?
+	JB	3$.S			;No
+	PUSHL	EAX
+	MOVL	EBX, #strcbx		;Yes
+	CALL	logstr
+	MOVL	EAX, cdb_index.B[EDI]
+	MOVL	ECX, #2
+	MOVB	DL, #' '
+	CALL	logdecval
+	CALL	logspace
+	POPL	EAX
+	CALL	loghexvalv
+	CALL	logspace
+	MOVL	EAX, cdb_tcpqab+qab_handle.B[EDI]
+	CALL	logdecvalv
+	CALL	logout
+3$:
+
+	CALLF	svcIoQueue#
+	TESTL	EAX, EAX
+	JS	6$.S			;If error
+4$:	POPAL				;OK - restore registers
+	CALLF	svcSchDismiss#		;And dismiss
+
+;Here with error while clearing the TCP connection
+
+6$:
+;;;;;;;;CODE GOES HERE TO LOG THE ERROR!!!
+
+;;;;;;;	JMP	14$
+
+	JMP	8$			;Forget the TCP close, go close any
+					;  open devices
+
+;TCP close done software interrupt routine
+
+closedone:
+	PUSHAL				;Save registers
+	MOVL	EDI, 64t.B[ESP]		;Get offset of the CDB
+	TESTB	cdb_tcpqab+qab_status+1.B[EDI], #QSTS$DONE>8 ;Really finished?
+	JE	4$.S			;No - false alarm!
+
+	JMP	7$.S
+
+	CMPB	loglevel, #2
+	JB	7$.S
+	PUSHL	EAX
+	MOVL	EBX, #strcdx		;Yes
+	CALL	logstr
+	MOVL	EAX, cdb_index.B[EDI]
+	MOVL	ECX, #2
+	MOVB	DL, #' '
+	CALL	logdecval
+	CALL	logspace
+	POPL	EAX
+	CALL	loghexvalv
+	CALL	logspace
+	MOVL	EAX, cdb_tcpqab+qab_handle.B[EDI]
+	CALL	logdecvalv
+	CALL	logout
+
+
+
+7$:	CMPL	cdb_tcpqab+qab_error.B[EDI], #0.B ;Yes - any errors?
+	JS	6$.S			;Yes
+8$:	CLRL	EAX
+10$:	CMPL	cdb_hndltbl.B[EDI+EAX*4], #0.B ;This handle in use?
+	JNE	14$.S			;Yes
+	INCL	EAX			;No - bump handle index
+	CMPL	EAX, #NUMHNDL		;Finished?
+	JB	10$.S			;No - continue
+	MOVL	ECX, cdb_index.B[EDI]	;Yes - put this slot on the free list
+	MOVL	EAX, freecont
+	MOVL	EBX, ipptable
+	MOVL	-4.B[EBX+ECX*4], EAX
+	MOVL	freecont, ECX
+	CLRL	EAX
+	MOVL	EBX, ipatable
+	MOVL	-4.B[EBX+ECX*4], EAX	
+	SUBL	EDI, #cdb_MSIZE.B	;Give up our CDB
+	PUSHL	DS
+	PUSHL	EDI
+	PUSHL	#PG$WRITE|PG$READ
+	PUSHL	#0.B
+	CALLF	svcMemChange#
+	POPAL				;Finished here
+	CALLF	svcSchDismiss#
+
+;Here with a handle which is in use
+
+14$:	MOVL	EDX, cdb_hndltbl.B[EDI+EAX*4] ;Get XOS handle
+	MOVL	cdb_diskqab+qab_handle.B[EDI], EDX ;Store it
+	MOVL	cdb_hndltbl.B[EDI+EAX*4], #0 ;Clear the handle table entry
+	MOVW	cdb_diskqab+qab_func.B[EDI], #QFNC_CLOSE
+	CLRL	EAX
+	MOVL	cdb_diskqab+qab_option.B[EDI], EAX
+	MOVL	cdb_diskqab+qab_parm.B[EDI], EAX
+	MOVL	cdb_diskdsp.B[EDI], #8$	;Set dispatch for disk done
+	JMP	dodisk			;Continue
+.PAGE
+;Here for the XFPOF_DATA function - Data without parameters (response required)
+
+msgdata:MOVB	cdb_response.B[EDI], #1	;Indicate need response
+	JMP	2$.S
+
+;Here for the XFPOF_DATANR function - Data without parameters (no response)
+
+msgdatanr:
+	MOVB	cdb_response.B[EDI], #0	;Indicate no response wanted
+2$:	DECL	cdb_cmdcnt.B[EDI]	;Must have at least 1 byte here
+	JS	5$.S
+	CALL	gethandle		;Get the file handle
+	JC	sererr			;If error
+	MOVL	EAX, cdb_cmdcnt.B[EDI]	;Entire rest of message is data
+	JMP	6$.S
+
+;Here for the XFPOF_DATAPAR function - Data with parameters (response required)
+
+msgdataparm:
+	MOVB	cdb_response.B[EDI], #1	;Indicate need response
+	JMP	4$.S
+
+;Here for the XFPOF_DATAPARNR function - Data with parameters (no response)
+
+msgdataparmnr:
+	MOVB	cdb_response.B[EDI], #0	;Indicate no response wanted
+4$:	SUBL	cdb_cmdcnt.B[EDI], #2.B	;Must have at least 2 bytes here
+5$:	JS	snperr
+	CALL	gethandle		;Get the file handle
+	JC	sererr			;If error
+	CLRL	EAX
+	LODSB	[ESI]			;Get first count byte
+	TESTB	AL, #80h		;Is it a one byte count?
+	JE	6$.S			;Yes - this is all of it
+	ANDB	AL, #7Fh		;No - get the entire count
+	MOVB	AH, AL
+	DECL	cdb_cmdcnt.B[EDI]
+	JS	5$.S
+	LODSB	[ESI]
+6$:	MOVL	cdb_diskqab+qab_count.B[EDI], EAX ;Store total amount available
+	SUBL	cdb_cmdcnt.B[EDI], EAX
+	MOVL	cdb_diskqab+qab_buffer1.B[EDI], ESI ;Store buffer offset
+	ADDL	ESI, EAX		;Point to the parameters
+	CALL	setupparms		;Set up the parameter list
+	JC	sererr
+	MOVL	cdb_diskdsp.B[EDI], #outputrdy ;Set dispatch for disk done
+	MOVW	cdb_diskqab+qab_func.B[EDI], #QFNC_OUTBLOCK ;Store function
+	JMP	dodisk			;Continue
+.PAGE
+;Here when disk output is complete
+
+outputrdy:
+	CMPL	cdb_diskqab+qab_error.B[EDI], #0.B ;Error?
+	JL	closerdy		;Yes
+	MOVL	EAX, cdb_diskqab+qab_amount.B[EDI] ;No - get amount
+	MOVZBL	EBX, cdb_curhndl.B[EDI]
+	ADDL	cdb_hndlamnt-4.B[EDI+EBX*4], EAX ;Add in to amount for handle
+	CMPL	cdb_diskqab+qab_count.B[EDI], EAX ;Was it all output?
+	JNE	4$.S			;No - return error
+	CMPB	cdb_response.B[EDI], #0	;Yes - need a response?
+	JE	outputdon2		;No
+2$:	MOVL	EAX, cdb_hndlamnt-4.B[EDI+EBX*4] ;Yes - get total amount output
+	MOVL	cdb_diskqab+qab_amount.B[EDI], EAX ;Store for reply
+	CLRL	EAX			;Clear the amount
+	MOVL	cdb_hndlamnt-4.B[EDI+EBX*4], EAX
+	JMP	closerdy
+
+;Here if output was incomplete
+
+4$:	MOVL	cdb_diskqab+qab_error.B[EDI], #ER_INCMO
+	JMP	2$.S
+.PAGE
+;Here for the XFPOF_DATAREQ function - Data request
+
+msgdatareq:
+	SUBL	cdb_cmdcnt.B[EDI], #5.B	;Must have at least 5 bytes here
+	JS	snperr
+	CALL	gethandle		;Get the file handle
+	JC	sererr			;If error
+	LODSL	[ESI]			;Get count value
+	XCHGB	AL, AH
+	RORL	EAX, #16t
+	XCHGB	AL, AH
+	MOVL	cdb_reqtotal.B[EDI], EAX ;Store total amount wanted
+	CALL	setupparms		;Set up the parameter list
+	JC	sererr
+datreq2:LEAL	EBX, cdb_buffer+4[EDI]	;Get offset of the data buffer
+	CMPL	cdb_diskqab+qab_parm.B[EDI], #0.B ;Have any parameters?
+	JE	4$.S			;No
+	ADDL	EBX, #2.B		;Yes - adjust data buffer offset
+4$:	MOVL	cdb_diskqab+qab_buffer1.B[EDI], EBX ;Store buffer offset
+	MOVL	EAX, cdb_reqtotal.B[EDI] ;Get amount wanted
+	CMPL	EAX, #1024t		;Too big?
+	JBE	6$.S			;No
+	MOVL	EAX, #1024t		;Yes
+6$:	SUBL	cdb_reqtotal.B[EDI], EAX ;Reduce amount to get
+	MOVL	cdb_diskqab+qab_count.B[EDI], EAX ;Store byte count
+	MOVW	cdb_diskqab+qab_func.B[EDI], #QFNC_INBLOCK ;Store function
+	MOVL	cdb_diskdsp.B[EDI], #inputrdy ;Set dispatch for disk done
+	JMP	dodisk			;Continue
+.PAGE
+;Here when disk input is done
+
+inputrdy:
+	CMPL	cdb_diskqab+qab_error.B[EDI], #0.B ;Error?
+	JL	closerdy		;Yes - go handle that
+	MOVL	cdb_buffer+0[EDI], #XFPOF_DRESP ;No - store function
+	MOVL	EAX, cdb_diskqab+qab_amount.B[EDI] ;Get amount of data read
+	CMPL	EAX, cdb_diskqab+qab_count.B[EDI] ;Did we get all we wanted?
+	JE	2$.S			;Yes
+	MOVB	cdb_buffer+0[EDI], #XFPOF_DRESPF ;No - use right function
+	MOVL	cdb_reqtotal.B[EDI], #0.B ;Make this the last thing we do
+2$:	CMPL	cdb_diskqab+qab_parm.B[EDI], #0.B ;Have any parameters?
+	JE	4$.S			;No
+	INCB	cdb_buffer+0[EDI]	;Yes - fix up the function
+	ORB	AH, #80h		;Indicate 2 byte value
+	XCHGB	AL, AH
+	MOVW	cdb_buffer+4[EDI], AX	;Store data length in the message
+4$:	MOVL	ESI, cdb_diskqab+qab_buffer1+0.B[EDI] ;Point to first byte after
+	ADDL	ESI, cdb_diskqab+qab_amount.B[EDI]    ;  the data we just read
+	CALL	doresp4			;Finish setting up the response
+	JC	sererr
+	CLRL	EAX			;Only process parameters once
+	MOVL	cdb_diskqab+qab_parm.B[EDI], EAX
+	JMP	sndresp			;Send the response
+.PAGE
+;Here for the XFPOF_COMMIT function - Commit data to file
+
+msgcommit:
+	DECL	cdb_cmdcnt.B[EDI]	;Must have at least 1 byte here
+	JS	snperr
+	CALL	gethandle		;Get the file handle
+	JC	sererr			;If error
+	CLRL	EAX
+	MOVL	cdb_diskqab+qab_count.B[EDI], EAX ;Store total amount available
+	CALL	setupparms		;Set up the parameter list
+	JC	sererr			;If error
+	MOVL	cdb_diskdsp.B[EDI], #commitrdy ;Set dispatch for disk done
+	MOVW	cdb_diskqab+qab_func.B[EDI], #QFNC_COMMIT ;Store function
+	JMP	dodisk			;Continue
+.PAGE
+;Here when commit function is complete
+
+commitrdy:
+	CMPL	cdb_diskqab+qab_error.B[EDI], #0.B ;Error?
+	JL	4$.S			;Yes
+	CLRL	EAX			;OK - amount is always 0
+	MOVL	cdb_diskqab+qab_amount.B[EDI], EAX ;Store for reply
+4$:	JMP	closerdy		;Continue
+.PAGE
+;Here for the XFPOF_OPEN function - Open file
+
+msgopen:MOVW	cdb_diskqab+qab_func.B[EDI], #QFNC_OPEN
+	CALL	opensetup		;Do first part of this
+	JC	sererr
+	MOVL	ECX, #NUMHNDL		;Find a free XFPO handle
+	CLRL	EAX
+6$:	INCL	EAX
+	CMPL	cdb_hndltbl-4.B[EDI+EAX*4], #0.B
+	LOOPNE	ECX, 6$
+	JNE	10$.S			;If none free
+	MOVB	cdb_curhndl.B[EDI], AL	;Remember the handle
+	MOVL	cdb_diskdsp.B[EDI], #openrdy ;Set dispatch for disk done
+	JMP	dodisk
+
+;Here if no network handle available
+
+10$:	MOVL	EAX, #ER_TMRNC
+sererr:	MOVL	cdb_buffer+0[EDI], #XFPOF_ERROR+{8<24t}
+	XCHGB	AL, AH
+	RORL	EAX, #16t
+	XCHGB	AL, AH
+	MOVL	cdb_buffer+4[EDI], EAX
+	CLRL	EAX
+	MOVL	cdb_buffer+8[EDI], EAX
+	JMP	sndresp
+.PAGE
+;Here when the open is finished
+
+openrdy:LEAL	ESI, cdb_buffer+4[EDI]	;Assume error
+
+	CMPL	cdb_diskqab+qab_error.B[EDI], #ER_ADRER.B ;Right?
+	JNE	1$.S
+$$$$ae::NOP
+1$:
+	CMPL	cdb_diskqab+qab_error.B[EDI], #0.B ;Right?
+	JL	2$.S			;Yes
+	MOVL	EAX, cdb_diskqab+qab_handle.B[EDI] ;No - store XOS handle
+	MOVZBL	EBX, cdb_curhndl.B[EDI]		   ;  in the XFPO handle table
+	MOVB	cdb_hndltbl-4.B[EDI+EBX*4], AL
+	MOVB	[ESI], BL		;Also store it in the message
+	INCL	ESI
+	CLRL	EAX			;Clear amount output
+	MOVL	cdb_hndlamnt-4.B[EDI+EBX*4], EAX
+	MOVL	cdb_buffer+0[EDI], #XFPOF_OPNRESP
+2$:	CALL	doresp2			;Do common response stuff
+	JC	sererr
+sndresp:CMPB	loglevel, #2
+	JB	4$.S
+	MOVL	EBX, #strtcpo
+	MOVL	EDX, #tableo
+	CALL	logmsg
+4$:	PUSHL	DS			;Start output
+	PUSHL	EDI
+	CALLF	svcIoQueue#
+	TESTL	EAX, EAX
+	JS	clrcon			;If error, just quietly clear the
+					;  conection
+	POPAL				;Restore registers
+	CALLF	svcSchDismiss#		;And dismiss
+.PAGE
+;Here for the XFPOF_DEVPARM function - Device parameter function
+
+msgdevparm:
+	MOVW	cdb_diskqab+qab_func.B[EDI], #QFNC_DEVPARM
+devparm2:
+	CALL	opensetup		;Do first part of this
+	JC	sererr
+	MOVL	cdb_diskdsp.B[EDI], #devparmrdy ;Set dispatch for disk done
+dodisk:	PUSHL	DS
+	LEAL	EAX, cdb_diskqab.B[EDI]
+	PUSHL	EAX
+	CALLF	svcIoQueue#		;Do the function
+	TESTL	EAX, EAX
+	JS	sererr			;If error
+	POPAL
+	CALLF	svcSchDismiss#		;Dismiss the interrupt
+.PAGE
+;Here if a devparm function has just finished
+
+devparmrdy:
+	CALL	doresp			;Do common response stuff
+	JNC	sndresp			;If OK
+	JMP	sererr
+.PAGE
+;Here for the XFPOF_CLOSE function - Close
+
+msgclose:
+	SUBL	cdb_cmdcnt.B[EDI], #2.B	;Must have at least 2 bytes here
+	JS	clrcon
+	CLRL	EAX
+	LODSB	[ESI]			;Get the command bits
+	MOVL	cdb_diskqab+qab_option.B[EDI], EAX
+	CALL	gethandle		;Get the file handle
+	JC	clrcon			;If error
+	MOVL	cdb_hndltbl.B[EDI+EAX*4], #0 ;OK - clear the handle
+	CALL	setupparms		;Set up the parameter list
+	JC	4$.S
+	MOVL	cdb_diskdsp.B[EDI], #closerdy ;Set dispatch for disk done
+2$:	MOVW	cdb_diskqab+qab_func.B[EDI], #QFNC_CLOSE
+	JMP	dodisk.S		;Continue
+
+;Here if error setting up the parameter list - close the file anyway but
+;  report the error
+
+4$:	CLRL	EAX
+	MOVL	cdb_diskqab+qab_parm+0.B[EDI], EAX
+	MOVL	cdb_diskdsp.B[EDI], #closeerr
+	JMP	2$.S
+
+;Here when the close function is done if had problem setting up the parameter
+;  list
+
+closeerr:
+	MOVL	EAX, #ER_NPERR
+	MOVL	cdb_diskqab+qab_error.B[EDI], EAX
+
+;Here when the close function is done
+
+closerdy:
+	CLRL	EAX			;Clear input request amount
+	MOVL	cdb_reqtotal.B[EDI], EAX
+	CALL	doresp			;Set up the response
+	JNC	sndresp			;Send it
+	JMP	clrcon			;Clear connection if error
+.PAGE
+;Here for the XFPOF_DELETE function - Delete file
+
+msgdelete:
+	MOVW	cdb_diskqab+qab_func.B[EDI], #QFNC_DELETE
+	JMP	devparm2
+.PAGE
+;Here for the XFPOF_RENAME function - Rename file
+
+msgrename:
+	MOVW	cdb_diskqab+qab_func.B[EDI], #QFNC_RENAME
+	JMP	devparm2
+.PAGE
+	.SBTTL	opensetup - Subroutine to do set up for open type functions
+
+;Subroutine to do set up for open type functions
+;	CALL	opensetup
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+
+opensetup:
+	SUBL	cdb_cmdcnt.B[EDI], #5.B	;Must have at least 5 bytes here!
+	JS	12$.S
+	LODSL	[ESI]			;Get the command bits
+	XCHGB	AL, AH			;Fix up the byte order
+	RORL	EAX, #16t
+	XCHGB	AL, AH
+	MOVL	cdb_diskqab+qab_option.B[EDI], EAX
+	CALL	getname			;Get offset of name string
+	JC	10$.S
+	MOVL	cdb_diskqab+qab_buffer1+0.B[EDI], EDX ;Store offset of name
+	CMPB	cdb_diskqab+qab_func.B[EDI], #QFNC_RENAME ;Rename?
+	JNE	2$.S			;No
+	DECL	cdb_cmdcnt.B[EDI]	;Yes - must have count byte for new name
+	JS	12$.S
+	PUSHL	ESI
+	CALL	getname			;Get offset of new name
+	POPL	EBX
+	JC	10$.S
+	MOVL	cdb_diskqab+qab_buffer2+0.B[EDI], EDX ;Store offset of name
+	MOVB	[EBX], #0		;Store null to terminate name
+2$:	PUSHL	ESI			;Save offset of byte after name
+	CALL	setupparms		;Set up the parameter list
+	POPL	EBX
+	JC	10$.S			;If error
+	MOVB	[EBX], #0		;Store null to terminate name
+	CMPB	loglevel, #1		;Should we log this?
+	JB	8$.S			;No
+	MOVL	EBX, #strox		;Yes
+	CALL	logstr
+	MOVL	EBX, cdb_diskqab+qab_buffer1.B[EDI]
+	CALL	logstr
+	CALL	logout
+	CMPB	cdb_diskqab+qab_func.B[EDI], #QFNC_RENAME
+	JNE	8$.S
+	MOVL	EBX, #strrx
+	CALL	logstr
+	MOVL	EBX, cdb_diskqab+qab_buffer2.B[EDI]
+	CALL	logstr
+	CALL	logout
+8$:	CLC
+10$:	RET
+
+12$:	MOVL	EAX, #ER_NPERR
+	STC
+	RET
+
+;Subroutine to get offset of name string
+;	c{ESI} = Pointer to message data
+;	CALL	getname
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  c{EDX} = Offset of name string
+;	  c{ESI} = Pointer to first byte after name string
+
+getname:CLRL	EAX
+	LODSB	[ESI]			;Get first byte of length of file name
+	TESTB	AL, #80h		;Need a second count byte?
+	JE	16$.S			;No
+	ANDB	AL, #7Fh		;Yes
+	MOVB	AH, AL
+	LODSB	[ESI]
+	DECL	cdb_cmdcnt.B[EDI]
+	JS	12$.S
+16$:	MOVL	EDX, ESI		;Save offset of name
+	ADDL	ESI, EAX		;Point to next byte past name
+	SUBL	cdb_cmdcnt.B[EDI], EAX	;Reduce command length by name length
+	JS	12$.S			;If error
+	RET
+.PAGE
+	.SBTTL	gethandle - Subroutine to get handle from a message
+
+;Subroutine to get handle from a message
+;	CALL	gethandle
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  c{EAX} = XFPO handle - 1, XOS handle is stored in
+;		     cdb_diskqab+qab_handle
+
+gethandle:
+	CLRL	EAX			;Get the handle
+	LODSB	[ESI]
+	DECL	EAX
+	JS	4$.S
+	CMPB	AL, #NUMHNDL		;Valid value?
+	JA	4$.S			;No - fail
+	MOVB	cdb_curhndl.B[EDI], AL	;Yes - remember the handle
+	MOVL	ECX, cdb_hndltbl.B[EDI+EAX*4] ;Get XOS handle
+	JREGZ	ECX, 4$			;If none
+	MOVL	cdb_diskqab+qab_handle.B[EDI], ECX
+	CLC
+	RET
+
+;Here if have bad handle value
+
+4$:	MOVL	EAX, #ER_NPERR
+	STC
+ret010:	RET
+.PAGE
+	.SBTTL	setupparms - Subroutine to set up a parameter list
+
+;Subroutine to set up a parameter list for an IO call given the received
+;  XFPO parameter list.
+;	c{ESI} = Offset of the parameter byte count in the input message
+;	CALL	setupparms
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+
+;The XFPO parameter list is always the last thing in a message, thus all of
+;  the space after the parameter list is available for use here.  We build
+;  the XOS parameter list in the buffer immediately following the end of
+;  the XFPO parameter list.  Any space needed for string buffers is allocated
+;  backwards from the end of the buffer.
+
+setupparms:
+	CLRL	EAX
+	MOVL	cdb_diskqab+qab_parm+0.B[EDI], EAX ;Assume no parameters
+	CMPL	cdb_cmdcnt.B[EDI], #0.B	;Have any parameters?
+	JE	ret010.S		;No
+	MOVL	EAX, ESI		;Yes - store offset of end of the
+	ADDL	EAX, cdb_cmdcnt.B[EDI]	;  parameter list
+	MOVL	cdb_parmend.B[EDI], EAX
+	LEAL	EBX, cdb_parm[EDI]	;Point to place for XOS parameters
+	MOVL	cdb_diskqab+qab_parm+0.B[EDI], EBX
+	LEAL	EAX, cdb_parm+PARMSIZE[EDI] ;Store pointer for strings
+	MOVL	cdb_string.B[EDI], EAX
+setupp2:CLRL	EAX
+	LODSB	[ESI]			;Get parameter index
+	CMPB	AL, #PARMMAX
+	JA	snperr
+	MOVZWL	EDX, xfpo2xos[EAX*2]	;Translate to the XOS parameter
+	TESTL	EDX, EDX		;  value
+	JE	snperr
+	MOVB	CL, xfpo2rep[EAX]	;Get the parameter representation
+	LODSB	[ESI]			;Get bits and first part of count
+	MOVB	cdb_parmbits.B[EDI], AL	;Save bits
+	ANDB	cdb_parmbits.B[EDI], #0C0h
+	ANDB	AL, #1Fh
+	TESTB	AL, #10h		;Need the second count byte?
+	JE	12$.S			;No
+	ANDB	AL, #0Fh
+	MOVB	AH, AL			;Yes
+	LODSB	[ESI]
+12$:	CMPL	EAX, #1024t		;Is the parameter too long?
+	JBE	13$.S			;No
+	MOVL	EAX, #1024t		;Yes - just use maximum length
+13$:	MOVL	cdb_parmsize.B[EDI], EAX ;Save parmeter length
+	CMPW	DX, #IOPAR_DIRHNDL	;Is this the directory handle parameter?
+	JE	dirhndl			;Yes - go handle that
+	ORB	CL, cdb_parmbits.B[EDI]	;Merge in the bits
+	MOVB	cdb_parmbits.B[EDI], CL
+	MOVB	[EBX], CL		;Store it
+	INCL	EBX
+	XORB	CL, #REP_STR		;Does it have a string value?
+	TESTB	CL, #0Fh
+	JE	26$.S			;Yes - go handle that
+	MOVB	AL, cdb_parmsize.B[EDI] ;No - store size
+	MOVB	[EBX], AL
+	INCL	EBX
+	MOVW	[EBX], DX		;Store parameter index
+	ADDL	EBX, #2.B
+	TESTB	cdb_parmbits.B[EDI], #PAR$SET ;Are we setting the value?
+	JNE	18$.S			;Yes - this is harder!
+	ADDL	EBX, cdb_parmsize.B[EDI] ;No - just skip the space for the value
+	JMP	setupnx.S
+
+;Here if need to store a value for the parameter
+
+18$:	MOVZBL	EAX, cdb_parmbits.B[EDI]
+	ANDB	AL, #0Fh
+	MOVL	ECX, cdb_parmsize.B[EDI]
+	BTL	valmask, EAX		;Should we invert the byte order?
+	JNC	22$.S			;No
+	ADDL	EBX, ECX		;Yes
+	CMPL	EBX, cdb_string.B[EDI]	;Too big?
+	JAE	23$.S			;Yes - fail
+	PUSHL	EBX
+20$:	LODSB	[ESI]			;Get a value byte
+	DECL	EBX
+	MOVB	[EBX], AL		;Store it
+	LOOP	ECX, 20$
+	POPL	EBX
+	JMP	setupnx.S
+
+;Here if to not need to invert byte order for the value
+
+22$:	LEAL	EAX, [EBX+ECX]		;Make sure not too big
+	CMPL	EAX, cdb_string.B[EDI]
+23$:	JAE	snperr.S		;Too big - fail
+24$:	LODSB	[ESI]
+	MOVB	[EBX], AL
+	INCL	EBX
+	LOOP	ECX, 24$
+	JMP	setupnx.S
+
+;Here if have a string value
+
+26$:	MOVB	[EBX], #0FFh		;Store parameter "size"
+	INCL	EBX
+	MOVW	[EBX], DX		;Store parameter index
+	ADDL	EBX, #2.B
+	MOVL	ECX, cdb_parmsize.B[EDI] ;Get string length
+	SUBL	cdb_string.B[EDI], ECX
+	MOVL	EDX, cdb_string.B[EDI]
+	CMPL	EBX, EDX		;Too big?
+	JAE	snperr.S		;Yes - fail
+	MOVL	[EBX], EDX		;No - store address of string buffer
+	MOVL	4.B[EBX], DS
+	TESTB	cdb_parmbits.B[EDI], #PAR$SET ;Are we setting the value?
+	JE	28$.S			;No
+	SHLL	ECX, #16t		 ;Yes - store size in string length
+	ORL	ECX, cdb_parmsize.B[EDI] ;  field too
+28$:	MOVL	8.B[EBX], ECX	
+	ADDL	EBX, #12t.B
+	TESTB	cdb_parmbits.B[EDI], #PAR$SET ;Are we setting the value?
+	JE	setupnx.S		;No - finished here
+	MOVZWL	ECX, CX			;Yes - copy the value to the string
+	PUSHL	EDI
+	MOVL	EDI, EDX
+	CLD
+	RMOVSB	[EDI], [ESI]
+	POPL	EDI
+setupnx:CMPL	EBX, cdb_string.B[EDI]	;Too big?
+	JAE	snperr.S		;Yes - fail
+	CMPL	ESI, cdb_parmend.B[EDI]	;At end of the list?
+	JB	setupp2			;No - continue
+	MOVB	[EBX], #0		;Finished - put a 0 at the end	
+	CLC
+	RET
+
+;Here for serious protocol error
+
+snperr:	MOVL	EAX, #ER_NPERR
+	STC
+	RET
+.PAGE
+;Here for the XFOPAR_DIRHNDL parameter
+
+dirhndl:CMPL	EAX, #1			;Is the length one byte?
+	JNE	4$.S			;No - fail
+	LODSB	[ESI]			;Yes - get the value byte
+	DECL	EAX
+	JS	4$.S			;Cannot be 0
+	CMPL	EAX, #NUMHNDL.B		;Valid value?
+	JAE	4$.S			;No - fail
+	MOVL	EAX, cdb_hndltbl.B[EDI+EAX*4] ;Yes - get XOS handle
+	TESTL	EAX, EAX		;Is it open?
+	JE	4$.S			;No - fail
+	MOVL	[EBX], #{PAR$SET|REP_DECV}+{4<8}+{IOPAR_DIRHNDL<16t}
+	MOVL	4.B[EBX], EAX
+	ADDL	EBX, #8.B
+	JMP	setupnx.S		;Continue
+
+;Here if error
+
+4$:	MOVL	EAX, #ER_PARMV
+	STC
+	RET
+.PAGE
+	.PSECT	data_p
+
+	.MACRO	XFOPAR
+  XX 0   , 0			;		= 0.   - Illegal
+  XX HEXV, IOPAR_FILOPTN	;XFOPAR_FILOPTN  = 1.   - File option bits
+  XX STR , IOPAR_FILSPEC	;XFOPAR_FILSPEC  = 2.   - File spec. string
+  XX HEXV, IOPAR_DEVSTS		;XFOPAR_DEVSTS   = 3.   - Device status
+  XX HEXV, IOPAR_UNITNUM	;XFOPAR_UNITNUM  = 4.   - Unit number
+  XX HEXV, IOPAR_GLBID		;XFOPAR_GLBID    = 5.   - Global device ID
+  XX 0   , 0			;		= 6.   - Illegal
+  XX HEXV, IOPAR_TIMEOUT	;XFOPAR_TIMEOUT  = 7.   - Illegal
+  XX HEXV, IOPAR_INPSTS		;XFOPAR_INPSTS   = 8.   - Illegal
+  XX HEXV, IOPAR_OUTSTS		;XFOPAR_OUTSTS   = 9.   - Illegal
+  XX 0   , 0			;		= 10.  - Illegal
+  XX 0   , 0			;		= 11.  - Illegal
+  XX HEXV, IOPAR_DIRHNDL	;XFOPAR_DIRHNDL  = 12.  - Dir. handle for srch
+  XX 0   , 0			;		= 13.  - Illegal
+  XX HEXV, IOPAR_SRCATTR	;XFOPAR_SRCATTR  = 14.  - File attr. for srch
+  XX HEXV, IOPAR_FILATTR	;XFOPAR_FILATTR  = 15.  - File attr.
+  XX HEXV, IOPAR_DIROFS		;XFOPAR_DIROFS   = 16.  - Dir. offset for srch
+  XX HEXV, IOPAR_ABSPOS		;XFOPAR_ABSPOS   = 17.  - Absolute pos. in file
+  XX HEXV, IOPAR_RELPOS		;XFOPAR_RELPOS   = 18.  - Relative pos. in file
+  XX HEXV, IOPAR_EOFPOS		;XFOPAR_EOFPOS   = 19.  - Position rel. to EOF
+  XX 0   , 0			;		= 20.  - Illegal
+  XX HEXV, IOPAR_LENGTH		;XFOPAR_LENGTH   = 21.  - Written length of file
+  XX HEXV, IOPAR_REQALLOC	;XFOPAR_REQALLOC = 22.  - Request allocation
+  XX HEXV, IOPAR_RQRALLOC	;XFOPAR_RQRALLOC = 23.  - Require allocation
+  XX HEXV, IOPAR_GRPSIZE	;XFOPAR_GRPSIZE  = 24.  - Allocation group size
+  XX HEXV, IOPAR_ADATE		;XFOPAR_ADATE    = 25.  - Last access date/time
+  XX HEXV, IOPAR_CDATE		;XFOPAR_CDATE    = 26.  - Creation date/time
+  XX HEXV, IOPAR_MDATE		;XFOPAR_MDATE    = 27.  - Modify date/time
+  XX HEXV, IOPAR_PROT		;XFOPAR_PROT     = 28.  - File protection
+  XX STR , IOPAR_OWNER		;XFOPAR_OWNNAME  = 29.  - Owner
+  XX 0   , 0			;		= 30.  - Illegal
+  XX HEXV, IOPAR_SETLOCK	;XFOPAR_SETLOCK  = 31.  - Set file lock
+  XX HEXV, IOPAR_CLRLOCK	;XFOPAR_CLRLOCK  = 32.  - Clear file lock
+  XX HEXV, IOPAR_SHRPARMS 	;XFOPAR_SHRPARMS = 33.  - File sharing parameters
+  XX 0   , 0		 	;		= 34.  - Illegal
+  XX 0   , 0		 	;		= 35.  - Illegal
+  XX 0   , 0		 	;		= 36.  - Illegal
+  XX 0   , 0		 	;		= 37.  - Illegal
+  XX 0   , 0		 	;		= 38.  - Illegal
+  XX 0   , 0		 	;		= 39.  - Illegal
+  XX 0   , 0		 	;		= 40.  - Illegal
+  XX 0   , 0		 	;		= 41.  - Illegal
+  XX 0   , 0		 	;		= 42.  - Illegal
+  XX 0   , 0		 	;		= 43.  - Illegal
+  XX 0   , 0		 	;		= 44.  - Illegal
+  XX 0   , 0		 	;		= 45.  - Illegal
+  XX 0   , 0		 	;		= 46.  - Illegal
+  XX 0   , 0		 	;		= 47.  - Illegal
+  XX 0   , 0		 	;		= 48.  - Illegal
+  XX 0   , 0		 	;		= 49.  - Illegal
+  XX 0   , 0		 	;		= 50.  - Illegal
+  XX 0   , 0		 	;		= 51.  - Illegal
+  XX 0   , 0		 	;		= 52.  - Illegal
+  XX 0   , 0		 	;		= 53.  - Illegal
+  XX 0   , 0		 	;		= 54.  - Illegal
+  XX 0   , 0		 	;		= 55.  - Illegal
+  XX 0   , 0		 	;		= 56.  - Illegal
+  XX 0   , 0		 	;		= 57.  - Illegal
+  XX 0   , 0		 	;		= 58.  - Illegal
+  XX 0   , 0		 	;		= 59.  - Illegal
+  XX 0   , 0		 	;		= 60.  - Illegal
+  XX 0   , 0		 	;		= 61.  - Illegal
+  XX 0   , 0		 	;		= 62.  - Illegal
+  XX 0   , 0		 	;		= 63.  - Illegal
+  XX 0   , 0		 	;		= 64.  - Illegal
+  XX 0   , 0		 	;		= 65.  - Illegal
+  XX 0   , 0		 	;		= 66.  - Illegal
+  XX 0   , 0		 	;		= 67.  - Illegal
+  XX 0   , 0		 	;		= 68.  - Illegal
+  XX 0   , 0		 	;		= 69.  - Illegal
+  XX 0   , 0		 	;		= 70.  - Illegal
+  XX 0   , 0		 	;		= 71.  - Illegal
+  XX 0   , 0		 	;		= 72.  - Illegal
+  XX 0   , 0		 	;		= 73.  - Illegal
+  XX 0   , 0		 	;		= 74.  - Illegal
+  XX 0   , 0		 	;		= 75.  - Illegal
+  XX 0   , 0		 	;		= 76.  - Illegal
+  XX 0   , 0		 	;		= 77.  - Illegal
+  XX 0   , 0		 	;		= 78.  - Illegal
+  XX 0   , 0		 	;		= 79.  - Illegal
+  XX 0   , 0		 	;		= 80.  - Illegal
+  XX 0   , 0		 	;		= 81.  - Illegal
+  XX 0   , 0		 	;		= 82.  - Illegal
+  XX 0   , 0		 	;		= 83.  - Illegal
+  XX 0   , 0		 	;		= 84.  - Illegal
+  XX 0   , 0		 	;		= 85.  - Illegal
+  XX 0   , 0		 	;		= 86.  - Illegal
+  XX 0   , 0		 	;		= 87.  - Illegal
+  XX 0   , 0		 	;		= 88.  - Illegal
+  XX 0   , 0		 	;		= 89.  - Illegal
+  XX 0   , 0		 	;		= 90.  - Illegal
+  XX 0   , 0		 	;		= 91.  - Illegal
+  XX 0   , 0		 	;		= 92.  - Illegal
+  XX 0   , 0		 	;		= 93.  - Illegal
+  XX 0   , 0		 	;		= 94.  - Illegal
+  XX 0   , 0		 	;		= 95.  - Illegal
+  XX HEXV, IOPAR_DSKFSTYPE	;XFOPAR_FSTYPE   = 96.  - File system type
+  XX HEXV, IOPAR_DSKSECTSIZE	;XFOPAR_SECTSIZE = 97.  - Sector size
+  XX HEXV, IOPAR_DSKCLSSIZE 	;XFOPAR_CLSSIZE  = 98.  - Cluster size
+  XX HEXV, IOPAR_DSKTTLSPACE	;XFOPAR_TTLSPACE = 99.  - Total space
+  XX HEXV, IOPAR_DSKAVLSPACE	;XFOPAR_AVLSPACE = 100. - Available space
+  XX HEXV, IOPAR_DSKNUMHEAD 	;XFOPAR_NUMHEAD  = 101. - Number of heads
+  XX HEXV, IOPAR_DSKNUMSECT 	;XFOPAR_NUMSECT  = 102. - Number of sectors
+  XX HEXV, IOPAR_DSKNUMCYLN 	;XFOPAR_NUMCYLN  = 103. - Number of cylinders
+	.ENDM
+
+	.MACRO	XX type, parm
+	.WORD	parm
+	.ENDM
+
+	.MOD	4
+xfpo2xos:XFOPAR
+PARMMAX=!$-xfpo2xos-1
+
+	.MACRO	XX type, parm
+.IF NE parm
+	.BYTE	REP_'type	
+.IFF
+	.BYTE	0
+.ENDC
+	.ENDM
+
+xfpo2rep:XFOPAR
+
+	.MOD	4
+xos2xfpo:
+	.LONG	xos2xfpogen	;IOPAR_xxxxxx = 00xx - Generic IO parameters
+	.LONG	xos2xfpofil	;IOPAR_FILxxx = 01xx - File system IO parameters
+	.LONG	0		;IOPAR_TRMxxx = 02xx - Terminal IO parameters
+	.LONG	xos2xfpodsk	;IOPAR_DSKxxx = 03xx - Disk IO parameters
+XOSMAX=!{$-xos2xfpo}/4
+
+
+	.BYTE	XOSGENMAX
+xos2xfpogen:
+	.BYTE	0		;		   = 0000h
+	.BYTE	XFOPAR_FILOPTN	;IOPAR_FILOPTN     = 0001h
+	.BYTE	XFOPAR_FILSPEC	;IOPAR_FILSPEC     = 0002h
+	.BYTE	XFOPAR_DEVSTS	;IOPAR_DEVSTS      = 0003h
+	.BYTE	XFOPAR_UNITNUM	;IOPAR_UNITNUM     = 0004h
+	.BYTE	XFOPAR_GLBID	;IOPAR_GLBID       = 0005h
+	.BYTE	0		;IOPAR_DELAY       = 0006h
+	.BYTE	0		;IOPAR_TIMEOUT     = 0007h
+	.BYTE	0		;IOPAR_INPSTS      = 0008h
+	.BYTE	0		;IOPAR_OUTSTS      = 0009h
+	.BYTE	0		;IOPAR_INPQLMT     = 000Ah
+	.BYTE	0		;IOPAR_OUTQLMT     = 000Bh
+	.BYTE	0		;IOPAR_SIGVECT1    = 000Ch
+	.BYTE	0		;IOPAR_SIGVECT2    = 000Dh
+	.BYTE	0		;IOPAR_SIGDATA     = 000Eh
+	.BYTE	0		;IOPAR_NUMOPEN     = 000Fh
+	.BYTE	0		;IOPAR_BUFRLMT	   = 0010h
+XOSGENMAX=!{$-xos2xfpogen}
+
+	.BYTE	XOSFILMAX
+xos2xfpofil:
+	.BYTE	0		;		   = 0100h
+	.BYTE	XFOPAR_DIRHNDL	;IOPAR_DIRHNDL     = 0101h
+	.BYTE	XFOPAR_SRCATTR	;IOPAR_SRCATTR     = 0102h
+	.BYTE	XFOPAR_FILATTR	;IOPAR_FILATTR     = 0103h
+	.BYTE	XFOPAR_DIROFS	;IOPAR_DIROFS      = 0104h
+	.BYTE	XFOPAR_ABSPOS	;IOPAR_ABSPOS      = 0105h
+	.BYTE	XFOPAR_RELPOS	;IOPAR_RELPOS      = 0106h
+	.BYTE	XFOPAR_EOFPOS	;IOPAR_EOFPOS      = 0107h
+	.BYTE	0		;		   = 0108h
+	.BYTE	XFOPAR_LENGTH	;IOPAR_LENGTH      = 0109h
+	.BYTE	XFOPAR_REQALLOC	;IOPAR_REQALLOC    = 010Ah
+	.BYTE	XFOPAR_RQRALLOC	;IOPAR_RQRALLOC    = 010Bh
+	.BYTE	XFOPAR_GRPSIZE	;IOPAR_GRPSIZE     = 010Ch
+	.BYTE	XFOPAR_ADATE	;IOPAR_ADATE       = 010Dh
+	.BYTE	XFOPAR_CDATE	;IOPAR_CDATE       = 010Eh
+	.BYTE	XFOPAR_MDATE	;IOPAR_MDATE       = 010Fh
+	.BYTE	XFOPAR_PROT	;IOPAR_PROT        = 0110h
+	.BYTE	XFOPAR_OWNER	;IOPAR_OWNNAME     = 0111h
+	.BYTE	0		;		   = 0112h
+	.BYTE	XFOPAR_SETLOCK	;IOPAR_SETLOCK     = 0113h
+	.BYTE	XFOPAR_CLRLOCK	;IOPAR_CLRLOCK     = 0114h
+	.BYTE	0		;IOPAR_CLSTIME     = 0115h
+	.BYTE	0		;IOPAR_CLSNAME     = 0116h
+	.BYTE	0		;IOPAR_CLSMSG      = 0117h
+	.BYTE	XFOPAR_SHRPARMS	;IOPAR_SHRPARMS    = 0118h
+XOSFILMAX=!{$-xos2xfpofil}
+
+	.BYTE	XOSDSKMAX
+xos2xfpodsk:
+	.BYTE	0		;		   = 0300h
+	.BYTE	XFOPAR_FSTYPE	;IOPAR_DSKFSTYPE   = 0301h
+	.BYTE	XFOPAR_SECTSIZE	;IOPAR_DSKSECTSIZE = 0302h
+	.BYTE	XFOPAR_CLSSIZE	;IOPAR_DSKCLSSIZE  = 0303h
+	.BYTE	XFOPAR_TTLSPACE	;IOPAR_DSKTTLSPACE = 0304h
+	.BYTE	XFOPAR_AVLSPACE	;IOPAR_DSKAVLSPACE = 0305h
+	.BYTE	XFOPAR_NUMHEAD	;IOPAR_DSKNUMHEAD  = 0306h
+	.BYTE	XFOPAR_NUMSECT	;IOPAR_DSKNUMSECT  = 0307h
+	.BYTE	XFOPAR_NUMCYLN	;IOPAR_DSKNUMCYLN  = 0308h
+XOSDSKMAX=!{$-xos2xfpodsk}
+
+BITS=!{1<REP_DECV}+{1<REP_HEXV}+{1<REP_OCTV}+{1<REP_BINV}+{1<REP_VERN}
+BITS=!BITS+{1<REP_TIME}+{1<REP_DATE}+{1<REP_DT}
+
+	.MOD	4
+valmask:.LONG	BITS
+
+	.PSECT	code_p
+.PAGE
+	.SBTTL	outputdone - Software interrupt routine for TCP output complete
+
+;Software interrupt routine for TCP output complete - all this routine does
+;  is queue another TCP input
+
+outputdone:
+	PUSHAL				;Save registers
+	MOVL	EDI, 64t.B[ESP]		;Get offset of the CDB
+	CMPL	cdb_tcpqab+qab_error.B[EDI], #0.B ;Error on output?
+	JS	tcperr			;Yes
+	CMPL	cdb_reqtotal.B[EDI], #0.B ;No - need to finish an input request?
+	JNE	datreq2			;Yes
+outputdon2:
+	CALL	qinhdr
+	POPAL				;Restore registers
+	CALLF	svcSchDismiss#		;And dismiss
+.PAGE
+	.SBTTL	diskdone - Software interrupt routine for disk IO complete
+
+;Subroutine software interrupt routine for disk IO complete
+
+diskdone:
+	PUSHAL				;Save registers
+	MOVL	EDI, 64t.B[ESP]		;Get offset of the CDB
+	SUBL	EDI, #cdb_diskqab.B
+	JMPIL	cdb_diskdsp.B[EDI]	;Dispatch on the current state
+.PAGE
+	.SBTTL	doresp - Subroutine to do initial response processing
+
+;Subroutine to do initial response processing
+;	CALL	doresp
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+
+doresp:	LEAL	ESI, cdb_buffer+4[EDI]
+	MOVL	cdb_buffer+0[EDI], #XFPOF_RESPONSE ;Assume OK
+doresp2:CMPL	cdb_diskqab+qab_error.B[EDI], #0.B ;Did this work?
+	JGE	2$.S			;Yes
+	MOVB	cdb_buffer+0[EDI], #XFPOF_ERROR ;Make this an error response
+	MOVL	EAX, cdb_diskqab+qab_error.B[EDI] ;Get error code
+	XCHGB	AL, AH			;Fix up the byte order
+	RORL	EAX, #16t
+	XCHGB	AL, AH
+	MOVL	[ESI], EAX		;Store it in the message
+	ADDL	ESI, #4.B
+2$:	MOVL	EAX, cdb_diskqab+qab_amount.B[EDI] ;Get the item count
+	XCHGB	AL, AH
+	RORL	EAX, #16t
+	XCHGB	AL, AH
+	MOVL	[ESI], EAX		;Store it
+	ADDL	ESI, #4.B
+doresp4:CALL	storeparms		;Store parameters in the response
+	JC	10$.S			;If error
+	LEAL	EAX, cdb_buffer[EDI] ;Calculate length of the response
+	MOVL	cdb_tcpqab+qab_buffer1+0.B[EDI], EAX
+	SUBL	ESI, EAX
+	MOVL	cdb_tcpqab+qab_count.B[EDI], ESI ;Store it in the QAB
+	LEAL	ECX, -4.B[ESI]		;Get length of message part only
+	XCHGB	CL, CH			;Fix up the byte order
+	MOVW	cdb_buffer+2[EDI], CX	;Store length in the message header
+	MOVW	cdb_tcpqab+qab_func.B[EDI], #QFNC_OUTBLOCK ;Set up the QAB
+	MOVB	cdb_tcpqab+qab_vector.B[EDI], #IV_OUTPUT
+	CLRL	EAX
+	MOVL	cdb_tcpqab+qab_parm+0.B[EDI], EAX
+10$:	RET
+.PAGE
+	.SBTTL	storeparms - Subroutine to store parameters into the reply
+
+;Subroutine to store parameters into the reply message
+;	c{ESI} = Pointer to reply message
+;	CALL	storeparms
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+
+2$:	RET
+
+storeparms:
+	CMPL	cdb_diskqab+qab_parm+0.B[EDI], #0.B ;Have any parameters?
+	JE	2$.S			;No - nothing to do here
+	MOVL	EBX, cdb_diskqab+qab_parm+0.B[EDI] ;Yes
+4$:	MOVB	AL, [EBX]		;Get bits and representation
+	TESTB	AL, AL			;Finished?
+	JE	2$.S			;Yes
+	MOVZBL	EDX, 3.B[EBX]		;No - get parameter page number
+	CMPL	EDX, #XOSMAX
+	JAE	65$.S
+	MOVL	EDX, xos2xfpo[EDX*4]
+	MOVZBL	ECX, 2.B[EBX]
+	CMPB	CL, -1.B[EDX]
+	JAE	65$.S
+	MOVB	DL, [EDX+ECX]		;Get XFPO value
+	MOVB	[ESI], DL		;Store index in response
+	MOVB	AH, AL
+	ANDB	AH, #0Fh
+	CMPB	AH, #REP_STR		;Is it a string?
+	JE	20$.S			;Yes
+	MOVZBL	ECX, 1.B[EBX]		;No - get length
+	TESTB	AL, #PAR$GET		;Getting the value?
+	JNE	6$.S			;Yes - always return it
+	TESTB	AL, #PAR$ERROR		;No - error indicated?
+	JE	7$.S			;No - skip this parameter
+6$:	CALL	strlength		;Store it
+	TESTB	AL, #PAR$ERROR		;Error indicated?
+	JE	8$.S			;No
+	ADDL	EBX, ECX		;Yes - skip the value
+	JMP	4$.S			;Continue
+
+65$:	MOVL	EAX, #ER_NPERR
+	STC
+	RET
+
+;Here if want to skip this parameter
+
+7$:	LEAL	EBX, 4.B[EBX+ECX]
+	JMP	4$.S
+
+;Here to store parameter
+
+8$:	JREGZ	ECX, 4$
+	MOVZBL	EAX, AH
+	BTL	valmask, EAX		;Should we invert the byte order?
+	JNC	12$.S			;No
+	ADDL	ESI, ECX		;Yes
+
+;CHECK LIMITS HERE
+
+	PUSHL	ESI
+10$:	MOVB	AL, [EBX]		;Get a value byte
+	INCL	EBX
+	DECL	ESI
+	MOVB	[ESI], AL		;Store it
+	LOOP	ECX, 10$
+	POPL	ESI
+	JMP	4$.S
+
+;Here if to not need to invert byte order for the value
+
+12$:
+
+;CHECK LIMITS HERE
+
+14$:	MOVB	AL, [EBX]
+	INCL	EBX
+	MOVB	[ESI], AL
+	INCL	ESI
+	LOOP	ECX, 14$
+	JMP	4$.S
+
+;Here if have string value
+
+20$:	TESTB	AL, #PAR$GET		;Getting the value?
+	JNE	22$.S			;Yes - always return it
+	TESTB	AL, #PAR$ERROR		;No - error indicated?
+	JE	26$.S			;No - skip this parameter
+22$:	MOVZWL	ECX, 14t.B[EBX]		;Get length of the string returned
+	CALL	strlength		;Store it
+	TESTB	AL, #PAR$ERROR		;Error indicated?
+	JNE	24$.S			;Yes - skip the value
+	PUSHL	EDI
+	MOVL	EDI, ESI
+	MOVL	ESI, [EBX]		;Get offset of the string buffer
+	CLD
+	RMOVSB	[EDI], [ESI]		;Copy string to response
+	MOVL	ESI, EDI
+	POPL	EDI
+24$:	ADDL	EBX, #12t.B		;Bump pointer
+	JMP	4$			;Continue
+
+26$:	ADDL	EBX, #16t.B
+	JMP	4$
+.PAGE
+;	c(AL)  = Representation and bits
+;	c{EBX} = Offset of parameter header byte
+;	c{ECX} = Length of value
+;	c{ESI} = Pointer to index value in response
+;	CALL	strlength
+;	c{EBX} = Updated pointer
+;	c{ECX} = Amount to store
+;	c{ESI} = Updated pointer
+
+strlength:
+	ANDB	AL, #0E0h
+	TESTB	AL, #PAR$ERROR		;Error indicated?
+	JNE	10$.S			;Yes
+	CMPL	ECX, #0Fh.B
+	JA	6$.S
+	ORB	AL, CL
+	MOVB	1.B[ESI], AL
+	JMP	8$.S
+
+6$:	ORB	AL, CH
+	ORB	AL, #10h
+	MOVB	1.B[ESI], AL
+	MOVB	2.B[ESI], CL
+	INCL	ESI
+8$:	ADDL	ESI, #2.B
+	ADDL	EBX, #4.B
+	RET
+
+;Here if error indicated
+
+10$:	MOVB	1.B[ESI], AL
+	JMP	8$.S
+.PAGE
+;	c{EBX} = Offset of initial string
+;	c{EDX} = Offset of function table
+
+logmsg:	PUSHL	EDX
+	CALL	logstr
+	MOVL	EAX, cdb_index.B[EDI]	;Display the index
+	MOVL	ECX, #2
+	MOVB	DL, #' '
+	CALL	logdecval
+	POPL	EBX
+	MOVL	EAX, cdb_buffer+0[EDI]
+	MOVB	AL, AH
+	MOVB	AH, #0
+	RORL	EAX, #16t
+	XCHGB	AL, AH
+	MOVL	ECX, #5
+	PUSHL	EAX
+	PUSHL	EBX
+	MOVB	DL, #' '
+	CALL	logdecval
+	CALL	logspace
+	POPL	EBX			;Restore offset of function table
+	MOVZBL	EAX, cdb_buffer+0[EDI]	;Get function byte
+	CMPL	EAX, -4.B[EBX]		;Is it in the table?
+	JA	2$.S			;No
+	LEAL	EBX, [EBX+EAX*8]	;Yes - get offset of message
+	CALL	logstr			;Output it
+	JMP	4$.S
+
+;Here if function not in the table
+
+2$:	MOVL	ECX, #7
+	MOVB	DL, #' '
+	CALL	logdecval
+4$:	POPL	EAX
+	TESTL	EAX, EAX		;Have 0 length message?
+	JE	12$.S			;Yes - finished
+	LEAL	EBX, cdb_buffer+4[EDI]	;No - point to the buffer
+	MOVL	ECX, #16t		;Assume what short form
+	CMPB	loglevel, #2		;Right?
+	JBE	5$.S			;Yes
+	MOVL	ECX, #64t		;No - display as much as we can
+5$:	CMPL	ECX, EAX
+	JB	6$.S
+	MOVL	ECX, EAX
+6$:	PUSHL	#0.B
+8$:	CMPB	[ESP], #16t.B		;Need new line?
+	JB	10$.S			;No
+	PUSHL	EBX			;Yes
+	MOVL	EBX, #strnl
+	CALL	logstr
+	POPL	EBX
+	CLRL	EAX
+	MOVL	[ESP], EAX
+10$:	INCL	[ESP]			;Count the line
+	CALL	logspace
+	MOVZBL	EAX, [EBX]
+	INCL	EBX
+	PUSHL	EBX
+	PUSHL	ECX
+	MOVL	ECX, #2
+	MOVB	DL, #'0'
+	CALL	loghexval
+	POPL	ECX
+	POPL	EBX
+	LOOP	ECX, 8$
+	POPL	EAX
+12$:	JMP	logout
+.PAGE
+	.SBTTL	logout - Subroutine to output a log record
+
+;Subroutine to output a log record
+;	CALL	logout
+
+logout:	MOVL	EAX, logpnt
+	MOVB	[EAX], #CR
+	MOVB	1.B[EAX], #LF
+	SUBL	EAX, #msgbfr-2
+	PUSHL	loghndl
+	PUSHL	DS
+	PUSHL	#msgbfr
+	PUSHL	EAX
+	CALLF	svcIoOutBlock#
+	MOVL	logpnt, #msgbfr
+	RET
+.PAGE
+	.SBTTL	logstr - Subroutine to put string in a log record
+
+;Subroutine to put string in a log record
+;	c{EBX} = Offset of string
+;	CALL	logstr
+
+logstr:	PUSHL	ESI
+	MOVL	ESI, EBX
+2$:	LODSB	[ESI]			;Get character
+	CMPB	AL, #0			;End?
+	JE	4$.S			;Yes
+	CALL	logchr			;No - store character
+	JMP	2$.S			;Continue
+
+;Here at end of string
+
+4$:	POPL	ESI			;Restore register
+	RET				;Finished
+
+logspace:
+	MOVB	AL, #' '
+
+;Subroutine to store single character into a log message
+;	c(AL) = Character
+;	CALL	logchr
+
+logchr:	PUSHL	EDI			;Save register we need
+	MOVL	EDI, logpnt		;Get log message pointer
+	CMPL	EDI, #msgend		;Is the buffer full now?
+	JB	10$.S			;No - go on
+	PUSHL	EAX			;Yes - save character
+	PUSHL	loghndl			;Output the buffer
+	PUSHL	DS
+	MOVL	EDI, #msgbfr		;Reset pointer
+	PUSHL	EDI
+	PUSHL	#MSGBFRSIZE
+	CALLF	svcIoOutBlock#
+	POPL	EAX			;Restore character
+10$:	CLD
+	STOSB	[EDI]			;Store character
+	MOVL	logpnt, EDI		;Update pointer
+	POPL	EDI
+	RET
+.PAGE
+	.SBTTL	loghexval - Subroutine to put hex value in a log record
+
+;Subroutine to put hex value in a log record
+;	c{EAX} = Value
+;	c{ECX} = Field width
+;	CALL	loghexval		;Enter at loghexvalv for minimum field
+;					;  width
+
+loghexvalv:
+	CLRL	ECX
+loghexval:
+	MOVL	radix, #16t
+	JMP	2$.S
+
+	.SBTTL	logdecval - Subroutine to put decimal value in a log record
+
+;Subroutine to put decimal value in a log record
+;	c{EAX} = Value
+;	c{ECX} = Field width
+;	c(DL)  = Fill character
+;	c(DL)  = Fill character
+;	CALL	logdecval		;Enter at logdecvalv for minimum field
+;					;  width
+
+logdecvalv:
+	CLRL	ECX
+logdecval:
+	MOVL	radix, #10t
+2$:	CLD
+	PUSHL	ESI
+	MOVL	ESI, EDX		;Save fill character
+	MOVL	digits, #0		;Clear digit counter
+4$:	CLRL	EDX			;Get next digit
+	IDIVL	radix
+	PUSHL	EDX			;Save it
+	INCL	digits			;Count it
+	TESTL	EAX, EAX		;More?
+	JNE	4$.S			;Yes - continue
+	MOVL	EAX, ESI		;Get fill character
+	SUBL	ECX, digits		;Calculate number of leading characters
+	JLE	6$.S			;If none
+5$:	CALL	logchr
+	LOOP	ECX, 5$
+6$:	POPL	EAX			;Get digit value
+	CMPB	AL, #9
+	JBE	8$.S
+	ADDB	AL, #'A'-'0'-10t
+8$:	ADDB	AL, #'0'		;Change to digit
+	CALL	logchr
+	DECL	digits			;Continue if more
+	JNE	6$.S
+	POPL	ESI			;Restore registers
+	RET				;Finished
+.PAGE
+	.SBTTL	logsyslog - Subroutine to put message in the system log
+
+;Subroutine to put message in the system log
+;	c{EAX} = Error code
+;	c{ESI} = Message
+;	CALL	logsyslog
+
+logsyslog:
+	PUSHL	EDI
+	MOVL	EDI, #msgbfr
+	TESTL	EAX, EAX
+	JE	2$.S
+	PUSHL	EAX
+	PUSHL	#3.B
+	PUSHL	DS
+	PUSHL	EDI
+	CALLF	svcSysErrMsg#
+	ADDL	EDI, EAX
+2$:	PUSHL	DS
+	POPL	ES
+	CLD
+4$:	LODSB	[ESI]
+	STOSB	[EDI]
+	CMPB	AL, #0
+	JNE	4$.S
+	PUSHL	DS
+	PUSHL	#logmsgbfr
+	SUBL	EDI, #logmsgbfr
+	DECL	EDI
+	PUSHL	EDI
+	CALLF	svcSysLog#
+	POPL	EDI
+	RET
+.PAGE
+	.SBTTL	Data
+
+	.PSECT	data_p
+
+	  .MOD	4
+numopens:.LONG	0		;Maximum number of opens to queue
+numconts:.LONG	0		;Maximum number of open connections
+cntopens:.LONG	0		;Current number of queued opens
+cntconts:.LONG	0		;Current number of open connections
+freecont:.LONG	0		;CDB free list pointer (contains index of
+				;  first free CDB slot - the list is chained
+				;  using the ipptable - ipatable is 0 for
+				;  a free CDB slot)
+ipatable:.LONG	0		;Offset of the IP address table
+ipptable:.LONG	0		;Offset of the IP port table
+cdbtable:.LONG	0		;Offset of the CDB table
+logpnt:  .LONG  msgbfr		;Log routine pointer
+radix:	 .LONG	10t
+digits:	 .LONG	0
+loghndl: .LONG	DH_STDERR
+devname: .BLKB	16t		;Device name specified
+loglevel:.BYTE	0		;Logging level
+
+tcperrmsg:.ASCIZ "Cannot open TCP device"
+opnemsg:  .ASCIZ "Error queueing open"
+qinmsg:	  .ASCIZ "Error queueing TCP input"
+nomcdbmsg:.ASCIZ "Cannot allocate memory for CDB"
+
+strcnx:	 .ASCIZ	"CON:"
+strtcpi: .ASCIZ	"INP:"
+strcrx:	 .ASCIZ	"CLR:"
+strerx:  .ASCIZ "ERR:"
+strtcpo: .ASCIZ	"OUT:"
+strcdx:  .ASCIZ "CDN:"
+strcbx:  .ASCIZ "CBG:"
+strox:	 .ASCIZ	"nam: "
+strrx:	 .ASCIZ	"nnm: "
+strnl:	 .ASCIZ {CR,LF}"                   "
+finalmsg:.ASCII {MT_FINALMSG}"XFPOSRV: v1.0 - Initialization complete for _"
+FINALSZ=!$-finalmsg
+msgname: .ASCIZ "IPM:"
+phyname: .BLKB  12t
+
+dststr:  .BLKB  36t		;Response message destination string
+
+	.MOD	4
+	.LONG	13t
+tablei:	.ASCIZ	"      0"       ; 0
+	.ASCIZ	"DATA   "	; 1 - Data (response required)
+	.ASCIZ  "DATAPR "	; 2 - Data with parameters (response required)
+	.ASCIZ	"DATANR "	; 3 - Data (no response)
+	.ASCIZ	"DATPRNR"	; 4 - Data with parameters (no response)
+	.ASCIZ	"      5"	; 5
+	.ASCIZ	"      6"	; 6
+	.ASCIZ	"      7"	; 7
+	.ASCIZ	"DATAREQ"	; 8 - Data request
+	.ASCIZ	"OPEN   "	; 9 - Open file
+	.ASCIZ	"PARM   "	;10 - Parameter function
+	.ASCIZ	"CLOSE  "	;11 - Close file
+	.ASCIZ	"DELETE "	;12 - Delete file
+	.ASCIZ	"RENAME "	;13 - Rename file
+
+	.MOD	4
+	.LONG	10t
+tableo:	.ASCIZ	"      0"	; 0
+	.ASCIZ	"DATA   "	; 1 - Data
+	.ASCIZ	"      2"	; 2
+	.ASCIZ	"DRES   "	; 3 - Data response
+	.ASCIZ	"DRESPR "	; 4 - Data response with parameters
+	.ASCIZ	"DRESF  "	; 5 - Data response (final)
+	.ASCIZ	"DRESFPR"	; 6 - Data response (final) with parameters
+	.ASCIZ	"OPNRES "	; 7 - Open response
+	.ASCIZ	"RES    "	; 8 - Normal response
+	.ASCIZ	"EOFRES "	; 9 - End of file
+	.ASCIZ	"ERRRES "	;10 - Error response
+
+	  .MOD   4
+notoparm: .BYTE  PAR$SET|REP_DECV, 4 ;Parameters for IO without timeout
+	  .WORD  IOPAR_TIMEOUT
+	  .LONG  -1
+	  .BYTE  0
+
+moparm:	.BYTE	PAR$SET|REP_STR, 0
+	.WORD	IOPAR_MSGRMTADDRS
+	.LONG	dststr, !dststr
+	.WORD	32t, 32t
+	.BYTE	0
+
+	  .MOD   4
+msgqab:	  .WORD  QFNC_OUTBLOCK	;qab_func    = 0.  - Function
+	  .WORD  0		;qab_status  = 2.  - Returned status
+	  .LONG  0		;qab_error   = 4.  - Error code
+	  .LONG  0		;qab_amount  = 8.  - Amount transfered
+	  .LONG  0		;qab_handle  = 12. - Device handle
+	  .BYTE  0		;qab_vector  = 16. - Vector for interrupt
+	  .BYTE  0, 0, 0	;Reserved
+	  .LONG  0		;qab_option  = 20. - Option bits
+	  .LONG  MSGBFRSIZE	;qab_count   = 24. - Amount to transfer
+	  .LONG  msgbfr, !msgbfr;qab_buffer1 = 28. - Pointer to data buffer
+	  .LONG  dststr, !dststr;qab_buffer2 = 36. - Pointer to destination
+				;		       string
+	  .LONG  0, 0		;qab_parm    = 44. - Pointer to parameter list
+
+	  .MOD   4
+logmsgbfr:.BYTE  0, 0, '#', 0
+	  .ASCII "XFPOSRV: "
+msgbfr:   .BLKB  320t
+msgend:
+MSGBFRSIZE = msgend-msgbfr
+
+	  .MOD   4
+firstodb:			;First ODB
+
+;Space in this area is used as follows:
+;   Table of ODBs (odb_SIZE bytes per entry, c(numopens) entries)
+;   Table of client IP address (1 long per entry, c(numconts) entries)
+;   Table of client port numbers (1 long per entry, c(numconts) entries)
+;   Table of CDB offsets (1 long per entry, c(numconts) entries)
+
+;Following data is used during initialization only (this area is overlayed
+;   when memory is allocated during operation
+
+ourname:  .ASCIZ "XFPOServer"
+failmsg1: .ASCII {MT_FINALERR}"? XFPOSRV: "
+FAILSZ1=!$-failmsg1
+failmsg2: .ASCIZ ", terminating"
+FAILSZ2=!$-failmsg2
+crlfmsg:  .BYTE  CR, LF, 0
+nostkmsg: .ASCIZ "Cannot allocate stack space"
+noargmsg: .ASCIZ "No arguments given"
+badpidmsg:.ASCIZ "Bad requestor PID"
+notodomsg:.ASCIZ "No TCP device specified"
+nottcpmsg:.ASCIZ "Device is not a TCP device"
+badargmsg:.ASCIZ "Illegal argument"
+nomemmsg: .ASCIZ "Not enough memory"
+nologmsg: .ASCIZ "Cannot open local log file"
+sivfmsg:  .ASCIZ "Cannot initialize interrupt vector"
+
+	  .MOD   4
+openparms:.BYTE	 PAR$GET|REP_TEXT, 8 ;Parameters for initial check of TCP
+	  .WORD	 IOPAR_CLASS	     ;   device
+devclass: .BLKB  8t
+	  .BYTE  PAR$SET|REP_HEXV, 4
+	  .WORD	 IOPAR_FILOPTN
+	  .LONG  FO$XOSNAME
+	  .BYTE  PAR$GET|REP_STR, 0
+	  .WORD  IOPAR_FILSPEC
+	  .LONG  phyname
+	  .LONG  !phyname
+	  .WORD  12t
+phylength:.WORD  0
+	  .BYTE  0

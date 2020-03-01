@@ -1,0 +1,942 @@
+	.TITLE	SDSKDRV - SCSI disk device interface routine
+
+;++++
+; This software is in the public domain.  It may be freely copied and used
+; for whatever purpose you see fit, including commerical uses.  Anyone
+; modifying this software may claim ownership of the modifications, but not
+; the complete derived code.  It would be appreciated if the authors were
+; told what this software is being used for, but this is not a requirement.
+
+;   THIS SOFTWARE IS PROVIDED BY THE AUTHORS "AS IS" AND ANY EXPRESS OR
+;   IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
+;   OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+;   IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+;   INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+;   BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS
+;   OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+;   ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR
+;   TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
+;   USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+;----
+
+	.PROC	80486
+	.INCLUD	XOSINC:\XMAC\XOS.PAR
+	.INCLUD	XOSINC:\XMAC\XOSX.PAR
+	.INCLUD	XOSINC:\XMAC\XOSERR.PAR
+	.INCLUD	XOSINC:\XMAC\PCAT.PAR
+	.INCLUD	XOSINC:\XMAC\XOSXDISK.PAR
+	.INCLUD	XOSINC:\XMAC\XOSDISK.PAR
+	.INCLUD	XOSINC:\XMAC\XOSXHDK.PAR
+	.INCLUD	XOSINC:\XMAC\XOSLKE.PAR
+	.INCLUD	XOSINC:\XMAC\XOSXLKE.PAR
+	.INCLUD	SCSI.PAR
+
+MAJV   =!1t
+MINV   =!1t
+EDITNUM=!2t
+
+;1.1.1 - 22-Dec-94
+;	Fixed problem with addunit routine not waiting for extended fork
+;	context to finish - was not initializing pdaResponse.
+;1.1.2 - 20-Nov-99
+;	Removed the BOOT boot-time characteristic.  This is no longer needed
+;	since DISKINST is now used to set up boot devices.
+
+	LKEHEAD	SDSKDRV, MAJV, MINV, EDITNUM, LKETYPE_DEVICE
+
+	CODE
+
+;SCSI disk device driver dispatch table
+
+sdskdsp:.LONG	0		;kf_init     =  0. - Initialize controller
+	.LONG	0		;kf_getparms =  4. - Get drive parameters
+	.LONG	0		;kf_getaparms=  8. - Get alternate drive
+				;		       parameters
+	.LONG	0		;kf_setparms = 12. - Set drive parameters
+	.LONG	sdskreaddata	;kf_readraw  = 16. - Read raw
+	.LONG	sdskreaddata	;kf_readdata = 20. - Read block
+	.LONG	sdskreadlist	;kf_readlist = 24. - Read buffer list
+	.LONG	0		;kf_readid   = 28. - Read ID field
+	.LONG	sdskwritdata	;kf_writraw  = 32. - Write raw
+	.LONG	sdskwritdata	;kf_writdata = 36. - Write block
+	.LONG	sdskwritlist	;kf_writlist = 40. - Write buffer list
+	.LONG	sdskformat	;kf_format   = 44. - Format track
+	.LONG	0		;kf_chkwp    = 48. - Check write protect status
+	.LONG	sdskchkchgf	;kf_chkchg   = 52. - Check for possible disk
+				;		       change at fork level
+	.LONG	sdskgettoc	;kf_gettoc   = 56. - Get CD-ROM TOC data
+	.LONG	sdskgettrks	;kf_gettrks  = 60. - Get CD-ROM track data
+	.LONG	sdskmedia	;ks_media    = 64. - Determine media type
+	.LONG	knlRtnZero##	;ks_chkwp    = 68. - Check write protect status
+	.LONG	sdskchkchg	;ks_chkchg   = 72. - Check for possible disk
+				;		       change
+	.LONG	sdsksenchg	;ks_senchg   = 76. - Sense disk change
+	.LONG	sdskaddunit	;ks_addunit  = 80. - Add disk unit
+	.LONG	xosdskHdkClear##;ks_unmount  = 84. - Unmount disk
+SDSKDSPSZ=!{$-sdskdsp}/4
+
+;SCSI disk (type SDSK) device characteristics table
+
+	DATA
+
+	.MOD	4
+sdskdchartbl:
+ DCHARBGN  1, knlDCharValCom##
+ DCHARENT  CLASS   , TEXT, , 8  , knlDcMsgClass##    , knlDcGetClass##  , knlDcSetClass##   , 0
+ DCHARENT  TYPE    , TEXT, , 4  , knlDcMsgType##     , knlDcGet4Byte##  , 0                 , dcb_type
+ DCHARENT  SCSIDEV , TEXT, , 16 , xossciMsgScsiDev## , sdskgetdev       , 0                 , 0
+ DCHARENT  SCSITAR , DECV, , 4  , xossciMsgScsiTar## , xosdskGtU1Byte## , 0                 , ucb_scsitar
+ DCHARENT  SCSILUN , DECV, , 4  , xossciMsgScsiLUN## , xosdskGtU1Byte## , 0                 , ucb_scsilun
+ DCHARENT  MODEL   , STR , , 44 , knlDcMsgModel##    , xosdskGtUxStr##  , 0                 , ucbx_model
+ DCHARENT  SERIALNO, STR , , 24 , knlDcMsgSerialNo## , xosdskGtUxStr##  , 0                 , ucbx_serialno
+ DCHARENT  REVISION, STR , , 12 , knlDcMsgRevision## , xosdskGtUxStr##  , 0                 , ucbx_revision
+ DCHARENT  UNITTYPE, TEXT, , 4  , knlDcMsgUnitType## , xosdskUnitType## , 0                 , 0
+ DCHARENT  MSENSOR , TEXT, , 4  , xosdskMsgMSensor## , xosdskGetBits##  , xosdskSetBits##   , UB$MEDIAC
+ DCHARENT  REMOVE  , TEXT, , 4  , xosdskMsgRemove##  , xosdskGetRemove##, 0                 , 0
+ DCHARENT  VOLNAME , TEXT, , 16 , xosdskMsgVolName## , xosdskGtU16Byte##, xosdskStU8Byte##  , ucb_volname
+ DCHARENT  DOSNAME , TEXT, ,  16, xosdskMsgDosName## , xosdskGtU16Byte##, xosdskSetDosName##, ucb_dosname
+ DCHARH    dosnmdc , xosdskGetHdDosNm##, xosdskFindDosNm##
+ DCHARENT  PARTN   , HEXV, , 1  , xosdskMsgPartn##   , xosdskGtU1Byte## , 0                 , ucb_partnx
+ DCHARENT  PARTOFF , DECV, , 4  , xosdskMsgPartOff## , xosdskGtU4Byte## , 0                 , ucb_partnoff
+ DCHARENT  VOLLABEL, STR , , 34 , xosdskMsgVolLabel##, xosdskGtUxStr##  , 0                 , ucbx_vollabel
+ DCHARENT  VOLCDT  , DT  , , 8  , xosdskMsgVolCDT##  , xosdskGtU8Byte## , 0                 , ucb_volcdt
+ DCHARENT  VOLMDT  , DT  , , 8  , xosdskMsgVolMDT##  , xosdskGtU8Byte## , 0                 , ucb_volmdt
+ DCHARENT  VOLXDT  , DT  , , 8  , xosdskMsgVolXDT##  , xosdskGtU8Byte## , 0                 , ucb_volxdt
+ DCHARENT  VOLEDT  , DT  , , 8  , xosdskMsgVolEDT##  , xosdskGtU8Byte## , 0                 , ucb_voledt
+ DCHARENT  CBLKSZ  , DECV, , 2  , xosdskMsgCBlkSz##  , xosdskGtU4Byte## , 0                 , ucb_csecsz
+ DCHARENT  CHEADS  , DECV, , 1  , xosdskMsgCHeads##  , xosdskGtU1Byte## , 0                 , ucb_cheads
+ DCHARENT  CSECTS  , DECV, , 4  , xosdskMsgCSects##  , xosdskGtU4Byte## , 0                 , ucb_csects
+ DCHARENT  CCYLNS  , DECV, , 4  , xosdskMsgCCylns##  , xosdskGtU4Byte## , 0                 , ucb_ccylns
+ DCHARENT  CBLOCKS , DECV, , 4  , xosdskMsgCBlocks## , xosdskGtU4Byte## , 0                 , ucb_cblocks
+ DCHARENT  IBLKSZ  , DECV, , 2  , xosdskMsgIBlkSz##  , xosdskGtU4Byte## , 0                 , ucb_isecsz
+ DCHARENT  IHEADS  , DECV, , 1  , xosdskMsgIHeads##  , xosdskGtU1Byte## , 0                 , ucb_iheads
+ DCHARENT  ISECTS  , DECV, , 4  , xosdskMsgISects##  , xosdskGtU4Byte## , 0                 , ucb_isects
+ DCHARENT  ICYLNS  , DECV, , 4  , xosdskMsgICylns##  , xosdskGtU4Byte## , 0                 , ucb_icylns
+ DCHARENT  IBLOCKS , DECV, , 4  , xosdskMsgIBlocks## , xosdskGtU4Byte## , 0                 , ucb_iblocks
+ DCHARENT  WTMAX   , DECV, , 4  , knlDcMsgWTMax##    , xosdskGtU4Byte## , xosdskSetWTMax##  , ucb_wtmax
+ DCHARENT  RAMAX   , DECV, , 4  , knlDcMsgRAMax##    , xosdskGtU4Byte## , xosdskSetRAMax##  , ucb_ramax
+ DCHARENT  DTHLIMIT, DECV, , 4  , knlDcMsgDTHLimit## , xosdskGtU4Byte## , 0                 , ucb_dthlimit
+ DCHARENT  BLOCKIN , DECV, , 4  , xosdskMsgBlockIn## , xosdskGtU4Byte## , xosdskStU4Byte##  , ucb_blockin
+ DCHARENT  BLOCKOUT, DECV, , 4  , xosdskMsgBlockOut##, xosdskGtU4Byte## , xosdskStU4Byte##  , ucb_blockout
+ DCHARENT  BYTEIN  , DECV, , 4  , knlDcMsgByteIn##   , xosdskGtU4Byte## , xosdskStU4Byte##  , ucb_bytein
+ DCHARENT  BYTEOUT , DECV, , 4  , knlDcMsgByteOut##  , xosdskGtU4Byte## , xosdskStU4Byte##  , ucb_byteout
+ DCHARENT  SHRDELAY, DECV, , 4  , xosdskMsgShrDelay##, xosdskGtU4Byte## , xosdskStU4Byte##  , ucb_shrdelay
+ DCHARENT  SHRRETRY, DECV, , 4  , xosdskMsgShrRetry##, xosdskGtU4Byte## , xosdskStU4Byte##  , ucb_shrretry
+ DCHARENT  SHRFAIL , DECV, , 4  , xosdskMsgShrFail## , xosdskGtU4Byte## , xosdskStU4Byte##  , ucb_shrfail
+ DCHARENT  TDEVERR , DECV, , 4  , knlDcMsgTDevErr##  , xosdskGtU4Byte## , xosdskStU4Byte##  , ucb_tdeverr
+ DCHARENT  HDEVERR , DECV, , 4  , knlDcMsgHDevErr##  , xosdskGtU4Byte## , xosdskStU4Byte##  , ucb_hdeverr
+ DCHARENT  TDATAERR, DECV, , 4  , knlDcMsgTDataErr## , xosdskGtU4Byte## , xosdskStU4Byte##  , ucb_tdataerr
+ DCHARENT  HDATAERR, DECV, , 4  , knlDcMsgHDataErr## , xosdskGtU4Byte## , xosdskStU4Byte##  , ucb_hdataerr
+ DCHARENT  TSEEKERR, DECV, , 4  , xosdskMsgTSeekErr##, xosdskGtU4Byte## , xosdskStU4Byte##  , ucb_tseekerr
+ DCHARENT  HSEEKERR, DECV, , 4  , xosdskMsgHSeekErr##, xosdskGtU4Byte## , xosdskStU4Byte##  , ucb_hseekerr
+ DCHARENT  TIDFERR , DECV, , 4  , xosdskMsgTIdFErr## , xosdskGtU4Byte## , xosdskStU4Byte##  , ucb_tidferr
+ DCHARENT  HIDFERR , DECV, , 4  , xosdskMsgHIdFErr## , xosdskGtU4Byte## , xosdskStU4Byte##  , ucb_hidferr
+ DCHARENT  TRNFERR , DECV, , 4  , xosdskMsgTRNFErr## , xosdskGtU4Byte## , xosdskStU4Byte##  , ucb_trnferr
+ DCHARENT  HRNFERR , DECV, , 4  , xosdskMsgHRNFErr## , xosdskGtU4Byte## , xosdskStU4Byte##  , ucb_hrnferr
+ DCHARENT  TOVRNERR, DECV, , 4  , knlDcMsgTOvrnErr## , xosdskGtU4Byte## , xosdskStU4Byte##  , ucb_tovrnerr
+ DCHARENT  HOVRNERR, DECV, , 4  , knlDcMsgHOvrnErr## , xosdskGtU4Byte## , xosdskStU4Byte##  , ucb_hovrnerr
+ DCHARENT  HUNGERR , DECV, , 4  , knlDcMsgHungErr##  , xosdskGtU4Byte## , xosdskStU4Byte##  , ucb_hungerr
+ DCHARENT  FSTYPE  , TEXT, , 8  , xosdskMsgFSType##  , xosdskGtU8Byte## , 0                 , ucb_fsname
+ DCHARENT  CLSSZ   , DECV, , 4  , xosdskMsgClsSz##   , xosdskGtU4Byte## , 0                 , ucb_clussize
+ DCHARENT  CLUSTERS, DECV, , 4  , xosdskMsgClsters## , xosdskGtU4Byte## , 0                 , ucb_total
+ DCHARENT  AVAIL   , DECV, , 4  , xosdskMsgAvail##   , xosdskGtU4Byte## , 0                 , ucb_avail
+ DCHARENT  FATMODE , HEXV, , 1  , xosdskMsgFatMode## , xosdskGtU1Byte## , 0                 , ucb_fatmode
+ DCHARENT  DUPFAT  , TEXT, ,   4, xosdskMsgDupFat##  , xosdskGetBits##  , xosdskSetBits##   , UB$DUPFAT
+ DCHARENT  ROOTBLK , DECV, , 4  , xosdskMsgRootBlk## , xosdskGtU4Byte## , 0                 , ucb_rootblk
+ DCHARENT  ROOTSIZE, DECV, , 4  , xosdskMsgRootSize##, xosdskGtU4Byte## , 0                 , ucb_rootsize
+ DCHARENT  ROOTPROT, STR , , 100, xosdskMsgRootProt##, xosdskGtRtProt## , xosdskStRtProt##  , 0
+
+	CODE
+.PAGE
+	.SBTTL	Initialization
+
+	INITSUB	initsdsk
+
+	DATA
+
+	.MOD	4
+sdskinitblk:					;Characteristics description
+ DCHARBGN  2, knlDCharValCom##			;  block for initialization
+ DCHARENT  RESULT, STR , , 0, 0, knlGetDcNullS##, 0       , 0
+
+	ONCE
+
+initsdsk::
+	PUSHL	FS
+	PUSHL	EDX
+	MOVL	EBX, #'SDSK'		;Get disk driver name
+	MOVL	EDX, #sdskdsp		;Get offset of dispatch table
+	CALL	xosdskNewDriver##	;Register this disk driver
+	POPL	EDX
+	POPL	FS
+	JC	6$.S			;If error
+	TESTL	EDX, EDX		;Have a characteristics list?
+	JE	2$.S			;No
+	MOVL	EBX, #sdskinitblk	;Yes - point to characteristics table
+	CALL	knlAddUnitChar##	;Process characteristics
+	JC	10$.S			;If error
+2$:	CLRL	EAX			;OK
+	CLRL	EDX
+	MOVL	ECX, #codetop
+	CLC
+6$:	RET
+
+;Here if error after driver has been registered
+
+10$:	CALL	xosdskUnlinkDriver##
+	STC
+	RET
+
+	CODE
+.PAGE
+	.SBTTL	sdskaddunit - Subroutine to add disk unit
+
+;Subroutine to add disk unit
+;	c{EAX}    = Unit number
+;	c{EBX}    = Offset of KCB for controller (0 if none)
+;	c{ECX}    = Index on controller
+;	c{FS:EDX} = Address of characteristics list
+;	c{ESI}    = Base IO register
+;	CALL	sdskaddunit
+;	c{EAX} = Error code
+;	c{EBX} = Status bits
+;	c{ECX} = Item count (number of units added)
+
+	DATA
+
+	.MOD	4
+sdskaublk:				;Characteristics description block
+ DCHARBGN  3, 0				;  for addunit
+ DCHARENT  TYPE    , TEXT, , 4, 0, 0, knlRtnZero##, 0
+ DCHARENT  UNIT    , DECV, , 4, 0, 0, knlRtnZero##, 0
+ DCHARENT  INDEX   , DECV, , 4, 0, 0, auindex     , 0
+ DCHARENT  DOINQ   , TEXT, , 4, 0, 0, audoinq     , 0
+ DCHARENT  SCSIDEV , TEXT, , 8, 0, 0, audev       , 0
+ DCHARENT  SCSITAR , DECV, , 4, 0, 0, autar       , 0
+ DCHARENT  SCSILUN , DECV, , 4, 0, 0, aulun       , 0
+
+	CODE
+
+$$$=!0
+FRM au_unit  , 4t		;Disk unit number
+FRM au_target, 4t		;SCSI target ID
+FRM au_lun   , 4t
+FRM au_kcb   , 4t		;Offset of disk KCB
+FRM au_ucb   , 4t		;Offset of disk UCB
+FRM au_icb   , 4t		;Offset of SCSI ICB
+FRM au_doinq , 1t
+FRM          , 3t
+au_SIZE=!$$$
+
+2$:	MOVL	EAX, #ER_DUADF
+3$:	JMP	18$
+
+sdskaddunit:
+	ENTER	au_SIZE, 0
+	MOVL	au_unit.B[EBP], EAX
+	CLRL	EAX
+	MOVL	au_ucb.B[EBP], EAX
+	MOVL	au_lun.B[EBP], EAX
+	DECL	EAX
+	MOVL	au_icb.B[EBP], EAX
+	MOVL	au_target.B[EBP], EAX
+	MOVB	au_doinq.B[EBP], AL
+	MOVL	EBX, #sdskaublk
+	MOVB	AL, #0
+	CALL	knlAddUnitChar##	;Process characteristics
+	JC	3$.S			;If error
+	MOVL	EAX, au_icb.B[EBP]	;Did we get the required
+	ORL	EAX, au_target.B[EBP]	;  characteristics?
+	INCL	EAX
+	JE	10$			;No - fail
+	MOVB	AL, #'S'		;See if this unit is defined now
+	MOVB	AH, au_unit.B[EBP]
+	CALL	xosdskSrchUnit##
+	JE	2$.S			;Defined - fail
+	CALL	knlGetXRes##		;Get the exec memory resource
+	MOVL	ECX, #kcb_hdSIZE	;Make a KCB
+	MOVL	EBX, #sdskdsp
+	MOVL	EDX, #'SDSK'
+	MOVB	AL, #KB$AHEAD+KB$DEFER
+	CLRL	ESI
+	CALL	xosdskMakeKcb##
+	JC	16$
+	MOVL	au_kcb.B[EBP], EDI	;Remember where our KCB is
+	MOVL	EAX, sdskkcb
+	MOVL	sdskkcb, EDI
+	MOVL	kcb_nexts.B[EDI], EAX
+	MOVB	AL, #UB$DUPFAT		;Get value for ucb_bits
+	MOVB	AH, #'S'		;Get first letter of our name
+	MOVZBL	EDX, au_unit.B[EBP]	;Get unit number
+	MOVL	ECX, #ucb_hdSIZE
+	MOVL	EBX, au_kcb.B[EBP]	;Get offset of KCB
+	CALL	xosdskMakeUcb##		;Make a UCB
+	JC	14$			;If error
+	MOVL	au_ucb.B[EBP], ESI
+	MOVL	EAX, au_icb.B[EBP]	;OK - store offset of the SCSI ICB
+	MOVL	ucb_scsiicb[ESI], EAX
+	MOVL	EAX, icb_dthlimit.B[EAX] ;Store the data transfer hardware limit
+	MOVL	ucb_dthlimit[ESI], EAX
+	MOVL	ucb_ramax[ESI], EAX	;Also store it as the initial read-ahead
+	MOVL	ucb_wtmax[ESI], EAX	;  and write maximums
+	MOVL	EAX, au_target.B[EBP]
+	MOVB	AH, au_lun.B[EBP]	;Store target and logical unit numbers
+	MOVL	ucb_scsitar[ESI], EAX
+	CMPB	au_doinq.B[EBP], #0	;Can we do inquiries?
+	JNE	6$.S			;Yes
+	ORB	ucb_sts1.B[ESI], #U1$NOINQ ;No
+6$:	MOVL	ucb_devchar.B[ESI], #sdskdchartbl ;Store offset of our device
+	MOVL	EDX, ESI			  ;  characteristics table
+	CALL	knlGetQelClr##		;Get an IORB
+	JC	13$.S			;fail if can't get one
+	MOVL	iorb_count.B[ESI], EDX	;Store UCB offset where we can find it
+	MOVL	iorb_finish.B[ESI], #knlQioFinish##
+	MOVL	iorb_routine.B[ESI], #addunit1
+	CLRL	EDI
+	MOVL	SS:pdaResponse##, EDI
+	CALL	knlXfBegin##		;Start the extended fork
+8$:	MOVL	EAX, SS:pdaResponse##	;Finished now?
+	TESTL	EAX, EAX
+	JNE	12$.S			;Yes
+	PUSHL	SS			;No - wait until finished
+	POPL	ES
+	MOVB	AL, #knlQX_DW2##
+	CALL	knlWRequeue##
+	FROMFORK
+	CALLF	schedule		;Call the scheduler (this is an
+	TOFORK				;  uninterruptable wait)
+	JMP	8$.S
+
+;Here if required characteristic is missing
+
+10$:	MOVL	EAX, #ER_CHARM
+	JMP	18$.S
+
+;Here when finished with extended fork context stuff
+
+12$:	JS	13$.S			;If error
+	FROMFORK
+	CLRL	EAX			;OK
+	JMP	16$.S
+
+;Here if have error after the KCB is set up - we must unlink it before
+;  returning the error
+
+13$:	MOVL	ESI, au_ucb.B[EBP]
+	TESTL	ESI, ESI
+	JE	14$.S
+	PUSHL	EAX
+	CALL	xosdskGiveupUcb##
+	POPL	EAX
+14$:	FROMFORK
+	PUSHL	EAX
+	MOVL	EBX, au_kcb.B[EBP]
+	MOVL	EDX, #sdskkcb		;Point to our first KCB pointer
+	CALL	xosdskGiveupKcb##
+	MOVL	EBX, knlSvDataPnt##	;Give up the memory we got
+	CALL	knlGiveXMem##
+	POPL	EAX
+16$:	CALL	knlGiveXRes##		;Give up the exec memory resource
+18$:	LEAVE
+	CLRL	ECX
+	MOVL	EBX, #QSTS$DONE
+	TOFORK
+	RET
+.PAGE
+;Subroutine called by addunitchar for the INDEX characteristic
+
+auindex:CMPL	EAX, #1.B		;Is it 1?
+	JE	4$.S			;Yes - OK
+2$:	MOVL	EAX, #ER_CHARV		;No - fail
+	STC
+4$:	RET
+
+;Subroutine called by addunitchar for the DOINQ characteristic
+
+audoinq:CMPB	AL, #'a'
+	JB	8$.S
+	ADDB	AL, #'A'-'a'
+8$:	CMPB	AL, #'Y'
+	JE	10$.S
+	CMPB	AL, #'N'
+	JNE	2$.S
+	MOVB	au_doinq.B[EBP], #0
+	RET
+
+10$:	MOVB	au_doinq.B[EBP], #1
+	RET
+
+;Subroutine called by addunitchar for the SCSIDEV characteristic
+
+audev:	CALL	xossciDevFind##		;Find the SCSI device
+	JC	2$.S			;If error
+	MOVL	au_icb.B[EBP], ESI	;Store offset of the ICB
+	RET
+
+;Subroutine called by addunitchar for the SCSITAR characteristic
+
+autar:	CMPL	EAX, #7.B		;Valid value?
+	JA	2$.S			;No
+	MOVL	au_target.B[EBP], EAX	;Yes - store value
+	CLC
+	RET
+
+;Subroutine called by addunitchar for the SCSILUN characteristic
+
+aulun:	CMPL	EAX, #7.B		;Valid value?
+	JA	2$.S			;No
+	MOVL	au_lun.B[EBP], EAX	;Yes - store value
+	CLC
+	RET
+.PAGE
+;Extended fork context routine to finish setting up a hard disk unit
+
+$$$=!0
+FRM aux_xcb   , xcb_SIZE
+FRM aux_buffer, 256t		;Data buffer
+aux_SIZE=!$$$
+
+addunit1:
+	ENTER	aux_SIZE, 0
+	MOVL	EDX, #xosdskCcb##	;Get a disk DCB
+	MOVL	ESI, SS:xffCount##
+	PUSHL	#0.B
+	PUSHL	#0.B
+	PUSHL	#'INIT'
+	PUSHL	#'SDSK'
+	MOVL	EBX, ESP
+	CALL	xosdskGetDcb##
+	JC	18$			;If can't get one
+	ADDL	ESP, #16t.B
+	MOVW	dcb_outframe.B[EDI], SS	;OK - store XFF selector
+	MOVL	SS:xffDcb##, EDI
+	CLRL	EAX			;Just to be safe, clear some vectors
+	MOVL	dcb_sdisp.B[EDI], EAX
+	TESTB	ucb_sts1.B[ESI], #U1$NOINQ
+	MOVB	AL, #SDT_GDISK
+	SETE	AH
+	PUSHL	ESI
+	MOVL	EDX, ucb_scsitar[ESI]	;Get target and logical unit number
+	MOVL	ESI, ucb_scsiicb[ESI]	;Get offset of the ICB
+	LEAL	EBX, aux_buffer[EBP]
+	CALL	xossciUnitInit##	;Initialize the SCSI unit
+	POPL	ESI
+	JC	16$			;If error
+	MOVB	AH, #DT_HARD		;Assume hard disk
+	MOVB	AL, aux_buffer+0[EBP]	;Get the device type
+	ANDB	AL, #1Fh
+	CMPB	AL, #5t			;Is it a CD-ROM?
+	JNE	2$.S			;No
+	MOVB	AH, #DT_CDRM		;Yes
+2$:	CMPB	AL, #4t			;Is it a WORM?
+	JNE	4$.S			;No
+	MOVB	AH, #DT_WORM		;Yes
+4$:	CMPB	AL, #7t			;Is it an optical disk?
+	JNE	6$.S			;No
+	MOVB	AH, #DT_OPTD		;Yes
+6$:	MOVB	ucb_unittype.B[ESI], AH
+	TESTB	aux_buffer+1[EBP], #80	;Is the device removable?
+	JE	8$.S			;No
+	ORB	ucb_bits.B[ESI], #UB$MEDIAC ;Yes - indicate that
+	ORB	ucb_dsp.B[ESI], #DS$REMOVE
+8$:	MOVL	ECX, #8t
+	LEAL	EDX, aux_buffer+8[EBP]	;Copy vendor and model information
+	MOVL	EBX, ucb_ext.B[ESI]
+	ADDL	EBX, #ucbx_model.B
+	CALL	xossciCopyInq##
+	MOVB	[EBX], #'-'
+	INCL	EBX
+	MOVB	CL, #16t
+	LEAL	EDX, aux_buffer+16t[EBP]
+	CALL	xossciCopyInq##
+	MOVB	CL, #4t
+	LEAL	EDX, aux_buffer+32t[EBP] ;Copy revision information
+	MOVL	EBX, ucb_ext.B[ESI]
+	ADDL	EBX, #ucbx_revision.B
+	CALL	xossciCopyInq##
+	MOVB	CL, #20t
+	LEAL	EDX, aux_buffer+36t[EBP] ;Copy other information
+	MOVL	EBX, ucb_ext.B[ESI]
+	ADDL	EBX, #ucbx_serialno.B
+	CALL	xossciCopyInq##
+	CALL	fixblksize		;Get and, if necessary, set block size
+	MOVL	EAX, ucb_scsitar[ESI]
+	PUSHL	ESI
+	MOVL	ESI, ucb_scsiicb[ESI]
+	MOVB	DL, #04h		;Get the disk drive geometry info
+	MOVB	DH, #08h
+	LEAL	EBX, aux_buffer[EBP]
+	PUSHL	SS
+	POPL	FS
+	CALL	xossciModeSense##
+	POPL	ESI
+	JC	10$.S			;If error, assume its not available
+	CMPB	aux_buffer+1[EBP], #16h	;Is it long enough?
+	JB	10$.S			;No - forget it!
+	MOVZWL	EAX, aux_buffer+2[EBP]	;Get number of cylinders
+	XCHGB	AL, AH
+	MOVL	ucb_ccylns.B[ESI], EAX
+	MOVL	ucb_icylns.B[ESI], EAX
+	MOVZBL	EAX, aux_buffer+5[EBP]	;Get number of heads
+	MOVL	ucb_cheads.B[ESI], EAX
+	MOVL	ucb_iheads.B[ESI], EAX
+10$:	LEAL	EBX, aux_buffer[EBP]
+	PUSHL	SS
+	POPL	FS
+	PUSHL	ESI
+	MOVL	EAX, ucb_scsitar[ESI]
+	MOVL	ESI, ucb_scsiicb[ESI]
+	MOVB	DL, #03h		;Get the disk drive format info
+	MOVB	DH, #08h
+	CALL	xossciModeSense##
+	POPL	ESI
+	JC	12$.S			;If error, assume its not available
+	CMPB	aux_buffer+1[EBP], #16h	;Is it long enough?
+	JB	12$.S			;No - forget it!
+	MOVZWL	EAX, aux_buffer+10t[EBP] ;Get number of sectors per track
+	XCHGB	AL, AH
+	MOVL	ucb_csects.B[ESI], EAX
+	MOVL	ucb_isects.B[ESI], EAX
+	MOVZWL	EAX, aux_buffer+12t[EBP] ;Get bytes per sector
+	XCHGB	AL, AH
+	MOVL	ucb_csecsz.B[ESI], EAX
+	MOVL	ucb_isecsz.B[ESI], EAX
+12$:	CMPL	ucb_isecsz.B[ESI], #0.B	;Did we get the block size?
+	JNE	14$.S			;Yes
+	MOVL	EAX, #512t		;No - assume 512 bytes
+	MOVL	ucb_csecsz.B[ESI], EAX
+	MOVL	ucb_isecsz.B[ESI], EAX
+14$:	CLRL	EAX
+	INCL	EAX
+16$:	PUSHL	EAX
+	CALL	xosdskCDcb##		;Give up the DCB we were using
+	POPL	EAX
+	MOVL	SS:xffDcb##, #0
+18$:	MOVW	ES, SS:xffPda##
+	MOVL	ES:pdaResponse##, EAX
+	CALL	knlRRequeue##
+	LEAVE
+ret002:	RET
+.PAGE
+fixblksize:
+	CALL	getblksize		;Get number of blocks and block size
+	JC	ret002.S		;If error
+	CMPL	EAX, #512t		;Does this device have 512 byte blocks?
+	JE	ret002.S		;Yes - finished here
+	MOVL	EAX, ucb_scsitar[ESI]	;No - try to change the block size to
+	PUSHL	ESI			;  be 512 bytes (this is known to be
+	MOVL	ESI, ucb_scsiicb[ESI]	;  needed for some CD-ROM drives)
+	MOVL	aux_xcb+xcb_target.B[EBP], EAX
+	MOVZBL	EAX, AL
+	MOVL	aux_xcb+xcb_task.B[EBP], EAX
+	LEAL	EAX, aux_buffer[EBP]
+	MOVL	aux_xcb+xcb_buffer+0[EBP], EAX
+	MOVW	aux_xcb+xcb_buffer+4[EBP], SS
+	MOVL	aux_xcb+xcb_count.B[EBP], #12t
+	MOVL	aux_buffer+0t[EBP], #08000000h
+	MOVL	aux_buffer+4t[EBP], #00000000h
+	MOVL	aux_buffer+8t[EBP], #00020000h
+	MOVB	aux_xcb+xcb_mode.B[EBP], #MODE$OUTPUT
+	MOVL	aux_xcb+xcb_cdb+0.B[EBP], #CMD_MODESEL6 ;Set up the CDB
+	MOVL	aux_xcb+xcb_cdb+4.B[EBP], #12t
+	MOVL	aux_xcb+xcb_cdblen.B[EBP], #6t
+	LEAL	EBX, aux_xcb.B[EBP]
+	CALLI	icb_doio.B[ESI]
+	POPL	ESI
+
+;Subroutine to get number of blocks and block size for the device
+;	CALL	getblksize
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  c{EAX} = Block size
+
+getblksize:
+	MOVL	EAX, ucb_scsitar[ESI]
+	PUSHL	ESI
+	MOVL	ESI, ucb_scsiicb[ESI]
+	MOVL	aux_xcb+xcb_target.B[EBP], EAX
+	MOVZBL	EAX, AL
+	MOVL	aux_xcb+xcb_task.B[EBP], EAX
+	LEAL	EAX, aux_buffer[EBP]
+	MOVL	aux_xcb+xcb_buffer+0.B[EBP], EAX
+	MOVW	aux_xcb+xcb_buffer+4.B[EBP], SS
+	MOVL	aux_xcb+xcb_count.B[EBP], #20t
+	MOVB	aux_xcb+xcb_mode.B[EBP], #0h
+	MOVL	aux_xcb+xcb_cdb+0.B[EBP], #CMD_READCAP ;Set up the CDB
+	CLRL	EAX
+	MOVL	aux_xcb+xcb_cdb+2.B[EBP], EAX
+	MOVL	aux_xcb+xcb_cdb+6.B[EBP], EAX
+	MOVL	aux_xcb+xcb_cdblen.B[EBP], #10t
+	LEAL	EBX, aux_xcb.B[EBP]
+	CALLI	icb_doio.B[ESI]
+	POPL	ESI
+	JC	2$
+	MOVL	EAX, aux_buffer+0[EBP]	;Get number of blocks on disk
+	XCHGB	AL, AH
+	RORL	EAX, #16t
+	XCHGB	AL, AH
+	MOVL	ucb_cblocks.B[ESI], EAX
+	MOVL	ucb_iblocks.B[ESI], EAX
+	MOVL	EAX, aux_buffer+4[EBP]	;Get block size
+	XCHGB	AL, AH
+	RORL	EAX, #16t
+	XCHGB	AL, AH
+	MOVL	ucb_csecsz.B[ESI], EAX
+	MOVL	ucb_isecsz.B[ESI], EAX
+2$:	RET
+
+;Subroutine to get SCSI device name for devchar
+
+sdskgetdev:
+	MOVL	ESI, dcb_dkucb.B[EDI]	;Get offset of our UCB
+	MOVL	EBX, ucb_scsiicb[ESI]	;Get offset of our ICB
+	LEAL	EAX, icb_name.B[EBX]	;Get offset of SCSI device name
+	RET
+.PAGE
+	.SBTTL	ks_media - Function to determine media type
+
+sdskmedia:
+	CMPL	ucb_baseucb.B[ESI], #0.B ;Is this a partition?
+	JNE	4$.S			;Yes
+	ENTER	aux_SIZE, 0		;No - make sure the block size is OK
+	CALL	fixblksize
+	LEAVE
+4$:	CLRL	EAX			;Do hard disk partition set up
+	JMP	xosdskHdkMedia##
+.PAGE
+	.SBTTL	kf_gettoc - Function to get CD-ROM TOC data
+
+;Here for the get CD-ROM TOC data function
+;	c{ES:EBX} = Address of buffer
+;	c{ECX}    = Maximum amount to transfer
+;	c{ESI}    = Offset of UCB
+;	c{EDI}    = Offset of DCB
+;	CALL	sdskgettoc
+;	c{ECX} = Amount transfered
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  c{EAX} = 0
+;  Data returned in the buffer is the raw data received from the drive
+
+sdskgettoc:
+	ENTER	aux_SIZE, 0		;No - make sure the block size is OK
+	MOVL	aux_xcb+xcb_cdb+0.B[EBP], #020000h+CMD_READTOC
+	MOVB	aux_xcb+xcb_cdb+9.B[EBP], #80
+	JMP	4$.S
+
+	.SBTTL	kf_gettrks - Function to get CD-ROM track data
+
+;Here for the get CD-ROM track data function
+;	c{ES:EBX} = Address of buffer
+;	c{ECX}    = Maximum amount to transfer
+;	c{ESI}    = Offset of UCB
+;	c{EDI}    = Offset of DCB
+;	CALL	sdskgettrks
+;	c{ECX} = Amount transfered
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  c{EAX} = 0
+;  Data returned in the buffer is the raw data received from the drive
+
+sdskgettrks:
+	ENTER	aux_SIZE, 0		;No - make sure the block size is OK
+	MOVL	aux_xcb+xcb_cdb+0.B[EBP], #CMD_READTOC
+	MOVB	aux_xcb+xcb_cdb+9.B[EBP], #0
+4$:	MOVL	EAX, ucb_scsitar[ESI]
+	PUSHL	ESI
+	MOVL	ESI, ucb_scsiicb[ESI]
+	MOVL	aux_xcb+xcb_target.B[EBP], EAX
+	MOVZBL	EAX, AL
+	MOVL	aux_xcb+xcb_task.B[EBP], EAX
+	MOVL	aux_xcb+xcb_buffer+0[EBP], EBX
+	MOVW	aux_xcb+xcb_buffer+4[EBP], ES
+	MOVL	aux_xcb+xcb_count.B[EBP], ECX
+	MOVB	aux_xcb+xcb_mode.B[EBP], #0
+	MOVB	AL, CH
+	SHLL	EAX, #24t
+	MOVL	aux_xcb+xcb_cdb+4.B[EBP], EAX
+	MOVB	aux_xcb+xcb_cdb+8.B[EBP], CL
+	MOVL	aux_xcb+xcb_cdblen.B[EBP], #10t
+	LEAL	EBX, aux_xcb.B[EBP]
+	CALLI	icb_doio.B[ESI]
+	POPL	ESI
+	LEAVE
+	RET
+.PAGE
+	.SBTTL	kf_readlist - Function to read data into buffer list
+
+;Here for the read buffer list function
+;	c{ES:EBX} = Address of buffer
+;	c{ECX}    = Amount to transfer
+;	c{ESI}    = Offset of UCB
+;	c{EDI}    = Offset of DCB
+;	CALL	sdskreadlist
+;	c{ECX} = Amount transfered
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  c{EAX} = 0
+
+sdskreadlist:
+	MOVB	AH, #MODE$LIST		;Get mode bits
+	JMP	2$.S
+
+	.SBTTL	kf_readdata - Function to read data into single buffer
+
+;Here for the read block function
+;	c{ES:EBX} = Address of buffer
+;	c{ECX}    = Amount to transfer
+;	c{ESI}    = Offset of UCB
+;	c{EDI}    = Offset of DCB
+;	CALL	sdskreaddata
+;	c{ECX} = Amount transfered
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  c{EAX} = 0
+
+sdskreaddata:
+	MOVB	AH, #0
+2$:	MOVB	AL, #CMD_READ10		;Get read command
+	JMP	sdskxfer.S
+
+	.SBTTL	kf_writlist - Function to write data from buffer list
+
+;Here for the write buffer list function
+;	c{ES:EBX} = Address of buffer
+;	c{ECX}    = Amount to transfer
+;	c{ESI}    = Offset of UCB
+;	c{EDI}    = Offset of DCB
+;	CALL	sdskwritlist
+;	c{ECX} = Amount transfered
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  c{EAX} = 0
+
+sdskwritlist:
+	MOVB	AH, #MODE$OUTPUT|MODE$LIST ;Get mode bits
+	JMP	6$.S
+
+;Here if byte count is too large or is not an exact multiple of the block size
+
+4$:	MOVL	EAX, #ER_ICDEV
+	CLRL	ECX
+	STC
+	RET
+
+	.SBTTL	kf_writdata - Function to write data from single buffer
+
+;Here for the write block function
+;	c{ES:EBX} = Address of buffer
+;	c{ECX}    = Amount to transfer
+;	c{ESI}    = Offset of UCB
+;	c{EDI}    = Offset of DCB
+;	CALL	sdskwritdata
+;	c{ECX} = Amount transfered
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  c{EAX} = 0
+
+sdskwritdata:
+	MOVB	AH, #MODE$OUTPUT	;Get mode bits
+6$:	MOVB	AL, #CMD_WRITE10	;Get write command
+
+$$$=!0
+FRM            , 3t
+FRM xfr_changed, 1t
+FRM xfr_xcb    , xcb_SIZE
+xfr_SIZE=!$$$
+
+sdskxfer:
+	TESTL	ECX, #0FE0001FFh	;Make sure count is not too big or
+	JNE	4$.S			;  not even
+	ENTER	xfr_SIZE, 0		;OK
+	MOVB	xfr_xcb+xcb_mode.B[EBP], AH ;Store mode value
+	MOVB	xfr_xcb+xcb_cdb+0.B[EBP], AL ;Store command
+	MOVB	xfr_xcb+xcb_cdb+1.B[EBP], #0
+	MOVL	xfr_xcb+xcb_buffer+0.B[EBP], EBX ;Store buffer address
+	MOVL	xfr_xcb+xcb_buffer+4.B[EBP], ES
+	MOVL	xfr_xcb+xcb_count.B[EBP], ECX ;Store amount to transfer
+	MOVB	xfr_changed.B[EBP], #0
+	LEAL	EAX, 512t-1[ECX]	;Get number of blocks to transfer
+	SHRL	EAX, #9t
+	TESTB	AH, #MODE$OUTPUT	;Doing output?
+	JNE	10$.S			;Yes
+	ADDL	ucb_bytein[ESI], ECX	;No - add into the input counts
+	ADDL	ucb_blockin[ESI], EAX
+	JMP	12$.S
+
+10$:	ADDL	ucb_byteout[ESI], ECX	;Add into the output counts
+	ADDL	ucb_blockout[ESI], EAX
+12$:	XCHGB	AL, AH			;Store number of blocks in the CDB
+	SHLL	EAX, #8t
+	MOVL	xfr_xcb+xcb_cdb+6.B[EBP], EAX
+	MOVL	EAX, dcb_dkdblk.B[EDI]	;Get disk block number
+	ADDL	EAX, ucb_partnoff.B[ESI]
+	XCHGB	AL, AH			;Fix up the byte order
+	RORL	EAX, #16t
+	XCHGB	AL, AH
+	MOVL	xfr_xcb+xcb_cdb+2.B[EBP], EAX ;Store block number
+	MOVL	EAX, ucb_scsitar[ESI]	;Get target and LUN
+	MOVL	xfr_xcb+xcb_target.B[EBP], EAX
+	MOVZBL	EAX, AL
+	MOVL	xfr_xcb+xcb_task.B[EBP], EAX ;Store interface task number
+	MOVL	xfr_xcb+xcb_cdblen.B[EBP], #10t ;Store CDB length
+14$:	LEAL	EBX, xfr_xcb.B[EBP]
+	PUSHL	ESI
+	MOVL	ESI, ucb_scsiicb[ESI]
+	CALLI	icb_doio.B[ESI]		;Call SCSI driver to do the IO
+	POPL	ESI
+	JNC	16$.S			;Finished if no error
+	CMPL	EAX, #ER_MDCHG.B	;Error - is it media changed?
+	JNE	16$.S
+	CMPB	xfr_changed.B[EBP], #0	;Yes - have we already done this?
+	JNE	16$.S			;Yes - fail now
+	INCB	xfr_changed.B[EBP]	;No
+	TESTB	ucb_sts1.B[ESI], #U1$MOUNT ;Is the disk mounted now?
+	JE	14$.S			;No - don't care about this!
+	MOVL	EAX, dcb_sdisp.B[EDI]	;Yes - see if it is really changed
+	CALLI	CS:dd_vfychg.B[EAX]
+	JNC	14$.S			;Try again if OK
+	CLRL	ECX
+16$:	MOVL	EDX, ECX
+	MOVL	EBX, xfr_xcb+xcb_buffer+0.B[EBP]
+18$:	SUBL	EDX, #512t
+	JL	20$.S
+	ORB	cb_sts.B[EBX], #CB$FULL
+	MOVL	EBX, cb_xnext.B[EBX]
+	TESTL	EBX, EBX
+	JNE	18$.S
+20$:	MOVL	EDX, knlTickCnt##	;Remember when we did this
+	MOVL	ucb_acstime.B[ESI], EDX
+	LEAVE
+	BTL	EAX, #31t
+	RET
+.PAGE
+	.SBTTL	kf_format - Format track
+
+;Here for the format track function
+;	c{EDI} = Offset of DCB
+;	CALL	sdskformat
+;	c{ECX} = Amount transfered
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  c{EAX} = 0
+
+sdskformat:
+	MOVL	EAX, #ER_NIYT
+	CLRL	ECX
+	STC
+	RET
+.PAGE
+	.SBTTL	ks_senchg - Sense disk change
+
+;Subroutine to sense if a disk has changed - This function is called to
+;  determine if a disk has been changed when obtaining a block from the
+;  cache.  If there has been disk activity within the last second, it
+;  assumes the disk has not been changed.  Otherwise it sends a test
+;  unit ready command to the disk.  This will give a disk changed error
+;  if the disk has been changed since the last IO operation.
+;	c{EDI} = Offset of DCB
+;	CALL	sdsksenchg
+;	c{EDX} = Return value:
+;		   0 - Error, c{EAX} = Error code
+;		   1 - Disk not changed
+;		   2 - Might be changed (no MS) - never returned here
+;		   3 - Probably changed (try to assume changed) - never
+;			 returned here
+;		   4 - Probably changed (always verify)
+
+sdsksenchg:
+	TESTB	ucb_dsp.B[ESI], #DS$REMOVE ;Is this disk removable?
+	JE	2$.S			;No - it can't be changed!
+	MOVL	EAX, knlTickCnt##	;Yes - do we need to do this now?
+	SUBL	EAX, ucb_acstime.B[ESI]
+	JS	2$.S			;No
+	CMPL	EAX, #TICKSPERSEC	;Maybe
+	JAE	4$.S			;Yes - must check
+2$:	MOVL	EDX, #1			;No - indicate not changed
+	RET
+
+	.SBTTL	ks_chkchg - Check for disk change
+
+;Subroutine to check if a disk has changed - This function is called to
+;  determine if a disk has been changed when mounting a disk.  It always
+;  sends a check unit ready command to the disk.  This will give a disk
+;  changed error if the disk has been changed since the last IO operation.
+;	c{EDI} = Offset of DCB
+;	CALL	sdskchkchg
+;	c{EDX} = Return value:
+;		   0 - Error, c{EAX} = Error code
+;		   1 - Disk not changed
+;		   2 - Might be changed (no MS) - never returned here
+;		   3 - Probably changed (try to assume changed) - never
+;			 returned here
+;		   4 - Probably changed (always verify)
+
+sdskchkchg:
+	TESTB	ucb_dsp.B[ESI], #DS$REMOVE ;Is this disk removable?
+	JE	2$.S			;No - it can't be changed!
+4$:	PUSHL	EBX			;Yes
+	MOVL	EAX, #kf_chkchg		;See if the disk has been changed
+	CALL	xosdskXfer##
+	POPL	EBX
+	JNC	2$.S			;Not changed if no error
+	CLRL	EDX			;Error - assume not media changed
+	CMPL	EAX, #ER_MDCHG.B	;Is it?
+	JNE	6$.S			;No
+	MOVB	DL, #4			;Yes
+6$:	RET
+.PAGE
+	.SBTTL	kf_chkchg - Check for disk change
+
+;Here for the check for disk change function - This function is called to
+;  determine if a disk has been changed by obtaining the state of the media
+;  sensor for the disk.  Note that this function is only called from the
+;  sdsksenchg (ks_senchg) and dskchkchg (ks_chkchg) routines in this module.
+;	c{EDI} = Offset of DCB
+;	CALL	sdskchkchgf
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+
+$$$=!0
+FRM sen_xcb  , xcb_SIZE
+sen_SIZE=!$$$
+
+sdskchkchgf:
+	ENTER	sen_SIZE, 0
+	CLRL	EAX
+	MOVB	sen_xcb+xcb_mode.B[EBP], AL ;Store mode value
+	MOVL	sen_xcb+xcb_cdb+0.B[EBP], EAX ;Store command (CMD_TSTURDY = 0)
+	MOVL	sen_xcb+xcb_cdb+4.B[EBP], EAX
+	MOVL	sen_xcb+xcb_count.B[EBP], EAX ;Nothing to transfer
+	MOVL	EAX, ucb_scsitar[ESI]	;Get target and LUN
+	MOVL	sen_xcb+xcb_target.B[EBP], EAX
+	MOVZBL	EAX, AL
+	MOVL	sen_xcb+xcb_task.B[EBP], EAX ;Store interface task number
+	MOVL	sen_xcb+xcb_cdblen.B[EBP], #6t ;Store CDB length
+	LEAL	EBX, sen_xcb.B[EBP]
+	PUSHL	ESI
+	MOVL	ESI, ucb_scsiicb[ESI]
+	CALLI	icb_doio.B[ESI]		;Call SCSI driver to do the command
+	POPL	ESI
+	MOVL	EDX, knlTickCnt##	;Remember when we did this
+	MOVL	ucb_acstime.B[ESI], EDX
+	LEAVE
+	RET
+.PAGE
+	.SBTTL	Data
+
+	DATA
+
+	.MOD	4
+sdskkcb:.LONG	0		;Offset of first SCSI disk KCB
+
+	LKEEND

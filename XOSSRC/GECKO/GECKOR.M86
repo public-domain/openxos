@@ -1,0 +1,613 @@
+	.TITLE	GECKOR
+
+;++++
+; This software is in the public domain.  It may be freely copied and used
+; for whatever purpose you see fit, including commerical uses.  Anyone
+; modifying this software may claim ownership of the modifications, but not
+; the complete derived code.  It would be appreciated if the authors were
+; told what this software is being used for, but this is not a requirement.
+
+;   THIS SOFTWARE IS PROVIDED BY THE AUTHORS "AS IS" AND ANY EXPRESS OR
+;   IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
+;   OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+;   IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+;   INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+;   BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS
+;   OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+;   ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR
+;   TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
+;   USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+;----
+
+	.PROC	80386
+	.INCLUD	GECKO.PAR
+
+.IF NDF $$DEBUG
+  $$DEBUG==!0
+.ENDC
+
+;Sturcture of memory:
+;	code_s segment		;Contains all GECKOR code
+;	  code_p psect
+;	data_s segment		;Contains all GECKOR data
+;	  data_p psect
+;	symbol table		;Not loaded, allocated above loaded memory
+
+	.SEG	code_s, 16BIT, DATA, READ, WRITE
+	.MSECT	code_m, code_s, ADDR=0
+	.PSECT	code_p,  code_m, MOD=16t
+
+	.SEG	data_s, 16BIT, DATA, READ, WRITE
+	.MSECT	data_m, data_s, ADDR=0
+	.PSECT	data_p, data_m, MOD=16t
+
+	.SEG	mtop_s, 16BIT, DATA, READ, WRITE
+	.MSECT	mtop_m, mtop_s, ADDR=0
+	.PSECT	mtop_p, mtop_m, MOD=16t
+
+	.PSECT	code_p
+	.START	gecko
+	.STACK	stack
+	.STK16
+
+PRGNSZ  =!100t		;Maximum length for program name
+
+;Format of the symbol table file:
+;16 bit format:
+;  File header (12 bytes):
+;	ID       (4 bytes)  = 030222D4h
+;	Length   (4 bytes)  = Number of bytes in file
+;	Count    (4 bytes)  = Number of table entries in file
+;  Symbol definition:
+;	Flags    (1 byte)   = Symbol flags:
+;				80h - Symbol is a selector value
+;				40h - Symbol is multiply defined
+;				20h - Symbol is an address
+;				10h - Symbol is suppressed
+;				08h - Symbol is global
+;				04h - Symbol is a msect selector/offset value
+;				02h - Symbol is a module name
+;	Offset   (2 bytes)  = Offset part of value
+;	Selector (2 bytes)  = Selector part of value
+;	Name     (variable) = Symbol name (high bit set on last byte)
+;32 bit format:
+;  File header (12 bytes):
+;	ID       (4 bytes)  = 040222D4h
+;	Length   (4 bytes)  = Number of bytes in file
+;	Count    (4 bytes)  = Number of table entries in file
+;  Symbol definition:
+;	Flags    (1 byte)   = Symbol flags:
+;				80h - Symbol is a selector value
+;				40h - Symbol is multiply defined
+;				20h - Symbol is an address
+;				10h - Symbol is suppressed
+;				08h - Symbol is global
+;				04h - Symbol is a msect selector/offset value
+;				02h - Symbol is a module name
+;				01h - Symbol value is relocatable
+;	Offset   (4 bytes)  = Offset part of value
+;	Selector (2 bytes)  = Selector part of value if absolute or msect
+;				number if relocatable
+;	Name     (variable) = Symbol name (high bit set on last byte)
+;Format of symbol table entry in memory:
+;	Length   (1 byte)   = Length of symbol name (in bytes)
+;	Flags    (1 byte)   = Symbol flags:
+;				SF$MLT = 40h - Symbol is multiply defined
+;				SF$ADR = 20h - Symbol is an address
+;				SF$SUP = 10h - Symbol is suppressed
+;				SF$GLB = 08h - Symbol is global
+;				SF$MOD = 02h - Symbol is a module name
+;				SF$V86 = 01h - Symbol is a V86 address
+;	Offset   (4 bytes)  = Offset part of value
+;	Selector (2 bytes)  = Selector part of value
+;	Name     (variable) = Symbol name
+.PAGE
+	.PSECT	code_p
+
+gecko::	PUSHW	#!data_m		;Initialize DS
+	POPW	DS
+	MOVW	pspseg, ES
+	CLD
+	MOVB	CL, ES:80h		;Get length of command tail
+	MOVW	SI, #81h		;Point to first command tail character
+2$:	CALL	getchr			;Get command tail character
+	JE	noprog.S		;If nothing there
+	CMPB	AL, #' '		;Skip leading whitespace
+	JE	2$.S
+	CMPB	AL, #HT
+	JE	2$.S
+	CMPB	AL, #'/'		;Have an GECKO switch?
+	JNE	getprog			;No - go on
+	CALL	getchr			;Yes
+	JE	12$.S
+	CLRW	DX			;Clear value
+	MOVW	BX, #4			;Collect 4 hex digits
+4$:	CMPB	AL, #'a'		;Lower case letter?
+	JB	6$.S			;No
+	ADDB	AL, #'A'-'a'		;Yes - convert to upper case
+6$:	CMPB	AL, #'0'		;Decimal digit?
+	JB	10$.S			;No
+	CMPB	AL, #'9'		;Maybe
+	JBE	8$.S			;Yes
+	CMPB	AL, #'A'		;No - hex digit?
+	JB	10$.S			;No
+	CMPB	AL, #'F'		;Maybe
+	JA	10$.S			;No
+	ADDB	AL, #9			;Yes - fix up the value
+8$:	ANDB	AL, #0Fh		;Get value of digit
+	ROLW	DX, #4			;Shift value
+	ORB	DL, AL
+	CALL	getchr			;Get next character
+	JE	12$.S			;Finished if no more
+	DECW	BX			;Continue if need more
+	JNE	4$.S
+10$:	CMPB	AL, #' '		;Character after the value must be a
+	JE	14$.S			;  whitespace character
+	CMPB	AL, #HT
+	JE	14$.S			;OK
+12$:	MOVW	DX, #bswmsg		;Bad load selector
+	JMP	failbig
+
+;Here with valid segment address
+
+14$:	ORW	DX, DX
+	JE	16$.S
+	DECW	DX
+16$:	MOVW	keepseg, DX		;Store top segment to keep
+	JMP	2$.S			;Continue
+.PAGE
+;Subroutine to get command tail character
+;	c(CL) = Number of characters left
+;	c[ES:SI] = Address of next character
+;	CALL	getchr
+;	Z:set = No more available
+;	Z:clr = Have character
+;	  c(AL) = Character, CL and SI updated
+
+getchr:	ORB	CL, CL			;More there?
+	JE	4$.S			;No - no program specified
+	LODSB	ES:[SI]			;Get character
+	DECB	CL			;Reduce count
+	ORW	SI, SI			;Make sure Z not set
+4$:	RET
+.PAGE
+getprog:MOVW	BX, #prgname		;Store name of program to debug
+	MOVB	CH, #PRGNSZ
+4$:	DECB	CH			;Room for more?
+	JNE	8$.S			;Yes
+	MOVW	line1pnt, #ntlmsg	;No - complain and load nothing
+	JMP	7$.S
+
+;Here if no program specified
+
+noprog:	MOVW	line1pnt, #npsmsg
+7$:	MOVW	line2pnt, #nullmsg
+	JMP	allrd2
+
+;Here with room for another character
+
+8$:	MOVB	[BX], AL		;Store character
+	INCW	BX
+	CALL	getchr			;Get next character
+	JE	12$.S			;If no more available
+	CMPB	AL, #' '		;End of name?
+	JE	10$.S			;Yes
+	CMPB	AL, #HT
+	JNE	4$.S			;No - continue
+10$:	DECW	SI			;Backup to first ws character
+	INCW	CX
+12$:	MOVW	endname, BX		;Remember where file name ends
+	MOVB	CH, #0
+	MOVB	ES:80h, CL		;Update command tail size
+	MOVW	DI, #81h
+	PUSHW	DS
+	PUSHW	ES			;Move rest of command tail to front
+	POPW	DS			;  of the DOS command buffer
+	RMOVSB	[DI], [SI]
+	MOVB	AL, #CR			;Make sure have CR at end (some MS-DOS
+	STOSB	[DI]			;  programs expect this)
+	MOVW	CX, #100h		;Calculate amount left in buffer
+	SUBW	CX, DI
+	MOVB	AL, #0			;Zero the rest of the buffer
+	RSTOSB	[DI]
+	MOVW	DI, #5Ch		;Parse first argument
+	MOVW	SI, #81h
+	MOVW	AX, #2901h
+	INT	21h
+	MOVW	DI, #6Ch		;Parse second argument
+	MOVW	AX, #2901h
+	INT	21h
+	POPW	DS
+
+;Here with command tail processed - now open and read the symbol table file
+
+	MOVW	BX, endname		;Open symbol table file
+	MOVL	[BX], #'.SYM'		;Add .SYM after name
+	MOVW	DX, #prgname		;Open the file
+	MOVW	AX, #3D00h
+	INT	21h
+	JNC	loadsym.S		;If OK
+	MOVW	BX, #nosmsg		;Can't open it - tell him
+	JMP	nosyms.S
+.PAGE
+;Here with symbol table file open
+
+loadsym:MOVW	symhndl, AX		;Store file handle for symbol file
+	MOVW	BX, AX			;Read symbol file header
+	MOVW	CX, #12t
+	MOVW	DX, #symhead
+	MOVB	AH, #3Fh
+	INT	21h
+	JC	symerr			;If error
+	CMPW	symhead+0, #22D4h	;Check for valid symbol file format
+	JNE	badsym.S
+	CMPW	symhead+2, #0302h
+	JNE	badsym.S
+	CMPW	geckosymcnt, #0.B
+	JNE	4$.S
+badsym:	MOVW	BX, #bsfmsg		;Bad symbol file format
+	JMP	nosyms.S
+
+;Here with valid symbol table format
+
+4$:	CMPW	symhead+6, #0		;Make sure symbol file not too big
+	JE	6$			;OK
+tobsym:	MOVW	BX, #tobmsg
+nosyms:	MOVW	line2pnt, BX		;Store offset of symbol message
+	MOVL	geckosymcnt, #0		;Indicate no symbols
+	MOVW	symhead+4, #0
+6$:	MOVW	AX, symhead+4		;Calculate number of paragraphs in
+	CLRW	DX			;  symbol table
+	ADDW	AX, geckosymcnt
+	ADCW	DX, #0.B
+	ADDW	AX, #0Fh+16t
+	ADCW	DX, #0.B
+	MOVW	CX, #10
+	DIVW	CX
+	MOVW	BX, AX
+	ADDW	BX, #!mtop_p		;Calculate amount of memory to keep
+	CMPW	BX, keepseg		;Is this high enough?
+	JAE	10$.S			;Yes
+	MOVW	BX, keepseg		;No - load it where he said
+10$:	SUBW	BX, pspseg
+	MOVB	AH, #4Ah		;Reduce our allocation
+	INT	21h
+	JNC	8$.S			;If OK
+memfail:MOVW	DX, #mermsg
+failbig:MOVB	AH, #09h
+	INT	21h
+	MOVW	AX, #4C01h
+	INT	21h
+
+;Here with memory allocated for symbol table.  The in-memory symbol table
+;  format is almost the same as the format of the symbol table file.  We add
+;  one byte before each entry which specifies the length of the symbol name.
+;  Also, we clear the high bit of the last character in each name (which is
+;  used as an end of string indicator in the file.  This allows for faster
+;  symbol table searches.  We load the symbol table file with a single read
+;  into memory n bytes above the start of the symbol table (where n is the
+;  number of entires in the symbol table).  We later expand each entry by
+;  one byte and move it to the right place - we also relocate the symbol
+;  values as necessary at this time.
+
+8$:	MOVW	BX, symhndl		;Get handle for symbol table file
+	ORW	BX, BX			;Really have a symbol table?
+	JE	load10.S		;No - go on
+	MOVW	CX, symhead+4		;Yes - get amount to load
+	MOVW	DX, geckosymcnt		;Get number of symbols as offset for
+	MOVW	AX, DX			;  loading the data
+	ADDW	AX, CX
+	MOVW	symtop, AX		;Remember where the top of the table is
+	MOVW	symsize, AX
+	PUSHW	DS
+	MOVW	DS, geckosymtbl+2
+	MOVB	AH, #3Fh
+	INT	21h
+	POPW	DS
+	JC	symerr.S		;If error
+	MOVW	BX, #line2arg		;Setup the second message line
+	MOVW	SI, #line2a
+	CALL	fmtmsg
+	JMP	load10.S		;Continue
+
+;Here if error while reading the symbol table
+
+symerr:	MOVW	line2pnt, #erdmsg
+	MOVL	geckosymcnt, #0
+	MOVW	symhead+4, #0		;Fall into load10 on next page
+.PAGE
+;Here with the symbol table loaded into memory if we have a symbol table (fixup
+;  not done yet)
+
+load10:	MOVW	BX, endname
+	MOVL	[BX], #'.COM'		;Add .COM after name
+	MOVW	AX, #3D00h		;Try to open the file
+	MOVW	DX, #prgname
+	INT	21h
+	JC	8$.S			;If error
+	PUSHW	AX
+	MOVW	BX, AX			;Get length of the file
+	CLRW	CX
+	CLRW	DX
+	MOVW	AX, #4202h
+	INT	21h
+	JNC	14$.S			;OK - go on
+2$:	MOVW	line1pnt, #cnrmsg
+	JMP	6$.S
+
+4$:	MOVW	line1pnt, #cnomsg	;Can't open it - tell him
+6$:	MOVL	execblk+12h, #0
+	JMP	allrd2
+
+;Here if can't open a COM file
+
+8$:	CMPW	AX, #2			;Is the error file not found?
+	JNE	4$.S			;No - go fail
+	MOVW	BX, endname		;Yes - put .EXE after name
+	MOVL	[BX], #'.EXE'
+	MOVW	AX, #3D00h		;Try to open the file
+	MOVW	DX, #prgname
+	INT	21h
+10$:	JC	4$.S			;If error
+	PUSHW	AX
+	MOVW	BX, AX			;Read the EXE header
+	MOVW	CX, #1Ah
+	MOVW	DX, #xdispbf#
+	MOVB	AH, #3Fh
+	INT	21h
+	JC	2$.S
+	CMPW	AX, #1Ah.B
+	JNE	4$.S
+	MOVW	AX, xdispbf#+4		;Get number of whole blocks in file
+	ANDW	xdispbf#+2, #1FFh
+	JE	12$.S
+	DECW	AX
+12$:	MOVW	CX, #200h		;Change to bytes
+	MULW	CX
+	ADDW	AX, xdispbf#+2		;Add in length of last block
+	ADCW	DX, #0.B
+	MOVW	BX, xdispbf#+8		;Get length of EXE header
+	SHLW	BX, #4			;Change to bytes
+	SUBW	AX, BX			;Difference is length of program
+	SBBW	DX, #0.B
+14$:	MOVW	progsize+0, AX
+	MOVW	progsize+4, DX
+	POPW	BX			;Close the file
+	MOVB	AH, #3Eh
+	INT	21h
+	MOVW	DX, #prgname
+	MOVW	BX, #execblk
+	MOVW	AX, pspseg
+	MOVW	4.B[BX], AX
+	MOVW	8.B[BX], AX
+	MOVW	0C.B[BX], AX
+	PUSHW	DS
+	POPW	ES
+	MOVW	AX, #4B01h		;Load the program
+	INT	21h
+	JC	10$.S
+	MOVB	AH, #51h		;Get segment for the new PSP
+	INT	21h
+	MOVW	newpsp, BX
+	MOVW	ES, BX
+	LEAW	BP, 10h.B[BX]
+	MOVW	ES:0Ah, #alldone
+	MOVW	ES:0Ch, CS		;Fall into fixsym on next page
+.PAGE
+fixsym:	MOVW	CX, symhead+8		;Get number of table entries
+	JREGZ	CX, allrdy		;If none
+	MOVW	SI, geckosymcnt		;Get offset where symbol table was
+					;  loaded
+	CLRW	DI			;Get offset where symbol table goes
+	MOVW	DX, symtop		;Also get top of symbol table
+	PUSHW	DS			;And point DS to the symbol table
+	MOVW	DS, geckosymtbl+2		;  segment (since we will use it more
+					;  here)
+fixs02:	LODSB	[SI]			;Get flag bits for symbol
+	MOVB	1.B[DI], AL		;Put them where they go
+	TESTB	AL, #SF$SEL		;Is this a segment selector?
+	LODSW	[SI]			;Get offset part
+	JE	4$.S			;Not segment selector
+	ADDW	AX, BP			;Segment selector - relocate it
+4$:	MOVW	2.B[DI], AX		;Store offset
+	LODSW	[SI]			;Get segment part
+	TESTB	1.B[DI], #SF$ADR	;Is this an address?
+	JNE	5$.S			;Yes
+	ORW	AX, AX			;Maybe - is segment part non-zero?
+	JE	6$.S			;No
+	ORB	1.B[DI], #SF$ADR	;Yes - mark it as an address
+	JMP	6$.S			;But don't relocate it
+
+;Here if need to relocate address
+
+5$:	ADDW	AX, BP			;Relocate it
+6$:	MOVW	4.B[DI], AX
+	CLRW	BX
+8$:	CMPW	SI, DX			;Past end of table?
+	JBE	10$.S			;No - go on
+fixerr:	POPW	DS
+	MOVL	geckosymcnt, #0		;Yes - error
+	MOVW	line2pnt, #bsfmsg
+	JMP	allrdy.S
+
+10$:	LODSB	[SI]			;Get character and bump pointer
+	ORB	AL, AL			;Last character?
+	JS	12$.S			;Yes
+	MOVB	6.B[BX+DI], AL		;No - store character
+	INCW	BX
+	JMP	8$.S			;Continue
+
+;Here with last character in symbol
+
+12$:	ANDB	AL, #7Fh		;Remove high bit
+	MOVB	6.B[BX+DI], AL		;Store last character
+	INCW	BX
+	MOVB	[DI], BL		;Store length of symbol
+	ADDW	DI, BX			;Bump destination pointer
+	ADDW	DI, #6
+	LOOP	CX, fixs02		;Continue if more table entries
+	MOVW	[DI], #SF$MOD*100h+0	;Store dummy module entry at end
+	POPW	DS			;  to stop local searches
+	INCL	geckosymcnt		;Adjust count for dummy entry at end
+
+;Here when ready to go to GECKO
+
+allrdy:	MOVW	BX, endname
+	MOVL	EAX, [BX]
+	MOVB	AL, #'('
+	MOVL	line1typ, EAX
+	MOVW	BX, #line1arg
+	MOVW	SI, #line1a
+	CALL	fmtmsg
+	MOVW	SS, execblk+10h		;Switch to the user's stack
+	MOVW	SP, execblk+0Eh
+allrd2:	PUSHW	#0200h			;Stack initial FR bits
+	PUSHW	execblk+14h		;Stack initial CS value
+	PUSHW	execblk+12h		;Stack initial PC value
+	MOVW	ES, newpsp		;Setup ES
+	MOVW	DS, newpsp		;And DS
+	JMP	geckoentr#		;Go to GECKO!
+
+;Here when the loaded program exits
+
+alldone:CMPB	CS:quitflg#, #0		;Did we just quit?
+	JNE	exit2#			;Yes - really quit now!
+	PUSHW	#0200h			;No - restore GECKO's state
+	PUSHW	#0.B
+	PUSHW	#0.B
+	CALL	entgecko#
+	MOVW	BX, #adnmsg		;Tell him his program terminated
+	CALL	outstrd#
+	JMP	nxtcmd#			;Go to GECKO
+.PAGE
+;Subroutine to format message line
+;	c[BX] = Offset of argument table
+;	c[SI] = Offset of text string
+;	CALL	fmtmsg
+
+fmtmsg:	MOVW	DI, SI
+	PUSHW	DS
+	POPW	ES
+2$:	LODSB	[SI]			;Get character
+	CMPB	AL, #'#'		;Numeric field?
+	JE	6$.S			;Yes
+	CMPB	AL, #'@'		;"s" field?
+	JE	14$.S			;Yes
+4$:	STOSB	[DI]			;No - store character
+	CMPB	AL, #0			;Finished
+	JNE	2$.S			;No - continue
+	RET				;Yes
+
+;Here with numeric field
+
+6$:	LODSB	[SI]			;Scan to end of field
+	CMPB	AL, #'d'
+	JE	12$.S
+	CMPB	AL, #'h'
+	JNE	6$.S
+
+;Here for hex field
+
+	MOVW	AX, [BX]		;Get value
+	MOVW	CX, #4
+8$:	ROLW	AX, #4			;Get next 4 bits
+	PUSHW	AX
+	ANDB	AL, #0Fh
+	CMPB	AL, #9
+	JBE	10$.S
+	ADDB	AL, #'A'-'0'-10t
+10$:	ADDB	AL, #'0'
+	STOSB	[DI]
+	POPW	AX
+	LOOP	CX, 8$
+	JMP	2$.S
+
+;Here for decimal field
+
+12$:	MOVL	EAX, [BX]
+	ADDL	EBX, #4.B
+	CALL	fmtval			;Convert value
+	JMP	2$.S			;Continue
+
+;Here with "s" field
+
+14$:	CMPL	-4.B[EBX], #1.B		;Was previous value 1?
+	JE	2$.S			;Yes
+	MOVB	AL, #'s'		;No
+	JMP	4$.S
+
+fmtval:	CLRL	EDX
+	IDIVL	lit10			;Get next digit
+	PUSHW	DX
+	TESTL	EAX, EAX		;Finished?
+	JE	20$.S			;Yes
+	CALL	fmtval			;No - get next digit
+20$:	POPW	AX			;Get digit to output
+	ADDB	AL, #'0'		;Change to ASCII
+	STOSB	[DI]			;Store it
+	RET
+.PAGE
+	.SBTTL	Data
+
+	.PSECT	data_p
+
+	 .BLKL	256t			;GECKO's stack
+stack:
+mermsg:	 .ASCIZ	"? GECKOR: Memory allocation error"{CR,LF}"$"
+bswmsg:	 .ASCIZ	"? GECKOR: Bad value for load selector"{CR,LF}"$"
+adnmsg:	 .ASCIZ	{CR,LF}"***** Program terminated *****"{CR,LF}
+ntlmsg:	 .ASCII	"Illegal program name - nothing loaded"{CR,LF}
+npsmsg:	 .ASCII	"No program specified - nothing loaded"{CR,LF}
+nullmsg: .BYTE	0
+cnomsg:	 .ASCIZ	"Cannot open program file - program not loaded"{CR,LF}
+cnrmsg:	 .ASCIZ "Cannot determine program length - program not loaded"{CR,LF}
+nosmsg:	 .ASCIZ	"Cannot open symbol file - symbol table not loaded"{CR,LF}
+erdmsg:	 .ASCIZ	"Error reading program file - program not loaded"{CR,LF}
+nemmsg:	 .ASCIZ	"Not enough memory available - program not loaded"{CR,LF}
+bsfmsg:	 .ASCII	"Illegal format in symbol table file - symbol table not"
+	 .ASCIZ	" loaded"{CR,LF}
+tobmsg:	 .ASCII	"Symbol table is too big - symbol table not loaded"{CR,LF}
+line1msg:.ASCII "Program "
+line1typ:.ASCII	"(XXX) loaded: "
+line1a:	 .ASCIZ	"#########d byte@ at ###h:0000"{CR,LF}
+line2msg:.ASCII	"Symbol table loaded: "
+line2a:	 .ASCIZ	"#######d symbol@ using #########d byte@"{CR,LF}
+
+prgname: .BLKB	PRGNSZ+5	;Buffer to hold program name
+
+	.MOD	4
+lit10:	 .LONG	10t
+pspseg:	 .WORD	0		;Selector of our PSP
+line1arg:
+progsize:.LONG	0		;Size of loaded program
+newpsp:	 .WORD	0		;Selector of PSP for loaded program
+keepseg: .WORD	0		;Highest segment to keep for GECKO
+endname: .WORD	0		;Offset in our PSP of end of program name
+
+execblk: .WORD	0		; 0 Segment of environment
+	 .WORD	80h, 0		; 2 Pointer to command line
+	 .WORD	5Ch, 0		; 6 Pointer to first FCB
+	 .WORD	6Ch, 0		;0A Pointer to second FCB
+	 .WORD	0, 0		;0E Initial SS:SP
+	 .WORD	0, 0		;12 Initial CS:PC
+
+symhndl: .WORD	0		;File handle for symbol file
+blkpnt:	 .WORD	0
+blkcnt:	 .WORD	0
+bytcnt:	 .WORD	0
+symtop:	 .WORD	0		;Highest offset for symbol table
+prgmem:	 .WORD	0
+prgsize: .WORD	0
+line1pnt::
+	 .WORD	line1msg
+line2pnt::
+	 .WORD	line2msg
+
+symhead: .LONG	0, 0		;Symbol file header buffer
+line2arg:
+geckosymcnt::			;Number of symbol table entries (this must
+	 .LONG	0		;  symhead since its really part of the header!)
+symsize: .LONG	0		;Size of symbol table in bytes (must follow
+				;  geckosymcnt so fmtmsg will work right!)
+geckosymtbl::
+	 .WORD	0, !mtop_p	;Address of symbol table

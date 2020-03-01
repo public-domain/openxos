@@ -1,0 +1,903 @@
+	.TITLE	STAPDRV - SCSI tape device interface routine
+
+;++++
+; This software is in the public domain.  It may be freely copied and used
+; for whatever purpose you see fit, including commerical uses.  Anyone
+; modifying this software may claim ownership of the modifications, but not
+; the complete derived code.  It would be appreciated if the authors were
+; told what this software is being used for, but this is not a requirement.
+
+;   THIS SOFTWARE IS PROVIDED BY THE AUTHORS "AS IS" AND ANY EXPRESS OR
+;   IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
+;   OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+;   IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+;   INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+;   BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS
+;   OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+;   ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR
+;   TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
+;   USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+;----
+
+	.PROC	80486
+	.INCLUD	XOSINC:\XMAC\XOS.PAR
+	.INCLUD	XOSINC:\XMAC\XOSX.PAR
+	.INCLUD	XOSINC:\XMAC\XOSERR.PAR
+	.INCLUD	XOSINC:\XMAC\PCAT.PAR
+	.INCLUD	XOSINC:\XMAC\XOSLKE.PAR
+	.INCLUD	XOSINC:\XMAC\XOSXLKE.PAR
+	.INCLUD	TAPE.PAR
+	.INCLUD	SCSI.PAR
+
+MAJV   =!1t
+MINV   =!1t
+EDITNUM=!0t
+
+	LKEHEAD	STAPDRV, MAJV, MINV, EDITNUM, LKETYPE_DEVICE
+
+;Define offsets in the STAP part of the TAPE KCB
+
+$$$=!kcb_devdep
+kcb_stapSIZE=!$$$
+
+;Define offsets in the STAP part of the TAPE DCB
+
+$$$=!dcb_tpdriver
+BLK dcb_staphdataerr , 4t
+BLK dcb_staphdeverr  , 4t
+BLK dcb_staphovrnerr , 4t
+BLK dcb_staphungerr  , 4t
+BLK dcb_staprecin    , 4t
+BLK dcb_staprecout   , 4t
+BLK dcb_stapbytein   , 4t
+BLK dcb_stapbyteout  , 4t
+BLK dcb_staptdataerr , 4t
+BLK dcb_staptdeverr  , 4t
+BLK dcb_staptovrnerr , 4t
+BLK dcb_stapscsiicb  , 4t	;Offset of ICB for SCSI interface
+BLK dcb_stapstatus   , 1t	;Status byte
+BLK                  , 3t
+BLK dcb_stapscsitar  , 1t	;Target ID for SCSI interface
+BLK dcb_stapscsilun  , 1t	;Logical unit number for SCSI interface
+BLK 		     , 2t	;Reserved (can not be used)
+BLK dcb_stapdthlimit , 4t	;Data transfer hardware limit (blocks)
+BLK dcb_stapmodel    , 44t	;Disk model description
+BLK dcb_stapserialno , 24t	;Disk serial number or other data
+BLK dcb_staprevision , 12t	;Disk revision number
+dcb_stapSIZE=!$$$
+
+;Define bits in dcb_stapstatus
+
+TS$MOUNTED=!04h			;Tape is mounted
+TS$ATFM   =!02h			;Tape is positioned at a filemark
+TS$ATSM   =!01			;Tape is positioned at a setmark
+
+	CODE
+
+;SCSI tape device driver dispatch table
+
+stapdsp:.LONG	0		;tf_init     =  0. - Initialize controller
+	.LONG	stapchkmount	;tf_chkmount =  4. - Check that tape is mounted
+	.LONG	stapread	;tf_read     =  8. - Read data
+	.LONG	stapwrite	;tf_write    = 12. - Write data
+	.LONG	stapformat	;tf_format   = 16. - Format tape
+	.LONG	stapreten	;tf_reten    = 20. - Retension tape
+	.LONG	stapwritefm	;tf_writefm  = 24. - Write filemarks
+	.LONG	stapwritesm	;tf_writesm  = 28. - Write setmarks
+	.LONG	staplock	;tf_lock     = 32. - Lock/unlock tape mounting
+	.LONG	staperasegap	;tf_erasegap = 36. - Erase gap
+	.LONG	staperaseall	;tf_eraseall = 40. - Erase entire tape
+	.LONG	stapunload	;tf_unload   = 44. - Unload tape
+	.LONG	staprewind	;tf_rewind   = 48. - Rewind tape
+	.LONG	stapskprec	;tf_skprec   = 52. - Skip records
+	.LONG	stapskpfile	;tf_skpfile  = 56. - Skip filemarks
+	.LONG	stapconfile	;tf_confile  = 60. - Skip to consective
+				;		       filemarks
+	.LONG	stapskpset	;tf_skpset   = 64. - Skip setmarks
+	.LONG	stapconset	;tf_conset   = 68. - Skip to consective setmarks
+	.LONG	stapskp2eod	;tf_skp2eod  = 72. - Skip to end-of-data
+	.LONG	stapaddunit	;ts_addunit  = 76. - Add new tape unit
+STAPDSPSZ=!{$-stapdsp}/4
+
+;SCSI tape (type STAP) device characteristics table
+
+	DATA
+
+	.MOD	4
+stapdchartbl:
+ DCHARBGN  1, knlDCharValCom##
+ DCHARENT  CLASS   , TEXT, , 8 , knlDcMsgClass##   , knlDcGetClass##, knlDcSetClass##, 0
+ DCHARENT  TYPE    , TEXT, , 4 , knlDcMsgType##    , knlDcGet4Byte##, 0              , dcb_type
+ DCHARENT  SCSIDEV , TEXT, , 16, xossciMsgScsiDev##, stapgetdev     , 0              , 0
+ DCHARENT  SCSITAR , DECV, , 4 , xossciMsgScsiTar##, knlDcGet1Byte##, 0              , dcb_stapscsitar
+ DCHARENT  SCSILUN , DECV, , 4 , xossciMsgScsiLUN##, knlDcGet1Byte##, 0              , dcb_stapscsilun
+ DCHARENT  MODEL   , STR , , 44, knlDcMsgModel##   , knlDcGetStr##  , 0              , dcb_stapmodel
+ DCHARENT  SERIALNO, STR , , 24, knlDcMsgSerialNo##, knlDcGetStr##  , 0              , dcb_stapserialno
+ DCHARENT  REVISION, STR , , 12, knlDcMsgRevision##, knlDcGetStr##  , 0              , dcb_staprevision
+ DCHARENT  DTHLIMIT, DECV, , 4 , knlDcMsgDThLimit##, knlDcGet4Byte##, 0              , dcb_stapdthlimit
+ DCHARENT  RECMIN  , DECV, , 4 , msgrecmin         , knlDcGet4Byte##, knlDcSet4Byte##, dcb_tprecmin
+ DCHARENT  RECMAX  , DECV, , 4 , msgrecmax         , knlDcGet4Byte##, knlDcSet4Byte##, dcb_tprecmax
+ DCHARENT  RECIN   , DECV, , 4 , xostapMsgRecIn##  , knlDcGet4Byte##, knlDcSet4Byte##, dcb_staprecin
+ DCHARENT  RECOUT  , DECV, , 4 , xostapMsgRecOut## , knlDcGet4Byte##, knlDcSet4Byte##, dcb_staprecout
+ DCHARENT  BYTEIN  , DECV, , 4 , knlDcMsgByteIn##  , knlDcGet4Byte##, knlDcSet4Byte##, dcb_stapbytein
+ DCHARENT  BYTEOUT , DECV, , 4 , knlDcMsgByteOut## , knlDcGet4Byte##, knlDcSet4Byte##, dcb_stapbyteout
+ DCHARENT  TDEVERR , DECV, , 4 , knlDcMsgTDevErr## , knlDcGet4Byte##, knlDcSet4Byte##, dcb_staptdeverr
+ DCHARENT  HDEVERR , DECV, , 4 , knlDcMsgHDevErr## , knlDcGet4Byte##, knlDcSet4Byte##, dcb_staphdeverr
+ DCHARENT  TDATAERR, DECV, , 4 , knlDcMsgTDataErr##, knlDcGet4Byte##, knlDcSet4Byte##, dcb_staptdataerr
+ DCHARENT  HDATAERR, DECV, , 4 , knlDcMsgHDataErr##, knlDcGet4Byte##, knlDcSet4Byte##, dcb_staphdataerr
+ DCHARENT  TOVRNERR, DECV, , 4 , knlDcMsgTOvrnErr##, knlDcGet4Byte##, knlDcSet4Byte##, dcb_staptovrnerr
+ DCHARENT  HOVRNERR, DECV, , 4 , knlDcMsgHOvrnErr##, knlDcGet4Byte##, knlDcSet4Byte##, dcb_staphovrnerr
+ DCHARENT  HUNGERR , DECV, , 4 , knlDcMsgHungErr## , knlDcGet4Byte##, knlDcSet4Byte##, dcb_staphungerr
+
+	CODE
+
+msgrecmin:DCHARINFO  {Minimum allowed record length}
+msgrecmax:DCHARINFO  {Maximum allowed record length}
+.PAGE
+	.SBTTL	Initialization
+
+	INITSUB	initstap
+
+initstap::
+	MOVL	EBX, #'STAP'		;Get tape driver name
+	MOVL	EDX, #stapdsp		;Get offset of dispatch table
+	CALL	xostapNewDriver##	;Register this tape driver
+	JC	10$.S
+	MOVL	ECX, #codetop
+	CLRL	EDX
+	CLRL	EAX
+10$:	MOVL	EBX, #QSTS$DONE
+	RET
+.PAGE
+	.SBTTL	stapaddunit - Subroutine to add tape unit
+
+;Subroutine to add tape unit
+;	c{EAX}    = Unit number
+;	c{EBX}    = Offset of KCB for controller (0 if none)
+;	c{ECX}    = Index on controller
+;	c{FS:EDX} = Address of characteristics list
+;	c{GS:ESI} = Address of QAB (needed for fork level)
+;	CALL	stapaddunit
+;	c{EAX} = Error code
+;	c{EBX} = Status bits
+;	c{ECX} = Item count (number of units added)
+
+;Each SCSI tape drive is given its own KCB.  This allows the SCSI driver to
+;  schedule access to multiple tapes to optimize use of the SCSI bus.
+
+	DATA
+
+	.MOD	4
+stapaublk:				;Characteristics description block
+ DCHARBGN  2, 0				;  for addunit
+ DCHARENT  TYPE   , TEXT, , 4, 0, 0, knlRtnZero##, 0
+ DCHARENT  UNIT   , DECV, , 4, 0, 0, knlRtnZero##, 0
+ DCHARENT  INDEX  , DECV, , 4, 0, 0, auindex     , 0
+ DCHARENT  SCSIDEV, TEXT, , 8, 0, 0, audev       , 0
+ DCHARENT  SCSITAR, DECV, , 4, 0, 0, autar       , 0
+ DCHARENT  SCSILUN, DECV, , 4, 0, 0, aulun       , 0
+
+	CODE
+
+$$$=!0
+FRM au_unit  , 4t		;Tape unit number
+FRM au_target, 4t		;SCSI target ID
+FRM au_lun   , 4t
+FRM au_icb   , 4t		;Offset of SCSI ICB
+FRM au_qab   , 8t		;Address of QAB
+au_SIZE=!$$$
+
+stapaddunit:
+	ENTER	au_SIZE, 0
+	MOVL	au_unit.B[EBP], EAX
+	MOVL	au_qab+0.B[EBP], ESI
+	MOVL	au_qab+4.B[EBP], GS
+	CLRL	EAX
+	MOVL	au_lun.B[EBP], EAX
+	DECL	EAX
+	MOVL	au_icb.B[EBP], EAX
+	MOVL	au_target.B[EBP], EAX
+	MOVL	EBX, #stapaublk
+	MOVB	AL, #0
+	CALL	knlAddUnitChar##	;Process characteristics
+	JC	16$			;If error
+	MOVL	EAX, au_icb.B[EBP]	;Did we get the required
+	ORL	EAX, au_target.B[EBP]	;  characteristics?
+	INCL	EAX
+	JE	4$			;No - fail
+	CALL	knlGetXRes##		;Yes
+	MOVB	AL, #0			;Make a KCB
+	MOVL	ECX, #kcb_stapSIZE+kcb_mSIZE
+	MOVL	EBX, #stapdsp
+	MOVL	EDX, #'STAP'
+	CLRL	ESI
+	CALL	xostapMakeKcb##
+	JC	14$
+	PUSHL	EBX
+	MOVL	EAX, au_unit.B[EBP]
+	MOVL	EBX, #'STAP'
+	MOVL	ECX, #dcb_cSIZE+dcb_stapSIZE
+	MOVL	EDX, #stapdchartbl
+	CALL	xostapMakeDcb##
+	POPL	EBX
+	JC	14$
+	CALL	knlGiveXRes##
+	MOVL	EAX, au_icb.B[EBP]	;Store offset of the SCSI ICB
+	MOVL	dcb_stapscsiicb[EDI], EAX
+	MOVL	EAX, icb_dthlimit.B[EAX] ;Store the data transfer hardware limit
+	MOVL	dcb_stapdthlimit.B[EDI], EAX
+	MOVL	EAX, au_target.B[EBP]	;Store target and logical unit numbers
+	MOVB	AH, au_lun.B[EBP]
+	MOVL	dcb_stapscsitar[EDI], EAX
+	CALL	knlGetQelClr##		;Get an IORB
+	JC	10$.S			;fail if can't get one
+	MOVL	iorb_finish.B[ESI], #knlQioFinish##
+	MOVL	iorb_routine.B[ESI], #addunit1
+	MOVB	iorb_queue.B[ESI], #dcb_outframe
+	MOVL	EAX, au_qab+0.B[EBP]
+	MOVL	iorb_qab+0.B[ESI], EAX
+	MOVL	EAX, au_qab+4.B[EBP]
+	MOVW	iorb_qab+4.B[ESI], AX
+	LEAVE
+	CLRL	EAX
+	MOVL	iorb_buffer1+4.B[ESI], EAX
+	MOVL	iorb_buffer2+4.B[ESI], EAX
+	MOVL	iorb_parm+4.B[ESI], EAX
+	JMP	knlXfBegin##		;Start the extended fork
+
+4$:	MOVL	EAX, #ER_CHARM
+	JMP	16$.S
+
+;Here if cannot allocate an IORB - must give up the UCB and KCB we just got
+
+10$:	CRASH	????
+
+;Here if cannot allocate a UCB - must give up the KCB we just got
+
+12$:	CRASH	????
+
+14$:	CALL	knlGiveXRes##
+16$:	LEAVE
+	CLRL	ECX
+	MOVL	EBX, #QSTS$DONE
+	TOFORK
+	RET
+.PAGE
+;Subroutine called by addunitchar for the INDEX characteristic
+
+auindex:CMPL	EAX, #1.B		;Is it 1?
+	JE	4$.S			;Yes - OK
+2$:	MOVL	EAX, #ER_CHARV		;No - fail
+	STC
+4$:	RET
+
+;Subroutine called by addunitchar for the SCSIDEV characteristic
+
+audev:	CALL	xossciDevFind##		;Find the SCSI device
+	JC	2$.S			;If error
+	MOVL	au_icb.B[EBP], ESI	;Store offset of the ICB
+	RET
+
+;Subroutine called by addunitchar for the SCSITAR characteristic
+
+autar:	CMPL	EAX, #7.B		;Valid value?
+	JA	2$.S			;No
+	MOVL	au_target.B[EBP], EAX	;Yes - store value
+	CLC
+	RET
+
+;Subroutine called by addunitchar for the SCSILUN characteristic
+
+aulun:	CMPL	EAX, #7.B		;Valid value?
+	JA	2$.S			;No
+	MOVL	au_lun.B[EBP], EAX	;Yes - store value
+	CLC
+	RET
+.PAGE
+;Extended fork context routine to finish setting up a hard disk unit
+
+$$$=!0
+FRM aux_xcb   , xcb_SIZE
+FRM aux_buffer, 256t		;Data buffer
+aux_SIZE=!$$$
+
+addunit1:
+	ENTER	aux_SIZE, 0
+	MOVL	EDX, dcb_stapscsitar[EDI] ;Get target and logical unit number
+	PUSHL	ESI
+	MOVL	ESI, dcb_stapscsiicb[EDI] ;Get offset of the ICB
+	LEAL	EBX, aux_buffer[EBP]
+	MOVB	AL, #SDT_TAPE
+	CALL	xossciUnitInit##	;Initialize the SCSI unit
+	POPL	ESI
+	JNC	4$.S
+	CLRL	ECX
+	JMP	12$
+
+;Here with the SCSI unit initialized
+
+4$:	MOVL	ECX, #8t
+	LEAL	EDX, aux_buffer+8[EBP]	;Copy vendor and model information
+	LEAL	EBX, dcb_stapmodel[EDI]
+	CALL	xossciCopyInq##
+	MOVB	[EBX], #'-'
+	INCL	EBX
+	MOVB	CL, #16t
+	LEAL	EDX, aux_buffer+16t[EBP]
+	CALL	xossciCopyInq##
+	MOVB	CL, #4t
+	LEAL	EDX, aux_buffer+32t[EBP] ;Copy revision information
+	LEAL	EBX, dcb_staprevision[EDI]
+	CALL	xossciCopyInq##
+	MOVB	CL, #20t
+	LEAL	EDX, aux_buffer+36t[EBP] ;Copy other information
+	LEAL	EBX, dcb_stapserialno[EDI]
+	CALL	xossciCopyInq##
+	MOVL	EAX, dcb_stapscsitar.B[EDI]
+	PUSHL	ESI
+	MOVL	ESI, dcb_stapscsiicb.B[EDI]
+	MOVL	aux_xcb+xcb_target.B[EBP], EAX
+	MOVZBL	EAX, AL
+	MOVL	aux_xcb+xcb_task.B[EBP], EAX
+	LEAL	EAX, aux_buffer[EBP]
+	MOVL	aux_xcb+xcb_buffer+0.B[EBP], EAX
+	MOVW	aux_xcb+xcb_buffer+4.B[EBP], SS
+	MOVL	aux_xcb+xcb_count.B[EBP], #6t
+	MOVL	aux_xcb+xcb_cdb+0.B[EBP], #CMD_READBL ;Set up the CDB to get the
+	CLRL	EAX				      ;  block limits
+	MOVB	aux_xcb+xcb_mode.B[EBP], AL
+	MOVL	aux_xcb+xcb_cdb+4.B[EBP], EAX
+	MOVL	aux_xcb+xcb_cdblen.B[EBP], #6t
+	LEAL	EBX, aux_xcb.B[EBP]	;Note that this will probably fail if
+	CALLI	icb_doio.B[ESI]		;  a tape is not mounted!
+	POPL	ESI
+	JC	10$.S
+	MOVL	EAX, aux_buffer+0[EBP]	;Get maximum record length
+	MOVB	AL, AH
+	MOVB	AH, #0
+	RORL	EAX, #16t
+	XCHGB	AL, AH
+	MOVL	dcb_tprecmax.B[EDI], EAX
+	MOVZWL	EAX, aux_buffer+4[EBP]	;Get minimum record length
+	XCHGB	AL, AH
+	MOVL	dcb_tprecmin.B[EDI], EAX
+10$:	CLRL	ECX
+	INCL	ECX
+	CLRL	EAX
+12$:	MOVL	EBX, #QSTS$DONE
+	LEAVE
+ret002:	RET
+.PAGE
+;Subroutine to get SCSI device name for devchar
+
+stapgetdev:
+	MOVL	EBX, dcb_stapscsiicb[EDI] ;Get offset of our ICB
+	LEAL	EAX, icb_name.B[EBX]	;Get offset of SCSI device name
+	RET
+.PAGE
+	.SBTTL	tf_chkmount - Function to check that tape is mounted
+
+;Here for the check that tape is mounted function
+;	c{EDI}    = Offset of DCB
+;	c{ESI}    = Offset of KCB
+;	CALL	stapchkmount
+;	C:clr = Normal (tape is mounted)
+;	C:set = Error
+;	  c{EAX} = Error code
+;	  c{EBX} = QSTS$DONE
+;	  c{ECX} = 0
+
+$$$=!0
+FRM chk_xcb   , xcb_SIZE
+FRM chk_buffer, 256t
+chk_SIZE=!$$$
+
+stapchkmount:
+	TESTB	dcb_stapstatus.B[EDI], #TS$MOUNTED ;Is the tape mounted now?
+	JNE	ret002.S		;Yes - nothing is needed here
+	ENTER	chk_SIZE, 0
+	MOVL	EAX, dcb_stapscsitar.B[EDI]
+	PUSHL	ESI
+	MOVL	ESI, dcb_stapscsiicb.B[EDI]
+	MOVL	chk_xcb+xcb_target.B[EBP], EAX
+	MOVZBL	EAX, AL
+	MOVL	chk_xcb+xcb_task.B[EBP], EAX
+	LEAL	EAX, chk_buffer[EBP]
+	MOVL	chk_xcb+xcb_buffer+0.B[EBP], EAX
+	MOVW	chk_xcb+xcb_buffer+4.B[EBP], SS
+	MOVL	chk_xcb+xcb_count.B[EBP], #6t
+	MOVL	chk_xcb+xcb_cdb+0.B[EBP], #CMD_READBL ;Set up the CDB to get the
+	CLRL	EAX				      ;  block limits
+	MOVB	chk_xcb+xcb_mode.B[EBP], AL
+	MOVL	chk_xcb+xcb_cdb+4.B[EBP], EAX
+	MOVL	chk_xcb+xcb_cdblen.B[EBP], #6t
+	LEAL	EBX, chk_xcb.B[EBP]	;Note that this will probably fail if
+	CALLI	icb_doio.B[ESI]		;  a tape is not mounted!
+	POPL	ESI
+	JC	10$.S
+	MOVL	EAX, chk_buffer+0[EBP]	;Get maximum record length
+	MOVB	AL, AH
+	MOVB	AH, #0
+	RORL	EAX, #16t
+	XCHGB	AL, AH
+	MOVL	dcb_tprecmax.B[EDI], EAX
+	MOVZWL	EAX, chk_buffer+4[EBP]	;Get minimum record length
+	XCHGB	AL, AH
+	MOVL	dcb_tprecmin.B[EDI], EAX
+	MOVL	EAX, dcb_stapscsitar.B[EDI] ;Get the mode sense page 0 with
+	CLRL	EDX			    ;  buffer descriptor blocks
+	PUSHL	ESI
+	MOVL	ESI, dcb_stapscsiicb.B[EDI]
+	LEAL	EBX, chk_buffer[EBP]
+	CALL	xossciModeSense##
+	POPL	ESI
+	JC	10$.S
+	CMPB	chk_buffer+0[EBP], #11t	;Did we get a buffer descriptor?
+	JB	8$.S			;No - fail!
+	CMPB	chk_buffer+3[EBP], #8t	;Maybe
+	JB	8$.S			;No
+	MOVL	EAX, chk_buffer+8t[EBP]	;Yes - get the record length
+	MOVB	AL, AH
+	MOVB	AH, #0
+	RORL	EAX, #16t
+	XCHGB	AL, AH
+	MOVL	dcb_tpreclen.B[EDI], EAX
+	MOVB	AL, chk_buffer+2[EBP]	;Get write protect, speed, and buffer
+	MOVB	AH, AL
+	ANDB	AH, #0Fh		;Get just speed
+	MOVB	dcb_tpspeed.B[EDI], AH
+	SHRB	AL, #4t
+	ANDB	AL, #07h		;Get just buffer mode
+	MOVB	dcb_tpbfrmode.B[EDI], AL
+	ORB	dcb_stapstatus.B[EDI], #TS$MOUNTED ;Indicate mounted
+	LEAVE				;Finished (C is clear)
+	RET
+
+;Here if error
+
+8$:	MOVL	EAX, #ER_IFDEV
+10$:	LEAVE
+	MOVL	EBX, #QSTS$DONE
+	CLRL	ECX
+	STC
+	RET
+.PAGE
+	.SBTTL	tf_read - Function to read data
+
+;Here for the read data function
+;	c{ES:EBX} = Address of buffer
+;	c{ECX}    = Amount to transfer
+;	c{EDI}    = Offset of DCB
+;	c{ESI}    = Offset of KCB
+;	CALL	stapread
+;	c{EAX} = Error code (0 = no error)
+;	c{ECX} = Amount transfered
+
+stapread:
+	TESTB	dcb_stapstatus.B[EDI], #TS$ATFM
+	JNE	4$.S
+	TESTB	dcb_stapstatus.B[EDI], #TS$ATSM
+	JNE	6$.S
+	MOVB	AH, #0
+	MOVB	AL, #CMD_READ6		;Get read command
+	JMP	stapxfer.S
+
+;Here if currently at end of file
+
+4$:	ANDB	dcb_stapstatus.B[EDI], #~TS$ATFM
+	MOVL	EAX, #ER_EOF
+	CLRL	ECX
+	RET
+
+;Here if currently at end of set
+
+6$:	ANDB	dcb_stapstatus.B[EDI], #~TS$ATSM
+	MOVL	EAX, #ER_EOS
+	CLRL	ECX
+	RET
+
+	.SBTTL	tf_write - Function to write data
+
+;Here for the write data function
+;	c{ES:EBX} = Address of buffer
+;	c{ECX}    = Amount to transfer
+;	c{EDI}    = Offset of DCB
+;	c{ESI}    = Offset of KCB
+;	CALL	stapwrite
+;	c{EAX} = Error code (0 = no error)
+;	c{ECX} = Amount transfered
+
+stapwrite:
+	MOVB	AH, #MODE$OUTPUT	;Get mode bits
+	MOVB	AL, #CMD_WRITE6		;Get write command
+	JMP	stapxfer
+.PAGE
+$$$=!0
+FRM xfr_xcb, xcb_SIZE
+xfr_SIZE=!$$$
+
+stapxfer:
+	ENTER	xfr_SIZE, 0
+	MOVB	xfr_xcb+xcb_mode.B[EBP], AH ;Store mode value
+	MOVB	xfr_xcb+xcb_cdb+0.B[EBP], AL ;Store command
+	CMPL	dcb_tpreclen.B[EDI], #0.B ;Make sure the record length is not 0
+	JE	4$.S
+	MOVL	EAX, ECX		;Get number of records to transfer
+	CLRL	EDX
+	DIVL	dcb_tpreclen.B[EDI]
+	TESTL	EDX, EDX		;Is it even?
+	JNE	4$.S			;No - fail!
+	XCHGB	AL, AH			;Yes - fix up the byte order
+	RORL	EAX, #16t
+	MOVB	AH, AL
+	MOVB	AL, #01h		;Indicate fixed length records
+	MOVL	xfr_xcb+xcb_cdb+1.B[EBP], EAX
+	MOVB	xfr_xcb+xcb_cdb+5.B[EBP], #0
+xfer2:	MOVL	xfr_xcb+xcb_buffer+0.B[EBP], EBX ;Store buffer address
+	MOVL	xfr_xcb+xcb_buffer+4.B[EBP], ES
+	MOVL	xfr_xcb+xcb_count.B[EBP], ECX ;Store amount to transfer
+	MOVL	EAX, dcb_stapscsitar.B[EDI] ;Get target and LUN
+	MOVL	xfr_xcb+xcb_target.B[EBP], EAX
+	MOVZBL	EAX, AL
+	MOVL	xfr_xcb+xcb_task.B[EBP], EAX ;Store interface task number
+	MOVL	xfr_xcb+xcb_cdblen.B[EBP], #6t ;Store CDB length
+	LEAL	EBX, xfr_xcb.B[EBP]
+	PUSHL	ESI
+	MOVL	ESI, dcb_stapscsiicb.B[EDI]
+	CALLI	icb_doio.B[ESI]		;Call SCSI driver to do the IO
+	POPL	ESI
+	JC	6$.S			;If error
+	LEAVE
+	RET
+
+;Here if have illegal transfer length
+
+4$:	LEAVE
+	MOVL	EAX, #ER_ICDEV
+	CLRL	ECX
+	STC
+	RET
+
+;Here if error
+
+$$$$err::
+6$:	CMPL	EDX, #-1.B		;Have a residue value?
+	JE	8$.S			;No - report 0 bytes transfered
+	IMULL	EDX, dcb_tpreclen.B[EDI] ;Yes - convert to bytes
+	SUBL	ECX, EDX		;Calculate amount transfered
+	JNS	10$.S
+8$:	CLRL	ECX
+10$:	CMPL	EAX, #ER_EOF
+	JE	14$.S
+	CMPL	EAX, #ER_EOS
+	JE	16$.S
+12$:	LEAVE
+	STC
+	RET
+
+;Here if have end of file reported - this means we hit a filemark
+
+14$:	JREGZ	ECX, 12$		;Return the error if nothing read
+	ORB	dcb_stapstatus.B[EDI], #TS$ATFM
+	JMP	18$.S
+
+;Here if have end of set reproted - this means we hit a setmark
+
+16$:	JREGZ	ECX, 12$
+	ORB	dcb_stapstatus.B[EDI], #TS$ATSM
+18$:	LEAVE
+	CLRL	EAX
+	RET
+.PAGE
+	.SBTTL	tf_format - Format tape
+
+;Here for the tf_format function - format tape
+;	c{EDI} = Offset of DCB
+;	c{ESI} = Offset of KCB
+;	CALL	stapformat
+;	c{EAX} = Error code (0 = no error)
+;	c{ECX} = 0
+
+stapformat:
+	ANDB	dcb_stapstatus.B[EDI], #~{TS$ATFM|TS$ATSM}
+	MOVL	EAX, #ER_NIYT
+	CLRL	ECX
+	STC
+	RET
+
+	.SBTTL	tf_reten - Retension tape
+
+;Here for the tf_reten function - retension tape
+;	c{EDI} = Offset of DCB
+;	c{ESI} = Offset of KCB
+;	CALL	stapwritefm
+;	c{EAX} = Error code (0 = no error)
+;	c{ECX} = 0
+
+stapreten:
+	ANDB	dcb_stapstatus.B[EDI], #~{TS$ATFM|TS$ATSM}
+	ENTER	xfr_SIZE, 0
+	MOVL	xfr_xcb+xcb_cdb+0.B[EBP], #CMD_LOAD
+	MOVL	xfr_xcb+xcb_cdb+4.B[EBP], #03h
+	JMP	xfer2
+
+	.SBTTL	tf_writefm - Write filemarks
+
+;Here for the tf_writefm function - write filemarks
+;	c{ECX} = Number of filemarks to write
+;	c{EDI} = Offset of DCB
+;	c{ESI} = Offset of KCB
+;	CALL	stapwritefm
+;	c{EAX} = Error code (0 = no error)
+;	c{ECX} = Number of filemarks written
+
+stapwritefm:
+	CALL	writechk
+	JC	6$.S
+	MOVB	AL, #00h
+	JMP	2$.S
+
+	.SBTTL	tf_writesm - Write setmarks
+
+;Here for the tf_writesm function - write setmarks
+;	c{ECX} = Number of setmarks to write
+;	c{EDI} = Offset of DCB
+;	c{ESI} = Offset of KCB
+;	CALL	stapwritesm
+;	c{EAX} = Error code (0 = no error)
+;	c{ECX} = Number of setmarks written
+
+stapwritesm:
+	CALL	writechk
+	JC	6$.S
+	MOVB	AL, #02h
+2$:	ENTER	xfr_SIZE, 0
+	MOVB	xfr_xcb+xcb_cdb+0.B[EBP], #CMD_WRITEFM
+	JMP	12$.S
+
+	.SBTTL	tf_lock - Lock/unlock tape mounting
+
+;Here for the tf_lock function - lock/unlock tape mounting
+;	c{ECX} = 0 to unlock mounting, 1 to lock mounting
+;	c{EDI} = Offset of DCB
+;	c{ESI} = Offset of KCB
+;	CALL	staplock
+;	c{EAX} = Error code (0 = no error)
+;	c{ECX} = 0
+
+staplock:
+	CMPL	ECX, #1.B
+	JA	4$.S
+	ENTER	xfr_SIZE, 0
+	MOVL	xfr_xcb+xcb_cdb+0.B[EBP], #CMD_PREVENT
+	MOVL	xfr_xcb+xcb_cdb+4.B[EBP], ECX
+	JMP	xfer2
+
+4$:	MOVL	EAX, #ER_IFDEV
+	CLRL	ECX
+6$:	RET
+
+	.SBTTL	tf_erasegap - Erase gap
+
+;Here for the tf_erasegap function - erase gap
+;	c{EDI} = Offset of DCB
+;	c{ESI} = Offset of KCB
+;	CALL	staperasegap
+;	c{EAX} = Error code (0 = no error)
+;	c{ECX} = 0
+
+staperasegap::
+	CALL	writechk
+	JC	6$.S
+	MOVL	EAX, #CMD_ERASE
+	JMP	10$.S
+
+	.SBTTL	tf_eraseall - Erase entire tape
+
+;Here for the tf_eraseall function - erase entire tape
+;	c{EDI} = Offset of DCB
+;	c{ESI} = Offset of KCB
+;	CALL	staperaseall
+;	c{EAX} = Error code (0 = no error)
+;	c{ECX} = 0
+
+staperaseall::
+	MOVL	EAX, #CMD_ERASE+100h
+	JMP	8$.S
+
+	.SBTTL	tf_unload - Unload tape
+
+;Here for the tf_unload function - unload tape
+;	c{EDI} = Offset of DCB
+;	c{ESI} = Offset of KCB
+;	CALL	stapunload
+;	c{EAX} = Error code (0 = no error)
+;	c{ECX} = 0
+
+stapunload::
+	MOVL	EAX, #CMD_LOAD
+	JMP	8$.S
+
+	.SBTTL	tf_rewind - Rewind tape
+
+;Here for the tf_rewind function - rewind tape
+;	c{EDI} = Offset of DCB
+;	c{ESI} = Offset of KCB
+;	CALL	staprewind
+;	c{EAX} = Error code (0 = no error)
+;	c{ECX} = 0
+
+staprewind::
+	MOVL	EAX, #CMD_REWIND
+8$:	ANDB	dcb_stapstatus.B[EDI], #~{TS$ATFM|TS$ATSM}
+10$:	ENTER	xfr_SIZE, 0
+	MOVL	xfr_xcb+xcb_cdb+0.B[EBP], EAX
+	CLRL	ECX
+	MOVL	xfr_xcb+xcb_cdb+4.B[EBP], ECX
+	JMP	xfer2
+
+	.SBTTL	tf_skprec - Skip records
+
+;Here for the tf_skprec function - skip records
+;	c{ECX} = Number of records to skip
+;	c{EDI} = Offset of DCB
+;	c{ESI} = Offset of KCB
+;	CALL	stapskprec
+;	c{EAX} = Error code (0 = no error)
+;	c{ECX} = Number of records skipped
+
+stapskprec::
+	CALL	writechk
+	JC	6$.S
+	MOVB	AL, #00h
+skip:	ENTER	xfr_SIZE, 0
+	MOVB	xfr_xcb+xcb_cdb+0.B[EBP], #CMD_SPACE
+12$:	MOVL	EDX, ECX		;Is the count too big?
+	ANDL	EDX, #0FF800000h
+	JE	13$.S			;No
+	CMPL	EDX, #0FF800000h	;Maybe
+	JNE	14$.S			;Yes - fail
+13$:	XCHGB	CL, CH			;No - fix up the byte order
+	RORL	ECX, #16t
+	MOVB	CH, CL
+	MOVB	CL, AL
+	MOVL	xfr_xcb+xcb_cdb+1.B[EBP], ECX
+	MOVB	xfr_xcb+xcb_cdb+5.B[EBP], #0
+	CLRL	ECX
+	JMP	xfer2
+
+;Here if count is too large
+
+14$:	MOVL	EAX, #ER_ICDEV
+	CLRL	ECX
+	LEAVE
+	RET
+
+	.SBTTL	tf_skpfile - Skip filemarks
+
+;Here for the tf_skpfile function - skip filemarks
+;	c{ECX} = Number of filemarks to skip
+;	c{EDI} = Offset of DCB
+;	c{ESI} = Offset of KCB
+;	CALL	stapskpfile
+;	c{EAX} = Error code (0 = no error)
+;	c{ECX} = Number of filemarks skipped
+
+stapskpfile::
+	TESTB	dcb_stapstatus.B[EDI], #TS$ATFM
+	JE	16$.S
+	ANDB	dcb_stapstatus.B[EDI], #~TS$ATFM
+	DECL	ECX
+16$:	CALL	writechk
+18$:	JC	6$
+	MOVB	AL, #01h
+	JMP	skip.S
+
+	.SBTTL	tf_confile - Skip to consective filemarks
+
+;Here for the tf_confile function - skip to consective filemarks
+;	c{ECX} = Number of consective filemarks to skip to
+;	c{EDI} = Offset of DCB
+;	c{ESI} = Offset of KCB
+;	CALL	stapconfile
+;	c{EAX} = Error code (0 = no error)
+;	c{ECX} = 0
+
+stapconfile::
+	CALL	writechk
+	JC	18$.S
+	MOVB	AL, #02h
+	JMP	skip.S
+
+	.SBTTL	tf_skpset - Skip setmarks
+
+;Here for the tf_skpset function - skip setmarks
+;	c{ECX} = Number of setmarks to skip
+;	c{EDI} = Offset of DCB
+;	c{ESI} = Offset of KCB
+;	CALL	stapskpset
+;	c{EAX} = Error code (0 = no error)
+;	c{ECX} = Number of setmarks skipped
+
+stapskpset::
+	TESTB	dcb_stapstatus.B[EDI], #TS$ATSM
+	JE	20$.S
+	DECL	ECX
+20$:	ANDB	dcb_stapstatus.B[EDI], #~{TS$ATFM|TS$ATSM}
+	MOVB	AL, #04h
+	JMP	skip.S
+
+	.SBTTL	tf_conset - Skip to consective setmarks
+
+;Here for the tf_conset function - skip to consective setmarks
+;	c{ECX} = Number of consective setmarks to skip to
+;	c{EDI} = Offset of DCB
+;	c{ESI} = Offset of KCB
+;	CALL	stapconset
+;	c{EAX} = Error code (0 = no error)
+;	c{ECX} = 0
+
+stapconset::
+	CALL	writechk
+	JC	18$.S
+	MOVB	AL, #05h
+	JMP	skip.S
+
+	.SBTTL	tf_skp2eod - Skip to end-of-data
+
+;Here for the tf_skp2eod function - skip to end-of-data
+;	c{EDI} = Offset of DCB
+;	c{ESI} = Offset of KCB
+;	CALL	stapskp2eod
+;	c{EAX} = Error code (0 = no error)
+;	c{ECX} = 0
+
+stapskp2eod::
+	CALL	writechk
+	JC	18$.S
+	MOVB	AL, #03h
+	JMP	skip
+.PAGE
+	.SBTTL	writechk - Subroutine to check tape position before write
+
+;Subroutine to check tape position before write
+;	CALL	writechk
+;	C:set = Error
+;	  c{EAX} = Error code
+;	  c{ECX} = 0
+;	C:clr = Normal
+
+writechk:
+	TESTB	dcb_stapstatus.B[EDI], #TS$ATFM|TS$ATSM
+					;Have we passed a tapemark or setmark?
+	JE	6$.S			;No - nothing needed here
+	PUSHL	ECX
+	PUSHL	ES
+	PUSHL	EBX
+	MOVB	AL, #01h		;Assume filemark
+	TESTB	dcb_stapstatus.B[EDI], #TS$ATFM ;Right?
+	JNE	4$.S			;Yes
+	MOVB	AL, #04h		;No - setmark
+4$:	ANDB	dcb_stapstatus.B[EDI], #~{TS$ATFM|TS$ATSM}
+	MOVL	ECX, #-1
+	CALL	skip
+	POPL	EBX
+	POPL	ES
+	POPL	ECX
+	JC	8$.S
+6$:	RET
+
+;Here if error
+
+8$:	CLRL	ECX
+	STC
+	RET
+.PAGE
+	.SBTTL	Data
+
+	DATA
+
+	.MOD	4
+stapkcb:.LONG	0		;Offset of first SCSI tape KCB
+
+	LKEEND

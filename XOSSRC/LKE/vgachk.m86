@@ -1,0 +1,180 @@
+	.TITLE	VGACHK - Transient LKE to determine VGA type
+
+;*--------------------------------------------------------------------------*
+;* VGACHK.M86
+;*
+;* Written by: John R. Goltz
+;*
+;* Edit History:
+;* 1.0.0  18-Nov-99 JRG - Original version
+;*
+;*--------------------------------------------------------------------------*
+
+;++++
+; This software is in the public domain.  It may be freely copied and used
+; for whatever purpose you see fit, including commerical uses.  Anyone
+; modifying this software may claim ownership of the modifications, but not
+; the complete derived code.  It would be appreciated if the authors were
+; told what this software is being used for, but this is not a requirement.
+
+;   THIS SOFTWARE IS PROVIDED BY THE AUTHORS "AS IS" AND ANY EXPRESS OR
+;   IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
+;   OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+;   IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+;   INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+;   BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS
+;   OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+;   ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR
+;   TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
+;   USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+;----
+
+	.PROC	80486
+	.INCLUD	XOSINC:\XMAC\XOS.PAR
+	.INCLUD	XOSINC:\XMAC\XOSX.PAR
+	.INCLUD	XOSINC:\XMAC\XOSERR.PAR
+	.INCLUD	XOSINC:\XMAC\XOSTIME.PAR
+	.INCLUD	XOSINC:\XMAC\XOSLKE.PAR
+	.INCLUD	XOSINC:\XMAC\XOSXLKE.PAR
+
+MAJV   =!1t
+MINV   =!0t
+EDITNUM=!0t
+
+;This LKE is used to determine the type of the console VGA display adapter.
+;  When it is loaded, a pointer (VALUE) to an array of longs must be supplied.
+;  This array must contain at least 2 longs.  The type of the VGA (color or
+;  mono) is stored in the first long.  A value of 1 indicates mono and a value
+;  of 2 indicates color.  The PCI ID of the adapter is stored in the second
+;  long.  If it is not a PCI device, a value of 0 is stored.  If there is
+;  more than one display adapter in the system, additional pairs of longs are
+;  stored for each adapter if there is space in the string.  Note that if both
+;  ISA and PCI adapters are present, the ISA adapter will NOT be reported!
+;  Multiple PCI adapters or a AGP adapter and one or more PCI adapters will
+;  all be reported.
+
+	LKEHEAD	VGACHK, MAJV, MINV, EDITNUM, LKETYPE_TRANS
+
+	.SBTTL	Initialization routine
+
+	INITSUB	vgachkinit
+
+vgachkinitblk:					;Characteristics description
+ DCHARBGN  2, knlDCharValCom##			;  block for initialization
+ DCHARENT  VALUE, STR, , 0, 0, valpnt, 0, 0
+DATASIZE=$-vgachkinitblk
+
+XMBINDEX DATAINDEX, DATASIZE
+
+;Initialization subroutine (since this is an init-only LKE, the initialization
+;  subroutine contains all the executable code in the LKE)
+;	c{FS:EDX] = Address of characteristics list
+;	CALL	vgachkinit
+;	C:set = Error code
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  c{ECX} = Offset of first code byte to not save
+;	  c{EDX} = Offset of first data byte to not save
+
+$$$=!0
+FRM vc_data, 4t
+FRM vc_dpnt, 4t
+FRM vc_cpnt, 4t
+FRM vc_dcnt, 4t
+FRM vc_type, 4t
+vc_SIZE=!$$$
+
+addmeminit::
+	ENTER	vc_SIZE, 0
+
+	INT3
+
+	TESTL	EDX, EDX		;Have a characteristics list?
+	JE	2$.S			;No - fail
+	CLRL	EAX			;Yes
+	MOVL	vc_pntr+0.B[EBP], EAX
+	MOVL	ECX, #DATAINDEX
+	CALL	knlGetXmb##
+	JC	4$.S
+	MOVL	vc_data.B[EBP], ESI
+	MOVL	EBX, ESI
+	CLD
+	MOVL	EDI, ESI
+	PUSHL	DS
+	POPL	ES
+	MOVL	ESI, #addmeminitblk
+	MOVL	ECX, #{DATASIZE+3}/4
+	RMOVSL	[EDI], CS:[ESI]
+	CALL	knlAddUnitChar##	;Process the characteristics
+	JC	error.S			;If error
+	CMPL	vc_pntr.B[EBP], #0.B	;Did he give us a data pointer?
+	JNE	8$.S			;Yes
+2$:	MOVL	EAX, #ER_CHARM		;No - fail
+error:	MOVL	ESI, vc_data.B[EBP]
+	MOVL	ECX, #DATAINDEX
+	CALL	knlGiveXmb##
+4$:	STC
+6$:	LEAVE
+	RET
+
+;Here if the have a data pointer
+
+
+8$:	MOVL	ESI, vc_data.B[EBP]
+	MOVL	ECX, #DATAINDEX
+	CALL	knlGiveXmb##
+	IFFAULT	knlRtnAdrErLv##
+	LESL	EDI, vc_cpnt.B[EBP]
+	CLRL	EAX
+	IFFAULT	knlRtnAdrErLv##
+	MOVW	ES:[EDI], AX
+	IFFAULT	knlRtnAdrErLv##		;Store the first entry in case
+	LESL	EDI, vc_dpnt.B[EBP]	;  we don't find any PCI devices
+	IFFAULT	knlRtnAdrErLv##
+	MOVL	ES:4.B[EDI], #0
+	TESTB	knlDispType##, #DISP$COLOR ;Color adapter?
+	JE	9$.S			;No
+	INCL	EAX			;Yes
+9$:	INCL	EAX
+	MOVL	vc_type.B[EBP], EAX
+	IFFAULT	knlRtnAdrErLv##
+	MOVL	ES:[EDI], EAX
+	MOVB	BH, #0			;Find all display devices
+10$:	MOVB	CL, #03h
+	CALLI	knxPciFindType##
+	JC	12$.S			;If no more there
+	IFFAULT	knlRtnAdrErLv##
+	LESL	EDI, vc_dpnt.B[EBP]
+	IFFAULT	knlRtnAdrErLv##
+	MOVL	ES:4.B[EDI], EAX
+	MOVL	EAX, vc_type.B[EBP]
+	IFFAULT	knlRtnAdrErLv##
+	MOVL	ES:4.B[EDI], EAX
+	MOVB	vc_type.B[EBP], #2	;Say all additional adapters are color!
+	ADDL	vc_dpnt.B[EBP], #8t.B
+	INCB	BH
+	IFFAULT	knlRtnAdrErLv##
+8$:	LESL	EDI, vc_cpnt.B[EBP]
+	IFFAULT	knlRtnAdrErLv##
+	ADDW	ES:[EDI], #8t.B
+	DECL	vc_dcnt.B[EBP]
+	JNE	10$.S
+12$:	CLRL	EDX
+	MOVL	ECX, #codebeginDISKCHECK
+	LEAVE
+	RET
+.PAGE
+valstr:	SHRL	ECX, #3
+	JE	knlBadCharS##
+	MOVL	vc_dcnt.B[EBP], ECX
+	MOVL	vc_pntr+0.B[EBP], EBX
+	MOVL	vc_pntr+4.B[EBP], ES
+	MOVL	vc_cpnt+0.B[EBP], EAX
+	MOVL	vc_cpnt+4.B[EBP], FS
+	CLC
+	RET
+.PAGE
+	.MOD	4
+lit10:	.LONG	10t
+
+	LKEEND

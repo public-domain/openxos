@@ -1,0 +1,481 @@
+	.TITLE	NETSPY - Simple network monitor
+
+;++++
+; This software is in the public domain.  It may be freely copied and used
+; for whatever purpose you see fit, including commerical uses.  Anyone
+; modifying this software may claim ownership of the modifications, but not
+; the complete derived code.  It would be appreciated if the authors were
+; told what this software is being used for, but this is not a requirement.
+
+;   THIS SOFTWARE IS PROVIDED BY THE AUTHORS "AS IS" AND ANY EXPRESS OR
+;   IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
+;   OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+;   IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+;   INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+;   BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS
+;   OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+;   ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR
+;   TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
+;   USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+;----
+
+	.PROC	80386
+	.INCLUD	XOSINC:\XMAC\XOS.PAR
+	.INCLUD	XOSINC:\XMAC\XOSX.PAR
+	.INCLUD	XOSINC:\XMAC\XOSERR.PAR
+	.INCLUD	XOSINC:\XMAC\XOSTIME.PAR
+	.INCLUD	XOSINC:\XMAC\XOSNET.PAR
+	.INCLUD	XOSINC:\XMAC\XOSXNET.PAR
+	.INCLUD XOSINC:\XMAC\XOSTRM.PAR
+	.INCLUD	XOSINC:\XMAC\XOSDDSP.PAR
+	.INCLUD XOSINC:\XMAC\PROCARG.PAR
+	.INCLUD	XOSINC:\XMAC\STDC.PAR
+	.INCLUD	XOSINC:\XMAC\CTYPE.PAR
+
+	.STDSEGS
+
+scrnbase =!100000h	;Base offset for mapped screen memory
+nbufbase =!180000h	;Base offset for network buffers
+dbufbase =!280000h	;Base offset for data buffer
+NBUFNUM  =!10t		;Default number of network buffers
+NBUFSIZE =!1600t	;Default size of each network buffer
+DBUFSIZE =!200000h	;Default size of the data buffer
+
+IV_NETIN =!24t		;Network input ready software interrupt
+IV_TRM   =!26t		;TRM input ready software interrupt
+
+ATR_SBGND=!30h		;Screen attribute for set up screen background
+
+;Define offsets in each network buffer
+
+$$$=!0
+BLK nb_next , 4t	;Offset of next network buffer
+BLK nb_state, 1t	;Buffer state
+BLK         , 3t
+BLK nb_qab  , qab_SIZE	;QAB
+BLK nb_data , 0t
+
+;Define values for nb_state
+
+NBS_AVAIL=!0t		;Buffer is available
+NBS_FULL =!1t		;Buffer is full
+
+	.PSECT	_odata_p
+
+argmsect:.LONG	0
+argpntr: .LONG  0, 0
+
+onhelp1: .ASCIZ "?"
+onhelp2: .ASCIZ "H"
+onhelp3: .ASCIZ "HEL"
+onhelp4: .ASCIZ "HELP"
+
+options:.LONG	onhelp1 , 0        , 0, opthelp , 0
+	.LONG	onhelp2 , 0        , 0, opthelp , 0
+	.LONG	onhelp3 , 0        , 0, opthelp , 0
+	.LONG	onhelp4 , 0        , 0, opthelp , 0
+	.LONG	0
+
+	.SBTTL	Start of program
+
+	.PSECT	_ocode_p
+
+mainalt::
+	PUSHL	DS
+	POPL	ES
+	MOVL	ESI, 4.B[ESP]		;Get offset of argument msect
+	MOVL	argmsect, ESI
+	ADDL	ESI, 8.B[ESI]		;Point to command tail
+	CLRL	EAX
+	CLD
+2$:	LODSB	[ESI]			;Skip any leading whitespace
+	CMPB	AL, #0
+	JE	6$.S
+	TESTB	_chrtbl#[EAX], #CT$SPACE
+	JNE	2$.S
+4$:	LODSB	[ESI]			;Skip first atom
+	CMPB	AL, #0
+	JE	6$.S
+	TESTB	_chrtbl#[EAX], #CT$SPACE
+	JE	4$.S
+	MOVL	argpntr, ESI		;Store argument offset for procarg
+	PUSHL	#0.B			;No default extension for indirect file
+	PUSHL	#0.B			;No next line function
+	PUSHL	#0.B			;Error function
+	PUSHL	#havename		;Function called for non-keyword args
+	PUSHL	#0.B			;Offset of keyword table
+	PUSHL	#options		;Offset of option table
+	PUSHL	#PAF$INDIRECT|PAF$EATQUOTE ;Flag bits
+	PUSHL	#argpntr		;Offset of arg string pointer
+	CALL	procarg#		;Process arguments
+	ADDL	ESP, #32t.B
+	PUSHL	DS			;Give up the argument data
+	PUSHL	argmsect
+	PUSHL	#0.B
+	PUSHL	#0.B
+	CALLF	svcMemChange#
+
+;Here with all command line processing done
+
+6$:	MOVL	EBX, #notodomsg		;Was a host specified?
+	CMPB	devname, #0
+	JE	failner.S		;No - fail
+	PUSHL	#O$PHYS			;Yes - check the device to make sure it
+	PUSHL	DS			;  is a NET device
+	PUSHL	#devname
+	PUSHL	DS
+	PUSHL	#devpparms
+	CALLF	svcIoDevParm#
+	TESTL	EAX, EAX
+	JNS	24$.S
+22$:	MOVL	EBX, #neterrmsg
+	JMP	fail.S
+
+24$:	CMPL	devclass+0, #'NET'	;Is this really a NET device?
+	JE	havedev.S		;Yes
+26$:	MOVL	EBX, #notnetmsg		;No
+failner:CLRL	EAX
+fail:	PUSHL	EAX
+	PUSHL	EBX
+	MOVL	EBX, #fmsg1
+	CALL	outstr
+	POPL	EBX
+	CALL	outstr	
+	POPL	ECX			;Restore error code
+	JREGZ	ECX, 30$
+	PUSHL	trmhndl
+	PUSHL	DS
+	MOVL	EBX, #fmsg2
+	CALL	outstr
+	PUSHL	ECX
+	PUSHL	#3.B
+	PUSHL	DS
+	MOVL	EBX, #devname
+	PUSHL	EBX
+	CALLF	svcSysErrMsg#
+done:	CALL	outstr
+30$:	CALL	outcrlf
+	PUSHL	#0.B
+	CALLF	svcSchExit#
+.PAGE
+;Here when have a NET device to use
+
+havedev::
+	PUSHL	#IV_TRM.B		;Set the terminal input ready vector
+	PUSHL	#84h
+	PUSHL	CS
+	PUSHL	#trmready
+	CALLF	svc_schsetsivect#
+	TESTL	EAX, EAX
+	JS	6$.S
+;;;;;;	PUSHL	#IV_NETIN.B		;Set the NET input ready vector
+;;;;;;	PUSHL	#84h
+;;;;;;	PUSHL	CS
+;;;;;;	PUSHL	#netready
+;;;;;;	CALLF	svc_schsetsivect#
+	TESTL	EAX, EAX
+	JNS	10$.S
+6$:	MOVL	EBX, #sivfmsg
+	JMP	failner
+
+10$:	PUSHL	#O$IN|O$OUT|O$PARTIAL	;Now open the NET device
+	PUSHL	DS
+	PUSHL	#devname
+	PUSHL	DS
+	PUSHL	#openparms
+	CALLF	svcIoOpen#
+	TESTL	EAX, EAX
+	JNS	devopen.S
+12$:	MOVL	EBX, #neterrmsg
+	JMP	fail
+
+devopen::
+;;;;;;	MOVL	tcpiqab+qab_handle, EAX	;Store the handle
+	PUSHL	trmhndl
+	PUSHL	#0.B
+	PUSHL	#0.B
+	PUSHL	#0.B
+	PUSHL	DS
+	PUSHL	#trminpparms
+	CALLF	svcIoInBlockp#
+	MOVL	EBX, #trminpper
+	TESTL	EAX, EAX
+	JS	fail
+	PUSHL	trmhndl
+	PUSHL	#0.B
+	PUSHL	#0.B
+	PUSHL	#0.B
+	PUSHL	DS
+	PUSHL	#trmoutparms
+	CALLF	svcIoOutBlockp#
+	MOVL	EBX, #trmoutper
+	TESTL	EAX, EAX
+14$:	JS	fail
+	PUSHL	trmhndl			;Map the terminal screen
+	PUSHL	DS
+	PUSHL	#scrnbase
+	PUSHL	#10000h
+	PUSHL	#0.B
+	CALLF	svcTrmMapScrn#
+	MOVL	EBX, #trmmaper
+	TESTL	EAX, EAX		;Did it work?
+	JS	14$.S			;No - fail
+	MOVL	scrnsize, EAX		;Yes - store actual buffer size
+	ADDL	EAX, #scrnbase		;And store top offset
+
+	
+	MOVL	EAX, nbufsize		;Calculate amount of memory needed
+	ADDL	EAX, #nb_data.B
+	IMULL	EAX, nbufnum
+	PUSHL	DS
+	PUSHL	#nbufbase		;Allocate memory for network buffers
+	PUSHL	#PG$READ|PG$WRITE.B
+	PUSHL	EAX
+	CALLF	svcMemChange#
+	MOVL	EBX, #nbufmer
+	TESTL	EAX, EAX
+	JS	fail
+	PUSHL	DS			;Allocate memory for the data
+	PUSHL	#dbufbase		;  buffer
+	PUSHL	#PG$READ|PG$WRITE.B
+	PUSHL	dbufsize
+	CALLF	svcMemChange#
+	MOVL	EBX, #dbufmer
+	TESTL	EAX, EAX
+	JS	fail
+
+	MOVL	ECX, nbufnum		;Set up the network buffers
+	MOVL	EAX, nbufsize
+	MOVL	EDI, #nbufbase
+	MOVL	nbuftak, EDI
+20$:	LEAL	EDX, nb_data.B[EDI]	;Point to next buffer
+	ADDL	EDX, nbufsize
+	MOVL	[EDI], EDX		;Store pointer to next buffer
+	MOVW	nb_qab+qab_func.B[EDI], #QFNC_INBLOCK
+	MOVL	nb_qab+qab_count.B[EDI], EAX
+	LEAL	ESI, nb_data.B[EDI]
+	MOVL	nb_qab+qab_buffer1+0.B[EDI], ESI
+	MOVL	nb_qab+qab_buffer1+4.B[EDI], DS
+	DECL	ECX
+	JE	22$.S
+	MOVL	EDI, EDX
+	JMP	20$.S
+
+;Here with all buffers set up
+
+22$:	MOVL	[EDI], #nbufbase	;Close the ring
+	JMP	ready
+.PAGE
+;Function called for command line argument
+
+havename:
+	MOVL	EBX, #tomnymsg
+	CMPB	devname, #0		;Already have a device?
+	JNE	failner			;Yes - fail
+	PUSHL	ESI			;No
+	MOVL	ESI, 8.B[ESP]		;Get offset of argument string
+	PUSHL	DS
+	POPL	ES
+	CLD
+	MOVL	EDI, #devname		;Copy the name
+4$:	LODSB	[ESI]
+	STOSB	[EDI]
+	TESTB	AL, AL
+	JNE	4$.S
+	POPL	ESI
+	CLRL	EAX
+	INCL	EAX
+ret004:	RET
+.PAGE
+;Function called for the HELP option
+
+opthelp:MOVL	EBX, #helpmsg
+	CALL	outstr
+	PUSHL	#0.B
+	CALLF	svcSchExit#
+.PAGE
+	.SBTTL	Main program loop
+
+	.PSECT	_code_p
+
+;Here with all initialization complete
+
+ready::
+;	CALLF	svcMemChange#		;Give up the once-only code
+	PUSHL	#0.B			;Set software interrupt level to 0
+	CALLF	svc_schsetsilvl#	;  to allow interrupts
+
+;Here to do set up
+
+dosetup::
+	MOVL	EDI, #scrnbase		;Clear the screen to the background
+	MOVL	ECX, scrnsize		;  color
+	SHRL	ECX, #2
+	MOVL	scrntop, EAX
+	MOVL	EAX, #{{{ATR_SBGND<8}+' '}<16t}+{ATR_SBGND<8}+' '
+	CLD
+	RSTOSL	[EDI]
+
+;Here to start monitoring
+
+domonitor:
+	MOVL	EDI, #nbufbase		;Initialize the network buffers and
+	MOVL	ECX, nbufnum		;  start input
+	MOVB	DL, #IV_NETIN
+4$:	MOVB	nb_qab+qab_vector.B[EDI], DL
+	LEAL	EAX, nb_qab.B[EDI]
+	PUSHL	DS
+	PUSHL	EAX
+	CALLF	svcIoQueue#
+	MOVL	EBX, #nioer
+	TESTL	EAX, EAX
+	JS	error
+	MOVB	DL, #0
+	LOOP	ECX, 4$
+40$:	PUSHL	#0.B			;Wait for interrupt
+	PUSHL	#0.B
+	PUSHL	#-1.B
+	CALLF	svcSchSuspend#
+	JMP	40$.S
+.PAGE
+;Terminal input ready software interrupt routine
+
+trmready::
+	PUSHAL
+	CALL	trmsrv
+	POPAL
+	CALLF	svcSchDismiss#
+
+2$:	RET
+
+;Subroutine to process terminal input - this is a called as a subroutine from
+;  the terminal input ready interrupt service routine so that it can also be
+;  called from the NET input ready interrupt service routine so that continuous
+;  NET input will not block terminal input
+
+trmsrv:	TESTB	trmqab+qab_status+1, #QSTS$DONE>8t ;Really have input now?
+	JE	2$.S			;No - false alarm!
+
+	RET
+.PAGE
+;Subroutine to output CR-LF to the terminal
+;	CALL	outcrlf
+
+outcrlf:MOVL	EBX, #crlfmsg
+
+;Subroutine to output string to the terminal
+;	c{EBX} = String
+;	CALL	outstr
+
+outstr:	PUSHL	trmhndl
+	PUSHL	DS
+	PUSHL	EBX
+	PUSHL	#0.B
+	CALLF	svcIoOutString#
+	RET
+.PAGE
+	.SBTTL	Data
+
+	.PSECT	_data_p
+
+	  .MOD   4
+devname:  .BLKB  128t		;Device name specified
+
+prgname:: .ASCIZ "NETSPY"
+notodomsg:.ASCII "No network interface device specified (/H for help)"
+crlfmsg:  .ASCIZ {CR,LF}
+notnetmsg:.ASCIZ "Device is not a NET device"{CR,LF}
+tomnymsg: .ASCIZ "More than one device specified (/H for help)"{CR,LF}
+nomemmsg: .ASCIZ "Not enough memory"{CR,LF}
+trmemsg:  .ASCIZ "Cannot open terminal device"{CR,LF}
+sivfmsg:  .ASCIZ "Cannot initialize software interrupt vector"{CR,LF}
+neterrmsg:.ASCIZ "Cannot open NET device"{CR,LF}
+trmoutper:.ASCIZ "Cannot set terminal output parameters"{CR,LF}
+trminpper:.ASCIZ "Cannot set terminal input parameters"{CR,LF}
+trmmaper: .ASCIZ "Cannot map terminal screen buffer"{CR,LF}
+nbufmer:  .ASCIZ "Cannot allocate memory for network buffers"
+dbufmer:  .ASCIZ "Cannot allocate memory for data buffer"
+fmsg1:    .ASCIZ "? NETSPY: "
+fmsg2:    .ASCIZ "          "
+
+helpmsg:  .ASCII ""
+	  .ASCII {CR,LF}
+	  .ASCII "NETSPY {/option} {-option} {netdev:}"{CR,LF}
+	  .ASCII {CR,LF}
+	  .ASCII "Options are:"{CR,LF}
+	  .ASCII "  Help      - Display this message"{CR,LF}
+	  .ASCIZ "  ?         - Same as Help"{CR,LF}
+
+phyname:  .BLKB  120t
+
+	.MOD	4
+scrnsize:  .LONG  0		;Actual screen buffer size
+scrntop:   .LONG  0		;Offset of top of screen buffer + 1
+nbufnum:   .LONG  NBUFNUM	;Number of network buffers
+nbufsize:  .LONG  NBUFSIZE	;Size of each network buffer
+dbufsize:  .LONG  DBUFSIZE	;Size of the data buffer
+nbuftak:   .LONG  0		;Network buffer taker pointer
+
+	.MOD	4
+trmdata: .BLKB	dm_SIZE
+
+	.MOD	4
+trminpparms:
+	.BYTE	PAR$SET|REP_HEXV, 4
+	.WORD	IOPAR_CINPMODE
+	.LONG	0FFFFFFFEh
+	.BYTE	PAR$SET|REP_HEXV, 4
+	.WORD	IOPAR_SINPMODE
+	.LONG	TIM$IMAGE|TIM$ANSI
+	.BYTE	0
+
+trmoutparms:
+	.BYTE	PAR$SET|REP_HEXV, 4
+	.WORD	IOPAR_COUTMODE
+	.LONG	0FFFFFFFEh
+	.BYTE	PAR$SET|REP_HEXV, 4
+	.WORD	IOPAR_SOUTMODE
+	.LONG	TOM$IMAGE|TOM$ANSICM
+	.BYTE	0
+
+trmibuf:.BLKB	200t
+
+	  .MOD   4
+trmqab:	  .WORD  QFNC_INBLOCK	;qab_func    = 0.  - Function
+	  .WORD  0		;qab_status  = 2.  - Returned status
+	  .LONG  0		;qab_error   = 4.  - Error code
+	  .LONG  0		;qab_amount  = 8.  - Amount transfered
+trmhndl:  .LONG  DH_STDTRM	;qab_handle  = 12. - Device handle
+	  .BYTE  IV_TRM		;qab_vector  = 16. - Vector for interrupt
+	  .BYTE  0, 0, 0	;Reserved
+	  .LONG  0		;qab_option  = 20. - Option bits
+	  .LONG  1024t		;qab_count   = 24. - Amount to transfer
+	  .LONG  trmibuf	;qab_buffer1 = 28. - Pointer to data buffer
+	  .LONG  !trmibuf
+	  .LONG  0, 0		;qab_buffer2 = 36. - Not used
+	  .LONG  0, 0		;qab_parm    = 44. - Pointer to parameter list
+
+	  .MOD   4
+devpparms:.BYTE	 PAR$GET|REP_TEXT, 8 ;Parameters for initial check of NET device
+	  .WORD	 IOPAR_CLASS
+devclass: .BLKB  8t
+	  .BYTE  PAR$SET|REP_HEXV, 4
+	  .WORD	 IOPAR_FILOPTN
+	  .LONG  FO$NOPREFIX|FO$XOSNAME
+	  .BYTE  PAR$GET|REP_STR, 0
+	  .WORD  IOPAR_FILSPEC
+	  .LONG  phyname
+	  .LONG  !phyname
+	  .WORD  120t, 0
+	  .BYTE  0
+
+openparms:
+	.BYTE	PAR$SET|REP_HEXV, 4
+	.WORD	IOPAR_FILOPTN
+	.LONG	FO$NOPREFIX|FO$XOSNAME|FO$NODENUM
+	.BYTE	PAR$GET|REP_STR, 0
+	.WORD	IOPAR_FILSPEC
+	.LONG	phyname
+	.LONG	!phyname
+	.WORD	120t, 0
+	.BYTE	0

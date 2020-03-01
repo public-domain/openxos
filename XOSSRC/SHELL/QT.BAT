@@ -1,0 +1,2 @@
+SETENV/Q/L=S BFLAGS = "-i180l255Mpu100 -mBRN -mrestore -Dega -DC:\BRIEF\MACROS\EGA.DRV"
+

@@ -1,0 +1,1721 @@
+	.TITLE	IOCS4 - Top level IO routines for XOS
+
+;++++
+; This software is in the public domain.  It may be freely copied and used
+; for whatever purpose you see fit, including commerical uses.  Anyone
+; modifying this software may claim ownership of the modifications, but not
+; the complete derived code.  It would be appreciated if the authors were
+; told what this software is being used for, but this is not a requirement.
+
+;   THIS SOFTWARE IS PROVIDED BY THE AUTHORS "AS IS" AND ANY EXPRESS OR
+;   IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
+;   OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+;   IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+;   INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+;   BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS
+;   OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+;   ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR
+;   TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
+;   USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+;----
+
+	.PROC	80486
+	.INCLUD	XOSINC:\XMAC\XOS.PAR
+	.INCLUD	XOSINC:\XMAC\XOSX.PAR
+	.INCLUD	XOSINC:\XMAC\XOSERR.PAR
+	.INCLUD	XOSINC:\XMAC\XOSDISK.PAR
+	.INCLUD	XOSINC:\XMAC\XOSXDISK.PAR
+
+	CODE
+
+	.SBTTL	svcIoDupHandle - Duplicate device handle
+
+;Here for the svcIoDupHandle SVC - Duplicate device handle
+;	long oldhandle;			// Old handle to duplicate - if bit
+;					//   31 is set, the handle is closed
+;					//   after it is duplicated	
+;	long newhandle;			// New handle - if -1, a new handle
+;					//   is allocated - otherwise this
+;					//   handle is used - if it is in use
+;					//   the call fails
+;	rtn = svcIoDupHandle(oldhandle, newhandle);
+;  Value returned is the new handle if normal or negative error code if error
+
+psvcIoDupHandle::
+	SVCENTR	CNTIoDupHandle#
+rsvcIoDupHandle::
+	MOVL	EAX, SS:pdaArg1#	;Get old handle
+	MOVL	EBX, SS:pdaArg2#	;Get new handle
+					;Fall into duphandle on next page
+.PAGE
+	.SBTTL	duphandle - Subroutine to duplicate Allegro device handle
+
+;Subroutine to duplicate Allegro device handle
+;	c{EAX} = Old handle
+;	c{EBX} = New handle
+;	CALL	duphandle
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  c{EAX} = New handle assigned
+
+$$$=!0
+FRM duph_oldhndl, 4t		;Old handle
+FRM duph_newhndl, 4t		;New handle
+FRM duph_cmd    , 4t		;Command bits
+duph_SIZE=!$$$
+
+duphandle::
+	ENTER	duph_SIZE, 0
+	MOVL	duph_oldhndl.B[EBP], EAX
+	BTZL	EAX, #31t
+	MOVL	duph_newhndl.B[EBP], EBX
+	CALL	knlGetDcb#		;Get the DCB
+	JC	6$.S			;If error
+	MOVL	duph_cmd.B[EBP], ECX	;Save the command bits
+	PUSHL	EDI			;Save the DCB offset
+	MOVL	EBX, duph_newhndl.B[EBP] ;Get the new handle
+	BTSL	EBX, #31t		;Did he give us one?
+	JNC	4$.S			;Yes
+	MOVL	EBX, #DH_FV		;No - start at the standard place
+4$:	CALL	gethandle#		;Allocate a new handle
+	POPL	EDI
+	JC	6$.S			;If error
+	MOVL	duph_newhndl.B[EBP], EBX
+	BTZL	duph_oldhndl.B[EBP], #31t ;Want to give up old handle?
+	JC	dupnewhndl		;Yes
+	CALL	knlGetQel#		;No - get an IORB
+6$:	JC	12$			;If error
+	MOVL	EAX, duph_cmd.B[EBP]
+	MOVL	iorb_option.B[ESI], EAX	;Store new command bits 
+	CLRL	EAX			;Clear some fields
+	MOVL	iorb_mlckcnt.B[ESI], EAX
+	MOVW	iorb_func.B[ESI], AX
+	MOVB	iorb_queue.B[ESI], AL
+	MOVL	iorb_parm+0.B[ESI], EAX
+	MOVL	iorb_lock+0.B[ESI], EAX
+	MOVL	EAX, duph_oldhndl.B[EBP]
+	MOVW	iorb_handle.B[ESI], AX
+	MOVL	EAX, duph_newhndl.B[EBP]
+	MOVL	iorb_count.B[ESI], EAX		  ;Store offset of termination
+	MOVL	iorb_finish.B[ESI], #knlXfFinish# ;  routine
+	MOVL	iorb_routine.B[ESI], #duphandle1 ;Store offset of extended fork
+						 ;  context rouitne
+	MOVL	SS:pdaResponse#, #80000000h ;Indicate no response yet
+	CALL	knlXfBegin#		;Start extended fork context (this
+					;  returns at device fork level)
+8$:	MOVL	EAX, SS:pdaResponse#	;Finished yet?
+	CMPL	EAX, #80000000h
+	JNE	10$.S			;Yes
+	PUSHL	SS			;No - set up to wait
+	POPL	ES
+	MOVB	AL, #knlQX_SPND#
+	CALL	knlWRequeue#		;Requeue to the suspend queue
+	FROMFORK
+	CALLF	schedule		;Call the scheduler (this is an
+	TOFORK				;  uninterruptable wait!)
+	JMP	8$.S
+
+10$:	FROMFORK
+	BTL	EAX, #31t
+12$:	LEAVE
+	RET
+
+;Here if transfering device to a new handle - this is easy since all we have
+;  to do is change the handle table and tell the device about any changed
+;  command bits
+
+dupnewhndl:
+	MOVL	ESI, duph_oldhndl.B[EBP]
+	SHLL	ESI, #5t
+	ADDL	ESI, SS:pdaHndlTbl#	;Point to the handle table entry
+	CLRL	EAX
+	PUSHL	SS:4t.B[ESI]		;Save command bits
+	PUSHL	SS:8t.B[ESI]		;Save reference name
+	PUSHL	SS:12.B[ESI]	
+	MOVL	SS:0t.B[ESI], EAX	;Clear old entry
+	MOVL	SS:4t.B[ESI], EAX
+	MOVL	SS:8t.B[ESI], EAX
+	MOVL	SS:12t.B[ESI], EAX
+	MOVL	EAX, duph_newhndl.B[EBP]
+	MOVL	ESI, EAX
+	SHLL	ESI, #5t
+	ADDL	ESI, SS:pdaHndlTbl#
+	MOVL	ECX, duph_cmd.B[EBP]
+	MOVL	SS:[ESI], EDI		;Set up new handle
+	ANDL	ECX, #0007FFFFh
+	MOVL	SS:4.B[ESI], ECX
+	POPL	SS:12t.B[ESI]		;Store reference name
+	POPL	SS:8.B[ESI]	
+	POPL	SS:4.B[ESI]		;Store command bits
+	LEAVE
+	RET
+
+;Here if have error after a new handle is assigned but before it has been used
+
+20$:	MOVL	ESI, duph_newhndl.B[EBP] ;Get the new handle
+	SHLL	ESI, #5t
+	ADDL	ESI, SS:pdaHndlTbl#	;Clear it out
+	CLRL	EDX
+	MOVL	SS:[ESI], EDX
+	MOVL	SS:4.B[ESI], EDX
+	LEAVE
+	STC
+	RET
+.PAGE
+;Extended fork context routine to finish duplicating a device handle
+
+duphandle1:
+	INCL	dcb_opencnt.B[EDI]
+	MOVL	ECX, SS:xffOption#
+	MOVL	SS:xffCmd#, ECX
+	MOVL	EBX, dcb_sdisp.B[EDI]	;Tell the device about this
+	CALLI	sd_opena.B[EBX]
+	MOVW	ES, SS:xffPda#
+	JC	4$.S			;If error
+	MOVZWL	ESI, SS:xffHandle#	;Get the old handle
+	SHLL	ESI, #5t
+	ADDL	ESI, ES:pdaHndlTbl#
+	PUSHL	ES:8t.B[ESI]		;Save reference name
+	PUSHL	ES:12t.B[ESI]	
+	MOVL	EAX, SS:xffCount#	;Get new handle
+	MOVW	SS:xffHandle#, AX
+	MOVL	ESI, EAX
+	SHLL	ESI, #5t		;Get offset of corresponding handle
+	ADDL	ESI, ES:pdaHndlTbl#	;  table entry
+	MOVL	ES:[ESI], EDI		;Set up new handle
+	MOVL	ECX, SS:xffCmd#
+	ANDL	ECX, #0007FFFFh
+	MOVL	ES:4.B[ESI], ECX
+	POPL	ES:12t.B[ESI]		;Store reference name
+	POPL	ES:8.B[ESI]	
+2$:	MOVL	ES:pdaResponse#, EAX
+	JMP	knlRRequeue#
+
+;Here if error on the open/additional call to the device driver
+
+4$:	DECL	dcb_opencnt.B[EDI]	;Fix up the open count
+	JMP	2$.S			;And return the error
+.PAGE
+	.SBTTL	knlAddUnitChar - Subroutine to process characteristics for addunit
+
+;Subroutine to process characteristics for addunit functions
+;	c(AL)     = 0 to fail on bad names, 1 to ignore them
+;	c{EBX}    = Offset of characteristics table
+;	c{FS:EDX} = Address of characteristics list
+;	c{EDI}    = Offset of DCB
+;	CALL	knlAddUnitChar
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;  ESI is preserved
+
+knlAddUnitChar::
+	ENTER	dc_SIZE, 0		;Set up our stack frame
+	CLRL	ECX			;Clear info pointer adjustment value
+	MOVL	dc_iadj.B[EBP], ECX
+	MOVL	dc_table.B[EBP], EBX	;Store offset of device's table
+	MOVB	dc_errhand.B[EBP], AL	;Store error handling flag
+	PUSHL	ESI
+	CALL	knlIoCharChk#		;Make sure list is writable
+	JC	10$.S			;If error
+	CALL	dcharval2		;Do the work
+10$:	POPL	ESI
+	LEAVE
+ret006:	RET
+.PAGE
+	.SBTTL	devcharfunc - Get or set device characteristics
+
+;Here for the QFNC_DEVCHAR queued IO function - Get or set device
+;  characteristics  - arguments in the QAB are used as follows:
+;	qab_handle  - Device handle
+;	qab_option  - Function:
+;			CF_SIZE   = 1 - Get size needed for complete list
+;					  without info pointers
+;			CF_SIZEIP = 2 - Get size needed for complete list with
+;					  info pointers
+;			CF_ALL    = 3 - Get names and types of all items without
+;					  info pointers
+;			CF_ALLIP  = 4 - Get names and types of all items with
+;					  info pointers
+;			CF_TYPE   = 5 - Get type of single characteristic
+;			CF_VALUES = 6 - Get or set characteristics values
+;	qab_count   - Size of available buffer (CF_ALL, CF_ALLIP, CF_VALUES)
+;	qab_buffer2 - Address of device characteristics list
+;  Value returned in qab_amount is the number of items processed
+
+;The set subroutine is called as follows for other than a long string value:
+;	c{EDX,EAX} = New value (8 bytes only, values longer than 8 bytes are
+;		       stored in knlDcValue - absolute maximum value length is
+;		       16 bytes)
+;	c{EBX}     = Data value
+;	c{ESI}     = Offset of table entry
+;	CALL	setsub
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;  NOTE: Overflow is checked before the set routine is called, and it is not
+;	 called if the data value is too big for the value size specified for
+;	 the parameter - numeric or text values longer than 8 bytes CANNOT be
+;	 set
+;The set subroutine is called as follows for a long string value:
+;	c{ES:EBX} = Address of new string
+;	c{ECX}    = Length of new string (may be 0 if string is null terminated)
+;	c{EDX}    = Data value
+;	c{ESI}    = Offset of table entry
+;	CALL	setsub
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;The get subroutine is called as follows for other than a long string value:
+;	c{EDX} = Data value
+;	c{ESI} = Offset of table entry
+;	CALL	getsub
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  c{EDX,EAX} = Value (if value is 8 bytes or less)
+;	  c{EAX}     = Offset of value buffer (if value is more than
+;			 8 bytes)
+;  NOTE: Only as large a value as is specified by the parameter table entry
+;	 need be returned - only this much is stored - if the user's value
+;	 area is longer, it is zero filled
+;The get subroutine is called as follows for a long string value:
+;	c{ES:EBX} = Address of buffer to receive string
+;	c{ECX}    = Length of buffer
+;	c{FS:EAX} = Address of count word
+;	c{EDX}    = Data value
+;	c{ESI}    = Offset of table entry
+;	CALL	getsub
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  c{ECX} = Length of string stored
+
+$$$=!0
+FRM dc_number , 4t	;Number of items
+FRM dc_handle , 2t	;Device handle
+FRM           , 1t
+FRM dc_errhand, 1t	;Error handling flag: 0 = fail on bad name, 1 = ignore
+			;  bad names
+FRM dc_count  , 4t
+FRM dc_iadj   , 4t	;Amount to adjust offsets to allow for info pointer
+FRM dc_table  , 4t	;Offset of data table for device
+FRM dc_dcb    , 4t	;Offset of DCB
+dc_SIZE=!$$$
+
+;	c{ESI} = Offset of IORB
+;	CALL	devchar
+
+devcharfunc::
+	CALL	knlQioGetDcb#		;Get offset of our DCB
+	JC	8$.S
+	MOVL	EBX, dcb_devchar[EDI]	;Does device have a table?
+	TESTL	EBX, EBX
+	JE	nochar.S		;No - say illegal function for device
+	IFFAULT	6$			 ;Yes - get address of characteristics
+	LFSL	EDX, iorb_buffer2.B[ESI] ;  list
+	MOVZBL	EAX, iorb_option.B[ESI]	;Get function
+	CMPL	EAX, #7.B		;Legal function?
+	JA	nochar.S		;No - fail
+dochar:	ENTER	dc_SIZE, 0		;Set up our stack frame
+	MOVL	dc_dcb.B[EBP], EDI	;Store DCB offset
+	MOVZWL	ECX, iorb_handle.B[ESI]	;Store handle value
+	MOVW	dc_handle.B[EBP], CX
+	MOVL	ECX, iorb_count.B[ESI]	;Store count value
+	MOVL	dc_count.B[EBP], ECX
+	CALL	knlGiveQel#
+	CLRL	ECX			;Clear info pointer adjustment value
+	MOVL	dc_iadj.B[EBP], ECX
+	MOVL	dc_table.B[EBP], EBX	;Store offset of device's table
+	MOVB	dc_errhand.B[EBP], CL	;Always fail on errors
+	JMPIL	dchardsp[EAX*4]		;Yes - dispatch on function
+
+;Here if no table for device or class - say illegal function
+
+nochar:	MOVL	EAX, #ER_IFDEV
+	JMP	8$.S
+
+;Here if address error
+
+	FAULTHDR
+6$:	MOVL	EAX, #ER_ADRER
+8$:	CALL	knlGiveQel#
+	CLRL	ECX
+	MOVL	EBX, #QSTS$DONE
+	TOFORK
+	RET
+
+	DATA
+
+	.MOD	4
+dchardsp:
+	.LONG	knlIFnDevTFLv#
+	.LONG	dcharsize	;DCF_SIZE   = 1 - Get size needed for everything
+				;		    without info pointers
+	.LONG	dcharsizeip	;DCF_SIZEIP = 2 - Get size needed for everything
+				;		    with info pointers
+	.LONG	dcharall	;DCF_ALL    = 3 - Get names, types, and sizes of
+				;		    all characteristics without
+				;		    info pointers
+	.LONG	dcharallip	;DCF_ALLIP  = 4 - Get names, types, and sizes of
+				;		    all characteristics with
+				;		    info pointers
+	.LONG	dchartype	;DCF_TYPE   = 5 - Get type of characteristic
+				;		    without info pointer
+	.LONG	dchartypeip	;DCF_TYPEIP = 6 - Get type of characteristic
+				;		    with info pointer
+	.LONG	dcharvalfunc	;DCF_VALUES = 7 - Get or set characteristic
+				;		    values
+
+	CODE
+.PAGE
+nullinfo:
+	.BYTE	0
+
+;Define some commonly used device characteristic information strings
+
+knlDcMsgAccess::  DCHARINFO  {System access class}
+knlDcMsgModel::   DCHARINFO  {Device model description}
+knlDcMsgSerialNo::DCHARINFO  {Device serial number or other data}
+knlDcMsgRevision::DCHARINFO  {Device revision number}
+knlDcMsgUnit::    DCHARINFO  {Unit number}
+knlDcMsgUnitType::DCHARINFO  {Unit type}
+knlDcMsgUnitDesp::DCHARINFO  {Unit description}
+knlDcMsgClass::   DCHARINFO  {Device class}
+knlDcMsgType::    DCHARINFO  {Device type}
+knlDcMsgConDesp:: DCHARINFO  {Controller description}
+knlDcMsgIoReg::   DCHARINFO  {Base IO register number}
+knlDcMsgMemReg::  DCHARINFO  {Base memory register address}
+knlDcMsgInt::     DCHARINFO  {Interrupt request number}
+knlDcMsgDma::     DCHARINFO  {DMA channel number}
+knlDcMsgIndex::   DCHARINFO  {Index or unit number on controller}
+knlDcMsgTimeOut:: DCHARINFO  {Time-out period (in seconds)}
+knlDcMsgByteOut:: DCHARINFO  {Number of bytes output}
+knlDcMsgByteIn::  DCHARINFO  {Number of bytes input}
+knlDcMsgWTMax::   DCHARINFO  {Write transfer limit}
+knlDcMsgRAMax::   DCHARINFO  {Maximum read-ahead blocks}
+knlDcMsgDTHLimit::DCHARINFO  {Data transfer hardware limit}
+knlDcMsgTDataErr::DCHARINFO  {Total number of data errors}
+knlDcMsgHDataErr::DCHARINFO  {Number of hard data errors}
+knlDcMsgHungErr:: DCHARINFO  {Number of device time-outs}
+knlDcMsgTOvrnErr::DCHARINFO  {Total number of DMA overrun errors}
+knlDcMsgHOvrnErr::DCHARINFO  {Number of hard DMA overrun errors}
+knlDcMsgTDevErr:: DCHARINFO  {Total number of device errors}
+knlDcMsgHDevErr:: DCHARINFO  {Number of hard device errors}
+.PAGE
+;Here for QFNC_DEVCHAR function DCF_SIZE - get size needed for all
+;  characteristics for device without info pointers
+
+$$$=!0
+FRM gs_info, 1t
+FRM        , 3t
+FRM gs_size, 4t
+gs_SIZE=!$$$
+
+dcharsize:
+	MOVB	AL, #0
+	JMP	2$.S
+
+;Here for QFNC_DEVCHAR function DCF_SIZEIP - get size needed for all
+;  characteristics for device with info pointers
+
+dcharsizeip:
+	MOVB	AL, #1
+2$:	ENTER	gs_SIZE, 0
+	MOVB	gs_info.B[EBP], AL
+	CLRL	EAX
+	MOVL	gs_size.B[EBP], EAX
+	MOVL	ESI, EBX
+	TOFORK
+	CALL	getdcsize
+	MOVL	ECX, gs_size.B[EBP]
+	LEAVE
+	LEAVE
+	JC	4$.S
+	CLRL	EAX
+4$:	MOVL	EBX, #QSTS$DONE
+	RET
+
+;Here for QFNC_DEVCHAR function DCF_ALLIP - get name and type for all
+;  characteristics for device with info pointers
+
+dcharallip:
+	MOVB	dc_iadj.B[EBP], #12t	;Store offset adjustment to allow for
+					;  info pointers
+
+;Here for QFNC_DEVCHAR function DCF_ALL - get name and type for all
+;  characteristics for device without info pointers
+
+dcharall:
+	MOVL	ECX, dc_count.B[EBP]	;Get buffer size
+	PUSHL	EBX			;Make sure the buffer is writable
+	PUSHL	FS
+	PUSHL	EDX
+	MOVL	EBX, EDX
+	PUSHL	FS
+	POPL	ES
+	CALL	knlIoBufrChk#
+	POPL	EDX
+	POPL	FS
+	POPL	EBX
+	JC	10$.S
+	MOVL	ECX, [EBX]		;Get number of table entries
+	TESTL	ECX, ECX		;Is it zero?
+	JE	14$.S			;Yes - nothing to do here
+	LEAL	ESI, 16t.B[EBX]		;No - point to first one
+	JMP	12$.S			;Continue
+
+;Here for QFNC_DEVCHAR function DCF_TYPEIP - get type of a single
+;  characteristic with info pointer
+
+dchartypeip:
+	MOVB	dc_iadj.B[EBP], #12t	;Store offset adjustment to allow for
+	MOVL	ECX, #34t		;  info pointer
+	JMP	8$.S
+
+;Here for QFNC_DEVCHAR function DCF_TYPE - get type of a single characteristic
+;  without info pointer
+
+dchartype:
+	MOVL	ECX, #22t
+8$:	PUSHL	EBX
+	PUSHL	FS
+	PUSHL	EDX
+	MOVL	EBX, EDX
+	PUSHL	FS
+	POPL	ES
+	CALL	knlIoBufrChk#		;Make sure buffer is writable
+	POPL	EDX
+	POPL	FS
+	POPL	EBX
+10$:	JC	dchardn
+	CALL	finddchar		;Find the characteristic
+	JC	10$.S			;If error
+	MOVL	ECX, #-1		;Just return one characteristic
+12$:	MOVL	EDI, EDX
+	PUSHL	FS
+	POPL	ES
+	CLRL	EAX
+	MOVL	dc_number.B[EBP], EAX
+	CALL	getdcentry
+14$:	MOVB	AL, #0
+	IFFAULT	knlQAdrErr0#
+	STOSB	[EDI]
+	MOVL	ECX, dc_number.B[EBP]	;Return number of characteristics
+	CLRL	EAX
+	JMP	16$.S
+
+dchardn:CLRL	ECX
+16$:	LEAVE
+	MOVL	EBX, #QSTS$DONE
+	TOFORK
+	RET
+.PAGE
+;Subroutine to give a series of device characteristic entries to the user
+;	c{ESI} = Offset of entry
+;	c{ECX} = Number of entries
+
+getdcentry:
+	CLD
+2$:	MOVL	EAX, [ESI]		;Get description and size
+	MOVB	DL, AL			;Save description for later
+	ANDB	DL, #0Fh
+	TESTB	AH, #DCTF$HIDDEN	;Is this a hidden value?
+	JE	4$.S			;No - go on
+	ORL	ECX, ECX		;Yes - returning single characteristic?
+	JNS	32$			;No - skip this one
+4$:	TESTB	AH, #DCTF$LNKHEAD|DCTF$INDIR ;Special entry?
+	JE	12$.S			;No
+	PUSHL	ESI
+	PUSHL	ECX
+	TESTB	AH, #DCTF$LNKHEAD	;Yes - linked head entry?
+	JE	6$.S			;No
+	PUSHL	EDI
+	MOVL	EDI, dc_dcb.B[EBP]
+	CALLI	dct_lnkgethd.B[ESI]	;Yes - get first linked element
+	POPL	EDI
+	JNE	8$.S			;If have at least one
+	JMP	10$.S			;If none
+
+;Here for an indirect entry (cannot get here if returning a single item since
+;  we have already called finddchar in this case and finddchar has returned
+;  the desired final (normal or linked element) entry
+
+6$:	MOVL	ESI, dct_indtable.B[ESI] ;Get offset of indirect table
+	MOVL	ECX, [ESI]		;Get number of table entries
+	JREGZ	ECX, 12$		;Nothing to do here if 0
+	ADDL	ESI, #16t.B		;Point to first entry
+8$:	CALL	getdcentry		;Recur!
+10$:	POPL	ECX
+	POPL	ESI
+	JMP	32$
+
+;Here for a normal or a linked element entry entry
+
+12$:	CMPB	dc_iadj.B[EBP], #0	;Does he want info pointers?
+	JE	14$.S			;No
+	ORB	AL, #PAR$INFO		;Yes
+	IFFAULT	knlQAdrErr0#
+14$:	DECL	dc_count.B[EBP]		;Have room for at least 1 more byte?
+;;;;;;;	JS	26$.S			;No
+	MOVL	EBX, dc_iadj.B[EBP]	;Yes
+	ADDL	EBX, #9t.B
+	SUBL	dc_count.B[EBP], EBX	;Have room for the minimum size?
+;;;;;;;	JS	24$.S			;No
+	STOSB	[EDI]			;Give him the description byte
+	SHRL	EAX, #16t		;Get size
+	ANDB	DL, #0Fh
+	CMPB	DL, #REP_DATAS
+	JE	15$.S
+	CMPB	DL, #REP_STR		;Is it a string?
+	JNE	16$.S			;No
+15$:	MOVL	EAX, #12t		;Yes - give him the length of the item,
+	IFFAULT	knlQAdrErr0#		;  not the string
+16$:	SUBL	dc_count.B[EBP], EAX	;Have room for it?
+;;;;;;;	JS	22$.S			;No
+	STOSB	[EDI]			;Yes - give him the size byte
+	MOVL	EAX, dct_name+0.B[ESI]	;Give him the characteristic name
+	IFFAULT	knlQAdrErr0#
+	STOSL	[EDI]
+	MOVL	EAX, dct_name+4.B[ESI]
+	IFFAULT	knlQAdrErr0#
+	STOSL	[EDI]
+	CMPB	dc_iadj.B[EBP], #0	;Does he want info pointers?
+	JE	20$.S			;No
+	CLRL	EAX			;Yes - clear the space for the info
+	IFFAULT	knlQAdrErr0#		;  pointer (which we don't supply
+	STOSL	[EDI]			;  here)
+	IFFAULT	knlQAdrErr0#
+	STOSL	[EDI]
+	MOVL	EAX, dct_infopnt.B[ESI]	;Get offset of info string
+	TESTL	EAX, EAX		;Is there one?
+	JE	18$.S			;No
+	MOVZBL	EAX, CS:[EAX]		;Yes - get its length
+	INCL	EAX			;Plus one is minimum size for buffer
+	IFFAULT	knlQAdrErr0#
+18$:	STOSL	[EDI]			;Store minimum size for buffer
+20$:	CLRL	EAX			;Clear data area
+	CMPB	DL, #REP_DATAS
+	JE	28$.S
+	CMPB	DL, #REP_STR		;Is this a long string?
+	JE	28$.S			;Yes
+	PUSHL	ECX			;No
+	MOVZBL	ECX, dct_length.B[ESI]
+	IFFAULT	knlQAdrErr0#
+	RSTOSB	[EDI]
+	POPL	ECX
+	JMP	30$.S
+
+;Here if user's buffer is not big enough
+
+22$:	DECL	EDI
+24$:	MOVB	ES:[EDI], #0
+26$:	MOVL	EAX, #ER_DATTR
+	STC
+	RET
+
+;Here if long string
+
+	IFFAULT	knlQAdrErr0#
+28$:	STOSL	[EDI]			;Clear space for the buffer pointer
+	IFFAULT	knlQAdrErr0#
+	STOSL	[EDI]
+	MOVZWL	EAX, dct_length.B[ESI]	;Give him the required buffer size
+	IFFAULT	knlQAdrErr0#
+	STOSL	[EDI]
+30$:	INCL	dc_number.B[EBP]
+32$:	TESTB	dct_flags.B[ESI], #DCTF$LNKELMT ;Is this a linked element?
+	JNE	34$.S			;Yes
+	ADDL	ESI, #dct_SIZE.B	;No
+	DECL	ECX
+	JG	2$
+	RET
+
+;Here to advance to next linked element
+
+34$:	ORL	ECX, ECX		;Only doing 1?
+	JS	36$.S			;Yes - stop now
+	MOVL	ESI, dct_lnknext.B[ESI]	;No - get offset onext linked element
+	ORL	ESI, ESI
+	JNE	2$
+36$:	RET
+.PAGE
+;Here for QFNC_DEVCHAR function DCF_VALUES - get or set characteristic values
+;	c{FS:EDX} = Address of characteristic list
+;	CALL	dcharvalfunc
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  c{EAX} = 0
+
+dcharvalfunc:
+	CALL	knlIoCharChk#		;Make sure list is writable
+	JC	2$.S			;If error
+	MOVL	EAX, dc_table.B[EBP]	;Call the device routine
+	JMPIL	12t.B[EAX]
+
+;Here if error
+
+2$:	CLRL	ECX
+	JMP	4$.S
+
+;Common device characteristics value routine
+
+knlDCharValCom::
+	CALL	dcharval2
+4$:	LEAVE
+	MOVL	EBX, #QSTS$DONE
+	TOFORK
+	RET
+
+;Common device characteristics value routine for extended fork context
+
+knlDCharValXff::
+
+;;; NEED TO LOCK THE CHARACTERISTIC LIST HERE!!!
+
+	CALL	knlGetQel#		;Get an IORB
+	JC	4$.S			;Fail if can't get one
+	MOVL	iorb_buffer2+0.B[ESI], EDX
+	MOVL	iorb_buffer2+4.B[ESI], FS
+	CLRL	EAX
+	MOVL	iorb_buffer1+4.B[ESI], EAX
+	MOVL	iorb_parm+4.B[ESI], EAX
+	MOVL	iorb_lock+0.B[ESI], EAX
+	MOVL	iorb_mlckcnt.B[ESI], EAX
+	MOVL	EAX, dc_table.B[EBP]
+	MOVL	iorb_count.B[ESI], EAX
+	MOVL	EAX, dc_number.B[EBP]
+	SHLL	EAX, #16t
+	MOVB	AH, dc_errhand.B[EBP]
+	MOVB	AL, dc_iadj.B[EBP]
+	MOVL	iorb_option.B[ESI], EAX
+	MOVZWL	EAX, dc_handle.B[EBP]
+	MOVW	iorb_handle.B[ESI], AX
+	LEAVE
+	MOVL	iorb_finish.B[ESI], #knlQioFinish#
+	MOVL	iorb_routine.B[ESI], #dcharvalxff1
+	MOVL	EAX, SS:pdaArg2#
+	MOVL	iorb_qab+0.B[ESI], EAX
+	MOVL	EAX, SS:pdaArg1#
+	MOVW	iorb_qab+4.B[ESI], AX
+	MOVB	iorb_queue.B[ESI], #dcb_outframe
+	JMP	knlXfBegin#		;Start the extended fork
+
+;Here when in extended fork context
+
+dcharvalxff1:
+	ENTER	dc_SIZE, 0
+	MOVZBL	EAX, SS:xffOption#+0
+	MOVL	dc_iadj.B[EBP], EAX
+	MOVB	AL, SS:xffOption#+1
+	MOVB	dc_errhand.B[EBP], AL
+	MOVZWL	EAX, SS:xffOption#+2
+	MOVL	dc_number.B[EBP], EAX
+	MOVL	EAX, SS:xffCount#
+	MOVL	dc_table.B[EBP], EAX
+	LFSL	EDX, SS:xffBuffer2#
+	CALL	dcharval2
+	LEAVE
+	MOVL	EBX, #QSTS$DONE
+	RET
+.PAGE
+;Subroutine to process device characteristics or add unit characteristics
+
+	IFFAULT	knlQAdrErr0#
+dcharval2::
+	CMPB	FS:[EDX], #0		;Finished?
+	JE	4$.S			;Yes
+	CALL	finddchar		;No - find the next characteristic
+	JNC	12$.S			;Go on if found it
+	CMPB	dc_errhand.B[EBP], #0	;Bad name - is this fatal?
+	JE	10$.S			;Yes
+	IFFAULT	knlQAdrErr0#
+	MOVB	AL, FS:[EDX]		;No - get description byte
+	MOVB	dc_iadj.B[EBP], #0	;Assume no info wanted
+	TESTB	AL, #PAR$INFO		;Right?
+	JE	2$.S			;Yes
+	MOVB	dc_iadj.B[EBP], #12t	;No - get the right adjustment value
+2$:	ANDB	AL, #0Fh		;Get description for characteristic
+	CMPB	AL, #REP_STR		;Is this a string value?
+	JE	nxtstr			;Yes
+	CMPB	AL, #REP_DATAS
+	JE	nxtstr2
+	JMP	nxtval2			;No
+
+4$:	CLRL	ECX
+	CLRL	EAX
+	RET
+
+	FAULTHDR
+6$:	MOVL	EAX, #ER_ADRER
+8$:	POPL	ESI
+10$:	CLRL	ECX
+	STC
+	RET
+
+;Here with characteristic found
+
+	IFFAULT	knlQAdrErr0#
+12$:	MOVB	AL, FS:[EDX]		;Get description byte
+	MOVB	dc_iadj.B[EBP], #0	;Assume no info wanted
+	TESTB	AL, #PAR$INFO		;Right?
+	JE	14$.S			;Yes
+	MOVB	dc_iadj.B[EBP], #12t	;No - get the right adjustment value
+14$:	ANDB	AL, #0Fh		;Get description for characteristic
+	MOVB	AH, [ESI]
+	ANDB	AH, #0Fh
+	CMPB	AL, AH			;Same?
+	JE	16$.S			;Yes - OK
+	CMPB	AL, #REP_TEXT		;No - are both numeric?
+	JAE	15$.S
+	CMPB	AH, #REP_TEXT
+15$:	JAE	dcbadval		;No - fail
+16$:	CMPB	dc_iadj.B[EBP], #0	;Want info?
+	JE	28$			;No
+	MOVL	EBX, #dcv_infopnt	;Yes - get pointer to information buffer
+	CALL	dcgetaddr
+	JC	10$.S
+	TESTL	EBX, EBX		;Is there one?
+	JE	28$.S			;No
+	PUSHL	ESI			;Yes
+	MOVL	ESI, dct_infopnt.B[ESI] ;Point to string for device
+	TESTL	ESI, ESI		;Is there a string?
+	JNE	18$.S			;Yes
+	MOVL	ESI, #nullinfo		;No - point to a null string
+18$:	MOVZBL	ECX, CS:[ESI]		;Get length of string
+	IFFAULT	6$
+	MOVW	FS:dcv_istrlen.B[EDX], CX ;Give it too him
+	CMPB	knlForkLvl, #FORK_XFF
+	JAE	19$.S
+	INCL	ECX
+	PUSHL	ECX
+	PUSHL	ESI
+	PUSHL	FS
+	PUSHL	EDX
+	CALL	knlIoBufrChk#
+	POPL	EDX
+	POPL	FS
+	POPL	ESI
+	POPL	ECX
+	JC	8$
+	IFFAULT	6$
+19$:	CMPW	CX, FS:dcv_ibfrlen.B[EDX] ;Will it fit in his buffer?
+	JB	20$.S			;Yes
+	IFFAULT	6$
+	MOVW	CX, FS:dcv_ibfrlen.B[EDX] ;No - just give him as much as will
+	DECL	ECX			  ;  fit
+	JE	24$.S
+	JS	26$.S
+20$:	INCL	ESI
+	JREGZ	ECX, 24$
+22$:	LODSB	CS:[ESI]
+	IFFAULT	6$
+	MOVB	ES:[EBX], AL
+	INCL	EBX
+	LOOP	ECX, 22$
+	IFFAULT	6$
+24$:	MOVB	ES:[EBX], #0		;Put null at end
+26$:	POPL	ESI
+	IFFAULT	knlQAdrErr0#
+28$:	MOVB	AL, FS:[EDX]		;Get his description byte
+	MOVB	AH, AL
+	ANDB	AH, #0Fh
+	TESTB	AL, #PAR$SET		;Setting value?
+	JE	getchar			;No
+	CMPL	dct_setsub.B[ESI], #0.B	;Yes - do we have a set subroutine?
+	JE	32$.S			;No - fail
+	CMPB	AH, #REP_STR		;Yes - did he give us a string value?
+	JE	30$.S			;Yes
+	CMPB	AH, #REP_DATAS		;No - binary string?
+	JNE	36$.S			;No
+30$:	MOVL	EBX, #dcv_value		;Yes - get address of the string
+	CALL	dcgetaddri
+	JC	34$.S			;If error
+	MOVL	ECX, dc_iadj.B[EBP]
+	IFFAULT	knlQAdrErr0#
+	MOVZWL	ECX, FS:dcv_vstrlen.B[EDX+ECX] ;Get length of his string
+	PUSHL	EDX
+	MOVL	EDX, dct_data.B[ESI]	;Get data value
+	JMP	52$			;Continue
+
+;Here if trying to set a value which cannot be set
+
+32$:	MOVL	EAX, #ER_CHARF
+34$:	JMP	dcerr2
+
+;Here if do not have a string value
+
+	IFFAULT	knlQAdrErr0#
+36$:	MOVZBL	ECX, FS:dcv_vallen.B[EDX] ;Get length of his value
+	IFFAULT	knlQAdrErr0#
+	MOVZBL	EAX, FS:[EDX]		;Get representation of value
+	ANDB	AL, #PAR$REP
+	PUSHL	EDX
+	MOVL	EDX, #16t
+	CMPB	CL, DL			;Is it too big?
+	JB	38$.S			;No
+	MOVL	ECX, EDX		;Yes - just use as much as we can!
+38$:	SUBL	EDX, ECX		;Calculate amount to zero
+	PUSHL	ESI
+	MOVL	ESI, 4.B[ESP]		;Copy his argument to our buffer
+	ADDL	ESI, #dcv_value.B
+	ADDL	ESI, dc_iadj.B[EBP]
+	PUSHL	EDI
+	MOVL	EDI, #knlDcValue
+	PUSHL	DS
+	POPL	ES
+	CLD
+	CMPB	AL, #REP_TEXT		;Is this a text value?
+	JE	40$.S			;Yes
+	IFFAULT	dcadrer3
+	RMOVSB	[EDI], FS:[ESI]		;No
+	JMP	44$.S
+
+;Here if have a text value - convert it to upper case
+
+	IFFAULT	dcadrer3
+40$:	LODSB	FS:[ESI]		;Get character
+	CMPB	AL, #'a'		;Lower case?
+	JB	42$.S			;No
+	SUBB	AL, #'a'-'A'		;Yes - change to upper case
+42$:	STOSB	[EDI]			;Store character
+	LOOP	ECX, 40$		;Loop if more to do
+44$:	MOVL	ECX, EDX		;Zero the rest of the data buffer
+	CLRL	EAX
+	IFFAULT	dcadrer3
+	RSTOSB	[EDI]
+	POPL	EDI
+	POPL	ESI
+	MOVL	EDX, #16t		;Now see how big a value he really
+46$:	CMPL	knlDcValue-4[EDX], #0.B	;  gave us
+	JNE	48$.S
+	SUBL	EDX, #4.B
+	JNE	46$.S
+	JMP	50$.S
+
+;Here with a non-zero long
+
+48$:	MOVL	EAX, knlDcValue-4[EDX]
+	TESTL	EAX, #0FF000000h	;Is high byte non-zero
+	JNE	50$.S			;Yes
+	DECL	EDX
+	TESTL	EAX, #0FF0000h
+	JNE	50$.S
+	DECL	EDX
+	CMPB	DH, #0
+	JNE	50$.S
+	DECL	EDX
+50$:	CMPB	DL, dct_length.B[ESI]	;Can we take this big a value?
+	POPL	EDX
+	JA	dcbadval		;No - fail!
+	PUSHL	EDX
+	MOVL	EAX, knlDcValue+0	;Get low 8 bytes of the value
+	MOVL	EDX, knlDcValue+4
+	MOVL	EBX, dct_data.B[ESI]	;Get data value
+	MOVZWL	ECX, dct_length.B[ESI]	;Get length of the value
+52$:	PUSHL	FS
+	PUSHL	ESI
+	PUSHL	EDI
+	PUSHL	EBP
+	MOVL	EBP, 0.B[EBP]
+	CLC
+	CALLI	dct_setsub.B[ESI]	;Call the set subroutine
+	POPL	EBP
+	POPL	EDI
+	POPL	ESI
+	POPL	FS
+	POPL	EDX
+	JC	dcerror			;If error
+	IFFAULT	knlQAdrErr0#
+	MOVB	AL, FS:[EDX]		;OK
+	MOVB	AH, AL
+	ANDB	AH, #0Fh		;Fall into getchar on next page
+.PAGE
+;Here to get the value of a characteristic
+
+getchar:CMPB	AH, #REP_STR		;Did he give a string value?
+	JE	2$.S			;Yes
+	CMPB	AH, #REP_DATAS		;No - binary string?
+	JNE	10$			;No
+2$:	TESTB	AL, #PAR$GET		;Yes - getting value?
+	JE	nxtstr.S		;No
+	MOVL	ECX, dc_iadj.B[EBP]
+	IFFAULT	knlQAdrErr0#		       ;Yes - get length of his string
+	MOVZWL	ECX, FS:dcv_vbfrlen.B[EDX+ECX] ;  buffer
+	MOVL	EBX, #dcv_value		;Get address of his string buffer
+	CALL	dcgetaddri
+	JC	4$.S
+	CMPB	knlForkLvl#, #FORK_XFF
+	JAE	3$.S
+	PUSHL	EDX
+	PUSHL	FS
+	PUSHL	ESI
+	PUSHL	ECX
+	CALL	knlIoBufrChk#		;Make sure buffer is writable
+	POPL	ECX
+	POPL	ESI
+	POPL	FS
+	POPL	EDX
+	JC	dcerror.S
+3$:	PUSHL	EDX
+	PUSHL	FS
+	PUSHL	ESI
+	PUSHL	EDI
+	PUSHL	EBP
+	MOVL	EAX, dc_iadj.B[EBP]	;Get address of the count word
+	LEAL	EAX, FS:dcv_vbfrlen.B[EDX+EAX]
+	MOVL	EBP, 0.B[EBP]
+	MOVL	EDX, dct_data.B[ESI]
+	CALLI	dct_getsub.B[ESI]
+	POPL	EBP
+	POPL	EDI
+	POPL	ESI
+	POPL	FS
+	POPL	EDX
+	JC	dcerror.S
+	MOVL	EAX, dc_iadj.B[EBP]
+	IFFAULT	knlQAdrErr0#
+	MOVW	FS:dcv_vstrlen.B[EDX+EAX], CX ;Store length of string
+nxtstr:	TESTB	dct_flags.B[ESI], #DCTF$LNKELMT ;Linked element?
+	JE	nxtstr2.S		;No
+	CALLI	dct_lnkdone.B[ESI]	;Yes - call the done routine
+nxtstr2:ADDL	EDX, #dcv_SIZE.B	;Bump pointer by size of a string
+	ADDL	EDX, dc_iadj.B[EBP]
+	JMP	dcharval2		;Continue
+
+
+dcbadval:
+	MOVL	EAX, #ER_CHARV
+
+;Here if error indicated by device
+
+dcerror:BTL	EAX, #31t		;Really have an error code?
+	JNC	6$.S			;No!
+	IFFAULT	knlQAdrErr0#
+dcerr2:	ORB	FS:[EDX], #PAR$ERROR
+4$:
+	CLRL	ECX
+	STC
+	RET
+
+6$:	CRASH	BDEC			;[BaD Error Code]
+
+;Here if not a string value
+
+10$:	TESTB	AL, #PAR$GET		;Getting value?
+	JE	nxtval			;No
+	IFFAULT	knlQAdrErr0#		;Yes
+	MOVB	AL, FS:dcv_vallen.B[EDX] ;Is his value field big enough?
+	CMPB	AL, dct_length.B[ESI]
+	JB	dcbadval.S		;No - fail
+	PUSHL	EDX			;Yes - get value for device
+	PUSHL	FS
+	PUSHL	ESI
+	PUSHL	EDI
+	PUSHL	EBP
+	MOVL	EBP, 0.B[EBP]
+	MOVL	EBX, dct_data.B[ESI]
+	CLC
+	CALLI	dct_getsub.B[ESI]
+	POPL	EBP
+	POPL	EDI
+	POPL	ESI
+	POPL	FS
+	MOVL	knlDcValue+0t, EAX	;Store value in our buffer
+	MOVL	knlDcValue+4t, EDX
+	POPL	EDX
+	JC	dcerror.S		;If error
+	CLRL	EAX			;Zero rest of the buffer
+	MOVL	knlDcValue+8t, EAX
+	MOVL	knlDcValue+12t, EAX
+	MOVZBL	ECX, dct_length.B[ESI]	;Get length of the value
+	IFFAULT	knlQAdrErr0#
+	MOVZBL	EAX, FS:dcv_vallen.B[EDX] ;Get length of his field
+	SUBL	EAX, ECX		;Calculate amount to zero
+	PUSHL	EDI
+	PUSHL	ESI
+	LEAL	EDI, dcv_value.B[EDX]
+	ADDL	EDI, dc_iadj.B[EBP]
+	PUSHL	FS
+	POPL	ES
+	MOVL	ESI, #knlDcValue	;Assume not a long value
+	CMPL	ECX, #8t.B		;Right?
+	JBE	12$.S			;Yes
+	MOVL	ESI, [ESI]		;No - get right buffer offset
+	ORL	ESI, ESI		;Null value?
+	JNE	12$.S			;No
+	MOVL	ESI, #nullvalue		;Yes
+12$:	CLD
+	IFFAULT	dcadrer2
+	RMOVSB	[EDI], [ESI]		;Copy the data
+	MOVL	ECX, EAX
+	CLRL	EAX
+	IFFAULT	dcadrer2
+	RSTOSB	[EDI]			;Zero the rest of his field
+	POPL	ESI
+	POPL	EDI
+	IFFAULT	knlQAdrErr0#
+nxtval:	TESTB	dct_flags.B[ESI], #DCTF$LNKELMT ;Linked element?
+	JE	nxtval2.S		;No
+	CALLI	dct_lnkdone.B[ESI]	;Yes - call the done routine
+nxtval2:MOVZBL	EAX, FS:dcv_vallen.B[EDX] ;Get length of non-string item
+	LEAL	EDX, dcv_value.B[EDX+EAX] ;Bump pointer
+	ADDL	EDX, dc_iadj.B[EBP]
+	JMP	dcharval2		;Continue
+
+	FAULTHDR
+dcadrer3:
+	POPL	EDI
+	POPL	ESI
+	POPL	EDX
+	JMP	knlQAdrErr0#
+
+	FAULTHDR
+dcadrer2:
+	POPL	ESI
+	POPL	EDI
+	JMP	knlQAdrErr0#
+.PAGE
+	.SBTTL	classfunc - Class functions
+
+;Here for the QFNC_CLASSCHAR queued IO function - Get or set class
+;  characteristics - argument in the QAB are used as follows:
+;	qab_option  - Function:
+;			CF_SIZE    = 1 - Get size needed for complete
+;					   characteristics list without info
+;					   pointers
+;			CF_SIZEIP  = 2 - Get size needed for complete
+;					   characteristics list with info
+;					   pointers
+;			CF_ALL     = 3 - Get names and types of all
+;					   characteristics items without info
+;					   pointers
+;			CF_ALLIP   = 4 - Get names and types of all
+;					   characteristics items with info
+;					   pointers
+;			CF_TYPE    = 5 - Get type of single characteristic
+;					   without info pointers
+;			CF_TYPEIP  = 6 - Get type of single characteristic
+;					   with info pointers
+;			CF_VALUES  = 7 - Get or set characteristics values
+;			CF_ADDUNIT = 8 - Add unit
+;	qab_buffer1 - Address of name of class
+;	qab_buffer2 - Address of characteristics list
+;  Value returned in qab_amount is the number of item processed
+
+;	c{ESI} = Offset of IORB
+;	CALL	classchar
+
+	IFFAULT	10$
+classfunc::
+	LESL	EBX, iorb_buffer1.B[ESI]
+	ENTER	opn_SIZE, 1		;Create an opn stack frame
+	PUSHL	ESI
+	CALL	findclass#		;Find the device class
+	MOVL	EDI, ESI
+	POPL	ESI
+2$:	LEAVE				;Don't need the opn frame any more
+	JC	12$.S			;If error
+	CLRL	EAX			;Clear our data item
+	MOVL	chardata, EAX
+	MOVZBL	EAX, iorb_option.B[ESI]	;Get function
+	CMPL	EAX, #7.B		;Characteristics function?
+	JA	4$.S			;No - go handle general class function
+	IFFAULT	10$			 ;Yes - get address of characteristics
+	LFSL	EDX, iorb_buffer2.B[ESI] ;  list
+	MOVL	EBX, ccb_clschar.B[EDI]	;Get offset of table for class
+	TESTL	EBX, EBX
+	JNE	dochar			;Yes - continue with common code
+	JMP	nochar			;No - fail
+
+;Here if have general class function
+
+4$:	SUBL	EAX, #8.B		;Adjust the function
+	MOVL	EDX, ccb_fdsp.B[EDI]	;Get offset of dispatch table
+	TESTL	EDX, EDX
+	JE	8$.S
+	CMPL	EAX, CS:-4.B[EDX]	;Valid function for class?
+	JA	8$.S			;No
+	JMPIL	CS:[EDX+EAX*4]		;Yes - dispatch to function
+
+;Here if error
+
+8$:	MOVL	EAX, #ER_IFDEV
+	JMP	12$.S
+
+	FAULTHDR
+10$:	MOVL	EAX, #ER_ADRER
+12$:	CALL	knlGiveQel
+	TOFORK
+	CLRL	ECX
+	MOVL	EBX, #QSTS$DONE
+	RET
+.PAGE
+;Subroutine to get user address from device characteristics block
+;	c{EBX}    = Offset in block for address
+;	c{FS:EDX} = Address of block
+;	CALL	dcgetaddr
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	c{ES:EBX} = Address
+
+dcgetaddri:
+	ADDL	EBX, dc_iadj.B[EBP]	;Adjust offset to allow for info pointer
+dcgetaddr::
+	PUSHL	EAX
+	IFFAULT	10$
+	MOVL	EAX, FS:4.B[EDX+EBX]	;Get selector
+	TESTL	EAX, EAX		;Null selector?
+	JE	4$.S			;Yes
+	ORB	AL, #03			;No - make sure its a user selector
+	IFFAULT	10$
+2$:	MOVL	ES, EAX
+	POPL	EAX
+	IFFAULT	knlRtnAdrEr#
+	MOVL	EBX, FS:[EDX+EBX]	;Get offset
+	RET				;Thats all
+
+;Here with null selector
+
+4$:	CMPL	FS:[EDX+EBX], #0.B	;Is the offset null too?
+	JE	2$.S			;Yes - its really a null pointer
+	IFFAULT	10$
+	MOVZWL	EAX, FS:[EDX+EBX]	;No - its a real mode address
+	IFFAULT	10$
+	MOVZWL	EBX, FS:2.B[EDX+EBX]	;Get real mode selector
+	SHLL	EBX, #4			;Calculate offset
+	ADDL	EBX, EAX
+	POPL	EAX
+	PUSHL	#GS_REAL16.B		;Get selector for the real mode segment
+	POPL	ES
+	RET
+
+;Here if address error
+
+	FAULTHDR
+10$:	POPL	EAX
+	JMP	knlRtnAdrEr#
+.PAGE
+;Subroutine to find device characteristic in table for device
+;	c{FS:EDX} = Address of user's characteristic item
+;	CALL	finddchar
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  c{ESI} = Offset of characteristic data
+
+	IFFAULT	knlRtnAdrEr#
+finddchar:
+	ANDB	FS:[EDX], #~PAR$ERROR	;Clear user's error field
+	MOVL	ECX, #8			;Copy up to 8 name characters
+	PUSHL	EDX
+	PUSHL	#0.B			;Clear 8 bytes on the stack
+	PUSHL	#0.B
+	INCL	EDX			;Skip the type and length bytes
+	INCL	EDX
+	MOVL	ESI, ESP
+	IFFAULT	10$
+2$:	MOVB	AL, FS:[EDX]		;Get character
+	INCL	EDX
+	CMPB	AL, #0			;End of name?
+	JE	6$.S			;Yes
+	CMPB	AL, #'a'		;No - lower case?
+	JB	4$.S			;No
+	SUBB	AL, #'a'-'A'		;Yes - convert to upper case
+4$:	MOVB	SS:[ESI], AL		;Store character
+	INCL	ESI
+	LOOP	ECX, 2$			;Continue if have more
+6$:	POPL	EBX			;Get name in some registers
+	POPL	EDX
+	MOVL	ESI, dc_table.B[EBP]	;Point to start of table
+	CALL	finddcchk
+	POPL	EDX
+	JNC	8$.S
+	CMPB	dc_errhand.B[EBP], #0	;Bad name - is this fatal?
+	JE	dcerr2			;Yes
+	STC				;No - don't set error bit for
+8$:	RET				;  characteristic
+
+;Here if address error
+
+	FAULTHDR
+10$:	ADDL	ESP, #12t.B
+	JMP	knlRtnAdrEr#
+
+finddcchk:
+	MOVL	ECX, [ESI]		;Get number of entries in table
+	JREGZ	ECX, 16$		;In case table is empty
+	ADDL	ESI, #16t.B		;Bump pointer to first entry
+finddcchk2:
+	TESTB	dct_flags.B[ESI], #DCTF$LNKHEAD|DCTF$INDIR
+	JNE	20$.S
+12$:	CMPL	EBX, dct_name+0.B[ESI]	;This name?
+	JNE	14$.S			;No
+	CMPL	EDX, dct_name+4.B[ESI]	;Maybe
+	JE	18$.S			;Yes
+14$:	ADDL	ESI, #dct_SIZE		;No - bump table pointer
+	LOOP	ECX, finddcchk2		;Continue if more to check
+16$:	MOVL	EAX, #ER_CHARN		;Didn't find the name - fail
+	STC
+18$:	RET
+
+;Here if have linked head or indirect entry
+
+20$:	PUSHL	ESI
+	PUSHL	ECX
+	TESTB	dct_flags.B[ESI], #DCTF$LNKHEAD ;Linked head?
+	JNE	22$.S			;Yes
+	MOVL	ESI, dct_indtable.B[ESI]
+	CALL	finddcchk
+	JMP	24$.S
+
+;Here if have linked head entry
+
+22$:	CALLI	dct_lnkfind.B[ESI]
+24$:	JE	26$.S
+	POPL	ECX
+	POPL	ESI
+	JMP	14$.S
+
+;Here with match
+
+26$:	POPL	EAX
+	POPL	EAX
+	RET				;Return
+.PAGE
+;Subroutine to get total size needed for device characteristics for a table
+;	c{ESI} = Offset of device characteristics table (in code segment)
+;	CALL	getdcsize
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  c{ECX} = Total size needed
+
+getdcsize:
+	MOVL	ECX, [ESI]		;Get number of entries in table
+	JREGZ	ECX, 26$
+	ADDL	ESI, #16t.B		;Point to first entry in table
+getdcsize2:
+	MOVL	EAX, [ESI]		;Get description and flags
+	TESTB	AH, #DCTF$HIDDEN	;Hidden entry?
+	JNE	20$.S			;Yes - don't include it
+	TESTB	AH, #DCTF$INDIR|DCTF$LNKHEAD ;No - indirect or linked entry?
+	JNE	14$.S			;Yes - go handle that
+	ANDB	AL, #PAR$REP
+	CMPB	AL, #REP_STR
+	JE	4$.S
+	CMPB	AL, #REP_DATAS
+	JNE	6$.S
+4$:	MOVL	EAX, #12t
+	JMP	8$.S
+
+6$:	MOVZWL	EAX, dct_length.B[ESI]
+8$:	ADDL	EAX, #10t.B
+	CMPB	gs_info.B[EBP], #0
+	JE	10$.S
+	ADDL	EAX, #12t.B
+10$:	ADDL	gs_size.B[EBP], EAX
+	JMP	20$.S
+
+;Here if have an indirect or extended entry
+
+14$:	PUSHL	ESI
+	PUSHL	ECX
+	TESTB	AH, #DCTF$INDIR		;Indirect entry?
+	JE	16$.S			;No
+	TESTB	AH, #DCTF$HIDDEN	;Hidden entry?
+	JNE	20$.S			;Yes - don't include it
+	MOVL	ESI, dct_indtable.B[ESI] ;Get size of the indirect table
+	CALL	getdcsize
+	JMP	18$.S
+
+;Here if have a linked head entry
+
+16$:	PUSHL	EDI
+	MOVL	EDI, dc_dcb.B[EBP]
+	CALLI	dct_lnkgethd.B[ESI]	;Get first element
+	POPL	EDI
+	JE	18$.S			;If none
+	CALL	getdcsize2
+18$:	POPL	ECX
+	POPL	ESI
+	JC	30$.S
+20$:	TESTB	dct_flags.B[ESI], #DCTF$LNKELMT
+	JNE	28$.S
+	ADDL	ESI, #dct_SIZE.B
+24$:	LOOP	ECX, getdcsize2
+26$:	RET
+
+28$:	MOVL	ESI, dct_lnknext.B[ESI]
+	ORL	ESI, ESI
+	JNE	getdcsize2.S
+30$:	RET
+.PAGE
+	.SBTTL	knlDcGetClass - Subroutine to get class name
+
+;Subroutine to get class name for a device
+;	c{EDI} = Offset of DCB
+;	CALL	knlDcSetClass
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  c{EDX,EAX} = Class name
+
+knlDcGetClass::
+	MOVL	EDX, dcb_ccb.B[EDI]
+	MOVL	EAX, ccb_name+0.B[EDX]
+	MOVL	EDX, ccb_name+4.B[EDX]
+	CLC
+	RET
+
+	.SBTTL	knlDcSetClass - Subroutine to "set" class name
+
+;Subroutine to "set" class name for a device - this really verifies the class
+;  name
+;	c{EDX,EAX} = Class name
+;	c{EDI} = Offset of DCB
+;	CALL	knlDcSetClass
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+
+knlDcSetClass::
+	MOVL	EBX, dcb_ccb.B[EDI]
+	CMPL	EAX, ccb_name+0.B[EBX]
+	JNE	2$.S
+	CMPL	EDX, ccb_name+4.B[EBX]
+	JE	4$.S
+2$:	MOVL	EAX, #ER_IDEVC
+	STC
+4$:	RET
+.PAGE
+	.SBTTL	knlDcGet1Byte - Subroutine to get 1 byte value from the DCB
+
+;Subroutine to get 1 byte device characteristic value from the DCB
+;	c{EBX} = Offset of value in DCB
+;	c{EDI} = Offset of DCB
+;	CALL	knlDcGet1Byte
+;	c{EDX,EAX} = Value
+
+knlDcGet1Byte::
+	MOVZBL	EAX, [EDI+EBX]
+	CLRL	EDX
+	RET
+
+	.SBTTL	knlDcGet2Byte - Subroutine to get 2 byte value from the DCB
+
+;Subroutine to get 2 byte device characteristic value from the DCB
+;	c{EBX} = Offset of value in DCB
+;	c{EDI} = Offset of DCB
+;	CALL	knlDcGet2Byte
+;	c{EDX,EAX} = Value
+
+knlDcGet2Byte::
+	MOVZWL	EAX, [EDI+EBX]
+	CLRL	EDX
+	RET
+
+	.SBTTL	knlDcGet4Byte - Subroutine to get 4 byte value from the DCB
+
+;Subroutine to get 4 byte device characteristic value from the DCB
+;	c{EBX} = Offset of value in DCB
+;	c{EDI} = Offset of DCB
+;	CALL	knlDcGet4Byte
+;	c{EDX,EAX} = Value
+
+knlDcGet4Byte::
+	MOVL	EAX, [EDI+EBX]
+	CLRL	EDX
+	RET
+
+	.SBTTL	knlDcGet8Byte - Subroutine to get 8 byte value from the DCB
+
+;Subroutine to get 8 byte device characteristic value from the DCB
+;	c{EBX} = Offset of value in DCB
+;	c{EDI} = Offset of DCB
+;	CALL	knlDcGet1Byte
+;	c{EDX,EAX} = Value
+
+knlDcGet8Byte::
+	MOVL	EAX, [EDI+EBX]
+	MOVL	EDX, 4.B[EDI+EBX]
+	CLC
+	RET
+
+	.SBTTL	knlDcGetLong - Subroutine to get more than 8 byte value from the DCB
+
+;Subroutine to get more than 8 byte device characteristic value from the DCB
+;	c{EBX} = Offset of value in DCB
+;	c{EDI} = Offset of DCB
+;	CALL	knlDcGetLong
+;	c{EAX} = Offset of first byte of value
+
+knlDcGetLongDcb::
+	ADDL	EBX, EDI
+knlDcGetLong::
+	MOVL	EAX, EBX		;Get offset of value in right register
+	CLC
+	RET
+.PAGE
+
+	.SBTTL	knlDcGetStr - Subroutine to get string value from the DCB
+
+;Subroutine to get string device characteristic value from the DCB
+;	c{ES:EBX} = Address of user's buffer
+;	c{EDX}    = Offset of string in DCB
+;	c{EDI}    = Offset of DCB
+;	CALL	knlDcGetStr
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  c{ECX} = Length of string stored
+
+knlDcGetStr::
+	ADDL	EDX, EDI		;Get offset of string
+	JMP	knlGetSysStr#		;Go give it to him
+.PAGE
+	.SBTTL	knlDcSet1Byte - Subroutine to set 1 byte value in the DCB
+
+;Subroutine to set 1 byte device characteristic value in the DCB
+;	c{EDX,EAX} = Value
+;	c{EBX} = Offset of value in DCB
+;	c{EDI} = Offset of DCB
+;	CALL	knlDcSet1Byte
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+
+knlDcSet1Byte::
+	CMPL	EAX, #0FFh		;Make sure valid value
+	JA	4$.S
+	TESTL	EDX, EDX
+	JNE	4$.S
+	MOVB	[EDI+EBX], AL		;OK - store new value
+	RET
+
+;Here if bad value
+
+4$:	MOVL	EAX, #ER_CHARV
+	STC
+	RET
+
+	.SBTTL	knlDcSet2Byte - Subroutine to set 2 byte value in the DCB
+
+;Subroutine to set 2 byte device characteristic value in the DCB
+;	c{EDX,EAX} = Value
+;	c{EBX} = Offset of value in DCB
+;	c{EDI} = Offset of DCB
+;	CALL	knlDcSet2Byte
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+
+knlDcSet2Byte::
+	CMPL	EAX, #0FFFFh		;Make sure valid value
+	JA	4$.S
+	TESTL	EDX, EDX
+	JNE	4$.S
+	MOVL	[EDI+EBX], EAX		;OK - store new value
+	RET
+
+	.SBTTL	knlDcSet4Byte - Subroutine to set 4 byte value in the DCB
+
+;Subroutine to set 4 byte device characteristic value in the DCB
+;	c{EDX,EAX} = Value
+;	c{EBX} = Offset of value in DCB
+;	c{EDI} = Offset of DCB
+;	CALL	knlDcSet4Byte
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+
+knlDcSet4Byte::
+	TESTL	EDX, EDX		;Make sure valid value
+	JNE	4$.S
+	MOVL	[EDI+EBX], EAX		;OK - store new value
+	CLC
+	RET
+
+	.SBTTL	knlDcSetLongDcb - Subroutine to set longer than 8 byte value in the DCB
+
+;Subroutine to set longer than 8 byte device characteristic value in the DCB
+;  - value is in knlDcValue
+;	c{EBX} = Offset of value in DCB
+;	c{EDI} = Offset of DCB
+;	CALL	knlDcSetLong
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+
+knlDcSetLongDcb::
+	ADDL	EBX, EDI
+knlDcSetLong::
+	MOVZBL	ECX, dct_length.B[ESI]	;Get length of value
+	MOVL	EDI, EBX		;Get offset to receive value
+	PUSHL	DS
+	POPL	ES
+	MOVL	ESI, #knlDcValue
+	CLD
+	RMOVSB	[EDI], [ESI]		;Copy value
+	RET
+.PAGE
+;Subroutine to see if characteristic or parameter value is "YES" or "NO"
+;	c{EAX} = First 4 characters of value
+;	c{EDX} = Second 4 characters of value
+;	CALL	knlGetYesNo
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  Z:set = Value was "Y" or "YES"
+;	  Z:clr = Value was "N" or "NO"
+
+knlGetYesNo::
+	CMPL	EAX, #'YES'		;Want to set the bit?
+	JE	4$.S			;Yes
+	CMPL	EAX, #'Y'		;Maybe
+	JE	4$.S
+	CMPL	EAX, #'NO'		;No - want to clear it?
+	JE	2$.S			;Yes
+	CMPL	EAX, #'N'
+	JNE	6$.S			;No - say bad value!
+2$:	TESTL	EAX, EAX		;Yes - clear Z to indicate "NO"
+4$:	RET
+
+6$:	MOVL	EAX, #ER_CHARV
+	STC
+	RET
+.PAGE
+	.SBTTL	knlGetDcVal1 - Subroutine to search table for device characteristics value
+
+;Subroutine to search table for device characteristics value using tight table
+;  - comparison is on the first character only or on the entire value - format
+;  of each table is entry is an 8 byte name only
+;	c{EBX}     = Offset of table
+;	c{ECX}     = Number of entries in table
+;	c{EAX,EDX} = Name (8 bytes)
+;	CALL	knlGetDcVal1
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  c{EAX} = Table index
+;	  c{EBX} = Offset of matching entry
+
+knlGetDcVal1::
+	PUSHL	EBX
+2$:	CMPB	AL, CS:[EBX]		;Check first character
+	JE	6$.S			;If match
+4$:	ADDL	EBX, #8.B		;Not match - bump pointer
+	LOOP	ECX, 2$			;Continue if more to check
+	POPL	EBX
+	MOVL	EAX, #ER_CHARV		;Not found - report bad parameter value
+	STC
+	RET
+
+;Here with match on first character
+
+6$:	CMPB	AH, #0			;More than one character given?
+	JE	8$.S			;No - success
+	CMPL	EAX, CS:[EBX]		;Yes - check it all
+	JNE	4$.S
+	CMPL	EDX, CS:4.B[EBX]
+	JNE	4$.S			;Different - continue if more to check
+8$:	POPL	EAX			;Restore original table offset
+	SUBL	EAX, EBX		;Calculate index
+	NEGL	EAX
+	SHRL	EAX, #3
+	RET				;Return success
+.PAGE
+	.SBTTL	knlGetDcVal2 - Subroutine to search table for device characteristics value
+
+;Subroutine to search table for device characteristics value using table with
+;  values - comparison is on the first character only or on the entire value
+;  - format of each table is entry is 8 byte name followed by 4 byte value
+;	c{EBX}     = Offset of table
+;	c{ECX}     = Number of entries in table
+;	c{EAX,EDX} = Name (8 bytes)
+;	CALL	knlGetDcVal2
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  c{EAX} = Value
+;	  c{EBX} = Offset of matching entry
+
+knlGetDcVal2::
+	CMPB	AL, CS:[EBX]		;Check first character
+	JE	6$.S			;If match
+4$:	ADDL	EBX, #12t.B		;Not match - bump pointer
+	LOOP	ECX, knlGetDcVal2	;Continue if more to check
+	MOVL	EAX, #ER_CHARV		;Not found - report bad parameter value
+	STC
+	RET
+
+;Here with match on first character
+
+6$:	CMPB	AH, #0			;More than one character given?
+	JE	8$.S			;No - success
+	CMPL	EAX, CS:[EBX]		;Yes - check it all
+	JNE	4$.S
+	CMPL	EDX, CS:4.B[EBX]
+	JNE	4$.S			;Different - continue if more
+8$:	MOVL	EAX, CS:8.B[EBX]	;Get value
+	RET				;Return success
+.PAGE
+	.SBTTL	knlGetDcName - Subroutine to search table for device characteristics name
+
+;Subroutine to search table for device characteristics name given its value
+;	c{EBX} = Offset of table
+;	c{ECX} = Number of entries in table
+;	c{EAX} = Value
+;	CALL	knlGetDcName
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  c{EAX,EDX} = Name
+;	  c{EBX}     = Offset of matching entry
+
+knlGetDcName::
+	CMPL	EAX, CS:8.B[EBX]	;Check value
+	JE	6$.S			;If match
+	ADDL	EBX, #12t.B		;Not match - bump pointer
+	LOOP	ECX, knlGetDcName	;Continue if more to check
+4$:	MOVL	EAX, #ER_CHARV		;Not found - report bad parameter value
+	STC
+	RET
+
+;Here with match on value
+
+6$:	MOVL	EAX, CS:[EBX]		;Get name
+	MOVL	EDX, CS:4.B[EBX]
+	RET				;Return success
+.PAGE
+	.SBTTL	knlGetNullS - Subroutine to return null string for device characteristic
+
+;Subroutine to return a null string for a device characteristic
+
+;	c{ES:EBX} = Address of buffer
+;	c{ECX}    = Size of buffer
+;	CALL	knlGetNullS
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  c{ECX} = 0;
+
+knlGetDcNullS::
+	JREGZ	ECX, 4$
+	MOVB	ES:[EBX], #0
+4$:	CLRL	ECX
+	RET
+
+	.SBTTL	Data
+
+	DATA
+
+	  .MOD	4
+chardata::  .LONG 0
+knlDcValue::.BLKL 4
+nullvalue:  .LONG 0, 0, 0, 0
+
+	END

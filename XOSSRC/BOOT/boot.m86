@@ -1,0 +1,2045 @@
+	.TITLE	BOOT - XOS disk bootstrap
+
+;++++
+; This software is in the public domain.  It may be freely copied and used
+; for whatever purpose you see fit, including commerical uses.  Anyone
+; modifying this software may claim ownership of the modifications, but not
+; the complete derived code.  It would be appreciated if the authors were
+; told what this software is being used for, but this is not a requirement.
+
+;   THIS SOFTWARE IS PROVIDED BY THE AUTHORS "AS IS" AND ANY EXPRESS OR
+;   IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
+;   OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+;   IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+;   INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+;   BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS
+;   OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+;   ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR
+;   TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
+;   USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+;----
+
+;This is a 3 level bootstrap.  Level 1 is contained in a single block and
+;  is stored in the boot block of the disk or partition.  Level 2 is also
+;  contained in a single block and is stored in the first 512 bytes of the
+;  XOS.BSF file.  Level 3 is as long as necessary and is stored starting at
+;  offset 1024 in the XOS.BSF file.  The level 1 bootstrap contains enough
+;  code to search the root directory and find the XOS.BSF file and read its
+;  first block into memory.  It cannot follow FAT chains.  The level 2
+;  bootstrap mainly contains code for following FAT chains which it uses to
+;  load the level 3 bootstrap.  It uses the basic disk input routine contained
+;  in the level 1 bootstrap.  These two levels are separate because there is
+;  not enough space available in the boot block for the necessary code to load
+;  discontiguous files.  The level 3 bootstrap is a completely separate
+;  program that does not use any code from the level 1 or 2 bootstraps.  A
+;  copy of the original DOS boot block is kept in XOS.BSF at offset 512.  It
+;  is copied to its normal place in memory and used to boot DOS when this is
+;  requested.
+
+	.PROC	80386
+	.STK16
+
+	.INCLUD	XOSINC:\XMAC\XOS.PAR
+	.INCLUD	XOSINC:\XMAC\XOSX.PAR
+	.INCLUD	XOSINC:\XMAC\XOSRUN.PAR
+	.INCLUD XOSINC:\XMAC\XOSDISK.PAR
+	.INCLUD	XOSINC:\XMAC\XOSXDISK.PAR
+	.INCLUD XOSINC:\XMAC\XOSXDFS.PAR
+	.INCLUD	BOOT.PAR
+
+	.SEG	boot_s  , DATA, READ, WRITE, 16BIT
+	.MSECT	level3_m, boot_s, ADDR=8400h
+	.PSECT	level3_p, level3_m
+
+AM$OUT=!07h
+AM$TO =!07h
+AM$BRD=!07h
+AM$INV=!70h
+AM$INP=!70h
+AM$ERR=!07h
+
+AC$OUT=!30h
+AC$TO =!3Eh
+AC$BRD=!31h
+AC$INV=!17h
+AC$INP=!1Fh
+AC$ERR=!34h
+
+;Define offsets for the partition table entries
+
+$$$=!0
+BLK pt_type    , 1t		;Partition type (bit 7 set if extended
+				;  partition)
+BLK pt_dosname , 1t		;DOS disk name (ASCII)
+BLK            , 2t
+BLK pt_head    , 1t
+BLK pt_sector  , 1t
+BLK pt_cylinder, 2t
+BLK pt_begin   , 4t
+BLK pt_size    , 4t
+pt_SIZE=!$$$
+
+bb =!7C00h			;Offset of boot block
+cfg=!8000h			;Offset of configuration block
+ob =!8200h			;Offset of saved previous boot block
+
+;The contents of this file is loaded starting at lvl3 = 0:8400. The saved
+;  boot block is loaded at 0:8200 and the configuration block is loaded at
+;  cfg = 0:8000.
+
+	.WORD	VERSION, EDITNUM
+
+;Enter here from the level 1 (FAT32) or level 2 (FAT16 or FAT12) code.  When
+;  get here, c(DS) = 0, c(CS:IP) = 600:2404h, c(ss) = 600h, and c(DL) = default
+;  disk (00 or 80).
+
+level3::
+.IF NE $$GECKO
+	PUSHFW
+	CALLF	geckoentr#
+.ENDC
+	CLRW	AX			;Clear our data segment
+	MOVW	ES, AX
+	MOVW	CX, #{datatop-firstdata+1}/2
+	MOVW	DI, #firstdata
+	CLD
+	RSTOSW	[DI]
+	MOVB	defunit, DL		;Store default device
+	MOVB	defpart, #0
+	INT	12h			;Get memory size in 1K blocks
+	SHLW	AX, #6			;Change to number of paragraphs
+	MOVW	memsize, AX		;Save it for use later
+	MOVB	atrout, #AM$OUT		;Assume not color display
+	MOVB	atrto, #AM$TO
+	MOVB	atrinp, #AM$INP
+	MOVB	atrinv, #AM$INV
+	MOVB	atrbrd, #AM$BRD
+	MOVB	atrerr, #AM$ERR
+	MOVW	curtype, #0B0Ch
+	MOVW	AX, #0F00h		;Get display mode
+	INT	10h
+	MOVB	dispmode, AL		;Remember if for later
+	CMPB	AL, #7			;Is it 7?
+	JE	4$.S			;Yes - it must be monochrome
+	CMPW	cfg+cfg_timeout, #-1.B	;Auto mode?
+	JE	2$.S			;Yes - don't use color attributes
+	MOVB	atrout, #AC$OUT		;No - set attributes for color display
+	MOVB	atrto, #AC$TO
+	MOVB	atrinp, #AC$INP
+	MOVB	atrinv, #AC$INV
+	MOVB	atrbrd, #AC$BRD
+	MOVB	atrerr, #AC$ERR
+2$:	MOVW	curtype,  #0708
+4$:	MOVB	AL, dispmode		;Initialize the display
+	MOVB	AH, #0
+	INT	10h
+	MOVW	CX, curtype		;Set up the cursor
+	ORB	CH, #20h
+	MOVB	AH, #01h
+	INT	10h
+	MOVW	0+0, #diverr		;Set up the divide error vector
+	MOVW	0+2, CS
+	CMPW	cfg+cfg_timeout, #-1.B	;Auto mode?
+	JNE	6$.S			;No - go set up screen
+	PUSHW	DS			;Yes - clear our data area
+	POPW	ES
+	MOVW	CX, #{datatop-firstclr+1}/2
+	MOVW	DI, #firstclr
+	CLRW	AX
+	CLD
+	RSTOSW	[DI]
+	MOVW	DI, #lblmsg+1		;Just display our label
+	MOVB	AL, atrout
+	MOVW	DX, #-1
+	CALL	outstr
+	MOVW	DI, #crlf
+	MOVB	AH, atrout
+	MOVW	DX, #-1
+	CALL	outstr
+	MOVW	DI, #inpbufr
+	JMP	havin2			;Go load program
+
+;Here if not auto mode
+
+6$:	MOVW	AX, #600h		;Write background for our window
+	MOVB	BH, atrout
+	CLRW	CX
+	MOVB	DH, cfg+cfg_numline
+	ADDB	DH, #6
+	MOVB	DL, #79t
+	INT	10h
+	MOVB	AH, atrbrd
+	MOVB	AL, #0CDh		;Store top line
+	CLRW	DX
+	MOVW	CX, #80t
+	CALL	outchrn
+	MOVB	AH, atrbrd
+	MOVB	AL, #0CDh		;Store bottom line
+	MOVB	DH, cfg+cfg_numline
+	ADDB	DH, #6
+	MOVB	DL, #0
+	MOVW	CX, #80t
+	CALL	outchrn
+	MOVW	CX, cfg+cfg_numline	;Store left and right sides
+	ADDW	CX, #6.B
+	MOVW	DX, #100h
+8$:	PUSHW	CX
+	PUSHW	DX
+	MOVB	AH, atrbrd
+	MOVB	AL, #0BAh		;Store left side line
+	CALL	outchr
+	POPW	DX
+	PUSHW	DX
+	MOVB	DL, #79t
+	MOVB	AH, atrbrd
+	MOVB	AL, #0BAh		;Store right side line
+	CALL	outchr
+	POPW	DX
+	INCB	DH
+	POPW	CX
+	LOOP	CX, 8$
+	MOVB	AH, atrbrd		;Store corners
+	MOVB	AL, #0C9h
+	CLRW	DX
+	CALL	outchr
+	MOVB	AH, atrbrd
+	MOVB	AL, #0BBh
+	MOVW	DX, #79t
+	CALL	outchr
+	MOVB	AH, atrbrd
+	MOVB	AL, #0C8h
+	MOVB	DH, cfg+cfg_numline
+	ADDB	DH, #6
+	MOVB	DL, #0
+	CALL	outchr
+	MOVB	AH, atrbrd
+	MOVB	AL, #0BCh
+	MOVB	DH, cfg+cfg_numline
+	ADDB	DH, #6
+	MOVB	DL, #79t
+	CALL	outchr
+	MOVW	DI, #lblmsg		;Store label over center of the
+	MOVW	DX, #{80t-LBLMSGSZ}/2	;  top line
+	MOVB	AL, atrinv
+	CALL	outstr
+	CMPB	cfg+cfg_f10name+2, #0	;Do we have a name for F10?
+	JNE	10$.S			;Yes
+	MOVB	ins2msg, #0		;No - truncate this message
+10$:	MOVW	DI, #ins1msg
+	MOVW	DX, #2*100h+15t
+	MOVB	AL, atrout
+	CALL	outstr
+	MOVW	DI, #ins3msg
+	MOVW	DX, #3*100h+15t
+	MOVB	AL, atrout
+	CALL	outstr
+	MOVW	DI, #cfg+cfg_dftname
+	MOVW	DX, #-1
+	MOVB	AL, atrout
+	CALL	outstr		;Fall into getinp on next page
+.PAGE
+;Here to get keyboard input
+
+getinp:	PUSHW	DS			;Clear our data area
+	POPW	ES
+	MOVW	CX, #{datatop-firstclr+1}/2
+	MOVW	DI, #firstclr
+	CLRW	AX
+	CLD
+	RSTOSW	[DI]
+	CALL	putmenu			;Put the menu on the screen
+2$:	MOVB	BH, atrout		;Clear the input line
+	MOVW	CX, #5*100h+1t
+	MOVW	DX, #5*100h+78t
+	MOVW	AX, #600h
+	INT	10h
+	MOVB	BH, atrinp		;Write the input window
+	MOVW	CX, #5*100h+19t
+	MOVW	DX, #5*100h+62t
+	MOVW	AX, #600h
+	INT	10h
+	MOVW	inppnt, #inpbufr	;Initialize the input buffer
+	MOVW	inpcnt, #0
+	MOVB	echopos, #20t
+4$:	MOVB	DH, #05h		;Display cursor at input position
+	MOVB	DL, echopos
+	MOVB	BH, #0
+	MOVB	AH, #2
+	INT	10h
+	CALL	curon			;Make cursor visible
+	CMPW	cfg+cfg_timeout, #0.B	;Doing timing?
+	JLE	16$			;No - just go wait for character
+	MOVB	AH, #0			;Yes - get clock tick value
+	INT	1Ah
+	MOVW	bgntime+0, DX
+	MOVW	bgntime+2, CX
+	MOVW	lastsec, #-1		;Force display first time
+6$:	MOVB	AH, #1			;See if have any keyboard input
+	INT	16h
+	JNE	14$			;If have input
+	MOVB	AH, #0			;No input - get clock tick value
+	INT	1Ah
+	SUBW	DX, bgntime+0		;Get difference
+	SBBW	CX, bgntime+2
+	JNS	8$.S			;If did not wrap around
+	ADDW	DX, #00B0h		;Wrapped around midnite - fix it up
+	ADCW	CX, #0018h
+8$:	MOVW	AX, cfg+cfg_timeout	;Get timeout period
+	SUBW	AX, DX			;Minus amount elapsed
+	JLE	12$.S			;If timed-out
+	CLRW	DX			;Change to seconds (approximately)
+	ADDW	AX, #17t
+	MOVW	CX, #18t
+	DIVW	CX
+	CMPW	AX, lastsec		;Have we displayed this value?
+	JE	6$.S			;No - continue waiting
+	MOVW	lastsec, AX
+	MOVW	DI, #buffer
+	PUSHW	DS
+	POPW	ES
+	MOVW	SI, #cfg+cfg_dftname
+	CALL	copytxt
+	MOVW	SI, #wtmsg1
+	CALL	copytxt
+	MOVW	AX, lastsec
+	CALL	decvtxt
+	MOVW	SI, #wtmsg2
+	CALL	copytxt
+	CMPW	lastsec, #1.B
+	JE	10$.S
+	MOVB	AL, #'s'
+	STOSB	[DI]
+10$:	MOVW	[DI], #' '
+	MOVW	DI, #buffer
+	MOVB	65t.B[DI], #0		;Make sure not too long
+	MOVW	DX,#4*100h+15t
+	MOVB	AL, atrto
+	CALL	outstr
+	MOVB	DH, #05h		;Display cursor at input position
+	MOVB	DL, echopos
+	MOVB	BH, #0
+	MOVB	AH, #2
+	INT	10h
+	JMP	6$
+
+;Here if have timed-out - load default program
+
+12$:	MOVB	BH, atrout		;Remove the time-out message
+	MOVW	CX, #4*100h+15t
+	MOVW	DX, #4*100h+78t
+	MOVW	AX, #600h
+	INT	10h
+	MOVW	cfg+cfg_timeout, #0	;Only do this once
+	MOVW	DI, #inpbufr
+	JMP	havin2			;Go do default action
+
+;Here if have keyboard character available
+
+14$:	MOVB	BH, atrout		;Remove the time-out message
+	MOVW	CX, #4*100h+15t
+	MOVW	DX, #4*100h+78t
+	MOVW	AX, #600h
+	INT	10h
+	MOVW	cfg+cfg_timeout, #0	;Disable time-out
+16$:	MOVB	AH, #0			;Get keyboard character
+	INT	16h
+	CMPB	AL, #0			;ASCII character?
+	JE	22$.S			;No - go handle this
+	CMPB	AL, #0Dh		;Yes - return?
+	JE	havinp			;Yes - all done here
+	CMPB	AL, #'X'-40h		;Control-X?
+18$:	JE	2$			;Yes - clear the input buffer
+	CMPB	AL, #'U'-40h		;Control-U?
+	JE	18$.S			;Yes - same as control-X
+	CMPB	AL, #'H'-40h		;Backspace?
+	JNE	26$.S
+	CMPB	inpcnt, #0		;Yes - have any input?
+	JE	20$.S			;No - ignore this
+	DECB	inpcnt			;Yes - delete last character
+	DECW	inppnt
+	DECB	echopos
+	MOVB	DL, echopos		;Erase the character we just deleted
+	MOVB	DH, #5
+	MOVB	AH, atrinp
+	MOVB	AL, #' '
+	CALL	outchr
+20$:	JMP	4$			;Continue
+
+;Here with non-ASCII character
+
+22$:	SUBB	AH, #59t		;Is it a function key?
+	JL	20$.S			;No - ignore it
+	CMPB	AH, #9
+	JA	20$.S
+	MOVB	BL, AH			;Calculate offset of definition
+	MOVB	BH, #0
+	IMULW	BX, #44t.B
+	ADDW	BX, #cfg+cfg_f1name+2
+	CMPB	[BX], #0		;Is this key defined?
+	JE	20$.S			;No - ignore it
+	MOVW	DI, #inpbufr		;Yes - copy name to input buffer
+	PUSHW	DS
+	POPW	ES
+	MOVW	SI, BX
+	CLD
+24$:	LODSB	[SI]
+	STOSB	[DI]
+	CMPB	AL, #0
+	JNE	24$.S
+	JMP	havin6.S		;Go load program
+
+;Here with non-special ASCII character
+
+26$:	CMPB	AL, #' '		;Is it a printing character?
+	JBE	30$.S			;No - ignore it
+	CMPB	AL, #7Fh		;Is it a high character?
+	JAE	30$.S			;Yes - ignore it
+	CMPB	AL, #'a'		;Lower case?
+	JB	28$.S			;No
+	CMPB	AL, #'z'
+	JA	28$.S
+	SUBB	AL, #'a'-'A'		;Yes - convert to upper case
+28$:	CMPB	inpcnt, #42t		;Too many characters?
+	JAE	30$.S			;Yes - ignore this one!
+	MOVW	DI, inppnt		;No - store in input buffer
+	MOVB	[DI], AL
+	INCW	inppnt
+	INCB	inpcnt
+	MOVB	DL, echopos		;Echo the character
+	MOVB	DH, #5
+	MOVB	AH, atrinp
+	CALL	outchr
+	INCB	echopos
+30$:	JMP	4$			;Go back for another character
+.PAGE
+;Here with return
+
+havinp:	MOVW	DI, inppnt		;Put null at end of input
+	MOVB	[DI], #0
+	CMPW	DI, #inpbufr		;Null input?
+	JE	havin2.S		;Yes - use default name
+	CMPB	-1.B[DI], #':'		;No - device only?
+	JNE	havin6.S		;No - go on
+havin2:	PUSHW	DS			;Yes
+	POPW	ES
+	MOVW	SI, #cfg+cfg_dftname	;Copy default name to the name
+4$:	LODSB	[SI]
+	STOSB	[DI]
+	CMPB	AL, #0
+	JNE	4$.S
+havin6:	CALL	curoff			;Remove cursor from screen
+	MOVW	DX, #-1
+	CMPW	cfg+cfg_timeout, #-1.B	;Doing auto load?
+	JE	6$.S			;Yes
+	MOVB	BH, atrout		;No - remove the input window
+	MOVW	CX, #5*100h+1t
+	MOVW	DX, #5*100h+78t
+	MOVW	AX, #600h
+	INT	10h
+	MOVW	DX, #5*100h+15t		;Tell him what we are loading
+6$:	MOVW	DI, #loadstr
+	MOVB	AL, atrout
+	CALL	outstr
+	MOVW	DI, #inpbufr
+	PUSHW	DS
+	POPW	ES
+	MOVW	DX, #-1
+	MOVB	AL, atrout
+	CALL	outstr
+	CMPW	cfg+cfg_timeout, #-1.B	;Doing auto load?
+	JNE	8$.S			;No
+	MOVW	DI, #crlf		;Yes - go to next line
+	MOVW	DX, #-1
+	MOVB	AL, atrout
+	CALL	outstr
+	CALL	curon			;And make the cursor visible
+8$:	CMPL	inpbufr+0, #'DOS'	;Does he want to boot DOS?
+	JNE	12$.S			;No
+	CMPW	ob, #0.B		;Yes - do we have a DOS bootstrap?
+	JE	4$.S			;No - fail
+	MOVL	EAX, flptblsave		;Yes - restore address of original
+	MOVL	78h, EAX		;  floppy parameter table
+	MOVB	DH, cfg+cfg_numline	;Put cursor below our window
+	ADDB	DH, #8
+	MOVB	DL, #0
+	MOVB	BH, #0
+	MOVB	AH, #2
+	INT	10h
+	CALL	curon			;Make the cursor visible
+	CLI				;No more interrupts here
+	MOVW	SI, #ob
+	PUSHW	DS			;Copy the DOS bootstrap to where it
+	POPW	ES			;  should be
+	MOVW	DI, #bb+db_jump
+	MOVW	CX, #512t/2
+	CLD
+	RMOVSW	[DI], [SI]
+	MOVW	SP, #cb-408-36t		;Make sure stack is right
+	POPW	ES			;Restore registers we were loaded with
+	POPW	DS
+	POPAL
+	MOVL	EAX, CS:cb-408
+	LSSW	SP, CS:cb-404		;Restore the original stack pointer
+	RETF				;Go to the original boot code
+
+;Here if not booting DOS
+
+12$:	MOVB	inpname+0, #0		;Clear the directory name, file name,
+	MOVB	inpdir+0, #0		;  and device name
+	MOVL	devname, #'    '
+	MOVW	SI, #inpbufr		;Point to input buffer
+	MOVW	namebgn, SI
+	CLD
+14$:	LODSB	[SI]			;See if we have a colon
+	CMPB	AL, #':'
+	JE	16$.S
+	ORB	AL, AL
+	JNE	14$.S
+	MOVW	AX, defunit		;No colon - use default device
+	JMP	havdev.S
+
+;Here with colon - use device name given
+
+16$:	MOVW	namebgn, SI
+	MOVW	SI, #inpbufr
+	MOVW	DI, #devname
+	MOVW	CX, #4
+	PUSHW	DS
+	POPW	ES
+18$:	LODSB	[SI]
+	CMPB	AL, #':'
+	JE	namrdy.S
+	DECB	CL
+	JS	nsdver.S		;If name is too long, say no device
+	STOSB	[DI]
+	JMP	18$.S
+.PAGE
+;Here with device name setup
+
+namrdy:	CMPB	devname+1, #' '		;Single character device name?
+	JNE	6$.S			;No
+	MOVB	AL, devname+0		;Yes - get the character
+	CMPB	AL, #'A'		;Letter?
+	JB	nsdver.S		;No
+	CMPB	AL, #'Z'		;Maybe
+	JA	nsdver.S		;No
+	CMPB	AL, #'B'		;Yes - floppy?
+	JA	2$.S			;No
+	SUBB	AL, #'A'
+	JMP	4$.S
+
+;Here if not A: or B:
+
+2$:	CMPB	AL, #'C'		;Is it C:?
+	JNE	4$.S			;No
+	MOVW	AX, #0180h		;Yes - this is always D0P1:
+	JMP	havdev.S
+
+;Here if have single character name between D and Z inclusive.  In this case
+;  we just store the ASCII code in the devunit word.  We use the 40h bit to
+;  flag an "indefinate" name which must be resolved by reading partition
+;  tables on both hard disks!
+
+4$:	MOVB	AH, #0
+	JMP	havdev.S
+
+;Here if do not have a single character name
+
+6$:	MOVW	CX, #DEVTBLSZ		;Get number of device table entries
+	MOVW	BX, #devtbl
+	MOVL	EAX, devname
+8$:	CMPL	[BX], EAX
+	JE	10$.S
+	ADDW	BX, #6.B		;Bump pointer
+	LOOP	CX, 8$			;Continue if more to check
+nsdver:	MOVW	BX, #nsdvmsg		;No such device
+	JMP	booter3
+
+;Here with match found for given device name
+
+10$:	MOVW	AX, 4.B[BX]		;Get unit and partition numbers
+havdev:	MOVW	devunit, AX		;Store unit and partition
+
+;Now see if a directory name was given (we only allow a single directory level)
+
+	MOVW	SI, namebgn		;Point past device name (if any)
+	CLRW	CX			;Count the number of slashes
+12$:	LODSB	[SI]
+	CMPB	AL, #0
+	JE	16$.S
+	CMPB	AL, #'\'
+	JE	14$.S
+	CMPB	AL, #'/'
+	JNE	12$.S
+14$:	INCL	ECX
+	JMP	12$.S
+
+16$:	JREGZ	CX, 22$			;Go use default directory if no slashes
+	DECW	CX			;Exactly one slash?
+	JE	20$.S			;Yes
+	DECW	CX			;Exactly two slashes?
+	JNE	ntfdfl.S		;No - fail
+	MOVW	BX, namebgn		;Yes - did it start with a slash
+	MOVB	AL, [BX]
+	CMPB	AL, #'\'
+	JE	18$.S
+	CMPB	AL, #'/'
+	JNE	ntfdfl.S		;No - fail
+18$:	INCW	namebgn			;Yes - ignore the initial slash
+20$:	MOVW	DI, #inpdir		;Copy the directory name
+	CALL	copyname
+	MOVB	[DI], #0
+	MOVW	namebgn, SI
+	JMP	24$.S
+
+;Here if want to use default directory
+
+22$:	MOVL	inpdir+0, #'XOS'	;Store default directory name
+	MOVL	inpdir+4, #0
+24$:	MOVW	DI, #inpname		;Copy the file name
+	CALL	copyname
+	MOVL	[DI], #'.RUN'
+	MOVB	4.B[DI], #0
+	JMP	doload.S
+
+;Here if name is too long - say file not found
+
+ntfdfl:	MOVW	AX, #BER_FDNFND
+	JMP	error
+.PAGE
+;Subroutine to copy directory or file name
+;	c[DI] = Offset of buffer in code segment to receive name
+;	CALL	copyname
+
+copyname:
+	PUSHW	DS
+	POPW	ES
+	CLD
+	MOVW	SI, namebgn		;Point to start of name
+	MOVB	CL, #8			;Allow up to 8 characters
+4$:	LODSB	[SI]
+	CMPB	AL, #0
+	JE	6$.S
+	CMPB	AL, #'\'
+	JE	6$.S
+	CMPB	AL, #'/'
+	JE	6$.S
+	DECB	CL
+	JS	ntfdfl.S
+	STOSB	[DI]
+	JMP	4$.S
+
+;Here at end of name
+
+6$:	RET
+.PAGE
+;Here when ready to actually load something
+
+doload:	TESTB	devunit, #40h		;Is this an indefinate name?
+	JE	10$.S			;No
+	PUSHW	devunit			;Yes
+	MOVB	AL, #80h		;Set up partitions for D0:
+	MOVW	BX, #parttbl0
+	CALL	setupptn
+	MOVB	AH, #15h		;See if we have D1:
+	MOVB	DL, #81h
+	INT	13h
+	CMPB	AH, #03h
+	JNE	4$.S			;If do not have D1:
+	MOVB	AL, #81h		;Set up partitions for D1:
+	MOVW	BX, #parttbl1
+	CALL	setupptn
+4$:	POPW	devunit
+	MOVW	DX, #'C'+0000h		;Now assign DOS drive names to the
+	CALL	dosscan			;  partitions
+	MOVB	DH, #80h
+	CALL	dosscan
+	MOVB	AL, devunit		;Now see if we have the DOS drive name
+	MOVW	BX, #parttbl0		;  specified
+	MOVB	DL, #80h		;First check D0:
+	CALL	doscheck
+	JE	6$.S
+	MOVB	DL, #81h		;Next check D1:
+	CALL	doscheck
+	JNE	nsdver
+6$:	MOVW	devunit, DX
+10$:	MOVB	fattype, #0		;Indicate fat type is not known
+	MOVB	partsect, #1		;Assume disk not partitioned
+	MOVW	partcyl, #0
+	MOVB	parthead, #0
+	CMPB	devunit, #80h		;Right?
+	JB	btrdy			;Yes - boot block is in block 0
+	MOVW	BX, #parttbl0		;No - assume D0:
+	JE	12$.S			;Yes
+	MOVW	BX, #parttbl1		;No - its D1:
+12$:	CMPB	[BX], #0		;Have we read its partition table?
+	JNE	14$.S			;Yes
+	PUSHW	BX			;No - do it now
+	CALL	setuppt2
+	POPW	BX
+	JC	error			;If error
+14$:	MOVB	AL, devpart
+	MOVB	AH, #0
+	TESTW	AX, AX			;Want default?
+	JNE	20$.S			;No
+	MOVB	AL, defpart		;Yes
+	MOVB	devpart, AL
+20$:	DECW	AX
+	IMULW	AX, #pt_SIZE.B
+	ADDW	BX, AX
+	CMPB	pt_type[BX], #0		;Is this partition defined?
+	JNE	22$.S			;Yes - go on
+	MOVW	BX, #nopartm		;No - fail
+	JMP	booter3
+
+;Here with a valid partition
+
+22$:	MOVB	AL, pt_head.B[BX]	;Get head
+	MOVB	parthead, AL
+	MOVB	AL, pt_sector.B[BX]	;Get sector
+	MOVB	partsect, AL
+	MOVW	AX, pt_cylinder.B[BX]	;Get cylinder
+	MOVW	partcyl, AX
+	MOVL	EAX, pt_begin.B[BX]	;Get sector offset of partition
+	MOVL	partofs, EAX
+	MOVB	AL, pt_type.B[BX]	;Determine the FAT block type
+	ANDB	AL, #7Fh
+	CMPB	AL, #FS_DOS12
+	JNE	24$.S
+	MOVB	fattype, #12t		;Have 12-bit FATs
+	JMP	btrdy.S
+
+;Here if don't have 12-bit FATs
+
+24$:	CMPB	AL, #FS_DOS16
+	JE	26$.S
+	CMPB	AL, #FS_DOS16H
+	JE	26$.S
+	CMPB	AL, #FS_DOS16X
+	JNE	28$.S
+26$:	MOVB	fattype, #16t		;Have 16-bit FATs
+	JMP	btrdy.S
+
+;Here if dont have 16-bit FATs
+
+28$:	CMPB	AL, #FS_DOS32
+	JE	30$.S
+	CMPB	AL, #FS_DOS32X
+	JE	30$.S
+	MOVW	BX, #unpartm
+	JMP	booter3
+
+;Here have 32-bit FATs
+
+30$:	MOVB	fattype, #32t
+					;Fall into btrdy on next page
+.PAGE
+;Here when ready to actually boot from the disk
+
+btrdy:	MOVB	AH, partsect		;Now read the boot block
+	MOVW	CX, partcyl
+	MOVB	DH, parthead
+	MOVW	BX, #buffer
+	CALL	readdisk
+	JC	error			;If error
+	CMPW	buffer+1FEh, #0AA55h	;Make sure really a boot block
+	JNE	4$.S
+	CMPW	buffer+db_secsize, #512t ;Must have 512 byte sectors
+4$:	JNE	badboot
+	MOVZBL	EAX, buffer+db_secpcls	;Get cluster size
+	MOVL	clustsz, EAX
+	MOVZWL	EAX, buffer+db_rdirent	;Get number of root directory entries
+	ADDL	EAX, #15t.B		;Change to number of sectors
+	SHRL	EAX, #4
+	MOVL	rootblks, EAX
+	MOVZWL	EAX, buffer+db_sectors	;Get disk/partition size
+	TESTL	EAX, EAX		;Is it given here?
+	JNE	6$.S			;Yes - use it
+	MOVL	EAX, buffer+db_ttlsec	;No - get the 32-bit value
+6$:	MOVL	disksz, EAX
+	CMPB	fattype, #0		;Do we know the FAT type yet?
+	JNE	8$.S			;Yes
+	MOVB	fattype, #16t		;No - assume 16-bit FATs
+	MOVZWL	ECX, clustsz
+	IMULL	ECX, #4087t
+	CMPL	EAX, ECX		;Right?
+	JAE	8$.S			;Yes
+	MOVB	fattype, #12t		;No - have 12-bit FATs
+8$:	MOVZWL	EAX, buffer+db_secpfat	;Get sectors per FAT
+	CMPB	fattype, #32t		;Have 32-bit FATs?
+	JNE	10$.S			;No
+	TESTL	EAX, EAX		;Yes - 16-bit value must be 0!
+	JNE	4$.S
+	MOVL	EAX, buffer+db_ttlsecpfat ;Get 32-bit value
+10$:	TESTL	EAX, EAX		;FAT size must not be 0
+	JE	badboot
+	MOVL	fatsz, EAX
+	MOVZBL	ECX, buffer+db_numfats	;Get number of FATs
+	IMULL	ECX, EAX		;Get total FAT sectors
+	MOVZWL	EAX, buffer+db_ressec	;Get number of reserved sectors
+	ADDL	EAX, partofs		;Plus partition offset
+	MOVL	firstfat, EAX		;Gives first FAT block
+	ADDL	EAX, ECX		;Plus total FAT sectors
+	CMPB	fattype, #32t		;Have 32-bit FATs?
+	JNE	12$.S			;No
+	MOVL	EDX, buffer+db_rootcls	;Yes - get cluster number for root
+	MOVL	rootpos, EDX		;  directory
+	JMP	14$.S
+
+;Here if don't have 32-bit FATs
+
+12$:	MOVL	rootpos, EAX		;Gives first root directory block
+	ADDL	EAX, rootblks		;Plus root directory sectors
+14$:	MOVL	firstblk, EAX		;Gives offset of first allocated block
+	MOVW	AX, buffer+db_secptrk	;Get number of sectors per track
+	MOVW	numsect, AX
+	MOVW	AX, buffer+db_heads	;Get number of heads
+	MOVW	numhead, AX
+
+;When get here, we know we have a DOS file structure.  We next copy the DOS
+;  file system routine to the top of memory and initialize it.
+
+	SUBW	memsize, #DFSCODEPAGES#	;Allocate space for the file system
+	CLRW	DI			;  module at the top of memory
+	MOVW	ES, DI
+	MOVW	AX, memsize
+	MOVW	0B1h*4+0, #0		;Set up the INT B1 vector
+	MOVW	0B1h*4+2, AX
+	CLRW	SI
+	MOVW	DX, #!dfscode#
+	MOVW	FS, DX
+	MOVW	ES, AX
+	MOVW	CX, #DFSCODEWORDS#
+	CLD
+	RMOVSW	[DI], FS:[SI]		;Copy the code to the top of memory
+	SUBW	memsize, #DFSDATAPAGES	;Allocate space for the file system data
+	SUBW	AX, #DFSDATAPAGES#+{firstdata>4t} ;Get selector for data area
+	MOVW	ES:selfix#, AX		;Fix up the code
+	CLRW	DI
+	MOVW	AX, 0B1h*4+2
+	SUBW	AX, #DFSDATAPAGES#
+	MOVW	ES, AX
+	MOVW	SI, #dkbegin		;Copy the file system data we have
+	MOVW	CX, #WDS2COPY		;  set up
+	RMOVSW	[DI], [SI]
+	MOVW	CX, #DFSDATAWORDS#-WDS2COPY ;Clear the rest of the data area
+	CLRW	AX
+	RSTOSW	[DI]
+fsbegin::
+	MOVW	SI, #nullstr		;Open the root directory
+	PUSHW	DS
+	POPW	ES
+	MOVB	AH, #BF_SEARCH
+	INT	0B1h
+	JC	error.S			;If not found
+	MOVW	SI, #inpdir		;Look for directory
+	PUSHW	DS
+	POPW	ES
+	MOVW	AX, #10h+BF_SEARCH*100h
+	INT	0B1h
+	JC	error.S			;If not found
+	MOVW	SI, #sysdir		;Look for SYS
+	PUSHW	DS
+	POPW	ES
+	MOVW	AX, #10h+BF_SEARCH*100h
+	INT	0B1h
+	JC	error.S
+	MOVW	SI, #inpname		;Look for file to load
+	PUSHW	DS
+	POPW	ES
+	MOVW	AX, #80h+BF_SEARCH*100h
+	INT	0B1h
+	JNC	loadrun			;Go load the file
+error:	MOVB	AH, #BF_ERRMSG		;Get error message
+	MOVW	BX, #inpbufr
+	PUSHW	DS
+	POPW	ES
+	INT	0B1h
+	JMP	booter3.S
+.PAGE
+badboot:MOVW	BX, #bdbtmsg
+
+;Here if error booting XOS
+
+booter3:CLRW	DI
+	MOVW	SP, #bb+db_jump-10h-36t	;Reset the stack pointer
+	PUSHW	DI
+	PUSHW	BX
+	MOVW	DX, #-1
+	CMPW	cfg+cfg_timeout, #-1.B	;Doing auto load?
+	JE	2$.S			;Yes
+	CALL	clrmenu			;No - clear the menu area
+	MOVW	DX, #7*100h+15t
+2$:	MOVW	DI, #btemsg		;Display the error message
+	MOVB	AL, atrerr
+	CALL	outstr
+	POPW	DI
+	MOVB	AL, atrerr
+	MOVW	DX, #-1
+	CALL	outstr
+	MOVW	DX, #8*100h+29t		;Ask him to type any character (assume
+	MOVW	DI, #contmsg+2		;  not auto load)
+	CMPW	cfg+cfg_timeout, #-1.B	;Right?
+	JNE	8$.S			;Yes
+	MOVW	DX, #-1
+	ADDW	DI, #-2.B
+8$:	MOVB	AL, atrout
+	CALL	outstr
+	MOVB	AH, #0			;Get keyboard character
+	INT	16h
+	CMPW	cfg+cfg_timeout, #-1.B	;Auto mode?
+	JNE	getinp			;No - go get input again
+	PUSHW	DS			;Yes - clear our data area
+	POPW	ES
+	MOVW	CX, #{datatop-firstclr+1}/2
+	MOVW	DI, #firstclr
+	CLRW	AX
+	CLD
+	RSTOSW	[DI]
+	MOVW	DI, #inpbufr
+	JMP	havin2
+
+;Here if have a divide error
+
+diverr:	CLRW	AX
+	MOVW	DS, AX
+	MOVW	BX, #dvermsg
+	JMP	booter3.S
+.PAGE
+;Here to load an XOS RUN file
+
+loadrun:MOVW	CX, #8t			;Read first part of the file header
+	MOVW	SI, #runhead
+	PUSHW	DS
+	POPW	ES
+	MOVB	AH, #BF_READ
+	INT	0B1h
+	JC	error
+	CMPW	runhead+ih_id, #022D7h	;Check for valid header bytes
+	JNE	notrun
+	MOVB	AL, runhead+ih_ver	;Get RUN file version number
+	MOVB	version, AL
+	MOVW	SI, #runhead+8
+	CMPB	AL, #2			;Version 2?
+	JE	2$.S			;Yes
+	CMPB	AL, #1			;No - version 1?
+	JNE	notrun			;No - fail
+	MOVW	CX, #18t		;Read rest of RUN file header
+	PUSHW	DS
+	POPW	ES
+	MOVB	AH, #BF_READ
+	INT	0B1h
+	JC	error			;If error
+	MOVB	AL, runhead+24t		;Fix up the header format
+	MOVB	runhead+ih_stackms, AL
+	MOVL	EAX, runhead+20t
+	MOVL	runhead+ih_stack, EAX
+	MOVB	AL, runhead+18t
+	MOVB	runhead+ih_debugms, AL
+	MOVL	EAX, runhead+14t
+	MOVL	runhead+ih_debug, EAX
+	MOVB	CL, runhead+ih_hdrsize	;Get byte count for file header
+	SUBB	CL, #20t		;Minus amount already read
+	JMP	4$.S
+
+;Here if have version 2 RUN file
+
+2$:	MOVW	CX, #56t		;Read rest of RUN file header
+	PUSHW	DS
+	POPW	ES
+	MOVB	AH, #BF_READ
+	INT	0B1h
+	JC	error			;If error
+	MOVB	CL, runhead+ih_hdrsize	;Get byte count for file header
+	SUBB	CL, #58t		;Minus amount already read
+4$:	CALL	skipxhd			;Skip any extra header bytes
+	CMPB	runhead+ih_proc, #2
+	JB	notrun
+	CMPB	runhead+ih_proc, #6
+	JA	notrun
+	MOVB	AL, runhead+ih_startms	;Was a starting or debugger address
+	ORB	AL, runhead+ih_debugms	;  given?
+	JNE	8$.S			;Yes
+	MOVW	BX, #nsamsg		;No
+6$:	JMP	booter3
+
+8$:	MOVB	AL, runhead+ih_numseg	;Get number of segments
+	ORB	AL, AL			;Can't be 0
+	JE	notrun.S
+	CMPB	AL, #SEGMAX		;Too many?
+	JB	10$.S			;No - go on
+	MOVW	BX, #tmsmsg		;Yes - tell him
+	JMP	6$.S
+
+;Here if not valid RUN file
+
+notrun:	MOVW	BX, #ntcmsg
+	JMP	6$.S
+
+;Here if valid so far
+
+10$:	MOVW	SI, #headblk
+	MOVB	segcnt, AL
+	MOVB	segnum, AL
+	MOVW	progsel, #0
+seglop:	MOVW	CX, #12t		;Read segment header
+	PUSHW	DS
+	POPW	ES
+	MOVB	AH, #BF_READ
+	INT	0B1h
+	JC	error
+	MOVB	CL, [SI]		;Get byte count for segment header
+	SUBB	CL, #12t
+	CALL	skipxhd			;Skip any extra bytes
+	CMPB	sh_nummsc.B[SI], #1	;Must have no more than 1 msect
+	JA	notrun.S
+	JE	12$.S			;If have 1 msect
+	CLRL	EAX
+	MOVL	mh_alloc.B[SI], EAX	;No msect - indicate nothing to allocate
+	MOVL	mh_datasz.B[SI], EAX	;And nothing to load
+	JMP	22$.S
+
+;Here with a single msect in the segment
+
+12$:	CMPW	progsel, #0.B		;First time here?
+	JNE	16$.S			;No
+	MOVW	AX, sh_select.B[SI]	;Yes - have a selector?
+	TESTW	AX, AX
+	JNE	14$.S			;Yes
+	DECW	AX			;No - indicate that
+14$:	MOVW	progsel, AX
+16$:	PUSHW	DS
+	POPW	ES
+	CMPB	version, #1		;Version 1 file?
+	JNE	18$.S			;No - this is easy
+	MOVW	CX, #6			;Yes - read first part of msect header
+	MOVB	AH, #BF_READ
+	INT	0B1h
+	JC	error
+	PUSHW	SI
+	ADDW	SI, #8.B		;Read second part of msect header
+	PUSHW	DS
+	POPW	ES
+	MOVW	CX, #MSHDRSZ-8
+	MOVB	AH, #BF_READ
+	INT	0B1h
+	POPW	SI
+	JC	error
+	MOVB	CL, [SI]		;Get byte count for msect header
+	SUBB	CL, #MSHDRSZ-2		;Calculate excess bytes
+	JMP	20$.S
+
+;Here if have version 2 RUN file
+
+18$:	MOVW	CX, #MSHDRSZ		;Read msect header
+	PUSHW	DS
+	POPW	ES
+	MOVB	AH, #BF_READ
+	INT	0B1h
+	JC	error
+	MOVB	CL, [SI]		;Get byte count for msect header
+	SUBB	CL, #MSHDRSZ		;Calculate excess bytes
+20$:	CALL	skipxhd			;Skip excess bytes
+	MOVW	AX, mh_alloc+0.B[SI]	;Get amount to allocate for msect
+	MOVW	DX, mh_alloc+2.B[SI]
+	ADDW	AX, #0Fh.B		;Round up to paragraphs
+	ADCW	DX, #0.B
+	ANDW	AX, #0FFF0h
+	ADDW	progsize+0, AX
+	ADCW	progsize+2, DX
+22$:	ADDW	SI, #MSHDRSZ.B
+	DECB	segcnt			;More segments?
+	JNE	seglop			;Yes
+
+;Here with all headers input
+
+	ADDW	progsize+0, #0Fh.B	;Round size up to paragraphs
+	ADCW	progsize+2, #0.B
+	ANDW	progsize+0, #0FFF0h
+	MOVZWL	EAX, progsel		;Get possible initial selector
+	CMPW	AX, #-1.B		;Do we have one?
+	JNE	24$.S			;Yes - use it
+	MOVW	AX, #MINADDR>4t		;No - put is as low as we can
+24$:	SHLL	EAX, #4t		;Change to physical address
+	CMPL	EAX, #MINADDR		;Is it too low?
+	JAE	26$.S			;No - go on
+	MOVW	BX, #tlwmsg		;Yes - complain and fail
+	JMP	booter3
+
+;Here if load address is not too low
+
+26$:	MOVL	progload, EAX
+	ADDL	EAX, progsize		;Get highest address needed
+	ADDL	EAX, #15t.B
+	SHRL	EAX, #4			;Change to paragraphs
+	MOVZWL	EDX, memsize		;Do we have this much?
+	CMPL	EAX, EDX
+	JBE	clrmem.S		;Yes - go on
+	MOVW	BX, #nemmsg		;No - fail!
+	JMP	booter3
+.PAGE
+;Here to clear memory before loading
+
+clrmem:	MOVW	AX, progload+0
+	MOVW	DX, progload+2
+	MOVW	BX, #16t
+	DIVW	BX
+	MOVW	DX, AX
+	CLRW	AX
+	MOVW	BX, progsize+2
+	INCW	BX
+	CLD
+2$:	DECW	BX
+	JE	4$.S
+	MOVW	CX, #8000h
+	MOVW	ES, DX
+	CLRW	DI
+	CLRW	AX
+	RSTOSW	[DI]
+	ADDW	DX, #1000h
+	JMP	2$.S
+
+4$:	MOVW	CX, progsize+0
+	SHRW	CX, #1
+	JE	readpg.S
+	MOVW	ES, DX
+	CLRW	DI
+	CLRW	AX
+	RSTOSW	[DI]
+.PAGE
+readpg:	MOVW	DI, #headblk		;Point to header for first msect
+	MOVL	EAX, progload
+	MOVL	progpnt, EAX
+	MOVB	AL, segnum
+	MOVB	segcnt, AL
+readlp:	CMPL	mh_datasz.B[DI], #0.B	;See if anything to load
+	JE	2$.S			;If nothing to load
+	MOVL	EDX, mh_dataos.B[DI]
+	MOVW	AX, #00h+BF_SEEK*100h	;Position to data
+	INT	0B1h
+	JC	10$.S
+2$:	MOVL	EAX, progpnt		;Store segment selector for msect in
+	MOVL	loadpnt, EAX		;  block
+	SHRL	EAX, #4
+	MOVW	[DI], AX
+	MOVL	EAX, mh_alloc.B[DI]	;Bump pointer by amount for this msect
+	ADDL	EAX, #0Fh.B		;Round up to even paragraph
+	ANDB	AL, #0F0h
+	ADDL	progpnt, EAX
+	MOVW	AX, mh_datasz+0.B[DI]	;Get number of bytes to load
+	MOVW	DX, mh_datasz+2.B[DI]
+	SHLW	AX, #1
+	RCLW	DX, #1
+	MOVW	blkcnt, DX		;Store counts
+	SHRW	AX, #1
+	MOVW	bytcnt, AX
+
+;Here to read next hunk of the msect
+
+4$:	DECW	blkcnt			;Need more than 1 hunk?
+	JNS	6$.S			;Yes
+	MOVW	CX, bytcnt		;No - get amount left over
+	MOVW	bytcnt, #0
+	JREGZ	CX, readdn		;If all done
+	JMP	8$.S
+
+6$:	MOVW	CX, #8000h
+8$:	MOVW	AX, loadpnt+0
+	MOVW	DX, loadpnt+2
+	MOVW	BX, #16t
+	DIVW	BX
+	ADDW	loadpnt+0, CX
+	ADCW	loadpnt+2, #0.B
+	MOVW	ES, AX
+	MOVW	SI, DX
+	MOVB	AH, #BF_READ
+	INT	0B1h
+	JNC	4$.S
+10$:	JMP	error
+
+;Here after reading entire msect
+
+readdn:	ADDW	DI, #MSHDRSZ.B		;Bump to next header block
+	DECB	segcnt			;More msects to read?
+	JNE	readlp			;Yes - continue
+					;No - fall into relprg on next page
+.PAGE
+;Here with entire program loaded
+
+;Here when ready to relocate stuff in the loaded program
+
+relprg:	MOVW	SI, #runhead+ih_start	;Relocate starting address
+	CALL	relocad
+	MOVW	SI, #runhead+ih_debug	;Relocate debugger address
+	CALL	relocad
+	MOVW	SI, #runhead+ih_stack	;Relocate stack address
+	CALL	relocad
+	MOVW	DI, #headblk		;Point to first header block
+	MOVB	AL, segnum
+	MOVB	segcnt, AL
+rellop:	MOVL	EDX, mh_relos.B[DI]	;Get offset in file for relocation
+	TESTL	EDX, EDX		;Is there any?
+	JE	8$			;No
+	MOVW	AX, #00h+BF_SEEK*100h	;Yes - position to read relocation
+	INT	0B1h			;  data
+	JC	error
+	MOVZWL	EAX, [DI]		;Initialize place to apply relocation
+	SHLL	EAX, #4t
+	MOVL	foffset, EAX
+	MOVL	EAX, mh_relsz.B[DI]	;Get relocation count
+	MOVL	relcnt, EAX
+relmsc:	CALL	getbyte			;Get relocation header byte
+	MOVB	DH, AL
+	CMPB	version, #1
+	JNE	2$.S
+	TESTB	AL, #0E0h		;Segment selector relocation?
+	JNE	4$.S			;No
+	MOVB	DL, AL
+	SHRB	DL, #2			;Get segment or msect number
+	ANDB	DL, #7
+	CMPB	DL, #7			;Need to get next byte?
+	JNE	6$.S
+	CALL	getbyte
+	MOVB	DL, AL
+	JMP	6$.S
+
+;Here for version 2 RUN file
+
+2$:	TESTB	AL, #0FCh		;Segment selector relocation?
+4$:	JNE	10$.S			;No
+	CALL	getbyte			;Yes - get item number (we know we have
+	MOVB	DL, AL			;  less than 128 segments!)
+6$:	CLRL	ECX
+	MOVL	inpbufr, ECX
+	MOVB	CL, DH			;Get number of offset bytes
+	ANDB	CL, #03h
+	INCW	CX
+	MOVW	SI, #inpbufr
+	PUSHW	DS
+	POPW	ES
+	MOVB	AH, #BF_READ		;Read the offset bytes
+	INT	0B1h
+	JC	error
+	MOVL	EAX, inpbufr		;Add offset to current position
+	ADDL	foffset, EAX
+	MOVB	AL, DL			;Get segment number
+	MOVB	AH, #0
+	ORW	AX, AX			;Is it valid?
+	JE	10$.S			;No
+	CMPB	AL, segnum		;Maybe
+	JA	10$.S			;No
+	MOVW	BX, #MSHDRSZ		;Yes - change to table offset
+	MULW	BX
+	MOVW	BX, AX
+	MOVW	AX, foffset+0		;Get address of word to change
+	MOVW	DX, foffset+2		;Change to selector and offset values
+	MOVW	CX, #16t
+	DIVW	CX
+	MOVW	SI, DX
+	MOVW	ES, AX
+	MOVW	AX, headblk-MSHDRSZ[BX]	;Get segment selector
+	ADDW	ES:[SI], AX		;Relocate
+	DECL	relcnt			;More to do?
+	JNE	relmsc			;Yes - continue
+8$:	DECB	segcnt			;No - more msects to relocate?
+	JE	strprog.S		;No - start program now
+	ADDW	DI, #MSHDRSZ		;Yes
+	JMP	rellop			;Continue
+
+;Here if have bad relocation information
+
+10$:	MOVW	BX, #brtmsg
+	JMP	booter3
+.PAGE
+;Here when ready to start the loaded program
+
+strprog:TESTB	devunit, #80h		;Loading from a floppy?
+	JNE	10$.S			;No
+	MOVB	CH, #0			;Read track 0 and see which unit(s)
+	CALL	chkboth			;  are at track 0
+	JC	10$.S
+	JE	10$.S			;If neither one at track 0
+	TESTB	BL, #02h		;Is the other unit at track 0?
+	JE	10$.S			;No - units are NOT swapped
+	TESTB	BL, #01h		;Yes - is this unit at track 0?
+	JE	8$.S			;No - units ARE swapped
+	MOVB	CH, #1			;Read track 1 and see which units(s)
+	CALL	chkboth			;  are at track 0
+	JC	10$.S
+	CMPB	BL, #03			;Are both now at track 0?
+	JE	10$.S			;Yes - just assume not swapped!
+	TESTB	BL, #01			;No - is the corresponding unit at 0?
+	JE	10$.S			;No - units are not swapped
+8$:	ORB	devpart, #80h		;Yes - indicate floppies are swapped
+10$:	MOVL	EAX, flptblsave		;Restore address of original floppy
+	MOVL	78h, EAX		;  parameter table
+	CLRL	EAX			;Store flag value to indicate have
+	MOVW	DI, #604h		;  a directory name
+	MOVL	-4.B[DI], #'XOS*'
+	MOVL	[DI], EAX
+	MOVL	4.B[DI], EAX
+	MOVL	8.B[DI], EAX
+	MOVW	SI, #inpdir		;Copy the directory name to 0:604
+	CLD
+12$:	LODSB	[SI]
+	CMPB	AL, #0
+	JE	14$.S
+	MOVB	[DI], AL
+	INCW	DI
+	JMP	12$.S
+
+14$:	CMPB	runhead+ih_stackms, #0	;Have a stack specified?
+	JE	16$.S			;No
+	MOVW	SS, runhead+ih_stack+2	;Yes  - Setup program's stack
+	MOVW	SP, runhead+ih_stack+0
+16$:	MOVW	DX, devunit		;Get disk type and unit
+	CMPW	runhead+ih_debug+2, #0.B ;Have a debugger address?
+	JNE	dbgjmp.S		;Yes
+strjmp:	JMPFIW	runhead+ih_start
+
+dbgjmp:	JMPFIW	runhead+ih_debug
+.PAGE
+;Subroutine to set up the partition table for a disk.  The structure of the
+;  partition table(s) is somewhat complex and not very well defined.  We first
+;  process the partition table(s) and build our own simple partition table
+;  which we then use to find the location on the disk for a specified
+;  partition.  We first scan the main partition table backwards (high to low
+;  offsets) looking for standard DOS (type 1, 4, 6, 0B, 0C, or 0E) partitions.
+;  These are entered in our table in the order found.  We next scan the main
+;  partition table;  forwards (low to high offsets), looking for everything
+;  except standard DOS partitions.  This includes extended partitions.
+;  Partitions found are entered in our table in the order found, except that
+;  entries are made for the volumns in an extended partition rather than for
+;  the partition itself.  This is the same way that XOS establishes partition
+;  order.
+;	c(AL) = Physical unit number (80 or 81)
+;	c[BX] = Offset of partition table
+;	CALL	setupptn
+
+setupptn:
+	MOVB	devunit, AL
+setuppt2:
+	LEAW	DX, pt_SIZE*8[BX]
+	MOVW	partend, DX
+	PUSHW	BX
+	MOVB	AH, #1			;Read the main partition table
+	MOVB	DH, #0
+	CLRW	CX
+	MOVW	BX, #buffer
+	CALL	readdisk
+	POPW	DI
+	JC	error			;If error
+	MOVW	SI, #buffer+1BEh	;First scan forwards checking 4 entries
+	MOVW	CX, #4			;  (in this scan, we only look for
+2$:	MOVL	xpartofs, #0		;  standard DOS partitions)
+	MOVB	AL, 4.B[SI]		;Get partition type
+	CMPB	AL, #FS_DOS12		;Is it a standard DOS partition type?
+	JE	4$.S			;Yes
+	CMPB	AL, #FS_DOS16
+	JE	4$.S
+	CMPB	AL, #FS_DOS16H
+	JE	4$.S
+	CMPB	AL, #FS_DOS16X
+	JE	4$.S
+	CMPB	AL, #FS_DOS32
+	JE	4$.S
+	CMPB	AL, #FS_DOS32X
+	JNE	6$.S
+4$:	CALL	setpart
+6$:	ADDW	SI, #16t.B		;Bump pointer
+	LOOP	CX, 2$			;Continue if more entires
+	MOVW	SI, #buffer+1EEh	;Point to last entry in partition table
+	MOVW	CX, #4			;Check 4 slots
+10$:	MOVB	AL, 4.B[SI]		;Get partition type
+	CMPB	AL, #0			;In use at all?
+	JE	26$			;No
+	CMPB	AL, #5			;Yes - extended DOS partition?
+	JNE	24$.S			;No
+	PUSHW	SI			;Yes
+	PUSHW	CX
+
+	MOVL	EAX, 8.B[SI]
+	MOVL	xpartbase, EAX
+
+12$:	MOVL	xpartofs, EAX		;Save offset of extended partition
+	MOVB	AH, 2.B[SI]		;Read the first extended partition
+	MOVB	CH, AH			;  table
+	ANDB	AH, #3Fh
+	SHRB	CH, #6
+	MOVB	CL, 3.B[SI]
+	MOVB	DH, 1.B[SI]
+	MOVW	BX, #fatbufr
+	CALL	readdisk
+	JC	22$.S			;If error just ignore this partition!
+	MOVW	SI, #fatbufr+1BEh	;Point to last entry in partition table
+	MOVW	CX, #4			;Check up to 4 slots
+14$:	MOVB	AL, 4.B[SI]		;Get partition type
+	CMPB	AL, #0			;Is it in use?
+	JE	16$.S			;No
+	CMPB	AL, #5			;Yes - link to next volume?
+	JE	16$.S			;Yes - ignore it for now
+	ORB	AL, #80h		;Indicate extended partition volume
+	CALL	setpart
+16$:	ADDW	SI, #10h.B		;Bump pointer
+	LOOP	CX, 14$			;Continue if more
+	MOVW	SI, #fatbufr+1BEh	;Now scan it again looking for a link
+	MOVW	CX, #4			;  to the next volume
+18$:	CMPB	4.B[SI], #5		;Link?
+	JNE	20$.S
+	MOVL	EAX, 8.B[SI]		;Yes
+	ADDL	EAX, xpartbase
+	JMP	12$.S
+
+20$:	ADDW	SI, #10h.B		;No - bump pointer
+	LOOP	CX, 18$			;Continue if more
+22$:	POPW	CX			;Finished with the extended partition
+	POPW	SI
+	JMP	26$.S
+
+;Here if not extended partition
+
+24$:	CMPB	AL, #FS_DOS12		;Is this a DOS partition?
+	JE	26$.S			;Yes - we have already stored it
+	CMPB	AL, #FS_DOS16
+	JE	26$.S
+	CMPB	AL, #FS_DOS16H
+	JE	26$.S
+	CMPB	AL, #FS_DOS16X
+	JE	26$.S
+	CMPB	AL, #FS_DOS32
+	JE	26$.S
+	CMPB	AL, #FS_DOS32X
+	JE	26$.S
+	MOVL	xpartofs, #0		;No
+	CALL	setpart			;Set it up now
+26$:	SUBW	SI, #16t.B		;Bump pointer
+	DECW	CX
+	JNE	10$			;Continue if more entires
+	RET
+.PAGE
+;Subroutine to store partition data
+;	c(AL) = Partition type
+;	c[DI] = Offset of entry for partition
+;	CALL	setpart
+
+setpart:CMPW	DI, partend		;Is our table full?
+	JAE	4$.S			;Yes - forget about anything left!
+	MOVB	pt_type.B[DI], AL	;No - store partition type
+	MOVL	EAX, 8t.B[SI]		;Store offset for partition
+	ADDL	EAX, xpartofs
+	MOVL	pt_begin.B[DI], EAX
+	MOVL	EAX, 12t.B[SI]		;Store size of partition
+	MOVL	pt_size.B[DI], EAX
+	MOVB	AL, 1.B[SI]		;Store head number
+	MOVB	pt_head.B[DI], AL
+	MOVB	AL, 2.B[SI]		;Store sector number
+	MOVB	AH, AL
+	ANDB	AL, #3Fh
+	MOVB	pt_sector.B[DI], AL
+	SHRB	AH, #6
+	MOVB	AL, 3.B[SI]		;Store cylinder number
+	MOVW	pt_cylinder.B[DI], AX
+	CMPB	[SI], #80h		;Is this the active partition?
+	JNE	2$.S			;No
+	MOVW	AX, DI			;Yes - make it the default partition
+	SUBW	AX, partend		;Calculate partition number
+	ADDW	AX, #pt_SIZE*8
+	SHRW	AX, #4
+	INCW	AX
+	MOVB	defpart, AL
+2$:	ADDW	DI, #pt_SIZE.B
+4$:	RET
+.PAGE
+;Subroutine to scan a partition table and set DOS drive names
+;	c(DL) = First DOS drive name to use
+;	c(DH) = 0 if should check standard partitions, 80 if should check
+;		  extended partitions
+;	CALL	dosscan
+
+dosscan:MOVW	CX, #16t
+	MOVW	BX, #parttbl0
+2$:	MOVB	AL, pt_type.B[BX]	;Get partition type
+	CMPB	AL, #0			;Is it in use?
+	JE	6$.S			;No
+	XORB	AL, DH			;Yes - should we check this one?
+	TESTB	AL, #80
+	JNE	6$.S			;No
+	CMPB	AL, #FS_DOS12		;Yes - is it a DOS partition?
+	JE	4$.S			;Yes
+	CMPB	AL, #FS_DOS16
+	JE	4$.S
+	CMPB	AL, #FS_DOS16H
+	JE	4$.S
+	CMPB	AL, #FS_DOS16X
+	JE	4$.S
+	CMPB	AL, #FS_DOS32
+	JE	4$.S
+	CMPB	AL, #FS_DOS32X
+	JNE	6$.S			;No
+4$:	MOVB	pt_dosname.B[BX], DL	;Store DOS drive name for partition
+	INCW	DX			;Bump name
+6$:	ADDW	BX, #pt_SIZE.B		;Bump pointer
+	LOOP	CX, 2$			;Continue if more to do
+	RET				;Finished
+
+;Subroutine to search partition table for DOS drive name
+;	c(AL) = DOS drive name
+;	c(DL) = Low order byte for devunit
+;	c[BX] = Offset of partition table
+;	CALL	doscheck
+;	Z:set = Name found
+;	  c[DX] = Value for devunit
+;	Z:clr = Not found
+
+doscheck:
+	MOVB	DH, #1			;Initialize partition number
+	MOVW	CX, #8
+10$:	CMPB	pt_dosname.B[BX], AL	;This one?
+	JE	12$.S			;Yes - return with Z set
+	INCB	DH			;No - bump partition number
+	ADDW	BX, #pt_SIZE.B		;Bump pointer
+	LOOP	CX, 10$			;Continue if more to do
+12$:	RET				;Not there - return with Z clear
+.PAGE
+;Subroutine to read sector and then check both physical units for track 0
+;	c(CH) = Cylinder to read
+;	CALL	chkboth
+;	C:set = Error
+;	C:clr = Normal
+;	  c(BL) = Bit 0 set if corresponding unit at track 0, bit 1 set if
+;		  other unit at track 0
+
+chkboth:MOVB	AH, #02h		;Read a block
+	MOVB	AL, #01h
+	MOVB	CL, 1
+	MOVB	DL, devunit
+	MOVB	DH, 0
+	MOVW	BX, #buffer
+	PUSHW	DS
+	POPW	ES
+	INT	13h
+	CLI
+	JC	1$.S			;If error
+	MOVB	AH, devunit
+	CALL	chktk0
+	JC	1$.S
+	SHRB	AL, #4
+	PUSHW	AX
+	MOVB	AH, devunit
+	XORB	AH, #01h
+	CALL	chktk0
+	POPW	BX
+	JC	1$.S
+	SHRB	AL, #3
+	ORB	BL, AL
+	MOVB	AL, #0Ch		;Turn off both motors
+	MOVW	DX, 3F2h
+	OUTB	[DX]
+	ANDB	BL, #03h
+1$:	RET
+
+;Subroutine to check the track 0 bit for a floppy
+;	c(AH) = Physical (not BIOS) unit number
+;	CALL	chktk0
+;	C:set = Error
+;	C:clr = Normal
+;	  Z:set = At track 0
+;	  Z:clr = Not at track 0
+
+chktk0:	PUSHW	AX
+	MOVB	AL, AH			;Select the unit
+	ORB	AL, #1Ch
+	ORB	AH, AH
+	JE	2$.S
+	ADDB	AL, #10h
+2$:	MOVW	DX, #3F2h
+	OUTB	[DX]
+	MOVB	AH, #04			;Do a sense drive status command
+	CALL	flpcmd
+	POPW	AX
+	JC	8$.S
+	CALL	flpcmd
+	JC	8$.S
+	MOVW	CX, #800h
+4$:	NOP
+	LOOP	CX, 4$
+	MOVW	DX, #3F4h		;Get IO port
+	XORW	CX, CX
+6$:	INB	[DX]			;Get controller status
+	ANDB	AL, #0C0h		;Only high 2 bits
+	CMPB	AL, #0C0h		;Is a result byte ready?
+	JE	10$.S			;Yes
+	LOOP	CX, 6$			;No - wait some more
+	STC
+8$:	RET
+
+;Here with result byte ready
+
+10$:	INCW	DX			;Point to the data port
+	INB	[DX]			;Get the result byte
+	ANDB	AL, #10h		;Only check the track 0 bit
+	RET
+
+flpcmd:	MOVW	DX, #3F4h		;Get IO port
+	XORW	CX, CX
+12$:	INB	[DX]			;Get controller status
+	ANDB	AL, #0C0h		;Just high 2 bits
+	CMPB	AL, #80h		;Is it ready for data?
+	JE	14$.S			;Yes
+	LOOP	CX, 12$
+	STC
+	RET
+
+;Here when controller is ready for data
+
+14$:	MOVB	AL, AH			;Get sense drive status command
+	INCW	DX			;Point to data port
+	OUTB	[DX]			;Output the byte
+	RET
+.PAGE
+;Subroutine to skip extra bytes in a header block
+;	c(CL) = Number of extra bits to check
+;	Condition bits as left by SUB to calculate value in CL
+;	CALL	skipxhd
+
+skipxhd:JE	ret008.S		;If nothing to skip
+	JS	notrun			;Must be at least as big as we think
+	MOVZBL	EDX, CL
+	MOVW	AX, #01h+BF_SEEK*100h
+	INT	0B1h
+	JC	ret008.S
+	JMP	error
+.PAGE
+;Subroutine to relocate address in the file header
+;	c[SI] = Offset of entry in header to relocate
+;	CALL	relocad
+
+relocad:MOVB	AL, 4.B[SI]		;Get msect number
+	ORB	AL, AL			;Was an address specified?
+	JE	ret008.S		;No - nothing to do here
+	MOVB	AH, #0
+	IMULW	AX, #MSHDRSZ.B		;Yes - calculate index
+	ADDW	AX, #headblk-MSHDRSZ
+	MOVW	BX, AX
+	MOVW	AX, [BX]		;Get segment value for msect
+	MOVW	2.B[SI], AX		;Store it in the header
+ret008:	RET				;Finished
+.PAGE
+;Subroutine to get next relocation byte
+;	CALL	getbyte
+;	C(AL) = Byte
+
+getbyte:MOVW	CX, #1
+	MOVW	SI, #inpbufr
+	PUSHW	DS
+	POPW	ES
+	MOVB	AH, #BF_READ
+	INT	0B1h
+	JC	error
+	MOVB	AL, inpbufr
+	RET
+.PAGE
+;Subroutine to copy null terminated string to a buffer
+;	c[SI] = Offset of string 
+;	c[DI] = Offset of buffer
+;	CALL	copytxt
+
+copytxt:LODSB	[SI]
+	CMPB	AL, #0
+	JE	8$.S
+	STOSB	[DI]
+	JMP	copytxt.S
+
+;Subroutine to store decimal value in a buffer
+;	c[AX]    = Value to store
+;	c[ES:DI] = Address of buffer
+;	CALL	decvtxt
+
+decvtxt:CLRW	DX
+	MOVW	CX, #10t
+	DIVW	CX
+	PUSHW	DX
+	ORW	AX, AX
+	JE	4$.S
+	CALL	decvtxt
+4$:	POPW	AX
+	ADDB	AL, #'0'
+	STOSB	[DI]
+8$:	RET
+.PAGE
+;Subroutine to display null terminated string
+;	c[ES:DI] = Address of string to display
+;	c[DX]    = Position (-1 if at current cursor position)
+;	c(AL)    = Attribute byte
+;	CALL	outstr
+
+outstr:	CLD
+	PUSHW	BP
+	PUSHW	DI
+	PUSHW	AX
+	MOVB	AL, #0
+	MOVW	CX, #-1
+2$:	RNSCASB	[DI]			;Find end of string
+	NOTW	CX
+	DECW	CX
+	CMPW	DX, #-1.B		;Want current cursor position?
+	JNE	4$.S			;No
+	PUSHW	ES			;Yes - get current position
+	PUSHW	CX
+	MOVB	BH, #0
+	MOVB	AH, #3
+	INT	10h
+	POPW	CX
+	POPW	ES
+4$:	POPW	BX			;Restore attribute
+	MOVB	BH, #0
+	POPW	BP
+	MOVW	AX, #1301h
+	INT	10h
+	POPW	BP
+	RET
+.PAGE
+;Subroutine to output character to screen
+;	c(AL) = Character
+;	c(AH) = Attribute
+;	c(DL) = Column
+;	c(DH) = Row
+;	CALL	outchr			;Enter at outchrn with count in CX
+
+outchr:	PUSHW	BP
+	CMPW	DX, #-1.B		;Want current cursor position?
+	JNE	4$.S			;No
+	PUSHW	AX
+	PUSHW	ES			;Yes - get current position
+	PUSHW	CX
+	MOVB	BH, #0
+	MOVB	AH, #3
+	INT	10h
+	POPW	CX
+	POPW	ES
+	POPW	AX			;Restore attribute and character
+4$:	MOVB	BL, AH
+	MOVB	chrbfr, AL
+	MOVB	BH, #0
+	MOVW	BP, #chrbfr
+	PUSHW	DS
+	POPW	ES
+	MOVW	CX, #1
+	MOVW	AX, #1301h
+	INT	10h
+	POPW	BP
+	RET
+
+
+outchrn:CMPW	DX, #-1.B
+	JE	6$.S
+	PUSHW	CX
+	PUSHW	AX
+	MOVB	BH, #0			;First position cursor
+	MOVB	AH, #2
+	INT	10h
+	POPW	AX
+	POPW	CX
+6$:	MOVB	BL, AH
+	MOVB	BH, #0
+	MOVB	AH, #9	
+	INT	10h
+	RET
+.PAGE
+curon:	MOVW	CX, curtype
+	JMP	4$.S
+
+curoff:	MOVW	CX, curtype
+	ORB	CH, #20h
+4$:	MOVB	AH, #1
+	INT	10h
+	RET
+.PAGE
+;Subroutine to put menu on the screen
+;	CALL	putmenu
+
+putmenu:CALL	clrmenu			;First clear the menu area
+	MOVW	DI, #cfg+cfg_f1name	;Scan the menu item list
+	MOVW	CX, #10t
+2$:	CMPB	[DI], #0		;Is this one defined?
+	JE	10$.S			;No - go on
+	PUSHW	CX			;Yes
+	PUSHW	DI
+	MOVW	DX, [DI]
+	MOVB	AL, #'F'		;Output name of function key
+	MOVB	AH, atrout
+	CALL	outchr
+	POPW	AX
+	PUSHW	AX
+	SUBW	AX, #cfg+cfg_f1name-44t
+	CLRW	DX
+	MOVW	CX, #44t
+	DIVW	CX
+	MOVW	DX, #-1
+	CMPB	AL, #10t		;Is it 10?
+	JE	4$.S			;Yes
+	ADDB	AL, #'0'		;No
+	MOVB	AH, atrout
+	CALL	outchr
+	JMP	6$.S
+
+4$:	MOVW	DI, #tenstr
+	MOVB	AL, atrout
+	CALL	outstr
+6$:	MOVB	AL, #':'		;Follow function name with a colon
+	MOVB	AH, atrout
+	MOVW	DX, #-1
+	CALL	outchr
+	POPW	DI
+	PUSHW	DI
+	MOVW	DX, [DI]		;Display name associated with the
+	ADDB	DL, #5			;  function key
+	ADDW	DI, #2
+	MOVB	AL, atrout
+	CALL	outstr
+	POPW	DI
+	POPW	CX
+10$:	ADDW	DI, #44t.B		;Bump pointer
+	LOOP	CX, 2$			;Continue if more to do
+	RET				;Finished
+.PAGE
+;Subroutine to clear the menu area on the screen
+;	CALL	clrmenu
+
+clrmenu:MOVB	BH, atrout		;Clear the menu area
+	MOVW	CX, #6*100h+1t
+	MOVB	DH, cfg+cfg_numline
+	ADDB	DH, #5
+	MOVB	DL, #78t
+	MOVW	AX, #600h
+	INT	10h
+	RET
+.PAGE
+;Subroutine to convert decimal value to a string
+;	c[AX]    = Value
+;	c[ES:DI] = Address of string buffer
+;	CALL	convertdec
+
+convertdec:
+	CLRW	DX
+	DIVW	lit10
+	PUSHW	DX
+	ORW	AX, AX
+	JE	4$.S
+	CALL	convertdec
+4$:	POPW	AX
+	ADDB	AL, #'0'
+	STOSB	[DI]
+	RET
+
+lit10:	.WORD	10t
+.PAGE
+;Subroutine to read single disk sector.  The buffer must not cross a 64KB
+;  bountry
+;	c(AH)    = Sector number
+;	c[CX]    = Cylinder number
+;	c(DH)    = Head number
+;	c[DS:BX] = Address of buffer
+;	CALL	readdisk
+;	C:set = Error
+;	C:clr = Normal
+;	  c(AL) = Number of sectors read
+
+readdisk:
+	MOVW	retrycnt, #6
+2$:	PUSHW	AX
+	PUSHW	BX
+	PUSHW	CX
+	PUSHW	ES
+	PUSHW	DX
+	SHLB	CH, #6
+	ORB	AH, CH
+	MOVB	CH, CL
+	MOVB	CL, AH
+	MOVB	DL, devunit
+	MOVB	AL, #1
+	MOVB	AH, #2
+	PUSHW	DS
+	POPW	ES
+	INT	13h			;Do the read
+	JNC	10$.S			;If it worked
+	DECW	retrycnt		;Error - should we try again?
+	JE	4$.S			;No - fail!
+	POPW	DX			;Yes - do a reset
+	PUSHW	DX
+	MOVB	AH, #0
+	INT	13h
+	POPW	DX
+	POPW	ES
+	POPW	CX
+	POPW	BX
+	POPW	AX
+	JMP	2$.S			;And try again
+
+;Here if have retried as much as we should - return the failure
+
+4$:	MOVB	AL, AH
+	PUSHW	DS
+	POPW	ES
+	MOVW	DI, #errtbl
+	MOVW	CX, #NUMERR
+	CLD
+	RNSCASB	[DI]
+	JNE	6$.S
+	MOVB	AL, codetbl-errtbl-1[DI]
+	JMP	8$
+
+6$:	MOVB	AL, #BER_ERROR
+8$:	MOVB	AH, #0
+	POPW	DX
+	POPW	ES
+	POPW	CX
+	POPW	BX
+	POPW	BX
+	STC
+	RET
+
+;Here with good read
+
+10$:	POPW	DX			;Restore registers
+	POPW	ES
+	POPW	CX
+	POPW	BX
+	POPW	AX
+	RET				;And return
+
+	.MACRO	ERR
+	EX  01h , BER_FUNC
+	EX  02h , BER_AMNF
+	EX  04h , BER_SECTNF
+	EX  05h , BER_RSTERR
+	EX  08h , BER_DMAOVR
+	EX  09h , BER_BNDYERR
+	EX  0Ah , BER_BADSECT
+	EX  0Bh , BER_BADCYLN
+	EX  0Dh , BER_INVSECT
+	EX  0Eh , BER_INVDATA
+	EX  0Fh , BER_DMAERR
+	EX  10h , BER_DATAERR
+	EX  20h , BER_CONERR
+	EX  40h , BER_SEEKERR
+	EX  80h , BER_NORESP
+	EX  0CCh, BER_WRTFLT
+	.ENDM
+
+	.MACRO	EX num, code
+	.BYTE	num
+	.ENDM
+
+errtbl:	ERR
+NUMERR=!$-errtbl
+
+	.MACRO	EX num, code
+	.BYTE	code
+	.ENDM
+
+codetbl:ERR
+
+.PAGE
+	.MACRO	NUMBER value
+	.ASCII	/value/
+	.ENDM
+
+	.RADIX	10t
+lblmsg: .ASCII	" XOS Bootstrap v"
+	NUMBER	>VERSION
+	.ASCII	"."
+	NUMBER	>EDITNUM
+	.ASCIZ	" "
+	.RADIX	16t
+  LBLMSGSZ=!$-lblmsg-1
+sysdir:	.ASCIZ	"SYS"
+ins1msg:.ASCII	"Enter name of file to load"
+ins2msg:.ASCIZ	" or enter DOS to load DOS"
+ins3msg:.ASCIZ	"Default is "
+btemsg: .ASCIZ	"? Boot error: "
+contmsg:.ASCII	{0D}{0A}"Press any key to continue"
+crlf:	.ASCII	{0D}{0A}
+nullstr:.BYTE	0
+dvermsg:.ASCIZ	"Divide error"
+bdbtmsg:.ASCIZ	"Boot block format is incorrect"
+nopartm:.ASCIZ	"Partition is not defined"
+unpartm:.ASCIZ	"Unsupported partition type"
+nsdvmsg:.ASCIZ	"No such device"
+nsamsg:	.ASCIZ	"No starting or debugger address specified"
+ntcmsg:	.ASCIZ	"Not a valid RUN file"
+tmsmsg:	.ASCIZ	"Too many segments"
+nemmsg:	.ASCIZ	"Not enough memory"
+tlwmsg:	.ASCIZ	"Load address is too low"
+brtmsg:	.ASCIZ	"Bad relocation data in RUN file"
+loadstr:.ASCIZ	"Loading "
+tenstr:	.ASCIZ	"10"
+wtmsg1:	.ASCIZ  " will be loaded in "
+wtmsg2: .ASCIZ  " second"
+
+;Define device name table
+
+devtbl:	.ASCII	"F0  "			;First floppy disk
+	.BYTE	 0, 0
+	.ASCII	"A   "
+	.BYTE	 0, 0
+	.ASCII	"F1  "			;Second floppy disk
+	.BYTE	 1, 0
+	.ASCII	"B   "
+	.BYTE	 1, 0
+	.ASCII	"D0P1"			;First hard disk, first partition
+	.BYTE	80, 1
+	.ASCII	"C   "
+	.BYTE	80, 1
+	.ASCII	"D0P2"			;First hard disk, second partition
+	.BYTE	80, 2
+	.ASCII	"D0P3"			;First hard disk, third partition
+	.BYTE	80, 3
+	.ASCII	"D0P4"			;First hard disk, fourth partition
+	.BYTE	80, 4
+	.ASCII	"D0P5"			;First hard disk, fifth partition
+	.BYTE	80, 5
+	.ASCII	"D0P6"			;First hard disk, sixth partition
+	.BYTE	80, 6
+	.ASCII	"D0P7"			;First hard disk, seventh partition
+	.BYTE	80, 7
+	.ASCII	"D1P8"			;First hard disk, eighth partition
+	.BYTE	80, 8
+	.ASCII	"D1P1"			;Second hard disk, first partition
+	.BYTE	81, 1
+	.ASCII	"D1P2"			;Second hard disk, second partition
+	.BYTE	81, 2
+	.ASCII	"D1P3"			;Second hard disk, third partition
+	.BYTE	81, 3
+	.ASCII	"D1P4"			;Second hard disk, fourth partition
+	.BYTE	81, 4
+	.ASCII	"D1P5"			;Second hard disk, fifth partition
+	.BYTE	81, 5
+	.ASCII	"D1P6"			;Second hard disk, sixth partition
+	.BYTE	81, 6
+	.ASCII	"D1P7"			;Second hard disk, seventh partition
+	.BYTE	81, 7
+	.ASCII	"D1P8"			;Second hard disk, eigtht partition
+	.BYTE	81, 8
+	.ASCII	"D   "
+	.BYTE	42, 0
+	.ASCII	"D   "
+	.BYTE	42, 0
+	.ASCII	"D   "
+	.BYTE	42, 0
+	.ASCII	"D   "
+	.BYTE	42, 0
+	.ASCII	"D   "
+	.BYTE	42, 0
+	.ASCII	"D   "
+	.BYTE	42, 0
+	.ASCII	"D   "
+	.BYTE	42, 0
+	.ASCII	"D   "
+	.BYTE	42, 0
+	.ASCII	"D   "
+	.BYTE	42, 0
+DEVTBLSZ=!{$-devtbl}/6
+
+	.MOD	16
+errbufr:				;Buffer for error message text

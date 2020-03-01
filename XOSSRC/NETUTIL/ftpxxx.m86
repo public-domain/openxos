@@ -1,0 +1,898 @@
+	.TITLE	FTP - Simple FTP client for XOS
+
+;++++
+; This software is in the public domain.  It may be freely copied and used
+; for whatever purpose you see fit, including commerical uses.  Anyone
+; modifying this software may claim ownership of the modifications, but not
+; the complete derived code.  It would be appreciated if the authors were
+; told what this software is being used for, but this is not a requirement.
+
+;   THIS SOFTWARE IS PROVIDED BY THE AUTHORS "AS IS" AND ANY EXPRESS OR
+;   IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
+;   OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+;   IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+;   INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+;   BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS
+;   OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+;   ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR
+;   TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
+;   USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+;----
+
+	.PROC	80386
+
+	.INCLUD	XOSINC:\XMAC\STDIO.PAR
+	.INCLUD XOSINC:\XMAC\PROCARG.PAR
+	.INCLUD	XOSINC:\XMAC\CTYPE.PAR
+	.INCLUD	XOSINC:\XMAC\XOS.PAR
+	.INCLUD	XOSINC:\XMAC\XOSX.PAR
+	.INCLUD	XOSINC:\XMAC\XOSERR.PAR
+	.INCLUD	XOSINC:\XMAC\XOSTIME.PAR
+	.INCLUD	XOSINC:\XMAC\XOSNET.PAR
+	.INCLUD	XOSINC:\XMAC\XOSXNET.PAR
+	.INCLUD XOSINC:\XMAC\XOSTRM.PAR
+	.INCLUD	XOSINC:\XMAC\XOSDDSP.PAR
+
+	.STDSEGS
+
+;This is the XOS FTP client.  It is implemented with 3 threads as follows:
+;	Command send and receive
+;	Data receive
+;	Data send
+
+tdbcommand=!201000h-tdb_SIZE
+tdbinput  =!281000h-tdb_SIZE
+tdboutput =!301000h-tdb_SIZE
+
+
+DATASIZE =!1200t	;Size of the data input/output buffer
+CMDISIZE =!800t		;Size of the command input buffer
+
+VECT_BASE=!30t		;Base threads vector
+
+	.PSECT	_ODATA_p
+
+argmsect:.LONG	0
+argpntr: .LONG  0, 0
+
+onhelp1: .ASCIZ "?"
+onhelp2: .ASCIZ "H"
+onhelp3: .ASCIZ "HEL"
+onhelp4: .ASCIZ "HELP"
+
+
+options:.LONG	onhelp1 , 0                  , 0, opthelp , 0
+	.LONG	onhelp2 , 0                  , 0, opthelp , 0
+	.LONG	onhelp3 , 0                  , 0, opthelp , 0
+	.LONG	onhelp4 , 0                  , 0, opthelp , 0
+	.LONG	onport1 , ASF$NVAL|ASF$VALREQ, 0, optport , 0
+	.LONG	onport2 , ASF$NVAL|ASF$VALREQ, 0, optport , 0
+	.LONG	ondebug1, ASF$LSVAL          , 0, optdebug, 2
+	.LONG	ondebug2, ASF$LSVAL          , 0, optdebug, 2
+	.LONG	onnodeb1, 0                  , 0, optdebug, 0
+	.LONG	onnodeb2, 0                  , 0, optdebug, 0
+	.LONG	onnodeb3, 0                  , 0, optdebug, 0
+	.LONG	ontrm   , ASF$LSVAL          , 0, opttrm  , 0
+	.LONG	onxos   , 0                  , 0, optxos  , 0
+	.LONG	0
+
+	.SBTTL	Start of program
+
+	.PSECT	_OTEXT_p
+
+mainalt::
+	MOVL	EAX, 4.B[ESP]		;Get offset of argument msect
+	MOVL	argmsect, EAX
+	MOVL	ESI, 8.B[EAX]		;Point to command tail
+	CLRL	EAX
+	CLD
+2$:	LODSB	[ESI]			;Skip any leading whitespace
+	CMPB	AL, #0
+	JE	6$.S
+	TESTB	_chrtbl#[EAX], #CT$SPACE
+	JNE	2$.S
+4$:	LODSB	[ESI]			;Skip first atom
+	CMPB	AL, #0
+	JE	6$.S
+	TESTB	_chrtbl#[EAX], #CT$SPACE
+	JE	4$.S
+	MOVL	argpntr, ESI		;Store argument offset for procarg
+	PUSHL	#0.B			;No default extension for indirect file
+	PUSHL	#0.B			;No next line function
+	PUSHL	#0.B			;Error function
+	PUSHL	#havehost		;Function called for non-keyword args
+	PUSHL	#0.B			;Offset of keyword table
+	PUSHL	#options		;Offset of option table
+	PUSHL	#PAF$INDIRECT|PAF$EATQUOTE ;Flag bits
+	PUSHL	#argpntr		;Offset of arg string pointer
+	CALL	procarg#		;Process arguments
+	ADDL	ESP, #32t.B
+	PUSHL	DS			;Give up the argument data
+	PUSHL	argmsect
+	PUSHL	#0.B
+	PUSHL	#0.B
+	CALLF	svcMemChange#
+
+;Here with all command line processing done
+
+6$:	MOVL	EBX, #notodomsg		;Was a host specified?
+	CMPL	devnamep, #0.B
+	JE	failner.S		;No - fail
+	PUSHL	#O$PHYS			;Yes - check the device to make sure it
+	PUSHL	DS			;  is a TCP device
+	PUSHL	devnamep
+	PUSHL	DS
+	PUSHL	#devpparms
+	CALLF	svcIoDevParm#
+	TESTL	EAX, EAX
+	JNS	24$.S
+22$:	MOVL	EBX, #tcperrmsg
+	JMP	fail.S
+
+24$:	CMPL	devclass+0, #'TCP'	;Is this really a TCP device?
+	JE	havedev.S		;Yes
+26$:	MOVL	EBX, #nottcpmsg		;No
+failner:CLRL	EAX
+fail:	PUSHL	EAX
+	PUSHL	EBX
+	MOVL	EBX, #fmsg1
+	CALL	outstr
+	POPL	EBX
+	CALL	outstr	
+	POPL	ECX			;Restore error code
+	JREGZ	ECX, 30$
+	PUSHL	trmhndl
+	PUSHL	DS
+	MOVL	EBX, #fmsg2
+	CALL	outstr
+	PUSHL	ECX
+	PUSHL	#3.B
+	PUSHL	DS
+	MOVL	EBX, #devname
+	PUSHL	EBX
+	CALLF	svcSysErrMsg#
+done:	CALL	outstr
+30$:	CALL	outcrlf
+	PUSHL	#0.B
+	CALLF	svcSchExit#
+.PAGE
+;Here when have a TCP device to use
+
+havedev::
+	PUSHL	#VECT_TRM.B		;Set the terminal input ready vector
+	PUSHL	#84h+{VT_XOSS<8t}
+	PUSHL	CS
+	PUSHL	#trmready
+	CALLF	svcSchSetVector#
+	TESTL	EAX, EAX
+	JS	6$.S
+	PUSHL	#VECT_TCPIN.B		;Set the TCP input ready vector
+	PUSHL	#84h+{VT_XOSS<8t}
+	PUSHL	CS
+	PUSHL	#tcpready
+	CALLF	svcSchSetVector#
+	TESTL	EAX, EAX
+	JNS	10$.S
+6$:	MOVL	EBX, #sivfmsg
+	JMP	failner
+
+10$:	PUSHL	#O$IN|O$OUT|O$PARTIAL	;Now open the device
+	PUSHL	DS
+	PUSHL	devnamep
+	PUSHL	DS
+	PUSHL	#openparms
+	CALLF	svcIoOpen#
+	TESTL	EAX, EAX
+	JNS	devopen.S
+12$:	MOVL	EBX, #tcperrmsg
+	JMP	fail
+
+devopen::
+	MOVL	tcpiqab+qab_handle, EAX	;Store the handle
+	PUSHL	#VECT_CNTC
+	PUSHL	#87h+{VT_XOSS<8t}
+	PUSHL	CS
+	PUSHL	#havecc
+	CALLF	svcSchSetVector#
+	PUSHL	trmhndl
+	PUSHL	#0.B
+	PUSHL	#0.B
+	PUSHL	#0.B
+	PUSHL	DS
+	PUSHL	#trminpparms
+	CALLF	svcIoInBlockP#
+	MOVL	EBX, #trminpper
+	TESTL	EAX, EAX
+	JS	fail
+	PUSHL	trmhndl
+	PUSHL	#0.B
+	PUSHL	#0.B
+	PUSHL	#0.B
+	PUSHL	DS
+	PUSHL	#trmoutparms
+	CALLF	svcIoOutBlockP#
+	TESTL	EAX, EAX
+	JNS	16$.S
+	MOVL	EBX, #trmoutper
+	JMP	fail
+
+16$:	CALL	tcpinput		;Start TCP input
+	MOVL	ESI, #initmsg		;Output initial TELNET commands
+	MOVL	ECX, #INITMSG
+	CALL	puttcpstr
+	CALL	dotcpoutput
+	JMP	ready
+.PAGE
+;Function called for command line argument
+
+havehost:
+	MOVL	EBX, #tomnymsg
+	CMPL	devnamep, #0.B		;Already have a host?
+	JNE	failner			;Yes - fail
+	PUSHL	ESI			;No
+	MOVL	ESI, 8.B[ESP]		;Get offset of argument string
+	PUSHL	DS
+	POPL	ES
+	CLD
+	MOVL	EDI, #devname		;Copy the name
+	MOVL	devnamep, EDI
+4$:	LODSB	[ESI]
+	CMPB	AL, #':'		;Is this a colon?
+	JNE	8$.S			;No
+	CMPB	[ESI], #':'		;Yes - is next a colon too?
+	JNE	6$.S			;No
+	MOVB	havenode, #1		;Yes - remember have node
+	STOSB	[EDI]
+	LODSB	[ESI]
+	JMP	8$.S
+
+6$:	MOVB	havename, #1		;Remember have device name
+8$:	STOSB	[EDI]
+	TESTB	AL, AL
+	JNE	4$.S
+	CMPB	havenode, #0		;Did we see a double colon?
+	JNE	10$.S			;Yes
+	CMPB	-2.B[ESI], #':'		;No - did it end with a single colon?
+	JE	10$.S			;Yes
+	MOVL	-1.B[EDI], #'::'	;No - add a double colon to the end
+10$:	CMPB	havename, #0		;Did we see a device name?
+	JNE	12$.S			;Yes
+	ADDL	devnamep, #dftname-devname.B ;No - use default name
+12$:	POPL	ESI
+rtnone:	CLRL	EAX
+	INCL	EAX
+ret004:	RET
+.PAGE
+;Function called for the PORT option
+
+optport:MOVL	EBX, 4.B[ESP]		;Get offset of argument string
+	MOVL	EBX, argdata_value.B[EBX] ;Get port number
+	MOVW	rmtport, BX		;Store it
+	JMP	rtnone.S
+.PAGE
+;Function called for the {NO}DEBUG option
+
+optdebug:
+	MOVL	EBX, 4.B[ESP]
+	MOVB	AL, argdata_data.B[EBX]
+	MOVB	debuglvl, AL
+	BTL	argdata_flags.B[EBX], #ADF%LSVAL ;File spec given?
+	JC	2$.S			;Yes
+	MOVL	EAX, #DH_STDTRM		;No - use his terminal
+	JMP	4$.S
+
+;Here if a file spec was given
+
+2$:	PUSHL	#O$CREATE|O$TRUNCA|O$OUT ;Open the debug output file
+	PUSHL	DS
+	PUSHL	argdata_value.B[EBX]
+	PUSHL	#0.B
+	PUSHL	#0.B
+	CALLF	svcIoOpen#
+	MOVL	EBX, #debgemsg
+	TESTL	EAX, EAX
+	JS	fail
+4$:	MOVL	debughndl, EAX
+	CLRL	EAX
+	INCL	EAX
+	RET
+
+;Function called for the TRM option
+
+opttrm:	MOVL	EBX, 4.B[ESP]
+	MOVB	AL, argdata_data.B[EBX]
+	MOVB	debuglvl, AL
+	BTL	argdata_flags.B[EBX], #ADF%LSVAL ;File spec given?
+	JC	6$.S			;Yes
+	MOVL	EAX, #DH_STDTRM		;No - use his terminal
+	JMP	8$.S
+
+;Here if a file spec was given
+
+6$:	PUSHL	#O$CREATE|O$TRUNCA|O$OUT|O$IN ;Open the terminal device
+	PUSHL	DS
+	PUSHL	argdata_value.B[EBX]
+	PUSHL	#0.B
+	PUSHL	#0.B
+	CALLF	svcIoOpen#
+	MOVL	EBX, #trmemsg
+	TESTL	EAX, EAX
+	JS	fail
+8$:	MOVL	trmhndl, EAX
+10$:	CLRL	EAX
+	INCL	EAX
+	RET
+
+;Function called for the {NO}XOS option
+
+optxos:	MOVL	EBX, 4.B[ESP]
+	MOVB	AL, argdata_data.B[EBX]
+	MOVB	lcltbl+TNO_XOSMODE, AL
+	MOVB	rmttbl+TNO_XOSMODE, AL
+	JMP	10$.S
+
+;Function called for the HELP option
+
+opthelp:MOVL	EBX, #helpmsg
+	CALL	outstr
+	PUSHL	#0.B
+	CALLF	svcSchExit#
+.PAGE
+	.SBTTL	Main program loop
+
+	.PSECT	_TEXT_p
+
+;Here with all initialization complete
+
+ready::
+
+;	CALLF	svcMemChange#		;Give up the once-only code
+
+
+	PUSHL	#0.B			;Set software interrupt level to 0
+	CALLF	svcSchSetLevel#		;  to allow interrupts
+mainloop::
+	PUSHL	DS
+	POPL	ES
+4$:	PUSHL	#0.B			;Wait for interrupt
+	PUSHL	#0.B
+	PUSHL	#-1.B
+	CALLF	svcSchSuspend#
+	JMP	4$.S
+.PAGE
+;Terminal input ready software interrupt routine
+
+trmready::
+	PUSHAL
+	CALL	trmsrv
+	POPAL
+	CALLF	svcSchDismiss#
+
+2$:	RET
+
+;Subroutine to process terminal input
+
+trmsrv:	TESTB	trmqab+qab_status+1, #QSTS$DONE>8t ;Really have input now?
+	JE	2$.S			;No - false alarm!
+	MOVL	trmipnt, #trmibuf	;Yes - initialize input pointer
+	CMPB	xosmdkb, #0		;Doing XOS mode keyboard handling?
+	DECL	trmqab+qab_amount	;Have another character?
+	JS	trmdone.S		;No
+	MOVL	EBX, trmipnt		;Yes
+4$:	MOVB	AL, [EBX]
+	INCL	trmipnt
+	CMPB	AL, #0			;Null?
+	JE	4$.S			;Yes - ignore it
+	MOVL	EBX, tcpopnt		;Store character for TCP output
+	MOVB	[EBX], AL
+	INCL	tcpopnt
+	JMP	4$.S			;Continue
+
+;Here with all input characters processed
+
+trmdone:CALL	dotcpoutput		;Do TCP output if need to
+	MOVB	trmqab+qab_vector, #0	;Queue terminal input request
+	CALL	restarttrm
+	MOVB	trmqab+qab_vector, #VECT_TRM
+	JMP	trmsrv
+.PAGE
+;TCP input ready software interrupt routine
+
+tcpready::
+	PUSHAL
+4$:	TESTB	tcpiqab+qab_status+1, #QSTS$DONE>8t ;Really have input done?
+	JE	2$.S			;No - false alarm!
+	MOVB	tcpinact, #0		;Yes - indicate input not active now
+	MOVL	EAX, tcpiqab+qab_error	;Error?
+	TESTL	EAX, EAX
+	JS	tcpinerror		;Yes
+	CMPB	debuglvl, #2		;Yes - want full debug output?
+	JB	6$.S			;No
+	MOVL	EAX, #'<>'		;Yes - display the TCP input
+	MOVL	ESI, #tcpibuf
+	MOVL	ECX, tcpiqab+qab_amount
+	CALL	tcpdebug
+6$:	MOVL	tcpipnt, #tcpibuf	;Initialize pointer
+tcplp:	DECL	tcpiqab+qab_amount	;Have another character?
+	JS	10$.S			;No
+	MOVL	EBX, tcpipnt		;Yes
+	MOVZBL	EAX, [EBX]		;Get next character
+	INCL	tcpipnt
+	MOVL	EBX, tcpstate		;Dispatch on the state
+	JMPIL	tcpsdsp[EBX*4]
+
+	.PSECT	_DATA_p
+
+tcpsdsp:.LONG	inormal		;TCPS_NORMAL  = 0  - Normal character is next
+	.LONG	cmdnext		;TCPS_CMDNEXT = 1  - Command byte is next
+	.LONG	subneg		;TCPS_SUBNEG  = 2  - Sub-negotiation option byte
+				;		       is next
+	.LONG	subdata		;TCPS_SUBDATA = 3  - Sub-negotiation data byte
+				;		       is next
+	.LONG	subiac		;TCPS_SUBIAC  = 4  - TNC_IAC seen during
+				;		       sub-negotiation 
+	.LONG	optwill		;TCPS_OPTWILL = 5  - TNC_WILL option byte next
+	.LONG	optdo		;TCPS_OPTDO   = 6  - TNC_DO option byte next
+
+	.PSECT	_TEXT_p
+
+;Here when finished processing TCP input
+
+10$:	CALL	trmoutput		;Do terminal output if need to (note
+					;  that this can generate TCP output)
+	CALL	dotcpoutput		;Start TCP output if need to
+	MOVB	tcpiqab+qab_vector, #0
+	CALL	tcpinput		;Start TCP input if should
+	TESTB	trmqab+qab_status+1, #QSTS$DONE>8t ;Have any terminal input now?
+	JE	20$.S			;No
+	CALL	trmsrv			;Yes - handle it now
+20$:	MOVB	tcpiqab+qab_vector, #VECT_TCPIN
+	JMP	4$
+
+;Here on TCP input error
+
+tcpinerror:
+	CMPL	EAX, #ER_NCCLR		;Connection cleared error?
+	JE	tcpclr.S		;Yes - give him a good message
+	MOVL	EBX, #tcpier		;No - give general error message
+	JMP	fail
+
+tcpclr:	MOVL	EBX, #ncclrmsg
+	JMP	done
+.PAGE
+;Here for literal 0FFh character
+
+cmdlitFF:
+	MOVB	tcpstate, #TCPS_NORMAL	;Reset state
+	JMP	2$.S			;Go process character
+
+;Here with Telnet command prefix character
+
+telnetpfx:
+	MOVB	tcpstate, #TCPS_CMDNEXT	;Change state
+	JMP	tcplp			;Continue
+
+;Here when expecting command byte next
+
+cmdnext:CMPB	AL, #0F0h		;Valid command?
+	JB	2$.S			;No - treat it like a normal character!
+	MOVZBL	EAX, AL			;Yes
+	JMPIL	cmdtbl-{0F0h*4}[EAX*4]	;Dispatch on the command
+
+	.PSECT	_DATA_p
+
+;Telnet command table
+
+	.MOD	4
+cmdtbl:	.LONG	cmddone		;TNC_SE   = F0 - End of subnegotiation
+	.LONG	cmddone		;TNC_NOP  = F1 - No operation
+	.LONG	cmddone		;TNC_DM   = F2 - Data mark
+	.LONG	cmddone		;TNC_BRK  = F3 - Break
+	.LONG	cmddone		;TNC_IP   = F4 - Interrupt process
+	.LONG	cmddone		;TNC_AO   = F5 - Abort output
+	.LONG	cmdayt		;TNC_AYT  = F6 - Are you there
+	.LONG	cmddone		;TNC_EC   = F7 - Erase character
+	.LONG	cmddone		;TNC_EL   = F8 - Erase line
+	.LONG	cmddone		;TNC_GA   = F9 - Go ahead signal
+	.LONG	cmdsb		;TNC_SB   = FA - Start of subnegoatiation
+	.LONG	cmdwill		;TNC_WILL = FB - WILL
+	.LONG	cmdwill		;TNC_WONT = FC - WONT
+	.LONG	cmddo		;TNC_DO   = FD - DO
+	.LONG	cmddo		;TNC_DONT = FE - DONT
+	.LONG	cmdlitFF	;TNC_FF   = FF - Literal value 0xFF
+
+	.PSECT	_TEXT_p
+.PAGE
+;Here for the TNC_NOP (No operation) command
+
+cmddone:MOVB	tcpstate, #TCPS_NORMAL	;Reset state
+	JMP	tcplp			;Thats all
+
+;Here for the TNC_AYT (Are you there function) command
+
+cmdayt:
+
+	JMP	cmddone.S		;Ignore this
+.PAGE
+;Here for the TNC_SB (Start of subnegotiation) command
+
+cmdsb:	HLT
+
+;Here for the TNC_WILL command - this is a request from the host to allow it to
+;  enable an option or an acknowlegement to our request that the host enable an
+;  option.  If it is a request we reply with DO or DONT.  If it is an
+;  acknowlegement (indicated by the option being in a "want to enable" state),
+;  we update the option state but do not send a reply.
+
+cmdwill:MOVB	tcpstate, #TCPS_OPTWILL
+	JMP	tcplp
+
+;Here with the option byte for the TNC_WILL or TNC_WONT command
+
+optwill:CMPB	AL, #TNO_SUPGA		;Suppress go-ahead option?
+	JNE	4$.S			;No - reply with DONT
+2$:	MOVB	AH, #TNC_DO		;Yes - reply with DO
+	JMP	optrply.S
+
+4$:	MOVB	AH, #TNC_DONT		;Reply with DONT
+optrply:PUSHL	EAX
+	MOVB	AL, #TNC_IAC		;Output prefix byte
+	CALL	puttcpcmd
+	MOVB	AL, 1.B[ESP]		;Output command byte (TNC_DO, TNC_DONT,
+	CALL	puttcpcmd		;  TNC_WILL, or TNC_WONT)
+	POPL	EAX			;Output option byte
+	CALL	puttcpcmd
+	JMP	cmddone
+
+;Here for the TNC_DO or TNC_DONT command
+
+comdo:	MOVB	tcpstate, #TCPS_OPTDO
+	JMP	tcplp
+
+;Here with the option byte for the TNC_DO or TNC_DONT command
+
+optdo:	CMPB	AL, #TNO_SUPGA
+	JNE	6$.S
+	MOVB	AH, #TNC_WONT
+	JMP	optrply.S
+
+6$:	MOVB	AH, #TNC_WILL
+	JMP	optrply.S
+.PAGE
+	.SBTTL	tcpinput - Subroutine to start TCP input
+
+;Subroutine to start TCP input
+
+tcpinput:
+	CMPB	tcpinact, #0		;Is input active now?
+	JNE	ret014.S		;Yes - nothing to do now
+	CLRL	EAX			;No
+	MOVW	tcpiqab+qab_status, AX
+	MOVL	tcpiqab+qab_amount, EAX
+	CMPB	flowstop, #0		;Have we stopped output?
+	JNE	ret014.S		;Yes - don't start TCP input
+	PUSHL	DS			;No - start TCP input
+	PUSHL	#tcpiqab
+	CALLF	svcIoQueue#
+	TESTL	EAX, EAX
+	JS	4$.S			;If error
+	MOVB	tcpinact, #1		;OK - indicate TCP input is active
+ret014:	RET
+
+;Here if error starting TCP input - this is a fatal error
+
+4$:	MOVL	EBX, #tcpier
+	JMP	fail
+.PAGE
+
+cmdtbl:	.LONG	'USER', cmduser
+	.LONG	'PASS', cmdpass
+
+	.LONG	'ACCT', cmdacct
+
+	.LONG	'QUIT', cmdquit
+
+	.LONG	'HELP', cmdhelp
+
+
+lginreq:.LONG	'CD'		;'CWD' 'CDUP' 'PWD' , cmdcwd
+
+
+????	.LONG	'REIN', cmdrein
+
+
+	.LONG	'TYPE'		;'TYPE', cmdtype
+
+
+	.LONG	'GET'		;'RETR', cmdretr
+	.LONG	'MGET'
+	.LONG	'PUT'		;'STOR', cmdstor
+	.LONG	'MPUT'
+
+
+	.LONG	'APPEND'	;'APPE', cmdappe
+
+????	.LONG	'REST', cmdrest
+
+	.LONG	'RENAME'	;'RNFR' 'RNTO', cmdrnfr
+
+????	.LONG	'ABOR', cmdabor
+
+	.LONG	'DELETE'	;'DELE', cmddele
+	.LONG	'RMDIR'		;'RMD' , cmdrmd
+	.LONG	'MKDIR'		;'MKD' , cmdmkd
+
+	.LONG	'DIR'		''LIST', cmdlist
+	.LONG	'LIST'		;'NLST', cmdnlst
+
+	.LONG	'SITE', cmdsite
+	.LONG	'SYST', cmdsyst
+	.LONG	'STAT', cmdstat
+CMDTSZ=!{$-cmdtbl}/8
+
+
+.PAGE
+	.SBTTL	trmoutput - Subroutine to do terminal output
+
+;Subroutine to do terminal output
+;	CALL	trmoutput
+
+trmoutput:
+
+
+	.SBTTL	tcpdebug - Subroutine to output debug data
+
+;Subroutine to output debug data
+;	c(AL)  = Initial character to output
+;	c(AH)  = Final character to output
+;	c{ESI} = Offset of buffer
+;	c{ECX} = Number of bytes in buffer
+;	CALL	tcpdebug
+
+tcpdebug:
+	JREGZ	ECX, 8$
+	MOVB	debugstr, AH		;Save final character
+	PUSHL	debughndl		;Output initial character
+	PUSHL	EAX
+	CALLF	svcIoOutSingle#
+	JMP	4$.S
+
+2$:	PUSHL	debughndl		;Output leading space
+	PUSHL	#' '.B
+	CALLF	svcIoOutSingle#
+4$:	MOVB	AL, [ESI]		;Get first digit
+	SHRB	AL, #4
+	CALL	outdigit
+	CLD
+	LODSB	[ESI]			;Get second digit
+	CALL	outdigit
+	LOOP	ECX, 2$
+	MOVL	EBX, #debugstr
+	PUSHL	debughndl
+	PUSHL	DS
+	PUSHL	EBX
+	PUSHL	#0.B
+	CALLF	svcIoOutString#
+8$:	RET
+
+outdigit:
+	ANDB	AL, #0Fh
+	CMPB	AL, #9
+	JBE	10$.S
+	ADDB	AL, #'A'-'0'-10t
+10$:	ADDB	AL, #'0'
+	PUSHL	debughndl
+	PUSHL	EAX
+	CALLF	svcIoOutSingle#
+	RET
+.PAGE
+	.SBTTL	Data
+
+	.PSECT	_DATA_p
+
+	  .MOD   4
+dftname:  .ASCII "TCP0:"	;Default device name
+devname:  .BLKB  128t		;Device name specified
+
+prgname:: .ASCIZ "FTP"
+nostkmsg: .ASCIZ "Cannot allocate stack space"
+crlfmsg:  .ASCIZ {CR,LF}
+notodomsg:.ASCIZ "No host specified (/H for help)"{CR,LF}
+nottcpmsg:.ASCIZ "Device is not a TCP device"{CR,LF}
+tomnymsg: .ASCIZ "More than one host specified (/H for help)"{CR,LF}
+nomemmsg: .ASCIZ "Not enough memory"{CR,LF}
+debgemsg: .ASCIZ "Cannot open debug output device/file"{CR,LF}
+trmemsg:  .ASCIZ "Cannot open terminal device"{CR,LF}
+sivfmsg:  .ASCIZ "Cannot initialize software interrupt vector"{CR,LF}
+tcperrmsg:.ASCIZ "Cannot open TCP device"{CR,LF}
+trmoutper:.ASCIZ "Cannot set terminal output parameters"{CR,LF}
+trminpper:.ASCIZ "Cannot set terminal input parameters"{CR,LF}
+tcpoer:   .ASCIZ "TCP output error"{CR,LF}
+tcpier:   .ASCIZ "TCP input error"{CR,LF}
+ddsper:   .ASCIZ "Display data stream protocol (DDSP) error"{CR,LF}
+ncclrmsg: .ASCIZ {CR,LF}"% TELNET: Network connection cleared"
+conmsg:   .ASCIZ "Connected to _"
+xosmmsg:  .ASCIZ " using XOS mode (escape is alt-break)"{CR,LF}
+ansimmsg: .ASCIZ " using ANSI mode (escape is ctl-break)"{CR,LF}
+covmsg:   .ASCIZ "Protocol overflow/deadlock - fatal"
+trmmsg:   .ASCIZ {CR,LF}"% TELNET: Terminating"
+fmsg1:    .ASCIZ "? TELNET: "
+fmsg2:    .ASCIZ "          "
+xosmwill: .BYTE	 TNC_IAC, TNC_SB, TNO_XOSMODE, XOS_BGNKB
+disptype: .LONG  0
+xosmend:  .BYTE  TNC_IAC, TNC_SE
+XOSMEND=!$-xosmend
+XOSMWILL=!$-xosmwill
+xosmvidmd:.BYTE	 TNC_IAC, TNC_SB, TNO_XOSMODE, XOS_VIDMODE
+XOSMVIDMD=!$-xosmvidmd
+xosmvidft:.BYTE	 TNC_IAC, TNC_SB, TNO_XOSMODE, XOS_VIDFONT
+XOSMVIDFT=!$-xosmvidft
+
+trmfmsg:  .ASCII "? TELNET: Cannot start terminal input, terminating"{CR,LF}
+
+helpmsg:  .ASCII ""
+	  .ASCII {CR,LF}
+	  .ASCII "TELNET {/option} {-option} {dev:}host{::}"{CR,LF}
+	  .ASCII {CR,LF}
+	  .ASCII "Options are:"{CR,LF}
+	  .ASCII "  Help      - Display this message"{CR,LF}
+	  .ASCII "  ?         - Same as Help"{CR,LF}
+	  .ASCII "  {NO}DEBug - Debug mode (displays all network data)"{CR,LF}
+	  .ASCII "  XOS       - XOS mode (VGA text mode display and PC"
+	  .ASCII " keyboard emulation)"{CR,LF}
+	  .ASCII "  ANSi      - ANSI mode (VT220 emulation)"{CR,LF}
+	  .ASCII {CR,LF}
+	  .ASCII "Note: If XOS mode is specified and the host or user"
+	  .ASCII " terminal does not support"{CR,LF}
+	  .ASCIZ "      it, ANSI mode is used"{CR,LF}
+
+trmtypestr:.BYTE  TNC_IAC, TNC_SB, TNO_TERM, TERM_IS
+	   .ASCII "VT220"
+	   .BYTE  TNC_IAC, TNC_SE
+TRMTYPESTR=!$-trmtypestr
+
+debugstr: .ASCIZ "x"{CR,LF}
+
+phyname:  .BLKB  120t
+initmsg:  .BYTE	TNC_IAC, TNC_DO, TNO_SUPGA, TNC_IAC, TNC_WILL, TNO_TERM
+INITMSG=!$-initmsg
+
+	.MOD	4
+devnamep: .LONG  0
+debughndl:.LONG  DH_STDTRM	;Debug output handle
+havename: .BYTE  0
+havenode: .BYTE  0
+debuglvl: .BYTE  0
+attrdata: .BLKL  4t
+
+	.MOD	4
+trmdata:.BLKB	dm_SIZE
+
+	.MOD	4
+trminpparms:
+	.BYTE	PAR$SET|REP_HEXV, 4
+	.WORD	IOPAR_TRMCINPMODE
+	.LONG	0FFFFFFFEh
+	.BYTE	PAR$SET|REP_HEXV, 4
+	.WORD	IOPAR_TRMSINPMODE
+	.LONG	TIM$IMAGE|TIM$ANSI7
+	.BYTE	0
+
+trmoutparms:
+	.BYTE	PAR$SET|REP_HEXV, 4
+	.WORD	IOPAR_TRMCOUTMODE
+	.LONG	0FFFFFFFEh
+	.BYTE	PAR$SET|REP_HEXV, 4
+	.WORD	IOPAR_TRMSOUTMODE
+	.LONG	TOM$IMAGE|TOM$ANSICM
+	.BYTE	0
+
+trmxosparms:
+	.BYTE	PAR$SET|REP_HEXV, 4
+	.WORD	IOPAR_TRMCINPMODE
+	.LONG	0FFFFFFFEh
+	.BYTE	PAR$SET|REP_HEXV, 4
+	.WORD	IOPAR_TRMSINPMODE
+	.LONG	TIM$IMAGE|TIM$SCNALL
+	.BYTE	PAR$SET|REP_HEXV, 4
+	.WORD	IOPAR_TRMCOUTMODE
+	.LONG	0FFFFFFFEh
+	.BYTE	PAR$SET|REP_HEXV, 4
+	.WORD	IOPAR_TRMSOUTMODE
+	.LONG	TOM$IMAGE
+	.BYTE	0
+
+	  .MOD   4
+trmqab:	  .WORD  QFNC_INBLOCK	;qab_func    = 0.  - Function
+	  .WORD  0		;qab_status  = 2.  - Returned status
+	  .LONG  0		;qab_error   = 4.  - Error code
+	  .LONG  0		;qab_amount  = 8.  - Amount transfered
+trmhndl:  .LONG  DH_STDTRM	;qab_handle  = 12. - Device handle
+	  .BYTE  VECT_TRM		;qab_vector  = 16. - Vector for interrupt
+	  .BYTE  0, 0, 0	;Reserved
+	  .LONG  0		;qab_option  = 20. - Option bits
+	  .LONG  1024t		;qab_count   = 24. - Amount to transfer
+	  .LONG  trmibuf	;qab_buffer1 = 28. - Pointer to data buffer
+	  .LONG  !trmibuf
+	  .LONG  0, 0		;qab_buffer2 = 36. - Not used
+	  .LONG  0, 0		;qab_parm    = 44. - Pointer to parameter list
+
+tcptparm:
+	.BYTE	PAR$SET|REP_DECV, 4
+	.WORD	IOPAR_TIMEOUT
+	.LONG	0FFFFFFFFh
+	.BYTE	0
+
+	.MOD	4
+tcpiqab:  .WORD  QFNC_INBLOCK	;qab_func    = 0.  - Function
+	  .WORD  0		;qab_status  = 2.  - Returned status
+	  .LONG  0		;qab_error   = 4.  - Error code
+	  .LONG  0		;qab_amount  = 8.  - Amount transfered
+tcphndl:  .LONG  0		;qab_handle  = 12. - Device handle
+	  .BYTE  VECT_TCPIN	;qab_vector  = 16. - Vector for interrupt
+	  .BYTE  0, 0, 0	;Reserved
+	  .LONG  0		;qab_option  = 20. - Option bits
+	  .LONG  1024t		;qab_count   = 24. - Amount to transfer
+	  .LONG  tcpibuf	;qab_buffer1 = 28. - Pointer to data buffer
+	  .LONG  !tcpibuf
+	  .LONG  0, 0		;qab_buffer2 = 36. - Not used
+	  .LONG  tcptparm	;qab_parm    = 44. - Pointer to parameter list
+	  .LONG  !tcptparm
+
+	  .MOD   4
+devpparms:.BYTE	 PAR$GET|REP_TEXT, 8 ;Parameters for initial check of TCP device
+	  .WORD	 IOPAR_CLASS
+devclass: .BLKB  8t
+	  .BYTE  PAR$SET|REP_HEXV, 4
+	  .WORD	 IOPAR_FILOPTN
+	  .LONG  FO$NOPREFIX|FO$XOSNAME
+	  .BYTE  PAR$GET|REP_STR, 0
+	  .WORD  IOPAR_FILSPEC
+	  .LONG  phyname
+	  .LONG  !phyname
+	  .WORD  120t, 0
+	  .BYTE  0
+
+openparms:
+	.BYTE	PAR$SET|REP_HEXV, 4
+	.WORD	IOPAR_FILOPTN
+	.LONG	FO$NOPREFIX|FO$XOSNAME|FO$NODENUM
+	.BYTE	PAR$GET|REP_STR, 0
+	.WORD	IOPAR_FILSPEC
+	.LONG	phyname
+	.LONG	!phyname
+	.WORD	120t, 0
+	.BYTE	PAR$GET|REP_HEXV, 2
+	.WORD	IOPAR_NETLCLPORT
+lclport:.WORD	0
+	.BYTE	PAR$GET|REP_HEXV, 4
+	.WORD	IOPAR_NETRMTNETAR
+rmtnode:.LONG	0
+	.BYTE	PAR$SET|REP_HEXV, 2
+	.WORD	IOPAR_NETRMTPORTS
+rmtport:.WORD	TCPP_TELNET
+	.BYTE	0
+
+	   .MOD   4
+tcpipnt:   .LONG  0
+tcpibuf:   .BLKB  1024t
+
+trmipnt:   .LONG  0
+trmibuf:   .BLKB  1024t
+
+trmostate: .LONG  0
+trmocnt:   .LONG  0
+trmopnt:   .LONG  trmobuf
+trmobuf:   .BLKB  TRMBSIZE
+
+tcpstate:  .LONG  TCPS_NORMAL
+
+tcpinact:  .BYTE  0		;Non-zero if TCP input is active
+
+
+
+	.MOD	4
+tcpcpnt:.LONG	tcpcbuf
+tcpcbuf:.BLKB	TCPCSIZE
+tcpopnt:.LONG   tcpobuf
+tcpobuf:.BLKB	TCPOSIZE

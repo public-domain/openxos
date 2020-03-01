@@ -1,0 +1,167 @@
+	.TITLE	_fsetup - Stream I/O setup routines
+	.SBTTL	STDC run-time library for XOS
+
+;++++
+; This software is in the public domain.  It may be freely copied and used
+; for whatever purpose you see fit, including commerical uses.  Anyone
+; modifying this software may claim ownership of the modifications, but not
+; the complete derived code.  It would be appreciated if the authors were
+; told what this software is being used for, but this is not a requirement.
+
+;   THIS SOFTWARE IS PROVIDED BY THE AUTHORS "AS IS" AND ANY EXPRESS OR
+;   IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
+;   OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+;   IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+;   INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+;   BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS
+;   OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+;   ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR
+;   TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
+;   USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+;----
+
+;+
+; Edit history:
+;
+;  Date    Who  Description
+; -------  ---  -----------
+; 27Sep94  FPJ  Fixed some bugs.
+; 17Jan95  FPJ  Fixed bug which didn't allocate buffer for stream which was
+;		buffer but which did not point to a disk file. This caused
+;		problems when re-directing output to PRN: or NULL:.
+; 13Apr95  FPJ  Fixed bug which indexed IOB with EBP instead of EDI.
+;-
+
+	.INCLUD	XOSINC:\XMAC\XOS.PAR
+	.INCLUD XOSINC:\XMAC\XOSERR.PAR
+	.INCLUD	XOSINC:\XMAC\STDIO.PAR
+
+	.STDSEGS
+
+	.SBTTL	_fsetup - Finish opening file for I/O stream
+
+;+
+; Function: _fsetup
+;
+;	_IOB  iob;		// IOB for stream
+;
+;	value = _fsetup(&iob)
+;
+;  Value returned is address of the streams IOB if OK or NULL if
+;    error (errno is set)
+;-
+
+
+$$$ = !0
+
+FRM fset_parms, 20t
+
+fset_SIZE = !$$$			;Calculate size of parameter frame
+
+PAR_DEVSTS =!	{ PAR$GET | REP_HEXV } + { 4 < 8t } + { IOPAR_DEVSTS < 16t }
+PAR_LENGTH =!	{ PAR$GET | REP_DECV } + { 4 < 8t } + { IOPAR_LENGTH < 16t }
+PAR_ABSPOS =!	{ PAR$GET | REP_DECV } + { 4 < 8t } + { IOPAR_ABSPOS < 16t }
+
+	.PSECT	_TEXT_p
+
+	.ENTRY	_fsetup
+
+_fsetup:
+	PUSHL	EDI
+	ENTER	fset_SIZE, 0
+	MOVL	fset_parms+0t.B[EBP], #PAR_DEVSTS
+	MOVB	fset_parms+8t.B[EBP], #0 ;Mark end of parameter list
+	MOVL	EDI, 12t.B[EBP]		;Get pointer to IOB block
+	PUSHL	iob_handle.B[EDI]	;Pass handle
+	PUSHL	#0.B			;No buffer
+	PUSHL	#0.B
+	PUSHL	#0.B			;No characters
+	PUSHL	SS
+	LEAL	EAX, fset_parms.B[EBP]
+	PUSHL	EAX			;Specify parameter list
+	CALLF	svcIoInBlockP#		;Get the device parameters
+	TESTL	EAX, EAX
+	JS	70$			;If error, quit
+
+;Here with device information
+
+	MOVL	EDX, fset_parms+4t.B[EBP] ;Copy device status
+	BTL	EDX, #DS%UNBFRD 	;Unbuffered device?
+	JNC	20$.S			;No, buffered
+10$:	BTSL	iob_flag.B[EDI], #IOB%UNBUF ;Yes - remember that
+	MOVL	iob_count.B[EDI], #-1
+	JMP	60$
+
+;Here for buffered device
+
+20$:	MOVL	fset_parms+0t.B[EBP], #PAR_LENGTH
+	MOVL	fset_parms+8t.B[EBP], #PAR_ABSPOS
+	MOVB	fset_parms+16t.B[EBP], #0 ;Mark end of parameter list
+	MOVL	EDI, 12t.B[EBP]		;Get pointer to IOB block
+	PUSHL	iob_handle.B[EDI]	;Pass handle
+	PUSHL	#0.B			;No buffer
+	PUSHL	#0.B
+	PUSHL	#0.B			;No characters
+	PUSHL	SS
+	LEAL	EAX, fset_parms.B[EBP]
+	PUSHL	EAX			;Specify parameter list
+	CALLF	svcIoInBlockP#		;Get the device parameters
+	CMPL	EAX, #ER_EOF		;End of file?
+	JE	10$.S			;Yes, treat as unbuffered device
+	TESTL	EAX, EAX
+	JS	70$			;Quit if other error
+	MOVL	iob_end.B[EDI], #0
+	MOVL	iob_count.B[EDI], #0
+	BTL	EDX, #DS%FILE 		;File structured device?
+	JNC	30$.S			;No, just check buffer
+	BTSL	iob_flag.B[EDI], #IOB%DISK ;Yes
+	MOVL	EAX, fset_parms+4t.B[EBP] ;Store file length
+	MOVL	iob_length.B[EDI], EAX
+	CMPL	fset_parms+12t.B[EBP], EAX ;Past EOF?
+	JBE	30$.S			;No
+	MOVL	fset_parms+12t.B[EBP], EAX ;Yes - set to EOF
+30$:	CMPL	iob_buffer.B[EDI], #0.B	;Have buffer?
+	JNE	50$.S			;Yes
+	PUSHL	#BUFSIZE		;No - allocate one now
+	CALL	malloc#
+	POPL	EBX
+	TESTL	EAX, EAX		;Did we get the memory?
+	JNE	40$.S			;Yes
+	MOVL	EAX, #ER_NEMA		;No - call it a no memory error
+	JMP	70$.S			;And exit
+
+;Here when buffer allocated
+
+40$:	MOVL	iob_buffer.B[EDI], EAX	;Store buffer offset
+	MOVL	ECX, #BUFSIZE		;Get buffer size
+	MOVL	iob_bsize.B[EDI], ECX	; and store it
+50$:	MOVL	EAX, fset_parms+12t.B[EBP] ;Set new offset in file
+	ANDL	EAX, #~{BUFSIZE - 1}
+	MOVL	iob_offset.B[EDI], EAX
+	PUSHL	ESI
+	MOVL	ESI, EDI		;Copy for $thisblk
+	CALL	$thisblk#		;Read the block
+	POPL	ESI
+	TESTL	EAX, EAX
+	JS	70$.S			;If error
+	MOVL	EAX, fset_parms+12t.B[EBP] ;Get offset in block
+	ANDL	EAX, #{BUFSIZE - 1}
+	MOVL	EDX, #BUFSIZE
+	SUBL	EDX, EAX
+	MOVL	iob_count.B[EDI], EDX
+	ADDL	iob_pnt.B[EDI], EAX
+60$:	MOVL	iob_error.B[EDI], #0	;No errors yet
+	MOVL	iob_ungetc.B[EDI], #-1	;No pushback character yet
+	MOVL	EAX, EDI		;Return pointer to stream
+	JMP	80$.S			;Continue
+
+;Here if error occurred - return a NULL pointer
+
+70$:	NEGL	EAX			;Make it positive for errno
+	MOVL	errno#, EAX		;And save it
+	CLRL	EAX			;Indicate a NULL pointer
+80$:	LEAVE
+	POPL	EDI			;Restore scratch register
+	RET				;Exit with EAX set to error code or 0
+
+	.END

@@ -1,0 +1,3237 @@
+	.TITLE	MEMORY1 - Memory allocation routine for XOS
+
+;++++
+; This software is in the public domain.  It may be freely copied and used
+; for whatever purpose you see fit, including commerical uses.  Anyone
+; modifying this software may claim ownership of the modifications, but not
+; the complete derived code.  It would be appreciated if the authors were
+; told what this software is being used for, but this is not a requirement.
+
+;   THIS SOFTWARE IS PROVIDED BY THE AUTHORS "AS IS" AND ANY EXPRESS OR
+;   IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
+;   OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+;   IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+;   INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+;   BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS
+;   OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+;   ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR
+;   TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
+;   USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+;----
+
+	.PROC	80486
+	.INCLUD	XOSINC:\XMAC\XOS.PAR
+	.INCLUD	XOSINC:\XMAC\XOSX.PAR
+	.INCLUD	XOSINC:\XMAC\XOSERR.PAR
+	.INCLUD	XOSINC:\XMAC\PCAT.PAR
+
+	DATA
+
+maxoffset==!0DFFFFFFh		;Maximum valid offset in user segment
+
+;Following is a description of the use of the linear address space
+;  Dir page     Address    	     Size    Use
+;  000		00000000-0010FFFF    1088K   Virtual DOS mode segment
+;  000		00110000-001FFFFF    960K    Linear address space table
+;  000-37F	00200000-DFFFFFFF    3774M   User space
+;  380-3DF	E0000000-EFFFFFFF    256M    PDAs
+;  3C0-3CE	F0000000-F3BFFFFF    60M     XFFs
+;  3CF		F3C00000-F3C3FFFF    256K    Console screen buffer
+;  3CF		F3C40000-F3C7FFFF    256K    Debugger code segment
+;  3CF		F3C80000-F3DFFFFF    1536K   Debugger data segment
+;  3CF		F3E00000-F3FEFFFF    1984K   System code segment
+;  3D0		F3FF0000-F3FFEFFF    48K     Protected mode user code segment
+;  3D0		F3FFF000-F3FFFFFF    16K     Real mode code segment
+;  3D0-3D1	F4000000-F47DFFFF    8064K   System data segment
+;  3D1		F47E0000-F47EFFFF    64K     EGA ROM
+;  3D1		F47F0000-F47FFFFF    64K     BIOS ROM
+;  3D2-3DF	F4800000-F7FFFFFF    56M     Exec buffers
+;  3E0-3EF      F8000000-FBFFFFFF    64M     Display buffers
+;  3F0-3FE	FC000000-FFBFFFFF    60M     Disk buffers
+;  3FF		FFC00000-FFFFFFFF    4M	     Current process page tables
+
+;Note:  Directory pages 380 through 3FF are common to all processes.  All other
+;	  directory pages are mapped individually for each process.
+
+;Format of the page table entries when P bit is set:
+
+;    3 3 2 2 2 2 2 2 2 2 2 2 1 1 1 1 1 1 1 1 1 1
+;    1 0 9 8 7 6 5 4 3 2 1 0 9 8 7 6 5 4 3 2 1 0 9 8 7 6 5 4 3 2 1 0
+;   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+;   |F F F F F F F F F F F F F F F F F F F F|X X X|0 0|D|A|C|W|U|R|P|
+;   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+
+;Where:
+;  F = Page frame address bits
+;  X = Memory area table index (0 means page is not managed by knlMemTable)
+;  D = Dirty page bit
+;  A = Page accessed bit
+;  C = Cache disable bit (80486 only)
+;  W = Write through caching bit (80486 only)
+;  U = User page bit
+;  R = Read/write bit
+;  P = Page is present bit (1)
+
+;Format of the page table entries when P bit is clear
+
+;    3 3 2 2 2 2 2 2 2 2 2 2 1 1 1 1 1 1 1 1 1 1
+;    1 0 9 8 7 6 5 4 3 2 1 0 9 8 7 6 5 4 3 2 1 0 9 8 7 6 5 4 3 2 1 0
+;   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+;   |D D D D D D D D D D D D D D D D D D D D D D D D D D|T T T T|R|P|
+;   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+
+;Where:
+;  D = Data (depends on value in T field)
+;  T = Page type:
+;	PT_VIRT  = 1 - Virtually allocated page (D field is not used)
+;	PT_SWAP  = 2 - Swapped out page
+;	PT_DISP  = 3 - Unmapped display page (D field contains TDB offset)
+;	PT_BLOCK = 4 - Blocked memory page (D field contains MDB offset)
+;  R = Read/write bit
+;  P = Page is present bit (0)
+
+;XOS keeps track of memory pages using the knlMemTable.  knlMemTable is an 8
+;  entry staticaly allocated table which contains the offset of each memory
+;  area table.  It always contains at least two entires.  The first entry
+;  always points to the area table for the first 640KB of physical memory
+;  (basetable).  The last used entry always points to a dummy table (toptable)
+;  which indicates  the end of the memory area tables.  Each memory area table
+;  describes a contiguous range of physical pages.  Each table contains one 8
+;  byte entry for each page of memory in the range described by the table.  The
+;  8 bytes just before the table contain the physical address of the first
+;  page (table address - 4) and the number of entries in the table (table
+;  address - 8).  The last (dummy) table (toptable) has -1 as the number of
+;  enties.  The format of each memory area table entry is as follows:
+
+;  +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+;  |   IO count    | Type  |                 F1                    |
+;  +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+;  |                             F2                                |
+;  +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+
+;  The IO count field specifies the number of processes which have the page
+;  locked for IO.  The type field specifies the page type as indicated below.
+;  The use of the F1 and F2 fields depend on the type of the page.
+
+;Values less than 8 are system pages
+;   MT_FREE  = 0    Unallocated page
+;			F1 = Memory table for next free page
+;			F2 = Offset in memory table for next free page
+;   MT_SYS   = 1    System page
+;			F1 = Not used
+;			F2 = Not used
+;   MT_PDIR  = 2    Page directory page
+;			F1 = Not used
+;			F2 = Selector for PDA for process
+;   MT_PTBL  = 3    Page table page
+;			F1 = Page number in page directory
+;			F2 = Selector for PDA for process
+;   MT_PDA   = 6    Process data area (PDA) page
+;			F1 = Page number in PDA
+;			F2 = Selector for PDA for process
+;   MT_SDA   = 7    Shared section data area (SDA) page
+;			F1 = Page number in SDA
+;			F2 = Selector for SDA for shared section
+
+;Values 8 or greater are user pages - even values are private pages and odd
+;  values are shared pages
+;   MT_PLOCK = 8    Private locked user page
+;			F1 = Page number in msect
+;			F2 = Offset of MDB for msect or handle for DPMI block
+;   MT_SLOCK = 9    Shared locked user page
+;			F1 = Page number in shared section
+;			F2 = Selector for SDA for shared section
+;   MT_PNSWP = 10   Private non-swapable user page
+;			F1 = Page number in msect
+;			F2 = Offset of MDB for msect
+;   MT_SNSWP = 11   Shared non-swapable user page
+;			F1 = Page number in shared section
+;			F2 = Selector for SDA for shared section
+;   MT_PUSER = 12   Private user page
+;			F1 = Page number in msect
+;			F2 = Offset of MDB for msect
+;   MT_SUSER = 13   Shared user page
+;			F1 = Page number in shared section
+;			F2 = Selector for SDA for shared section
+
+;  Memory free list pointers are made up of two values; the knlMemTable index
+;  for the memory area table containing the page plus 1 and the page number in
+;  the memory area table (starting with 0).  The knlMemTable index is stored
+;  in the F1 field and the page number in the memory area table is stored in
+;  the F2 field for each page on the memory free list. An entry of all 0
+;  indicates the end of the list.  Note that since a free page has a type of
+;  0 and that the IO count field for a free page will always contain 0, the
+;  F1 field can be referenced as a long without masking off the type and IO
+;  count fields.
+.PAGE
+	.SBTTL	meminit - Subroutine to initialize memory allocator
+
+	ONCE
+
+;Subroutine to initialize memory allocator
+;	c{EAX} = First unavailable paragraph in base memory area
+;	c{EBX} = First available address in base memory area
+;	c{ECX} = Size of the once-only ram-disk
+;	CALL	meminit
+
+meminit::
+	PUSHL	EBP
+	ADDL	ECX, #0FFFH		;Change ram-disk size to number of
+	SHRL	ECX, #12t		;  pages (round up)
+	PUSHL	ECX
+	SHRL	EAX, #8t		;Change to block number
+	MOVL	knlMemTotal, EAX
+	MOVL	basetable#-8t, EAX
+	ADDL	EBX, #0FFFh
+	SHRL	EBX, #12t
+	SUBL	EAX, EBX		;Get number of blocks available
+	MOVL	knlMemAvail, EAX	;Store it
+	MOVL	ECX, #4t
+	MOVL	EDI, #pgtable+{la_vusercode>10t}
+2$:	ANDB	[EDI], #~02		;Make the user real mode code pages
+	ADDL	EDI, #4t.B		;  read only
+	LOOP	ECX, 2$
+
+;All pages which contain the kernel are indicated as being used by the system
+
+	MOVL	ECX, EBX
+	MOVL	EAX, #MT_SYS<20t
+	MOVL	EDI, #basetable
+	PUSHL	DS
+	POPL	ES
+	CLD
+4$:	STOSL	[EDI]
+	ADDL	EDI, #4t.B
+	LOOP	ECX, 4$
+
+;All pages above the loaded data and code and the top of the base memory
+;  are next linked to the beginning of the memory free list
+
+	MOVL	ECX, knlMemAvail
+	DECL	ECX
+	LEAL	EDI, basetable#[EBX*8]	;Point to first memory free list entry
+	MOVL	knlMemFree#+0, #1	;Put available base memory on the
+	MOVL	knlMemFree#+4, EBX	;  memory free list
+6$:	INCL	EBX
+	MOVL	[EDI], #1
+	MOVL	4.B[EDI], EBX
+	ADDL	EDI, #8t.B
+	LOOP	ECX, 6$
+
+;The memory table for the first hunk (which is all we set up here) of extended
+;  memory is allocated and set up.  The beginning of extended memory contains
+;  the once-only RAM-disk and is marked as system pages.  The remainder of
+;  extended memory is linked onto the memory free list.
+
+	CLRL	EAX			;Get size of extended memory
+	MOVB	AL, #18h
+	CALL	knlReadCmos#
+	MOVB	AH, AL
+	MOVB	AL, #17h
+	CALL	knlReadCmos#
+	SHRL	EAX, #2t		;Change to number of pages
+	JE	8$.S			;If none
+	PUSHL	EDI			;Save offset for linking
+	MOVL	EBX, EAX
+	PUSHL	EBX			;Save number of pages
+	CALL	knlGetXRes
+	LEAL	ECX, 8t[EBX*8]		;Allocate exec memory for memory table
+	CALL	knlGetXMem
+	JNC	10$.S			;If OK
+8$:	CRASH	NMEM			;[No MEMory]
+
+;Here with memory allocated for the memory table
+
+10$:	CALL	knlGiveXRes
+	MOVL	4t.B[EDI], #100000h	;Store physical address
+	POPL	ECX			;Restore number of pages
+	MOVL	[EDI], ECX
+	MOVL	EAX, 4.B[ESP]
+	ADDL	knlMemTotal, ECX	;Add into total pages
+	SUBL	ECX, EAX		;Reduce by the size of the ram-disk
+	ADDL	knlMemAvail, ECX	;Add into pages available
+	ADDL	EDI, #8t.B
+	MOVL	knlMemTable#+4, EDI	;Store address in knlMemTable
+	MOVL	knlMemTable#+8, #toptable#
+	MOVL	EBX, EAX
+12$:	MOVL	[EDI], #MT_SYS<20t	;Mark the once-only RAM-disk pages as
+	ADDL	EDI, #8.B		;  system pages
+	DECL	EAX
+	JNE	12$.S
+	POPL	EAX			;Link into memory free list
+	MOVL	[EAX], #2
+	MOVL	4.B[EAX], EBX
+	INCL	EBX
+14$:	MOVL	[EDI], #2
+	MOVL	4.B[EDI], EBX
+	INCL	EBX
+	ADDL	EDI, #8t.B
+	LOOP	ECX, 14$
+	SUBL	EDI, #8t.B		;Save final address for linking
+	MOVL	[EDI], #0		;Zero the last link
+	POPL	ECX			;Fix up the stack
+.PAGE
+;Now copy (and compress) the exported symbol table
+
+$$$=!0
+FRM sym_mempnt, 4t		;Memory pointer
+FRM sym_savdst, 4t		;Pointer to start of destination block
+FRM sym_savsrc, 4t		;Pointer to start of source block
+FRM sym_savsym, 4t		;Pointer to start of source symbol entry
+FRM sym_offset, 4t		;Offset value for symbol
+FRM sym_select, 4t		;Selector value for symbol
+FRM sym_header, 48t		;Header bytes for symbol + buffer
+FRM sym_count , 4t		;Symbol counter
+sym_SIZE=!$$$
+
+setsym:	ENTER	sym_SIZE, 0
+	MOVL	sym_mempnt.B[EBP], #symtable
+	MOVL	EAX, #8t		;Get memory for table header
+	CALL	getsymmem
+	MOVL	EAX, #8			;Store first offset in the header
+	STOSL	[EDI]
+	CLRL	EAX			;Second long is not used
+	STOSL	[EDI]
+	MOVL	ESI, #exporttable#
+1$:	MOVL	EAX, #16t		;Allocate space for the block header
+	CALL	getsymmem
+	MOVL	sym_savdst.B[EBP], EDI
+	MOVL	sym_savsrc.B[EBP], ESI
+	MOVSL	[EDI], CS:[ESI]		;Copy the block header
+	MOVSL	[EDI], CS:[ESI]
+	MOVSL	[EDI], CS:[ESI]
+	LODSL	CS:[ESI]
+	STOSL	[EDI]
+	MOVL	sym_count.B[EBP], EAX
+2$:	MOVL	sym_savsym.B[EBP], ESI	;Remember where the symbol entry starts
+	LODSW	CS:[ESI]		;Get header bytes
+	MOVL	sym_header.B[EBP], EAX
+	MOVB	BL, AH			;Get symbol size
+	ANDL	EBX, #1Fh.B
+	INCL	EBX
+	PUSHL	SS			;Copy symbol name
+	POPL	ES
+	LEAL	EDI, sym_header+2.B[EBP]
+	MOVL	ECX, EBX
+	RMOVSB	[EDI], CS:[ESI]
+	CLRL	ECX			;Determine selector size
+	TESTB	AH, #80h
+	JE	4$.S
+	INCL	ECX
+	TESTB	AH, #40h
+	JE	4$.S
+	INCL	ECX
+4$:	MOVZBL	EDX, AL			;Determine offset size
+	SUBL	EDX, EBX
+	SUBL	EDX, ECX
+	SUBL	EDX, #2.B
+	CMPL	EDX, #4.B		;Make sure valid
+	JA	6$.S
+	JMPIL	CS:symvsd[EDX*4]
+
+	.MOD	4
+symvsd:	.LONG	ofs0
+	.LONG	ofs1
+	.LONG	ofs2
+	.LONG	ofs3
+	.LONG	ofs4
+
+6$:	CRASH	IFST
+
+ofs4:	MOVL	EAX, CS:[ESI]
+	JMP	8$.S
+
+ofs3:	MOVZWL	EAX, CS:1.B[ESI]
+	SHLL	EAX, #8t
+	MOVB	AL, CS:[ESI]
+	TESTB	sym_header+1.B[EBP], #20h
+	JE	8$.S
+	ORL	EAX, #0FF000000h
+	JMP	8$.S
+
+ofs2:	MOVZWL	EAX, CS:[ESI]
+	TESTB	sym_header+1.B[EBP], #20h
+	JE	8$.S
+	ORL	EAX, #0FFFF0000h
+	JMP	8$.S
+
+ofs1:	MOVZBL	EAX, CS:[ESI]
+	TESTB	sym_header+1.B[EBP], #20h
+	JE	8$.S
+	ORL	EAX, #0FFFFFF00h
+	JMP	8$.S
+
+ofs0:	CLRL	EAX
+	TESTB	sym_header+1.B[EBP], #20h
+	JE	8$.S
+	NOTL	EAX
+8$:	MOVL	sym_offset.B[EBP], EAX
+	JMPIL	CS:symssd[ECX*4]
+
+	.MOD	4
+
+symssd:	.LONG	sel0
+	.LONG	sel1
+	.LONG	sel2
+
+sel2:	MOVZWL	EAX, CS:[ESI+EDX]
+	JMP	10$.S
+
+sel1:	MOVZBL	EAX, CS:[ESI+EDX]
+	JMP	10$.S
+
+sel0:	CLRL	EAX
+10$:	MOVL	sym_select.B[EBP], EAX
+	MOVL	EAX, sym_offset.B[EBP]	;Determine space needed for offset
+	ORB	sym_header+1.B[EBP], #20h ;Try 1 extend first
+	MOVL	EDX, EAX		;Will it fit in 0 bytes with 1 extend?
+	NOTL	EDX
+	TESTL	EDX, EDX
+	JE	18$.S			;Yes
+	TESTL	EDX, #0FFFFFF00h	;No - fit in 1 byte with 1 extend?
+	JE	16$.S			;Yes
+	TESTL	EDX, #0FFFF0000h	;No - fit in 2 bytes with 1 extend?
+	JE	14$.S			;Yes
+	TESTL	EDX, #0FF000000h	;No - fit in 3 bytes with 1 extend?
+	JE	12$.S			;Yes
+	ANDB	sym_header+1.B[EBP], #~20h ;No - now check for 0 extend
+	TESTL	EAX, EAX		;Will it fit in 0 bytes with 0 extend?
+	JE	18$.S			;Yes
+	TESTL	EAX, #0FFFFFF00h	;No - fit in 1 byte with 0 extend?
+	JE	16$.S			;Yes
+	TESTL	EAX, #0FFFF0000h	;No - fit in 2 bytes with 0 extend?
+	JE	14$.S			;Yes
+	TESTL	EAX, #0FF000000h	;No - fit in 3 bytes with 0 extend?
+	JE	12$.S			;Yes
+	STOSL	[EDI]			;No - store value in 4 bytes
+	JMP	18$.S
+
+;Here if can store value in 3 bytes
+
+12$:	STOSB	[EDI]
+	SHRL	EAX, #8t
+
+;Here if can store value in 2 bytes
+
+14$:	STOSW	[EDI]
+	JMP	18$.S
+
+;Here if can store value in 1 byte
+
+16$:	STOSB	[EDI]
+18$:	ANDB	sym_header+1.B[EBP], #~40h
+	TESTB	sym_header+1.B[EBP], #80h ;Is this an address?
+	JE	22$.S			;No
+	MOVL	EAX, sym_select.B[EBP]	;Yes - get selector value
+	CMPB	AH, #0			;Do we need two bytes?
+	JE	20$.S			;No
+	ORB	sym_header+1.B[EBP], #40h ;Yes
+	STOSW	[EDI]
+	JMP	22$.S
+
+20$:	STOSB	[EDI]
+22$:	MOVL	EAX, EDI		;Calculate total length of entry
+	SUBL	EAX, EBP
+	SUBL	EAX, #sym_header.B
+	MOVB	sym_header.B[EBP], AL	;Store it in the header byte
+	PUSHL	EAX
+	CALL	getsymmem		;Get memory for the symbol entry
+	POPL	ECX
+	LEAL	ESI, sym_header.B[EBP]	;Copy the entry
+	PUSHL	DS
+	POPL	ES
+	RMOVSB	[EDI], SS:[ESI]
+	MOVL	ESI, sym_savsym.B[EBP]
+	MOVZBL	EAX, CS:[ESI]
+	ADDL	ESI, EAX
+	DECL	sym_count.B[EBP]
+	JNE	2$			;Continue if more in this block
+	MOVL	ESI, sym_savsrc.B[EBP]
+	MOVL	EDX, sym_savdst.B[EBP]
+	MOVL	ECX, EDI		;Fill with 0s up to the next 16-byte
+	NEGL	ECX			;  boundry
+	ANDL	ECX, #0Fh.B
+	CLRL	EAX
+	RSTOSB	[EDI]
+	LEAL	ECX, -symtable[EDI]
+	MOVL	[EDX], ECX		;Link to next block
+	MOVL	sym_mempnt.B[EBP], EDI
+	MOVL	ESI, CS:[ESI]		;Get next block
+	TESTL	ESI, ESI		;Have another one?
+	JNE	1$			;Yes - continue
+	LEAL	ECX, -symtable[EDI]	;No - remember where this one ended
+	MOVL	exportnext, ECX
+	MOVL	[EDX], EAX		;Clear last link
+	SUBL	EDX, #symtable
+	MOVL	exportlink, EDX
+	MOVL	ECX, EDI		;Clear the rest of the last memory
+	NEGL	ECX			;  page
+	ANDL	ECX, #0FFFh
+	SHRL	ECX, #2t
+	RSTOSL	[EDI]
+	LEAVE
+	JMP	setpage0.S
+.PAGE
+;Subroutine to allocate memory for the exported symbol table
+;	c{EAX} = Bytes to get
+;	CALL	getsymmem
+;	c{ES:EDI} = Address of memory allocated
+;	D bit is clear
+
+getsymmem:
+	MOVL	EDI, sym_mempnt.B[EBP]	;Get offset to use
+	ADDL	sym_mempnt.B[EBP], EAX
+	TESTL	EDI, #0FFFh
+	JE	2$.S
+	LEAL	ECX, [EDI+EAX]		;Do we need another page?
+	TESTL	ECX, #0FFFh
+	JE	4$.S
+	XORL	ECX, EDI
+	TESTL	ECX, #0FFFFF000h
+	JE	4$.S			;No
+2$:	LEAL	EBX, la_data+0FFF[EDI]
+	ANDL	EBX, #0FFFFF000h
+	MOVL	ECX, #1
+	CLRL	EDX
+	MOVL	EAX, #27h
+	PUSHL	EDI
+	PUSHL	ESI
+	CALL	knlGetPages#
+	POPL	ESI
+	POPL	EDI
+	JC	6$.S
+4$:	PUSHL	DS
+	POPL	ES
+	CLD
+	RET
+
+6$:	CRASH	NMST			;[No Memory for Symbol Table]
+.PAGE
+;Now set up possible saved crash data on physical page 0
+
+setpage0:
+	MOVW	pagezero+472h, #1234h	;Make the BIOS's reboot magic number is
+	CLRL	EAX			;  Right
+	MOVL	ESI, #crshmgc		;Is the crash save area set up?
+	MOVL	EDI, #crshdata
+	PUSHL	DS
+	POPL	ES
+	MOVL	ECX, #3t
+	CLD
+	RECMPSL	[EDI], CS:[ESI]
+	JE	2$.S			;Yes
+	MOVL	ESI, #crshmgc		;No - initialize it now
+	MOVL	EDI, #crshdata
+	MOVL	ECX, #3t
+	RMOVSL	[EDI], CS:[ESI]
+	MOVL	ECX, #pg0_crshSIZEo4#-3
+	RSTOSL	[EDI]
+	MOVL	EDI, #crshsave
+	MOVL	ECX, #pg0_crshSIZEo4#
+	RSTOSL	[EDI]
+2$:	CMPL	crshdata+pg0_crshCODE#, #0.B ;Do we have any crash data saved?
+	JE	4$.S			;No
+	MOVL	ESI, #crshdata		;Yes - copy it to the save area
+	MOVL	EDI, #crshsave
+	MOVL	ECX, #pg0_crshSIZEo4#
+	RMOVSL	[EDI], [ESI]
+4$:	MOVL	EDI, #crshdata+12t	;Clear the active crash data
+	MOVL	ECX, #pg0_crshSIZEo4#-3
+	RSTOSL	[EDI]
+
+;Now initialize the exec memory pool page free list
+
+	MOVL	ECX, #1023t
+	MOVL	EDI, #xpagelist
+	MOVL	EAX, #40000h
+	MOVL	xpagefree#, EAX
+8$:	ADDL	EAX, #40000h
+	STOSL	[EDI]
+	LOOP	ECX, 8$
+	MOVL	EAX, knlMemAvail	;Initialize count of user pages
+	MOVL	knlMemUser, EAX
+	MOVL	EDX, disprom#		;Map the EGA/VGA ROM
+	MOVL	EBX, #la_dsprom
+	MOVL	EAX, #27h
+	CLRL	EDI
+	DECL	EDI
+	CLRL	ECX
+	MOVB	CL, #16t
+	CALL	knlMapPhyPages#
+	MOVL	EDX, #0F0000h		;Map the BIOS ROM
+	MOVL	EBX, #la_biosrom
+	MOVL	EAX, #27h
+	CLRL	EDI
+	DECL	EDI
+	CLRL	ECX
+	MOVB	CL, #16t
+	CALL	knlMapPhyPages#
+	MOVL	EAX, knlXCodePnt
+	ADDL	EAX, #3.B		   ;Make sure memory allocation pointers
+	ANDL	EAX, #0FFFFFFFCh.B ;  point to a long
+	MOVL	knlXCodePnt, EAX
+	ADDL	EAX, #0FFFh
+	ANDL	EAX, #0FFFFF000h
+	MOVL	knlXCodeTop, EAX
+	ADDL	knlXDataPnt, #3.B
+	ANDL	knlXDataPnt, #0FFFFFFFCh.B
+	POPL	EBP
+	RET				;Finished here
+
+crshmgc:.LONG	0F0F0A5A5h
+	.ASCII	'CRSHDATA'
+
+	CODE
+.PAGE
+;Subroutine to set up segment descriptor in the global descriptor table
+;	c{EBX} = Global descriptor
+;	c{EDX} = Linear address for segment
+;	c{ECX} = (16) Limit value (16) Attribute bytes
+;	CALL	knlSetGDesc
+;	c{ESI} = Offset for next descriptor in the GDT
+
+knlSetGDesc::
+	LEAL	ESI, gdtable[EBX]
+
+;Subroutine to set up segment descriptor
+;	c{ESI} = Offset for GDT descriptor
+;	c{EDX} = Linear address for segment
+;	c{ECX} = (16) Limit value (16) Attribute bytes
+;	CALL	setdesc
+;	c{ESI} = Offset for next descriptor
+;  WARNING: EDX is changed!
+
+setdesc::
+	MOVL	st_base.B[ESI], EDX	;Store low 24 bits of address
+	SHRL	EDX, #24t
+	MOVB	st_baseh.B[ESI], DL	;Store high 8 bits of address
+	MOVW	st_atrb.B[ESI], CX	;Store attributes
+	SHRL	ECX, #16t
+	MOVW	st_limit.B[ESI], CX	;Store limit value
+	ADDL	ESI, #8.B
+	RET
+.PAGE
+	.SBTTL	knlGetXRes - Subroutine to get exec memory resource
+
+;Subroutine to get exec memory resource
+;	CALL	knlGetXRes
+
+knlGetXRes::
+	CMPL	knlXResPda, #0.B	;Is the resource free now?
+	JNE	4$.S			;No - go set up to wait
+	MOVL	knlXResPda, SS		;Yes - grab it
+2$:	MOVL	EAX, knlXDataPnt	;Save current memory pointers
+	MOVL	knlSvDataPnt#, EAX
+	MOVL	EAX, knlXSpacePnt
+	MOVL	knlSvSpacePnt#, EAX
+	MOVL	EAX, knlXCodePnt
+	MOVL	knlSvCodePnt#, EAX
+	RET				;Thats all
+
+;Here if exec memory resource is in use
+
+4$:	MOVL	EAX, SS			;Make sure we don't already have it!
+	CMPW	knlXResPda, AX
+	JE	10$.S
+	MOVL	EAX, #knlGetXMem
+	TOFORK
+	CALL	knlSetWait#
+	PUSHL	SS			;Requeue this process
+	POPL	ES
+	MOVB	AL, #knlQX_XMEM#	;Requeue to the exec memory queue
+	CALL	knlRequeue#
+	FROMFORK
+	CALLF	schedule		;Reschedule
+	MOVL	EAX, SS			;Do we have it now?
+	CMPW	knlXResPda, AX
+	JE	2$.S			;Yes - go finish set up	
+	JMP	4$.S			;No - go wait some more!
+
+;Here if already have the exec memory resource
+
+10$:	CRASH	XMDL			;[eXec Memory DeadLock]
+.PAGE
+;Subroutine to give up exec memory resource
+;	CALL	knlGiveXRes
+;  All registers are preserved
+
+knlGiveXRes::
+	PUSHL	EAX
+	MOVL	EAX, SS
+	CMPW	knlXResPda, AX
+	JNE	4$.S
+	TOFORK
+	MOVL	EAX, #knlGetXMem	;Wait up someone if waiting
+	CALL	knlEndWaitOne#
+	MOVL	knlXResPda, ES		;Update owner
+	FROMFORK
+	POPL	EAX
+	RET				;Thats all
+
+4$:	CRASH	XMEM
+.PAGE
+	.SBTTL	knlEnsXMem - Subroutine to ensure have exec memory on single page
+
+;Subroutine to ensure have enough exec memory on a single memory page
+;	c{ECX} = Amount needed on single page
+;	CALL	knlEnsXMem
+
+knlEnsXMem::
+	MOVL	EAX, SS
+	CMPW	knlXResPda, AX
+	JNE	6$.S
+	MOVL	EAX, knlXDataPnt	;Get current pointer
+	ADDL	EAX, ECX		;Plus amount wanted
+	DECL	EAX			;Minus one
+	XORL	EAX, knlXDataPnt	;Still on same page?
+	TESTL	EAX, #0FFFFF000h
+	JE	4$.S			;Yes
+	ADDL	knlXDataPnt, #0FFFh	;No - round up to start of next page
+	ANDL	knlXDataPnt, #0FFFFF000h
+4$:	RET
+
+6$:	CRASH	XMEM
+.PAGE
+	.SBTTL	knlGetXMem - Subroutine to allocate and clear exec memory
+
+;Subroutine to allocate and clear exec memory
+;	c{ECX} = Bytes to allocate
+;	CALL	knlGetXMem
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  c{ECX} = Amount allocated
+;	  c{EDI} = Offset of memory allocated
+;  All other registers are preserved
+
+1$:	CRASH	XMEM
+
+knlGetXMem::
+	PUSHL	EDX
+	PUSHL	EBX
+	PUSHL	EAX
+	MOVL	EAX, SS
+	CMPW	knlXResPda, AX
+	JNE	1$.S
+	ADDL	ECX, #3.B		;Round up to longs
+	ANDL	ECX, #0FFFFFFFCh.B
+	JE	8$.S
+	PUSHL	ECX			;Save count
+	MOVL	EDI, knlXDataPnt	;Get available offset
+	LEAL	EAX, [EDI+ECX]		;See if we have enough room now
+	CMPL	knlXSpacePnt, EAX
+	JB	10$.S
+	TESTW	DI, #0FFFh		;At beginning of a page?
+	JE	2$.S			;Yes - must get entire amount needed
+	MOVL	EBX, EDI		;See how much is needed above the
+	ANDL	EBX, #0FFFh		;  current page
+	MOVL	EAX, #1000h
+	SUBL	EAX, EBX
+	SUBL	ECX, EAX
+	JBE	4$.S			;If it will all fit on current page
+2$:	ADDL	ECX, #0FFFh		;Get number of additional pages needed
+	SHRL	ECX, #12t		;  (round up)
+	LEAL	EBX, la_data+0FFFh[EDI]	;Get linear address to allocate from
+	ANDW	BX, #0F000h
+	CLRL	EDX
+	MOVL	EAX, #27h
+	CALL	knlGetPages#
+	JC	12$.S			;If can't get them!
+	SUBL	knlMemUser, ECX
+4$:	MOVL	ECX, [ESP]		;Restore count
+	MOVL	EDI, knlXDataPnt	;Get offset for the block we got
+	ADDL	knlXDataPnt, ECX	;Bump offset (this leaves C clear)
+	SHRL	ECX, #2			;Change to long count (this will leave
+	PUSHL	DS			;  C clear since low 2 bits are 0)
+	POPL	ES
+	CLRL	EAX
+	CLD
+	PUSHL	EDI
+	RSTOSL	[EDI]			;Clear the space we just allocated
+	POPL	EDI
+	POPL	ECX
+	POPL	EAX
+	POPL	EBX
+	POPL	EDX
+ret010:	RET				;All done (C is clear)
+
+;Here if asking for 0 bytes - this is a serious internal error!
+
+8$:	CRASH	ZXMR			;[Zero eXec Memory Request]
+
+;Here if error (not enough memory available or have run out of segments!)
+
+10$:	MOVL	EAX, #ER_NEMA
+	STC
+12$:	POPL	ECX
+	POPL	EBX
+	POPL	EBX
+	POPL	EDX
+	RET
+.PAGE
+	.SBTTL	knlGiveXMem - Subroutine to give up exec memory
+
+;Subroutine to give up exec memory - must be called only immediately after
+;  memory has been allocated, before any other process runs!
+;	c{EBX} = New top of memory offset value
+;	CALL	knlGiveXMem
+;All regsiters are preserved
+
+knlGiveXMem::
+	PUSHAL
+	MOVL	EAX, SS
+	CMPW	knlXResPda, AX
+	JNE	8$.S
+	MOVL	ECX, knlXDataPnt	;Get current top of memory
+	MOVL	knlXDataPnt, EBX	;Update pointer
+	DECL	ECX			;See how many pages we can give up
+	SHRL	ECX, #12t
+	MOVL	EAX, EBX
+	DECL	EAX
+	SHRL	EAX, #12t
+	SUBL	ECX, EAX
+	JE	4$.S			;If nothing to give up
+	ADDL	EBX, #la_data+0FFFh	;Give up the extra pages
+	ANDW	BX, #0F000h
+	CLRL	EAX
+	CALL	knlGivePages#
+	JC	6$.S
+4$:	POPAL
+	RET
+
+6$:	CRASH	MPLK			;[Memory Page is LocKed]
+
+8$:	CRASH	XMEM
+.PAGE
+	.SBTTL	knlGetXSpace - Function to allocate exec address space
+
+;Function to allocate exec address space - no actual memory is allocated
+;	c{ECX} = Space needed (bytes)
+;	CALL	knlGetXSpace
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  c{ECX} = Actual size obtained
+;	  c{EDI} = Offset of address space obtained
+
+knlGetXSpace::
+	MOVL	EAX, SS
+	CMPW	knlXResPda, AX
+	JNE	6$.S
+	ADDL	ECX, #0FFFh		;Round size up to pages
+	ANDL	ECX, #0FFFFF000h
+	JE	2$.S
+	MOVL	EDI, knlXSpacePnt	;Get offset
+	SUBL	EDI, ECX		;Minus space
+	CMPL	EDI, knlXDataPnt	;Have enough room?
+	JC	4$.S			;No
+	MOVL	knlXSpacePnt, EDI	;Yes - update pointer
+	RET
+
+;Here if asking for 0 bytes!
+
+2$:	CRASH	ZXMR			;[Zero eXec Memory Request]
+
+;Here if do not have enough room
+
+4$:	MOVL	EAX, #ER_NEMA
+	RET
+
+6$:	CRASH	XMEM
+.PAGE
+	.SBTTL	knlGiveXSpace - Subroutine to give up exec memory space
+
+;Subroutine to give up exec memory space - must be called only immediately
+;  after memory space has been allocated, before any other process runs!
+;	c{EBX} = New bottom of memory space offset value
+;	CALL	knlGiveXSpace
+;All regsiters are preserved
+
+knlGiveXSpace::
+	PUSHL	EAX
+	MOVL	EAX, SS
+	CMPW	knlXResPda, AX
+	JNE	8$.S
+	MOVL	knlXSpacePnt, EBX	;Update pointer
+	POPL	EAX
+	RET
+
+8$:	CRASH	XMEM
+.PAGE
+	.SBTTL	knlGetXCode - Subroutine to allocate exec code memory
+
+;Subroutine to allocate exec code memory
+;	c{ECX} = Bytes to allocate
+;	CALL	knlGetXCode
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  c{ECX} = Amount allocated
+;	  c{EDI} = Offset of memory allocated
+
+2$:	CRASH	XMEM
+
+knlGetXCode::
+	PUSHL	EDX
+	PUSHL	EBX
+	PUSHL	EAX
+	MOVL	EAX, SS
+	CMPW	knlXResPda, AX
+	JNE	2$.S
+	ADDL	ECX, #3.B		;Round up to longs
+	ANDB	CL, #0FCh
+	PUSHL	ECX			;Save count
+	MOVL	EDI, knlXCodePnt	;Get available offset
+	LEAL	ECX, 0FFFh[EDI+ECX]	;See if we have enough room now
+	ANDL	ECX, #0FFFFF000h
+	CMPL	ECX, #100000h
+	JAE	12$.S			;No
+	SUBL	ECX, knlXCodeTop	;Yes - need to allocate memory?
+	JLE	10$.S			;No
+	SHRL	ECX, #12t		;Yes - get number of pages needed
+	LEAL	EBX, la_code+0FFFh[EDI]	;Get linear address to allocate from
+	ANDW	BX, #0F000h
+	CLRL	EDX
+	MOVL	EAX, #27h
+	CALL	knlGetPages#
+	JC	14$.S			;If can't get them!
+	SUBL	knlMemUser, ECX
+	SHLL	ECX, #12t
+	ADDL	knlXCodeTop, ECX
+10$:	POPL	ECX			;Restore count
+	MOVL	EDI, knlXCodePnt	;Get offset for the block we got
+	ADDL	knlXCodePnt, ECX	;Bump offset (this leaves C clear)
+	POPL	EAX
+	POPL	EBX
+	POPL	EDX
+	RET				;All done
+
+;Here if error
+
+12$:	MOVL	EAX, #ER_NEMA
+	STC
+14$:	POPL	ECX
+	POPL	EBX
+	POPL	EBX
+	POPL	EDX
+ret012:	RET
+.PAGE
+	.SBTTL	knlGiveXCode - Subroutine to give up exec code memory
+
+;Subroutine to give up exec code memory - must be called only immediately
+;  after memory has been allocated, before any other memory is allocated!
+;	c{EBX} = New top of memory offset value
+;	CALL	knlGiveXCode
+
+knlGiveXCode::
+	MOVL	EAX, SS
+	CMPW	knlXResPda, AX
+	JNE	4$.S
+	ADDL	EBX, #3.B		;Round up
+	ANDB	BL, #0FCh
+	MOVL	knlXCodePnt, EBX	;Update pointer
+	MOVL	ECX, knlXCodeTop
+	SUBL	ECX, EBX
+	SHRL	ECX, #12t
+	JE	ret012.S
+	ADDL	EBX, #0FFFh		;Give up the extra pages
+	ANDL	EBX, #0FFFFF000h
+	MOVL	knlXCodeTop, EBX
+	ADDL	EBX, #la_code
+	CLRL	EAX
+	CALL	knlGivePages#
+	JNC	ret012.S
+	CRASH	MPLK			;[Memory Page is Locked]
+
+4$:	CRASH	XMEM
+.PAGE
+	.SBTTL	knlGetGSelector - Function to allocate global selector
+
+;Function to allocate global selector
+;	CALL	knlGetGSelector
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  c{EBX} = Selector of segment allocated (the selector has not been
+;		     initialized and no memory has been allocated)
+;  All registers except EAX and EBX are preserved
+
+knlGetGSelector::
+	MOVL	EBX, gselfree		;Have another segment on the free list?
+	TESTL	EBX, EBX
+	JE	2$.S			;No - go create another one
+	MOVL	EAX, gdtable[EBX]	;Yes - remove from free list
+	MOVL	gselfree, EAX
+	JMP	6$.S
+
+;Here if need to create another global selector
+
+2$:	CMPL	gseltop, #10000h	;Another segment possible?
+	JAE	8$.S			;No - fail!
+	MOVL	EBX, gseltop		;Yes - get selector
+	ADDL	gseltop, #10h.B
+	INCL	gselnum#
+	IFFAULT	12$
+6$:	MOVW	gdtable+8+sd_lnksel[EBX], BX ;Link it to itself
+	MOVL	gdtable+8+sd_lnkpda[EBX], #1
+	INCL	gselinuse#		;Count it
+	RET
+
+8$:	MOVL	EAX, #ER_NEMA
+	STC
+10$:	RET
+
+;Here if have page fault when accessing GDT entry for selector
+
+	FAULTHDR
+12$:	PUSHL	EBX
+	PUSHL	ECX
+	PUSHL	EDX
+	LEAL	EBX, gdtable+la_data[EBX]
+	CLRL	ECX
+	INCL	ECX
+	CLRL	EDX
+	MOVL	EAX, #27h
+	CALL	knlGetPages#		;Allocate a page
+	POPL	EDX
+	POPL	ECX
+	POPL	EBX
+	JC	10$.S
+	DECL	knlMemUser
+	PUSHL	EDI
+	PUSHL	ECX
+	PUSHL	ES
+	PUSHL	DS
+	POPL	ES
+	LEAL	EDI, gdtable[EBX]
+	MOVL	ECX, #1024t
+	CLRL	EAX			;Clear the page
+	CLD
+	RSTOSL	[EDI]
+	POPL	ES
+	LEAL	ECX, 0FFFh[EBX]		;Get new GDT size
+	MOVW	gdtrvalue, CX
+	LGDTL	gdtrvalue		;Update GDT size in the hardware
+	POPL	ECX
+	POPL	EDI
+	JMP	6$.S			;Continue
+.PAGE
+	.SBTTL	knlGiveGSelector - Function to give up a global selector
+
+;Function to give up a global selector - this routine just puts the selector on
+;  the free list - it does not make any attempt to reduce the size of the GDT
+;  if this is possible - it does not seem like its worth the overhead of doing
+;  this, since its unlikely to ever actually really free up any memory!
+;  WARNING:  the caller of this routine MUST ensure that the selector for the
+;  segment being given up is NOT loaded in ANY segment register(s)!
+;	c{EBX} = Selector to give up
+;	CALL	knlGiveGSelector
+
+knlGiveGSelector::
+	PUSHL	ECX
+	PUSHL	EDX
+	PUSHL	ES
+	TESTB	BL, #07h		;Valid selector?
+	JNE	10$			;No
+	CMPL	EBX, #GS_AVAIL		;Maybe
+	JB	10$			;No
+	CMPL	EBX, gseltop		;Maybe
+	JAE	10$			;No
+	CMPW	gdtable+8+sd_lnksel[EBX], BX ;Any user selectors linked?
+	JE	6$.S			;No
+	CALL	knlUnlinkGSelector	;Yes - unlink them
+6$:	CLRL	EAX			;Yes - clear the selector
+	MOVL	gdtable+4t[EBX], EAX
+	MOVL	gdtable+8t[EBX], EAX
+	MOVL	gdtable+12t[EBX], EAX
+	MOVL	EAX, gselfree		;Put it on the free list
+	MOVL	gselfree, EBX
+	MOVL	gdtable+0[EBX], EAX
+	DECL	gselinuse#		;Reduce number of in use selectors
+	POPL	ES
+	POPL	EDX
+	POPL	ECX
+	RET
+
+10$:	CRASH	BSEL			;[Bad SELector]
+.PAGE
+	.SBTTL	knlUnlinkGSelector - Unlink global selector
+
+;Subroutine to unlink global selector
+;	c{EBX} = Global selector
+;	CALL	knlUnlinkGSelector
+
+knlUnlinkGSelector::
+	MOVL	ES, gdtable+8+sd_lnkpda[EBX] ;Get first linked segment
+	MOVZWL	EDX, gdtable+8+sd_lnksel[EBX]
+4$:	ANDL	EDX, #0FFFFFFF8h
+	MOVL	ECX, EDX
+	ADDL	EDX, ES:pdaLdtPnt#
+	ADDL	ECX, ES:pdaSegTbl#	;Point to the segment table
+	PUSHL	ES:sd_lnkpda.B[ECX]	 ;Save pointer to next
+	MOVZWL	EAX, ES:sd_lnksel.B[ECX] ;  linked segmeont
+	PUSHL	EAX
+	MOVL	ES:mb_data+0[EDX], #la_void<16t ;Make this a "null" segment
+	MOVB	ES:mb_data+4[EDX], #{la_void<16t}&0FFh
+	ANDB	ES:mb_data+6[EDX], #0F0h
+	MOVB	ES:mb_data+7[EDX], #{la_void<24t}&0FFh
+	CLRL	EAX
+	MOVL	ES:sd_lnkpda.B[ECX], EAX ;Clear links
+	SUBL	EDX, ES:pdaLdtPnt#
+	ORB	DL, #04h
+	MOVW	ES:sd_lnksel.B[ECX], DX
+	POPL	EDX			;Restore next linked segment
+	POPL	ES
+	CMPW	DX, BX			;Finished?
+	JNE	4$.S			;No - continue
+ret014:	RET				;YEs
+.PAGE
+	.SBTTL	knlGetLargeBuffer - Get large contiguous buffer
+
+;Subroutine to get a large contiguous buffer
+;	c(AL)  = Cache status (0 = not cachable, 1 = cachable)
+;	c{ECX} = Buffer size (bytes)
+;	CALL	knlGetLargeBuffer
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  c{ECX} = Actual length allocated
+;	  c{ESI} = Exec address of buffer allocated
+;	  c{EDI} = Physical address of buffer allocated
+
+$$$=!0
+FRM glb_spacepnt, 4t
+FRM glb_size    , 4t
+FRM glb_address , 4t
+FRM glb_physical, 4t
+FRM glb_cachests, 1t
+FRM             , 3t
+glb_SIZE=!$$$
+
+knlGetLargeBuffer::
+	ENTER	0, glb_SIZE
+	MOVB	glb_cachests.B[EBP], AL
+	MOVL	EAX, knlXSpacePnt
+	MOVL	glb_spacepnt.B[EBP], EAX
+	CALL	knlGetXSpace		;Allocate address space for the buffer
+	JC	8$.S			;If error
+	MOVL	glb_size.B[EBP], ECX	;Save actual size
+	MOVL	glb_address.B[EBP], EDI	;Save address
+	SHRL	ECX, #12t		;Get number of pages needed
+	MOVL	EAX, #MT_SYS<20t	;Make these system pages
+	CLRL	EDX
+	PUSHL	ECX
+	CALL	getcmp#			;Get contiguous pages
+	POPL	ECX
+	JC	6$.S
+	MOVL	glb_physical.B[EBP], EAX
+	MOVL	EDX, EAX		;Map the pages
+	LEAL	EBX, la_data[EDI]
+	MOVL	EDI, #0FFFFFFFFh
+	MOVL	EAX, #25h
+	CMPB	glb_cachests.B[EBP], #0
+	JNE	2$.S
+	MOVB	AL, #3Dh
+2$:	CALL	knlMapPhyPages#
+	JC	10$.S			;This should not fail!
+	MOVL	ECX, glb_size.B[EBP]	;It all worked - get values to return
+	MOVL	ESI, glb_address.B[EBP]
+	MOVL	EDI, glb_physical.B[EBP]
+	ANDL	EDI, #0FFFFF000h
+	LEAVE
+	RET
+
+;Here if can't get enought contiguous pages
+
+6$:	MOVL	EBX, glb_spacepnt.B[EBP]
+	CALL	knlGiveXSpace
+
+;Here if can't get enought address space for the buffer
+
+8$:	MOVL	EAX, #ER_NEMA
+	LEAVE
+ret016:	RET
+
+10$:	CRASH	CNMM			;[Could Not Map Memory]
+.PAGE
+	.SBTTL	svcmemcreate - Create segment
+
+;Here for the svcMemCreate SVC - Create segment (cannot be called from real
+;  mode)
+;	int selector;		// Selector to use for segment (0 means
+;				//   to allocate selector, 0FFF8h references
+;				//   the real mode segment)
+;	int type;		// Segment type: (ignored if real mode segment
+;				//   is specified)
+;				//   ST_32RODATA  = 1  - 32 bit read only
+;				//		      data segment
+;				//   ST_32RWDATA  = 2  - 32 bit read/write
+;				//		      data segment
+;				//   ST_32STACK   = 3  - 32 bit stack segment
+;				//   ST_32NXOCODE = 4  - 32 bit execute only
+;				//		      normal code segment
+;				//   ST_32NXRCODE = 5  - 32 bit execute/read
+;				//		      normal code segment
+;				//   ST_32CXOCODE = 6  - 32 bit execute only
+;				//		      conformable code
+;				//		      segment
+;				//   ST_32CXRCODE = 7  - 32 bit execute/read
+;				//		      conformable code
+;				//		      segment
+;				//   ST_16RODATA  = 9  - 16 bit read only
+;				//		      data segment
+;				//   ST_16RWDATA  = 10 - 16 bit read/write
+;				//		      data segment
+;				//   ST_16STACK   = 11 - 16 bit stack space
+;				//   ST_16NXOCODE = 12 - 16 bit execute only
+;				//		      normal code segment
+;				//   ST_16NXRCODE = 13 - 16 bit execute/read
+;				//		      normal code segment
+;				//   ST_16CXOCODE = 14 - 16 bit execute only
+;				//		      conformable code
+;				//		      segment
+;				//   ST_16CXRCODE = 15 - 16 bit execute/read
+;				//		      conformable code
+;				//		      segment
+;				//   ST$TOP       = 0x80000000
+;				//		      Allocate selector
+;				//		      starting at top
+;	rtn = svcMemCreate(selector, type)
+;  Value returned is selector used (high 16 bits are 0) if normal or negative
+;    error code if error
+
+rsvcMemCreate::
+	JMP	knlRtnAdrEr#
+
+psvcMemCreate::
+	SVCENTR	CNTMemCreate#
+	MOVZWL	EBP, SS:pdaArg1#	;Get requested selector
+	CMPL	EBP, #0FFF8h		;Want real mode "segment"?
+	JNE	4$.S			;No
+	MOVXWL	EBP, BP			;Yes
+4$:	MOVL	EBX, SS:pdaArg2#	;Get segment type
+	MOVB	AL, #SK_USER
+					;Fall into makeseg on next page
+.PAGE
+	.SBTTL	makeseg - Subroutine to create a segment
+
+;Subroutine to create a segment
+;	c(AL)  = Segment kind
+;	c{EBX} = Search direction and segment type
+;		   bit   31: 0 = forwards, 1 = backwards)
+;		   bit   30: 1 = search starting with specified selector
+;		   bits 7-0: Segment type
+;	c{EBP} = Selector for segment (allocate selector if 0)
+;	CALL	makeseg
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  c{EAX} = Selector used
+;	  c{EBP} = Index for selector
+
+makeseg::
+	PUSHL	EAX
+	CALL	findnewseg#		;Find selector for new segment
+	POPL	ECX
+	JC	ret016.S		;If error
+	MOVL	EDX, SS:pdaSegTbl#
+	CMPL	EBP, #0FFFFFFF8h.B	;Is this the real mode segment?
+	JNE	10$			;No
+	MOVL	EAX, SS:pdaLATable#	;Yes
+	CMPW	SS:{LAH_BOTTOM*16t}+lad_type.B[EAX], #0.B
+					;Is it in use now?
+	JNE	8$.S			;Yes - fail
+	MOVB	sd_kind.B[EBP+EDX], CL	;No - store segment kind
+	MOVW	SS:{LAH_BOTTOM*16t}+lad_type.B[EAX], #LAT_RM ;Set it up
+	MOVW	sd_lnksel.B[EBP+EDX], #0FFF8h
+	MOVL	ESI, #pgtable+{la_vusercode>10t}
+	MOVL	EDI, #pgtable+{0ED000h>10t}
+	INCL	SS:pdaLABlks#
+	ADDL	SS:pdaLAInUse#, #180000h
+	PUSHL	DS			;Map the user real mode code pages at
+	POPL	ES			;  ED00:0 - map the actual code pages
+	MOVL	ECX, #vusercodetop#	;  (up to 3) followed by enough non-ex
+	SHRL	ECX, #12t		;  pages to make 3 pages
+	PUSHL	#3.B
+	SUBL	[ESP], ECX
+	CLD
+4$:	LODSL	[ESI]
+	ANDB	AL, #0FDh		;Make it read-only
+	IFFAULT	14$
+6$:	STOSL	[EDI]
+	LOOP	ECX, 4$
+	POPL	ECX
+	MOVL	EAX, knlNonExMem
+	MOVB	AL, #67h
+	RSTOSL	[EDI]
+	MOVB	BL, #PG$READ|PG$WRITE	;Create the protected mode stack
+	MOVL	EDX, #0EC000h		;  msect (this msect is used for the
+	MOVL	ECX, #1000h		;  protected mode stack when switching
+	MOVL	EBP, #0FFF8h		;  from real mode to protected mode and
+	CALL	knlChngMsect		;  for the DPMI protected mode stack)
+	JC	12$.S			;If error
+	MOVL	EAX, #0FFF8h		;OK - return value of real mode
+7$:	RET				;  "selector"
+
+;Here if real mode segment is not available
+
+8$:	MOVL	EAX, #ER_NSEGA
+	STC
+	RET
+
+;Here if not creating the virtual DOS mode segment
+
+10$:	MOVB	sd_kind.B[EBP+EDX], CL	;Store segment kind
+	LEAL	EAX, 4.B[EBP]
+	MOVW	sd_lnksel.B[EBP+EDX], AX ;Link segment to itself
+	CLRL	EAX
+	MOVW	sd_lad.B[EBP+EDX], AX
+	ADDL	EBP, SS:pdaLdtPnt#
+	MOVW	mb_data+st_limit.B[EBP], AX     ;Indicate no linear address
+	ANDB	mb_data+st_limith.B[EBP], #0F0h ;  space allocated
+	MOVL	mb_data+st_base.B[EBP], EAX ;Store linear address (0) in the LDT
+	MOVB	mb_data+st_baseh.B[EBP], AL
+	MOVZBL	EBX, BL
+	MOVW	AX, segttbl#[EBX*2]	;Get type and class for selector
+	MOVW	mb_data+st_atrb.B[EBP], AX ;Store it too
+	SUBL	EBP, SS:pdaLdtPnt#
+	MOVL	EAX, EBP		;Return selector as value
+	ORB	AL, #07
+ret020:	RET
+
+;Here if cannot allocate memory for the protected mode stack msect
+
+12$:	PUSHL	EAX			;Save error code
+	CALL	rmvseg6			;Give up what we got
+	POPL	EAX			;Restore error code
+	STC				;Indicate error
+	RET
+
+;Here if have page fault when referencing the page table - must not have
+;  a page table allocated for these pages
+
+	FAULTHDR
+14$:	PUSHL	EDI
+	LEAL	EBX, -pgtable[EDI]
+	CALL	knlGetPgTbl#		;Get page table
+	POPL	EDI
+	JNC	6$			;Continue if OK
+	PUSHL	EAX			;Error - save error code
+	CALL	rmvseg8			;Give up what we got
+	POPL	EAX			;Restore error code
+	STC				;Indicate error
+	RET
+.PAGE
+	.SBTTL	svcmemremove - Remove segment
+
+;Here for the svcMemRemove SVC - Remove segment (cannot be called from
+;  virtual DOS mode)
+;	long selector;		// Selector for segment to remove
+;	rtn = svcMemRemove(selector);
+;  Value returned is 0 if normal or negative error code if error
+
+psvcMemRemove::
+	SVCENTR	CNTMemRemove#
+	MOVZWL	EBP, SS:pdaArg1#
+	CMPL	EBP, #0FFF8h		;Removing real mode "segment"?
+	JNE	remove2.S		;No
+	MOVXWL	EBP, BP			;Yes
+remove2::
+	CLRL	EAX			;Make sure no selectors point to
+	MOVL	ES, EAX			;  segment we will remove
+	MOVL	FS, EAX
+	MOVL	GS, EAX
+	PUSHL	EBP
+	CALL	removeseg
+	POPL	EBP
+	JC	ret020.S		;If error
+	TESTB	SS:pdaXRegEFR#+2, #02h	;OK - native mode call?
+	JNE	ret020.S		;No
+	ANDL	EBP, #0FFFFFFFCh.B	;Yes - see if need to clear any user
+	JMP	chksel			;  selectors (this assumes that
+					;  removeseg returns with EAX clear!)
+.PAGE
+	.SBTTL	svcMemRmvMult - Remove (almost) all segments
+
+;Here for the svcMemRmvMult SVC - Remove (almost) all segments - a single
+;  segment can be specified to be retained (cannot be called from real mode)
+;	long data;		// Data value - bits 31 t0 24 specify the
+;				//   function:
+;				//     0 = Remove all segments
+;				//     1 = Remove all but one segment, low
+;				//	     16 bits specify segment to keep
+;				//     2 = Remove all but real mode segment
+;				//     3 = Remove all DPMI segments for DOS
+;				//	     task, low 6 bits specify DOS
+;				//	     task number
+;	rtn = svcMemRmvMult(data);
+;  Value returned is 0 if normal or negative error code if error (only possible
+;  errors are ER_MPIL, ER_VALUE, or ER_FUNC, no error is returned if the
+;  indicated segment is not allocated)
+
+psvcMemRmvMult::
+	SVCENTR	CNTMemRmvMult#
+	CLRL	EAX			;Make sure no selectors point to
+	MOVL	ES, EAX			;  segments we might remove
+	MOVL	FS, EAX
+	MOVL	GS, EAX
+	CMPB	SS:pdaArg1#+3, #0t	;Want to remove all segments?
+	JE	2$.S			;Yes
+	CMPB	SS:pdaArg1#+3, #2t	;No - want to keep real mode segment?
+	JNE	4$.S			;No
+2$:	MOVW	SS:pdaArg1#+3, #0	;Yes - make sure no junk
+	JMP	6$.S
+
+;Here if don't want to keep the real mode segment
+
+4$:	CMPB	SS:pdaArg1#+3, #3t	;No - want to remove DPMI segments?
+	JE	20$			;Yes
+	JA	knlBadFunc#		;No - fail if illegal function
+	TESTB	SS:pdaArg1#, #04h	;Local selector?
+	JE	knlBadValue#		;No - fail
+	ANDL	SS:pdaArg1#, #0FFFFFFFCh.B ;Yes - remove bits we don't want
+6$:	MOVL	EBP, SS:pdaSegMax#	;Start with highest selector
+	SUBL	EBP, #04h.B
+8$:	ADDL	EBP, SS:pdaLdtPnt#
+	CMPL	mb_data-4.B[EBP], #0.B	;Is this segment in use?
+	JE	10$.S			;No
+	SUBL	EBP, SS:pdaLdtPnt#
+	CMPW	BP, SS:pdaArg1#	;Yes - should we keep it?
+	JE	12$.S			;Yes
+	PUSHL	EBP
+	CALL	removeseg		;No - remove it
+	POPL	EBP
+	JC	16$.S			;If error
+	CALL	chksel
+	JMP	12$.S
+
+10$:	SUBL	EBP, SS:pdaLdtPnt#
+12$:	SUBL	EBP, #8.B		;Bump to next lower selector
+	CMPL	EBP, #0.B		;More to do?
+	JG	8$.S			;Yes - continue
+	MOVL	EDX, SS:pdaSegTbl#
+	CMPW	SS:sd_lnksel-8.B[EDX], #0.B ;Is the real mode segment in use?
+	JE	14$.S			;No
+	CMPB	SS:pdaArg1#+3, #2t	;Yes - want to keep it?
+	JE	14$.S			;Yes
+	MOVL	EBP, #0FFFFFFF8h	;No - give it up
+	CALL	removeseg
+	JC	16$.S
+14$:	CLRL	EAX			;Finished - return 0
+16$:	RET
+
+;Here to remove all DPMI segments for a DOS task
+
+20$:	MOVL	EBP, SS:pdaSegMax#	;Start with highest selector
+	SUBL	EBP, #04h.B
+	MOVL	EDX, SS:pdaSegTbl#
+22$:	MOVB	AL, sd_kind-4.B[EBP+EDX] ;DPMI selector?
+	TESTB	AL, #03h
+	JE	24$.S			;No
+	SHRB	AL, #2t			;Yes - should we give it up?
+	CMPB	SS:pdaArg1#, AL
+	JNE	24$.S			;No
+	PUSHL	EBP			;Yes
+	PUSHL	EDX
+	CALL	removeseg		;Remove it
+	POPL	EDX
+	POPL	EBP
+	JC	16$.S			;If error
+	CALL	chksel
+24$:	SUBL	EBP, #8.B		;Bump to next lower selector
+	CMPL	EBP, #0.B		;More to do?
+	JG	22$.S			;Yes - continue
+	CLRL	EAX			;Finished - return 0
+	RET
+.PAGE
+;Subroutine to clear any saved user selectors which point to the segment we
+;  just removed.  The user selectors must be saved in the pdaURegDS, pdaURegES,
+;  pdaURegFS, and pdaURegGS locations.  These locations are used for interrupt
+;  entires to exec mode but are not normally used for SVC entries.  SVC's
+;  with 1 argument do save the segment registers in these locations and all
+;  of the routines which call this subroutine service SVCs with 1 argument!
+;	c{EBP} = Selector for segment removed
+;	CALL	chksel
+;	C:clr always
+;	c{EAX} = 0
+
+chksel:	CLRL	EAX
+	MOVL	ECX, SS:pdaURegGS#
+	ANDL	ECX, #0FFFCh
+	CMPL	ECX, EBP
+	JNE	2$.S
+	MOVL	SS:pdaURegGS#, EAX
+2$:	MOVL	ECX, SS:pdaURegFS#
+	ANDL	ECX, #0FFFCh
+	CMPL	ECX, EBP
+	JNE	4$.S
+	MOVL	SS:pdaURegFS#, EAX
+4$:	MOVL	ECX, SS:pdaURegES#
+	ANDL	ECX, #0FFFCh
+	CMPL	ECX, EBP
+	JNE	6$.S
+	MOVL	SS:pdaURegES#, EAX
+6$:	MOVZWL	ECX, SS:pdaURegDS#
+	ANDB	CL, #0FCh
+	CMPL	ECX, EBP
+	JNE	8$.S
+	MOVL	SS:pdaURegDS#, EAX
+8$:	CLC
+ret022:	RET
+.PAGE
+	.SBTTL	removeseg - Subroutine to remove segment
+
+;Subroutine to remove segment
+;	c{EBP} = Selector for segment to remove
+;	CALL	removeseg
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  c{EAX} = 0
+
+removeseg::
+	CALL	findoldseg#		;Get selector for the segment
+	JC	ret022.S		;If error
+	MOVL	EDX, SS:pdaSegTbl#	;OK
+	MOVL	EAX, EBP		;Get actual selector value for
+	TESTL	EAX, EAX		;  comparasions
+	JS	2$.S
+	ORB	AL, #04h
+2$:	MOVZWL	ECX, sd_lnksel.B[EBP+EDX] ;Get next selector
+	MOVL	EDI, sd_lnkpda.B[EBP+EDX]
+	ANDL	EDI, #0FFFFFFh
+	TESTL	EDI, EDI		;Linked to exec segment?
+	JE	4$.S			;No
+	CMPL	EDI, #10000h		;Maybe
+	JB	rmvsegx.S		;Yes
+4$:	CMPW	sd_lnksel.B[EBP+EDX], AX ;Any other segments linked?
+	JE	rmvseg4			;No - go on
+6$:	CMPL	ECX, #0FFF8h		;Yes - real mode "selector"?
+	JNE	8$.S			;No
+	ORL	ECX, #0FFFFFFFCh.B	;Yes - fix up the value
+	ANDL	EAX, #0FFFFFFF8h.B
+8$:	CMPW	SS:sd_lnksel-4.B[ECX+EDX], AX ;Is this the previous one?
+	JE	10$.S			;Yes
+	MOVZWL	ECX, SS:sd_lnksel-4.B[ECX+EDX] ;No - advance to next one
+	JMP	6$.S
+
+;Here with previous linked segment
+
+10$:	MOVZWL	EAX, sd_lnksel.B[EBP+EDX] ;Get next selector
+	MOVW	SS:sd_lnksel-4.B[ECX+EDX], AX ;Unlink this segment
+	JMP	rmvseg10		;Continue
+.PAGE
+;Here if this segment is linked to an exec segment (note that this code does
+;  not check for the funny real mode "selector" since the real mode segment
+;  cannot be linked to an exec segment)
+
+rmvsegx:MOVL	ESI, SS
+	TESTB	CL, #04h		;Is this selector an exec selector?
+	JE	2$.S			;Yes
+	MOVL	ES, sd_lnkpda.B[EBP+EDX] ;No - get PDA selector for selector
+	JMP	8$.S
+
+2$:	CMPL	ECX, #GS_AVAIL		;Linked to static segment?
+	JB	rmvseg10		;Yes - nothing needed here
+
+;Here to compare exec selector
+
+4$:	CMPW	gdtable+8+sd_lnksel[ECX], AX ;Is this the previous one?
+	JNE	6$.S			;No
+	CMPW	gdtable+8+sd_lnkpda[ECX], SI ;Maybe
+	JE	12$.S			;Yes
+6$:	MOVL	ES, gdtable+8+sd_lnkpda[ECX] ;Advance to next selector
+	MOVZWL	ECX, gdtable+8+sd_lnksel[ECX] ;Fall into user selector compare
+					      ;  we know this is a user
+					      ;  selector!
+
+;Here to compare user selector
+
+8$:	MOVL	EDI, ES:pdaSegTbl#
+	CMPW	ES:sd_lnksel-4.B[ECX+EDI], AX
+	JNE	10$.S
+	CMPW	ES:sd_lnkpda-4.B[ECX+EDI], SI
+	JE	14$.S
+10$:	PUSHL	ES:sd_lnkpda-4.B[ECX+EDI] ;Advance to next selector
+	MOVZWL	ECX, ES:sd_lnksel-4.B[ECX+EDI]
+	POPL	ES
+	TESTB	CL, #04h		;Is it an exec selector?
+	JE	4$.S			;Yes
+	JMP	8$.S			;No
+
+;Here with previous selector which is an exec selector
+
+12$:	MOVZWL	EAX, sd_lnkpda.B[EBP+EDX] ;Unlink this selector
+	MOVL	gdtable+8+sd_lnkpda[ECX], EAX
+	MOVZWL	EAX, sd_lnksel.B[EBP+EDX]
+	MOVW	gdtable+8+sd_lnksel[ECX], AX
+	JMP	rmvseg10
+
+;Here with previous selector which is a user selector
+
+14$:	MOVZWL	EAX, sd_lnkpda.B[EBP+EDX] ;Unlink this selector
+	MOVL	ES:sd_lnkpda-4.B[ECX+EDI], EAX
+	MOVZWL	EAX, sd_lnksel.B[EBP+EDX]
+	MOVW	ES:sd_lnksel-4.B[ECX+EDI], AX
+	JMP	rmvseg10.S
+.PAGE
+;Here if no other segments are linked to the one we want to give up
+
+rmvseg4:MOVL	EDX, SS:pdaSegTbl#
+2$:	MOVL	EDI, sd_fmdb.B[EBP+EDX]	;Any msects in this segment now?
+	ANDL	EDI, #0FFFFFFh
+	JE	4$.S			;No
+	PUSHL	SS			;Yes - remove one of them
+	POPL	ES
+	LEAL	EBX, sd_fmdb.B[EBP+EDX]
+	CALL	memremove
+	JNC	rmvseg4.S		;Continue if OK
+	RET				;Error (page must be locked)
+
+;Here when all msects have been removed from the segment
+
+4$:	CMPL	EBP, #0FFFFFFF8h.B	;Giving up the real mode "segment"?
+	JNE	6$.S			;No
+rmvseg6:MOVL	EDI, #pgtable+{0ED000h>10t} ;Yes
+	PUSHL	DS			;Unmap the user real mode code pages at
+	POPL	ES			;  ED00:0
+	MOVL	ECX, #3
+	CLD
+	CLRL	EAX
+	RSTOSL	[EDI]
+	LEAL	EBX, -pgtable[EDI]
+	CALL	givepgtbl#
+rmvseg8:MOVL	EAX, SS:pdaLATable#
+	MOVB	SS:{LAH_BOTTOM*16t}+lad_type.B[EAX], #0
+	MOVB	sd_lad.B[EBP+EDX], #0
+	DECL	SS:pdaLABlks#
+	SUBL	SS:pdaLAInUse#, #110000h
+	CLRL	EAX
+	JMP	8$.S			;Continue
+
+;Here if not removing the real mode segment
+
+6$:	MOVZWL	EDI, sd_lad.B[EBP+EDX]	;Get LAD index
+	SHLL	EDI, #4t
+	CALL	givela#			;Give up linear address space
+rmvseg10:
+	CLRL	EAX
+	ADDL	EBP, SS:pdaLdtPnt#
+	MOVL	mb_data+0.B[EBP], EAX
+	MOVL	mb_data+4.B[EBP], EAX
+	SUBL	EBP, SS:pdaLdtPnt#
+8$:	MOVL	0.B[EBP+EDX], EAX	;Clear the segment table entry and
+	MOVL	4.B[EBP+EDX], EAX	;  the LDT entry
+	RET
+.PAGE
+	.SBTTL	svcMemChange - Change size of msect
+
+;Here for the svcMemChange SVC - Change size of msect
+;	char far *base;		// Address of base of msect
+;	int  pagebits;		// Page type bits:
+;				//   PG$VIRTUAL = 08 - Virtual page
+;				//   PG$EXECUTE = 04 - Executable page (not
+;				//			 supported)
+;				//   PG$WRITE   = 02 - Writable page
+;				//   PG$READ    = 01 - Readable (always set)
+;	int  size;		// New size for msect (negative value reports
+;				//   current size without changing it)
+;	rtn = svcMemChange(base, pagebits, size);
+;  Value returned is actual size of msect if normal or negative error code
+;    if error
+
+rsvcMemChange::
+	MOVL	EBP, #pdaArg2#
+	CALL	vfixmemr#
+	ANDL	SS:pdaArg2#, #0FFFFF000h
+	MOVL	EAX, SS:pdaArg2#	;Want to change the DOS base msect?
+	MOVL	EDX, SS:pdaDosBase#
+	CMPL	EAX, EDX
+	JGE	10$.S			;No
+	TESTL	EAX, EAX		;Maybe
+	JNE	knlRtnAdrEr#		;No - fail
+4$:	MOVZWL	EBP, SS:pdaArg1#	;Yes - get selector
+	MOVB	BL, SS:pdaArg3#	;Get page type bits
+	MOVL	ECX, SS:pdaArg4#	;Get segment size
+	SUBL	ECX, EDX		;Adjust for actual msect base
+	JS	knlRtnAdrEr#
+	CALL	knlChngMsect		;Do the work
+	JC	8$.S			;If error
+	ADDL	EAX, SS:pdaDosBase#	;Adjust returned size for msect base
+8$:	RET				;Finished
+
+psvcMemChange::
+	SVCENTR	CNTMemChange#
+	ANDL	SS:pdaArg2#, #0FFFFF000h
+10$:	MOVZWL	EBP, SS:pdaArg1#	;Get selector
+	CMPL	EBP, #0FFF8h		;Real mode segment?
+	JE	12$.S			;Yes
+	BTL	EBP, #2t		;No - user selector?
+	JNC	knlRtnAdrEr#		;No - fail
+12$:	MOVL	EDX, SS:pdaArg2#	;Yes - get base of msect
+	MOVB	BL, SS:pdaArg3#		;Get page type bits
+	MOVL	ECX, SS:pdaArg4#	;Get segment size
+					;Fall into knlChngMsect on next page
+.PAGE
+	.SBTTL	knlChngMsect - Subroutine to change memory allocation for an msect
+
+;Subroutine to change memory allocation for an msect
+;	c(BL)  = Page type bits
+;	c[EBP] = Selector for segment
+;	c{EDX} = Virtual address of base of msect
+;	c{ECX} = Requested new size of msect in bytes
+;	CALL	knlChngMsect
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  c{EAX} = Actual size allocated (always equal to or larger than
+;		     requested size
+
+knlChngMsect::
+	TESTB	BL, #PG$VIRTUAL		;Want virtual allocation?
+	JNE	chngmsect2.S		;Yes - don't clear space now
+	CALL	chngmsect2		;No - change size of segment
+	JBE	10$.S			;If error or if reducing size of
+	PUSHL	EAX			;  segment
+	PUSHL	EDI			;If increasing size
+	SHLL	ECX, #10t		;Change to number of longs to zero
+	CLD
+	CMPL	EBP, #0FFFFFFF8h.B	;What kind of pages?
+	JA	2$.S			;If DPMI pages
+	JB	4$.S			;If normal knl pages
+	MOVL	EAX, #GS_REAL16		;If real mode pages
+	JMP	6$.S
+
+;Here if have just allocated DPMI pages
+
+2$:	MOVL	EAX, mdb_la.B[EDI]	      ;Set up our temporary segment to
+	MOVW	gdtable+GS_TEMP+st_base+0, AX ;  address the pages we just
+	SHRL	EAX, #16t		      ;  allocated
+	MOVB	gdtable+GS_TEMP+st_base+2, AL
+	MOVB	gdtable+GS_TEMP+st_baseh, AH
+	CLRL	EDI
+	MOVL	EAX, #GS_TEMP
+	JMP	8$.S
+
+;Here if have just allocated normal knl segment pages
+
+4$:	LEAL	EAX, 04.B[EBP]
+6$:	SHLL	EBX, #12t		;Get first offset to zero
+	ADDL	EBX, mdb_base.B[EDI]
+	MOVL	EDI, EBX
+8$:	MOVL	ES, EAX
+	CLRL	EAX			;Zero the new space
+	RSTOSL	[EDI]
+	POPL	EDI
+	POPL	EAX
+10$:	RET
+.PAGE
+;Subroutine to change memory allocation without clearing new space
+;	c(BL)  = Page type bits
+;	c[EBP] = Selector index for segment
+;	c{EDX} = Virtual address of base of msect
+;	c{ECX} = Requested new size of msect in bytes
+;	CALL	chngmsect2
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  c{EAX} = Actual size allocated (always equal to or larger than
+;		     requested size
+;	  Z:set = Size not increased
+;	  Z:clr = Size increased
+;	    c{EBX} = First new page allocated
+;	    c{ECX} = Number of new pages allocated
+;	    c[ES]  = Selector for segment changed
+
+chngmsect2::
+	PUSHL	EBX
+	CALL	knlFindMsect#		;Find requested msect
+	JC	chngm4.S		;If error
+	JE	chngmsect8.S		;If it exists
+	TESTL	ECX, ECX		;New msect - trying to get its size?
+					;  its size?
+	JS	chngm2.S		;Yes - just return 0
+	JNE	2$.S			;No - go on if not trying to remove
+	POPL	EBX
+	MOVL	EAX, #ER_NOMEM
+	STC
+	RET
+
+;Here to create msect
+
+chngmsect4::
+	PUSHL	EAX
+2$:	CALL	createmsect#		;Set up an MDB and some other stuff
+	JC	chngm4.S		;If error
+	MOVL	mdb_size.B[EDI], #0	;Size is 0 to begin with
+	JMP	chngmsect10.S		;Continue
+.PAGE
+;Here with existing msect to change
+
+chngmsect6::
+	PUSHL	EAX
+chngmsect8:
+	TESTL	ECX, ECX		;Want to remove msect?
+	JG	chngmsect10.S		;No
+	JL	2$.S			;If just want current size
+	CALL	memremove		;Remove the msect
+	JC	chngm4.S		;If error
+	CLRL	EDI
+chngm2:	CLRL	EAX
+chngm4:	POPL	EBX
+	RET
+
+;Here if just want current size of the msect
+
+2$:	MOVL	EAX, mdb_size.B[EDI]	;Get size in pages
+	SHLL	EAX, #12t		;Change to bytes
+	CLRL	EBX			;Set Z to indicate size not increased
+	POPL	EBX
+	RET				;Thats all
+
+;Here if cannot change the size of the section
+
+3$:	MOVL	EAX, #ER_CCMSS
+	STC
+	POPL	EBX
+	RET
+
+;Here if not removing msect
+
+chngmsect10:
+	TESTB	mdb_sts.B[EDI], #MSS$FIXED ;Can we change the size of this
+					   ;  section?
+	JNE	3$.S			;No - fail
+	ADDL	ECX, #0FFFh		;Yes - round up to page boundry
+	ANDL	ECX, #0FFFFF000h
+	MOVL	EAX, mdb_size.B[EDI]	;Get current size
+	SHLL	EAX, #12t		;In bytes
+	CMPL	ECX, EAX		;Want to change size at all?
+	JE	10$.S			;No - just return size
+	JA	memincr.S		;If want to increase it
+	CMPL	EBP, #0FFFFFFF8h.B	;Decrease - changing real mode segment?
+	JNE	4$.S			;No
+	CLRL	EBX			;Yes - linear address is 0
+	JMP	6$.S
+
+4$:	ADDL	EBP, SS:pdaLdtPnt#
+	MOVB	BL, mb_data+st_base+2.B[EBP] ;Get linear address for segment
+	MOVB	BH, mb_data+st_baseh.B[EBP]
+	SHLL	EBX, #16t
+	MOVW	BX, mb_data+st_base.B[EBP]
+	SUBL	EBP, SS:pdaLdtPnt#
+6$:	ADDL	EBX, mdb_base.B[EDI]	;Get linear address for msect
+	PUSHL	ECX			;Save new size to return
+	ADDL	EBX, ECX		;Get linear address of first page to
+					;  give up
+	SHRL	ECX, #12t		;Change to pages
+	SHRL	EAX, #12t
+	PUSHL	ECX			;Save new size
+	SUBL	EAX, ECX		;Get number of pages to give up
+	MOVL	ECX, EAX
+	PUSHL	EBX
+	MOVL	EAX, EDI
+	TESTB	mdb_sts.B[EDI], #MSS$NODEALOC ;Should we deallocate pages?
+	JE	8$.S			;Yes
+	MOVL	EAX, #-1		;No
+8$:	CALL	knlGivePages#		;Give up the extra pages
+	POPL	EBX
+	POPL	ECX
+	JC	13$.S			;If error giving up the pages
+	MOVL	mdb_size.B[EDI], ECX	;OK - store new size
+	POPL	EAX
+10$:	POPL	EDX
+	CLRL	EDX			;Set Z to indicate size not increased
+12$:	RET
+
+;Here if error giving up the pages
+
+13$:	POPL	ECX			;Fix up the stack
+	POPL	EDX
+	RET
+.PAGE
+;Here if increasing size of the msect
+
+memincr:POPL	EDX			;Restore page bits
+	PUSHL	ECX			;Save size to return
+	CMPL	ECX, #MSECTMAX		;Is it too big?
+	JAE	26$.S			;Yes - fail
+	PUSHL	EDX
+	MOVL	EDX, mdb_base.B[EDI]	;Get base of msect
+	CALL	checkla#		;Increase linear address allocation if
+	POPL	EDX			;  need to
+	JC	30$.S			;If error
+	MOVL	EBX, mdb_la.B[EDI]	;Get linear address for msect
+	MOVL	ECX, [ESP]
+	ADDL	EBX, EAX		;Get linear address for first new page
+	SHRL	ECX, #12t		;Change to pages
+	SHRL	EAX, #12t
+	PUSHL	ECX			;Save new size in pages
+	SUBL	ECX, EAX		;Get number of pages to get
+	MOVL	EAX, #27h		;Assume want normal read/write pages
+	TESTB	DL, #PG$WRITE		;Want writable pages?
+	JNE	8$.S			;Yes
+	MOVB	AL, #25h		;No
+8$:	TESTB	DL, #PG$VIRTUAL		;Want virtual pages?
+	JE	10$.S			;No
+	DECL	EAX			;Yes
+10$:	MOVL	EDX, EDI		;Get MDB offset in right register
+	CALL	knlGetPages#		;Get the new pages
+	POPL	ECX			;Get new size
+	JC	30$.S			;If error
+	MOVL	EBX, mdb_size.B[EDI]	;Get old size
+	MOVL	mdb_size.B[EDI], ECX	;Store new size
+	SUBL	ECX, EBX		;Calculate number of pages to zero
+	POPL	EAX			;Get value to return
+	RET
+
+;Here if trying to assign memory at too high an offset
+
+26$:	MOVL	EAX, #ER_LASNA
+30$:	POPL	ECX
+	CMPL	mdb_size.B[EDI], #0.B	;Is this a new msect?
+	JNE	34$.S			;No
+	CALL	junkmsect		;Yes - get rid of it
+34$:	STC
+rtn010:	RET
+.PAGE
+	.SBTTL	junkmsect - Subroutine to get rid of new msect
+
+;Subroutine to get rid of msect which has just been created if cannot allocate
+;  memory to it for some reason
+;	c{EBP} = Selector for segment
+;	c{EDI} = Offset of MDB
+;	CALL	junkmsect
+;  c{EAX} is preserved
+
+junkmsect::
+	CMPW	BP, #0FFFFFFF8h.B
+	JE	2$.S
+	ORL	EBP, #04.B		;Make it a local selector
+2$:	MOVL	EDX, mdb_base.B[EDI]
+	PUSHL	EAX
+	CALL	knlFindMsect#		;Yes - find MDB again to restore address
+	POPL	EAX			;  of pointer to it!
+	JC	6$.S
+	JNE	6$.S			;It must be there!!
+	MOVL	ECX, [EDI]		;Unlink this MDB
+	MOVL	ES:[EBX], ECX
+	MOVL	ESI, EDI
+	JMP	knlGiveQel#		;Give up the queue element and return
+
+6$:	CRASH	NMDB			;[No MDB]
+.PAGE
+	.SBTTL	memremove - Subroutine to remove existing msect
+
+;Subroutine to remove existing msect
+;	c{ES:EBX} = Address of pointer to this MDB
+;	c{EDI}    = Offset of MDB for msect
+;	c{EBP}    = Selector index for segment
+;	CALL	memremove
+;	C:set = Error (msect not changed)
+;	  c{EAX} = Error code
+;	C:clr = Normal
+
+memremove::
+	PUSHL	ES
+	PUSHL	EBX
+	CALLI	mdb_remove.B[EDI]	;Do memory clean-up
+	JC	8$.S			;If can't remove it now
+	MOVL	ECX, mdb_size.B[EDI]	;Get number of pages in msect
+	TESTL	ECX, ECX		;If no pages to give up (doing this in
+	JE	8$.S			;  this funny order insures that C is
+					;  clear at 18$!)
+	CMPL	EBP, #0FFFFFFF8h.B	;Removing real mode or DPMI memory
+	JB	4$.S			;No
+	CLRL	EBX			;Yes - linear address = 0
+	JMP	6$.S
+
+;Here if not real mode segment
+
+4$:	ADDL	EBP, SS:pdaLdtPnt#
+	MOVB	BH, mb_data+st_baseh.B[EBP] ;Get linear address of segment
+	MOVB	BL, mb_data+st_base+2.B[EBP]
+	SHLL	EBX, #16t
+	MOVW	BX, mb_data+st_base.B[EBP]
+	SUBL	EBP, SS:pdaLdtPnt#
+6$:	ADDL	EBX, mdb_base.B[EDI]	;Get linear address for msect
+	MOVL	EAX, EDI
+	TESTB	mdb_sts.B[EDI], #MSS$NODEALOC ;Should we deallocate pages?
+	JE	7$.S			;Yes
+	MOVL	EAX, #-1		;No
+7$:	CALL	knlGivePages#		;Give up the pages
+8$:	POPL	EBX
+	POPL	ES
+	JC	ret024.S		;If error (must have a locked page)
+	MOVL	EAX, mdb_next.B[EDI]	;Unlink this MDB
+	ANDL	EAX, #0FFFFFFh
+	ANDL	ES:[EBX], #0FF000000h
+	ORL	ES:[EBX], EAX
+	MOVL	ESI, EDI		;Give up the MDB
+	CLRL	EDI			;Clear this in case someone tries to
+	JMP	knlGiveQel#		;  use it after its given up!
+.PAGE
+	.SBTTL	svcmemmove - Move msect
+
+;Here for the svcMemMove SVC - Move msect
+;	long nselect;		// New selector for msect
+;	long noffset;		// New base offset for msect
+;	long oselect;		// Selector for msect to move
+;	long ooffset;		// Base offset for msect to move
+;	rtn = svcMemMove(nselect, noffset, oselect, ooffset);
+;  Value returned is 0 if normal or negative error code if error
+
+psvcMemMove::
+	SVCENTR	CNTMemMove#
+	MOVZWL	EBP, SS:pdaArg1#	;Get new selector
+	MOVL	EDX, SS:pdaArg2#	;Get new offset
+	MOVZWL	ESI, SS:pdaArg3#	;Get current selector
+	MOVL	EDI, SS:pdaArg4#	;Get current offset
+	JMP	movemsect.S		;Go do the work
+.PAGE
+	.SBTTL	movemsect - Subroutine to move msect to different segment
+
+;Subroutine to move msect to different segment (both segments must be local
+;  segments) - this subroutine is called when loading a real mode knl program
+;  to move the command arguments to the real mode segment
+;	c{ESI} = Selector for current segment
+;	c{EDI} = Current offset for msect
+;	c{EBP} = Selector for new segment
+;	c{EDX} = New offset for msect
+;	CALL	movemsect
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  c{EAX} = 0
+
+$$$=!0
+FRM mms_oldoffset, 4
+FRM mms_oldselect, 4
+FRM mms_oldpntr  , 8
+FRM mms_oldmdb   , 4
+FRM mms_newoffset, 4
+FRM mms_newselect, 4
+FRM mms_newpntr  , 8
+FRM mms_newindx  , 4
+mms_SIZE=!$$$
+
+2$:	LEAVE
+ret024:	RET
+
+movemsect::
+	ENTER	mms_SIZE, 0
+	MOVL	mms_oldoffset.B[EBP], EDI
+	MOVL	mms_oldselect.B[EBP], ESI
+	MOVL	mms_newoffset.B[EBP], EDX
+	PUSHL	EBP
+	MOVL	EBP, 0.B[EBP]
+	CALL	knlFindMsect#		;Find new msect MDB
+	MOVL	ECX, EBP
+	POPL	EBP
+	JC	2$.S			;If error
+4$:	JE	ermacftlv		;Error if already exists
+	CMPL	ECX, #0FFFFFFFFh.B	;DPMI msect?
+	JE	4$.S
+	MOVL	mms_newpntr+0.B[EBP], EBX
+	MOVL	mms_newpntr+4.B[EBP], ES
+	MOVL	mms_newselect.B[EBP], ECX
+	PUSHL	EBP			;Find old msect MDB
+	MOVL	EDX, mms_oldoffset.B[EBP]
+	MOVL	EBP, mms_oldselect.B[EBP]
+	CALL	knlFindMsect#
+	POPL	EBP
+	JC	2$.S
+	JNE	knlBadValueLv#		;Error if does not exist
+	ANDB	mms_oldselect.B[EBP], #0F8h
+	MOVL	mms_oldmdb.B[EBP], EDI
+	MOVL	mms_oldpntr+0.B[EBP], EBX
+	MOVL	mms_oldpntr+4.B[EBP], ES
+	MOVL	EBX, mms_newoffset.B[EBP] ;Get offset of new msect
+	ADDL	EBX, mdb_size.B[EDI]	;Plus size of msect
+	LESL	EAX, mms_newpntr.B[EBP]	;See if there is a memory conflict
+	MOVL	EAX, ES:[EAX]
+	TESTL	EAX, EAX
+	JE	6$.S
+	CMPL	EBX, mdb_base.B[EAX]
+	JA	ermacftlv		;Yes - fail
+6$:	MOVL	ECX, mdb_size.B[EDI]	  ;Check linear address allocation for
+	MOVL	EDX, mms_newoffset.B[EBP] ;  new msect
+	PUSHL	EBP
+	MOVL	EBP, mms_newselect.B[EBP]
+	CALL	checkla#
+	POPL	EBP
+	JC	2$.S			;If error
+	CLRL	EDX
+	MOVL	EAX, mms_newselect.B[EBP] ;Get linear address of new msect
+	CMPL	EAX, #0FFFFFFF8h.B	;Real mode "segment"?
+	JE	8$.S			;Yes
+	ADDL	EAX, SS:pdaLdtPnt#
+	MOVB	DL, SS:mb_data+st_base+2.B[EAX] ;No - get linear address
+	MOVB	DH, SS:mb_data+st_baseh.B[EAX]
+	SHLL	EDX, #16t
+	MOVW	DX, SS:mb_data+st_base.B[EAX]
+8$:	ADDL	EDX, mms_newoffset.B[EBP]
+	SHRL	EDX, #10t		;Change to index to page table
+	CLRL	EBX
+	MOVL	EAX, mms_oldselect.B[EBP] ;Get linear address of old msect
+	ADDL	EAX, SS:pdaLdtPnt#
+	CMPL	EAX, #0FFFFFFF8h.B	;Real mode "segment"?
+	JE	10$.S			;Yes
+	MOVB	BL, SS:mb_data+st_base+2.B[EAX] ;No - get linear address
+	MOVB	BH, SS:mb_data+st_baseh.B[EAX]
+	SHLL	EBX, #16t
+	MOVW	BX, SS:mb_data+st_base.B[EAX]
+10$:	ADDL	EBX, mms_oldoffset.B[EBP]
+	SHRL	EBX, #10t		;Change to index to page table
+	MOVL	ECX, mdb_size.B[EDI]	;Get size of old msect
+
+;c{EDX} = page table index for new msect
+;c{EBX} = page table index for old msect
+;c{ECX} = number of pages
+
+	CLRL	EAX
+	CMPL	mms_oldselect.B[EBP], #0FFFFFFF8h.B
+	SETNE	AL
+	CMPL	mms_newselect.B[EBP], #0FFFFFFF8h.B
+	JE	102$.S
+	ORB	AL, #02h
+102$:	JMPIL	mmsdsp[EAX*4]
+
+	DATA
+
+mmsdsp:	.LONG	11$
+	.LONG	torm
+	.LONG	fromrm
+	.LONG	11$
+
+	CODE
+
+fromrm:	SUBL	SS:pdaRMPages#, ECX
+	ADDL	SS:pdaPMPages#, ECX
+	JMP	11$.S
+
+torm:	SUBL	SS:pdaPMPages#, ECX
+	ADDL	SS:pdaRMPages#, ECX
+11$:	MOVL	mms_newindx.B[EBP], EDX	;Remember index in case of error
+12$:	MOVL	EAX, pgtable[EBX]	;Get page table entry
+	IFFAULT	20$
+14$:	MOVL	pgtable[EDX], EAX	;Store entry in new position in table
+	ADDL	EDX, #4.B		;Bump index
+	CLRL	EAX
+	MOVL	pgtable[EBX], EAX	;Clear page table entry
+	ADDL	EBX, #4.B		;Bump index
+	TESTW	BX, #0FFFh		;At end of directory page?
+	JNE	16$.S			;No
+	CALL	givepgtbl#		;Yes - see if should give up this page
+16$:	LOOP	ECX, 12$			;Continue if more to do
+	CALL	givepgtbl#		;Make final check for giving up page
+					;  table page
+	LESL	EBX, mms_oldpntr.B[EBP]	;Unlink old MDB
+	MOVL	EDI, mms_oldmdb.B[EBP]
+	MOVL	EAX, [EDI]
+	MOVL	ES:[EBX], EAX
+	MOVL	EAX, mms_newoffset.B[EBP] ;Update offset in MDB
+	MOVL	mdb_base.B[EDI], EAX
+	LESL	EBX, mms_newpntr.B[EBP]	;Link it in at its new position
+	MOVL	EAX, ES:[EBX]
+	MOVL	ES:[EBX], EDI
+	MOVL	[EDI], EAX
+	CLRL	EAX			;Return 0
+	LEAVE
+	RET
+
+;Here if have address conflict
+
+ermacftlv::
+	MOVL	EAX, #ER_MACFT
+	STC
+	LEAVE
+	RET
+
+;Here if page table is not allocated
+
+	FAULTHDR
+20$:	XCHGL	EDX, EBX		;Allocate a page table page
+	PUSHL	EAX
+	CALL	knlGetPgTbl#
+	JC	22$.S			;If error
+	POPL	EAX			;If OK
+	XCHGL	EDX, EBX
+	JMP	14$.S
+
+;Here if cannot allocate a page for a new page table page
+
+22$:	MOVL	[ESP], EAX		;Save error code
+	MOVL	EBX, EDX
+	MOVL	EAX, EDI
+	CALL	knlGivePages2#		;Give up remaining pages
+	JC	24$.S
+	PUSHL	mdb_size.B[EDI]		;Save size of old msect
+	MOVL	EDI, mms_oldmdb.B[EBP]	;Give up the old msect
+	CALL	memremove
+	JC	24$.S
+	POPL	ECX
+	MOVL	EBX, mms_newindx.B[EBP]	;Also give up any pages we already
+	CALL	knlGivePages2#		;  moved
+	JC	24$.S
+	POPL	EAX			;Restore error code
+	STC
+	LEAVE
+	RET
+
+;Here if trying to remove a locked page above - this is imposible!
+
+24$:	CRASH	MPLK			;[Memory Page is LocKed]
+.PAGE
+	.SBTTL	svcMemSegType - Change segment type
+
+;Here for the svcMemSegType SVC - Change segment type
+;	int selector;		// Selector for segment
+;	int type;		// New segment type (see svcMemCreate
+;				//   for definition of segment types
+;	rtn = svcMemSegType(selector, type)
+;  Value returned is 0 if normal or negative error code if error
+
+psvcMemSegType::
+	SVCENTR	CNTMemSegType#
+rsvcMemSegType::
+	MOVL	EBX, SS:pdaArg2#	;Get new type
+	CMPL	EBX, #15t.B		;Valid segment type?
+	JA	knlBadValue#		;No - fail
+	MOVZWL	EBP, SS:pdaArg1#	;Yes
+	CALL	findoldseg#		;Find the segment
+	JC	4$.S			;If error
+	MOVL	EDX, SS:pdaSegTbl#
+	CMPW	sd_lnksel.B[EBP+EDX], #0.B ;Does the segment exist?
+	JE	knlBadValue#		;No - fail
+	MOVW	AX, segttbl#[EBX*2]	;Get new type and class
+	ADDL	EBP, SS:pdaLdtPnt#
+	MOVW	mb_data+st_atrb.B[EBP], AX ;Store it
+	CLRL	EAX
+4$:	RET
+.PAGE
+	.SBTTL	svcMemPageType - Change page type
+
+;Here for the svcMemPageType SVC - Change page type
+;	char far *base;		// Address of base of msect
+;	int  bottom;		// Offset from base of msect of first page to
+;				//   change
+;	int  top;		// Offset from base of msect of first page to
+;				//   not change
+;	int  pagebits;		// New page type bits:
+;				//   PG$VIRTUAL = 08 - Virtual page
+;				//   PG$EXECUTE = 04 - Executable page (not
+;				//			 supported)
+;				//   PG$WRITE   = 02 - Writable page
+;				//   PG$READ    = 01 - Readable (always set)
+;	rtn = svcMemPageType(base, bottom, top, pagebits);
+;  Value returned is 0 if normal or negative error code if error
+
+rsvcMemPageType::
+	MOVL	EBP, #pdaArg2#
+	CALL	vfixmemr#
+	JMP	4$.S
+
+2$:	MOVL	EAX, #ER_VALUE
+	RET
+
+psvcMemPageType::
+	SVCENTR	CNTMemPageType#
+	TESTB	SS:pdaArg1#, #04	;Global page?
+	JE	knlRtnAdrEr#		;Yes - error
+4$:	MOVZWL	EBP, SS:pdaArg1#	;Get selector
+	MOVL	EDX, SS:pdaArg2#	;Get base of msect
+	MOVL	EAX, SS:pdaArg3#	;Get offset of first page to change
+	ANDL	EAX, #0FFFFF000h	;Round down
+	MOVL	ECX, SS:pdaArg4#	;Get offset of first page to not change
+	SUBL	ECX, EAX		;Calculate number of pages to change
+	JLE	2$.S
+	SHRL	ECX, #12t
+	MOVB	BL, SS:pdaArg5#		;Get page type bits
+					;Fall into pagetype on next page
+.PAGE
+	.SBTTL	pagetype - Subroutine to change type of memory pages
+
+;Subroutine to change type of memory pages
+;	c(BL)  = Page type bits
+;	c{EBP} = Selector for segment
+;	c{EDX} = Virtual address of base of msect
+;	c{EAX} = Offset of first page to change
+;	c{ECX} = Number of pages to change
+;	CALL	pagetype
+;	C:set = Error
+;	  c{EAX} = Error code
+;	  c{ECX} = Number of pages not changed
+;	C:clr = Normal
+;	  c{EAX} = 0
+
+pagetype::
+	PUSHL	EBX
+	PUSHL	ECX
+	PUSHL	EAX
+	CALL	knlFindMsect#		;Find the msect
+	JC	22$			;If error
+	JNE	20$			;Error if msect does not exist
+	POPL	EBX			;Get linear address for first page to
+	POPL	ECX			;Get number of pages to change
+	POPL	EDX			;Get new page bits
+pagetype2::
+	ADDL	EBX, mdb_la.B[EDI]	;  change
+	SHRL	EBX, #10t		;Get index to page table entry
+	IFFAULT	knlRtnAdrEr#
+6$:	MOVL	EAX, pgtable[EBX]	;Get page table entry
+	TESTL	EAX, EAX		;Is the page allocated at all
+	JE	knlRtnAdrEr#		;No
+	TESTB	AL, #01			;Yes - is the page mapped?
+	JNE	8$			;Yes
+	ANDB	AL, #3Ch		;No - get page type
+	CMPB	AL, #PT_VIRT<2		;Is it a virtually allocated page?
+	JNE	10$			;No - don't change it
+	TESTB	DL, #PG$VIRTUAL		;Yes - want it to stay virtual?
+	JNE	10$			;Yes
+	PUSHL	ECX			;No - make it a real page
+	PUSHL	EBX
+	PUSHL	EDX
+	MOVL	pgtable[EBX], #0
+	SHLL	EBX, #10t
+	MOVL	ECX, #1
+	MOVL	EAX, #25h
+	MOVL	EDX, EDI		;Get MDB offset in right register
+	CALL	knlGetPages#		;Allocate the page
+	POPL	EDX
+	POPL	EBX
+	JC	7$.S			;If error
+	MOVL	EAX, pgtable[EBX]
+	ORB	AL, #02h		;Make sure write bit is set
+	MOVL	pgtable+{{la_data+ramaccess}>10t}.L, EAX
+	MOVL	EAX, CR3		;Map it where we can get at it
+	MOVL	CR3, EAX		;Clear the page cache
+	PUSHL	EDI
+	PUSHL	ES
+	MOVL	EDI, #ramaccess
+	PUSHL	DS
+	POPL	ES
+	MOVL	ECX, #400h
+	CLRL	EAX
+	RSTOSL	[EDI]
+	POPL	ES
+	POPL	EDI
+	POPL	ECX
+	CMPL	EBX, #110000h>10t	;Real mode page?
+	JAE	65$.S			;No
+	DECL	SS:pdaRMPages#		;Yes - fix up the virtual page count
+	JMP	10$			;  (knlGetPages incremented it!)
+
+65$:	DECL	SS:pdaPMPages#		;Fix up the virtual block count
+	JMP	10$			;  (knlGetPages incremented it!)
+
+;Here if error
+
+7$:	POPL	ECX
+	JMP	24$
+
+;Here if page is mapped
+
+8$:	TESTB	AH, #0Eh		;Is this a non-allocated page?
+	JE	10$.S			;Yes - ignore PG$VIRTUAL
+	PUSHL	EBX			;No
+	MOVL	EBX, EAX
+	SHRL	EAX, #7			;Get memory section table index
+	ANDL	EAX, #1Ch.B
+	MOVL	EAX, knlMemTable-4[EAX]	;Get memory section table offset
+	SUBL	EBX, -4.B[EAX]		;Get offset in section
+	SHRL	EBX, #12t		;Change to table index
+	MOVB	AL, 2.B[EAX+EBX*8]	;Get memory page type
+	ANDB	AL, #0F0h
+	POPL	EBX
+	CMPB	AL, #MT_PUSER<4		;Is this a private user page?
+	JNE	knlRtnAdrEr#		;No - error
+	TESTB	DL, #PG$VIRTUAL		;Yes - want page to be virtual now?
+	JE	10$.S			;No
+	MOVZBL	EAX, pgtable[EBX]	;Yes - get page write bit
+	ANDB	AL, #02h
+	SHLL	EDI, #8t		;Construct value for page table entry
+	ORL	EAX, EDI		;  for virtual page
+	SHRL	EDI, #8t
+	ORB	AL, #PT_VIRT<2
+	PUSHL	EAX			;Save it for now
+	PUSHL	ECX
+	PUSHL	EBX
+	PUSHL	EDX
+	MOVL	ECX, #1
+	MOVL	EAX, EDI		;Get expected knlMemTable F2 value
+	CALL	knlGivePages2#		;Give up the page
+	POPL	EDX
+	JC	22$.S			;If can't give it up (must be locked)
+	POPL	EBX
+	POPL	ECX
+	POPL	EAX
+	MOVL	pgtable[EBX], EAX
+	CMPL	EBX, #40h.B
+	JAE	9$.S
+	MOVL	pgtable+400h[EBX], EAX
+9$:	CMPL	EBX, #110000h>10t	;Real mode page?
+	JAE	95$.S			;No
+	INCL	SS:pdaRMPages#		;Yes - fix up the virtual page count
+	JMP	10$.S			;  (knlGivePages decremented it!)
+
+95$:	INCL	SS:pdaPMPages#		;Fix up the virtual block count
+					;  (knlGivePages decremented it!)
+
+;Here with virtual/real status changed if necessary
+
+10$:	TESTB	DL, #PG$WRITE		;Want writable page?
+	JNE	12$.S			;Yes
+	ANDB	pgtable[EBX], #~02h	;No - clear write bit
+	CMPL	EBX, #40h.B
+	JAE	14$.S
+	ANDB	pgtable+400h[EBX], #~02h
+	JMP	14$.S
+
+;Here if want writable page
+
+12$:	ORB	pgtable[EBX], #02h	;Set write bit
+	CMPL	EBX, #40h.B
+	JAE	14$.S
+	ORB	pgtable+400h[EBX], #02h
+14$:	ADDL	EBX, #4.B		;Bump index
+	DECL	ECX			;More to do?
+	JNE	6$			;Yes - continue
+	CLRL	EAX			;Finished - return 0
+	RET
+
+20$:	MOVL	EAX, #ER_NOMEM
+22$:	ADDL	ESP, #12t
+24$:	STC
+	RET
+.PAGE
+	.SBTTL	svcMemLink - Link segments
+
+;Here for the svcMemLink SVC - Link segments
+;	int selector1;		// Selector to link to existing segment
+;				//   (0 if should allocate selector
+;	int selector2;		// Selector of existing segment
+;	int type;		// Type for linked segment (see svcMemCreate
+;				//   for segment type values)
+;	rtn = svcMemLink(selector1, selector2, type);
+;  Value returned is selector used (high 16 bits are 0) if normal or negative
+;    error code if error
+
+psvcMemLink::
+	SVCENTR	CNTMemLink#
+rsvcMemLink::
+	MOVL	EBX, SS:pdaArg3#
+	CMPB	BL, #15t		;Valid segment type?
+	JA	knlBadValue#		;No - fail
+	MOVZWL	EBP, SS:pdaArg1#	;Get selector for new space
+	MOVZWL	ESI, SS:pdaArg2#	;Yes - Get selector for existing segment
+					;Fall into linkseg on next page
+.PAGE
+	.SBTTL	linkseg - Subroutine to link two segments
+
+;Subroutine to link two segments
+;	c{EBX} = Segment type and search mode
+;	c{ESI} = Selector for existing segment
+;	c{EBP} = Selector for new segment
+;	CALL	linkseg
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  c{EAX} = New selector used
+
+linkseg::
+	TESTL	ESI, #04h		;Want to link to exec segment
+	JE	lnkexec			;Yes
+	XCHGL	ESI, EBP		;No
+	CALL	findoldseg#		;Find segment to link to
+	JC	2$.S			;If error
+	XCHGL	EBP, ESI		;Yes - get selector to link to it
+	CALL	findnewseg#
+2$:	JC	12$
+	CMPL	EBP, #0FFFFFFF8h.B	;Trying to link real mode segment?
+	JE	knlBadValue#		;Yes - fail
+	MOVL	EDX, SS:pdaSegTbl#	;No
+	MOVZWL	EAX, SS:sd_lnksel.B[ESI+EDX]
+	MOVW	SS:sd_lnksel.B[ESI+EDX], BP
+	ORB	SS:sd_lnksel.B[ESI+EDX], #04h
+	MOVW	sd_lnksel.B[EBP+EDX], AX
+	MOVW	AX, SS:sd_lad.B[ESI+EDX]
+	MOVW	sd_lad.B[EBP+EDX], AX
+	MOVL	ECX, SS:sd_fmdb.B[ESI+EDX]
+	ANDL	ECX, #0FFFFFFh
+	ANDL	sd_fmdb.B[EBP+EDX], #0FF000000h
+	ORL	sd_fmdb.B[EBP+EDX], ECX
+	ADDL	ESI, SS:pdaLdtPnt#	;Copy the selector
+	ADDL	EBP, SS:pdaLdtPnt#
+	MOVL	EAX, SS:mb_data+0.B[ESI]
+	MOVL	mb_data+0.B[EBP], EAX
+	MOVL	EAX, SS:mb_data+4.B[ESI]
+	MOVL	mb_data+4.B[EBP], EAX
+	SUBL	ESI, SS:pdaLdtPnt#
+	MOVZBL	EBX, BL
+	MOVZWL	EAX, segttbl#[EBX*2]	;Get type and class for selector
+	MOVW	mb_data+st_atrb.B[EBP], AX ;Store it
+10$:	SUBL	EBP, SS:pdaLdtPnt#
+	ORL	EBP, #0007h
+	MOVL	EAX, EBP
+12$:	RET
+
+;Here if want to link to exec segment
+
+lnkexec:
+
+;CODE HERE TO CHECK PRIV.
+
+	ANDL	ESI, #0FFFFFFF8h.B
+	CMPL	ESI, gseltop		;Valid selector?
+14$:	JAE	knlBadValue#		;No
+	TESTB	gdtable+st_atrb[ESI], #80h ;Maybe
+	JE	14$.S			;No
+	CALL	findnewseg#		;Yes - find our segment
+	JC	12$.S
+	CMPB	BL, #ST_32RODATA
+	JE	16$.S
+	CMPB	BL, #ST_16RWDATA
+	JNE	knlBadValue#
+16$:	MOVL	EDX, SS:pdaSegTbl#
+	MOVZBL	EBX, BL
+	MOVW	AX, segttbl#[EBX*2]	;Get type and class for selector
+	ADDL	EBP, SS:pdaLdtPnt#
+	MOVW	mb_data+st_atrb.B[EBP], AX ;Store it too
+	SUBL	EBP, SS:pdaLdtPnt#
+	CMPL	ESI, #GS_AVAIL		;Static exec segment?
+	JAE	18$.S			;No
+	MOVW	sd_lnksel.B[EBP+EDX], SI ;Yes
+	MOVL	sd_lnkpda.B[EBP+EDX], #1
+	JMP	20$.S
+
+;Here if not linking to static exec segment - link this segment in
+
+18$:	MOVZWL	EAX, gdtable+8+sd_lnksel[ESI]
+	MOVW	sd_lnksel.B[EBP+EDX], AX
+	MOVL	EAX, gdtable+8+sd_lnkpda[ESI]
+	MOVL	sd_lnkpda.B[EBP+EDX], EAX
+	MOVL	EAX, EBP
+	ORB	AL, #04h
+	MOVW	gdtable+8+sd_lnksel[ESI], AX
+	MOVW	gdtable+8+sd_lnkpda[ESI], SS
+20$:	MOVL	EAX, gdtable+0[ESI]	;Set up user's selector
+	ADDL	EBP, SS:pdaLdtPnt#
+	MOVL	mb_data+0.B[EBP], EAX
+	MOVL	EAX, gdtable+4[ESI]
+	MOVB	AH, #0F1h
+	MOVL	mb_data+4.B[EBP], EAX
+	JMP	10$
+.PAGE
+	.SBTTL	svcMemNull - Map physical null memory
+
+;Here for the svcMemNull SVC - Map physical null memory - this call maps
+;  non-existant memory to the user's address space.  The low 16 bits of the
+;  physical address used always corresponds to the low 16 bits of the virtual
+;  address so this call can be used to map "safe" memory into the low 64K
+;  of the linear address space to compensate for the known problem with
+;  early 386s, which the main use for this system call.  This is a
+;  non-privileged function.
+;	char far *base;		// Base address of msect to create
+;	int  pagebits;		// Page type bits:
+;				//   PG$WRITE   = 02 - Writable page
+;				//   PG$READ    = 01 - Readable (always set)
+;	int  size;		// Amount to map
+;	rtn = svcMemNull(base, offset, pagebits, size);
+;  Value returned is actual amount mapped if normal or negative error code
+;    if error
+
+rsvcMemNull::
+	MOVL	EBP, #pdaArg2#
+	CALL	vfixmemr#
+	JMP	2$.S
+
+psvcMemNull::
+	SVCENTR	CNTMemNull#
+	TESTB	SS:pdaArg1#, #04	;Global page?
+	JE	knlRtnAdrEr#		;Yes - error
+2$:	MOVZWL	EBP, SS:pdaArg1#	;Get selector
+	MOVL	EDX, SS:pdaArg2#	;Get offset of base of msect
+	MOVL	EBX, SS:pdaArg3#	;Get page bits
+	MOVL	ECX, SS:pdaArg4#	;Get size
+	MOVL	ESI, EDX
+	MOVL	EDI, #0FFFFh		;Get increment mask
+	ANDL	ESI, EDI
+	ORL	ESI, knlNonExMem	;Get physical address
+	JMP	knlMapPhysMem
+.PAGE
+	.SBTTL	svcMemMap - Map physical memory
+
+;Here for the svcMemMap SVC - Map physical memory
+;	char far *base;		// Base address of msect to create
+;	int *offset;		// Physical offset
+;	int  pagebits;		// Page type bits:
+;				//   PG$VIRTUAL = 08 - Virtual page
+;				//   PG$EXECUTE = 04 - Executable page (not
+;				//			 supported)
+;				//   PG$WRITE   = 02 - Writable page
+;				//   PG$READ    = 01 - Readable (always set)
+;	int  size;		// Amount to map
+;	rtn = svcMemMap(base, offset, pagebits, size);
+;  Value returned is actual amount mapped if normal or negative error code
+;    if error
+
+rsvcMemMap::
+	MOVL	EBP, #pdaArg2#
+	CALL	vfixmemr#
+	JMP	2$.S
+
+psvcMemMap::
+	SVCENTR	CNTMemMap#
+	TESTB	SS:pdaArg1#, #04	;Global page?
+	JE	knlRtnAdrEr#		;Yes - error
+2$:	NOP
+
+;DO PRIVLEDGE CHECK HERE!!
+
+	MOVZWL	EBP, SS:pdaArg1#	;Get selector
+	MOVL	EDX, SS:pdaArg2#	;Get offset of base of msect
+	MOVL	ESI, SS:pdaArg3#	;Get physical address
+	MOVL	EBX, SS:pdaArg4#	;Get page bits
+	MOVL	ECX, SS:pdaArg5#	;Get size
+	MOVL	EDI, #0FFFFFFFFh	;Get increment mask
+					;Fall into knlMapPhysMem on next page
+.PAGE
+	.SBTTL	knlMapPhysMem - Subroutine to do physical mapping
+
+;Subroutine to do physical mapping - creates new msect to contain requested
+;  memory
+;	c{EBX} = Page type
+;	c{ECX} = Requested size of msect in bytes
+;	c{EDX} = Virtual address of base of msect
+;	c{ESI} = Physical address to map
+;	c{EDI} = Increment mask for physical address
+;	c{EBP} = Selector for segment
+;	CALL	knlMapPhysMem
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  c{EAX} = Actual size allocated
+;	  c[BX]  = Selector for segment
+;	  c{EDI} = Offset of MDB for msect
+
+knlMapPhysMem::
+	PUSHL	EBP
+	PUSHL	EDI			;Save increment mask
+	PUSHL	ESI			;Save physical address
+	PUSHL	EBX			;Save page type bits
+	CALL	knlFindMsect#		;Find segment and msect
+	JC	8$.S			;If error
+	JE	6$.S			;Also error if msect already exists
+	CMPL	EBP, #0FFFFFFFFh.B	;DPMI msect?
+	JE	6$.S			;Yes - fail
+	POPL	EAX			;Restore page type bits
+	CALL	createmsect#		;Do first part of this
+	JC	10$.S			;If error
+	POPL	EDX			;Restore physical address
+	ADDL	ECX, #0FFFh		;Change bytes to pages (round up)
+	SHRL	ECX, #12t
+	MOVL	mdb_size.B[EDI], ECX	;Store size in the MDB
+	ORB	mdb_sts.B[EDI], #MSS$NODEALOC ;Indicate should not deallocate
+	ORB	AL, #1			;Make sure not virtual request
+	XCHGL	EDI, [ESP]		;Save EDI, restore increment mask
+	CALL	knlMapPhyPages#		;Allocate pages to the msect
+	POPL	EDI
+	JC	12$.S			;If error
+	POPL	EBP
+	MOVL	EAX, ECX		;Return actual number of bytes
+	SHLL	EAX, #12t
+	RET
+
+;Here if error before MDB is created
+
+6$:	MOVL	EAX, #ER_MACFT
+8$:	POPL	EBX
+10$:	POPL	ESI
+	POPL	EDI
+	POPL	EBP
+	STC
+	RET
+
+;Here if error allocating pages - the MDB must be given up
+
+12$:	MOVL	EDX, mdb_base.B[EDI]
+	MOVL	EBP, [ESP]
+	PUSHL	EAX
+	CALL	knlFindMsect#		;Find MDB again to restore address of
+	POPL	EAX			;  pointer to it!
+	JC	16$.S
+	JNE	16$.S			;It must be there!!
+	MOVL	ECX, [EDI]		;Unlink this MDB
+	MOVL	ES:[EBX], ECX
+	MOVL	ESI, EDI
+	CALL	knlGiveQel#		;Give up the queue element
+	POPL	EBP
+	STC
+	RET
+
+16$:	CRASH	NMDB			;[No MDB]
+.PAGE
+	.SBTTL	knlGetPhyAddr - Subroutine to get physical address for DMA
+
+;Subroutine to get physical address given virtual address
+;	c{ES:EBX} = Virtual buffer address
+;	c[FS]     = Selector for PDA for process (only needed if ES:EBX
+;		      contains a local address)
+;	CALL	knlGetPhyAddr
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  c{EAX} = Physical address
+
+knlGetPhyAddr::
+	PUSHL	EDX
+	CLRL	EDX			;Get selector for address
+	MOVW	DX, ES
+	ANDB	DL, #0FCh
+	TESTB	DL, #4			;Global selector?
+	JNE	6$.S			;No
+	ADDL	EDX, #gdtable+2
+	MOVB	AH, 5.B[EDX]		;Yes  - get linear address of segment
+	MOVB	AL, 2.B[EDX]		;  from the GDT
+	SHLL	EAX, #16t
+	MOVW	AX, [EDX]
+	JMP	8$.S
+
+;Here if have local address
+
+6$:	ADDL	EDX, FS:pdaLdtPnt#	  ;Get linear address of segment from
+	MOVB	AH, FS:mb_data-4+7.B[EDX] ;  the LDT
+	MOVB	AL, FS:mb_data-4+4.B[EDX]
+	SHLL	EAX, #16t
+	MOVW	AX, FS:mb_data-4+2.B[EDX]
+8$:	ADDL	EAX, EBX		;Get linear address of buffer
+	MOVL	EDX, EAX		;Get page table index
+	SHRL	EDX, #12t
+	ANDL	EAX, #0FFFh		;And offset in page
+	PUSHL	EBX
+	MOVL	EBX, pgtable[EDX*4]	;Get page table entry
+	ANDL	EBX, #0FFFFF000h	;Remove junk
+	ORL	EAX, EBX		;Get physical address of buffer
+	POPL	EBX
+	POPL	EDX
+	RET
+.PAGE
+	.SBTTL	svcMemDebug - Memory debug functions
+
+;Here for the svcMemDebug SVC - Memory debug functions
+;	int  function;		// Function:
+;				//   1 = Read byte
+;				//   2 = Read word
+;				//   3 = Read long
+;				//   4 = Write byte
+;				//   5 = Write word
+;				//   6 = Write long
+;				//   7 = Reserved
+;				//   8 = Return physical address
+;	char far *address;	// Address to read or write or virtual address
+;				//   (function 8)
+;	int  far *value;	// Address of value
+;	rtn = svcMemDebug(function, address, value)
+;  For functions 1 to 6, value returned is segment type if normal or negative
+;    error code if error.  For function 8, value returned is 0 if normal or
+;    negative error code if error.
+
+rsvcMemDebug::
+	MOVL	EBP, #pdaArg3#
+	CALL	vfixaddr#
+	SUBL	EBP, #8.B
+	CALL	vfixaddr#
+	JMP	2$.S
+
+psvcMemDebug::
+	SVCENTR	CNTMemDebug#
+	ORB	SS:pdaArg2#, #03
+	ORB	SS:pdaArg4#, #03
+2$:	MOVZWL	EDI, SS:pdaArg2#
+	IFFAULT	dbger2			;This is not supposted to give a fault,
+					;  but it WILL fault on some chips!
+	VERR	DI			;See if its really readable
+	JNE	dbger2			;Not readable - fail
+	MOVL	ES, EDI			;OK - load the selector
+	MOVL	EAX, SS			;Assume local segment
+	MOVL	EBX, SS:pdaLdtPnt#
+	ADDL	EBX, #mb_data.B
+	TESTL	EDI, #04.B		;Right?
+	JNE	4$.S			;Yes
+	MOVL	EAX, DS			;No - its a global segment
+	MOVL	EBX, #gdtable
+4$:	ANDL	EDI, #0FFFFFFF8h.B	;Get address of selector for this
+	ADDL	EBX, EDI		;  segment into FS:EBX
+	MOVL	FS, EAX
+	MOVB	DL, FS:st_base+2.B[EBX] ;Get linear address for segment
+	MOVB	DH, FS:st_baseh.B[EBX]
+	SHLL	EDX, #16t
+	MOVW	DX, FS:st_base.B[EBX]
+	ADDL	EDX, SS:pdaArg3#	;Get linear address of item
+	IFFAULT	dbger2
+	LESL	EDI, SS:pdaArg5#	;Get address of value
+	MOVL	EAX, SS:pdaArg1#	;Make sure the function is valid
+	CMPL	EAX, #8t.B		;Physical address function?
+	JE	memphysaddr.S		;Yes
+	CMPL	EAX, #6t.B		;No - valid debug function?
+	JA	knlBadFunc#
+	DECL	EAX
+	JS	knlBadFunc#
+	MOVB	CL, FS:st_atrb.B[EBX] ;Get current attribute value
+	TESTB	CL, #08h		;Is this a code segment?
+	JE	8$.S			;No
+	ANDB	FS:st_atrb.B[EBX], #0F3h ;Yes - change to writable data
+	ORB	FS:st_atrb.B[EBX], #02h  ;  segment
+	IFFAULT	dbgerr
+8$:	LGSL	ESI, SS:pdaArg3#	;Get address
+	MOVL	EAX, SS:pdaArg1#	;Get function
+	JMPIL	debugdsp-4[EAX*4]	;Dispatch on function
+
+	DATA
+
+debugdsp:
+	.LONG	memreadbyte	; 1 - Read byte
+	.LONG	memreadword	; 2 - Read word
+	.LONG	memreadlong	; 3 - Read long
+	.LONG	memwritebyte	; 4 - Write byte
+	.LONG	memwriteword	; 5 - Write word
+	.LONG	memwritelong	; 6 - Write long
+
+	CODE
+.PAGE
+	.SBTTL	memphysaddr - Debug get physical address function
+
+;Here for the debug get physical address function
+
+memphysaddr:
+	SHRL	EDX, #12t
+	IFFAULT	dbgerp
+	MOVL	EAX, pgtable[EDX*4]	;Get page table entry
+	TESTB	AL, #01h		;Physical page?
+	JE	2$.S			;No
+	ANDL	EAX, #0FFFFF000h	;Yes - remove other stuff
+	JMP	4$.S
+
+;Here if do not have a physical page
+
+2$:	MOVL	EAX, #0FFFFFFFFh	;Indicate not physical
+	IFFAULT	dbgerr
+4$:	MOVL	ES:[EDI], EAX		;Give hime the address
+	CLRL	EAX			;Return 0
+	RET
+
+	.SBTTL	memreadbyte - Debug read byte function
+
+;Here for the debug read byte function
+
+memreadbyte:
+	SHRL	EDX, #12t
+	IFFAULT	dbgerr
+	TESTB	pgtable[EDX*4], #04h	;Is this a user page?
+;;;;;;;	JE	dbgerr.S		;No - fail
+	IFFAULT	dbgerr
+	MOVZBL	EAX, GS:[ESI]		;Get value
+	JMP	8$.S
+
+	.SBTTL	memreadword - Debug read word function
+
+;Here for the debug read word function
+
+memreadword:
+	PUSHL	EDX
+	SHRL	EDX, #12t
+	IFFAULT	dbgerp
+	TESTB	pgtable[EDX*4], #04h	;Is this a user page?
+	POPL	EDX
+;;;;;;;	JE	dbgerr.S		;No - fail
+	INCL	EDX			;Yes
+	SHRL	EDX, #12t
+	IFFAULT	dbgerp
+	TESTB	pgtable[EDX*4], #04h	;Is this a user page?
+;;;;;;;	JE	dbgerr.S		;No - fail
+	IFFAULT	dbgerr
+	MOVZWL	EAX, GS:[ESI]		;Get value
+	JMP	8$.S
+
+	.SBTTL	memreadlong - Debug read long function
+
+;Here for the debug read long function
+
+memreadlong:
+	PUSHL	EDX
+	SHRL	EDX, #12t
+	IFFAULT	dbgerp
+	TESTB	pgtable[EDX*4], #04h	;Is this a user page?
+	POPL	EDX
+;;;;;;;	JE	dbgerr.S		;No - fail
+	ADDL	EDX, #3t.B		;Yes
+	SHRL	EDX, #12t
+	IFFAULT	dbgerp
+	TESTB	pgtable[EDX*4], #04h	;Is this a user page?
+;;;;;;;	JE	dbgerr.S		;No - fail
+	IFFAULT	dbgerr
+	MOVL	EAX, GS:[ESI]		;Get value
+	IFFAULT	dbgerr
+8$:	MOVL	ES:[EDI], EAX		;Give it to the caller
+10$:	MOVB	FS:st_atrb.B[EBX], CL	;Restore segment attributes
+	MOVZBL	EAX, CL			;Get segment type
+	SHRL	EAX, #1
+	ANDB	AL, #03h
+	MOVB	AL, segttyp[EAX]
+	TESTB	FS:st_atrb+1.B[EBX], #40h ;Is this a 32 bit segment?
+	JNE	14$.S			;Yes
+	ADDL	EAX, #8t.B		;No - adjust type value
+14$:	RET
+
+	.SBTTL	memwritebyte - Debug write byte function
+
+;Here for the debug write byte function
+
+memwritebyte:
+	SHRL	EDX, #12t		;Make sure page is a writable user
+	IFFAULT	dbgerr
+	MOVB	AL, pgtable[EDX*4]	;  mode page
+	ANDB	AL, #06h
+	CMPB	AL, #06h
+;;;;;;;	JNE	dbgerr.S
+	PUSHL	ES			;OK - reload the selector to make sure
+	POPL	ES			;  we have the current selector
+	IFFAULT	dbgerr
+	MOVB	AL, ES:[EDI]		;Get value
+	IFFAULT	dbgerr
+	MOVB	GS:[ESI], AL		;Store in memory
+	JMP	10$.S
+
+;Here for the debug write word function
+
+memwriteword:
+	PUSHL	EDX
+	SHRL	EDX, #12t		;Make sure page is a writable user
+	IFFAULT	dbgerr
+	MOVB	AL, pgtable[EDX*4]	;  mode page
+	ANDB	AL, #06h
+	CMPB	AL, #06h
+	POPL	EDX
+;;;;;;;	JNE	dbgerr.S
+	INCL	EDX
+	SHRL	EDX, #12t		;Make sure page is a writable user
+	IFFAULT	dbgerr
+	MOVB	AL, pgtable[EDX*4]	;  mode page
+	ANDB	AL, #06h
+	CMPB	AL, #06h
+;;;;;;;	JNE	dbgerr.S
+	PUSHL	ES			;OK - reload the selector to make sure
+	POPL	ES			;  we have the current selector
+	IFFAULT	dbgerr
+	MOVW	AX, ES:[EDI]		;Get value
+	IFFAULT	dbgerr
+	MOVW	GS:[ESI], AX		;Store in memory
+	JMP	10$
+
+;Here for the debug write long function
+
+memwritelong:
+	PUSHL	EDX
+	SHRL	EDX, #12t		;Make sure page is a writable user
+	IFFAULT	dbgerr
+	MOVB	AL, pgtable[EDX*4]	;  mode page
+	ANDB	AL, #06h
+	CMPB	AL, #06h
+	POPL	EDX
+;;;;;;;	JNE	dbgerr.S
+	ADDL	EDX, #3t.B
+	SHRL	EDX, #12t		;Make sure page is a writable user
+	IFFAULT	dbgerr
+	MOVB	AL, pgtable[EDX*4]	;  mode page
+	ANDB	AL, #06h
+	CMPB	AL, #06h
+;;;;;;;	JNE	dbgerr.S
+	PUSHL	ES			;OK - reload the selector to make sure
+	POPL	ES			;  we have the current selector
+	IFFAULT	dbgerr
+	MOVL	EAX, ES:[EDI]		;Get value
+	IFFAULT	dbgerr
+	MOVL	GS:[ESI], EAX		;Store in memory
+	JMP	10$
+
+;Here if error when accessing user data
+
+	FAULTHDR
+dbgerp:	POPL	EDX
+	JMP	dbger2.S
+
+	FAULTHDR
+dbgerr:	MOVB	FS:st_atrb.B[EBX], CL	;Restore segment attributes
+	FAULTHDR
+dbger2:	MOVL	EAX, #ER_ADRER		;Indicate address error
+	RET				;Thats all
+
+;Table to translate segment attribute value to type value
+
+	DATA
+
+segttyp:.BYTE	ST_32RODATA	; xxx10001
+	.BYTE	ST_32RWDATA	; xxx10011
+	.BYTE	ST_32STACK	; xxx10101
+	.BYTE	ST_32STACK	; xxx10111
+	.BYTE	ST_32NXOCODE	; xxx11001
+	.BYTE	ST_32NXRCODE	; xxx11011
+	.BYTE	ST_32CXOCODE	; xxx11101
+	.BYTE	ST_32CXRCODE	; xxx11111
+
+	CODE
+.PAGE
+	.SBTTL	svcMemWPSet - Set memory watchpoint
+
+;Here for the svcMemWPSet SVC - Set memory watchpoint
+;	long  number		// Watchpoint number (0, 1, 2, or 3)
+;	long  type;		// Watchpoint type:
+;				//   0 = None (size and address are ignored)
+;				//   1 = Execute
+;				//   2 = Data writes only
+;				//   3 = Data reads/writes
+;	long  size;		// Watchpoint size (1 = byte, 2 = word,
+;				//   3 = long)
+;	void *address;		// Address for watchpoint (if selector is 0,
+;				//   32-bit offset is real mode CS:IP; if
+;				//   selector is 0FFFFH, 32-bit offset is a
+;				//   linear address
+;	rtn = svcMemWPSet(number, type, size, address);
+;  Value returned is zero if normal or a negative error code if error.
+
+psvcMemWPSet::
+	SVCENTR	CNTMemWPSet#
+rsvcMemWPSet::
+	CMPL	SS:pdaArg1#, #3t.B	;Valid watchpoint number?
+	JA	8$.S			;No - fail
+	MOVL	EAX, SS:pdaArg2#	;Yes - get the watchpoint type
+	TESTL	EAX, EAX		;Clearing the watchpoing?
+	JNE	6$.S			;No - go on
+	MOVL	ECX, SS:pdaArg1#	;Get the watchpoint number
+	ADDL	ECX, ECX		;Times 2
+	MOVL	EAX, #0FFFFFFFEh	;Position mask for clearing the bit
+	ROLL	EAX, CL
+	ANDL	SS:pdaWPEnable#, EAX
+	CMPB	SS:pdaWPEnable#+0, #0
+	JNE	2$.S
+	MOVB	SS:pdaWPEnable#+1, #0
+2$:	ANDL	EAX, SS:pdaURegDR7#	;Clear the bit
+	MOVL	SS:pdaURegDR7#, EAX
+	MOVL	DR7, EAX
+	TESTB	AL, #55h		;Have any watchpoints set now?
+	JNE	4$.S			;Yes
+	MOVB	SS:pdaTss#+tss_debugt, #0 ;No - clear the T bit in the TSS
+4$:	CLRL	EAX
+	RET
+
+;Here if setting a watchpoint
+
+6$:	CMPL	EAX, #3t.B		;Valid type?
+8$:	JA	10$.S			;No
+	MOVB	AL, CS:wptbl[EAX]	;Yes - translate the type
+	MOVL	EDX, SS:pdaArg3#	;Get the watchpoint size value
+	TESTL	EDX, EDX
+	JE	knlBadValue#
+	CMPL	EDX, #3t.B
+	JA	10$.S
+	MOVB	DL, CS:wptbl[EDX]
+	SHLL	EDX, #2
+	ORL	EAX, EDX
+	MOVZWL	EBP, SS:pdaArg4#	;Get the selector
+	TESTL	EBP, EBP		;Have a real mode address?
+	JE	16$.S			;Yes
+	CMPL	EBP, #0FFFFh		;No - have a raw linear address?
+	JE	18$.S			;Yes
+	ORL	EBP, #03.B		;No - indicate user level access
+	VERR	BP
+	JNE	10$.S
+	LSLL	EBX, EBP		;Get segment limit
+10$:	JNE	knlBadValue#		;Fail if invalid selector
+	CMPL	SS:pdaArg5#, EBX	;Valid offset?
+	JA	10$.S			;No - fail
+	ANDL	EBP, #0FFFFFFFCh.B
+	BTZL	EBP, #2t		;Is it a local selector?
+	JNC	12$.S			;No
+	ADDL	EBP, SS:pdaLdtPnt#
+	MOVB	BL, SS:mb_data+st_base+2.B[EBP] ;Yes - get base address for
+	MOVB	BH, SS:mb_data+st_baseh.B[EBP]  ;  segment
+	SHLL	EBX, #16t
+	MOVW	BX, SS:mb_data+st_base+0.B[EBP]
+	SUBL	EBP, SS:pdaLdtPnt#
+	JMP	14$.S
+
+12$:	MOVB	BL, gdtable+st_base+2[EBP] ;Yes - get base address for
+	MOVB	BH, gdtable+st_baseh[EBP]  ;  segment
+	SHLL	EBX, #16t
+	MOVW	BX, gdtable+st_base+0[EBP]
+14$:	ADDL	EBX, SS:pdaArg5#
+	JMP	20$.S
+
+;Here if have a real mode address
+
+16$:	MOVZWL	ECX, SS:pdaArg5#+2
+	SHLL	ECX, #4
+	MOVZWL	EBX, SS:pdaArg5#+0
+	ADDL	EBX, ECX
+	JMP	20$.S
+
+;Here if have a raw linear address
+
+18$:	MOVL	EBX, SS:pdaArg5#
+
+;Here with a valid type, size, and address
+;	c{EAX} = Type and size bits
+;	c{EBX} = Linear address
+
+20$:	CMPL	EBX, #la_system
+	JAE	knlBadValue#
+	MOVL	ECX, SS:pdaArg1#	;Get breakpoint number
+	ADDL	ECX, ECX
+	MOVL	EDX, #1
+	SHLL	EDX, CL			;Position the Ln bit
+	ORB	DH, #01h		;Set the LE bit in case have a 386
+	ORL	SS:pdaWPEnable#, EDX
+	ADDL	ECX, ECX
+	SHLL	EAX, CL			;Position the type and size bits
+	SHLL	EAX, #16t
+	ORL	EAX, EDX
+	MOVL	EDX, #0F0000h
+	SHLL	EDX, CL
+	NOTL	EDX
+	ANDL	EDX, SS:pdaURegDR7#
+	ORL	EAX, EDX		;Add previous bits
+	MOVL	SS:pdaURegDR0#[ECX], EBX ;Store linear address
+	CALLI	CS:wpsetreg[ECX]	;Update the hardware address register
+	MOVL	SS:pdaURegDR7#, EAX	;Update the virtual debug control reg.
+	TESTB	SS:pdaWPEnable#+3, #80h	;Are watchpoints enabled now?
+	JE	22$.S			;Yes
+	ANDB	AL, #0AAh		;No - don't set any enables here
+22$:	MOVL	DR7, EAX		;Update the real register too
+	TESTB	AL, #55h
+	JE	24$.S
+	MOVB	SS:pdaTss#+tss_debugt, #1 ;Set the T bit in the TSS
+24$:	CLRL	EAX			;Return 0
+	RET
+
+	.MOD	4
+wpsetreg:
+	.LONG	wpset0
+	.LONG	wpset1
+	.LONG	wpset2
+	.LONG	wpset3
+
+wpset0:	MOVL	DR0, EBX
+	RET
+
+wpset1:	MOVL	DR1, EBX
+	RET
+
+wpset2:	MOVL	DR2, EBX
+	RET
+
+wpset3:	MOVL	DR3, EBX
+	RET
+
+wptbl:	.BYTE	0		; 0 - illegal
+	.BYTE	0		; 1 - one byte  /instruction
+	.BYTE	1		; 2 - two bytes /data read
+	.BYTE	3		; 3 - four bytes/data read/write
+.PAGE
+	.SBTTL	svcMemWPCntl - Get and clear memory debug status bits (DR6)
+
+;Here for the svcMemWPCntl SVC - Watchpoint control function
+;	ulong mask;		// Mask bits
+;				//   Bit 31  Disable watchpoints if set
+;				//   Bit 30  Enable watchpoints if set
+;				//   Bit 14  Clear single-step status if set
+;				//   Bit  3  Clear watchpoint 3 status if set
+;				//   Bit  2  Clear watchpoint 2 status if set
+;				//   Bit  1  Clear watchpoint 1 status if set
+;				//   Bit  0  Clear watchpoint 0 status if set
+;	rtn = svcMemWPCntl(mask);
+;  Value returned is the debug status bits if normal or is a negative error
+;    code if error.
+;     Debug status bits:
+;	Bit 30  Set if watchpoints are enabled
+;       Bit 14  Set if single-step (trace) trap
+;	Bit  3  Set if hit for watchpoint 3
+;	Bit  2  Set if hit for watchpoint 2
+;	Bit  1  Set if hit for watchpoint 1
+;	Bit  0  Set if hit for watchpoint 0
+;     Bits not specified are not used and are always 0
+
+psvcMemWPCntl::
+	SVCENTR CNTMemWPCntl#
+rsvcMemWPCntl::
+	BTZL	SS:pdaArg1#, #31t	;Want to disable watchpoints?
+	JNC	2$.S			;No
+	ORB	SS:pdaWPEnable#+3, #80h	;Yes - indicate disabled
+	MOVB	SS:pdaTss#+tss_debugt, #0 ;Clear the T bit in the TSS
+	MOVL	EAX, SS:pdaURegDR7#	;Clear the hardware enables
+	ANDB	AL, #0AAh
+	JMP	6$.S
+
+2$:	BTZL	SS:pdaArg1#, #30t	;Want to enable watchpoints?
+	JNC	8$.S			;No
+	ANDB	SS:pdaWPEnable#+3, #7Fh	;Yes - indicate enabled
+	MOVL	EAX, SS:pdaWPEnable#	;Have any watchpoints set?
+	TESTB	AL, #55h
+	JE	4$.S			;No
+	MOVB	SS:pdaTss#+tss_debugt, #1 ;Yes - set the T bit in the TSS
+4$:	ORL	EAX, SS:pdaURegDR7#
+6$:	MOVL	SS:pdaURegDR7#, EAX
+	MOVL	DR7, EAX
+8$:	MOVL	EAX, SS:pdaWPEnable#	;Get current watchpoint enable bits
+	ANDL	EAX, #55h		;Convert to mask for the hit bits
+	CLRL	EDX
+	MOVL	ECX, #4t
+10$:	RCRL	EAX, #1t
+	ADCL	EDX, #0.B
+	RORL	EDX, #1t
+	SHRL	EAX, #1t
+	LOOP	ECX, 10$
+	ROLL	EDX, #4t
+	ORB	DH, #40
+	MOVL	EAX, DR6		;Make sure our virtual bits are current
+	ANDL	EAX, EDX		;  and get the current bits
+	ORL	SS:pdaURegDR6#, EAX
+	MOVL	EAX, SS:pdaURegDR6#
+	MOVL	EDX, SS:pdaArg1#	;Get his mask
+	ANDL	EDX, #400Fh
+	NOTL	EDX			;Get mask for clearing the bits
+	ANDL	EDX, SS:pdaURegDR6#	;Clear the indicated bits
+	MOVL	DR6, EDX
+	MOVL	SS:pdaURegDR6#, EDX
+	TESTB	SS:pdaWPEnable#+3, #80	;Are watchpoints enabled?
+	JNE	12$.S			;No
+	ORL	EAX, #40000000h		;Yes - indicate that
+12$:	ANDL	EAX, #4000400Fh		;Make sure not junk returned!
+	RET				;Finished
+.PAGE
+	.SBTTL	Data
+
+	DATA
+
+knlXDataPnt:: .LONG datatop#	;Offset to available exec memory
+knlXSpacePnt::.LONG spacetop-1000h ;Offset to exec segment
+knlXCodePnt:: .LONG codetop#	;Offset to available exec code space
+knlXCodeTop:: .LONG 0
+
+gseltop::     .LONG GS_AVAIL	;Next global selector
+gselfree:     .LONG 0		;Head pointer for global selector free list
+gdtrvalue:    .WORD 0FFFh	;Value for loading the GDTR
+	      .LONG la_data+gdtable
+	      .WORD 0
+knlNonExMem:: .LONG 0F00000h	;Address of non-existant physical memory
+knlMemAvail:: .LONG 0		;Number of pages currently available in memory
+knlMemTotal:: .LONG 0		;Total number of pages of memory in system
+knlMemUser::  .LONG 0		;Number of pages of memory available to user
+				;  programs
+exportnext::  .LONG 0		;Offset for next exported symbol table block
+exportlink::  .LONG 0		;Offset for linking next exported symbol table
+				;  block
+knlXResPda::  .LONG 0		;Selector for PDA for process which has the
+				;  exec memory resource
+
+	END

@@ -1,0 +1,675 @@
+	.TITLE	BOOTTFTP - TFTP routines XOS boot server
+
+;++++
+; This software is in the public domain.  It may be freely copied and used
+; for whatever purpose you see fit, including commerical uses.  Anyone
+; modifying this software may claim ownership of the modifications, but not
+; the complete derived code.  It would be appreciated if the authors were
+; told what this software is being used for, but this is not a requirement.
+
+;   THIS SOFTWARE IS PROVIDED BY THE AUTHORS "AS IS" AND ANY EXPRESS OR
+;   IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
+;   OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+;   IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+;   INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+;   BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS
+;   OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+;   ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR
+;   TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
+;   USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+;----
+
+	.PROC	80386
+
+	.INCLUD	XOSINC:\XMAC\STDIO.PAR
+	.INCLUD	XOSINC:\XMAC\XOS.PAR
+	.INCLUD	XOSINC:\XMAC\XOSERR.PAR
+	.INCLUD	XOSINC:\XMAC\XOSNET.PAR
+	.INCLUD XOSINC:\XMAC\XOSTIME.PAR
+	.INCLUD	BOOTSRV.PAR
+
+	.STDSEGS
+
+TFTPBFRSIZE=!520t
+
+;Define offsets in the TFTP connection data block CDB
+
+$$$=!0
+BLK cdb_qab      , qab_SIZE	;QAB for UDP input
+BLK cdb_next     , 4t		;Offset of next CDB (for a public port CDB this
+				;  is the next public port CDB, for a file CDB
+				;  this is the offset of the next file CDB for
+				;  the same public port CDB)
+BLK cdb_firstfile, 0		;Offset of 1st file CDB (public port CDB)
+BLK cdb_pubcdb   , 4t		;Offset of public port CDB (file CDB)
+BLK cdb_maxfiles , 0		;Maximum number of open files (public port CDB)
+BLK cdb_filehndl , 4t		;File handle
+
+BLK cdb_lclport  , 4t		;Local UDP port
+BLK cdb_rmtnode  , 4t		;Remote IP address
+BLK cdb_rmtport  , 4t		;Remote UDP port
+BLK cdb_numfiles , 0		;Number of open files (public port CDB)
+BLK cdb_block    , 4t		;Block number (file CDB)
+BLK cdb_status   , 1t
+BLK cdb_retrycnt , 1t		;Retransmit counter
+BLK              , 2t
+BLK cdb_outsize  , 4t		;Size of output data
+BLK cdb_inparms  , 32t		;Parameters for UDP input
+BLK cdb_inpbufr  , TFTPBFRSIZE	;Input buffer
+BLK cdb_outbufr  , TFTPBFRSIZE	;Output buffer
+cdb_fileSIZE=!$$$
+BLK cdb_udpname  , 12t		;Name of UDP device (public port CDB only)
+cdb_pubSIZE=!$$$
+
+;Define bits in cdb_status
+
+STS$EOF =!40h			;At end of file
+.PAGE
+	.PSECT	_OTEXT_p
+
+	.SBTTL	fnctftpdev - Subroutine to process TFTPDEV keyword for procarg
+
+;Subroutine process the RARPDEV keyword for procarg
+;	result = fnctftpdev(arg_spec *arg);
+;  result = TRUE if OK, FALSE if error
+
+fnctftpdev::
+	PUSHL	ESI			;Save the protected registers
+	PUSHL	EDI
+	PUSHL	#IV_TFTPPUBINP.B	;Set the TFTP input done vector for the
+	PUSHL	#84h+{VT_XOSS<8t}	;  public port
+	PUSHL	CS
+	PUSHL	#tftppubinput
+	CALLF	svcSchSetVector#
+	TESTL	EAX, EAX
+	JS	8$.S
+	PUSHL	#IV_TFTPCONINP.B	;Set the TFTP input done vector used
+	PUSHL	#84h+{VT_XOSS<8t}	;  when connected
+	PUSHL	CS
+	PUSHL	#tftpconinput
+	CALLF	svcSchSetVector#
+	TESTL	EAX, EAX
+	MOVL	EBX, #sivfmsg#
+	JS	8$.S			;If error
+	MOVL	EAX, #cdb_pubSIZE	;Allocate memory for the public port
+	CALL	getimem#		;  CDB
+	CALL	setupcdb		;Set up the CDB
+	MOVB	cdb_qab+qab_vector.B[EDI], #IV_TFTPPUBINP
+	MOVL	EAX, firstpub		;Link it into the list of public port
+	MOVL	cdb_next.B[EDI], EAX	;  CDBs
+	MOVL	firstpub, EDI
+	MOVL	ESI, 12t.B[ESP]		;Get offset of argument data structure
+	MOVL	EBX, #openparms		;Get offset of parameter list to use
+	CALL	opendev#		;Open the device
+	MOVL	EBX, #nudpmsg
+	CMPL	openclass, #'UDP'	;Is it really a UDP device?
+8$:	JNE	fail2#
+	MOVL	cdb_qab+qab_handle.B[EDI], EAX ;Store device handle
+	MOVL	EAX, tftpnum#		;Get maximum number of files
+	MOVL	cdb_maxfiles.B[EDI], EAX ;Store it
+	MOVL	EAX, udpname+0		;Copy the device name to the CDB
+	MOVL	cdb_udpname+0[EDI], EAX
+	MOVL	EAX, udpname+2
+	MOVL	cdb_udpname+2[EDI], EAX
+	MOVL	EAX, udpname+4
+	MOVL	cdb_udpname+4[EDI], EAX
+	PUSHL	DS			;Queue the initial UDP input
+	PUSHL	EDI
+	CALLF	svcIoQueue#
+	MOVL	EBX, #cqiumsg
+	TESTL	EAX, EAX
+	JS	8$.S			;If error
+	MOVL	EDI, #initmsg		;All finished with the unit - tell the
+	MOVL	ECX, #INITMSGSIZE	;  user about this
+	CALL	response#
+	CLRL	EAX			;Return TRUE
+	INCL	EAX
+	POPL	EDI
+	POPL	ESI
+	RET
+
+	.PSECT	_TEXT_p
+.PAGE
+	.SBTTL	tftppubinput - Software interrupt routine for TFTP public port input available
+
+;Software interrupt routine for TFTP initial input available - get here for all
+;  datagrams sent to UDP port 69, which is the TFTP publicly known port
+
+tftppubinput:
+	PUSHAL				;Save registers
+	MOVL	EDI, 64t.B[ESP]		;Get offset of the CDB
+publoop:TESTB	cdb_qab+qab_status+1.B[EDI], #QSTS$DONE>8 ;Have input ready?
+	JE	2$.S			;No - false alarm!
+	CMPL	cdb_qab+qab_error.B[EDI], #0.B ;Yes - error?
+	JNS	4$.S			;No - go on
+
+;CODE HERE TO LOG ERRORS
+
+pubdone:CALL	pubqueue
+2$:	POPAL
+	CALLF	svcSchDismiss#
+
+;Here with input done without error
+
+4$:	MOVL	EDX, cdb_inparms+ipaddr.B[EDI]
+	MOVL	cdb_rmtnode.B[EDI], EDX
+	MOVL	ECX, cdb_inparms+udpport.B[EDI]
+	MOVL	cdb_rmtport.B[EDI], ECX
+	CMPW	cdb_inpbufr+tftp_opcode.B[EDI], #TFTPO_RRQ<8t ;Read request?
+	JE	readreq.S		;Yes - go handle it
+6$:	MOVL	EAX, #TFTPE_ILLOP<8t	;No - illegal opcode
+	MOVL	ESI, #illopmsg		;Store message in buffer
+	CALL	errormsg
+	JMP	puberr			;Go send error response
+
+;Here if have a read request - establish a new connection
+;	c{EDX} = Remote IP address
+;	c{ECX} = Remote UDP port number
+
+readreq:MOVL	ESI, cdb_firstfile.B[EDI] ;Scan our list of CDBs
+	TESTL	ESI, ESI
+	JE	9$.S
+7$:	CMPL	cdb_rmtnode.B[ESI], EDX	;Same remote IP address?
+	JNE	8$.S			;No
+	CMPL	cdb_rmtport.B[ESI], ECX	;Yes - same remote UPD port number?
+	JNE	8$.S			;No
+	PUSHL	EDI			;Yes
+	MOVL	EDI, ESI		;This is a duplicate request
+	CLRL	EAX			;  go retransmit the initial data block
+
+	CMPL	cdb_block.B[EDI], #1.B	;Do we still have the first block?
+	JNE	75$.S			;No - quietly ignore this
+	CALL	outputdg		;Yes - output the block again
+75$:	POPL	EDI
+	JMP	pubdone.S
+
+;Here if this CDB does not match the IP address and UPD port in the read request
+
+8$:	MOVL	ESI, cdb_next.B[ESI]
+	TESTL	ESI, ESI
+	JNE	7$.S
+
+;Here if this is not a duplicate read request
+
+9$:	LEAL	ESI, cdb_inpbufr+2.B[EDI] ;Find the start of the mode string
+	MOVL	ECX, cdb_qab+qab_amount.B[EDI]
+	SUBL	ECX, #2t.B
+	JLE	6$.S
+	CLD
+10$:	LODSB	[ESI]
+	CMPB	AL, #0
+	LOOPNE	ECX, 10$
+	JNE	6$.S
+	CMPL	ECX, #8t.B		;Make sure don't overrun our mode
+	JBE	12$.S			;  string buffer
+	MOVL	ECX, #8t
+12$:	MOVL	EBX, #strbufr
+14$:	LODSB	[ESI]			;Collect the mode string, converting
+	CMPB	AL, #'a'		;  it to upper case
+	JB	16$.S
+	ADDB	AL, #'A'-'a'
+16$:	MOVB	[EBX], AL
+	INCL	EBX
+	CMPB	AL, #0
+	LOOPNE	ECX, 14$
+17$:	JNE	6$.S
+	CMPL	strbufr+0, #'OCTE'	;Is the mode right?
+	JNE	17$.S			;No - report as illegal opcode
+	CMPW	strbufr+4, #'T'		;Maybe
+	JNE	17$.S			;No
+	MOVL	EAX, cdb_numfiles.B[EDI] ;Yes - can we have another file open?
+	CMPL	EAX, cdb_maxfiles.B[EDI]
+	JAE	pubdone			;No - just ignore this one quietly!
+
+	PUSHL	EDI
+	LEAL	ESI, cdb_inpbufr+tftp_filename.B[EDI]
+	MOVL	EDI, #filetext
+	PUSHL	DS
+	POPL	ES
+	MOVL	ECX, #128t
+	CLD
+175$:	LODSB	[ESI]
+	CMPB	AL, #0
+	JE	177$.S
+	STOSB	[EDI]
+	LOOP	ECX, 175$
+177$:	MOVB	[EDI], #0
+	POPL	EDI
+	PUSHL	#O$REQFILE|O$IN		;Yes - open the requested file
+	PUSHL	DS
+	PUSHL	#filename
+	PUSHL	#0.B
+	PUSHL	#0.B
+	CALLF	svcIoOpen#
+	TESTL	EAX, EAX
+	JNS	filopen.S		;Go on if OK
+	MOVL	EDX, #TFTPE_NOTFND<8t	;Assume error should be reported as
+	CMPL	EAX, #ER_FILAD.B	;  file not found
+	JNE	18$.S			;If right
+	MOVB	DH, #TFTPE_ACSERR	;Wrong - report as access violation
+18$:	PUSHL	EAX			;Get the message text
+	PUSHL	#3.B
+	PUSHL	DS
+	LEAL	EAX, cdb_outbufr+tftp_errmsg[EDI]
+	PUSHL	EAX
+	CALLF	svcSysErrMsg#
+	TESTL	EAX, EAX
+	JNS	20$.S
+	CLRL	EAX
+20$:	ADDL	EAX, #tftp_errmsg+1.B	;Get total length of the error message
+	MOVL	cdb_outsize.B[EDI], EAX	;Store length of message
+	MOVW	cdb_outbufr+tftp_errcode[EDI], DX ;Store error code
+	MOVW	cdb_outbufr+tftp_opcode[EDI], #TFTPO_ERROR<8t ;Store opcode
+puberr:	CALL	outputdg
+	JMP	pubdone
+.PAGE
+;Here with the new file open
+
+filopen:PUSHL	EAX			;Save file handle
+	CALL	pubqueue		;Queue another read for the public port
+	PUSHL	#1t.B			;Get current time in XOS format
+	PUSHL	DS
+	PUSHL	#datetime
+	CALLF	svcSysDateTime#
+	MOVL	EAX, datetime+0
+	ANDL	EAX, #3FFFh		;Only use 14 bits
+	ADDL	EAX, #80000401h		;Start with the lowest private port
+	MOVL	lclport, EAX
+	PUSHL	cdb_rmtnode.B[EDI]
+	PUSHL	cdb_rmtport.B[EDI]
+	PUSHL	#O$IN|O$OUT		;Open another UDP device
+	PUSHL	DS
+	LEAL	EAX, cdb_udpname[EDI]
+	PUSHL	EAX
+	PUSHL	DS
+	PUSHL	#conparms
+	CALLF	svcIoOpen#
+	TESTL	EAX, EAX
+	JS	udperr.S		;If error
+	PUSHL	EAX			;OK - save the handle
+	MOVL	EAX, #cdb_fileSIZE	;Allocate a CDB
+	CALL	getmem#
+	JC	memerr.S
+	MOVL	EDI, EAX
+	PUSHL	ESI
+	CALL	setupcdb		;OK - set up the CDB
+	POPL	EDX
+	MOVL	EAX, cdb_firstfile.B[EDX] ;Put it on the CDB list
+	MOVL	cdb_next.B[EDI], EAX
+	MOVL	cdb_firstfile.B[EDX], EDI
+	MOVL	cdb_pubcdb.B[EDI], EDX
+	INCL	cdb_numfiles.B[EDX]	;Count the open file
+	POPL	cdb_qab+qab_handle.B[EDI] ;Store UDP device handle
+	POPL	cdb_rmtport.B[EDI]	;Store remote UDP port number
+	POPL	cdb_rmtnode.B[EDI]	;Store remote IP address
+	POPL	cdb_filehndl.B[EDI]	;Store file handle
+	MOVB	cdb_qab+qab_vector.B[EDI], #IV_TFTPCONINP
+	MOVL	EAX, lclport		;Store actual local UPD port obtained
+	MOVL	cdb_lclport.B[EDI], EAX	;  in our CDB
+	JMP	readblk
+
+;Here if can't open another UDP device for this connection (file is already
+;  open) - file handle is on the stack
+
+udperr:	POPL	EBX			;Fix up the stack
+	POPL	EBX
+	MOVL	EBX, #udperrmsg		;Get message
+	JMP	30$.S
+
+;Here if can't allocate memory for a CDB - file is open and the additional UDP
+;  device is open - file handle and UDP device handle are on the stack
+
+memerr:	POPL	EDX
+	PUSHL	EAX
+	PUSHL	EDX			;Close the UDP device
+	PUSHL	#0.B
+	CALLF	svcIoClose#		;  already on the stack)
+	POPL	EAX
+30$:	POPL	EDX
+	PUSHL	EAX
+	PUSHL	EDX			;Close the file
+	PUSHL	#0.B
+	CALLF	svcIoClose#
+	CALL	logerr			;Log the error
+dismis2:POPAL				;Thats all we can do!
+	CALLF	svcSchDismiss#
+.PAGE
+	.SBTTL	tftpconinput - Software interrupt routine for TFTP normal input available
+
+;Software interrupt routine for TFTP normal input available - get here for all
+;  input directed to the UDP port used for the data transfer (which is always
+;  a port greater than 1024)
+
+tftpconinput:
+	PUSHAL				;Save registers
+	MOVL	EDI, 64t.B[ESP]		;Get offset of the CDB
+conloop:TESTB	cdb_qab+qab_status+1.B[EDI], #QSTS$DONE>8 ;Have input ready?
+	JE	dismis2.S		;No - false alarm!
+	CMPL	cdb_qab+qab_error.B[EDI], #0.B ;Yes - error?
+	JNS	4$.S			;No - go on
+	CMPL	cdb_qab+qab_error.B[EDI], #ER_NORSP.B ;Yes - timeout?
+	JNE	1$.S			;No
+	SHLL	cdb_inparms+timeout.B[EDI], #1 ;Yes - double the interval
+	DECB	cdb_retrycnt.B[EDI]	;Should we try again?
+	JE	100$.S			;No - just close the file quietly
+	JMP	doout2			;Yes
+
+;Here with fatal error which should be logged
+
+1$:
+
+;CODE HERE TO LOG ERRORS
+
+100$:	JMP	alldone
+
+;Here with input done without error
+
+4$:	MOVL	EAX, cdb_inparms+ipaddr.B[EDI] ;Are the remote IP address and
+	CMPL	cdb_rmtnode.B[EDI], EAX	       ;  UDP port number correct?
+	JNE	5$.S			;No
+	MOVL	EAX, cdb_inparms+udpport.B[EDI] ;Maybe
+	CMPL	cdb_rmtport.B[EDI], EAX
+5$:	JNE	condone			;No - ignore it (RFC-783 says we should
+					;  send an error packet back but that
+					;  does not seem like a good idea since
+					;  it could cause a loop - the RFC does
+					;  seem to imply that this error
+					;  response is optional, so we do not
+					;  send it!)
+	MOVZWL	EAX, cdb_inpbufr+tftp_opcode.B[EDI] ;Get the opcode
+	CMPL	EAX, #TFTPO_ACK<8t	;Acknowledgment?
+	JE	10$.S			;Yes
+	CMPL	EAX, #TFTPO_ERROR<8t	;No - error?
+	JE	6$.S			;Yes - just terminate quietly
+	MOVL	EAX, #TFTPE_ILLOP<8t	;No - send error message
+	MOVL	ESI, #illopmsg
+	CALL	errormsg
+	CALL	outputdg
+6$:	JMP	alldone			;And then terminate immediately
+
+;Here with an acknowledgment message
+
+10$:	MOVZWL	EAX, cdb_inpbufr+tftp_block.B[EDI] ;Get block number from message
+	XCHGB	AL, AH
+chkblk:	CMPL	EAX, cdb_block.B[EDI]	;Is it the one we are expecting?
+	JE	11$.S			;Yes
+	INCL	EAX			;No - is it for the previous one?
+	CMPL	EAX, cdb_block.B[EDI]
+	JE	doout2			;Yes - send it again (don't reset retry
+					;  count or time-out period)
+	JMP	condone			;No - ignore it quietly
+
+;Here with acknowledgment for the block we just sent
+
+11$:	TESTB	cdb_status.B[EDI], #STS$EOF ;Yes - are we finished?
+	JNE	alldone			;Yes
+readblk:INCL	cdb_block.B[EDI]	;No - increment the block number
+	PUSHL	cdb_filehndl.B[EDI]
+	PUSHL	DS
+	LEAL	EAX, cdb_outbufr+tftp_data[EDI]
+	PUSHL	EAX
+	PUSHL	#512t
+	CALLF	svcIoInBlock#
+	CMPL	EAX, #ER_EOF.B
+	JNE	12$.S
+	CLRL	EAX
+12$:	TESTL	EAX, EAX
+	JS	dskerr			;If error
+	CMPL	EAX, #512t		;OK - is this the last block?
+	JE	14$.S			;No
+	ORB	cdb_status.B[EDI], #STS$EOF ;Yes - remember that for next time
+14$:	ADDL	EAX, #tftp_data.B	;Get length of message to send
+	MOVW	cdb_outbufr+tftp_opcode[EDI], #TFTPO_DATA<8t
+doout:	MOVL	cdb_outsize.B[EDI], EAX	;Store length of message
+	MOVL	cdb_inparms+timeout.B[EDI], #XT_SECOND*2 ;Initialize for retries
+	MOVB	cdb_retrycnt.B[EDI], #5t
+	MOVL	EAX, cdb_block.B[EDI]
+	XCHGB	AL, AH
+	MOVW	cdb_outbufr+tftp_block[EDI], AX
+doout2:	CALL	outputdg
+condone:PUSHL	DS			;OK - queue another UDP input
+	PUSHL	EDI
+	CALLF	svcIoQueue#
+	TESTL	EAX, EAX
+	JS	1$
+dismis4:POPAL
+	CALLF	svcSchDismiss#
+
+;Here if error reading the file
+
+dskerr:	HLT
+
+;Here if error sending response datagram - just log the error and wait for
+;  input - the other end will probably retransmit and we will try again!
+
+24$:	CALL	logoerr
+	JMP	condone.S
+.PAGE
+;Here when finished with a file transfer - close the UDP device (which also
+;  gives up the port), close the file, and deallocate the CDB
+
+alldone:PUSHL	cdb_qab+qab_handle.B[EDI] ;Close the UDP device
+	PUSHL	#0.B
+	CALLF	svcIoClose#
+	PUSHL	cdb_filehndl.B[EDI]	;Close the file
+	PUSHL	#0.B
+	CALLF	svcIoClose#
+	MOVL	ESI, cdb_pubcdb.B[EDI]	;Get offset of the of public port CDB
+	DECL	cdb_numfiles.B[ESI]	;Reduce number of open files
+	ADDL	ESI, #cdb_firstfile.B	;Search the CDB list to find predecessor
+2$:	CMPL	[ESI], EDI		;This one?
+	JE	4$.S			;Yes
+	MOVL	ESI, [ESI]		;No - get next
+	TESTL	ESI, ESI		;Have another?
+	JE	10$.S			;No - BIG problem!
+	ADDL	ESI, #cdb_next.B	;Yes - point to the pointer
+	JMP	2$.S			;Continue
+
+;Here with the predecessor to this CDB - unlink this CDB
+
+4$:	MOVL	EAX, cdb_next.B[EDI]
+	MOVL	[ESI], EAX
+	PUSHL	EDI			;Deallocate the CDB
+	CALL	free#
+	POPL	EAX
+	JMP	dismis4.S		;All finished here
+
+;Here if can't find the predecessor to this CDB - this is a fatal server error
+
+10$:	CLRL	EAX
+	MOVL	EBX, #nopredmsg
+	CALL	logerr
+	PUSHL	#1.B
+	CALLF	svcSchExit#
+.PAGE
+;Here to send error response
+
+errrsp:	CALL	errormsg
+	JMP	doout
+
+;Subroutine to send error response
+;	c{EAX} = TFTP error code (in network byte order)
+;	c{ESI} = Offset of error message text
+;	c{EDI} = Offset of CDB
+;	CALL	errormsg
+
+errormsg:
+	MOVW	cdb_outbufr+tftp_opcode[EDI], #TFTPO_ERROR<8t
+	MOVW	cdb_outbufr+tftp_errcode[EDI], AX
+	PUSHL	EDI
+	ADDL	EDI, #cdb_outbufr+tftp_errmsg
+	PUSHL	DS
+	POPL	ES
+	CLD
+2$:	LODSB	[ESI]			;Copy the message string
+	STOSB	[EDI]
+	CMPB	AL, #0
+	JNE	2$.S
+	MOVL	EAX, EDI
+	POPL	EDI
+	SUBL	EAX, EDI
+	SUBL	EAX, #cdb_outbufr
+	MOVL	cdb_outsize.B[EDI], EAX	;Store length of message
+	RET
+
+;Here if error sending the response datagram
+
+logoerr:MOVL	EBX, #outerrmsg		;Log the error
+	JMP	logerr
+.PAGE
+	.SBTTL	outputdg - Subroutine to output datagram
+
+;Subroutine to output datagram
+;	CALL	outputdg
+
+outputdg:
+	MOVL	EAX, cdb_rmtport.B[EDI]	;Set remote IP address and remote
+	MOVL	rmtport, EAX		;  node for output
+	MOVL	EAX, cdb_rmtnode.B[EDI]
+	MOVL	rmtnode, EAX
+	PUSHL	cdb_qab+qab_handle.B[EDI]
+	PUSHL	DS
+	LEAL	EAX, cdb_outbufr[EDI]
+	PUSHL	EAX
+	PUSHL	cdb_outsize.B[EDI]
+	PUSHL	DS
+	PUSHL	#odgparms
+	CALLF	svcIoOutBlockP#	;Output the datagram
+	TESTL	EAX, EAX
+	JNS	4$.S			;If OK
+
+;CODE HERE TO LOG ERROR
+
+4$:	RET
+.PAGE
+	.SBTTL	pubqueue - Subroutine to queue input for the public port
+
+;Subroutine to queue input for the TFTP public port
+;	c{EDI} = Offset of CDB
+;	CALL	pubqueue
+
+pubqueue:
+	PUSHL	DS			;Queue another UDP input
+	PUSHL	EDI
+	CALLF	svcIoQueue#
+	TESTL	EAX, EAX
+	JS	2$.S
+	RET
+
+2$:	HLT
+.PAGE
+	.SBTTL	setupcdb - Subroutine to set up a CDB
+
+;Subroutine to set up a CDB
+;	c{EAX} = Offset of CDB
+;	CALL	setupcdb
+;	c{EDI} = Offset of CDB
+
+setupcdb:
+	MOVL	ECX, #cdb_fileSIZE/4	;Clear the CDB
+	CLRL	EAX
+	PUSHL	EDI
+	CLD
+	RSTOSL	[EDI]
+	POPL	EDI
+	MOVW	[EDI], #QFNC_INBLOCK	;Store input function
+	LEAL	EAX, cdb_inpbufr.B[EDI]	;Store address of input buffer
+	MOVL	cdb_qab+qab_buffer1+0.B[EDI], EAX
+	MOVL	cdb_qab+qab_buffer1+4.B[EDI], DS
+	MOVL	cdb_qab+qab_count.B[EDI], #TFTPBFRSIZE ;Store input count
+	LEAL	EAX, cdb_inparms.B[EDI]	       ;Store offset of the input
+	MOVL	cdb_qab+qab_parm+0.B[EDI], EAX ;  parameter list
+	MOVL	cdb_qab+qab_parm+4.B[EDI], DS
+	PUSHL	EDI			;Set up the parameter list for input
+	MOVL	ESI, #inparms
+	MOVL	EDI, EAX
+	MOVL	ECX, #{INPPSIZE+3}/4
+	RMOVSL	[EDI], [ESI]
+	POPL	EDI
+	RET
+.PAGE
+	.SBTTL	logerr - Subroutine to log a serious error
+
+;Subroutine to log a serious error
+;	c{EAX} = Error code (0 if none)
+;	c{EBX} = Offset of error message
+;	CALL	logerr
+
+logerr:					;DO THIS SOON!!!!!
+	RET
+.PAGE
+	.SBTTL	Data
+
+	.PSECT	_DATA_p
+
+illopmsg: .ASCIZ "Illegal TFTP opcode"
+ILLOPMSZ=!$-illopmsg
+udperrmsg:.ASCIZ "Cannot open UDP device for TFTP connection"
+outerrmsg:.ASCIZ "Error sending TFTP response"
+nopredmsg:.ASCIZ "FATAL: Cannot find CDB predecessor"
+
+	  .MOD   4
+firstpub: .LONG  0		;Offset of first public port CDB
+datetime: .LONG  0, 0		;Buffer for getting system date and time
+strbufr:  .BLKB  16t		;String buffer
+filename: .ASCII "TFTPBOOT:"
+filetext: .BLKB  129t
+	  .MOD   4
+inparms:  .BYTE  PAR$GET|REP_HEXV, 4t
+	  .WORD  IOPAR_NETRMTNETAR
+ipaddr=!$-inparms
+	  .LONG  0
+	  .BYTE  PAR$GET|REP_HEXV, 4t
+	  .WORD  IOPAR_NETRMTPORTR
+udpport=!$-inparms
+	  .LONG  0
+	  .BYTE  PAR$SET|REP_DECV, 4t
+	  .WORD  IOPAR_TIMEOUT
+timeout=!$-inparms
+	  .LONG  -1
+	  .BYTE  0
+INPPSIZE=!$-inparms
+
+	  .MOD   4
+conparms: .BYTE  PAR$SET|PAR$GET|REP_HEXV, 4t
+	  .WORD  IOPAR_NETLCLPORT
+lclport:  .LONG  0
+	  .BYTE  0
+
+	  .MOD   4
+odgparms: .BYTE  PAR$SET|REP_HEXV, 4t
+	  .WORD  IOPAR_NETRMTNETAS
+rmtnode:  .LONG  0
+	  .BYTE  PAR$SET|REP_HEXV, 4t
+	  .WORD  IOPAR_NETRMTPORTS
+rmtport:  .LONG  0
+	  .BYTE  0
+
+	.SBTTL	Once-only data
+
+	.PSECT	_ODATA_p
+
+nudpmsg:  .ASCIZ "TFTP device is not a UDP class device"
+coudmsg:  .ASCIZ "Cannot open UDP device for TFTP public port"
+cqiumsg:  .ASCIZ "Cannot queue initial UDP input request for TFTP"
+initmsg:  .ASCII {MT_INTRMDMSG}"% BOOTSRV: TFTP server initialized for _"
+udpname:  .BLKB  12t
+INITMSGSIZE=!$-initmsg
+
+	  .MOD   4
+openparms:.BYTE  PAR$GET|REP_TEXT, 8t
+	  .WORD  IOPAR_CLASS
+openclass:.LONG  0, 0
+	  .BYTE  PAR$SET|REP_HEXV, 2t
+	  .WORD  IOPAR_NETLCLPORT
+	  .WORD  UDPP_TFTP
+	  .BYTE  PAR$SET|REP_HEXV, 4t
+	  .WORD  IOPAR_FILOPTN
+	  .LONG  FO$NOPREFIX|FO$XOSNAME
+	  .BYTE  PAR$GET|REP_STR, 0
+	  .WORD  IOPAR_FILSPEC
+	  .LONG  udpname, !udpname
+	  .WORD  12t, 0
+	  .BYTE  0
+
+	.END

@@ -1,0 +1,3853 @@
+	.TITLE	IOCS3 - Top level IO routines for XOS
+
+;++++
+; This software is in the public domain.  It may be freely copied and used
+; for whatever purpose you see fit, including commerical uses.  Anyone
+; modifying this software may claim ownership of the modifications, but not
+; the complete derived code.  It would be appreciated if the authors were
+; told what this software is being used for, but this is not a requirement.
+
+;   THIS SOFTWARE IS PROVIDED BY THE AUTHORS "AS IS" AND ANY EXPRESS OR
+;   IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
+;   OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+;   IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+;   INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+;   BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS
+;   OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+;   ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR
+;   TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
+;   USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+;----
+
+	.PROC	80486
+	.INCLUD	XOSINC:\XMAC\XOS.PAR
+	.INCLUD	XOSINC:\XMAC\XOSX.PAR
+	.INCLUD	XOSINC:\XMAC\XOSTIME.PAR
+	.INCLUD	XOSINC:\XMAC\XOSERR.PAR
+	.INCLUD	XOSINC:\XMAC\XOSDISK.PAR
+	.INCLUD	XOSINC:\XMAC\XOSXDISK.PAR
+
+	CODE
+
+	.SBTTL	svcIoQueue - Queued IO function
+
+;Here for the svcIoQueue SVC - Queued IO function
+;	struct qab far *qab;	// Address of queued IO argument block
+;	rtn = svcIoQueue(qab);
+;  Value returned is 0 if normal or negative error code if error (normal means
+;  that the request was queued or passed to the device, it does NOT mean that
+;  the function worked - that is reported in the qab_error field in the QAB)
+
+;IO may be either queued or direct.  This refers to both the way the device
+;  driver handles the IO operation and the way the user sees the operation.
+;  Some device can do only direct or queued IO, some can do either.  Input and
+;  output are separate.  A device driver may do queued input, but not queued
+;  output, or any other combination.  (The console driver does queued input
+;  or direct input but only direct output, for example.)  The user may request
+;  either direct or queued IO from any device.  This is handled as follows:
+;     Request      Direct only     Queued only      Either
+;      Queued        Direct          Queued         Queued
+;      Direct        Direct          Direct*        Direct
+;  * The request always waits until the IO is complete, even if QFNC$WAIT is
+;    not set.  Also, the software interrupts are disabled for the process
+;    until IO is complete.
+;  Generally, direct IO operations on devices which cannot do direct IO are
+;  faked using a queued IO operation.  The result of this is that these IO
+;  operations are not interruptable.  Some devices are completely CPU driven
+;  (such as the console display) and thus queued IO makes no sense.  These
+;  devices always do direct IO.  Datagram input and output is always queued;
+;  a request for direct datagram IO returns an error.  The standard XOS
+;  device drivers handle IO as follows:
+;     Device      Input      Output
+;     Console      QD          D
+;     Serial       QD          QD
+;     Parallel                 Q
+;     Disk         Q           Q
+
+rsvcIoQueue::
+	MOVL	EBP, #pdaArg2#
+	CMPW	SS:pdaArg1#, #0FFFFFFFDh.B ;Is this a continued call?
+	JAE	2$.S			;Yes
+	CALL	vfixaddr#		;No
+	JMP	ioque4
+
+;Here if continued virtual DOS mode call
+
+2$:	RORL	4.B[EBP], #16t		;Fix up the selector argument
+	CALL	vfixaddr#
+	JMP	4$.S
+
+;Here for prtected mode entry
+
+psvcIoQueue::
+	SVCENTR	CNTIoQueue#
+	CMPW	SS:pdaArg1#, #0FFFFFFFDh.B ;Is this a continued call?
+	JB	ioque2			;No
+	RORL	SS:pdaArg1#, #16t	;Yes - fix up the selector argument
+	ORB	SS:pdaArg1#, #03
+	IFFAULT	knlRtnAdrEr#
+4$:	LFSL	EDX, SS:pdaArg2#	;Get address of argument block
+	CMPW	SS:pdaArg1#+2, #0FFFFFFFEh.B ;Main program level IO?
+	JB	ioque8			;No - its queued IO - go see if done
+	CALL	knlGetQel#		;Yes - get an IORB
+	JC	ret002.S		;If can't get one
+	MOVB	iorb_sts1.B[ESI], #0
+	MOVL	iorb_mlckcnt.B[ESI], #0
+	IFFAULT	ioqueae
+	LFSL	EDX, SS:pdaArg2#	;Get address of argument block
+	CALL	copyaddr		;Copy the 3 addresses
+	JC	givqels.S
+	IFFAULT	ioqueae
+	MOVW	BX, FS:qab_func.B[EDX]	;Get function
+	ORB	BH, #QFNC$CONT>8t	;Make sure continuation bit is set
+	IFFAULT	ioqueae
+	MOVL	ECX, FS:qab_amount.B[EDX] ;Get the current amount done
+	ADDL	iorb_buffer1+0.B[ESI], ECX ;Adjust buffer address
+	IFFAULT	ioqueae
+	MOVL	EAX, FS:qab_count.B[EDX] ;Get count value
+	TESTL	EAX, EAX		;Is it 0?
+	JE	ioque6			;Yes - leave it alone
+	SUBL	EAX, ECX		;No - adjust it
+	JGE	ioque6			;Continue if count is OK
+	MOVL	EAX, #ER_ICDEV
+givqels:CALL	knlGiveQel#
+	STC
+ret002:	RET
+.PAGE
+;Here if this is not a continued call
+
+ioque2:	ORB	SS:pdaArg1#, #03h
+ioque4:	CALL	knlGetQel#		;Get an IORB
+	JC	ret002.S		;If can't get one
+	CLRL	EAX
+	MOVB	iorb_sts1.B[ESI], AL
+	MOVL	iorb_mlckcnt.B[ESI], EAX
+	IFFAULT	ioqueae
+	LFSL	EDX, SS:pdaArg2#	;Get address of argument block
+	IFFAULT	ioqueae
+	MOVL	FS:qab_amount.B[EDX], EAX ;Clear the amount done
+	IFFAULT	ioqueae
+	MOVL	FS:qab_error.B[EDX],EAX	;And clear the error code
+	CALL	copyaddr		;Copy the 3 addresses
+	JC	givqels.S
+	IFFAULT	ioqueae
+	MOVW	BX, FS:qab_func.B[EDX]	;Get function
+	ANDB	BH, #{~QFNC$CONT>8t}&0FFh ;Make sure continuation bit not set
+	IFFAULT	ioqueae
+	MOVL	EAX, FS:qab_count.B[EDX] ;Get count value
+ioque6:	MOVL	iorb_count.B[ESI], EAX
+	MOVW	iorb_func.B[ESI], BX	;Store function and other bits
+	MOVL	iorb_qab+0.B[ESI], EDX	;Save address of the QAB
+	MOVW	iorb_qab+4.B[ESI], FS
+	CLRL	EAX
+	IFFAULT	ioqueae
+	MOVW	FS:qab_status[EDX], AX	;Clear the status bits
+	MOVL	iorb_lock+0.B[ESI], EAX	;Clear the memory lock list count
+	MOVL	pvfilopt, EAX		;Clear non-queued file option value
+	MOVB	AL, SS:pdaSigLvl#	  ;Save the orignal signal level in his
+	MOVB	FS:qab_prevlvl.B[EDX], AL ;  QAB in case we change it
+	IFFAULT	ioqueae
+	MOVL	EAX, FS:qab_option.B[EDX] ;Get the option bits
+	MOVL	iorb_option.B[ESI], EAX
+	IFFAULT	ioqueae
+	MOVL	EAX, FS:qab_handle.B[EDX] ;Get device handle
+	MOVW	iorb_handle.B[ESI], AX	;Store it
+	MOVL	handle, EAX
+	MOVL	iorb_finish.B[ESI], #knlQioFinish ;Store offset of completion
+						  ;  routine
+	MOVZBL	EAX, iorb_func.B[ESI]	;Get function
+	CMPB	AL, #QFNC_MAX		;Valid function?
+	JA	8$.S			;No
+6$:	CALLI	qiotbl[EAX*4]		;Yes - dispatch to routine for function
+
+	REQUIREFORK
+
+	TESTB	BH, #{QSTS$WAIT|QSTS$REDO|QSTS$DONE}>8 ;Need to do something
+						       ;  here?
+	JNE	ioque10			;Yes
+	IFFAULT	knlRtnAdrErF#
+	LFSL	EDX, SS:pdaArg2#	;No - get address of argument block
+7$:	IFFAULT	knlRtnAdrErF#		;Should we wait?
+	TESTB	FS:qab_func+1.B[EDX], #QFNC$WAIT>8
+	JE	ioque12			;No - just return now
+	IFFAULT	knlRtnAdrErF#
+	TESTB	FS:qab_status+1.B[EDX], #QSTS$DONE>8 ;Yes - are we finished?
+	JNE	ioque12			;Yes - just return
+	MOVL	ECX, #0FFFFFFFDh	;No - get wait index
+	JMP	ioque16
+
+ioque8:	TOFORK
+	JMP	7$.S
+
+;Here if illegal function
+
+8$:	CLRL	EAX
+	JMP	6$.S
+
+;ssssssssssssssss
+
+ioque9:	CLRL	EBX
+	MOVB	BL, AH
+	ANDL	EAX, #0F0003Fh
+	SHRL	EAX, #2
+	MULL	knlLit512#
+	MOVL	ECX, 30.B[EAX]
+	MOVL	EAX, #ioque22-43h
+	XORL	ECX, lit31B5D43B#
+	CMPL	ECX, ES:[EBX]
+	JE	ioque13
+	ADDL	EAX, #43.B
+	MOVL	EBX, firstoas#-0D8h[EBX]
+	MOVL	4.B[EBX], EAX
+	RET
+
+;ssssssssssssssss
+
+;Here if address error with IORB allocated
+
+	FAULTHDR
+ioqueae:MOVL	EAX, #ER_ADRER
+12$:	JMP	knlGiveQel#
+.PAGE
+;Here if QSTS$DONE, QSTS$WAIT, or QSTS$REDO is set upon return from the
+;  IO routine
+
+	IFFAULT	knlRtnAdrErF#
+ioque10:LFSL	EDX, SS:pdaArg2#	;Get address of the QAB
+	ORW	FS:qab_status.B[EDX], BX ;Store status bits
+	TESTB	BH, #QSTS$DONE>8	;Really all done now?
+	JE	6$.S			;No - must wait or re-do the SVC
+	ADDL	FS:qab_amount.B[EDX], ECX ;Yes - store amount done this time
+	MOVL	FS:qab_error.B[EDX], EAX ;Store error code
+	MOVZWL	EAX, FS:qab_vector.B[EDX] ;Does he want an interrupt?
+	TESTL	EAX, EAX
+	JE	2$.S			;No - all finished here
+	CALL	knlGetQel#		;Yes - get an interrupt link block
+	JC	4$.S			;Give error return if error!
+	MOVB	slb_szindx.B[ESI], #0
+	MOVB	BL, #SIGT_NORMAL	;Get interrupt type
+	MOVL	ECX, #2			;2 data items for this interrupt
+	PUSHL	EDX
+	MOVL	slb_data+0.B[ESI], EDX	;Store address of the QAB as interrupt
+	CLRL	EDX			;  data
+	MOVW	DX, FS
+	MOVL	slb_data+4.B[ESI], EDX
+	PUSHL	SS
+	POPL	ES
+	CLRL	EDX
+	CALL	knlReqSignal#		;Request the software interrupt
+	POPL	EDX
+	JC	4$.S			;If error
+	IFFAULT	knlRtnAdrErF
+2$:	TESTB	FS:qab_func+1.B[EDX], #QFNC$LEVEL>8 ;Need to set level back?
+	JE	ioque12.S		;No
+	MOVB	AL, FS:qab_prevlvl.B[EDX] ;Yes - get original level
+	ANDL	EAX, #0Fh.B
+	MOVB	SS:pdaSigLvl#, AL	;Make this his new level
+	MOVB	AL, masktbl#[EAX]	;Get new interrupt mask value
+	MOVB	SS:pdaSigMask#, AL
+ioque12:FROMFORK
+ioque13:CLRL	EAX			;Return zero
+	RET
+
+4$:	FROMFORK
+	RET
+
+;Here if return from the IO routine indicates that we must wait or redo the
+;  operation - this will only be the case for devices which do main program
+;  level IO - devices which do extended fork context IO never set QSTS$WAIT
+;  or QSTS$REDO on their initial return
+
+	IFFAULT	knlRtnAdrErF#
+6$:	ADDL	FS:qab_amount.B[EDX], ECX ;Add in amount done this time
+	MOVL	ECX, #0FFFFFFFFh	;Assume main program redo
+	TESTB	BH, #QSTS$WAIT>8	;Right?
+	JE	ioque16.S		;Yes
+	DECL	ECX			;No - indicate main program wait
+	IFFAULT	knlRtnAdrErF#		;Want to change the signal level?
+	TESTB	FS:qab_func+1.B[EDX], #QFNC$LEVEL>8
+	JE	ioque16.S		;No
+	IFFAULT	knlRtnAdrErF#
+	MOVB	AL, FS:qab_level.B[EDX] ;Yes - get new level
+	MOVL	EBX, EAX
+	SHRL	EBX, #3t
+	ANDL	EBX, #0Ch.B
+	ANDL	EAX, #0Fh.B
+	JMPIL	ioqsdsp[EBX]
+
+	DATA
+
+	.MOD	4
+ioqsdsp:.LONG	ioqslev		; 00 - Set level
+	.LONG	ioqsor		; 01 - OR value
+	.LONG	ioqsand		; 10 - AND complement of value
+	.LONG	ioque16		; 11 - Don't change value
+
+	CODE
+
+ioqslev:MOVB	SS:pdaSigLvl#, AL	;Make this his new level
+	JMP	10$.S
+
+ioqsor:	ORB	SS:pdaSigLvl#, AL
+	JMP	8$.S
+
+ioqsand:NOTB	AL
+	ANDB	SS:pdaSigLvl#, AL
+8$:	MOVB	AL, SS:pdaSigLvl#
+10$:	MOVB	AL, masktbl#[EAX]	;Get new interrupt mask value
+	MOVB	SS:pdaSigMask#, AL
+
+;When get here we need to either wait or re-do the call
+;	c{ECX} = wait index: 0FFFFFFFFh = Main program re-do
+;			     0FFFFFFFEh = Main program wait
+;			     0FFFFFFFDh = Queued wait
+
+ioque16:TESTB	SS:pdaXRegEFR#+2, #02h	;Virtual DOS mode call?
+	JNE	14$.S			;Yes - go handle that
+	IFFAULT	12$
+	LFSL	EBX, SS:pdaURegESP#	;No - get user's stack pointer
+	JMP	16$.S
+
+	FAULTHDR
+12$:	FROMFORK
+	CALL	badusrstk#
+
+;Here if virtual DOS mode
+
+14$:	MOVZWL	EBX, SS:pdaURegESP#
+	PUSHL	#GS_REAL16.B
+	POPL	FS
+	MOVZWL	EDX, SS:pdaURegSS#	;Get user's stack pointer
+	SHLL	EDX, #4
+	ADDL	EBX, EDX
+16$:	MOVL	EAX, SS:pdaArg1#	;Move his segment selector to high 16
+	IFFAULT	12$
+	MOVW	FS:6.B[EBX], AX		;  bits on his stack
+	IFFAULT	12$
+	MOVW	FS:4.B[EBX], CX		;Store wait indication
+	INCL	ECX			;Really want to wait?
+	JE	svcredoc#		;No
+	MOVL	EAX, EDI		;Yes - assume main program wait
+	INCL	ECX			;Right?
+	JE	iowait2.S		;Yes
+ioque20:MOVL	EAX, SS:pdaArg2#	;No - use the offset of the QAB as the
+iowait2::				;  wait index
+	CALL	knlSetWait#
+	MOVB	AL, #knlQX_DW2#
+	PUSHL	SS			;Set up to wait
+	POPL	ES
+	CALL	knlWRequeue#		;Requeue to an IO wait queue
+	JMP	svcredow#		;Go wait
+
+ioque22:MOVL	ESP, ESI
+	RET
+.PAGE
+	.SBTTL	svcIoWait - Wait until IO is complete for device
+
+;Here for the svcIoWait SVC - Wait until IO is complete for device - this
+;  function can only be used to wait for queued IO operations.  This is only
+;  a problem is it is called from an interrupt routine which interrupted a
+;  main program wait or re-do of a direct IO operation.  Direct IO calls do
+;  not proceed from the svcIoQueue call until IO is complete.  If it is
+;  called for an interrupted direct IO wait, it returns immediately.  If it
+;  is called for an interrupt queued IO wait, it will wait (at interrupt
+;  level) until the operation is complete.  The interrupt will then be
+;  dismissed and the original svcIoQueue call will be re-executed.  Since
+;  the operation is now complete, this will return immediately.
+;	struct qab qab;
+;	rtn = svcIoWait(qab);
+;  Value returned is 0 if normal or negative error code if error
+
+rsvcIoWait::
+	MOVL	EBP, #pdaArg2#
+	CALL	vfixaddr#
+	JMP	4$.S
+
+;Here for native mode entry
+
+psvcIoWait::
+	SVCENTR	CNTIoWait#
+	ORB	SS:pdaArg1#, #03
+4$:	LFSL	EDX, SS:pdaArg2#	;Get address of argument block
+	IFFAULT	knlRtnAdrEr#		;Are we finished or not able to wait?
+	TESTB	FS:qab_status+1.B[EDX], #{QSTS$DONE|QSTS$WAIT|QSTS$REDO}>8
+	JNE	6$.S			;Yes - just return
+	TOFORK				;No
+	IFFAULT	knlRtnAdrErF#
+	TESTB	FS:qab_status+1.B[EDX], #QSTS$DONE>8 ;Did it sneak in?
+	JE	ioque20			;No - go wait
+	FROMFORK			;Yes - just return now
+6$:	CLRL	EAX
+	RET
+.PAGE
+	.SBTTL	Queued IO dispatch table
+
+	DATA
+
+qiotbl:	.LONG	badqio		;		  = 0.  - Illegal
+	.LONG	openfunc#	;QFNC_OPEN        = 1.  - Open device/file
+	.LONG	devparmfunc#	;QFNC_DEVPARM     = 2.  - Device parameters
+	.LONG	badqio		;		  = 3.  - Illegal
+	.LONG	devcharfunc#	;QFNC_DEVCHAR     = 4.  - Device characteristics
+	.LONG	deletefunc#	;QFNC_DELETE      = 5.  - Delete file
+	.LONG	renamefunc#	;QFNC_RENAME      = 6.  - Rename file
+	.LONG	badqio		;		  = 7.  - Illegal
+	.LONG	pathfunc#	;QFNC_PATH	  = 8.  - Path function
+	.LONG	classfunc#	;QFNC_CLASSFUNC   = 9.  - Class functions
+	.LONG	badqio		;		  = 10. - Illegal
+	.LONG	badqio		;		  = 11. - Illegal
+	.LONG	inblock		;QFNC_INBLOCK     = 12. - Input block
+	.LONG	badqio		;		  = 13. - Illegal
+	.LONG	outblock	;QFNC_OUTBLOCK    = 14. - Output block
+	.LONG	outstring	;QFNC_OUTSTRING   = 15. - Output string
+	.LONG	badqio		;		  = 16. - Illegal
+	.LONG	trmfunc#	;QFNC_TRMFUNC     = 17. - Terminal functions
+	.LONG	badqio		;		  = 18. - Illegal
+	.LONG	specfunc	;QFNC_SPECIAL     = 19. - Special device
+				;			    functions
+	.LONG	label		;QFNC_LABEL	  = 20. - Get device label
+	.LONG	commit		;QFNC_COMMIT	  = 21. - Commit data
+	.LONG	close		;QFNC_CLOSE       = 22. - Close file
+QFNC_MAX=!{$-qiotbl}/4-1
+
+	CODE
+
+badqio:	MOVL	EAX, #ER_IFDEV
+qxfail2:JMP	qxfail
+.PAGE
+	.SBTTL	inblock - Input block function
+
+inblock:CALL	knlQioGetDcb#		;Get offset of our DCB
+	JC	qxfail2.S
+	MOVL	EAX, dcb_sdisp.B[EDI]
+	JMPIL	CS:sd_inblock.B[EAX]
+
+	.SBTTL	outblock - Output block function
+
+outblock:
+	CALL	knlQioGetDcb#		;Get offset of our DCB
+	JC	2$.S			;If error
+	MOVL	EAX, dcb_sdisp.B[EDI]	;OK - dispatch to the driver
+	JMPIL	CS:sd_outblock.B[EAX]
+
+;Here if error getting DCB for outblock
+
+2$:	CMPL	EAX, #ER_DEVNO.B	;Was the error device not open?
+	JNE	qxfail4.S		;No
+	BTL	ECX, #O%NOREOPEN	;Yes - want auto-re-open?
+	JC	qxfail2.S		;No
+	CALL	knlIoQabLock		;Yes - lock the QAB
+	JC	4$.S			;If error
+	CALL	knlIoWriteLock		;Lock the buffer
+	JC	4$.S			;If error
+	JMP	reopen#			;OK - continue
+
+4$:	TOFORK
+	RET
+
+	.SBTTL	outstring - Output string function
+
+outstring:
+	CALL	knlQioGetDcb#		;Get offset of our DCB
+	JC	6$.S			;If error
+	MOVL	EAX, dcb_sdisp.B[EDI]	;OK - dispatch to the driver
+	JMPIL	CS:sd_outstring.B[EAX]
+
+;Here if error getting DCB for outstring
+
+6$:	CMPL	EAX, #ER_DEVNO.B	;Was the error device not open?
+qxfail4:JNE	qxfail.S		;No
+	BTL	ECX, #O%NOREOPEN	;Yes - want auto-re-open?
+	JC	qxfail.S		;No
+	CALL	knlIoQabLock		;Yes - lock the QAB
+	JC	4$.S			;If error
+	CALL	knlIoStringLock		;Lock the buffer
+	JC	4$.S			;If error
+	JMP	reopen#			;OK - continue
+.PAGE
+	.SBTTL	specfunc - Special device function
+
+;Special device function
+;	c{ESI] = Offset of IORB
+;	CALL	specfunc
+;	c{EAX} = Error code
+;	c{EBX} = Status bits
+;	c{ECX} = Count (0 = not closed, 1 = closed, always 1 unless error)
+
+specfunc:
+	CALL	knlQioGetDcb#		;Get offset of our DCB
+	JC	qxfail.S
+	MOVL	EBX, #dmyparms		;Process device parameters to see if
+	MOVL	ECX, #knlComDPParms	;  have IOPAR_CLASS
+	IFFAULT	knlQAdrErr
+	LFSL	EDX, iorb_parm.B[ESI]
+	MOVB	AL, #PDPF$IGNBP
+	CALL	knlProcDevParmx
+	JC	qxfail.S
+	TESTB	AL, #PDPF$CLASS		;Did we have a IOPAR_CLASS parameter?
+	JE	6$.S			;No - fail
+	MOVL	EAX, dcb_sdisp.B[EDI]	;Yes
+	JMPIL	CS:sd_special.B[EAX]	;Dispatch to device driver
+
+;Here if do not have a IOPAR_CLASS parameter
+
+6$:	MOVL	EAX, #ER_PARMM
+qxfail:	CALL	knlGiveQel#		;Give up the IORB
+	CLRL	ECX
+	MOVL	EDX, #7FFFh
+	MOVL	EBX, #QSTS$DONE
+	TOFORK
+	RET
+.PAGE
+	.SBTTL	label - Device label function
+
+;Device label function
+;	c{ESI] = Offset of IORB
+;	CALL	label
+;	c{EAX} = Error code
+;	c{EBX} = Status bits
+;	c{ECX} = Count
+
+label:	CALL	knlQioGetDcb#		;Get offset of our DCB
+	JC	qxfail.S
+	MOVL	EAX, dcb_sdisp.B[EDI]
+	JMPIL	CS:sd_label.B[EAX]
+
+	.SBTTL	commit - Commit data function
+
+;Commit data function
+;	c{ESI] = Offset of IORB
+;	CALL	commit
+;	c{EAX} = Error code
+;	c{EBX} = Status bits
+;	c{ECX} = Count
+
+commit:	CALL	knlQioGetDcb#		;Get offset of our DCB
+	JC	qxfail.S
+	MOVL	EAX, dcb_sdisp.B[EDI]
+	JMPIL	CS:sd_commitfunc.B[EAX]
+.PAGE
+	.SBTTL	close - Close function
+
+;Close routine
+;	c{ESI} = Offset of IORB
+;	CALL	close
+;	c{EAX} = Error code
+;	c{EBX} = Status bits
+;	c{ECX} = Count (0 = not closed, 1 = closed, always 1 unless error)
+
+close:	CALL	knlQioGetDcb#		;Get offset of our DCB
+	JC	qxfail.S
+
+;Subroutine to do the work for close.  Must be called at main program level.
+;  Always returns raised to fork level.  This code first terminates all IO for
+;  the device and then calls the device dependent close routine.  This routine
+;  will ALWAYS terminate by calling closefin to finish the close.  The device
+;  routine may switch to extended fork context if necessary.  Note that
+;  extended fork context should ONLY be used when absolutely necessary.  Only
+;  devices which can guarentee service in a reasonable length of time (generally
+;  devices with DS$NOABORT set) may switch to extended fork context here when
+;  this is not the last close for the DCB (since there may be operations
+;  active for other handles which could block the close indefinately).  Any
+;  device may switch to extended fork context for the final close for a DCB.
+;  Since we have already terminated all IO for this handle, this switch to
+;  extended fork context will never need to be queued.
+;	c{EDI} = Offset of DCB
+;	c{ESI} = Offset of IORB
+;	CALL	close2
+;	c{EAX} = Error code
+;	c{EBX} = Status bits
+;	c{ECX} = 0
+
+close2::REQUIREMAIN
+	MOVL	EBX, #dcb_outframe	;Cancel pending output
+	MOVZWL	EDX, iorb_handle.B[ESI]
+	MOVL	ECX, EDX
+	SHLL	ECX, #5
+	ADDL	ECX, SS:pdaHndlTbl#
+	BTSL	SS:4.B[ECX], #O%NOQUE	;Disable queueing
+	JC	6$.S			;Error if queueing already disabled
+	TOFORK
+	MOVB	CL, #CAN$ALL
+	PUSHL	ESI
+	CALL	knlCancelIo
+	POPL	ESI
+	JC	4$.S			;If must wait
+	MOVL	EBX, #dcb_inpframe	;Cancel pending input
+	MOVZWL	EDX, iorb_handle.B[ESI]
+	MOVB	CL, #CAN$ALL
+	PUSHL	ESI
+	CALL	knlCancelIo
+	POPL	ESI
+	JC	4$.S			;If must wait
+	FROMFORK
+	MOVL	EAX, dcb_sdisp.B[EDI]	;Dispatch to the device driver
+	JMPIL	CS:sd_close.B[EAX]
+
+;Here if must wait for IO to be canceled
+
+4$:	CALL	knlGiveQel#		;Give up the IORB
+	CLRL	EAX
+	MOVL	EBX, #QSTS$WAIT
+	CLRL	ECX
+	RET
+
+;Here if already have a close queued for the device
+
+6$:	CALL	knlGiveQel#		;Give up the IORB
+	TOFORK
+	MOVL	EAX, #ER_BDDVH		;Say bad device handle (since he's
+	MOVL	EBX, #QSTS$DONE
+	CLRL	ECX
+	RET
+.PAGE
+	FAULTHDR
+2$:	MOVL	EAX, #ER_ADRER
+	JMP	6$.S
+
+;Here on close for devices which do not need any close processing
+
+knlNullClose::
+	CMPL	iorb_parm.B[ESI], #0.B	;Have any device parameters?
+	JE	4$.S			;No
+	MOVL	EBX, #comparms		;Yes - process parameters
+	MOVL	ECX, #knlComDPParms
+	IFFAULT	2$
+	LFSL	EDX, iorb_parm.B[ESI]
+	CALL	knlProcDevParm
+	JC	6$.S
+4$:	CLRL	EAX
+6$:	TOFORK
+
+;Common routine to finish close at main program level.  This routine is called
+;  by all devices which do not use extended fork context to process a close.
+;  Must be called at main program level raised to fork level.
+;	c{EAX} = Error code
+;	c{ESI} = Offset of IORB
+;	JMP	closefin
+
+knlCloseFin::
+	REQUIREFORK
+	MOVXWL	EDX, iorb_handle.B[ESI]	;Get handle
+	SHLL	EDX, #5t
+	JS	14$.S			;If no handle
+	ADDL	EDX, SS:pdaHndlTbl#
+	CLRL	EBX			;Assume should store 0 in handle table
+	BTL	iorb_option.B[ESI], #C%KEEPHNDL ;Right?
+	JNC	12$.S			;Yes
+	MOVL	EBX, #0FFEh		;No - assume no auto-re-open
+	BTL	SS:4.B[EDX], #O%NOREOPEN ;Right?
+	JC	12$.S			;Yes
+	MOVZWL	EBX, dcb_sunit.B[EDI]	;No - get right value
+	ADDL	EBX, #0F00h
+12$:	CMPL	SS:[EDX], EDI		;Make sure its right!
+	JNE	16$.S
+	MOVL	SS:[EDX], EBX		;Clear device table entry
+	CLRL	EBX
+	MOVL	SS:4.B[EDX], EBX
+14$:	CALL	knlGiveIorb		;Give up the IORB
+	JMP	20$.S
+
+;Here if handle table entry was wrong
+
+16$:	CRASH	BHTE			;[Bad Handle Table Entry]
+
+;Common routine to finish close in extended fork context.  This routine is
+;  called by all devices which use extended fork context to process a close
+;	c{EAX} = Error code
+;	CALL	xfclosefin
+
+knlXfCloseFin::
+	CLRL	ESI			;Assume should store 0 in handle table
+	BTL	SS:xffOption#, #C%KEEPHNDL ;Right?
+	JNC	knlXfClose8.S		;Yes
+	MOVL	ESI, #0FFEh		;No - assume no auto-re-open
+	BTL	SS:xffCmd#, #O%NOREOPEN ;Right?
+	JC	knlXfClose8.S		;Yes
+	MOVZWL	ESI, dcb_sunit.B[EDI]	;No - get right value
+	ADDL	ESI, #0F00h
+knlXfClose8::
+	REQUIREXFF
+	MOVXWL	EDX, SS:xffHandle#	;Get device handle
+	SHLL	EDX, #5t
+	JS	20$.S			;If no handle (must be rename!)
+	MOVW	ES, SS:xffPda#		;Point to his device table
+	ADDL	EDX, ES:pdaHndlTbl#
+	CMPL	ES:[EDX], EDI		;Make sure its right!
+	JNE	16$.S
+	MOVL	ES:[EDX], ESI		;Clear device table entry
+	TESTL	ESI, ESI		;Really clearing the table?
+	JNE	20$.S			;No
+	MOVL	ES:4.B[EDX], ESI	;Yes - clear the bits too
+20$:	CMPL	dcb_opencnt.B[EDI], #0.B
+	JE	24$.S
+	DECL	dcb_opencnt.B[EDI]	;Reduce the open count
+	CMPL	dcb_opencnt.B[EDI], #0.B
+	JNE	22$.S			;Someone still have device?
+	MOVW	dcb_sesproc.B[EDI], #0	;No - its free now
+	PUSHL	EAX
+	CALL	knlClearDcb		;Give up the DCB
+	POPL	EAX
+22$:	MOVL	EBX, #QSTS$DONE
+	CLRL	ECX
+	RET
+
+;Here if device open count was 0!
+
+24$:	CRASH	BDOC			;[Bad Device Open Count]
+.PAGE
+	.SBTTL	knlClearDcb - Subroutine to give up a DCB
+
+;Subroutine to give up a DCB
+;	c{EDI} = Offset of DCB
+;	CALL	knlClearDcb
+
+knlClearDcb::
+	MOVL	ESI, dcb_cab.B[EDI]	;Do we have a CAB?
+	TESTL	ESI, ESI
+	JE	12$.S			;No
+	CMPL	[ESI], #-1.B		;Yes - is it in the timer list?
+	JE	6$.S			;No
+	MOVL	EBX, #firstcab#		;Yes - scan list to find predecessor
+2$:	CMPL	[EBX], ESI
+	JE	4$.S
+	MOVL	EBX, [EBX]
+	TESTL	EBX, EBX
+	JNE	2$.S
+	CRASH	BCAB			;[Bad CAB list]
+
+;Here with predecessor
+
+4$:	MOVL	EAX, [ESI]		;Unlink this CAB from the list
+	MOVL	[EBX], EAX
+6$:	CMPB	cab_clsmsg.B[ESI], #0	;Does he want a close message?
+	JE	10$.S			;No
+	PUSHL	ESI			;Yes
+	LEAL	EBX, cab_clsmsg.B[ESI]	;Point to destination string
+	ADDL	ESI, #cab_clsname-2.B	;Point to buffer for message
+	MOVW	[ESI], #MT_UNSPLREADY+{'n'<8}
+	CMPB	2.B[ESI], #0		;Do we have a close name?
+	JNE	8$.S			;Yes
+	MOVB	1.B[ESI], #'d'		;No - use the device name
+	MOVL	EAX, dcb_name+0.B[EDI]
+	MOVL	2.B[ESI], EAX
+	MOVL	EAX, dcb_name+4.B[EDI]
+	MOVL	6.B[ESI], EAX
+	MOVB	10t.B[ESI], #0
+8$:	MOVL	ECX, #31t		;Determine length of message
+	PUSHL	EDI
+	LEAL	EDI, 3.B[ESI]
+	PUSHL	DS
+	POPL	ES
+	CLD
+	CLRL	EAX
+	RNSCASB	[EDI]
+	POPL	EDI
+	NEGL	ECX
+	ADDL	ECX, #33t.B
+	PUSHL	DS			;c{FS:ESI} = Address of message
+	POPL	FS
+	MOVL	EDX, #clsmsgsrc		;c{GS:EDX} = Address of source string
+	PUSHL	CS
+	POPL	GS
+	CALL	knlIpmSendMsg#		;Send the message
+	POPL	ESI
+10$:	CLRL	ECX			;Give up the CAB
+	CALL	knlGiveXmb#
+	CLRL	EAX			;Clear CAB pointer in the DCB
+	MOVL	dcb_cab.B[EDI], EAX
+12$:	MOVL	EDX, dcb_sdisp.B[EDI]	;Dispatch to clear DCB routine for the
+	JMPIL	CS:sd_cleardcb.B[EDX]	;  device
+
+clsmsgsrc:.ASCIZ "DEV^CLS"
+.PAGE
+	.SBTTL	Common queued IO error returns
+
+;Here to return address error for queued IO
+
+	FAULTHDR
+knlQAdrErr0Lv::
+	LEAVE
+	FAULTHDR
+knlQAdrErr0::
+	CLRL	ECX
+	FAULTHDR
+knlQAdrErr::
+	MOVL	EAX, #ER_ADRER
+	MOVL	EBX, #QSTS$DONE
+	STC
+	RET
+
+;Common label routine for unlabeled devices
+
+knlNullLabel::
+	CMPB	iorb_option.B[ESI], #1	;Read function?
+	JE	knlNullQioGQ.S		;Yes - return null label
+	JMP	knlIFnDevGQ#		;No - fail
+
+;Here for queued IO function which does nothing
+
+knlNullQioGQ::
+	TOFORK
+	CALL	knlGiveQel#
+knlNullQio::
+	CLRL	EAX
+	CLRL	ECX
+	MOVL	EBX, #QSTS$DONE
+	RET
+.PAGE
+	.SBTTL	copyaddr - Subroutine to copy addresses
+
+;Subroutine to copy addresses from the QAB to the IORB
+;	c{FS:EDX} = Address of QAB
+;	c{ESI}    = Offset of IORB
+;	CALL	copyaddr
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+
+copyaddr:
+	PUSHL	ESI			 ;Copy the 3 addresses from the QAB
+	LEAL	EDI, iorb_buffer1.B[ESI] ;  to the IORB
+	LEAL	ESI, qab_buffer1.B[EDX]
+	PUSHL	DS
+	POPL	ES
+	TESTB	SS:pdaXRegEFR#+2, #02	;Real mode?
+	JNE	2$.S			;Yes
+	CLD
+	MOVL	ECX, #6
+	IFFAULT	10$
+	RMOVSL	[EDI], FS:[ESI]
+	POPL	ESI
+	ORB	iorb_buffer1+4.B[ESI], #03 ;Make sure have user mode selectors
+	ORB	iorb_buffer2+4.B[ESI], #03
+	ORB	iorb_parm+4.B[ESI], #03
+	RET
+
+;Here if real mode
+
+2$:	MOVL	ECX, #3
+4$:	IFFAULT	10$
+	MOVZWL	EAX, FS:[ESI]
+	IFFAULT	10$
+	MOVZWL	EBX, FS:2.B[ESI]
+	SHLL	EBX, #4
+	ADDL	EAX, EBX
+	STOSL	[EDI]
+	MOVL	EAX, #GS_REAL16
+	STOSL	[EDI]
+	ADDL	ESI, #8.B
+	LOOP	ECX, 4$
+	POPL	ESI
+	RET
+
+	FAULTHDR
+10$:	POPL	ESI
+	JMP	knlRtnAdrEr#
+.PAGE
+	.SBTTL	Routines to lock memory for IO
+
+;Format of a lock table entry (8 bytes):
+;  +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+;  |    Number of pages    |     First page number in msect + 1    |
+;  +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+;  |                       Offset of MDB                           |
+;  +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+
+;If there is only one entry, it is stored in iorb_lock.  If there is more
+;  than one entry, a QEL is allocated and iorb_lock contains the following:
+;  +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+;  |No. of entires |                      0                        |
+;  +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+;  |               Offset of QEL containing the table              |
+;  +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+
+;The following subroutines are called to lock various enities (such as input
+; and output buffers, name strings, parameter lists, etc.) for IO
+
+	.SBTTL	knlIoReadLock - Subroutine to lock a buffer for reading
+
+;Subroutine to lock a buffer for reading - must be called at main program level
+;	c{ESI} = Offset of IORB
+;	CALL	knlIoReadLock
+;	C:set = Error, IORB and all locks given up
+;	  c{EAX} = Error code
+;	  c{EBX} = QSTS$DONE
+;	  c{ECX} = 0
+;	C:clr = Normal
+
+knlIoReadLock::
+	MOVL	ECX, iorb_count.B[ESI]	;Get buffer size
+	TESTL	ECX, ECX
+	JE	knlIoParmLock		;If no buffer
+	IFFAULT	knlRtnAdrEr#
+	LESL	EBX, iorb_buffer1.B[ESI] ;Get buffer address
+	CALL	iolockin		;Lock the buffer
+	JNC	knlIoParmLock		;OK - lock the parameter list too
+ret004:	RET
+
+	.SBTTL	knlIoClsLock - Subroutine to lock a QAB for close
+
+;Subroutine to lock a QAB for close - must be called at main program level.
+;  This subroutine locks only the QAB itself, to lock the various items pointed
+;  to by QAB fields, the corresponding subroutines must be called separately.
+;  This is necessary since there is no general way to determine which QAB
+;  fields will be used at this point.
+;	c{ESI} = Offset of IORB
+;	CALL	knlIoClsLock
+;	C:clr = Always
+
+knlIoClsLock::
+	CMPL	iorb_qab+0.B[ESI], #0.B	;Do we have a QAB?
+	JE	4$.S			;No - nothing needed here
+	CALL	knlIoQabLock		;Yes - lock it
+	JNC	4$.S			;If OK
+	CLRL	EAX			;If error, forget about the QAB
+	MOVL	iorb_qab+0.B[ESI], EAX
+	MOVW	iorb_qab+4.B[ESI], AX
+4$:	RET
+
+	.SBTTL	knlIoQabLock - Subroutine to lock a QAB
+
+;Subroutine to lock a QAB - must be called at main program level - This
+;  subroutine locks only the QAB itself, to lock the various items pointed
+;  to by QAB fields, the corresponding subroutines must be called separately.
+;  This is necessary since there is no general way to determine which QAB
+;  fields will be used at this point.
+;	c{ESI} = Offset of IORB
+;	CALL	knlIoQabLock
+;	C:set = Error, IORB given up (unless iorb_func indicates QFNC_CLOSE,
+;		  in which case the IORB is not given up)
+;	  c{EAX} = Error code
+;	C:clr = Normal
+
+	IFFAULT	iolkae
+knlIoQabLock::
+	LESL	EBX, iorb_qab.B[ESI]	;Get address of the QAB
+	MOVL	ECX, #qab_SIZE		;Get length of the QAB
+	JMP	iolockin		;Lock the buffer
+.PAGE
+	.SBTTL	knlIoParmLock - Subroutine to lock a parameter list
+
+;Subroutine to lock a parameter list - must be called at main program level
+;	c{ESI} = Offset of IORB
+;	CALL	knlIoParmLock
+;	C:set = Error, IORB and all memory locks given up
+;	  c{EAX} = Error code
+;	  c{EBX} = QSTS$DONE
+;	  c{ECX} = 0
+;	C:clr = Normal
+
+knlIoParmLock::
+	CMPL	iorb_parm+0.B[ESI], #0.B ;Have any parameters?
+	JE	ret004.S		;No - nothing needed here
+	IFFAULT	iolkae
+	LFSL	EDX, iorb_parm.B[ESI]	;Yes - get address of parameter list
+
+;First we must scan through the parameter list and lock each string
+;  buffer - this also gives us the length of the parameter list
+
+4$:	IFFAULT	iolkae			;Get first header byte
+	MOVB	AL, FS:[EDX]
+	ANDB	AL, #PAR$REP
+	JE	20$			;If end of list
+	CMPB	AL, #REP_STR		;Is this a string item?
+	JNE	18$			;No - go on
+	IFFAULT	iolkae
+	MOVL	EAX, FS:8.B[EDX]	;Get selector
+	TESTL	EAX, EAX		;Null selector?
+	JE	8$.S			;Yes
+	ORB	AL, #03			;No - make sure its a user selector
+	IFFAULT	iolkae
+6$:	MOVL	ES, EAX
+	IFFAULT	iolkae
+	MOVL	EBX, FS:4.B[EDX]	;Get offset
+	JMP	10$.S
+
+;Here with null selector
+
+	IFFAULT	iolkae
+8$:	CMPL	FS:4.B[EDX], #0.B	;Is the offset null too?
+	JE	16$.S			;Yes - its really a null pointer
+	IFFAULT	iolkae
+	MOVZWL	EAX, FS:4.B[EDX]	;No - its a real mode address
+	IFFAULT	iolkae
+	MOVZWL	EBX, FS:6.B[EDX]	;Get real mode selector
+	SHLL	EBX, #4			;Calculate offset
+	ADDL	EBX, EAX
+	PUSHL	#GS_REAL16.B		;Get selector for the real mode segment
+	POPL	ES
+	IFFAULT	iolkae
+10$:	MOVZWL	ECX, FS:12t.B[EDX]	;Get length of the buffer
+	JREGZ	ECX, 16$
+	TESTB	FS:[EDX], #PAR$GET	;Need to change the buffer?
+	JNE	12$.S			;Yes
+	TESTB	FS:[EDX], #PAR$SET	;No - really going to use it?
+	JE	16$.S			;No
+	PUSHL	FS			;Yes
+	PUSHL	EDX
+	CALL	iolockout		;Lock the buffer for writting
+	JMP	14$.S
+
+;Here if are getting a string value
+
+12$:	PUSHL	FS
+	PUSHL	EDX
+	CALL	iolockin		;Lock the buffer for reading
+14$:	POPL	EDX
+	POPL	FS
+	JC	22$.S			;If error (IORB already given up)
+16$:	ADDL	EDX, #16t.B		;Point to next item
+	JMP	4$			;Continue
+
+;Here to advance to next parameter item if do not have a string item
+
+18$:	MOVZBL	EAX, FS:1.B[EDX]	;Get length of this item
+	LEAL	EDX, 4.B[EDX+EAX]	;Point to next item
+	JMP	4$			;Continue
+
+;Here when finished scanning the parameter list
+
+20$:	LESL	EBX, iorb_parm.B[ESI]	;Get address of parameter list again
+	SUBL	EDX, EBX		;Calculate length of list
+	JE	22$.S
+	MOVL	ECX, EDX
+	INCL	ECX
+	JMP	iolockin		;Lock the parameter list
+
+22$:	RET
+.PAGE
+	.SBTTL	knlIoDgaLock - Subroutine to lock a datagram address string
+
+;Subroutine to lock a datagram address string - must be called at main program
+;  level
+;	c{ESI} = Offset of IORB
+;	c{ECX} = Length of binary format value (including prefix byte)
+;	CALL	knlIoDgALock
+;	C:set = Error, IORB and all memory locks given up
+;	  c{EAX} = Error code
+;	  c{EBX} = QSTS$DONE
+;	  c{ECX} = 0
+;	C:clr = Normal
+
+	IFFAULT	iolkae
+knlIoDgALock::
+	LESL	EBX, iorb_buffer2.B[ESI] ;Get address of string
+	IFFAULT	iolkae
+	CMPB	ES:[EBX], #0FFh		;Is this a binary value?
+	JE	iolockout		;Yes - go handle this
+					;No - its just a name string - fall
+					;  into ionamelock
+
+	.SBTTL	knlIoNameLock - Subroutine to lock a name string
+
+;Subroutine to lock a name string - must be called at main program level
+;	c{ESI}    = Offset of IORB
+;	c{ES:EBX} = Address of string
+;	CALL	knlIoNameLock
+;	C:set = Error, IORB and all memory locks given up
+;	  c{EAX} = Error code
+;	  c{EBX} = QSTS$DONE
+;	  c{ECX} = 0
+;	C:clr = Normal
+
+knlIoNameLock::
+	MOVL	ECX, #-1
+	PUSHL	EDI
+	MOVL	EDI, EBX
+	MOVB	AL, #0
+	CLD
+	IFFAULT	2$
+	RNSCASB	[EDI]			;Find end of string
+	POPL	EDI
+	NOTL	ECX			;Get length of string + 1
+	JMP	iolockout.S		;Continue
+
+	FAULTHDRX
+2$:	POPL	EDI
+	JMP	iolkae
+
+	.SBTTL	knlIoStringLock - Subroutine to lock a string for output
+
+;Subroutine to lock a string for output - must be called at main program level
+;	c{ESI} = Offset of IORB
+;	CALL	knlIoStringLock
+;	C:set = Error, IORB and all memory locks given up
+;	  c{EAX} = Error code
+;	  c{EBX} = QSTS$DONE
+;	  c{ECX} = 0
+;	C:clr = Normal
+
+knlIoStringLock::
+	MOVL	ECX, iorb_count.B[ESI]	;Get maximum length
+	TESTL	ECX, ECX
+	JNE	4$.S
+	DECL	ECX
+4$:	IFFAULT	iolkae
+	LESL	EBX, iorb_buffer1.B[ESI] ;Get address of buffer
+	MOVL	EDX, ECX
+	PUSHL	EDI
+	MOVL	EDI, EBX
+	MOVB	AL, #0
+	CLD
+	IFFAULT	2$
+	RNSCASB	[EDI]			;Find end of string
+	POPL	EDI
+	JNE	6$.S			;Stopped by end of string?
+	INCL	ECX			;Yes - fix up the count
+6$:	SUBL	ECX, EDX
+	NEGL	ECX			;Get length of string
+	MOVL	iorb_count.B[ESI], ECX	;Store it
+	JMP	iowlk0.S		;Continue
+.PAGE
+	.SBTTL	knlIoWriteLock - Subroutine to lock a buffer for writing
+
+;Subroutine to lock a buffer for writing - must be called at main program level
+;	c{ESI} = Offset of IORB
+;	CALL	knlIoWriteLock
+;	C:set = Error, IORB given up
+;	  c{EAX} = Error code
+;	C:clr = Normal
+
+knlIoWriteLock::
+	MOVL	ECX, iorb_count.B[ESI]	;Get buffer size
+	TESTL	ECX, ECX
+	JE	knlIoParmLock		;If no buffer
+	IFFAULT	iolkae
+	LESL	EBX, iorb_buffer1.B[ESI] ;Get buffer address
+iowlk0:	CALL	iolockout
+	JNC	knlIoParmLock
+	RET
+
+2$:	POPL	ECX
+	JMP	iolkae
+.PAGE
+;Subroutine to lock memory for input
+;	c{ESI}    = Offset of IORB
+;	c{ES:EBX} = Address of buffer
+;	c{ECX}    = Length of buffer
+;	CALL	iolockin
+;	C:set = Error, IORB and all locks given up
+;	  c{EAX} = Error code
+;	  c{EBX} = QSTS$DONE
+;	  c{ECX} = 0
+;	C:clr = Normal
+
+$$$=!0
+FRM lck_func  , 1t		;Function
+FRM           , 3t
+FRM lck_segla , 4t		;Linear address of start of segment which
+				;  contains the buffer
+FRM lck_size  , 4t		;Number of bytes to lock
+FRM lck_fptent, 4t		;Offset of page table entry for first page
+				;  locked
+FRM lck_fpage , 4t		;Page number in msect for first page locked + 1
+FRM lck_num   , 4t		;Number of pages locked
+FRM lck_count , 4t		;Number of pages left to lock
+FRM lck_buffer, 4t		;Offset (in segment) of buffer
+FRM lck_top   , 4t		;Offset of highest location to lock
+lck_SIZE=!$$$
+
+iolockin:
+	MOVB	AL, #1
+	MOVL	EDX, ES			;Can we write to the segment?
+	VERW	DX
+	JMP	4$.S
+
+;Here if buffer is too large
+
+2$:	MOVL	EAX, #ER_ICDEV
+	JMP	iolkedn
+
+;Subroutine to lock memory for output
+;	c{ESI}    = Offset of IORB
+;	c{ES:EBX} = Address of buffer
+;	c{ECX}    = Length of buffer
+;	CALL	iolockout
+;	C:set = Error, IORB and all locks given up
+;	  c{EAX} = Error code
+;	  c{EBX} = QSTS$DONE
+;	  c{ECX} = 0
+;	C:clr = Normal
+
+iolockout:
+	MOVB	AL, #0
+	MOVL	EDX, ES			;Can we read the segment?
+	VERR	DX
+4$:	JNE	iolkae			;No - fail
+	CMPL	ECX, #MAXXFER		;Is the buffer too big?
+	JA	2$.S			;Yes - fail
+	PUSHL	EDI
+	ENTER	lck_SIZE, 0
+	MOVB	lck_func.B[EBP], AL
+	MOVL	lck_size.B[EBP], ECX	;Yes - store number of bytes to lock
+	MOVL	lck_buffer.B[EBP], EBX
+6$:	CLRL	EAX
+	MOVL	lck_num.B[EBP], EAX
+	MOVL	ECX, ES			;Get linear address of start of segment
+	ANDL	ECX, #0FFFCh		;  (Note that the segment may not start
+	TESTB	CL, #04h		;  on a page boundry if this is DPMI
+	JE	8$.S			;  memory!)
+	ADDL	ECX, SS:pdaLdtPnt#
+	MOVB	AL, SS:mb_data-4+4[ECX]
+	MOVB	AH, SS:mb_data-4+7[ECX]
+	SHLL	EAX, #16t
+	MOVW	AX, SS:mb_data-4+2[ECX]
+	JMP	10$.S
+
+8$:	MOVB	AL, gdtable+4[ECX]
+	MOVB	AH, gdtable+7[ECX]
+	SHLL	EAX, #16t
+	MOVW	AX, gdtable+2[ECX]
+10$:	MOVL	lck_segla.B[EBP], EAX
+	IFFAULT	iolkaexx
+	MOVB	AL, ES:[EBX]		;Touch the first page
+	PUSHL	SS			;Get PDA selector
+	POPL	FS
+	CALL	knlGetPTE#		;Find the page table entry
+	JC	iolkerx			;If error
+	TESTB	[EDX], #01		;Valid page?
+	JE	14$.S			;No - fail
+	CMPB	lck_func.B[EBP], #0	;Yes - need a writable page here?
+	JE	12$.S			;No - go on
+	TESTB	[EDX], #02		;Yes - is the page writable?
+	JE	14$.S			;No - fail!
+12$:	CALL	knlGetMTE#		;Yes - get memory table entry
+14$:	JE	iolkaex			;If not an allocated page
+	TESTB	2.B[EAX], #80h		;User page?
+	JE	40$			;No - don't need to lock this!
+	MOVL	lck_fptent.B[EBP], EDX	;Yes
+	SHLL	EDX, #10t		;Get linear address of the page (NOTE:
+					;  this counts on the low 22 bits of
+					;  the offset of pgtable being 0!)
+	TESTB	2.B[EAX], #10h		;Shared page?
+	JE	20$.S			;No
+
+;Here if have a buffer in a shared section
+
+	MOVL	FS, 4.B[EAX]		;Get selector for the section's SDA
+	MOVL	EDI, FS:sdaMdbHead#	;Get offset of first MDB
+16$:	MOVL	ECX, SS			;Does this section belong to the right
+	CMPW	CX, mdb_pda.B[EDI]	;  process?
+	JNE	18$.S			;No - go on
+	CMPL	EDX, mdb_la.B[EDI]	;Yes - is address in this section?
+	JB	18$.S			;No
+	MOVL	ECX, mdb_size.B[EDI]	;Maybe
+	SHLL	ECX, #12t
+	ADDL	ECX, mdb_la.B[EDI]
+	CMPL	EDX, ECX
+	JB	22$.S			;Yes
+18$:	MOVL	EDI, mdb_segnext.B[EDI]	;No - advance to next MDB
+	TESTL	EDI, EDI
+	JNE	16$.S			;Continue if more to check
+	CRASH	CFSS			;[Can't Find Shared Section]
+
+;Here if have a private user page
+
+20$:	MOVL	EDI, 4.B[EAX]		;Get offset of the MDB
+
+;Here with MDB for msect containing the first page to lock
+;	c{EAX}    = Offset of memory table entry for first page
+;	c{ES:EBX} = Address of buffer
+;	c{EDX}    = Linear address for first page containing the buffer
+;	c{EDI}    = Offset of MDB
+
+22$:	PUSHL	EAX
+	MOVL	EAX, EBX
+	ADDL	EAX, lck_size.B[EBP]	;Get offset of top of buffer
+	MOVL	ECX, mdb_size.B[EDI]	;Get linear address of top of msect
+	SHLL	ECX, #12t
+	ADDL	ECX, mdb_la.B[EDI]
+	SUBL	ECX, lck_segla.B[EBP]	;Get offset in segment of top of msect
+	CMPL	EAX, ECX		;Does buffer extend past top of msect?
+	JBE	24$.S			;No
+	MOVL	EAX, ECX		;Yes - only check what is in this msect
+24$:	MOVL	lck_top.B[EBP], EAX	;  this time around
+	DECL	lck_top.B[EBP]
+	SUBL	EAX, EBX		;Get length of buffer which is in this
+	SUBL	lck_size.B[EBP], EAX	;  msect
+	ADDL	lck_buffer.B[EBP], EAX
+
+;Now calculate number of pages spanned by the part of the buffer we are
+;  checking this time
+
+	MOVL	ECX, EBX		;Get linear address of bottom of buffer
+	ADDL	ECX, lck_segla.B[EBP]
+	ADDL	EAX, ECX		;Get linear address of top of buffer
+	ADDL	EAX, #0FFFh		;Round up top linear address
+	ANDL	ECX, #0FFFFF000h
+	ANDL	EAX, #0FFFFF000h	;Round down bottom linear address
+	SUBL	EAX, ECX		;Get difference
+	SHRL	EAX, #12t		;Change to number of pages
+	MOVL	lck_count.B[EBP], EAX	;No - store number of pages to lock here
+	SUBL	EDX, mdb_la.B[EDI]	;Get page number in the msect
+	SHRL	EDX, #12t
+	INCL	EDX			;Plus 1
+	MOVL	lck_fpage.B[EBP], EDX	;Remember this
+	MOVL	EDX, lck_fptent.B[EBP]	;Restore offset of page table for first					;  buffer page
+	POPL	EAX
+
+;Here when ready to check a page
+
+26$:	CMPB	3.B[EAX], #0FFh		;Too many users for this page?
+	JE	iolktex			;Yes - fail
+	INCB	3.B[EAX]		;No - bump the IO lock count
+	INCL	lck_num.B[EBP]
+	INCL	mdb_lockcnt.B[EDI]	;Bump lock count for section in case its
+	INCL	memlockcnt#		;  a shared section!
+	INCL	iorb_mlckcnt.B[ESI]	;Also bump lock count for IO request
+	INCL	SS:pdaMLckCnt#		;And for process
+	ADDL	EBX, #1000h		;Bump buffer offset
+	CMPL	EBX, lck_top.B[EBP]	;Too high an offset?
+	JB	28$.S			;No
+	MOVL	EBX, lck_top.B[EBP]	;Yes - check the last byte
+28$:	ADDL	EDX, #4.B		;Bump page table offset
+	DECL	lck_count.B[EBP]
+	JE	36$.S
+
+;Here to advance to next page
+
+	IFFAULT	iolkaexx		;Touch the page
+	MOVB	AL, ES:[EBX]
+	TESTB	[EDX], #01		;Valid page?
+	JE	32$.S			;No - fail
+	CMPB	lck_func.B[EBP], #0	;Yes - need writable page?
+	JE	30$.S			;No
+	TESTB	[EDX], #02		;Yes - is the page writable?
+	JE	32$.S			;No - fail!
+30$:	CALL	knlGetMTE#		;Get memory table entry
+	JNE	26$.S			;Go on if page is allocated
+32$:	JMP	iolkaex
+
+;Here when finished locking a block of memory
+
+36$:	MOVL	ECX, lck_num.B[EBP]	;Get number of pages locked
+	SHLL	ECX, #20t		;Construct page table entry
+	ORL	ECX, lck_fpage.B[EBP]
+	MOVL	EBX, iorb_lock+0.B[ESI]	;Already have a pointer table?
+	TESTL	EBX, EBX
+	JE	44$.S			;No - don't need one yet
+	TESTL	EBX, #0FFFFFh		;Maybe
+	JE	46$.S			;Yes
+	PUSHL	ESI			;No
+	CALL	knlGetQel#		;Allocate a pointer table
+	MOVL	EDX, ESI
+	POPL	ESI
+	JC	iolkerx			;If can't
+	MOVL	[EDX], EBX		;OK - save current pointer
+	MOVL	EAX, iorb_lock+4.B[ESI]
+	MOVL	4.B[EDX], EAX
+	MOVL	8t.B[EDX], ECX
+	MOVL	12t.B[EDX], EDI
+	MOVL	iorb_lock+0.B[ESI], #02000000h
+	MOVL	iorb_lock+4.B[ESI], EDX
+38$:	MOVL	ECX, lck_size.B[EBP]	;Have anything left over?
+	TESTL	ECX, ECX
+	JNE	42$.S			;Yes - continue
+	CLC
+40$:	LEAVE
+	POPL	EDI
+	RET
+
+;Here if have more to lock (will get here if buffer spans more than 1 msect)
+
+42$:	MOVL	EBX, lck_buffer.B[EBP]	;Restore offset of buffer
+	JMP	6$			;Continue
+
+;Here if don't have a pointer table and don't need one yet (this is the
+;  first buffer locked)
+
+44$:	MOVL	iorb_lock+0.B[ESI], ECX	;Just store the information in the
+	MOVL	iorb_lock+4.B[ESI], EDI	;  IORB
+	JMP	38$.S
+
+;Here if already have a pointer table
+
+46$:	SHRL	EBX, #21t		;Get offset in table
+	CMPB	BL, #qe_SIZE		;Have too many pointers?
+	JAE	48$.S			;Yes - fail!
+	ADDL	EBX, iorb_lock+4.B[ESI]	;No - point to pointer table
+	MOVL	[EBX], ECX		;Store new pointer
+	MOVL	4.B[EBX], EDI
+	INCB	iorb_lock+3.B[ESI]	;Bump pointer count
+	JMP	38$.S
+
+;Here if have too many pointers
+
+48$:	MOVL	EAX, #ER_TMIOP
+	STC
+	JMP	40$.S
+.PAGE
+;Here if have a read only page or if have address error or if cannot allocate
+;  memory for a virtual page after we may have locked some pages.  When get
+;  here we have an error code in EAX which should be either ER_NEMA (if could
+;  not allocate memory) or ER_ADRER (if read only page or address error).
+
+	FAULTHDRX
+iolkaexx:
+	CMPL	EAX, #ER_NEMA.B		;Out of memory?
+	JNE	iolkerx.S		;No - must be address error
+	MOVL	ECX, lck_num.B[EBP]	;Yes - get the number of pages we have
+					;  locked
+	JREGZ	ECX, 2$			;If none locked this time
+	MOVL	EDX, lck_fptent.B[EBP]	;Get offset of first page table entry
+	PUSHL	ESI
+	ADDL	ESI, #iorb_mlckcnt.B
+	PUSHL	DS
+	POPL	ES
+	PUSHL	SS
+	POPL	GS
+	CALL	unlockmem#		;Unlock the pages we just locked
+	POPL	ESI
+2$:	CALL	knlGiveIorb		;Give up the IORB
+	LEAVE
+	MOVL	EDI, SS:pdaArg4#
+	MOVL	EDX, SS:pdaArg3#
+	MOVL	EBP, SS:pdaXRegEFR#
+	JMP	nomemkil2#
+
+;Here if have a read only page or if have address error after we may have
+;  locked some pages.
+
+	FAULTHDR
+iolkaex:MOVL	EAX, #ER_ADRER
+	JMP	iolkerx.S
+
+;Here if too many users for page
+
+iolktex:MOVL	EAX, #ER_TMIOM		;Get error code
+iolkerx:MOVL	ECX, lck_num.B[EBP]	;Get the number of pages we have locked
+	JREGZ	ECX, 4$			;If none locked this time
+	MOVL	EDX, lck_fptent.B[EBP]	;Get offset of first page table entry
+	PUSHL	EAX
+	PUSHL	ESI
+	ADDL	ESI, #iorb_mlckcnt.B
+	PUSHL	DS
+	POPL	ES
+	PUSHL	SS
+	POPL	GS
+	CALL	unlockmem#		;Unlock the pages we just locked
+	POPL	ESI
+	POPL	EAX
+4$:	LEAVE
+	POPL	EDI
+	JMP	iolkedn.S
+
+;Here if address error
+
+	FAULTHDR
+iolkae:	MOVL	EAX, #ER_ADRER
+iolkedn:PUSHL	EAX			;Save error code
+	CMPB	iorb_func.B[ESI], #QFNC_CLOSE ;Is this a close?
+	JE	18$.S			;Yes - keep the IORB
+	CALL	knlGiveIorb		;No - give up the IORB
+18$:	POPL	EAX			;Restore error code
+	CLRL	ECX			;IO amount is 0
+	MOVL	EBX, #QSTS$DONE		;Get status bits
+	STC				;Indicate error
+ret006:	RET				;Done
+.PAGE
+	.SBTTL	unlockall - Subroutine to unlock all locked memory pages
+
+;Subroutine to unlock all locked memory pages for an extended fork frame
+;	CALL	unlockall
+
+unlockall::
+	MOVL	ECX, SS:xffLock#+0	;Get memory lock pointer count
+	JREGZ	ECX, ret006		;If nothing to unlock
+	CLRL	EAX
+	MOVL	SS:xffLock#+0, EAX
+	TESTL	ECX, #0FFFFFh		;Have a single pointer?
+	JE	2$.S			;No
+	MOVL	EAX, SS:xffLock#+4	;Yes - get offset of the MDB
+unlockp:MOVL	ESI, #xffMLckCnt#
+	PUSHL	SS
+	POPL	ES
+	MOVW	GS, SS:xffPda#
+	MOVL	EDX, ECX		;Get page number
+	DECL	EDX
+	SHLL	EDX, #12t		;Change to offset
+	SHRL	ECX, #20t		;Get number of pages
+	ADDL	EDX, mdb_la.B[EAX]	;Get linear address of first page
+	SHRL	EDX, #10t		;Change to page table offset
+	ADDL	EDX, #pgtable
+	JMP	unlockmem#		;Unlock the memory page and return
+
+;Here if have a lock pointer table
+
+2$:	SHRL	ECX, #24t		;Get number of pointers
+	PUSHL	ECX
+	MOVL	ESI, SS:xffLock#+4	;Get pointer to the table
+4$:	MOVL	ECX, [ESI]
+	MOVL	EAX, 4.B[ESI]
+	PUSHL	ESI
+	CALL	unlockp
+	POPL	ESI
+	ADDL	ESI, #8.B
+	DECL	[ESP]
+	JNE	4$.S
+	POPL	EAX			;Fix up the stack
+	MOVL	ESI, SS:xffLock#+4	;Give up the pointer table
+	JMP	knlGiveQel#		;  and return
+.PAGE
+	.SBTTL	knlIoCharChk - Subroutine to verify that a characteristic list is writable
+
+;Subroutine to verify that a characteristic list is writable - must be called
+;  at main program level - this checks the list only - it does not check any
+;  string buffers pointed to by the list
+;	c{FS:EDX} = Address of the characteristics list
+;	CALL	knlIoCharChk
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+
+knlIoCharChk::
+	PUSHL	EDX			;Save offset of list
+	IFFAULT	8$			;Get first header byte
+2$:	MOVB	AL, FS:[EDX]
+	MOVL	ECX, #10t		;Assume no info pointer present
+	TESTB	AL, #PAR$INFO		;Right
+	JE	4$.S			;Yes
+	MOVB	CL, #22t		;No - we have an info pointer here
+4$:	ANDB	AL, #PAR$REP
+	JE	12$.S			;If end of list
+	CMPB	AL, #REP_STR		;Is this a string item?
+	JNE	6$.S			;No - go on
+	LEAL	EDX, 12t.B[EDX+ECX]	;Point to next item
+	JMP	2$.S			;Continue
+
+;Here to advance to next characteristics item if do not have a string item
+
+	IFFAULT	8$
+6$:	MOVZBL	EAX, FS:1.B[EDX]	;Get length of this item
+	ADDL	EAX, ECX
+	ADDL	EDX, EAX		;Point to next item
+	JMP	2$.S			;Continue
+
+	FAULTHDR
+8$:	POPL	EDX
+	MOVL	EAX, #ER_ADRER
+	STC
+10$:	RET
+
+;Here when finished scanning the characteristics list
+
+12$:	MOVL	ECX, EDX
+	POPL	EDX			;Restore offset of parameter list
+	SUBL	ECX, EDX		;Calculate length of list
+	JE	10$.S			;Nothing to do here if 0
+	PUSHL	FS
+	PUSHL	EDX
+	MOVL	EBX, EDX
+	PUSHL	FS
+	POPL	ES
+	CALL	knlIoBufrChk
+	POPL	EDX
+	POPL	FS
+	RET
+.PAGE
+	.SBTTL	knlIoBufrChk - Subroutine to verify that a buffer is writable
+
+;Subroutine to verify that a buffer is writable - must be called at main
+;  program level
+;	c{ES:EBX} = Address of buffer
+;	c{ECX}    = Length of buffer
+;	CALL	knlIoBufrChk
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;  ES:EBX and ECX are respected
+
+knlIoBufrChk::
+	MOVL	EAX, ES			;Can we write to the segment?
+	VERW	AX
+	MOVL	EAX, SS
+	JMP	2$.S
+
+	.SBTTL	knlXfBufrChk - Subroutine to verify that a buffer is writable
+
+;Subroutine to verify that a buffer is writable - must be called in extended
+;  fork context
+;	c{ES:EBX} = Address of buffer
+;	c{ECX}    = Length of buffer
+;	CALL	knlXfBufrChk
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;  ES:EBX is respected
+
+knlXfBufrChk::
+	MOVL	EAX, ES			;Can we write to the segment?
+	VERW	AX
+	MOVW	AX, SS:xffPda#
+2$:	JNE	12$.S			;No - fail
+	PUSHL	EBX
+	PUSHL	ECX
+	LEAL	ECX, 0FFFh[EBX+ECX]	;Yes - calculate number of pages spanned
+	PUSHL	EBX			;  by the buffer
+	ANDL	EBX, #0FFFFF000h
+	SUBL	ECX, EBX
+	SHRL	ECX, #12t
+	MOVL	FS, EAX			;Get PDA selector
+	CALL	knlGetPTE#		;Find the page table entry
+	POPL	EBX
+	JC	8$.S			;If error
+4$:	IFFAULT	10$			;Touch the page
+	MOVB	AL, ES:[EBX]
+	TESTB	[EDX], #02		;Is the page writable?
+	JE	10$.S			;No - fail!
+	ADDL	EBX, #1000h		;Yes - bump buffer offset
+	ADDL	EDX, #4.B
+	LOOP	ECX, 4$			;Continue if more pages to lock
+8$:	POPL	ECX
+	POPL	EBX
+	RET
+
+	FAULTHDR
+10$:	POPL	ECX
+	POPL	EBX
+12$:	MOVL	EAX, #ER_ADRER
+	STC
+	RET
+.PAGE
+	.SBTTL	knlXfQueue - Subroutine to queue IO request
+
+;Subroutine to queue IO request - must be called at main program level
+;	c{EDI} = Offset of DCB
+;	c{ESI} = Offset of IORB
+;	CALL	knlXfQueue
+;	c{EAX} = Error code
+;	If error (IORB given up)
+;	  c{ECX} = 0
+;	  c{EBX} = QSTS$DONE
+;	If normal
+;	  c{EBX} = 0
+;  Always returns raised to fork level
+
+knlXfQueue::
+	MOVXBL	EBX, iorb_queue.B[ESI]	;Get queue pointer offset
+	CMPW	[EDI+EBX], #0.B		;Is there a current queued request?
+	JE	knlXfBegin.S		;No - go do the request now
+	TOFORK				;Yes - raise to fork level
+	CMPW	[EDI+EBX], #0.B		;Did it just finish?
+	JE	begin0.S		;Yes - really not busy
+	MOVW	ES, [EDI+EBX]
+	MOVB	AL, ES:xffIoQCnt#	;No - can we queue another one?
+	CMPB	AL, dcb_outqlmt-dcb_outframe.B[EDI+EBX]
+	JAE	10$.S			;No
+	INCB	ES:xffIoQCnt#		;Yes - count it
+	MOVW	iorb_pda.B[ESI], SS
+	MOVL	EAX, ES:xffIoQTail#	;Get tail of list
+	TESTL	EAX, EAX		;Is list empty?
+	JNE	6$.S			;No
+	MOVL	ES:xffIoQHead#, ESI	;Yes - setup a list
+	JMP	8$.S
+
+6$:	MOVL	[EAX], ESI		;Link into list
+8$:	MOVL	ES:xffIoQTail#, ESI
+	CLRL	EAX
+	MOVL	[ESI], EAX
+	CLRL	EBX
+	RET				;Thats all
+
+;Here if can't queue another request for the device
+
+10$:	CALL	knlGiveIorb		;Give up the IORB
+	MOVL	EAX, #ER_TMIOQ		;Get error code
+	MOVL	EBX, #QSTS$DONE
+	CLRL	ECX
+	RET
+.PAGE
+	.SBTTL	knlXfBegin - Subroutine to create extended fork frame
+
+;Subroutine to create extended fork frame to service function for device - must
+;  be called from main program level
+;	c{EBX} = Offset of dcb_outframe or dcb_inpframe relative to DCB
+;	c{EDI} = Offset of DCB (may be 0)
+;	c{ESI} = Offset of IORB
+;	CALL	knlXfBegin
+;	c{EAX} = Error code
+;	If error (IORB given up)
+;	  c{ECX} = 0
+;	  c{EBX} = QSTS$DONE
+;	If normal
+;	  c{EBX} = 0
+;  Always returns raised to fork level
+
+begin0:	FROMFORK
+knlXfBegin::
+	CMPL	xfffree, #0.B		;Is an extended fork frame available?
+	JNE	12$			;Yes - go on
+	MOVL	EAX, xffnum#		;No - can we make another one?
+	CMPL	EAX, xfflimit#
+	JB	10$.S			;Yes
+2$:	CALL	knlGiveIorb		;No - give up the IORB
+	MOVL	EAX, #ER_NEMA		;Fail
+	MOVL	EBX, #QSTS$DONE
+	CLRL	ECX
+	TOFORK
+	RET
+
+;Here if error allocating another XFF - we fail after giving up anything we
+;  might have already allocated (we need an address page, a memory page, and
+;  two global selectors to make an XFF - its possible to fail at any point
+;  while allocating these items)
+
+;Here if error allocating the second global selector - must give up the first
+;  global selector and the memory page
+
+4$:	POPL	EBX			;Restore first selector
+	CALL	knlGiveGSelector#		;Give it up
+
+;Here if error allocating the first global selector - must give up the memory
+;  pages
+
+6$:	MOVL	EBX, xffla		;Get linear address
+	MOVL	ECX, #2			;Give up the memory pages
+	CLRL	EAX
+	CALL	knlGivePages#
+8$:	CALL	knlGiveXRes#
+	POPL	EDI
+	POPL	ESI
+	JMP	2$.S
+
+;Here if need to allocate another XFF
+
+10$:	PUSHL	ESI
+	PUSHL	EDI
+	CALL	knlGetXRes#
+	MOVL	ECX, #2			;Need two pages
+	MOVL	EBX, xffla		;Get linear address
+	CMPL	EBX, #la_xfork+la_xforkSIZE ;Make sure not too many now!
+	JAE	2$.S
+	CLRL	EDX
+	MOVL	EAX, #63h
+	CALL	knlGetPages#
+	JC	8$.S			;If error
+	CALL	knlGetGSelector#	;Get selector for buffer
+	JC	6$.S
+	PUSHL	EBX
+	MOVL	ECX, #DT_RWDATA+PL_0+{DC_BG+DC_32}*100h+{2000h-1}*10000h
+	MOVL	EDX, xffla		;Get linear address for the buffer
+	CALL	knlSetGDesc#		;Set up buffer selector
+	CALL	knlGetGSelector#	;Get selector for TSS
+	JC	4$.S
+	PUSHL	EBX
+	MOVL	ECX, #DT_ITSS+PL_0+DC_BG*100h+{68h-1}*10000h
+	MOVL	EDX, xffla
+	ADDL	EDX, #xffTss#		;Get linear address for the TSS
+	CALL	knlSetGDesc#		;Set up TSS selector
+	ADDL	xffla, #2000h		;Bump XFF linear address
+	CALL	knlGiveXRes#
+	POPL	ESI			;Restore TSS selector
+	POPL	ES			;Restore selector for buffer
+	MOVL	ECX, #2000h/4
+	CLRL	EAX
+	CLRL	EDI
+	CLD
+	RSTOSL	[EDI]
+	MOVL	ES:xffTssSel#, ESI	;Store TSS selector (this also sets
+					;  up the address for a task switch)
+	MOVL	ES:xffMagic#, #XFF_MAGIC ;Store the magic number
+	MOVW	ES:xffTss#+tss_bmofs, #70h ;Set offset so there is no IO bit
+	POPL	EDI			    ;  map
+	POPL	ESI
+	INCL	xffnum#
+	SUBL	knlMemUser#, #2t.B
+	TOFORK
+	JMP	14$.S
+
+;Here with extended fork frame available on the free list
+
+12$:	TOFORK
+	MOVL	ES, xfffree		;Get selector for a free frame
+	MOVL	EAX, ES:xffSysNext#	;Remove frame from the free list
+	MOVL	xfffree, EAX
+14$:	MOVL	EAX, xfflast		;Put frame on the active list
+	TESTL	EAX, EAX
+	JE	16$.S
+	MOVL	FS, EAX
+	MOVL	FS:xffSysNext#, ES
+	JMP	18$.S
+
+16$:	MOVL	xfffirst, ES
+18$:	MOVL	xfflast, ES
+	MOVL	ES:xffSysPrev#, EAX
+	CLRL	EAX
+	MOVL	ES:xffSysNext#, EAX
+	MOVL	ES:xffProcPrev#, EAX
+	INCL	SS:pdaXffNum#
+	MOVL	EAX, SS:pdaXffFirst#	;Put frame on the process's list
+	TESTL	EAX, EAX
+	JE	20$.S
+	MOVL	FS, EAX
+	MOVL	FS:xffProcPrev#, ES
+20$:	MOVL	ES:xffProcNext#, EAX
+	MOVL	SS:pdaXffFirst, ES
+
+;Start of XFF timing code
+
+	CALL	getdelta#		;Get delta time
+	ADDL	SS:pdaRunTime#+0, EAX
+	ADCL	SS:pdaRunTime#+4, EDX
+	SUBL	SS:pdaRunQTime#, EAX
+
+;End of XFF timing code
+
+	INCL	xffinuse#		;Increase XFF in use count
+	MOVL	EAX, xffinuse#		;Is it a new maximum?
+	CMPL	xffmax#, EAX
+	JAE	30$.S			;No
+	MOVL	xffmax#, EAX		;Yes
+30$:	MOVL	ES:xffTmOutSub#, #ret002 ;Store offset of null time-out routine
+	PUSHL	EDI			;Copy the IORB items to the XFF
+	PUSHL	ESI
+	MOVL	EDI, #xffBgnCopy#
+	ADDL	ESI, #iorb_bgncopy.B
+	MOVL	ECX, #iorb_NUMCOPY
+	CLD
+	RMOVSL	[EDI], [ESI]
+	POPL	ESI
+	POPL	EDI
+	MOVL	EAX, iorb_finish.B[ESI]	;Put offset of finish routine on stack
+	MOVL	ES:xffStack#-4, EAX
+	MOVL	EAX, iorb_routine.B[ESI] ;Store initial EIP value for task
+	MOVL	ES:xffTss#+tss_EIP, EAX
+	MOVL	ES:xffTss#+tss_EFR, #200h
+	MOVB	ES:xffStatus1#, #0	;Clear XFF status bits
+	MOVL	ES:xffDcb#, EDI		;Store offset of DCB
+	MOVL	ES:xffTss#+tss_EDI, EDI
+	MOVXBL	EBX, iorb_queue.B[ESI]	;Get DCB queue offset
+	TESTL	EBX, EBX		;Do we have one?
+	JE	32$.S			;No
+	MOVW	[EDI+EBX], ES		;Yes - store selector in the DCB
+	MOVXWL	EAX, iorb_handle.B[ESI]	;Get handle
+	TESTL	EAX, EAX
+	JLE	32$.S
+	SHLL	EAX, #5t
+	ADDL	EAX, SS:pdaHndlTbl#	;Point to handle table
+	CMPL	SS:[EAX], EDI		;Make sure its right!
+	JNE	34$
+	MOVL	EAX, SS:4.B[EAX]	;Get device command bits
+	MOVL	ES:xffCmd#, EAX		;Store them in the XFF
+32$:	CALL	knlGiveQel#		;Give up the IORB
+	MOVW	ES:xffPda#, SS		;Store selector of the PDA
+	MOVL	ES:xffTss#+tss_ESP, #xffStack#-4
+	MOVL	ES:xffTss#+tss_SS, ES
+	MOVL	ES:xffTss#+tss_DS, DS
+	MOVL	ES:xffTss#+tss_CS, CS
+	CLRL	EAX
+	MOVL	ES:xffTss#+tss_ES, EAX
+	MOVL	ES:xffTss#+tss_FS, EAX
+	MOVL	ES:xffTss#+tss_GS, EAX
+	MOVL	ES:xffWakeBlk#, EAX
+	DECL	EAX
+	MOVL	ES:xffReqNext#, EAX	;Indicate not in the request list
+	MOVL	ES:xffTimeOut#, EAX	;Assume no time-out wanted
+	MOVL	EAX, SS:pdaCR3#		;Set up mapping data in the TSS for the
+	MOVL	ES:xffTss#+tss_CR3, EAX ;  extended fork frame
+	MOVL	EAX, SS:pdaTss#+tss_LDT
+	MOVL	ES:xffTss#+tss_LDT, EAX
+	MOVB	knlForkLvl#, #FORK_XFF	;Indicate in extended fork context
+	CALLFI	ES:xffCallAddr#	;Do task switch
+	MOVB	knlForkLvl#, #FORK_MFORK ;Back to normal fork level
+	CLRL	EAX
+	CLRL	EBX
+	RET				;Finished
+
+;Here if handle table is wrong
+
+34$:	CRASH	BDHT			;[BaD Handle Table]
+.PAGE
+	.SBTTL	knlQioFinish - Routine to finish queued IO
+
+;Here at fork level when a queued IO request is complete.  Always get here in
+;  extended fork context.  This code is responsible for wake up anyone waiting
+;  for an svcIoQueue to complete and for requesting the completion software
+;  interrupt.  (Note that the code at knlXfFinish handles waking up processes
+;  waiting for a request to be cancelled or aborted.)
+;	c{EAX} = Value for qab_error
+;	c[BX]  = Value for qab_status
+;	c{ECX} = Value for qab_amount
+;	c{EDX} = Handle (if non-transfer function)
+
+knlQioFinish::
+	ORL	EBX, #QSTS$DONE		;Always set QSTS$DONE
+	IFFAULT	knlXfFinish
+	LESL	EDI, SS:xffQab#		;Get address of his QAB
+	IFFAULT	4$
+	MOVL	ES:qab_error.B[EDI], EAX ;Store error code
+	FAULTHDR
+4$:	IFFAULT	6$
+	MOVL	ES:qab_amount.B[EDI], ECX ;Store amount done
+	FAULTHDR
+6$:	IFFAULT	8$
+	MOVW	ES:qab_status.B[EDI], BX ;Store status bits
+	FAULTHDR
+8$:	CMPB	SS:xffFunc#, #QFNC_INBLOCK ;Should we store the handle?
+	JAE	10$.S			;No
+	IFFAULT	10$
+	MOVL	ES:qab_handle.B[EDI], EDX ;Yes - do so
+	FAULTHDR
+10$:	MOVL	EAX, EDI		;Get offset of the QAB as wait index
+	CALL	knlEndWaitAll#		;Wake up all waiters
+	JE	12$.S			;If no one waiting
+	CMPB	curqx#, #knlQX_PQ1#	;Is current process in PQ1?
+	JE	12$.S			;Yes - don't bother scheduling now
+	MOVB	knlSchedReq#, #1	;No - reschedule immediately
+12$:	TESTB	SS:xffStatus1, #XF1$NOINT ;Want interrupt?
+	JNE	knlXfFinish.S		;No
+	IFFAULT	knlXfFinish		;Maybe
+	MOVZBL	EAX, ES:qab_vector.B[EDI] ;Get vector number
+	TESTL	EAX, EAX		;Want software interrupt here?
+	JE	knlXfFinish.S		;No
+	CALL	knlGetQel#		;Yes - get an interrupt link block
+	JC	knlXfFinish.S		;Forget it if error!
+	MOVB	slb_szindx.B[ESI], #0
+	MOVB	BL, #SIGT_NORMAL	;Get interrupt type
+	MOVL	ECX, #2			;2 data items for this interrupt
+	CLRL	EDX			;  data
+	MOVW	DX, ES
+	CMPL	EDX, #GS_REAL16.B
+	JNE	14$.S
+	MOVL	EDX, EDI
+	ANDL	EDI, #0Fh
+	ANDL	EDX, #0FFFFFFF0h.B
+	SHLL	EDX, #12t
+	ORL	EDI, EDX
+	MOVL	EDX, #0FFFEh
+14$:	MOVL	slb_data+0.B[ESI], EDI	;Store address of the QAB as interrupt
+	MOVL	slb_data+4.B[ESI], EDX	;  data
+	MOVW	ES, SS:xffPda#
+	CLRL	EDX
+	CALL	knlReqSignal#		;Request the software interrupt
+					;Fall into knlXfFinish on next page
+.PAGE
+;We are now finished with this fork frame.  First we unlock any memory we have
+;  locked for this IO operation.  Then we check to see if the operation just
+;  completed was cancelled or aborted.  If so, we handle this and wake up anyone
+;  waiting using the device handle as a wait index.  Then we see if there is
+;  queue associated with the fork frame.  If there is a request queued we must
+;  use this same task for it, since there is nothing to switch to outside of
+;  this task which can do the switch!  First we check to see if anyone is
+;  waiting for a fork frame - if so, this must mean that there are no more
+;  frames available so we first move the first pending request for the current
+;  device to the tail of the fork wait list, and then start the request waiting
+;  for a fork frame.  If there are no requests for a fork frame, we check to
+;  see if there are any requests queued for the device.  If so, we start the
+;  first one.  If none, we put the fork frame on the free list and terminate
+;  the task.
+
+	FAULTHDR
+knlXfFinish::
+	CMPL	SS:xffLockCnt#, #0.B	;Have any buffers locked?
+	JNE	10$			;Yes - big problem!
+	CALL	unlockall		;Unlock any locked pages
+	CMPL	SS:xffMLckCnt#, #0.B	;Did we unlock them all?
+	JNE	12$			;No - serious problem!!
+	MOVL	EDI, SS:xffDcb#	;Yes - get offset of DCB
+	MOVW	ES, SS:xffPda#		;Get PDA selector for associated process
+	TESTB	ES:pdaStatus1#, #P1$KILL ;Is this process being killed?
+	JNE	2$.S			;Yes
+	TESTB	SS:xffStatus1#, #XF1$ABORT|XF1$CANCEL|XF1$CLOSE ;Close or cancel?
+	JE	xfchkq			;No - go on
+2$:	MOVZWL	EAX, SS:xffHandle#	;Yes - wake up whoever is waiting for
+	CALL	knlEndWaitAll#		;  this
+	TESTB	SS:xffStatus1#, #XF1$CANCEL ;Cancel?
+	JE	xfchkq.S		;No
+	MOVXBL	EBX, SS:xffQueue#	;Yes - get first queued request
+	MOVL	EDX, #xffIoQHead#
+	PUSHL	SS
+	POPL	ES
+4$:	MOVL	ESI, ES:[EDX]
+	TESTL	ESI, ESI		;Get next
+	JE	xfchkq.S		;If no more
+	MOVL	EAX, SS:xffPda#	;Is it one of ours?
+	CMPW	iorb_pda.B[ESI], AX
+	JNE	14$.S			;No - continue
+	MOVW	AX, SS:xffHandle#	;Maybe
+	CMPW	iorb_handle.B[ESI], AX
+	JNE	14$.S			;No
+	CMPB	iorb_func.B[ESI], #QFNC_CLOSE ;Yes - is it a close function?
+	JE	xfchkq.S		;Yes - don't cancel it!
+	MOVL	EAX, [ESI]		;No - unlink this IORB
+	MOVL	ES:[EDX], EAX
+	TESTL	EAX, EAX		;Was this the last one?
+	JNE	8$.S			;No
+	CMPL	SS:xffIoQHead#, #0.B	;Yes
+	JNE	6$.S
+	CLRL	EDX
+6$:	MOVL	SS:xffIoQTail#, EDX
+8$:	CALL	canceliorb		;Cancel the request
+	TESTL	EDX, EDX		;More to do?
+	JNE	4$.S			;Yes
+	JMP	xfchkq.S		;No - continue
+
+10$:	CRASH	HBLK			;[Have Buffer LocKed]
+
+12$:	CRASH	MPSL			;[Memory Page Still Locked]
+
+;Here to skip a queued request when cancelling IO
+
+14$:	MOVL	EDX, ESI
+	PUSHL	DS
+	POPL	ES
+	JMP	4$.S
+.PAGE
+2$:	CRASH	BDQC			;[BaD Queue Count]
+
+;Here if not cancelling IO
+
+xfchkq:	MOVXBL	EBX, SS:xffQueue#	;Get offset of queue pointer
+	TESTL	EBX, EBX		;Do we have a queue?
+	JE	xfrqdn			;No
+	TESTL	EDI, EDI		;Yes - do we have a DCB?
+	JE	xfrqdn			;No - can't have anything waiting!
+	MOVW	[EDI+EBX], #0		;Yes - clear the selector to indicate no
+					;  longer using a fork frame
+	MOVL	ESI, SS:xffIoQHead#	;Is anyone waiting?
+	TESTL	ESI, ESI
+	JE	xfrqdn			;No - all done here
+	CMPB	SS:xffIoQCnt#, #0	;Yes - valid count?
+	JE	2$.S			;No!!!!
+	DECB	SS:xffIoQCnt#		;Reduce queue count
+	MOVL	EAX, [ESI]		;Remove next IORB from the list
+	TESTL	EAX, EAX		;Anything left in list?
+	JNE	4$.S			;Yes
+	MOVL	SS:xffIoQTail#, EAX	;No - clear tail pntr
+4$:	MOVL	SS:xffIoQHead#, EAX	;Update head pointer
+
+;Here with request to do
+
+6$:	MOVZWL	EAX, SS:xffPda#		;Different PDA?
+	MOVL	ES, EAX
+	CMPW	iorb_pda.B[ESI], AX
+	JE	20$			;No
+	DECL	ES:pdaXffNum#		;Yes
+	JS	8$.S
+	MOVL	EAX, SS:xffProcNext#	;Remove this XFF from the process's
+	CMPL	SS:xffProcPrev#, #0.B	;  list of XFFs
+	JE	10$.S
+	MOVL	FS, SS:xffProcPrev#
+	MOVL	FS:xffProcNext#, EAX
+	JMP	12$.S
+
+8$:	CRASH	BXFC			;[Bad eXtended Fork Count]
+
+10$:	MOVL	ES:pdaXffFirst#, EAX
+12$:	MOVL	EAX, SS:xffProcPrev#
+	CMPL	SS:xffProcNext#, #0.B
+	JE	14$.S
+	MOVL	FS, SS:xffProcNext#
+	MOVL	FS:xffProcPrev#, EAX
+14$:	CLRL	EAX			;Make sure selectors are null
+	MOVL	GS, EAX
+	MOVL	FS, EAX
+	MOVW	ES, iorb_pda.B[ESI]	;Get selector for new PDA
+	MOVL	EAX, ES:pdaCR3#		;Change mapping
+	MOVL	SS:xffTss#+tss_CR3, EAX
+	MOVL	CR3, EAX
+	LLDT	ES:pdaTss#+tss_LDT
+	SLDT	SS:xffTss#+tss_LDT
+	INCL	ES:pdaXffNum#
+	MOVL	EAX, ES:pdaXffFirst#	;Put frame on the new process's
+	TESTL	EAX, EAX		;  XFF list
+	JE	16$.S
+	MOVL	FS, EAX
+	MOVL	FS:xffProcPrev#, ES
+	JMP	18$.S
+
+16$:	MOVL	ES:pdaXffFirst, SS
+18$:	MOVL	SS:xffProcNext#, EAX
+20$:	MOVL	SS:xffTmOutSub#, #ret002
+	PUSHL	EDI			;Copy the IORB items to the XFF
+	PUSHL	ESI
+	MOVL	EDI, #xffBgnCopy#
+	PUSHL	ES
+	PUSHL	SS
+	POPL	ES
+	ADDL	ESI, #iorb_bgncopy.B
+	MOVL	ECX, #iorb_NUMCOPY
+	CLD
+	RMOVSL	[EDI], [ESI]
+	POPL	ES
+	POPL	ESI
+	POPL	EDI
+	MOVB	SS:xffStatus1#, #0	;Clear the XFF status bits
+	TESTL	EDI, EDI
+	JE	22$.S
+	MOVXBL	EBX, iorb_queue.B[ESI]
+	MOVW	[EDI+EBX], SS		;Store selector in the DCB
+22$:	MOVXWL	EAX, iorb_handle.B[ESI]	;Get device handle
+	SHLL	EAX, #5t
+	ADDL	EAX, ES:pdaHndlTbl#	;Point to handle table
+	CMPL	ES:[EAX], EDI		;Make sure its right!
+	JE	24$.S
+	TESTL	EDI, EDI
+	JNE	28$.S
+	CMPL	ES:[EAX], #0FFFh
+	JNE	28$.S
+24$:	MOVL	EAX, ES:4.B[EAX]	;Get device command bits
+	MOVL	SS:xffCmd#, EAX		;Store them in the XFF
+	PUSHL	iorb_finish.B[ESI]	;Stack offset of finish routine
+	PUSHL	iorb_routine.B[ESI]	;Stack offset of device routine
+	JMP	knlGiveQel#		;Give up the IORB and then go to
+					;  device routine
+
+;Here if handle table is wrong
+
+28$:	CRASH	BDHT			;[BaD Handle Table]
+.PAGE
+2$:	CRASH	XFFT
+
+;Here if nothing more to do - put the fork frame back on the free list and
+;  terminate the task
+
+xfrqdn:	CMPL	SS:xffWakeBlk#, #0.B
+	JNE	2$.S
+
+;Start of XFF timing code
+
+	CALL	getdelta#		;Get delta time
+	MOVW	FS, SS:xffPda#
+	ADDL	FS:pdaXffTime#+0, EAX
+	ADCL	FS:pdaXffTime#+4, EDX
+	SUBL	FS:pdaRunQTime#, EAX
+
+;End of XFF timing code
+
+	MOVL	EAX, SS:xffSysNext#	;Remove this XFF from the system's
+	CMPL	SS:xffSysPrev#, #0.B	;  list of active XFFs
+	JE	4$.S
+	MOVL	ES, SS:xffSysPrev#
+	MOVL	ES:xffSysNext#, EAX
+	JMP	6$.S
+
+4$:	MOVL	xfffirst, EAX
+6$:	MOVL	EAX, SS:xffSysPrev#
+	CMPL	SS:xffSysNext#, #0.B
+	JE	8$.S
+	MOVL	ES, SS:xffSysNext#
+	MOVL	ES:xffSysPrev#, EAX
+	JMP	10$.S
+
+8$:	MOVL	xfflast, EAX
+10$:	DECL	FS:pdaXffNum#
+	JS	20$.S
+	MOVL	EAX, SS:xffProcNext#	;Remove this XFF from the process's
+	CMPL	SS:xffProcPrev#, #0.B	;  list of XFFs
+	JE	12$.S
+	MOVL	ES, SS:xffProcPrev#
+	MOVL	ES:xffProcNext#, EAX
+	JMP	14$.S
+
+12$:	MOVL	FS:pdaXffFirst#, EAX
+14$:	MOVL	EAX, SS:xffProcPrev#
+	CMPL	SS:xffProcNext#, #0.B
+	JE	16$.S
+	MOVL	ES, SS:xffProcNext#
+	MOVL	ES:xffProcPrev#, EAX
+16$:	CLRL	EAX
+	MOVL	SS:xffDcb#, EAX
+	MOVW	SS:xffPda#, AX
+	MOVL	EAX, xfffree		;Put this XFF on the free list
+	MOVL	SS:xffSysNext#, EAX
+	MOVL	xfffree, SS
+	DECL	xffinuse#		;Reduce in use XFF count
+	IRET				;Terminate the task (NT is set here!)
+	CRASH	XFFS
+
+20$:	CRASH	BXFC			;[Bad eXtended Fork Count]
+.PAGE
+	.SBTTL	knlXfWait - Subroutine to wait for IO in extended fork context
+
+;Subroutine to wait for IO in extended fork context
+;	c{EAX} = Time-out interval (in fractional days, 0 means no wait,
+;		   0FFFFFFFFh means wait forever)
+;	CALL	knlXfWait
+;	C:set = Error
+;	  c{EAX} = Error code (negative)
+;	C:clr = Normal
+;	  c{EAX} = Completion code (0 or positive)
+;  All registers (except EAX) are preserved
+
+knlXfWait::
+	REQUIREXFF			;For debugging!
+	CMPL	SS:xffWakeBlk#, #0.B
+	JNE	8$
+	TESTL	EAX, EAX		;Want to wait at all?
+	JE	10$			;No - just fail immediately!
+	CMPL	EAX, #-1.B		;Yes - want any limit?
+	JE	6$.S			;No
+	PUSHL	ESI			;Yes
+	PUSHL	EBX
+	MOVL	EBX, #xfwdone
+xfwait2:PUSHL	EDI
+	PUSHL	EDX
+	MULL	knlLitTPD#		;Convert to number of ticks
+	MOVL	EAX, EDX
+	CMPL	EAX, #2			;Make sure at least 2
+	JA	2$.S
+	MOVB	AL, #2
+2$:	MOVL	EDI, SS
+	CALL	knlWakeRequest#		;Enter timer request
+	POPL	EDX
+	POPL	EDI
+	POPL	EBX
+	JC	4$.S			;If error
+	MOVL	SS:xffWakeBlk#, ESI	;Remember offset of the wake block
+	POPL	ESI
+	JMP	6$.S
+
+;Here if error entering timer request
+
+4$:	POPL	ESI
+	STC
+	RET
+
+knlXfWaitNTO::
+	REQUIREXFF			;For debugging!
+	CMPL	SS:xffWakeBlk#, #0.B	;This and the following checks are
+	JNE	8$.S			;  for debugging only!!
+6$:	CMPL	EDI, SS:xffDcb#
+	JNE	8$.S
+
+;Start of XFF timing code
+
+	PUSHL	EDX
+	CALL	getdelta#		;Get delta time
+	PUSHL	ES
+	MOVL	ES, SS:xffPda#
+	ADDL	ES:pdaXffTime#+0, EAX
+	ADCL	ES:pdaXffTime#+4, EDX
+	SUBL	ES:pdaRunQTime#, EAX
+	POPL	ES
+	POPL	EDX
+
+;End of XFF timing code
+
+	CLRL	EAX			;Clear EAX to indicate no error yet
+	IRET				;Terminate the task for now (NT is
+					;  set here, so this is effectively
+					;  a co-routine call)
+					;Return here when resumed
+	BTL	EAX, #31t		;Set C if error indicated
+	RET				;Finished
+
+8$:	CRASH	XFFT
+
+;Here if don't want to wait at all
+
+10$:	REQUIREXFF
+	CMPL	SS:xffWakeBlk#, #0.B
+	JNE	8$.S
+	CMPL	EDI, SS:xffDcb#
+	JNE	8$.S
+	MOVL	EAX, SS
+	CMPW	dcb_outframe.B[EDI], AX
+	JE	12$.S
+	CMPW	dcb_inpframe.B[EDI], AX
+	JNE	8$.S
+12$:	MOVL	EAX, #ER_NORSP		;Error = NO ReSPonse
+	STC
+	RET
+
+;Here when xfwait times out
+
+xfwdone::
+	MOVL	ES, EDI
+	CMPL	ES:xffWakeBlk#, ESI	;Make sure have the right wake block!
+	JNE	22$.S
+	CLRL	EAX			;OK - indicate no timer now
+	MOVL	ES:xffWakeBlk#, EAX
+	MOVL	EDI, ES:xffDcb#		;Timed-out - get DCB offset
+	TESTL	EDI, EDI		;Is the XFF really still in use?
+	JE	20$.S			;No - forget it
+	CALLI	ES:xffTmOutSub#		;Yes - call time-out subroutine
+	MOVL	EAX, #ER_NORSP		;Error = NO ReSPonse
+	MOVL	EDX, ES
+	CALL	knlResumeXf		;Tell it it has timed-out
+	CLC				;Clear C to indicate done with the
+20$:	RET				;  wake block
+
+22$:	CRASH	BXFW			;[Bad eXtended Fork Wake block]
+.PAGE
+	.SBTTL	knlXfTimeWait - Subroutine to wait for time interval in extended fork context
+
+;Subroutine to wait for specified time interval in extended fork context
+;	c{EAX} = Time-out interval (in fractional days)
+;	CALL	knlXfTimeWait
+;	C:set = Error
+;	  c{EAX} = Error code (negative)
+;	C:clr = Normal
+;	  c{EAX} = Completion code (0 or positive)
+;  All registers (except EAX) are preserved
+
+knlXfTimeWait::
+	REQUIREXFF
+	PUSHL	ESI
+	PUSHL	EBX
+	MOVL	EBX, #xftwdone
+	JMP	xfwait2
+
+;Here if error entering timer request
+
+4$:	POPL	ESI
+	STC
+	RET
+
+;Here when the timed wait completes
+
+xftwdone:
+	MOVL	ES, EDI
+	CMPL	ES:xffWakeBlk#, ESI	;Make sure have the right wake block!
+	JNE	12$.S
+	CLRL	EAX
+	MOVL	ES:xffWakeBlk#, EAX
+	MOVL	EDI, ES:xffDcb#		;Timed-out - get DCB offset
+	TESTL	EDI, EDI		;Is the XFF really still in use?
+	JE	10$.S			;No - forget it
+	CLRL	EAX
+	MOVL	EDX, ES
+	CALL	knlResumeXf		;Tell it it has timed-out
+	CLC				;Set C to indicate done with wake block
+10$:	RET
+
+12$:	CRASH	BXFW			;[Bad eXtended Fork Wake block]
+.PAGE
+	.SBTTL	knlResumeInput - Subroutine to resume extended fork input
+
+;Subroutine to resume extended fork input - must be called from fork level
+;	c{EAX} = Completion code
+;	c{EDI} = Offset of DCB
+;	CALL	knlResumeInput
+;  All registers except ES are preserved
+
+knlResumeInput::
+	PUSHL	EDX
+	MOVZWL	EDX, dcb_inpframe[EDI]	;Get selector for fork frame
+	JMP	4$.S
+
+	.SBTTL	knlResumeOutput - Subroutine to resume extended fork output
+
+;Subroutine to resume extended fork output - must be called from device fork
+;  level or extended fork context
+;	c{EAX} = Completion code
+;	c{EDI} = Offset of DCB
+;	CALL	knlResumeOutput
+;  All registers except ES are preserved
+
+2$:	CRASH	FXFF
+
+knlResumeOutput::
+	PUSHL	EDX
+	MOVZWL	EDX, dcb_outframe[EDI]	;Get selector for fork frame
+4$:	REQUIREFORK
+	TESTL	EDX, EDX
+	JE	16$
+	MOVL	ES, EDX
+	JMP	6$.S
+
+knlResumeXf::
+	PUSHL	EDX
+	REQUIREFORK
+	MOVL	EDX, ES			;##### DEBUG
+6$:	CMPW	xfffree, DX		;##### DEBUG
+	JE	2$.S			;##### DEBUG
+
+	CMPL	ES:xffTss#+tss_EAX, #0.B ;Already have an error indicated?
+	JNE	8$.S			;Yes
+	MOVL	ES:xffTss#+tss_EAX, EAX ;No - store EAX for him
+8$:	MOVL	EAX, SS			;Trying to resume ourself?
+	CMPW	AX, DX
+	JE	16$.S			;Yes - nothing more needed here
+	CMPL	ES:xffWakeBlk#, #0.B	;Have a timer running?
+	JE	10$.S			;No
+	PUSHL	ESI
+	MOVL	ESI, ES:xffWakeBlk#
+	CLRL	EAX
+	MOVL	ES:xffWakeBlk#, EAX
+	CALL	knlWakeRemove#
+	POPL	ESI
+10$:	CMPL	ES:xffReqNext#, #-1.B	;In request list now?
+	JNE	16$.S			;Yes - nothing more needed here
+	MOVL	EAX, xffreqt		;No - get tail of the request list
+	TESTL	EAX, EAX
+	JE	12$.S			;If list is empty now
+	PUSHL	FS
+	MOVL	FS, EAX
+	MOVL	FS:xffReqNext#, ES	;Link into list
+	POPL	FS
+	JMP	14$.S
+
+12$:	MOVL	xffreqh, ES
+14$:	MOVL	xffreqt, ES
+	CLRL	EAX
+	MOVL	ES:xffReqNext#, EAX
+16$:	POPL	EDX
+ret010:	RET				;Finished here
+.PAGE
+	.SBTTL	knlCancelIo - Subroutine to terminate queued IO
+
+;Subroutine to terminate queued IO - must be called from main program level
+;  raised to fork level  - the current queued IO operation (if any) is aborted
+;  and all queued requests are canceled
+;	c{EBX}    = Offset of dcb_inpframe or dcb_outframe relative to DCB
+;	c(CL)     = Function: 40 = cancel all
+;			      20 = cancel after
+;			      10 = suppress interrupts
+;	c{EDX}    = Device handle
+;	c{EDI}    = Offset of DCB
+;	c{ES:ESI} = Address of QAB for request to cancel
+;	CALL	knlCancelIo
+;	C:set = Need to wait
+;	C:clr = Complete
+
+;This routine first determines if the current IO operation, if any, is for
+;  the caller.  If it is, it is marked as being cancelled and is aborted.  In
+;  this case, any queued requests will be canceled by knlXfFinish when the
+;  current operation is finished.  This routine does NOT wait for the device
+;  to finish.  If there is nothing to abort (no current operation or it is
+;  not for this handle, all queued requests are cancelled here.
+
+$$$=!0
+FRM can_handle, 4t		;Handle
+FRM can_qab   , 8t		;Offset of QAB
+FRM can_func  , 1t		;Function
+FRM           , 3t
+can_SIZE=!$$$
+
+knlCancelIo::
+	REQUIREFORK
+	CMPW	[EDI+EBX], #0.B		;Is there a current IO operation?
+	JE	ret010.S		;No - nothing needed here (can't have
+					;  anything queued if device is not
+					;  busy)
+	ENTER	can_SIZE, 0		;Yes
+	MOVL	can_qab+0.B[EBP], ESI	;Store address of QAB
+	MOVL	can_qab+4.B[EBP], ES
+	MOVL	can_handle.B[EBP], EDX	;Store handle
+	MOVB	can_func.B[EBP], CL	;Store function
+	MOVW	ES, [EDI+EBX]		;Get selector for XFF
+	MOVL	EAX, SS			;Is it for us?
+	CMPW	ES:xffPda#, AX
+	JNE	14$			;No
+	CMPW	ES:xffHandle#, DX	;Maybe
+	JNE	14$			;No
+	TESTB	CL, #CAN$ALL		;Yes -want to cancel all?
+	JNE	2$.S			;Yes
+	CMPL	ES:xffQab#+0, ESI	;No - want to cancel this one?
+	JNE	14$			;No
+	MOVL	EAX, can_qab+4.B[EBP]	;Maybe
+	CMPW	ES:xffQab#+4, AX
+	JNE	14$			;No
+2$:	TESTB	ES:xffStatus1#, #XF1$ABORT ;Yes - is it being aborted now?
+	JNE	8$.S			;Yes - nothing more needed here
+	ORB	ES:xffStatus1#, #XF1$ABORT ;No - indicate being aborted
+	TESTB	CL, #CAN$ALL|CAN$AFTER	;Want to cancel remaining requests?
+	JE	4$.S			;No
+	ORB	ES:xffStatus1#, #XF1$CANCEL ;Yes
+4$:	TESTB	CL, #CAN$NOINT		;Want to suppress interrupts?
+	JE	6$.S			;No
+	ORB	ES:xffStatus1#, #XF1$NOINT ;Yes
+6$:	BTL	dcb_dsp.B[EDI], #DS%NOABORT ;Can we abort the device?
+	JC	8$.S			;No - let it stop by itself!
+	MOVL	EAX, #ER_ABORT		;Yes - get error code
+	CALL	knlResumeXf		;Stop the current IO operation and let
+	FROMFORK			;  the rest happen in knlXfFinish
+	TOFORK				;Give the fork a chance to execute
+	MOVL	EAX, ES			;Has the active operation terminated
+	CMPW	AX, [EDI+EBX]		;  yet?
+	JNE	12$.S			;Yes
+	MOVW	ES, [EDI+EBX]		;Maybe
+	MOVL	EAX, SS
+	CMPW	ES:xffPda#, AX
+	JNE	12$.S			;Yes
+	CMPW	ES:xffHandle#, DX	;Maybe
+	JNE	12$.S			;Yes
+	TESTB	CL, #CAN$ALL		;Maybe - cancelling all?
+	JNE	2$.S			;Yes - finished
+	CMPL	ES:xffQab#+0, ESI	;No - doing different request now?
+	JNE	12$.S			;Yes - finished
+8$:	LEAVE
+	STC				;Indicate need to wait
+10$:	RET
+
+;Here if finished
+
+12$:	LEAVE
+	CLC
+	RET
+
+;Here with current operation for device handled
+
+14$:	MOVL	EDX, #xffIoQHead#
+	PUSHL	ES
+	POPL	FS
+16$:	MOVL	ESI, FS:[EDX]		;Get next IORB
+	TESTL	ESI, ESI
+	JE	24$.S
+	MOVL	EAX, SS			;Is it one of ours?
+	CMPW	iorb_pda.B[ESI], AX
+	JNE	26$.S			;No - continue
+	MOVL	EAX, can_handle.B[EBP]	;Maybe
+	CMPW	iorb_handle.B[ESI], AX
+	JNE	26$.S			;No
+	TESTB	can_func.B[EBP], #CAN$ALL ;Want to cancel all requests?
+	JNE	18$.S			;Yes
+	MOVL	EAX, can_qab+0.B[EBP]	;No - want to cancel this one?
+	CMPL	ES:xffQab#+0, EAX
+	JNE	26$.S			;No
+	MOVL	EAX, can_qab+4.B[EBP]	;Maybe
+	CMPW	ES:xffQab#+4, AX
+	JNE	26$.S			;No
+18$:	CMPB	iorb_func.B[ESI], #QFNC_CLOSE ;Yes - is this a close function?
+	JE	26$.S			;Yes - can't cancel it!
+	MOVL	EAX, [ESI]		;No - unlink this IORB
+	MOVL	FS:[EDX], EAX
+	TESTL	EAX, EAX		;Was this the last one?
+	JNE	22$.S			;No
+	CMPL	ES:xffIoQHead#, #0.B	;Yes - also first?
+	JNE	20$.S
+	CLRL	EDX
+20$:	MOVL	ES:xffIoQTail#, EDX
+22$:	CALL	canceliorbci		;Cancel the request
+	TESTB	can_func.B[EBP], #CAN$ALL|CAN$AFTER ;Finished now?
+	JE	24$.S			;Yes
+	TESTL	EDX, EDX		;No - have any more to cancel?
+	JNE	16$.S			;Yes
+24$:	LEAVE				;No - finished
+	RET
+
+;Here if this is not one of our requests or is one that we do not want to
+;  cancel now
+
+26$:	MOVL	EDX, ESI		;Advance pointer
+	PUSHL	DS
+	POPL	FS
+	JMP	16$.S			;Continue
+.PAGE
+;Subroutine to cancel queued IO request
+;	c{ESI} = Offset of IORB
+;	CALL	canceliorb
+;  EBX, EDX, ES, and FS are respected
+
+canceliorbci:
+	PUSHL	ES
+	PUSHL	FS
+	PUSHL	EBX
+	PUSHL	EDX
+	IFFAULT	12$
+	LESL	EDX, iorb_qab.B[ESI]	;Get offset of the QAB
+	TESTB	can_func.B[EBP], #CAN$NOINT ;Want to suppress interrupts?
+	JNE	12$.S		;Yes
+	JMP	2$.S		;No
+
+canceliorb:
+	PUSHL	ES
+	PUSHL	FS
+	PUSHL	EBX
+	PUSHL	EDX
+	IFFAULT	12$
+	LESL	EDX, iorb_qab.B[ESI]	;Get offset of the QAB
+	IFFAULT	12$
+2$:	MOVZBL	EAX, ES:qab_vector.B[EDX] ;Get interrupt vector number
+	TESTL	EAX, EAX		;Want software interrupt here?
+	JE	10$.S			;No
+	PUSHL	EBX
+	PUSHL	ESI
+	CALL	knlGetQel#		;Yes - get an interrupt link block
+	JC	8$.S			;Forget it if error!
+	MOVB	slb_szindx.B[ESI], #0
+	MOVB	BL, #SIGT_NORMAL	;Get interrupt type
+	MOVL	ECX, #2			;2 data items for this interrupt
+	MOVL	slb_data+0.B[ESI], EDX	;Store address of the QAB as interrupt
+	CLRL	EDX			;  data
+	MOVW	DX, ES
+	MOVL	slb_data+4.B[ESI], EDX
+	CMPB	knlForkLvl, #FORK_XFF
+	JB	4$.S
+	MOVW	ES, SS:xffPda#
+	JMP	6$.S
+
+4$:	PUSHL	SS
+	POPL	ES
+6$:
+
+;NEED TO ALLOW ONLY ONE OUTSTANDING INTERRUPT HERE!!!
+
+	CLRL	EDX
+	CALL	knlReqSignal#		;Request the software interrupt
+8$:	POPL	ESI
+	POPL	EBX
+	IFFAULT	12$			;Forget it if error here!
+10$:	MOVW	ES:qab_status.B[EDX], #QSTS$DONE ;Indicate operation canceled
+	IFFAULT	12$
+	MOVL	ES:qab_error.B[EDX], #ER_CANCL
+	FAULTHDR
+12$:	CALL	knlGiveIorb		;Give up the IORB
+	POPL	EDX
+	POPL	EBX
+	POPL	FS
+	POPL	ES
+	RET
+.PAGE
+	.SBTTL	knlGiveIorb - Subroutine to give up an IORB
+
+;Subroutine to give up an IORB
+;	c{ESI} = Offset of IORB
+;	CALL	knlGiveIorb
+
+knlGiveIorb::
+	MOVL	ECX, iorb_lock+0.B[ESI]	;Get memory lock pointer count
+	JREGZ	ECX, 8$			;If nothing to unlock
+	TESTL	ECX, #0FFFFFh		;Have a single pointer?
+	JE	2$.S			;No
+	MOVL	EAX, iorb_lock+4.B[ESI]	;Get offset of the MDB
+	PUSHL	ESI
+	CALL	unlocki
+	POPL	ESI
+	JMP	8$.S
+
+;Here if have a lock pointer table
+
+2$:	PUSHL	ESI
+	MOVL	ESI, iorb_lock+4.B[ESI]	;Get pointer to the table
+	PUSHL	ESI
+	SHRL	ECX, #24t		;Get number of pointers
+	PUSHL	ECX
+4$:	MOVL	ECX, [ESI]		;Get contents of the pointer
+	MOVL	EAX, 4.B[ESI]
+	PUSHL	ESI
+	MOVL	ESI, 12t.B[ESP]
+	CALL	unlocki			;Unlock the page
+	POPL	ESI
+	ADDL	ESI, #8.B		;Advance to next entry
+	DECL	[ESP]			;More to unlock?
+	JNE	4$.S			;Yes - continue
+	POPL	EAX			;No - fix up the stack
+	POPL	ESI			;Give up the pointer
+	CALL	knlGiveQel#		;Give up the pointer table
+	POPL	ESI
+8$:	CMPL	iorb_mlckcnt.B[ESI], #0.B ;Did we unlock all of the pages?
+	JE	knlGiveQel#		;Yes - give up the IORB and return
+	CRASH	MPSL			;[Memory Page Still Locked]
+
+
+unlocki:ADDL	ESI, #iorb_mlckcnt.B
+	PUSHL	DS
+	POPL	ES
+	CMPB	knlForkLvl#, #FORK_XFF
+	JB	10$.S
+	MOVW	GS, SS:xffPda#
+	JMP	12$.S
+
+10$:	PUSHL	SS
+	POPL	GS
+12$:	MOVL	EDX, ECX		;Get page number
+	DECL	EDX
+	SHLL	EDX, #12t		;Change to offset
+	SHRL	ECX, #20t		;Get number of pages
+	ADDL	EDX, mdb_la.B[EAX]	;Get linear address of first page
+	SHRL	EDX, #10t		;Change to page table offset
+	ADDL	EDX, #pgtable
+	JMP	unlockmem#		;Unlock the memory page and return
+.PAGE
+	.SBTTL	Common device dependent device parameter tables
+
+;Common device parameter table for devices which only support the minimum
+;  required parameters
+
+	.MOD	4
+comparms::
+	.LONG	PARMMAX		;Size of table
+	.LONG	0		;		   = 0.
+	.LONG	knlIopFilOptn#	;IOPAR_FILOPTN     = 1.
+	.LONG	knlIopFilSpec#	;IOPAR_FILSPEC     = 2.
+	.LONG	knlIopDevSts#	;IOPAR_DEVSTS      = 3.
+	.LONG	knlIopUnitNum#	;IOPAR_UNITNUM     = 4.
+	.LONG	knlIopGlbId#	;IOPAR_GLBID       = 5.
+	.LONG	knlIopNullN	;IOPAR_DELAY       = 6.
+	.LONG	knlIopNullN	;IOPAR_TIMEOUT     = 7.
+	.LONG	knlIopIoSts#	;IOPAR_INPSTS	   = 8.
+	.LONG	knlIopIoSts#	;IOPAR_OUTSTS	   = 9.
+	.LONG	knlIopInpQLmt#	;IOPAR_INPQLMT	   = 10.
+	.LONG	knlIopOutQLmt#	;IOPAR_OUTQLMT	   = 11.
+PARMMAX=!{$-comparms}/4
+
+;Common device dependent device parameter table - this table may be used by
+;  device drivers which do not require any device dependent parameters
+
+	.LONG	1
+knlComDPParms::
+	.LONG	comdp0parms
+
+	.LONG	1
+comdp0parms:
+	.LONG	knlIoparClass	;IOPAR_CLASS = 8000h - Device class
+
+	.LONG	1
+dmyparms:
+	.LONG	0
+.PAGE
+	.SBTTL	knlProcDevParm - Subroutine to process device parameters
+
+;Subroutine to process device parameters - this routine is called by each
+;  device driver to compare the given parameters against a parameter table
+;  and to call a routine for each parameter given
+;	c{FS:EDX} = Address of parameter list
+;	c{EBX}    = Offset of standard parameter table
+;	c{ECX}    = Offset of device dependent parameter table
+;	CALL	knlProcDevParm
+;	C:set = Error
+;	  c{EAX} = Error code (error indication also set in parameter list)
+;	  c{EBX} = QSTS$DONE
+;	  c{ECX} = 0
+;	C:clr = Normal
+;	  c(AL) = Flag bits from pdp_flags
+;  ESI is preserved
+
+;Each parameter table is a simple table of memory offsets indexed by the
+;  parameter index.  The first long in each table contains the maximum index
+;  for the table.  The standard table starts with the entry for parameter 0
+;  and the device dependent table starts with the entry for parameter 128t.
+;  Each table entry points to a parameter handling routine which must be
+;  immediately prefixed in memory with a two bytes which indicate valid
+;  parameter formats.  The first byte (offset -1) contains two bits which
+;  indicate if the set or get functions are valid:
+;       Name    Value          Use
+;     PAR$SET     80   Set if set operation is NOT valid
+;     PAR$GET     40   Set if get operation is NOT valid
+;     PAR$ERROR   20   Cleared at start of parameter processing, set if error
+;			 occures
+;     PAR$INFO    10   Not used, must be 0
+;     PAR$REP     0F   Prefered representation of value
+;  The second byte (offset -2) specifies the prefered size of the value.
+;  The DPARMHDR macro may be used to define these two bytes as follows:
+;	DPARMHDR oper, rep
+;    where:  oper = One of: SET, GET, or BOTH to inidicate LEGAL operation(s)
+;            rep  = Perfered representation (DECV, HEXV, OCTV, DECB, HEXB,
+;		      OCTV, TEXT, or STR)
+;	     size = Perfered size of value in bytes
+
+;The parameter subroutine is called as follows:
+;	c(AL)     = Parameter index
+;	c(AH)     = Parameter description byte
+;	c{ES:EBX} = Address of value
+;	c{ECX}    = Number of value bytes or length of string buffer
+;	c{FS:EDX} = Address of word to receive string length (long string value
+;		      only)
+;	Registers EDI, ESI, and EBP are unchanged from the call to
+;	  knlProcDevParm
+;	CALL	subroutine
+;	C:set = Error (causes error return from knlProcDevParm)
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;  Registers do not need to be preserved (except for EBP and ESP, of course).
+;    This subroutine may get the parameter value from the parameter list, store
+;    a new value in the parameter list for the parameter or it may store the
+;    address and value size information and later store a value (anytime before
+;    the IO routine does its final return.  The subroutines getparm, strparm4,
+;    and strparm8 are provided for this purpose.
+
+$$$=!0
+FRM pdp_parm  , 8	;Address of user's parameter list
+FRM pdp_length, 4	;Lenth of parameter value
+FRM pdp_stable, 4	;Offset of standard parameter table
+FRM pdp_dtable, 4	;Offset of device dependent parameter table
+FRM pdp_typex , 1	;Type and index for current parameter
+FRM pdp_flags , 1	;Flag bits
+FRM           , 2
+FRM pdp_ESI   , 4	;Place to save ESI
+pdp_SIZE=!$$$
+
+;Define values for pdp_flags
+
+PDPF$CLASS=!80h		;Have seen correct IOPAR_CLASS value
+PDPF$IGNBP=!40h		;Ignore illegal parameter index values
+
+2$:	RET
+
+knlProcDevParm::
+	MOVB	AL, #0
+knlProcDevParmx:
+	TESTL	EDX, EDX		;Null pointer?
+	JE	2$.S			;Yes - nothing to do here!
+	ENTER	pdp_SIZE, 0
+	MOVB	pdp_flags.B[EBP], AL	;Save initial flag bits
+	MOVL	pdp_ESI.B[EBP], ESI	;Save ESI
+	MOVL	pdp_stable.B[EBP], EBX	;Save offsets of the parameter tables
+	MOVL	pdp_dtable.B[EBP], ECX
+	MOVL	pdp_parm+0.B[EBP], EDX	;Save address of the parameter list
+	MOVW	pdp_parm+4.B[EBP], FS
+	IFFAULT	pdpadrer
+doparm:	LFSL	EDX, pdp_parm.B[EBP]	;Get address of next parameter
+	IFFAULT	pdpadrer
+	ANDB	FS:[EDX], #~PAR$ERROR	;Clear bad parameter indication
+	IFFAULT	pdpadrer
+	MOVZBL	ECX, FS:[EDX]		;Get parameter description byte
+	CMPB	CL, #0			;End of list?
+	JE	12$			;Yes - finished
+	MOVB	pdp_typex.B[EBP], CL	;No - store description byte for later
+	IFFAULT	pdpadrer
+	MOVZBL	EAX, FS:3.B[EDX]	;Get parameter page number
+	MOVL	ESI, pdp_stable.B[EBP]	;Assume standard parameter
+	TESTB	AL, AL			;Right?
+	JNS	6$.S			;Yes
+	SUBL	EAX, #80h		;No - its a device dependent parameter
+	JNE	3$.S
+	CMPB	FS:2.B[EDX], #0		;Is it the device class?
+	JNE	3$.S			;No
+	TESTB	CL, #PAR$SET		;Yes - are we setting it?
+	JE	4$.S			;No
+	ORB	pdp_flags.B[EBP], #PDPF$CLASS ;Yes
+3$:	TESTB	pdp_flags.B[EBP], #PDPF$CLASS ;Have we seen the device class?
+	JE	9$.S			;No - say bad parameter
+4$:	MOVL	ESI, pdp_dtable.B[EBP]	;Get right table offset
+	TESTL	ESI, ESI		;Do we have a device dependent table?
+	JE	10$.S			;No - skip this
+6$:	CMPL	EAX, CS:-4.B[ESI]	;Valid value?
+	JAE	8$.S			;No
+	MOVL	ESI, CS:[ESI+EAX*4]	;Yes - get offset of next table
+	TESTL	ESI, ESI		;Do we have a 2nd level table?
+	JE	8$.S			;No - fail
+	MOVB	AL, FS:2.B[EDX]		;Yes - get 2nd level index
+	CMPL	EAX, CS:-4.B[ESI]	;Valid value?
+	JAE	8$.S			;No
+	MOVL	ESI, CS:[ESI+EAX*4]	;Yes - get offset of routine
+	TESTL	ESI, ESI		;Is there one?
+	JNE	14$.S			;Yes - go on
+8$:	TESTB	pdp_flags.B[EBP], #PDPF$IGNBP ;No - should we ignore this?
+9$:	JE	badparmi		;No - fail
+10$:	ANDB	CL, #0Fh		;Yes - get representation
+	MOVL	EAX, #16t		;Assume string
+	CMPB	CL, #REP_STR		;Right?
+	JE	24$			;Yes
+	CMPB	CL, #REP_DATAS
+	JE	24$
+	IFFAULT	pdpadrer
+	MOVB	AL, FS:1.B[EDX]		;No - get length
+	JMP	22$.S			;Continue
+
+;Here when finished
+
+12$:	MOVL	ESI, pdp_ESI.B[EBP]
+	MOVB	AL, pdp_flags.B[EBP]
+	LEAVE
+	RET
+
+;Here with valid parameter index
+
+14$:	MOVB	AH, CL			;Yes
+	MOVB	CH, CS:-1.B[ESI]
+	ANDB	CL, CH			;Legal request?
+	TESTB	CL, #PAR$GET|PAR$SET
+	JNE	badparmf.S		;No - fail
+	MOVB	CL, AH			;Yes - get value type
+	ANDB	CL, #0Fh
+	ANDB	CH, #0Fh
+	CMPB	CL, CH			;Same representation?
+	JE	16$.S			;Yes - go on
+	CMPB	CL, #REP_TEXT		;No - are both numeric?
+	JAE	badparmt.S
+	CMPB	CH, #REP_TEXT
+	JAE	badparmt.S		;No fail
+16$:	CMPB	CL, #REP_STR		;Is this a string?
+	JE	18$.S			;Yes - go handle that
+	CMPB	CL, #REP_DATAS
+	JE	18$.S
+	IFFAULT	pdpadrer
+	MOVZBL	ECX, FS:1.B[EDX]	;No - get size of value
+	MOVL	pdp_length.B[EBP], ECX
+	LESL	EBX, pdp_parm.B[EBP]	;Point to the value
+	ADDL	EBX, #4.B
+	JMP	20$.S			;Continue
+
+;Here if have a string or data value
+
+18$:	MOVL	pdp_length.B[EBP], #12t	;Store length of parameter item
+	MOVL	EBX, #4			;Get address of string
+	CALL	dcgetaddr#
+	JC	baddp.S
+	IFFAULT	pdpadrer
+	MOVZWL	ECX, FS:12t.B[EDX]	;Get length of buffer
+	ADDL	EDX, #14t.B		;Get address of length word
+20$:	PUSHL	EBP			;Save our stack frame
+	PUSHL	#21$
+	PUSHL	ESI
+	MOVL	ESI, pdp_ESI.B[EBP]	;Restore caller's ESI
+	MOVL	EBP, 0.B[EBP]		;Restore previous stack frame
+	CLC
+	RET				;"Call" subroutine for device
+
+21$:	POPL	EBP			;Restore our stack frame
+	JC	baddp.S
+	MOVL	EAX, pdp_length.B[EBP]	;Bump pointer
+22$:	ADDL	EAX, #4.B
+24$:	ADDL	pdp_parm+0.B[EBP], EAX
+	JMP	doparm			;Continue
+.PAGE
+;Here with illegal index for parameter
+
+badparmi:
+	MOVL	EAX, #ER_PARMI
+	JMP	4$.S
+
+;Here with illegal function for parameter
+
+badparmf:
+	MOVL	EAX, #ER_PARMF
+	JMP	4$.S
+
+;Here with illegal parameter type value
+
+badparmt:
+	MOVL	EAX, #ER_PARMT
+baddp:	BTL	EAX, #31t		;Valid error code?
+	JNC	10$.S			;No!
+	IFFAULT	pdpadrer
+4$:	LFSL	EDX, pdp_parm.B[EBP]	;Restore address of parameter list
+	IFFAULT	pdpadrer
+	ORB	FS:[EDX], #PAR$ERROR	;Indicate bad parameter
+6$:	MOVL	ESI, pdp_ESI.B[EBP]
+	LEAVE
+	CLRL	ECX
+	MOVL	EBX, #QSTS$DONE
+	STC
+ret012:	RET
+
+10$:	CRASH	BDEC			;[BaD Error Code]
+
+;Here if address error in knlProcDevParm
+
+	FAULTHDR
+pdpadrer:
+	MOVL	EAX, #ER_ADRER
+	JMP	6$.S
+.PAGE
+	.SBTTL	knlIopNullN - Subroutine to handle null parameter with numeric value
+
+;Subroutine to handle null parameter with numeric value
+
+	DPARMHDR  BOTH, DECV
+knlIopNullN::
+	TESTB	AH, #PAR$GET		;Want a value returned?
+	JE	ret012.S		;No - nothing needed here
+	CLRL	EAX			;Yes - return 0
+	JMP	knlStrParm4
+
+	.SBTTL	knlIopNullT - Subroutine to handle null parameter with text value
+
+;Subroutine to handle null parameter with text value
+
+	DPARMHDR  BOTH, TEXT
+knlIopNullT::
+	JMP	knlIopNullN.S
+
+	.SBTTL	knlIopNullS - Subroutine to handle null parameter with string value
+
+;Subroutine to handle null parameter with string value
+
+	DPARMHDR  BOTH, STR
+knlIopNullS::
+	TESTB	AH, #PAR$GET		;Want a value returned?
+	JE	ret012.S		;No - nothing needed here
+	CLRL	EAX			;Yes - return a null string
+	IFFAULT	knlRtnAdrEr#
+	MOVB	ES:[EBX], AL
+	IFFAULT	knlRtnAdrEr#
+	MOVW	FS:[EDX], AX
+	RET
+
+	.SBTTL	knlIopDummyN - Subroutine to handle dummy parameter with numeric value
+
+;Subroutine to handle dummy parameter with numeric value
+
+	DPARMHDR  BOTH, DECV
+knlIopDummyN::
+	CLC				;Just indicate no error
+	RET
+
+	.SBTTL	knlIopDummyT - Subroutine to handle dummy parameter with text value
+
+;Subroutine to handle dummy parameter with text value
+
+	DPARMHDR  BOTH, TEXT
+knlIopDummyT::
+	CLC				;Just indicate no error
+	RET
+
+	.SBTTL	knlIopDummyS - Subroutine to handle dummy parameter with string value
+
+;Subroutine to handle dummy parameter with string value
+
+	DPARMHDR  BOTH, STR
+knlIopDummyS::
+	CLC				;Just indicate no error
+	RET
+.PAGE
+	.SBTTL	knlIoparClass - Subroutine to handle IOPAR_CLASS parameter
+
+;Subroutine to process IOPAR_CLASS parameter
+
+	DPARMHDR  BOTH, TEXT
+knlIoparClass::
+	TESTB	AH, #PAR$SET		;Want to "set" the value?
+	JE	4$.S			;No
+	PUSHL	EAX			;Yes
+	CALL	knlGetParm		;Get value
+	JC	8$.S
+	MOVL	ESI, dcb_ccb.B[EDI]
+	CMPL	EAX, ccb_name+0.B[ESI]	;Is it correct?
+	JNE	6$.S			;No
+	CMPL	EDX, ccb_name+4.B[ESI]	;Maybe
+	JNE	6$.S			;No
+	POPL	EAX			;Yes
+4$:	TESTB	AH, #PAR$GET		;Want a value returned?
+	JE	10$.S			;No
+	MOVL	ESI, dcb_ccb.B[EDI]	;Yes
+	MOVL	EAX, ccb_name+0.B[ESI]
+	MOVL	EDX, ccb_name+4.B[ESI]
+	JMP	knlStrParm8		;Store value
+
+;Here if class name is wrong
+
+6$:	MOVL	EAX, #ER_PARMV
+8$:	POPL	ECX			;Fix up the stack
+	STC
+10$:	RET
+.PAGE
+;Subroutine to get parameter value - this subroutine is intended to be called
+;  from the routine called by knlProcDevParm to get a new value for a device
+;  parameter from the user's parameter list
+;	c{ES:EBX} = Address of value
+;	c{ECX}    = Size of value in bytes (0 to 8)
+;	CALL	knlGetParm
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:normal
+;	  c{EDX,EAX} = Value (64 bits)
+
+knlGetParm::
+	CMPL	ECX, #8.B		;Is it too long?
+	JA	2$.S			;Yes - fail
+	JMPIL	getdsp[ECX*4]		;Dispatch on the value size
+
+2$:	MOVL	EAX, #ER_PARMS
+	STC
+	RET
+
+	DATA
+
+getdsp:	.LONG	get0byte	; 0
+	.LONG	get1byte	; 1
+	.LONG	get2byte	; 2
+	.LONG	get3byte	; 3
+	.LONG	get4byte	; 4
+	.LONG	get5byte	; 5
+	.LONG	get6byte	; 6
+	.LONG	get7byte	; 7
+	.LONG	get8byte	; 8
+
+	CODE
+
+;Here for 0 byte value
+
+get0byte:
+	CLRL	EAX
+	CLRL	EDX
+	RET
+
+;Here to get a 1 byte value
+
+	IFFAULT	knlRtnAdrEr#
+get1byte:
+	MOVZBL	EAX, ES:[EBX]
+	CLRL	EDX
+	RET
+
+;Here to get a 2 byte value
+
+	IFFAULT	knlRtnAdrEr#
+get2byte:
+	MOVZWL	EAX, ES:[EBX]
+	CLRL	EDX
+	RET
+
+;Here to get a 3 byte value
+
+	IFFAULT	knlRtnAdrEr#
+get3byte:
+	MOVZBL	EAX, ES:2.B[EBX]
+	SHLL	EAX, #16t
+	IFFAULT	knlRtnAdrEr#
+	MOVW	AX, ES:[EBX]
+	CLRL	EDX
+	RET
+
+;Here to get a 4 byte value
+
+get4byte:
+	CLRL	EDX
+	IFFAULT	knlRtnAdrEr#
+4$:	MOVL	EAX, ES:[EBX]
+	RET
+
+;Here to get a 5 byte value
+
+	IFFAULT	knlRtnAdrEr#
+get5byte:
+	MOVZBL	EDX, ES:4.B[EBX]
+	JMP	4$.S
+
+;Here to get a 6 byte value
+
+	IFFAULT	knlRtnAdrEr#
+get6byte:
+	MOVZWL	EDX, ES:4.B[EBX]
+	JMP	4$.S
+
+;Here to get a 7 byte value
+
+	IFFAULT	knlRtnAdrEr#
+get7byte:
+	MOVZBL	EDX, ES:6.B[EBX]
+	SHLL	EDX, #16t
+	IFFAULT	knlRtnAdrEr#
+	MOVW	DX, ES:4.B[EBX]
+	JMP	4$.S
+
+;Here to get an 8 byte value
+
+	IFFAULT	knlRtnAdrEr#
+get8byte:
+	MOVL	EDX, ES:4.B[EBX]
+	JMP	4$.S
+.PAGE
+;Subroutine to store 4 byte parameter value - this subroutine is intended to be
+;  called from the routine called by knlProcDevParm to store the value of a
+;  device parameter in the user's parameter list
+;	c{EAX}    = Value
+;	c{ES:EBX} = Address for value
+;	c{ECX}    = Size of area for value in bytes
+;	CALL	knlStrParm4
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:normal
+
+knlStrParm4::
+	CLRL	EDX			;Zero extend to 8 bytes
+					;Fall into strparm8
+
+;Subroutine to store 8 byte parameter value - this subroutine is intended to be
+;  called from the routine called by knlProcDevParm to store the value of a
+;  device parameter in the user's parameter list
+;	c{EDX,EAX} = Value
+;	c{ES:EBX}  = Address for value
+;	c{ECX}     = Size of field for value in bytes
+;	CALL	knlStrParm8
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:normal
+
+knlStrParm8::
+	CMPL	ECX, #8t.B		;Is this a large field?
+	JA	strmbyte.S		;Yes
+	JMPIL	strdsp[ECX*4]		;No - dispatch on the field size
+
+	DATA
+
+strdsp:	.LONG	str0byte	; 0
+	.LONG	str1byte	; 1
+	.LONG	str2byte	; 2
+	.LONG	str3byte	; 3
+	.LONG	str4byte	; 4
+	.LONG	str5byte	; 5
+	.LONG	str6byte	; 6
+	.LONG	str7byte	; 7
+	.LONG	str8byte	; 8
+
+	CODE
+
+;Here to store a value longer than 8 bytes
+
+strmbyte:
+	CALL	str8byte
+	JC	6$.S
+	PUSHL	ECX
+	SUBL	ECX, #8.B
+	PUSHL	EDI
+	LEAL	EDI, 8.B[EBX]
+	MOVB	AL, #0
+	IFFAULT	2$
+	RSTOSB	[EDI]
+	POPL	EDI
+	POPL	ECX
+	RET
+
+	FAULTHDR
+2$:	POPL	EDI
+	POPL	ECX
+	JMP	knlRtnAdrEr#
+
+;Here for 0 byte value
+
+str0byte:
+	ORL	EAX, EDX		;Is the value 0?
+	JE	6$.S			;Yes - OK
+4$:	MOVL	EAX, #ER_PARMV		;No - fail
+	STC
+6$:	RET
+
+;Here to store a 1 byte value
+
+str1byte:
+	TESTL	EAX, #0FFFFFF00h	;Will the value fit in 1 byte?
+	JNE	4$.S			;No
+	TESTL	EDX, EDX
+	JNE	4$.S
+	IFFAULT	knlRtnAdrEr#
+	MOVB	ES:[EBX], AL		;Yes - store value
+	RET
+
+;Here to store a 2 byte value
+
+str2byte:
+	TESTL	EAX, #0FFFF0000h	;Will the value fit in 2 bytes?
+	JNE	4$.S			;No
+	TESTL	EDX, EDX
+	JNE	4$.S
+	IFFAULT	knlRtnAdrEr#
+	MOVW	ES:[EBX], AX		;Yes - store value
+	RET
+
+;Here to store a 3 byte value
+
+str3byte:
+	TESTL	EAX, #0FF000000h	;Will the value fit in 2 bytes?
+	JNE	4$.S			;No
+	TESTL	EDX, EDX
+	JNE	4$.S
+	IFFAULT	knlRtnAdrEr#
+	MOVW	ES:[EBX], AX		;Yes - store value
+	SHRL	EAX, #16t
+	IFFAULT	knlRtnAdrEr#
+	MOVB	ES:2.B[EBX], AL
+	CLC
+	RET
+
+;Here to store a 4 byte value
+
+str4byte:
+	TESTL	EDX, EDX		;Will the value fit in 4 bytes?
+	JNE	4$.S
+	IFFAULT	knlRtnAdrEr#
+	MOVL	ES:[EBX], EAX		;Yes - store value
+	RET
+
+;Here to store a 5 byte value
+
+str5byte:
+	TESTL	EDX, #0FFFFFF00h	;Will the value fit in 5 bytes?
+10$:	JNE	4$.S			;No
+	IFFAULT	knlRtnAdrEr#
+	MOVL	ES:[EBX], EAX		;Yes - store value
+	IFFAULT	knlRtnAdrEr#
+	MOVB	ES:4.B[EBX], DL
+	CLC
+	RET
+
+;Here to store a 6 byte value
+
+str6byte:
+	TESTL	EDX, #0FFFF0000h	;Will the value fit in 6 bytes?
+	JNE	10$.S			;No
+	IFFAULT	knlRtnAdrEr#
+	MOVL	ES:[EBX], EAX		;Yes - store value
+	IFFAULT	knlRtnAdrEr#
+	MOVW	ES:4.B[EBX], DX
+	RET
+
+;Here to store a 7 byte value
+
+str7byte:
+	TESTL	EDX, #0FF000000h	;Will the value fit in 7 bytes?
+	JNE	10$.S			;No
+	IFFAULT	knlRtnAdrEr#
+	MOVL	ES:[EBX], EAX		;Yes - store value
+	IFFAULT	knlRtnAdrEr#
+	MOVW	ES:4.B[EBX], DX
+	SHRL	EDX, #16t
+	IFFAULT	knlRtnAdrEr#
+	MOVB	ES:6.B[EBX], DL
+	CLC
+	RET
+
+;Here to store an 8 byte value
+
+	IFFAULT	knlRtnAdrEr#
+str8byte:
+	MOVL	ES:[EBX], EAX		;Store value
+	IFFAULT	knlRtnAdrEr#
+	MOVL	ES:4.B[EBX], EDX
+	CLC
+	RET
+.PAGE
+;Subroutine to store long parameter value - this subroutine is intended to be
+;  called from the routine called by knlProcDevParm to store the value of a
+;  device parameter in the user's parameter list
+;	c{EAX}    = Length of available value
+;	c{FS:ESI} = Address of value string
+;	c{ES:EBX} = Address for value
+;	c{ECX}    = Size of field for value in bytes
+;	CALL	knlStrParmLng
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:normal
+
+knlStrParmLng::
+	XCHGL	EAX, ECX
+	SUBL	EAX, ECX
+	JB	knlBadParmV#		;If it won't fit
+	PUSHL	EDI
+	MOVL	EDI, EBX
+	CLD
+	IFFAULT	4$
+	RMOVSB	[EDI], FS:[ESI]		;Copy the value
+	MOVL	ECX, EAX		;Zero out the remainder
+	MOVB	AL, #0
+	IFFAULT	4$
+	RSTOSB	[EDI]
+	POPL	EDI
+	CLC
+	RET
+
+	FAULTHDR
+4$:	POPL	EDI
+	JMP	knlRtnAdrEr#
+.PAGE
+;Subroutine to add to 4 byte parameter value - this subroutine is intended to
+;  be called from the routine called by knlProcDevParm to store the value of a
+;  device parameter in the user's parameter list
+;	c{EDX,EAX} = Value
+;	c{ES:EBX}  = Address for value
+;	c{ECX}     = Size of area for value in bytes
+;	CALL	knlAddParm4
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:normal
+
+knlAddParm4::
+	CLRL	EDX			;Zero extend to 8 bytes
+					;Fall into strparm8
+
+;Subroutine to add to 8 byte parameter value - this subroutine is intended to
+;  be called from the routine called by knlProcDevParm to store the value of a
+;  device parameter in the user's parameter list
+;	c{EDX,EAX} = Value
+;	c{ES:EBX}  = Address for value
+;	c{ECX}     = Size of field for value in bytes
+;	CALL	knlAddParm8
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:normal
+
+knlAddParm8::
+	CMPL	ECX, #8t.B		;Is this a large field?
+	JA	addmbyte.S		;Yes
+	JMPIL	adddsp[ECX*4]		;No - dispatch on the field size
+
+	DATA
+
+adddsp:	.LONG	str0byte	; 0
+	.LONG	add1byte	; 1
+	.LONG	add2byte	; 2
+	.LONG	add3byte	; 3
+	.LONG	add4byte	; 4
+	.LONG	add5byte	; 5
+	.LONG	add6byte	; 6
+	.LONG	add7byte	; 7
+	.LONG	add8byte	; 8
+
+	CODE
+
+;Here to add in a value longer than 8 bytes
+
+addmbyte:
+	SUBL	ECX, #8.B
+	IFFAULT	knlRtnAdrEr#
+	ADDL	ES:[EBX], EAX
+	IFFAULT	knlRtnAdrEr#
+	ADCL	ES:4.B[EBX], EDX
+2$:	ADCB	ES:8.B[EBX], #0
+	JNC	6$.S
+	LOOP	ECX, 2$
+	JMP	4$.S
+
+;Here to add in a 1 byte value
+
+add1byte:
+	TESTL	EAX, #0FFFFFF00h	;Will the value fit in 1 byte?
+	JNE	4$.S			;No
+	TESTL	EDX, EDX
+	JNE	4$.S
+	IFFAULT	knlRtnAdrEr#
+	ADDB	ES:[EBX], AL		;Yes
+	JC	4$.S
+	RET
+
+;Here to add in a 2 byte value
+
+add2byte:
+	TESTL	EAX, #0FFFF0000h	;Will the value fit in 2 bytes?
+	JNE	4$.S			;No
+	TESTL	EDX, EDX
+	JNE	4$.S
+	IFFAULT	knlRtnAdrEr#
+	ADDW	ES:[EBX], AX		;Yes
+	JC	4$.S
+	RET
+
+;Here to add in a 3 byte value
+
+add3byte:
+	TESTL	EAX, #0FF000000h	;Will the value fit in 2 bytes?
+	JNE	4$.S			;No
+	TESTL	EDX, EDX
+	JNE	4$.S
+	MOVL	EDX, EAX
+	SHRL	EDX, #16t
+	IFFAULT	knlRtnAdrEr#
+	ADDW	ES:[EBX], AX
+	IFFAULT	knlRtnAdrEr#
+	ADCB	ES:2.B[EBX], DL
+	JC	4$.S
+	RET
+
+;Here to add in a 4 byte value
+
+add4byte:
+	TESTL	EDX, EDX		;Will the value fit in 4 bytes?
+	JNE	4$.S
+	IFFAULT	knlRtnAdrEr#
+	ADDL	ES:[EBX], EAX		;Yes
+	JNC	6$.S
+4$:	MOVL	EAX, #ER_PARMV		;Fail if overflow
+	STC
+6$:	RET
+
+;Here to add in a 5 byte value
+
+add5byte:
+	TESTL	EDX, #0FFFFFF00h	;Will the value fit in 5 bytes?
+	JNE	4$.S			;No
+	IFFAULT	knlRtnAdrEr#
+	ADDL	ES:[EBX], EAX
+	IFFAULT	knlRtnAdrEr#
+	ADCB	ES:4.B[EBX], DL
+	JC	4$.S
+	RET
+
+;Here to add in a 6 byte value
+
+add6byte:
+	TESTL	EDX, #0FFFF0000h	;Will the value fit in 5 bytes?
+	JNE	4$.S			;No
+	IFFAULT	knlRtnAdrEr#
+	ADDL	ES:[EBX], EAX
+	IFFAULT	knlRtnAdrEr#
+	ADCW	ES:4.B[EBX], DX
+	JC	4$.S
+	RET
+
+;Here to add in a 7 byte value
+
+add7byte:
+	TESTL	EDX, #0FF000000h	;Will the value fit in 5 bytes?
+	JNE	4$.S			;No
+	MOVL	ECX, EDX
+	SHRL	ECX, #16t
+	IFFAULT	knlRtnAdrEr#
+	ADDL	ES:[EBX], EAX
+	IFFAULT	knlRtnAdrEr#
+	ADCW	ES:4.B[EBX], DX
+	JC	4$.S
+	IFFAULT	knlRtnAdrEr#
+	ADCB	ES:6.B[EBX], CL
+	RET
+
+;Here to add in an 8 byte value
+
+	IFFAULT	knlRtnAdrEr#
+add8byte:
+	ADDL	ES:[EBX], EAX
+	IFFAULT	knlRtnAdrEr#
+	ADCL	ES:4.B[EBX], EDX
+	JC	4$
+ret018:	RET
+.PAGE
+	.SBTTL	getdevinfo - Subroutine to return information about devices
+
+;Subroutine to return information about devices
+;	c{ES:EDI} = Address of user's data array
+;	c{ECX}    = Space available
+;	c{EDX}    = Data value (0 = return summary info about all devices,
+;		      otherwise gives DCB ID for detailed device info)
+;	CALL	getdevinfo
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  c{EAX} = Items returned
+
+;Format of the summary data returned:
+;  Offset   Size    Use
+;     0       8     Class name
+;     8       8     Device name
+;    16       4     Device type
+;    20       4     Group process ID
+;    24       4     Open count
+;    28       4     DCB ID
+;    32      28     Reserved
+
+getdevinfo::
+	TESTL	EDX, EDX		;Want summary data?
+	JE	4$.S			;Yes
+	CMPW	DX, #1.B		;No - valid DCB ID index value?
+	JB	2$.S			;No
+	CMPW	DX, dcbtblsize#		;Maybe
+	JAE	knlBadValue#		;No
+	MOVZWL	EAX, DX			;Yes
+	MOVL	ESI, dcbtable[EAX*4]	;Get offset of DCB
+	TESTL	ESI, ESI
+	JS	2$.S			;Fail if no DCB
+	CMPL	EDX, dcb_id.B[ESI]
+2$:	JNE	knlBadValue#
+	MOVL	EAX, dcb_sdisp.B[ESI]
+	JMPIL	CS:sd_devinfo.B[EAX]
+
+;Here if want summary data
+
+4$:	MOVL	ESI, knlFirstCcb#	;Get first CCB in system
+	SARL	ECX, #6			;Get number of entries we have room for
+	CLRL	EDX			;Clear count
+6$:	MOVL	EBX, ccb_dcbhead.B[ESI]	;Get first DCB for class
+	CALL	chkdcb			;See if real DCB
+	JNE	10$.S			;Yes
+	TESTL	EDI, EDI		;No - want data returned?
+	JE	8$.S			;No
+	CALL	classinfo		;Yes - give him the class name
+	JC	ret018.S
+	PUSHL	ECX
+	MOVL	ECX, #13t
+	CLRL	EAX
+	RSTOSL	[EDI]
+	POPL	ECX
+8$:	INCL	EDX			;Count this entry
+	JMP	18$
+
+10$:	TESTL	EDI, EDI		;Want data returned?
+	JE	16$			;No
+	CALL	classinfo		;Yes -give him the class name
+	JC	ret018.S
+	MOVL	EAX, dcb_name+0.B[EBX]	;Yes - give him the device name
+	IFFAULT	knlRtnAdrEr#
+	STOSL	[EDI]
+	MOVL	EAX, dcb_name+4.B[EBX]
+	IFFAULT	knlRtnAdrEr#
+	STOSL	[EDI]
+	MOVL	EAX, dcb_type.B[EBX]	;Give him the type name
+	IFFAULT	knlRtnAdrEr#
+	STOSL	[EDI]
+	MOVZWL	EAX, dcb_sesproc.B[EBX]	;Give him the session PID
+	IFFAULT	knlRtnAdrEr#
+	STOSL	[EDI]
+	MOVL	EAX, dcb_opencnt.B[EBX]	;Give him the open count
+	IFFAULT	knlRtnAdrEr#
+	STOSL	[EDI]
+	MOVL	EAX, dcb_id.B[EBX]	;Give him the DCB ID
+	IFFAULT	knlRtnAdrErP1#
+	STOSL	[EDI]
+	MOVZWL	EAX, dcb_outframe.B[EBX] ;Do we have an output frame?
+	TESTL	EAX, EAX
+	JE	12$.S			;No
+	MOVL	FS, EAX
+	MOVZBL	EAX, FS:xffIoQCnt#	;Yes - get the queue count
+	INCL	EAX			;Plus one gives the output count
+	IFFAULT	knlRtnAdrErP1#
+12$:	STOSW	[EDI]			;Give it to him
+	MOVZWL	EAX, dcb_inpframe.B[EBX] ;Do we have an input frame?
+	TESTL	EAX, EAX
+	JE	14$.S			;No
+	MOVL	FS, EAX
+	MOVZBL	EAX, FS:xffIoQCnt#	;Yes - get the queue count
+	INCL	EAX			;Plus one give the input count
+	IFFAULT	knlRtnAdrErP1#
+14$:	STOSW	[EDI]			;Give it to him
+	PUSHL	ECX
+	MOVL	ECX, #6			;Zero the reserved items
+	CLRL	EAX
+	IFFAULT	knlRtnAdrErP1#
+	RSTOSL	[EDI]
+	POPL	ECX
+16$:	INCL	EDX			;Count this entry
+	MOVL	EBX, dcb_next.B[EBX]	;Advance to next DCB in class
+	CALL	chkdcb			;Is there another one?
+	JNE	10$			;Yes - continue
+18$:	MOVL	ESI, [ESI]		;Advance to next class
+	TESTL	ESI, ESI		;Have another class?
+	JNE	6$			;Yes - continue
+	MOVL	EAX, EDX		;No - get item count in right register
+ret020:	RET				;And return
+.PAGE
+knlInfoNone::
+	JREGZ	ECX, 2$
+	IFFAULT	knlRtnAdrEr#
+	MOVB	ES:[EDI], #0
+2$:	CLRL	EAX
+	RET
+
+;Subroutine to return a fixed string as device info
+;	c{EBX} = Offset of string
+;	c{EDX} = Maximum length of string
+;	CALL	knlInfoSimple
+
+knlInfoSimple::
+	CLRL	EBP			;Clear count
+4$:	MOVB	AL, [EBX]		;Get character
+	INCL	EBX
+	CMPB	AL, #0			;End of string?
+	JE	8$.S			;Yes
+	DECL	ECX			;Room for more?
+	JS	6$.S			;No
+	IFFAULT	knlRtnAdrEr#		;Yes
+	STOSB	[EDI]			;Store character
+6$:	INCL	EBP			;Count the character
+	DECL	EDX			;Can we have more?
+	JNE	4$.S			;Yes - continue
+8$:	DECL	ECX			;No - have room for a null?
+	JS	10$.S			;No
+	IFFAULT	knlRtnAdrEr#		;Yes
+	MOVB	ES:[EDI], #0		;Store final null
+10$:	MOVL	EAX, EBP		;Get count in right register
+	CLC
+	RET				;Finished
+
+;Define stack frame for routines below
+
+$$$=!0
+FRM info_left  , 4t
+FRM info_amount, 4t
+info_SIZE=!$$$
+
+;Subroutine to store decimal value into the information buffer
+;	C{EAX}    = Value
+;	c{ES:EDI} = Buffer pointer
+;	CALL	knlInfoDec
+
+knlInfoDec::
+	CLRL	EDX
+	IDIVL	knlLit10#
+	PUSHL	EDX
+	TESTL	EAX, EAX
+	JE	16$.S
+	CALL	knlInfoDec
+16$:	POPL	EAX
+	ADDB	AL, #'0'
+					;Fall into knlInfoChr
+
+;Subroutine to store character into the information buffer
+;	c(AL)     = Character
+;	c{ES:EDI} = Buffer pointer
+;	CALL	knlInfoChr
+
+knlInfoChr::
+	DECL	info_left.B[EBP]	;Room for more?
+	JS	18$.S			;No
+	IFFAULT	knlRtnAdrErLv#
+	STOSB	[EDI]
+18$:	INCL	info_amount.B[EBP]
+	RET
+
+;Subroutine to store hex value into the information buffer
+;	C{EAX}    = Value
+;	c{ES:EDI} = Buffer pointer
+;	CALL	knlInfoHex
+
+knlInfoHex::
+	CLRL	EDX
+	IDIVL	lit16#
+	PUSHL	EDX
+	TESTL	EAX, EAX
+	JE	20$.S
+	CALL	knlInfoDec
+20$:	POPL	EAX
+	CMPB	AL, #9
+	JBE	22$.S
+	ADDB	AL, #'A'-'0'-10t
+22$:	ADDB	AL, #'0'
+	JMP	knlInfoChr.S
+
+;Subroutine to store string in the information buffer
+;	c{EBX} = Offset of string
+;	c{ECX} = Maximum length of string
+;	c{ES:EDI} = Buffer pointer
+;	CALL	knlInfoStr
+
+knlInfoStr::
+	MOVB	AL, [EBX]
+	INCL	EBX
+	CMPB	AL, #0
+	JE	ret022.S
+	CALL	knlInfoChr
+	LOOP	ECX, knlInfoStr
+ret022:	RET
+.PAGE
+;Subroutine to see if have a real DCB
+;	c{EBX} = Offset of DCB
+;	CALL	chkdcb
+;	Z:set = No more DCBs
+;	Z:clr = Real DCB
+
+chkdcb:	TESTL	EBX, EBX		;Do we have a DCB at all?
+	JE	ret022.S		;No
+	CMPB	dcb_name+0.B[EBX], #0	;Yes - is it real?
+	JNE	ret022.S		;Yes
+	MOVL	EBX, dcb_next.B[EBX]	;No - advance to next DCB
+	JMP	chkdcb.S		;Continue
+
+;Subroutine to give user class name
+;	CALL	classinfo
+
+classinfo:
+	DECL	ECX			;Have room for more?
+	JS	4$			;No - fail!
+	MOVL	EAX, ccb_name+0.B[ESI]	;Yes - give him the class name
+	IFFAULT	knlRtnAdrEr#
+	STOSL	[EDI]
+	MOVL	EAX, ccb_name+4.B[ESI]
+	IFFAULT	knlRtnAdrEr#
+	STOSL	[EDI]
+	RET
+
+;Here if don't have enough room
+
+4$:	MOVL	EAX, #ER_DATTR
+	STC
+	RET
+.PAGE
+	.SBTTL	getxffinfo - Subroutine to return extended fork frame information
+
+;Subroutine to return information about extended fork frames
+;	c{ES:EDI} = Address of user's data array
+;	c{ECX}    = Space available
+;	CALL	getxffinfo
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  c{EAX} = Items returned
+
+;Format of the data returned:
+;  Offset   Size    Use
+;     0       2     XFF selector
+;     2       1     Usage:  0 = Idle, 1 = Input, 2 = Output
+;     3       1     Process index
+;     4       4     Command bits
+;     8       8     Device name
+;    16       8     QAB address
+;    24       4     Reserved
+;    28       4     Time-out value
+;    32       4     Option bits
+;    36       4     Count value
+;    40       8     Buffer1 address     
+;    48       8     Buffer2 address     
+;    56       8     Parmeter list address     
+
+getxffinfo::
+	CLRL	EDX			;Clear count
+	SARL	ECX, #6			;Get number of entries we have room for
+	JE	12$
+	MOVL	FS, xfffirst		;Get first XFF in system
+2$:	MOVZWL	EAX, FS:xffPda#		;Get PDA selector
+	TESTL	EAX, EAX
+	JE	10$
+	MOVL	GS, EAX
+	MOVB	AH, GS:pdaPid#		;Get process index
+	MOVB	AL, #1			;Assume input
+	CMPB	FS:xffQueue#, #dcb_inpframe
+	JE	8$.S
+	INCL	EAX
+8$:	SHLL	EAX, #16t
+	MOVW	AX, FS
+	IFFAULT	knlRtnAdrEr#
+	STOSL	[EDI]
+	MOVL	EAX, FS:xffCmd#
+	IFFAULT	knlRtnAdrEr#
+	STOSL	[EDI]
+	MOVL	EBX, FS:xffDcb#
+	MOVL	EAX, dcb_name+0.B[EBX]
+	IFFAULT	knlRtnAdrEr#
+	STOSL	[EDI]
+	MOVL	EAX, dcb_name+4.B[EBX]
+	IFFAULT	knlRtnAdrEr#
+	STOSL	[EDI]
+	MOVL	EAX, FS:xffQab#+0
+	IFFAULT	knlRtnAdrEr#
+	STOSL	[EDI]
+	MOVZWL	EAX, FS:xffQab#+4
+	IFFAULT	knlRtnAdrEr#
+	STOSL	[EDI]
+	CLRL	EAX
+	IFFAULT	knlRtnAdrEr#
+	STOSL	[EDI]
+	MOVL	EAX, FS:xffTimeOut#
+	IFFAULT	knlRtnAdrEr#
+	STOSL	[EDI]
+	MOVL	EAX, FS:xffOption#
+	IFFAULT	knlRtnAdrEr#
+	STOSL	[EDI]
+	MOVL	EAX, FS:xffCount#
+	IFFAULT	knlRtnAdrEr#
+	STOSL	[EDI]
+	MOVL	EAX, FS:xffBuffer1#+0
+	IFFAULT	knlRtnAdrEr#
+	STOSL	[EDI]
+	MOVZWL	EAX, FS:xffBuffer1#+4
+	IFFAULT	knlRtnAdrEr#
+	STOSL	[EDI]
+	MOVL	EAX, FS:xffBuffer2#+0
+	IFFAULT	knlRtnAdrEr#
+	STOSL	[EDI]
+	MOVZWL	EAX, FS:xffBuffer2#+4
+	IFFAULT	knlRtnAdrEr#
+	STOSL	[EDI]
+	MOVL	EAX, FS:xffParm#+0
+	IFFAULT	knlRtnAdrEr#
+	STOSL	[EDI]
+	MOVZWL	EAX, FS:xffParm#+4
+	IFFAULT	knlRtnAdrEr#
+	STOSL	[EDI]
+	INCL	EDX
+10$:	MOVZWL	EAX, FS:xffSysNext#
+	MOVL	FS, EAX
+	TESTL	EAX, EAX
+	JE	12$.S
+	DECL	ECX
+	JNE	2$
+12$:	MOVL	EAX, EDX
+	RET
+.PAGE
+	DATA
+
+handle::  .LONG 0		;Current handle (can be used by non-queued
+				;  device transfer routines before waiting)
+pvfilopt::.LONG 0		;Value of IOPAR_FILOPTN for non-queued devices
+xfffree:: .LONG	0		;XFF free list head pointer
+xfffirst::.LONG	0		;XFF active list head pointer
+xfflast:: .LONG 0		;XFF active list tail pointer
+xffreqh:: .LONG	0		;XFF request list head pointer
+xffreqt:: .LONG	0		;XFF request list tail pointer
+;;;;;xffcheck::.LONG ioque9-111t ;ssssssssss
+xffla::   .LONG	la_xfork	;Linear address for allocating extended
+				;  fork frames
+
+	END

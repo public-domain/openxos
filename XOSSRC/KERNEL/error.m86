@@ -1,0 +1,2585 @@
+	.TITLE	ERROR - XOS error handling routines
+
+;++++
+; This software is in the public domain.  It may be freely copied and used
+; for whatever purpose you see fit, including commerical uses.  Anyone
+; modifying this software may claim ownership of the modifications, but not
+; the complete derived code.  It would be appreciated if the authors were
+; told what this software is being used for, but this is not a requirement.
+
+;   THIS SOFTWARE IS PROVIDED BY THE AUTHORS "AS IS" AND ANY EXPRESS OR
+;   IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
+;   OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+;   IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+;   INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+;   BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS
+;   OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+;   ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR
+;   TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
+;   USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+;----
+
+	.PROC	80486
+	.INCLUD	XOSINC:\XMAC\XOS.PAR
+	.INCLUD	XOSINC:\XMAC\XOSX.PAR
+	.INCLUD	XOSINC:\XMAC\XOSTRM.PAR
+	.INCLUD	XOSINC:\XMAC\XOSXTRM.PAR
+	.INCLUD XOSINC:\XMAC\XOSDOS.PAR
+	.INCLUD	XOSINC:\XMAC\XOSERR.PAR
+	.INCLUD	XOSINC:\XMAC\PCAT.PAR
+
+	DATA
+
+;Define special characters used in the fatal error display
+
+BTR =!0BBh		;Top right border corner
+BBR =!0BCh		;Bottom right border corner
+BVL =!0BAh		;Vertical border line
+BBL =!0C8h		;Bottom left border corner
+BTL =!0C9h		;Top left border corner
+BHL =!0CDh		;Horizontal border line
+
+BOXPSN=!27t		;Position on screen for crash message
+
+;Define attributes for the fatal error display
+
+A_CNORM=!047h		;(color) Normal characters (white on red)
+A_CBLNK=!0F1h		;(color) Blinking characters (blue on white)
+A_CINVR=!070h		;(color) Inverse characters (black on white)
+A_MNORM=!07h		;(monochrome) Normal characters (white on black)
+A_MBLNK=!0F0h		;(monochrome) Blinking characters (black on white)
+A_MINVR=!070h		;(monochrome) Inverse characters (black on white)
+
+;Define offsets in the crash save areas on page 0 - there are two crash save
+;  areas, crashdata, which is where the crash data is placed on a crash, and
+;  crashsave, where the once-only codes copies the initial crash save data
+
+	.INTERN	pg0_crshCODE, pg0_crshDATA
+
+$$$=!0
+BLK pg0_crshmagic, 12t		;Magic number which indicates valid crash data,
+				;  contains 0F0F0A5A5h or 0FA5A5h followed by
+				;  'CRSHDATA'.  If the 3rd byte is 0, the data
+				;  has been logged
+BLK pg0_crshTIME , 8t		;Date and time of crash
+BLK pg0_crshCODE , 4t		;Place to put crash code
+BLK pg0_crshEAX  , 4t
+BLK pg0_crshEBX  , 4t
+BLK pg0_crshECX  , 4t
+BLK pg0_crshEDX  , 4t
+BLK pg0_crshESP  , 4t
+BLK pg0_crshEBP  , 4t
+BLK pg0_crshEDI  , 4t
+BLK pg0_crshESI  , 4t
+BLK pg0_crshCS   , 4t
+BLK pg0_crshSS   , 4t
+BLK pg0_crshDS   , 4t
+BLK pg0_crshES   , 4t
+BLK pg0_crshFS   , 4t
+BLK pg0_crshGS   , 4t
+BLK pg0_crshEIP  , 4t
+BLK pg0_crshEFR  , 4t
+BLK pg0_crshTR   , 4t
+BLK pg0_crshLDT  , 4t
+BLK pg0_crshIDT  , 8t
+BLK pg0_crshGDT  , 8t
+BLK pg0_crshERRC , 4t
+BLK pg0_crshCR0  , 4t
+BLK pg0_crshCR2  , 4t
+BLK pg0_crshCR3  , 4t
+BLK pg0_crshDATA , 16t
+BLK pg0_crshSTK  , 128t
+pg0_crshSIZE  ==!$$$
+pg0_crshSIZEo4==!{pg0_crshSIZE+3t}/4t
+
+	ONCE
+
+;Subroutine to initialize error vectors
+;	CALL	vectorinit
+
+vectorinit::
+	PUSHL	EBP
+	MOVL	EBX, #vecttbl
+	MOVL	ECX, #VECTNUM
+2$:	MOVZBL	EBP, CS:[EBX]
+	SHLL	EBP, #3t
+	MOVL	EAX, CS:4.B[EBX]	;Get offset
+	MOVL	pdaIdt#+0[EBP], EAX	;Store low 16 bits at 0
+	MOVL	pdaIdt#+4[EBP], EAX	;Store high 16 bits at 6
+	MOVW	AX, CS:2.B[EBX]
+	MOVW	pdaIdt#+2[EBP], AX	;Store selector
+	CLRL	EAX
+	MOVB	AH, CS:1.B[EBX]
+	MOVW	pdaIdt#+4[EBP], AX	;Store 0 byte and type byte
+	ADDL	EBX, #8t.B
+	LOOP	ECX, 2$
+	POPL	EBP
+	RET
+
+;Table which gives initial vector contents
+
+	.MACRO	IV  vect, seg, offst, type, lvl
+	.BYTE	vect/8
+	.BYTE	DT_'type+PL_'lvl
+	.WORD	GS_'seg
+	.LONG	offst
+	.ENDM
+
+	.MOD	4
+vecttbl:IV	ID_DIVERR , CODE     , diverr    , TRAP, 0	;INT 00
+	IV	ID_DEBUG  , CODE     , debugtrp  , INT , 0 	;INT 01
+	IV	ID_NMI    , CODE     , nmierr    , TRAP, 0	;INT 02
+	IV	ID_BRKPNT , CODE     , int3trp   , TRAP, 3	;INT 03
+	IV	ID_INTO   , CODE     , intoerr   , TRAP, 0	;INT 04
+	IV	ID_BOUND  , CODE     , bnderr    , TRAP, 0	;INT 05
+	IV	ID_ILLINS , CODE     , illerr    , TRAP, 0	;INT 06
+	IV	ID_FPUNAVL, CODE     , fpunavl   , TRAP, 0	;INT 07
+	IV	ID_DBLEXP , DBLERRTSS, 0         , TASK, 0	;INT 08
+	IV	ID_FPUSOVR, CODE     , proter0   , TRAP, 0	;INT 09
+	IV	ID_ITSS   , CODE     , itsserr   , INT , 0	;INT 0A
+	IV	ID_SEGNP  , CODE     , snperr    , TRAP, 0	;INT 0B
+	IV	ID_STKERR , STKERRTSS, 0         , TASK, 0	;INT 0C
+	IV	ID_PROT   , CODE     , proterr   , TRAP, 0	;INT 0D
+	IV	ID_PAGEFLT, CODE     , pgferr    , INT , 0	;INT 0E
+	IV	0Fh*8     , CODE     , illint0F  , TRAP, 0	;INT 0F
+	IV	ID_FPUERR , CODE     , fpuerr    , TRAP, 0	;INT 10
+	IV	11h*8     , CODE     , illint11  , TRAP, 0	;INT 11
+	IV	12h*8     , CODE     , illint12  , TRAP, 0	;INT 12
+	IV	13h*8     , CODE     , illint13  , TRAP, 0	;INT 13
+	IV	14h*8     , CODE     , illint14  , TRAP, 0	;INT 14
+	IV	15h*8     , CODE     , illint15  , TRAP, 0	;INT 15
+	IV	16h*8     , CODE     , illint16  , TRAP, 0	;INT 16
+	IV	17h*8     , CODE     , illint16  , TRAP, 0	;INT 17
+	IV	18h*8     , CODE     , illint18  , TRAP, 0	;INT 18
+	IV	19h*8     , CODE     , illint19  , TRAP, 0	;INT 19
+	IV	1Ah*8     , CODE     , illint1A  , TRAP, 0	;INT 1A
+	IV	1Bh*8     , CODE     , illint1B  , TRAP, 0	;INT 1B
+	IV	1Ch*8     , CODE     , illint1C  , TRAP, 0	;INT 1C
+	IV	1Dh*8     , CODE     , illint1D  , TRAP, 0	;INT 1D
+	IV	1Eh*8     , CODE     , illint1E  , TRAP, 0	;INT 1E
+	IV	ID_CRASH  , CODE     , syscrash  , INT , 0	;INT 1F
+	IV	ID_TIMER0 , CODE     , timer0int#, INT , 0	;INT 70 (IRQ0)
+	IV	ID_KEYBRD , CODE     , illint71  , TRAP, 0	;INT 71 (IRQ1)
+	IV	ID_CASCADE, CODE     , illint72  , TRAP, 0	;INT 72 (IRQ2)
+	IV	ID_SPORT2 , CODE     , illint73  , TRAP, 0	;INT 73 (IRQ3)
+	IV	ID_SPORT1 , CODE     , illint74  , TRAP, 0	;INT 74 (IRQ4)
+	IV	ID_PPORT2 , CODE     , illint75  , TRAP, 0	;INT 76 (IRQ5)
+	IV	ID_FDISK  , CODE     , illint76  , TRAP, 0	;INT 76 (IRQ6)
+	IV	ID_PPORT1 , CODE     , sprintm   , TRAP, 0	;INT 77 (IRQ7)
+	IV	ID_RTC    , CODE     , illint78  , TRAP, 0	;INT 78 (IRQ8)
+	IV	ID_IRQ9   , CODE     , illint79  , TRAP, 0	;INT 79 (IRQ9)
+	IV	ID_IRQ10  , CODE     , illint7A  , TRAP, 0	;INT 7A (IRQ10)
+	IV	ID_IRQ11  , CODE     , illint7B  , TRAP, 0	;INT 7B (IRQ11)
+	IV	ID_IRQ12  , CODE     , illint7C  , TRAP, 0	;INT 7C (IRQ12)
+	IV	ID_FPUINT , CODE     , fpuint    , TRAP, 0	;INT 7D (IRQ13)
+	IV	ID_HDISK  , CODE     , illint7E  , TRAP, 0	;INT 7E (IRQ14)
+	IV	ID_IRQ15  , CODE     , sprints   , TRAP, 0	;INT 7F (IRQ15)
+VECTNUM=!{$-vecttbl}/8
+
+	CODE
+
+;Table which gives default vector values for the hardware interrupt vectors
+
+dftirq::.LONG	timer0int#
+	.LONG	illint71
+	.LONG	illint72
+	.LONG	illint73
+	.LONG	illint74
+	.LONG	illint75
+	.LONG	illint76
+	.LONG	sprintm
+	.LONG	illint78
+	.LONG	illint79
+	.LONG	illint7A
+	.LONG	illint7B
+	.LONG	illint7C
+	.LONG	fpuint
+	.LONG	illint7E
+	.LONG	sprints
+.PAGE
+	.SBTTL	fpunavl - FPU not available trap handler
+
+;Here on the FPU not available exception - get here when FPU instructions
+;  executed if do not have an FPU or if the TS flag is set
+
+fpunavl:PUSHAL				;Save registers
+	PUSHL	DS			;Save segment registers
+	PUSHL	ES
+	PUSHL	FS
+	PUSHL	GS
+	PUSHL	#GS_DATA.B
+	POPL	DS
+	CMPB	knlForkLvl#, #FORK_MFORK
+	JA	10$.S
+	MOVL	EAX, CR0		;Do we have an FPU?
+	TESTB	AL, #04h
+	JE	12$.S			;Yes - must have a task switch
+	TESTB	SS:pdaURegEFR#+2, #2	;No - trap from virtual DOS mode?
+	JE	2$.S			;No
+	PUSHL	#GS_REAL16.B		;Yes
+	POPL	ES
+	MOVZWL	EAX, SS:pdaURegCS#	;Get actual address
+	SHLL	EAX, #4
+	MOVZWL	EBX, SS:pdaURegEIP#
+	ADDL	EBX, EAX
+	MOVL	EDX, EBX
+	CALL	nextins			;Find next instruction
+	JC	6$.S			;If error
+	SUBL	EBX, EDX		;OK - get length of instruction
+	ADDL	SS:pdaURegEIP#, EBX	;Bump return address
+	JMP	knlTrapDone#		;Return to user
+
+;Here if trap is from protected mode
+
+2$:	LESL	EBX, SS:pdaURegEIP#	;Get address of 80387 instruction
+4$:	CALL	nextins			;Find next instruction
+	JC	6$.S			;If error
+	MOVL	SS:pdaURegEIP#, EBX	;Update return address
+	JMP	knlTrapDone#		;Return to user
+
+;Here if have address error above
+
+6$:	POPL	GS			;Restore registers
+	POPL	FS
+	POPL	ES
+	POPL	DS
+	POPAL
+	PUSHL	#0.B			;Make it look like a segment fault
+	JMP	proterr
+
+10$:	CRASH	IFPI			;[Illegal Floating Point Instruction]
+
+;Here with FPU trap due to an FPU instruction executed after a task switch
+;	c{EAX} = c{CR0}
+
+12$:	CLTS				;Clear the TS bit
+	CLI
+	JMP	knlDismissInt2#
+
+.IF NE 0
+	MOVL	EAX, fpupda#		;Is the FPU state for the current
+	CMPW	AX, knlCurPda#		;  process?
+	JE	14$.S			;Yes - nothing is needed here
+	MOVL	ES, EAX			;No - much save and restore state
+
+fpufx1::FWAIT				;This will be changed to NOP if the
+					;  once-only code determines that the
+					;  FPU does not generate exceptions
+					;  immediately
+	FNSAVE	ES:pdaFpuState#		;Save current FPU state
+
+	MOVL	EAX, knlCurPda#
+	MOVL	ES, EAX
+	MOVL	fpupda#, EAX
+	MOVB	fpuignore, #1
+	FRSTOR	ES:pdaFpuState#		;Restore FPU state
+fpufx2::FWAIT				;This instruction is also changed to NOP
+	MOVB	fpuignore, #0		;  if FPU exceptions are not immediate
+14$:	CLI
+	JMP	knlDismissInt2#		;Dismiss the interrupt
+.ENDC
+.PAGE
+	.SBTTL	diverr - Divide error trap handler
+
+;Here on divide error exception
+
+diverr:	PUSHL	#0.B			;Fake up error data
+	PUSHL	#0.B
+	TESTB	18t.B[ESP], #02		;From virtual DOS mode?
+	JNE	2$.S			;Yes
+	TESTB	12t.B[ESP], #03		;No - from user mode?
+	JNE	4$.S			;Yes
+	PUSHL	#'DIVE'
+	JMP	savcom
+
+;Here if trap is from real mode
+
+2$:	PUSHL	#VECT_RDIVERR+{ID_DIVERR/8+200h}*10000h
+	JMP	usertrap
+
+;Here if trap is from protected user mode
+
+4$:	PUSHL	#VECT_PDIVERR
+	JMP	usertrap
+.PAGE
+	.SBTTL	fpuint - FPU error interrupt routine
+
+;Here on a FPU error interrupt (IRQ13) - this is really a floating point
+;  exception, but most machines have this hooked up to cause this interrupt!
+
+fpuint:	PUSHL	EAX
+	MOVB	AL, #0			;First, clear the FPU busy latch
+	OUTB	P_MATHCBSY
+	MOVB	AL, #INT_EOI		;Release the interrupt controllers
+	OUTB	P_INC1P0
+	IOPAUSE
+	OUTB	P_INC2P0
+	POPL	EAX			;Now fall into the floating point
+					;  exception routine
+
+	.SBTTL	fpuerr - Floating point error trap handler
+
+;Here on floating point error exception
+
+fpuerr:	PUSHAL				;Save all registers
+	PUSHL	DS
+	PUSHL	ES
+	PUSHL	FS
+	PUSHL	GS
+	PUSHL	#GS_DATA.B		;Make our data addressable
+	POPL	DS
+	CMPB	fpuignore, #0		;Should we ignore this?
+	JNE	10$.S			;Yes
+;;;;;;;	MOVL	ES, fpupda#
+	MOVL	ES, knlCurPda#		;No
+	ORB	ES:pdaSigReq#, #01
+	ORB	ES:pdaSSigType#, #SSIG$FPUX
+	MOVB	knlSchedReq#, #1
+10$:	CLI
+	JMP	knlDismissInt2#
+.PAGE
+	.SBTTL	nmierr - NMI trap handler
+
+;Here on NMI exception
+
+nmierr:	PUSHL	EAX			;See if this is IOCHK interrupt
+	MOVB	AL, #80h
+	OUTB	90h
+	IOPAUSE
+	INB	61h
+	TESTB	AL, #40h
+	JE	2$.S			;No
+	MOVB	AL, #0C0h		;Yes - reset IOCHK latch
+	OUTB	61h
+	IOPAUSE
+	IOPAUSE
+	MOVB	AL, #040h
+	OUTB	61h
+	POPL	EAX
+nmiint::INT3				;Go to GECKO
+	NOP
+	IRET				;Dismiss interrupt
+
+;Here if NMI is not due to IOCHK
+
+2$:	POPL	EAX
+	PUSHL	#0.B
+	PUSHL	#0.B
+	PUSHL	#'NMIE'
+	JMP	savcom
+.PAGE
+	.SBTTL	intoerr - INTO trap handler
+
+;Here on INTO instruction trap
+
+intoerr:PUSHL	#0.B
+	PUSHL	#0.B
+	TESTB	18t.B[ESP], #02		;From real mode?
+	JNE	2$.S			;Yes
+	TESTB	12t.B[ESP], #03		;No - from user mode?
+	JNE	4$.S			;Yes
+	PUSHL	#'INTO'			;No
+	JMP	savcom
+
+;Here if trap is from real mode
+
+2$:	PUSHL	#VECT_RINTO+{ID_INTO/8+200h}*10000h
+	JMP	usertrap
+
+;Here if trap is from protected user mode
+
+4$:	PUSHL	#VECT_PINTO
+	JMP	usertrap
+.PAGE
+	.SBTTL	bnderr - BOUND trap handler
+
+;Here on BOUND instruction trap
+
+bnderr:	PUSHL	#0.B
+	PUSHL	#0.B
+	TESTB	18t.B[ESP], #02		;From virtual DOS mode?
+	JNE	2$.S			;Yes
+	TESTB	12t.B[ESP], #03		;No - from user mode?
+	JNE	4$.S			;Yes
+	PUSHL	#'BNDE'			;No
+	JMP	savcom
+
+;Here if trap is from real mode
+
+2$:	PUSHL	#VECT_RBOUND+{ID_BOUND/8+200h}*10000h
+	JMP	usertrap
+
+;Here if trap is from protected user mode
+
+4$:	PUSHL	#VECT_PBOUND
+	JMP	usertrap
+.PAGE
+	.SBTTL	illerr - Illegal instruction trap handler
+
+;Here on illegal instruction trap
+
+illerr:	PUSHL	#0.B
+	PUSHL	#0.B
+	TESTB	18t.B[ESP], #02		;From real mode?
+	JNE	2$.S			;Yes
+	TESTB	12t.B[ESP], #03		;No - from user mode?
+	JNE	4$.S			;Yes
+	PUSHL	#'IINS'			;No
+	JMP	savcom
+
+;Here if trap is from real mode
+
+2$:	PUSHL	#VECT_RILLINS+{ID_ILLINS/8+200h}*10000h
+	JMP	usertrap
+
+;Here if trap is from protected user mode
+
+4$:	PUSHL	#VECT_PILLINS
+	JMP	usertrap
+.PAGE
+	.SBTTL	dblerr - Double exception trap handler
+
+;Here on double exception trap (unlikely we will ever get here!)
+
+dblerr::PUSHL	#0.B
+	PUSHL	#-1.B
+	PUSHL	#-1.B
+	PUSHL	#-1.B
+	PUSHL	#0.B
+	PUSHL	#0.B
+	PUSHL	#'DBLX'
+	JMP	savcom
+
+	.SBTTL	itsserr - Invalid task state segment trap handler
+
+;Here on invalid task state segment trap
+
+itsserr:PUSHL	#0.B
+	PUSHL	#'ITSS'
+	JMP	savcom
+.PAGE
+	.SBTTL	int3trp - INT3 trap handler
+
+int3trp:CMPB	CS:userint3, #2		;Want all traps in exec mode?
+	JAE	2$.S			;Yes
+	TESTB	10t.B[ESP], #02		;No - from real mode?
+	JNE	4$.S			;Yes
+	TESTB	4.B[ESP], #03		;No - from user mode?
+	JNE	8$.S			;Yes
+2$:	JMPF	geckodispatch#+4	;No - go directly to GECKO
+
+;Here if trap is from real mode
+
+4$:	CMPW	4.B[ESP], #0ED00h	;From the user code segment?
+	JNE	6$.S			;No
+	CMPB	CS:userint3, #1		;Yes - want this trap?
+	JE	2$.S			;Yes
+6$:	PUSHL	EAX			;No - send it to user mode
+	MOVL	EAX, DR6
+	ORL	SS:pdaURegDR6#, EAX
+	POPL	EAX
+	PUSHL	SS:pdaURegDR6#
+	PUSHL	#0.B
+	PUSHL	#VECT_RBRKPNT+{ID_BRKPNT/8+200h}*10000h
+	JMP	usertrap
+
+;Here if trap is from protected user mode
+
+8$:	CMPW	4.B[ESP], #GS_USERCODE|03h ;From the user code segment?
+	JNE	10$.S			;No
+	CMPB	CS:userint3, #1		;Yes - want this trap?
+	JE	2$.S			;Yes
+10$:	PUSHL	EAX			;No - send it to user mode
+	MOVL	EAX, DR6
+	ORL	SS:pdaURegDR6#, EAX
+	POPL	EAX
+	PUSHL	SS:pdaURegDR6#
+	PUSHL	#0.B
+	PUSHL	#VECT_PBRKPNT
+	JMP	usertrap
+
+userint3::.BYTE 1		;0 = All user mode INT3 and debug traps to
+				;      user mode
+				;1 = User mode INT3 and debug traps from
+				;      GS_USERCODE segment to exec mode,
+				;      others to user mode
+				;2 = All user mode INT3 and debug traps to
+				;      exec mode
+userwp::  .BYTE 1		;0 = All user mode watch point traps to user
+				;      mode
+				;1 = User mode watch point traps from
+				;      GS_USERCODE segment to exec mode,
+				;      others to user mode
+				;2 = All user mode watch point traps to exec
+				;      mode
+tracetrp::.BYTE 0		;0 = All trace traps to user mode
+				;1 = All trace traps to exec mode
+.PAGE
+	.SBTTL	debugtrp - Debug trap handler
+
+debugtrp:
+	PUSHL	EAX			;Free up a register
+	MOVL	EAX, DR6		;Get DR6
+	TESTB	AH, #80h		;Task switch trap?
+	JNE	tsktrp			;Yes
+	TESTB	AH, #40h		;No - trace trap?
+	JNE	trctrp			;Yes - go handle it
+					;No - assume its just a watchpoint trap
+	CMPB	CS:userwp, #2		;Want all traps in exec mode?
+	JAE	14$.S			;Yes
+	PUSHL	EDX			;No - see if we have a hit on a global
+	MOVL	EDX, DR7		;  watchpoint
+	TESTB	AL, #01h
+	JE	2$.S
+	TESTB	DL, #02h
+	JNE	12$.S
+2$:	TESTB	AL, #02h
+	JE	4$.S
+	TESTB	DL, #08h
+	JNE	12$.S
+4$:	TESTB	AL, #04h
+	JE	6$.S
+	TESTB	DL, #20h
+	JNE	12$.S
+6$:	TESTB	AL, #08h
+	JE	8$.S
+	TESTB	DL, #80h
+	JNE	12$.S
+8$:	TESTB	AL, #55h		;No global hits - have any local hits?
+	JE	12$.S			;No - let exec debugger handle it
+	POPL	EDX
+	TESTB	14t.B[ESP], #02h	;Have local hit(s) - from real mode?
+	JNE	20$.S			;Yes
+	TESTB	8t.B[ESP], #03h		;No - from user mode?
+	JNE	24$.S			;Yes
+
+;Here if have a local watchpoint hit from exec mode - This means that the
+;  kernal referenced a user location on which a local watchpoint was set.
+;  This is messy, since we have no idea what state (main program level,
+;  extended fork context, device fork level, or interrupt level) we are in!
+;  Generally, device fork or interrupt level code does not directly reference
+;  user memory (it can, but this is not common).  If we do get a watchpoint
+;  hit from device fork or interrupt level we just ignore it since it is too
+;  complex to figure out which process is responsible!  We should never get
+;  here in extended fork context, since local watchpoints are never enabled
+;  for extended context tasks.  The main program level case is fairly simple
+;  to handle since the memory environment is well defined.  In this case we
+;  buffer the hits and fake up the debug trap the next time we go back to
+;  user mode.
+
+xuwp::	PUSHL	EAX
+	MOVB	AL, #0Bh		;At interrupt level?
+	OUTB	P_INC1P0
+	IOPAUSE
+	INB	P_INC1P0
+	CMPB	AL, #0
+	JNE	16$.S			;Yes - ignore the watchpoint hit(s)
+	CMPB	knlForkLvl#, #FORK_DFORK
+	JA	10$.S			;Big problem if extended fork context!
+	JE	16$.S			;Ignore this is device fork level
+	POPL	EAX
+	ANDL	EAX, #0Fh.B
+	ORL	SS:pdaWPHits#, EAX	;Set his buffered hit bit(s)
+	JMP	18$.S			;Otherwise ignore this
+
+;Here if have watchpoint hit for extended fork context
+
+10$:	CRASH	XFWP			;[eXtended Fork WatchPoint]
+
+;Here to report the debug trap to the exec debugger
+
+12$:	POPL	EDX
+14$:	POPL	EAX
+	JMPF	geckodispatch#+2	;No - go directly to exec GECKO
+
+;Here to ignore a watchpoint hit
+
+16$:	POPL	EAX
+18$:	CLRL	EAX			;Clear the hit bits
+	MOVL	DR6, EAX
+	POPL	EAX
+	IRET
+
+;Here if trap is from real mode
+
+20$:	CMPW	8t.B[ESP], #0ED00h
+	JNE	22$.S
+	CMPB	CS:userwp, #1
+	JE	14$.S
+22$:	POPL	EAX
+	JMP	dbgusr
+
+;Here if trap is from protected user mode
+
+24$:	CMPW	8t.B[ESP], #GS_USERCODE|03h
+	JNE	26$.S
+	CMPB	CS:userwp, #1
+	JE	14$.S
+26$:	POPL	EAX
+	JMP	dbgprot
+.PAGE
+;Here if this is a task switch debug trap
+
+tsktrp:	PUSHL	EDX
+	MOVL	EDX, SS:pdaURegDR7#
+	TESTB	DL, #01h		;Is watchpoint 0 in use?
+	JE	2$.S
+	MOVL	EAX, SS:pdaURegDR0#	;Yes
+	MOVL	DR0, EAX
+2$:	TESTB	DL, #04h		;Is watchpoint 1 in use?
+	JE	4$.S
+	MOVL	EAX, SS:pdaURegDR1#	;Yes
+	MOVL	DR1, EAX
+4$:	TESTB	DL, #10h		;Is watchpoint 2 in use?
+	JE	6$.S
+	MOVL	EAX, SS:pdaURegDR2#	;Yes
+	MOVL	DR2, EAX
+6$:	TESTB	DL, #40h		;Is watchpoint 0 in use?
+	JE	8$.S
+	MOVL	EAX, SS:pdaURegDR3#	;Yes
+	MOVL	DR3, EAX
+8$:	MOVL	EAX, SS:pdaURegDR6#
+	ANDL	EAX, #400Fh
+	MOVL	DR6, EAX
+	MOVL	DR7, EDX
+	POPL	EDX			;Restore registers
+	POPL	EAX
+	IRET				;Return
+
+;Here if this is a trace trap
+
+trctrp:	POPL	EAX
+trctrpx::				;Enter here on fake trace trap when
+					;  returning from a system call
+	CMPB	CS:tracetrp, #0		;Does exec GECKO want this?
+	JNE	10$.S			;Yes
+	TESTB	10t.B[ESP], #02		;No - from virtual DOS mode?
+	JNE	dbgusr.S		;Yes
+	TESTB	4.B[ESP], #03		;No - from user mode?
+	JNE	dbgprot.S		;Yes
+	CMPW	4.B[ESP], #GS_CODE.B	;No - from kernel code segment?
+	JNE	10$.S			;No
+	PUSHL	EAX			;Yes
+	PUSHL	ES
+	LESL	EAX, 8.B[ESP]		;Get address
+	CMPL	ES:[EAX], #0F061E60h	;Is this an exec mode entry point?
+	JE	20$.S			;Yes - go handle this funny case!
+	POPL	ES			;No - restore registers
+	POPL	EAX
+10$:	JMPF	geckodispatch#+2	;Go directly to GECKO
+
+;Here if trap is from real mode
+
+dbgusr:	PUSHL	#0.B
+	PUSHL	#0.B
+	PUSHL	#VECT_RDEBUG+{ID_DEBUG/8+200h}*10000h
+	JMP	18$.S
+
+;Here if trap is from protected user mode
+
+dbgprot:PUSHL	#0.B
+	PUSHL	#0.B
+	PUSHL	#VECT_PDEBUG
+18$:	PUSHL	EAX
+	MOVL	EAX, DR6
+	ORL	SS:pdaURegDR6#, EAX
+	CLRL	EAX
+	MOVL	DR6, EAX
+	POPL	EAX
+	JMP	usertrap
+
+;Here if trap is from exec mode from a call gate entry point
+
+20$:	POPL	ES
+	POPL	EAX
+	ADDL	[ESP], #12h.B		;Bump EIP past code we will do here
+	POPL	SS:pdaXRegEIP#		;Save EIP
+	ADDL	ESP, #8.B		;Discard CS and EFR
+	PUSHAL				;Do first part of the SVC entry code
+	PUSHL	DS			;  but store EFR with the trace trap
+	PUSHL	ES			;  bit set so will get another trace
+	PUSHL	FS			;  trap when returning to the user
+	PUSHL	GS
+	PUSHFL
+	POPL	SS:pdaXRegEFR#
+	ORB	SS:pdaXRegEFR#+1, #1
+	PUSHL	#GS_DATA.B
+	POPL	DS			;Request scheduling so return will work
+	MOVB	knlSchedReq#, #1	;  right!
+	JMPIL	SS:pdaXRegEIP#		;Continue with SVC setup code
+.PAGE
+	.SBTTL	snperr - Segment not present trap handler
+
+;Here on segment not present trap
+
+snperr:	TESTB	8.B[ESP], #3		;From user mode?
+	JNE	6$.S			;Yes
+	PUSHL	#0.B
+	PUSHL	#'SGNP'			;No
+	JMP	protcom
+
+;Here if from protected user mode
+
+6$:	PUSHL	#0.B
+	PUSHL	#VECT_PSEGNP
+	JMP	usertrapx
+.PAGE
+	.SBTTL	stkerr - Stack segment overrun trap handler
+
+;Here on stack segment overrun or not present trap - this trap is handled with
+;  a task gate, so we get here in a different task context - this is necessary
+;  to allow the traping of exec mode stack errors
+
+stkerr::MOVZWL	EAX, stkerrtss#
+	CMPL	EAX, #GS_SCHTSS		;Did the error occur in the scheduler?
+	JE	12$			;Yes
+	MOVL	ES, knlCurPda#		;No - assume its the current process
+	CMPW	AX, ES:pdaTssSel#	;Right?
+	JE	8$.S			;Yes
+	MOVL	ECX, xfffirst#		;No - see if its in an XFF
+2$:	JREGZ	ECX, 4$
+	MOVL	ES, ECX
+	CMPL	ES:xffTssSel#, EAX
+	JE	6$.S
+	MOVL	ECX, ES:xffSysNext#
+	JMP	2$.S
+
+;Here if can't find the task which reported the stack error (should not be
+;  possible!)
+
+4$:	CRASH	SERR
+
+;Here with XFF which reported the stack error
+
+6$:	MOVL	EBX, #xffTss#		;Point to the TSS
+	MOVL	EAX, ES:tss_CR3.B[EBX]	;Switch memmory mapping to the right
+	MOVL	CR3, EAX		;  address space
+	JMP	14$
+
+;Here with PDA which reported the stack error
+
+8$:	MOVL	EBX, #pdaTss#		;Point to the TSS
+	MOVL	EAX, ES:tss_CR3.B[EBX]	;Set memory mapping to the process's
+	MOVL	CR3, EAX		;  current address space
+	TESTB	ES:tss_EFR+2.B[EBX], #2	;From virtual-86 mode?
+	JNE	stkeusr.S		;Yes
+	TESTB	ES:tss_CS.B[EBX], #03h	;No - from user mode?
+	JE	14$.S			;No
+
+;Here with stack error from user mode - we fix things up to make this look like
+;  a normal trap gate trap and call badusrstk to pass the error to the user
+;  process
+
+stkeusr:PUSHL	ES
+	POPL	DS
+	STD
+	MOVL	EDI, #pdaXStackV#-4	;Get his exec stack pointer
+	CLRL	EAX			;Clear out the segment registers (these
+	STOSL	[EDI]			;  don't matter here since this is a
+	STOSL	[EDI]			;  fatal error for the user process and
+	STOSL	[EDI]			;  the segment register value are lost!)
+	STOSL	[EDI]
+	MOVL	tss_GS.B[EBX], EAX
+	MOVL	tss_FS.B[EBX], EAX
+	MOVL	tss_ES.B[EBX], EAX
+	MOVL	EAX, tss_SS.B[EBX]	;Store SS on his exec stack
+	STOSL	[EDI]
+	MOVL	EAX, tss_ESP.B[EBX]	;Store ESP on his exec stack
+	STOSL	[EDI]
+	MOVL	EAX, tss_EFR.B[EBX]	;Store EFR on his exec stack
+	STOSL	[EDI]
+	MOVL	EAX, tss_CS.B[EBX]	;Store CS on his exec stack
+	STOSL	[EDI]
+	MOVL	EAX, tss_EIP.B[EBX]	;Store EIP on his exec stack
+	STOSL	[EDI]
+	POPL	EAX			;Store the error code on his exec stack
+	STOSL	[EDI]
+	MOVL	[EDI], #stkeusr
+	MOVL	tss_ESP.B[EBX], EDI	;Store his exec stack pointer
+	MOVL	tss_SS.B[EBX], DS
+	MOVL	tss_DS.B[EBX], #GS_DATA	;Make sure his DS is right
+	MOVL	tss_EIP.B[EBX], #badusrstk ;Set his CS:EIP
+	MOVL	tss_CS.B[EBX], CS
+	MOVL	tss_EFR.B[EBX], #0200h	;Set his EFR
+	PUSHL	#GS_DATA.B		;Restore DS and ES to their initial
+	POPL	DS			;  values so they will be right for
+	PUSHL	#GS_SCHPDA		;  the next time we get here
+	POPL	ES
+	IRET				;This will "return" to badusrstk since
+	JMP	stkerr			;  NT is set
+
+;Here with scheduler context stack error
+
+12$:	MOVL	EBX, #pdaTss#
+	PUSHL	#GS_SCHPDA
+	POPL	ES
+
+;Here if stack error is not from user mode - this means we have a bad exec
+;  mode stack - we save the crash data from the previous TSS and give a
+;  fatal system error
+
+14$:	MOVL	EAX, ES:tss_ESP.B[EBX]
+	MOVL	crshdata+pg0_crshESP, EAX
+	MOVZWL	EAX, ES:tss_SS.B[EBX]
+	MOVL	crshdata+pg0_crshSS, EAX
+	MOVZWL	EAX, ES:tss_ES.B[EBX]
+	MOVL	crshdata+pg0_crshES, EAX
+	MOVZWL	EAX, ES:tss_FS.B[EBX]
+	MOVL	crshdata+pg0_crshFS, EAX
+	MOVZWL	EAX, ES:tss_GS.B[EBX]
+	MOVL	crshdata+pg0_crshGS, EAX
+	MOVL	EAX, stkerrtss#
+	MOVL	crshdata+pg0_crshTR, EAX
+	MOVL	EAX, ES:tss_LDT.B[EBX]
+	MOVL	crshdata+pg0_crshLDT, EAX
+	MOVL	EAX, ES:tss_EBX.B[EBX]
+	MOVL	crshdata+pg0_crshEBX, EAX
+	MOVL	EAX, ES:tss_EAX.B[EBX]
+	MOVL	ECX, ES:tss_ECX.B[EBX]
+	MOVL	EDX, ES:tss_EDX.B[EBX]
+	MOVL	EDI, ES:tss_EDI.B[EBX]
+	MOVL	ESI, ES:tss_ESI.B[EBX]
+	MOVL	EBP, ES:tss_EBP.B[EBX]
+	PUSHL	ES
+	CALL	savreg2			;Store other registers
+	POPL	ES
+	POPL	EAX			;Restore error code
+	PUSHL	ES:tss_EFR.B[EBX]	;Set up the stack the way fatal
+	PUSHL	ES:tss_CS.B[EBX]	;  expects it
+	PUSHL	ES:tss_EIP.B[EBX]
+	PUSHL	EAX
+	PUSHL	#0.B
+	PUSHL	#'STKE'
+	JMP	fatal
+.PAGE
+	.SBTTL	pgferr - Page fault trap handler
+
+;Here on page fault trap - we have an error code on the stack when get here
+
+pgferr:	PUSHL	EAX			;Save registers we need
+	MOVL	EAX, CR2		;Get page fault linear address
+	STI				;Interrupts are OK now
+	XCHGL	EAX, [ESP]
+	PUSHL	EAX
+	PUSHL	DS
+	PUSHL	#GS_DATA.B		;Setup to access our data segment
+	POPL	DS
+	MOVL	EAX, 8.B[ESP]		;No - get page fault linear address
+	SHRL	EAX, #12t		;Get index into page table
+	IFFAULT	pgfunal
+	MOVL	EAX, pgtable[EAX*4]	;Get page table entry
+	TESTB	AL, #01			;Is the P bit set?
+	JNE	pgfprs.S		;Yes
+	ANDL	EAX, #03Ch		;No - get the page type
+	JMPIL	pgfdsp[EAX]		;Dispatch on type of page
+
+;Page fault dispath table
+
+	DATA
+
+pgfdsp:.LONG	pgfunal		;PT_FREE =  0 - Unallocated
+	.LONG	pgfvirtpg#	;PT_VIRT =  1 - Virtually allocated page
+	.LONG	pgfcrsh		;PT_SWAP =  2 - Swapped out page
+	.LONG	pgfterm#	;PT_DISP =  3 - Unmapped display page (bits 5-31
+				;		  contain offset of TDB for
+				;		  terminal)
+	.LONG	pgfcrsh		;	 =  4 - Illegal
+	.LONG	pgfcrsh		;	 =  5 - Illegal
+	.LONG	pgfcrsh		;	 =  6 - Illegal
+	.LONG	pgfcrsh		;	 =  7 - Illegal
+	.LONG	pgfcrsh		;	 =  8 - Illegal
+	.LONG	pgfcrsh		;	 =  9 - Illegal
+	.LONG	pgfcrsh		;	 = 10 - Illegal
+	.LONG	pgfcrsh		;	 = 11 - Illegal
+	.LONG	pgfcrsh		;	 = 12 - Illegal
+	.LONG	pgfcrsh		;	 = 13 - Illegal
+	.LONG	pgfcrsh		;	 = 14 - Illegal
+	.LONG	pgfcrsh		;	 = 15 - Illegal
+
+	CODE
+
+;Here if illegal page table entry type
+
+pgfcrsh:CRASH	IPTT		;[Illegal Page Table Type]
+.PAGE
+;Here if have page fault on a page with the P bit set
+;	c{EAX} = Page table entry
+
+pgfprs:	POPL	DS			;Save reigsters in the standard way
+	PUSHL	ECX			;  (we cannot use a PUSHAL here since
+	PUSHL	EDX			;  we must preserve the value in EAX!)
+	PUSHL	EBX
+	PUSHL	ESP
+	PUSHL	EBP
+	PUSHL	ESI
+	PUSHL	EDI
+	PUSHL	DS
+	PUSHL	ES
+	PUSHL	FS
+	PUSHL	GS
+	PUSHL	#GS_DATA.B		;Make sure DS is correct
+	POPL	DS
+	CALL	knlGetMTE2#		;Get the memory table entry
+	JE	pgfuna0.S		;Fail if physical page
+	MOVL	EDX, [EAX]		;Get page type
+	SHRL	EDX, #20t
+	ANDL	EDX, #0Fh.B
+	JMPIL	pgtdsp[EDX*4]		;Dispatch on the page type
+
+	DATA
+
+pgtdsp:	.LONG	pgfuna0		;MT_FREE  = 0  - Unallocated page
+	.LONG	pgfuna0		;MT_SYS   = 1  - System page
+	.LONG	pgfuna0		;MT_PDIR  = 2  - Page directory page
+	.LONG	pgfuna0		;MT_PTBL  = 3  - Page table page
+	.LONG	pgfuna0		;MT_PDA   = 6  - Process data area (PDA) page
+	.LONG	pgfuna0		;MT_SDA   = 7  - Shared section data area (SDA) page
+	.LONG	pgfuser		;MT_PLOCK = 8  - Private locked user page
+	.LONG	pgfuna0		;MT_SLOCK = 9  - Shared locked user page
+	.LONG	pgfuser		;MT_PNSWP = 10 - Private non-swapable user page
+	.LONG	pgfuna0		;MT_SNSWP = 11 - Shared non-swapable user page
+	.LONG	pgfuser		;MT_PUSER = 12 - Private user page
+	.LONG	pgfuna0		;MT_SUSER = 13 - Shared user page
+	.LONG	pgfuna0		;	  = 14 - Illegal
+	.LONG	pgfuna0		;	  = 15 - Illegal
+
+	CODE
+.PAGE
+;Here for page fault on allocated user page
+
+pgfuser:CMPB	knlForkLvl#, #FORK_MAIN	;Must be at main program level here!
+	JNE	6$.S
+	MOVL	EDI, 4.B[EAX]		;Get offset of MDB
+	CALLI	mdb_fault.B[EDI]	;Call msect routine to see if we can
+					;  fix the problem
+	JC	pgfuna0.S		;If should fail
+pgfuagn::
+	LEAL	EDI, 52t.B[ESP]		;Should retry - remove the CR2 and
+	PUSHL	SS			;  error code values from the stack
+	POPL	ES
+	LEAL	ESI, 44t.B[ESP]
+	MOVL	ECX, #12t
+	STD
+	RMOVSL	[EDI], SS:[ESI]
+	ADDL	ESP, #8t.B
+	TESTB	34h.B[ESP], #03h	;Is trap from exec mode?
+	JNE	knlTrapDone#		;No - return to user to try again
+
+;Here if trap is from exec mode
+
+	CLI				;No interrupts now
+	ORB	39h.B[ESP], #02		;Make sure interrupts are enabled
+	POPL	GS			;  in the EFR
+	POPL	FS			;Restore segment registers
+	POPL	ES
+	POPL	DS
+	POPAL				;Restore general registers
+	IRET				;Return to exec mode code
+
+6$:	CRASH	ATFK			;[AT ForK level]
+.PAGE
+;Here if error after all registers saved
+
+pgfuna0:POPL	GS			;Restore segment registers
+	POPL	FS
+	POPL	ES
+	POPL	DS
+	POPAL				;Restore user registers
+	JMP	pgfuna2.S
+
+;Here for page fault on unallocated or physically mapped page
+
+	FAULTHDR
+pgfunal:POPL	DS
+	POPL	EAX
+pgfuna2::
+	TESTB	18t.B[ESP], #2		;From virtual DOS mode?
+	JE	14$.S			;No
+	JMP	vaddrtrp.S		;Yes
+
+vbadaddr::
+	POPL	GS			;Restore segment registers
+	POPL	FS
+	POPL	ES
+	POPL	DS
+	POPAL				;Restore user registers
+vaddrtrp::
+	PUSHL	#VECT_RPAGEFLT+{ID_PAGEFLT/8+200h}*10000h
+					;And go handle normal real mode user
+	JMP	usertrap		;  trap
+
+;Here if page fault trap is not from virtual DOS mode
+
+14$:	TESTB	12t.B[ESP], #3		;From user mode?
+	JNE	xaddrtrp.S		;Yes
+	PUSHL	#'PFLT'			;No
+	JMP	protcom
+
+;Here if page fault trap is from protected user mode
+
+xaddrtrp::
+	PUSHL	#VECT_PPAGEFLT
+	JMP	usertrapx
+.PAGE
+	.SBTTL	proterr - General protection trap handler
+
+proter0::
+	PUSHL	#0.B			;Fake up the error code
+					;Fall into normal protection trap
+					;  routine - this will report the
+					;  address we were returning to as the
+					;  bad address
+
+;Here on general protection trap
+
+proterr:TESTB	14t.B[ESP], #2		;From virtual DOS mode?
+	JE	20$			;No
+	CLI
+	ADDL	ESP, #4.B		;Yes - discard error code
+	PUSHAL				;Save general registers
+	STI
+	PUSHL	DS			;Save segment registers
+	PUSHL	ES
+	PUSHL	FS
+	PUSHL	GS
+	PUSHL	#GS_DATA.B		;Point to our normal data segment
+	POPL	DS
+	PUSHL	#GS_REAL16.B		;And point to real mode memory
+	POPL	GS
+	MOVZWL	ESI, 52t.B[ESP]		;Get CS value
+	SHLL	ESI, #4			;Times 16
+	ADDL	ESI, 48t.B[ESP]		;Plus EIP value gives address in segment
+	MOVL	rmlastprot, ESI
+	MOVL	userdatsz, #2		;Indicate code and data sizes are 16
+	MOVL	useradrsz, #2		;  bits
+rmgetop::
+	IFFAULT	knlRealFPErr
+	MOVZBL	EAX, GS:[ESI]		;Get opcode byte
+	MOVB	AL, voptblx#[EAX]	;Get dispatch index for opcode
+	JMPIL	voptbld#[EAX]		;Dispatch
+
+;Here for real mode protection error which is really a protection error
+
+	FAULTHDR
+knlRealFPErr::
+	MOVL	ESP, #pdaXStk#
+	STI
+	IFFAULT	10$
+2$:	POPL	GS			;Restore segment registers
+	IFFAULT	12$
+4$:	POPL	FS
+	IFFAULT	14$
+6$:	POPL	ES
+	IFFAULT	16$
+8$:	POPL	DS
+	POPAL				;Restore user registers
+	PUSHL	#0.B
+	PUSHL	#0.B
+	PUSHL	#VECT_RPROT+{ID_PROT/8+200h}*10000h
+	JMP	usertrap
+
+	FAULTHDR
+10$:	POPL	EAX
+	PUSHL	#0.B
+	JMP	2$.S
+
+	FAULTHDR
+12$:	POPL	EAX
+	PUSHL	#0.B
+	JMP	4$.S
+
+	FAULTHDR
+14$:	POPL	EAX
+	PUSHL	#0.B
+	JMP	6$.S
+
+	FAULTHDR
+16$:	POPL	EAX
+	PUSHL	#0.B
+	JMP	8$.S
+
+;Here if general protection trap is not from real mode
+
+20$:	TESTB	8t.B[ESP], #3		;From user mode?
+	JNE	protprot.S		;Yes
+	PUSHL	#0.B
+	PUSHL	#'PROT'
+	JMP	protcom
+
+;Here if general protection trap is from protected user mode
+
+protprot:
+	POPL	SS:pdaErrCode#		;Put error code in a safe place
+	PUSHAL				;Save user registers in the standard
+	PUSHL	DS			;  way
+	PUSHL	ES
+	PUSHL	FS
+	PUSHL	GS
+	STI
+	PUSHL	#GS_DATA.B		;Make exec data addressable
+	POPL	DS
+	IFFAULT	pfpe
+	LGSL	ESI, SS:pdaURegEIP	;Get address of the instruction
+	MOVL	EAX, GS			;Get the access bits for the code
+	LARL	EDX, EAX		;  segment
+	MOVL	EAX, #1			;Assume have a 16 bit code segment
+	BTL	EDX, #22t		;Right?
+	ADCL	EAX, #0.B		;Make it 2 if 32 bits
+	ADDL	EAX, EAX		;Make it 2 if 16 and 4 if 32 bits
+	MOVL	userdatsz, EAX		;Store as initial code and data widths
+	MOVL	useradrsz, EAX
+protgetop::
+	IFFAULT	pfpe
+	MOVZBL	EAX, GS:[ESI]		;Get opcode byte
+	MOVB	AL, poptblx#[EAX]	;Get index value
+	JMPIL	poptbld#[EAX]		;Dispatch on the opcode
+
+;Here if have a real protected mode protection error
+
+	FAULTHDR
+pfpe::	POPL	GS
+	POPL	FS
+	POPL	ES
+	POPL	DS
+	POPAL
+	PUSHL	SS:pdaErrCode#
+	PUSHL	#0.B
+	PUSHL	#VECT_PPROT
+	JMP	usertrapx
+.PAGE
+;Common routine for memory protection errors
+
+protcom:PUSHL	DS			;Make sure DS is right
+	PUSHL	#GS_DATA.B
+	POPL	DS
+	PUSHL	EAX			;Free up some registers
+	PUSHL	EBX
+	CMPW	28t.B[ESP], #GS_CODE	;Was it from our code segment?
+	JNE	memfail			;No - fatal error
+	MOVL	EBX, 24t.B[ESP]		;Yes - get offset of instruction
+	CMPL	EBX, #1002h		;Possible value?
+	JB	memfail			;No
+	CMPL	EBX, #oocodetop#	;Maybe
+	JAE	memfail.S		;No
+	CMPB	CS:-5.B[EBX], #0A9h	;Yes - have IFFAULT instruction?
+	JE	4$.S			;Yes
+	CMPB	CS:-5.B[EBX], #3Dh	;No - have IFFCALL instruction?
+	JNE	memfail.S		;No
+4$:	MOVL	EAX, CS:-4.B[EBX]	;Maybe - get offset
+	CMPL	EAX, #1002h		;Possible value?
+	JB	memfail.S		;No
+	CMPL	EAX, #oocodetop#	;Maybe
+	JAE	memfail.S		;No
+	CMPB	CS:-1.B[EAX], #90h	;Have right header value?
+	JE	6$.S			;Yes
+	CMPB	CS:-1.B[EAX], #0FEh	;Maybe - want error code in EAX?
+	JNE	memfail.S		;No
+	MOVL	4t.B[ESP], #ER_ADRER	;Yes - store error code
+6$:	MOVL	memfault, EBX		;Store address for debugging
+	CMPB	CS:-5.B[EBX], #3Dh	;Have IFFCALL instruction?
+	JNE	8$.S			;No
+	MOVL	EBX, 32t.B[ESP]		;Yes - rearange the stack as follows:
+	MOVL	20t.B[ESP], EBX		;  ESP+0 to ESP+8 contains saved regs
+	MOVL	EBX, 16t.B[ESP]		;    and is unchanged.
+	MOVL	28t.B[ESP], EBX		;  ESP+32  -> ESP+20 (err EFR)
+	MOVL	EBX, 24t.B[ESP]		;  ESP+28  -> junk   (err CS)
+	MOVL	32t.B[ESP], EBX		;  ESP+24  -> ESP+32 (err EIP)
+	MOVL	EBX, 12t.B[ESP]		;  ESP+20  -> junk   (err text)
+	MOVL	24t.B[ESP], EBX		;  ESP+16  -> ESP+28 (err code 2)
+	MOVL	12t.B[ESP], EAX		;  ESP+12  -> ESP+24 (err code 1)
+	MOVL	16t.B[ESP], #GS_CODE	;  CS_CODE -> ESP+16
+					;  New EIP -> ESP+12
+					;This results in a stack set up as
+					;  follows:
+					;  c{ESP+32) = Error EIP
+					;  c{ESP+28} = Error code 2
+					;  c{ESP+24} = Error code 1
+					;  c{ESP+20} = New EFR
+					;  c{ESP+16} = New EIP
+					;  c{ESP+12} = New CS
+					;  c{ESP+8}  = Saved DS
+					;  c{ESP+4}  = Saved EAX
+					;  c{ESP+0}  = Saved EBX
+	POPL	EBX			;Restore registers and go to the
+	POPL	EAX			;  error handler routine
+	POPL	DS
+	IRET
+
+;Here if have IFFAULT instruction
+
+8$:	MOVL	24t.B[ESP], EAX		;Store error handler offset as return
+	POPL	EBX			;  offset
+	POPL	EAX			;Restore registers
+	POPL	DS
+	ADDL	ESP, #12t.B		;Remove junk from the stack
+	IRET				;Go to error handler
+
+;Here when error cannot be recovered
+
+memfail:POPL	EBX			;Restore registers
+	POPL	EAX
+	POPL	DS			;Save registers in the normal way for
+savcom:	CALL	savregs			;  a crash
+	JMP	fatal			;And go fail
+.PAGE
+	.SBTTL	syscrash - Fatal system error call
+
+;Here on fatal system error interrupt
+
+syscrash:
+	PUSHL	#0.B			;Push dummy values to make the stack the
+	PUSHL	#0.B			;  way savregs expects it to be
+	PUSHL	#0.B
+	CALL	savregs			;Save registers
+	LESL	EDI, 12t.B[ESP]		;Point to the crash code
+	SUBL	12t.B[ESP], #2.B	;Adjust EIP value to point to the INT
+	MOVL	EAX, ES:[EDI]		;Get crash code
+	MOVL	[ESP], EAX
+	JMP	fatal
+.PAGE
+	.SBTTL	illint - Illegal interrupt routines
+
+;Here for spurious interrupt from slave interrupt controller
+
+illintmin::
+sprints::
+	PUSHL	EAX
+	MOVB	AL, #INT_EOI		;Release slave interrupt controller
+	OUTB	P_INC2P0
+	JMP	2$.S			;Continue
+
+;Here for spurious interrupt from master interrupt controller
+
+sprintm::
+	PUSHL	EAX
+	MOVB	AL, #INT_EOI		;Release master interrupt controller
+2$:	OUTB	P_INC1P0
+	POPL	EAX
+	IRET				;Just dismiss interrupt
+
+;Generate the entires for each possible illegal interrupt
+
+illint0F:
+	PUSHL	#0Fh.B
+	JMP	illint.S
+
+illint11:
+	PUSHL	#11h.B
+	JMP	illint.S
+
+illint12:
+	PUSHL	#12h.B
+	JMP	illint.S
+
+illint13:
+	PUSHL	#13h.B
+	JMP	illint.S
+
+illint14:
+	PUSHL	#14h.B
+	JMP	illint.S
+
+illint15:
+	PUSHL	#15h.B
+	JMP	illint.S
+
+illint16:
+	PUSHL	#16h.B
+	JMP	illint.S
+
+illint17:
+	PUSHL	#17h.B
+	JMP	illint.S
+
+illint18:
+	PUSHL	#18h.B
+	JMP	illint.S
+
+illint19:
+	PUSHL	#19h.B
+	JMP	illint.S
+
+illint1A:
+	PUSHL	#1Ah.B
+	JMP	illint.S
+
+illint1B:
+	PUSHL	#1Bh.B
+	JMP	illint.S
+
+illint1C:
+	PUSHL	#1Ch.B
+	JMP	illint.S
+
+illint1D:
+	PUSHL	#1Dh.B
+	JMP	illint.S
+
+illint1E:
+	PUSHL	#1Eh.B
+	JMP	illint.S
+
+illint71:
+	PUSHL	#71h.B
+	JMP	illint.S
+
+illint72:
+	PUSHL	#72h.B
+	JMP	illint.S
+
+illint73:
+	PUSHL	#73h.B
+	JMP	illint.S
+
+illint74:
+	PUSHL	#74h.B
+	JMP	illint.S
+
+illint75:
+	PUSHL	#75h.B
+	JMP	illint.S
+
+illint76:
+	PUSHL	#76h.B
+	JMP	illint.S
+
+illint78:
+	PUSHL	#78h.B
+	JMP	illint.S
+
+illint79:
+	PUSHL	#79h.B
+	JMP	illint.S
+
+illint7A:
+	PUSHL	#7Ah.B
+	JMP	illint.S
+
+illint7B:
+	PUSHL	#7Bh.B
+	JMP	illint.S
+
+illint7C:
+	PUSHL	#7Ch.B
+	JMP	illint.S
+
+illint7E:
+illintmax::
+	PUSHL	#7Eh.B
+illint:	ANDL	[ESP], #0FFh
+	PUSHL	#0.B
+	PUSHL	#'IINT'
+	CALL	savregs			;Fall into fatal error routine on next
+					;  page
+.PAGE
+	.SBTTL	fatal - Fatal error routine
+
+;Here on fatal system error to display console message
+
+fatal::	CLI				;Make sure no interrupts after this
+	POPL	crshdata+pg0_crshCODE	;Store crash code
+	POPL	EAX			;Discard stacked CR2 value
+	POPL	crshdata+pg0_crshERRC	;Store error code for the error display
+	POPL	crshdata+pg0_crshEIP	;Store EIP
+	POPL	crshdata+pg0_crshCS	;Store CS
+	POPL	crshdata+pg0_crshEFR	;Store EFR
+	MOVL	EAX, knlSysDate#	;Store date
+	MOVL	crshdata+pg0_crshTIME+4, EAX
+	MOVL	EAX, knlTickCnt#	;Store time
+	CALL	knlTick2SysTime#
+	MOVL	crshdata+pg0_crshTIME+0, EAX
+
+;;;;;;;	JMP	boxdone.S		;Insert this to eliminate crash box!
+
+	PUSHL	pagezero+pg0_ic1mask	;Save the orignal interrupt enables
+	MOVW	pagezero+pg0_ic1mask, #0FFFFh
+	MOVL	savestk+0, ESP
+	MOVL	savestk+4, SS
+
+
+	MOVL	ESI, #crshpg0
+	MOVL	ECX, #{crshend-crshpg0}
+	MOVL	EBX, #83h		;Assume have color display
+	TESTB	knlDispType#, #DISP$COLOR ;Right?
+	JNE	2$.S			;Yes
+	MOVB	BL, #87			;No - its mono
+2$:	JMP	realmode
+
+;Here on return from real mode after resetting the console display - interrupts
+;  are disabled and all segment registers (except CS) are invalid
+
+fatal2:	MOVL	EAX, #GS_DATA
+	MOVL	DS, EAX
+	MOVL	FS, EAX
+	MOVL	GS, EAX
+	MOVB	AL, #GS_SCHPDA
+	MOVL	ES, EAX
+	MOVL	EAX, savepgd
+	MOVL	ES:pdaPageDir#, EAX
+
+	MOVL	EAX, crshdata+pg0_crshCR0 ;Restore the CR0 from the time of the
+	MOVL	CR0, EAX		  ;  crash
+	MOVL	EAX, crshdata+pg0_crshGDT+0 ;Restore the GDT from the time of
+	MOVL	temp+0, EAX		    ;  the crash
+	MOVL	EAX, crshdata+pg0_crshGDT+4
+	MOVL	temp+2, EAX
+	LGDTL	temp
+	MOVL	EAX, crshdata+pg0_crshIDT+0 ;Restore the IDT from the time of
+	MOVL	temp+0, EAX		    ;  the crash
+	MOVL	EAX, crshdata+pg0_crshIDT+4
+	MOVL	temp+2, EAX
+	LIDTL	temp
+	LLDT	crshdata+pg0_crshLDT	;Restore the LDT from the time of the
+					;  crash
+	LSSL	ESP, savestk		;Restore the SS:ESP from the time of
+					;  the crash
+	POPL	pagezero+pg0_ic1mask	;Restore the original interrupt enables
+
+	MOVL	EDX, #P_EGAGCINDX	;Fix up the VGA display mapping
+	MOVB	AL, #06h
+	OUTB	[DX]
+	IOPAUSE
+	INCL	EDX
+	MOVB	AL, #06h
+	OUTB	[DX]
+	PUSHL	#GS_DISPLAY.B		;Make the screen addressable
+	POPL	ES
+	MOVL	EDI, #BOXPSN*2		;Start at top of screen
+	MOVL	ESI, #eline
+	MOVL	EBX, #crshdata+pg0_crshCODE
+	CALL	toscreen		;Display message
+boxdone:CMPL	knlGeckoSig#+0, #'GECK'	;Was GECKO loaded?
+	JNE	stop			;No
+	CMPL	knlGeckoSig#+4, #'O$'
+	JNE	stop
+	CMPW	crshdata+pg0_crshCS, #GS_GECKOCODE ;Yes - was the error from
+						   ;  GECKO?
+	JE	stop			;Yes - don't try to use GECKO now!
+	MOVL	EAX, crshdata+pg0_crshEAX ;No - restore all registers except
+	MOVL	EBX, crshdata+pg0_crshEBX ;  for SS, SP, and CS to make
+	MOVL	ECX, crshdata+pg0_crshECX ;  debugging a little easier!
+	MOVL	EDX, crshdata+pg0_crshEDX
+	MOVL	EDI, crshdata+pg0_crshEDI
+	MOVL	ESI, crshdata+pg0_crshESI
+	MOVL	EBP, crshdata+pg0_crshEBP
+	PUSHL	EAX
+	CLRL	EAX
+	CMPW	crshdata+pg0_crshES, #3.B
+	JBE	6$.S
+	MOVL	ES, EAX
+	VERR	crshdata+pg0_crshES
+	JNE	8$.S
+6$:	MOVW	ES, crshdata+pg0_crshES
+8$:	CMPW	crshdata+pg0_crshFS, #3.B
+	JBE	10$.S
+	MOVL	FS, EAX
+	VERR	crshdata+pg0_crshFS
+	JNE	12$.S
+10$:	MOVW	FS, crshdata+pg0_crshFS
+12$:	CMPW	crshdata+pg0_crshGS, #3.B
+	JBE	14$.S
+	MOVL	GS, EAX
+	VERR	crshdata+pg0_crshGS
+	JNE	16$.S
+14$:	MOVW	GS, crshdata+pg0_crshGS
+16$:	POPL	EAX
+fatal_system_error::
+	INT3				;Go to GECKO
+	JMP	fatal_system_error.S
+.PAGE
+;The following code is copied to the middle of page 0 of physical memory so
+;  we can use the BIOS to reset the display hardware.  We change the mapping
+;  and segmentation so that this code can be executed with one-to-one mapping
+;  so we can disable mapping and then switch to real mode.  After resetting
+;  the console display, this code returns to protected mode!
+;	c(BL) = BIOS INT 10 set mode function
+;	c(BH) = BIOS display mode
+
+	.SEG16				;Assemble this code for a 16 bit
+					;  segment, even though it is being
+					;  placed in a 32 bit segment here
+					;  since we are going to copy it to a
+					;  16 bit segment before executing it
+
+crshpg0:MOVL	CR0, EDX
+	CLRL	EAX			;Clear the TLB
+	MOVL	CR3, EAX
+	ANDB	DL, #0FEh		;Switch to real mode
+	MOVL	CR0, EDX
+	JMPF	0:{crshreal-crshpg0}+800h ;This is needed to load the correct
+					  ;  real mode selector into CS
+crshreal:
+	CLRW	AX			;Set our selectors for real mode
+	MOVW	SS, AX
+	MOVW	DS, AX
+	MOVW	ES, AX
+	MOVW	FS, AX
+	MOVW	GS, AX
+	LIDTL	{crshidt-crshpg0}+800h	;Set the IDT pointer for real mode
+	MOVW	AX, BX			;Get display mode and INT 10 function
+	INT	10h
+	LGDTL	{crshgdt-crshpg0}+800h	;Reload the GDT for protected mode
+	CLI				;Make sure interrupts are disabled
+	MOVL	EAX, #pa_schpgdir#
+	MOVL	CR3, EAX
+	MOVL	EAX, CR0
+	ORL	EAX, #80000001h		;Set protected mode, paging enabled,
+	MOVL	CR0, EAX
+	JMPF	fatal2
+
+crshidt:.WORD	03FFh
+	.LONG	0
+
+crshgdt:.WORD	0FFFFh
+	.LONG	la_data+gdtable
+
+crshend:
+
+	CODE
+.PAGE
+;Here if GECKO is not loaded - wait until someone presses one of the Del keys
+;  or the Pause key
+
+stop::	CLI
+	INB	P_KEYSTS		;Have anything from the keyboard?
+	IOPAUSE
+	ANDB	AL, #1
+	JE	stop.S			;No - wait
+	INB	P_KEYDATA		;Yes - get keyboard code
+	CMPB	AL, #53h		;Is this the reboot key?
+	JE	knlReboot.S		;Yes
+	CMPB	AL, #62h		;Maybe
+	JE	knlReboot.S		;Yes
+	CMPB	AL, #0E1h		;Maybe
+	JNE	stop.S			;No - wait
+
+;Here when ready to reboot the system (we are also entered here from GECKO to
+;  reboot).  This does a "soft" reboot which preserves memory so that the
+;  crash-save data will be preserved.  This is not the easiest way to reboot
+;  the system.  It requires that the original machine state be restored so that
+;  the BIOS reboot function (which does NOT reset much of anything) will work
+;  right!  This includes switching back to real mode.
+
+knlReboot::
+	BTL	knlSysDescp#, #SYSD%FASTBOOT ;Want to do a fast boot?
+	JC	2$.S			;Yes
+	JMPIL	knlPhysReset		;No - do full physical reset
+
+;Here to do a fast boot
+
+2$:	MOVL	ESI, #rebpg0
+	MOVL	ECX, #{rebend-rebpg0}
+
+;	c{EBX} = Data value passed to real mode
+
+realmode:
+	MOVB	AL, #0FFh		;Disable all interrupts
+	OUTB	P_INC1P1
+	IOPAUSE
+	OUTB	P_INC2P1
+	CLI
+	PUSHL	#GS_DATA.B
+	POPL	DS
+	MOVL	EAX, #pa_schpgdir#	;Use the scheduler's memory context (we
+	MOVL	CR3, EAX		;  know its there and we know where the
+					;  page directory is!)
+
+;Now initialize the interrupt controllers like the BIOS does (needed because
+;  we have put the hardware vectors in a different place)
+
+	MOVB	AL, #11h		;Controller 1, ICW1, edge, master, ICS4
+	OUTB	P_INC1P0
+	IOPAUSE
+	MOVB	AL, #08h		;Controller 1, ICW2, interrupt type
+	OUTB	P_INC1P1
+	IOPAUSE
+	MOVB	AL, #04h		;Controller 1, ICW3, master level 2
+	OUTB	P_INC1P1
+	IOPAUSE
+	MOVB	AL, #01h		;Controller 1, ICW4, master, 8086 mode
+	OUTB	P_INC1P1
+	IOPAUSE
+	MOVB	AL, pagezero+pg0_ic1mask ;Restore interrupt enables for
+	OUTB	P_INC1P1		 ;  for controller 1
+	IOPAUSE
+	MOVB	AL, #11h		;Controller 2, ICW1, edge, master, ICS4
+	OUTB	P_INC2P0
+	IOPAUSE
+	MOVB	AL, #70h		;Controller 2, ICW2, interrupt type
+	OUTB	P_INC2P1
+	IOPAUSE
+	MOVB	AL, #02h		;Controller 2, ICW3, slave level 2
+	OUTB	P_INC2P1
+	IOPAUSE
+	MOVB	AL, #01h		;Controller 2, ICW4, slave, 8086 mode
+	OUTB	P_INC2P1
+	IOPAUSE
+	MOVB	AL, pagezero+pg0_ic2mask ;Restore interrupt enables for
+	OUTB	P_INC2P1		 ;  controller 2
+	IOPAUSE
+
+;Now initialize the DMA controllers
+
+;;;;;	MOVB	AL, #0
+;;;;;	OUTB	P_DMA1PG0
+;;;;;	IOPAUSE
+;;;;;	OUTB	P_DMA1PG1
+;;;;;	IOPAUSE
+;;;;;	OUTB	P_DMA1PG2
+;;;;;	IOPAUSE
+;;;;;	OUTB	P_DMA1PG3
+;;;;;	IOPAUSE
+;;;;;	OUTB	P_DMA2PG1
+;;;;;	IOPAUSE
+;;;;;	OUTB	P_DMA2PG2
+;;;;;	IOPAUSE
+;;;;;	OUTB	P_DMA2PG3
+;;;;;	IOPAUSE
+
+	.REPT	0Eh
+	NOP
+	.ENDR
+
+;Now initialize timer 0 to interrupt at the standard BIOS rate (about 18 times
+;  a second) - we have changed this too
+
+	MOVB	AL, #34h
+	OUTB	P_TMRCWR
+	IOPAUSE
+	MOVB	AL, #0
+	OUTB	P_TMRCNT0
+	IOPAUSE
+	MOVB	AL, #0
+	OUTB	P_TMRCNT0
+	IOPAUSE
+
+;Now copy the rest of this routine to physical page 0 - must do this so its
+;  in memory which we can map one-to-one so we can disable paging
+
+	PUSHL	DS
+	POPL	ES
+	MOVL	EDI, #pagezero+800h
+	CLD
+	RMOVSB	[EDI], CS:[ESI]
+	MOVL	EAX, dostcnt#		 ;Store the current DOS tick count on
+	MOVL	pagezero+bda_vtimer, EAX ; page 0
+	MOVL	pagezero, #03h		;Set up page 0 as a page table with
+	PUSHL	#GS_SCHPDA.B		;  one entry pointing to page 0
+	POPL	ES
+	MOVL	EAX, ES:pdaPageDir#+0
+	MOVL	savepgd, EAX
+	MOVL	ES:pdaPageDir#+0, #03
+	MOVL	EAX, CR3		;Clear the TLB
+	MOVL	CR3, EAX		;Get bits for CR0 to disable paging and
+	MOVL	EDX, CR0		;  put the FPU bits in the right state
+	ANDL	EDX, #7FFFFFF1h		;This assume that we have an FPU
+	CMPB	fputype#, #FPU_NONE	;Right?
+	JNE	4$.S			;Yes
+	ORB	DL, #04h		;No - indicate no FPU
+4$:	MOVL	gdtable+GS_TEMP+4, #00009A00h ;Make a 16 bit code segment at
+	MOVL	gdtable+GS_TEMP+0, #0000FFFFh ;  0
+	MOVL	gdtable+GS_EXPORT+4, #000F920Bh ;Also make a data segment at 0
+	MOVL	gdtable+GS_EXPORT+0, #0000FFFFh
+	MOVL	EAX, #GS_EXPORT		;Reload all of the selectors (we MUST
+	MOVL	DS, EAX			;  do this to correctly set the shadow
+	MOVL	ES, EAX			;  parts for real mode)
+	MOVL	GS, EAX
+	MOVL	FS, EAX
+	MOVL	SS, EAX
+	MOVL	ESP, #400h
+	JMPF	GS_TEMP:800h		;Reload CS and jump to code at 800
+.PAGE
+;The following code is copied to the middle of page 0 of physical memory.
+;  We change the mapping and segmentation so that this code can be executed
+;  with one-to-one mapping so we can disable mapping and then switch to real
+;  mode.
+
+	.SEG16				;Assemble this code for a 16 bit
+					;  segment, even though it is being
+					;  placed in a 32 bit segment here
+					;  since we are going to copy it to a
+					;  16 bit segment before executing it
+
+					;Set CR0 to disable paging and set the
+rebpg0:	MOVL	CR0, EDX		;  correct FPU bits
+	CLRL	EAX			;Clear the TLB
+	MOVL	CR3, EAX
+	ANDB	DL, #0FEh		;Switch to real mode
+	MOVL	CR0, EDX
+	JMPF	0:{rebreal-rebpg0}+800h	;This is needed to load the correct
+					;  real mode selector into CS
+rebreal:CLRW	AX			;Set our selectors for real mode
+	MOVW	SS, AX
+	MOVW	DS, AX
+	MOVW	ES, AX
+	MOVW	FS, AX
+	MOVW	GS, AX
+	LIDTL	{rebidt-rebpg0}+800h	;Set the IDT pointer for real mode
+	MOVB	AH, #0			;Try to set display to mode 3
+	MOVB	AL, #3
+	INT	10h
+	MOVB	AH, #0Fh		;Read back the mode to see if it worked
+	INT	10h
+	CMPB	AL, #3
+	JE	2$.S
+	MOVB	AH, #0			;Didn't work - try mode 7
+	MOVB	AL, #7
+	INT	10h
+2$:	MOVW	SI, #{bootmsg-rebpg0}+800h
+	CLRW	DX			;Display the "Booting ..." message
+4$:	MOVB	AH, #2h
+	MOVB	BH, #0
+	PUSHW	DX
+	PUSHW	SI
+	INT	10h
+	POPW	SI
+	POPW	DX
+	INCW	DX
+	MOVB	AL, [SI]		;Get next character
+	INCW	SI
+	MOVB	AH, #9h
+	MOVB	BL, #70h
+	MOVB	BH, #0
+	MOVW	CX, #1
+	CMPB	AL, #0			;Finished?
+	JE	6$.S			;Yes
+	PUSHW	DX			;No
+	PUSHW	SI
+	INT	10h			;Display the character
+	POPW	SI
+	POPW	DX
+	JMP	4$.S			;Continue
+
+;Here when finished displayng the message
+
+6$:	INT	10h
+	CLRW	CX
+8$:	INB	P_KEYDATA
+	IOPAUSE
+	INB	P_KEYSTS		;Empty out the keyboard input buffer
+	IOPAUSE
+	TESTB	AL, #02h
+	LOOPNE	CX, 8$
+	MOVL	41Ah, #001E001Eh	;Reset the keyboard buffer
+	MOVW	BX, 413h		;Get size of low memory
+	CMPW	BX, #640t		;Make sure not too big
+	JBE	10$.S
+	MOVW	BX, #640t
+10$:	ANDB	BL, #0FCh		;Round down to whole pages
+	SHLW	BX, #6t			;Change to selector value
+	CLD				;Just to be very safe and make sure
+	MOVW	DX, #100h		;  nothing that follows XOS is messed
+	CLRW	AX			;  by anything we leave behind, zero
+12$:	MOVW	ES, DX			;  all base memory above page 0!
+	CLRW	DI
+	MOVW	CX, #800h
+	RSTOSW	[DI]
+	ADDW	DX, #100h
+	CMPW	DX, BX
+	JB	12$.S
+
+;We now have the machine as close as we can get it to the state it was in
+;  just before XOS was loaded
+
+	STI				;Enable interrupts
+	MOVB	AH, #0			;Reset the floppy disk
+	MOVB	DL, #0
+	INT	13h
+	MOVB	AH, #0
+	MOVB	DL, #80			;Reset the hard disk
+	INT	13h
+20$:	INT	19h			;Reboot the system
+	JMP	20$.S
+
+rebidt:	.WORD	03FFh
+	.LONG	0
+
+bootmsg:.ASCIZ	" Booting ... "
+
+rebend:
+					;This is needed to restore the correct
+	CODE				;  segment size attributes
+.PAGE
+	.SBTTL	physreset - Do a physical reset
+
+;Here to do a physical reset of the system - This is normally accessed through
+;  the knlPhysReset vector which may be changed by a processor dependent LKE.
+
+physreset::
+	MOVB	AL, #0FEh
+	OUTB	64h
+	MOVL	ECX, #200t
+	CALL	knlSDelay#
+	JMP	physreset.S
+.PAGE
+	.SBTTL	usradrer - Return address error to user
+
+;Here when have an address error from exec mode which should be reported to the
+;  user as a protection error trap - user state must be saved in the pdaUReg*
+;  locations (which means this cannot be used with SVC routines, which do not
+;  use the pdaUReg* locations!)
+
+	FAULTHDR
+usradrer::
+	TESTB	SS:pdaURegEFR#+2, #02h	;From real mode?
+	JNE	knlRealFPErr		;Yes
+	CLI				;No
+	MOVL	ESP, #pdaXStk#		;No
+	IFFAULT	10$
+2$:	POPL	GS			;Restore segment registers
+	IFFAULT	12$
+4$:	POPL	FS
+	IFFAULT	14$
+6$:	POPL	ES
+	IFFAULT	16$
+8$:	POPL	DS
+	POPAL				;Restore user registers
+	PUSHL	#0.B
+	PUSHL	#0.B
+	TESTB	18t.B[ESP], #02h	;From real mode?
+	JE	9$.S			;Yes
+	PUSHL	#VECT_PPROT		;No
+	JMP	usertrap
+
+9$:	PUSHL	#VECT_RPROT+{ID_PROT/8+200h}*10000h
+	JMP	usertrap
+
+	FAULTHDR
+10$:	POPL	EAX
+	PUSHL	#0.B
+	JMP	2$.S
+
+	FAULTHDR
+12$:	POPL	EAX
+	PUSHL	#0.B
+	JMP	4$.S
+
+	FAULTHDR
+14$:	POPL	EAX
+	PUSHL	#0.B
+	JMP	6$.S
+
+	FAULTHDR
+16$:	POPL	EAX
+	PUSHL	#0.B
+	JMP	8$.S
+.PAGE
+	.SBTTL	usertrap - User trap routine
+
+;Here on all protected user mode traps which get special treatment when they
+;  occur in the GS_USERCODE segment
+
+usertrapx:
+	CMPW	16t.B[ESP], #GS_USERCODE|03h ;From the USERCODE segment?
+	JNE	usertrap		;No - its not special
+	PUSHL	EAX
+	PUSHL	EBX
+	PUSHL	DS			;Yes - set up DS
+	PUSHL	ES
+	PUSHL	#GS_DATA.B
+	POPL	DS
+	MOVL	ES, 32t.B[ESP]
+	MOVL	EBX, 28t.B[ESP]		;Yes - get offset of instruction
+	CMPL	EBX, #1002h		;Possible value?
+	JB	2$.S			;No
+	CMPL	EBX, #usercodetop#	;Maybe
+	JAE	6$.S			;No
+	CMPB	ES:-5.B[EBX], #0A9h	;Yes - have IFFAULT instruction?
+	JE	4$.S			;Yes
+	CMPB	ES:-5.B[EBX], #3Dh	;No - have IFFCALL instruction?
+2$:	JNE	14$			;No
+4$:	MOVL	EAX, ES:-4.B[EBX]	;Maybe - get offset
+	CMPL	EAX, #1002h		;Possible value?
+	JB	2$.S			;No
+	CMPL	EAX, #usercodetop#	;Maybe
+6$:	JAE	14$			;No
+	CMPB	ES:-1.B[EAX], #90h	;Have right header value?
+	JNE	2$.S			;No
+	MOVL	memufault, EBX		;Yes - store address for debugging
+	CMPB	ES:-5.B[EBX], #3Dh	;Have IFFCALL instruction?
+	JNE	8$.S			;No
+	IFFCALL	badusrstk
+	SUBL	SS:pdaURegESP#, #4t.B	;Adjust his stack pointer
+	LESL	EBX, SS:pdaURegESP#	;Yes - point to the user's stack
+	XCHGL	EAX, 28t.B[ESP]		;Store return offset, get offset of
+	IFFCALL	badusrstk		;  offending instruction
+	MOVL	ES:[EBX], EAX		;Store it on his stack
+	JMP	10$.S
+
+8$:	MOVL	28t.B[ESP], EAX		;Store error handler offset as return
+10$:	MOVB	AL, SS:pdaSigReq#	;Need to schedule now?
+	ANDB	AL, SS:pdaSigMask#
+	ORB	AL, knlSchedReq#
+	POPL	ES			;Restore registers
+	POPL	DS
+	POPL	EBX
+	POPL	EAX
+	POPL	SS:pdaJunk#		;Fix up the stack without changing the
+	POPL	SS:pdaJunk#		;  Z bit!
+	POPL	SS:pdaJunk#
+	JNE	12$.S			;If need to schedule here
+;;;;;;;	TESTB	9.B[ESP], #01h		;No scheduling now - do we want a trace
+					;  trap now?
+;;;;;;;	JNE	trctrpx#		;Yes - go do that
+	IFFCALL	badusrstk		;No
+	IRET				;Return to user
+
+;Here if need to schedule before returning to the user
+
+12$:
+;;;;;;;	TESTB	9.B[ESP], #01h		;Do we want a trace trap now?
+;;;;;;;	JNE	trctrpx#		;Yes - go do that
+	CALLF	schedule		;No - call the scheduler
+	IFFCALL	badusrstk
+	IRET				;Return to user
+
+;Here when error cannot be recovered
+
+14$:	POPL	ES			;Restore register
+	POPL	DS
+	POPL	EBX
+	POPL	EAX			;Fall into usertrap
+
+;Here on all user mode traps which can be handled by the user - software
+;  interrupt vector has been pushed on the stack, nothing has been saved.
+;  Interrupt is known to be from user mode.  The format of the user mode
+;  stack information depends on the type of vector used.  When get here,
+;  the exec stack is setup as follows:
+;	c[{ESP}+0] = Primary software interrupt vector number
+;	c[{ESP}+2] = Real mode vector number
+;	c{{ESP}+4} = Trap data
+;	c{{ESP}+8} = Trap error code
+
+usertrap:
+	CLI
+	POPL	SS:pdaTrapVect#
+	POPL	SS:pdaTrapData#
+	POPL	SS:pdaTrapCode#
+	PUSHAL				;Save user registers in the standard
+	PUSHL	DS			;  places
+	PUSHL	ES
+	PUSHL	FS
+	PUSHL	GS
+	STI
+	PUSHL	#GS_DATA.B		;Make exec data addressable
+	POPL	DS
+usertrap2::
+	CLRL	ESI
+	MOVZWL	EDX, SS:pdaTrapVect#+0	;Get primary vector number
+	LEAL	EBP, pdaIdt#[EDX*8]	;Get offset of the descriptor
+	CMPB	it_type.B[EBP], #0	;Is the vector set up?
+	JNE	20$.S			;Yes - use it
+	TESTB	SS:pdaStatus1#, #P1$DOSSEG ;No - do we have a DOS page 0?
+	JE	userfail.S		;No
+	MOVZWL	EDX, SS:pdaTrapVect#+2	;Yes - get DOS interrupt number
+	TESTL	EDX, EDX		;Do we have one?
+	JE	userfail.S		;No - fail
+	IFFAULT	userfail
+	CMPL	SS:pdaRMPage0#-200h*4[EDX*4], #0.B ;Is this vector set?
+	JE	userfail.S		;No - terminate the process
+20$:	MOVL	SS:pdaSigRegEDX#, EDX	;Yes - store vector number where the
+					;  software interrupt routine wants it
+	MOVB	BL, SS:pdaSigLvl#	;Get current software interrupt level
+	JMP	sigready#		;Continue in common software interrupt
+					;  routine
+.PAGE
+;Here if no vector is setup for a user mode trap - kill the process
+
+	FAULTHDR
+userfail:
+	MOVZWL	EAX, SS:pdaTrapVect#	;Get termination status value
+	CMPL	EAX, #160h		;Is it a low special value?
+	JB	4$.S			;No
+	CMPL	EAX, #180h		;Maybe - is it a middle special value?
+	JB	2$.S			;No - its a low special value
+	CMPL	EAX, #190h		;Maybe
+	JA	4$.S			;Not special
+	SUBL	EAX, #190h-160h+70h	;Fix up middle special value
+2$:	SUBL	EAX, #160h		;Fix up low special value
+4$:	ORL	EAX, #TC_NOVECT<24t	;Add the termination code value
+	CMPW	AX, #VECT_PPROT
+	JE	6$.S
+	CMPW	AX, #VECT_RPROT
+	JE	6$.S
+	CMPW	AX, #VECT_PSEGNP
+	JE	6$.S
+	CMPW	AX, #VECT_PPAGEFLT
+	JE	8$.S
+	CMPW	AX, #VECT_RPAGEFLT
+	JE	8$.S
+	CLRL	ESI
+	CLRL	EBX
+	JMP	userfail2.S
+
+;Here if protection fault or segment not present trap
+
+6$:	CLRL	ESI
+	MOVL	EBX, SS:pdaTrapCode#
+	JMP	userfail2.S
+
+;Here if page fault trap
+
+8$:	MOVL	ESI, SS:pdaTrapData#
+	CLRL	EBX
+	JMP	userfail2.S
+
+;Here if have bad user stack address
+
+	FAULTHDR
+badusrstk::				;Discard the error information (Put a
+	ADDL	ESP, #12t.B		;  breakpoint here to see this for
+					;  debugging!)
+	PUSHL	#GS_DATA.B		;Make sure DS is right
+	POPL	DS
+	MOVL	EAX, #TC_BDUSTK<24t
+	MOVL	ESI, SS:pdaURegESP#
+	MOVL	EBX, SS:pdaURegSS#
+userfail2:
+	PUSHL	SS
+	POPL	ES
+	MOVL	EDI, SS:pdaURegEIP#	;Get data for the parent
+	MOVL	EDX, SS:pdaURegCS#
+	MOVL	EBP, SS:pdaURegEFR#
+	CLRL	ECX
+	JMP	reqkill2#		;Go kill this process
+.PAGE
+	.SBTTL	nextins - Subroutine to find start of next instruction
+
+;Subroutine to find start of next instruction in memory given address of an
+;  instruction
+;	c{ES:EBX} = Address of instruction
+;	CALL	nextins
+;	C:set = Cannot determine address of next instruction
+;	C:clr = Have address of next instruction
+;	  c{ES:EBX} = Address of next instruction
+;  All registers except EAX and EBX are unchanged
+
+$$$=0
+FRM ni_size, 4
+FRM ni_skip, 4
+ni_SIZE=!$$$
+
+nextins::
+	ENTER	ni_SIZE, 0
+	CLRL	EAX
+	MOVL	ni_skip.B[EBP], EAX	;Assume no immediate value bytes to skip
+	MOVB	ni_size.B[EBP], AL	;Assume 16 bit segment
+	MOVL	EAX, ES
+	LARL	EAX, EAX		;Get access bits for segment
+	BTL	EAX, #22t		;Is this a 32 bit segment?
+	JNC	nxtinxt.S		;No
+	MOVB	ni_size.B[EBP], #3	;Yes
+	IFFAULT	nxtibad
+nxtinxt:MOVZBL	EAX, ES:[EBX]		;Get first opcode byte
+	INCL	EBX			;Bump to next byte
+	MOVB	AL, opctbl1[EAX]	;Get index
+	JMPIL	opcdsp1[EAX]		;Dispatch to routine
+.PAGE
+;Define symbol used in the opcode byte index tables
+
+DONE=!0t		;This is last byte of opcode
+FAIL=!4t		;Memory error on this instruction cannot be recovered
+AMBN=!8t		;Address mode byte is next
+PRFX=!12t		;Prefix byte
+OPFX=!16t		;Operand size prefix byte
+APFX=!20t		;Address size prefix byte
+OFSN=!24t		;Offset next
+XINS=!28t		;Extended instruction prefix byte
+IMM1=!32t		;1 byte immediate value follows instruction
+IMMX=!36t		;2 or 4 byte immediate value follows instruction
+GRP3=!40t		;Group 3 instructions
+IMX2=!44t		;2 byte immediate value follows instruction (no memory
+			;  address)
+
+;Index table for opcode byte when finding end of instruction
+
+	DATA
+
+opctbl1:.BYTE	AMBN, AMBN, AMBN, AMBN	;00, 01, 02, 03
+	.BYTE	FAIL, FAIL, FAIL, FAIL  ;04, 05, 06, 07
+	.BYTE	AMBN, AMBN, AMBN, AMBN	;08, 09, 0A, 0B
+	.BYTE	FAIL, FAIL, FAIL, XINS  ;0C, 0D, 0E, 0F
+	.BYTE	AMBN, AMBN, AMBN, AMBN	;10, 11, 12, 13
+	.BYTE	FAIL, FAIL, FAIL, FAIL  ;14, 15, 16, 17
+	.BYTE	AMBN, AMBN, AMBN, AMBN	;18, 19, 1A, 1B
+	.BYTE	FAIL, FAIL, FAIL, FAIL  ;1C, 1D, 1E, 1F
+	.BYTE	AMBN, AMBN, AMBN, AMBN	;20, 21, 22, 23
+	.BYTE	FAIL, FAIL, PRFX, FAIL  ;24, 25, 26, 27
+	.BYTE	AMBN, AMBN, AMBN, AMBN	;28, 29, 2A, 2B
+	.BYTE	FAIL, FAIL, PRFX, FAIL  ;2C, 2D, 2E, 2F
+	.BYTE	AMBN, AMBN, AMBN, AMBN	;30, 31, 32, 33
+	.BYTE	FAIL, FAIL, PRFX, FAIL  ;34, 35, 36, 37
+	.BYTE	AMBN, AMBN, AMBN, AMBN	;38, 39, 3A, 3B
+	.BYTE	FAIL, FAIL, PRFX, FAIL  ;3C, 3D, 3E, 3F
+	.BYTE	FAIL, FAIL, FAIL, FAIL	;40, 41, 42, 43
+	.BYTE	FAIL, FAIL, FAIL, FAIL	;44, 45, 46, 47
+	.BYTE	FAIL, FAIL, FAIL, FAIL	;48, 49, 4A, 4B
+	.BYTE	FAIL, FAIL, FAIL, FAIL	;4C, 4D, 4E, 4F
+	.BYTE	FAIL, FAIL, FAIL, FAIL	;50, 51, 52, 53
+	.BYTE	FAIL, FAIL, FAIL, FAIL	;54, 55, 56, 57
+	.BYTE	FAIL, FAIL, FAIL, FAIL	;58, 59, 5A, 5B
+	.BYTE	FAIL, FAIL, FAIL, FAIL	;5C, 5D, 5E, 5F
+	.BYTE	FAIL, FAIL, FAIL, FAIL	;60, 61, 62, 63
+	.BYTE	PRFX, PRFX, OPFX, APFX	;64, 65, 66, 67
+	.BYTE	FAIL, FAIL, FAIL, FAIL	;68, 69, 6A, 6B
+	.BYTE	FAIL, FAIL, FAIL, FAIL	;6C, 6D, 6E, 6F
+	.BYTE	FAIL, FAIL, FAIL, FAIL	;70, 71, 72, 73
+	.BYTE	FAIL, FAIL, FAIL, FAIL	;74, 75, 76, 77
+	.BYTE	FAIL, FAIL, FAIL, FAIL	;78, 79, 7A, 7B
+	.BYTE	FAIL, FAIL, FAIL, FAIL	;7C, 7D, 7E, 7F
+	.BYTE	IMM1, IMMX, IMM1, IMM1	;80, 81, 82, 83
+	.BYTE	AMBN, AMBN, AMBN, AMBN	;84, 85, 86, 87
+	.BYTE	AMBN, AMBN, AMBN, AMBN	;88, 89, 8A, 8B
+	.BYTE	AMBN, FAIL, AMBN, AMBN	;8C, 8D, 8E, 8F
+	.BYTE	FAIL, FAIL, FAIL, FAIL	;90, 91, 92, 93
+	.BYTE	FAIL, FAIL, FAIL, FAIL	;94, 95, 96, 97
+	.BYTE	DONE, DONE, FAIL, DONE	;98, 99, 9A, 9B
+	.BYTE	FAIL, FAIL, FAIL, FAIL	;9C, 9D, 9E, 9F
+	.BYTE	OFSN, OFSN, OFSN, OFSN	;A0, A1, A2, A3
+	.BYTE	DONE, DONE, DONE, DONE	;A4, A5, A6, A7
+	.BYTE	FAIL, FAIL, DONE, DONE	;A8, A9, AA, AB
+	.BYTE	DONE, DONE, DONE, DONE	;AC, AD, AE, AF
+	.BYTE	FAIL, FAIL, FAIL, FAIL	;B0, B1, B2, B3
+	.BYTE	FAIL, FAIL, FAIL, FAIL	;B4, B5, B6, B7
+	.BYTE	FAIL, FAIL, FAIL, FAIL	;B8, B9, BA, BB
+	.BYTE	FAIL, FAIL, FAIL, FAIL	;BC, BD, BE, BF
+	.BYTE	IMM1, IMM1, FAIL, FAIL	;C0, C1, C2, C3
+	.BYTE	AMBN, AMBN, IMM1, IMMX	;C4, C5, C6, C7
+	.BYTE	FAIL, FAIL, IMX2, DONE	;C8, C9, CA, CB
+	.BYTE	FAIL, FAIL, FAIL, DONE	;CC, CD, CE, CF
+	.BYTE	AMBN, AMBN, AMBN, AMBN	;D0, D1, D2, D3
+	.BYTE	FAIL, FAIL, FAIL, DONE	;D4, D5, D6, D7
+	.BYTE	AMBN, AMBN, AMBN, AMBN	;D8, D9, DA, DB
+	.BYTE	AMBN, AMBN, AMBN, AMBN	;DC, DD, DE, DF
+	.BYTE	FAIL, FAIL, FAIL, FAIL	;E0, E1, E2, E3
+	.BYTE	FAIL, FAIL, FAIL, FAIL	;E4, E5, E6, E7
+	.BYTE	FAIL, FAIL, FAIL, FAIL	;E8, E9, EA, EB
+	.BYTE	FAIL, FAIL, FAIL, FAIL	;EC, ED, EE, EF
+	.BYTE	FAIL, FAIL, PRFX, PRFX	;F0, F1, F2, F3
+	.BYTE	FAIL, FAIL, GRP3, GRP3	;F4, F5, F6, F7
+	.BYTE	FAIL, FAIL, FAIL, FAIL	;F8, F9, FA, FB
+	.BYTE	FAIL, FAIL, FAIL, FAIL	;FC, FE, FD, FF
+
+;Dispatch table for first opcode byte
+
+opcdsp1:.LONG	nxtidon		;DONE =  0. - This is last byte of opcode
+	.LONG	nxtibad		;FAIL =  4. - Memory error on this instruction
+				;	       cannot be recovered
+	.LONG	nxtiamb		;AMBN =  8. - Address mode byte is next
+	.LONG	nxtinxt		;PRFX = 12. - Prefix byte
+	.LONG	nxtiosp		;OPFX = 16. - Operand size prefix byte
+	.LONG	nxtiasp		;APFX = 20. - Address size prefix byte
+	.LONG	nxtiofs		;OFSN = 24. - Offset next
+	.LONG	nxtixip		;XINS = 28. - Extended instruction prefix byte
+	.LONG	nxtiim1		;IMM1 = 32. - 1 byte immediate value follows
+				;		instruction
+	.LONG	nxtiimx		;IMMX = 36. - 2 or 4 byte immediate value
+				;		follows instruction
+	.LONG	nxtigp3		;GRP3 = 40. - Group 3 instructions
+	.LONG	nxtixm2		;IMX2 = 44. - 2 byte immediate value follows
+				;		instruction (no memory address)
+
+	CODE
+.PAGE
+;Here if cannot find end of instruction for some reason
+
+	FAULTHDR
+nxtibad:STC				;Indicate error
+	LEAVE
+	RET				;And return
+
+;Here when finding end of instruction when current byte is an operand size
+;  prefix
+
+nxtiosp:XORB	ni_size.B[EBP], #1	;Change operand size
+	JMP	2$.S
+
+;Here when finding end of instruction when current byte is an address size
+;  prefx
+
+nxtiasp:XORB	ni_size.B[EBP], #2	;Change address size
+2$:	JMP	nxtinxt
+
+;Here when finding end of instruction when current byte is an extended
+;  instruction prefix byte
+
+	IFFAULT	nxtibad
+nxtixip:MOVB	AL, ES:[EBX]		;Get next byte
+	INCL	EBX
+	CMPB	AL, #3
+	JBE	nxtiamb.S
+	CMPB	AL, #0A3h
+	JE	nxtiamb.S
+	CMPB	AL, #0B3h		;Is this a good instruction?
+	JB	6$.S			;No
+	CMPB	AL, #0BAh
+	JE	nxtiim1.S
+	CMPB	AL, #0BFh
+	JBE	nxtiamb.S
+6$:	JMP	nxtibad			;No
+.PAGE
+;Here when finding end of instruction when current byte is opcode byte for
+;  group 3 instruction
+
+	IFFAULT	nxtibad			;Is this an immediate mode TEST
+nxtigp3:TESTB	ES:1.B[EBX], #38h	;  instruction?
+	JNE	nxtiamb			;No
+	TESTB	ES:[EBX], #01h		;Yes - is it TESTB?
+	JNE	nxtiimx.S		;No
+					;Yes
+
+;Here when finding end of instruction when current byte is opcode byte for
+;  instruction with 1 byte immediate operand
+
+nxtiim1:MOVB	AL, #1			;Get size of immediate operand
+	JMP	4$.S
+
+;Here when finding end of instruction when current byte is opcode byte for
+;  instruction with 2 or 4 byte immediate operand
+
+nxtiimx:MOVB	AL, #2			;Assume 2 byte immediate operand
+	TESTB	ni_size.B[EBP], #1	;Right?
+	JE	4$.S			;Yes
+	INCL	EAX			;No - its 4 bytes
+	INCL	EAX
+4$:	MOVB	ni_skip.B[EBP], AL	;Skip this many bytes at end
+					;Fall into nxtiamb routine
+
+;Here when finding end of instruction when next byte is the addressing
+;  mode byte
+
+	IFFAULT	nxtibad
+nxtiamb:MOVB	AL, ES:[EBX]		;Get the address mode byte
+	INCL	EBX
+	ANDB	AL, #0C7h
+	TESTB	ni_size.B[EBP], #2	;32 bit address mode?
+	JNE	10$.S			;Yes
+	CMPB	AL, #06h		;Simple 16 bit offset?
+	JE	nxtixm2.S		;Yes
+	ANDB	AL, #0C0h		;No - any more bytes?
+	JE	nxtidon.S		;No
+	CMPB	AL, #0C0h		;Maybe
+	JE	nxtidon.S		;No
+	CMPB	AL, #40h		;Yes - only 1 byte?
+	JE	20$.S			;Yes
+	JMP	nxtixm2.S		;No - 2 bytes
+
+;Here for 32 bit address modes
+
+10$:	CMPB	AL, #05h		;Simple 32 bit offset?
+	JE	nxtiofs			;Yes
+	CMPB	AL, #04h		;No - is the SIB byte present?
+	JE	14$.S			;Yes
+	CMPB	AL, #44h
+	JE	14$.S			;Yes
+	CMPB	AL, #84h
+	JNE	16$.S			;No
+	IFFAULT	nxtibad
+14$:	MOVB	AH, ES:[EBX]		;Get the SIB byte
+	INCL	EBX
+	ANDB	AH, #07h		;We only care about the low 3 bits
+	ANDB	AL, #0C0h
+	ORB	AH, AL
+	CMPB	AH, #5			;Is this the exception?
+	JE	nxtiofs.S		;Yes - have 4 offset bytes
+16$:	ANDB	AL, #0C0h		;Only care about the high 2 bits now
+	JE	nxtidon.S		;Any more bytes?
+	CMPB	AL, #0C0h		;Maybe
+	JE	nxtidon.S		;No
+	CMPB	AL, #40h		;Yes - only 1 byte?
+	JE	20$.S			;Yes
+					;No
+
+;Here when finding end of instruction when next byte starts a memory offset
+
+nxtiofs:INCL	EBX			;Point to end of 16 bit offset
+	INCL	EBX
+	TESTB	ni_size.B[EBP], #2	;Have 32 bit offset?
+	JE	nxtidon.S		;No
+nxtixm2:INCL	EBX			;Yes
+20$:	INCL	EBX
+
+;Here when finding end of instruction when current byte is the last byte of
+;  the instuction
+
+nxtidon:ADDL	EBX, ni_skip.B[EBP]	;Skip over any immediate value bytes
+	LEAVE
+	RET				;Finished
+.PAGE
+	.SBTTL	savregs - Subroutine to save registers on error trap
+
+;Subroutine to save registers on error trap
+;	CALL	savregs
+
+savregs:PUSHL	DS
+	PUSHL	#GS_DATA.B
+	POPL	DS
+	POPL	crshdata+pg0_crshDS
+	MOVL	crshdata+pg0_crshESP, ESP
+	ADDL	crshdata+pg0_crshESP, #28t.B
+	MOVL	crshdata+pg0_crshSS, SS
+	MOVL	crshdata+pg0_crshES, ES
+	MOVL	crshdata+pg0_crshFS, FS
+	MOVL	crshdata+pg0_crshGS, GS
+	SLDT	crshdata+pg0_crshLDT
+	STR	crshdata+pg0_crshTR
+	MOVL	crshdata+pg0_crshEBX, EBX
+savreg2:MOVL	crshdata+pg0_crshEAX, EAX
+	MOVL	crshdata+pg0_crshECX, ECX
+	MOVL	crshdata+pg0_crshEDX, EDX
+	MOVL	crshdata+pg0_crshEDI, EDI
+	MOVL	crshdata+pg0_crshESI, ESI
+	MOVL	crshdata+pg0_crshEBP, EBP
+	SIDT	crshdata+pg0_crshIDT
+	MOVL	EAX, crshdata+pg0_crshIDT+2
+	MOVL	crshdata+pg0_crshIDT+4, EAX
+	SGDT	crshdata+pg0_crshGDT
+	MOVL	EAX, crshdata+pg0_crshGDT+2
+	MOVL	crshdata+pg0_crshGDT+4, EAX
+	MOVL	EAX, CR0
+	MOVL	crshdata+pg0_crshCR0, EAX
+	MOVL	EAX, CR2
+	MOVL	crshdata+pg0_crshCR2, EAX
+	MOVL	EAX, CR3
+	MOVL	crshdata+pg0_crshCR3, EAX
+	MOVL	EAX, crshdata+pg0_crshESP
+	MOVL	stkaddr, EAX
+	MOVL	ECX, #pdaXStackV#	;Calculate how much is on the stack
+	CMPW	crshdata+pg0_crshSS, #GS_ERRSTK
+	JNE	4$.S
+	MOVL	ECX, #ERRSTKSIZE#
+4$:	SUBL	ECX, EAX
+	SHRL	ECX, #2
+	CMPL	ECX, #32t.B		;Too much to display?
+	JBE	6$			;No
+	MOVL	ECX, #32t		;Yes - just display what we can
+6$:	MOVB	stkcnt, CL		;Save amount for display routine
+	TESTL	ECX, ECX		;Anything to save?
+	JE	10$.S			;No
+	PUSHL	DS			;Yes - store up to the first 32 longs
+	PUSHL	DS			;  of the stack for display
+	POPL	ES
+	MOVL	ESI, crshdata+pg0_crshESP
+	MOVW	DS, crshdata+pg0_crshSS
+	MOVL	EDI, #crshdata+pg0_crshSTK
+	CLD
+	RMOVSL	[EDI], [ESI]
+	POPL	DS
+10$:	RET				;All done here
+.PAGE
+	.SBTTL	toscreen - Subroutine to place error message on screen
+
+;Subroutine to place error message on screen
+;	c{EBX}    = Offset for values to display
+;	c{ESI}    = Offset of error message string
+;	c{ES:EDI} = Pointer to screen buffer
+;	CALL	toscreen
+
+toscreen:
+	TESTB	knlDispType#, #DISP$COLOR ;Color display?
+	JNE	1$.S			;Yes
+	MOVB	attrib, #A_MNORM	;No - fix up normal display attribute
+1$:	LODSB	[ESI]			;Get character
+	TESTB	AL, AL			;Done?
+	JE	5$.S			;Yes
+	CMPB	AL, #LF			;End of line?
+	JE	14$			;Yes
+	CMPB	AL, #'%'		;Insert word value?
+	JE	18$			;Yes
+	CMPB	AL, #'#'		;Insert stack value?
+	JE	tosstkv			;Yes
+	CMPB	AL, #'*'		;Insert stack address?
+	JE	tosstka			;Yes
+	CMPB	AL, #'&'		;Insert long value?
+	JE	16$			;Yes
+	CMPB	AL, #'+'		;Insert data character?
+	JE	12$.S
+	CMPB	AL, #'('		;Start blink?
+	JE	6$.S			;Yes
+	CMPB	AL, #')'		;End special?
+	JE	8$.S			;Yes
+	CMPB	AL, #'{'		;Start inverse?
+	JE	10$.S
+2$:	STOSB	[EDI]			;No - store character
+	MOVB	AL, attrib		;Get attribute byte
+	STOSB	[EDI]			;Store it
+4$:	JMP	1$.S			;Continue
+
+;Here if finished
+
+5$:	RET
+
+;Here to start blink region
+
+6$:	MOVB	attrib, #A_CBLNK
+	TESTB	knlDispType#, #DISP$COLOR
+	JNE	1$.S
+	MOVB	attrib, #A_MBLNK
+	JMP	4$.S
+
+;Here to end blink region
+
+8$:	MOVB	attrib, #A_CNORM
+	TESTB	knlDispType#, #DISP$COLOR
+	JNE	4$.S
+	MOVB	attrib, #A_MNORM
+	JMP	4$.S
+
+;Here to start inverse region
+
+10$:	MOVB	attrib, #A_CINVR
+	TESTB	knlDispType#, #DISP$COLOR
+	JNE	4$.S
+	MOVB	attrib, #A_MINVR
+	JMP	4$.S
+
+;Here to insert data character
+
+12$:	MOVB	AL, [EBX]		;Get data character
+	INCL	EBX
+	JMP	2$.S			;Go display it
+
+;Here if at end of line
+
+14$:	PUSHL	EDX
+	LEAL	EAX, -1.B[EDI]		;Advance to start of next line
+	ANDL	EAX, #0FFFh
+	ANDL	EDI, #0FFFFF000h
+	CLRL	EDX
+	MOVL	ECX, #160t
+	DIVL	ECX
+	INCL	EAX
+	MULL	ECX
+	POPL	EDX
+	LEAL	EDI, BOXPSN*2.B[EAX+EDI]
+	CMPB	stkcnt, #0		;Done with stack data?
+	JG	15$.S			;No - continue
+	MOVL	ESI, #lastln		;Yes - skip the rest
+15$:	JMP	4$
+
+;Here if need to insert 32 bit hex value
+
+16$:	MOVW	AX, 2.B[EBX]		;Get high word
+	CALL	dspword			;Display it
+	MOVW	AX, [EBX]		;Get low word
+	JMP	19$.S
+
+;Here if need to insert 16 bit hex value
+
+18$:	MOVW	AX, [EBX]		;Get value
+19$:	ADDL	EBX, #4.B
+20$:	CALL	dspword			;Display it
+22$:	JMP	1$
+
+;Here if need to insert 32 bit hex value from the stack
+
+tosstkv:DECB	stkcnt			;Anything left to display?
+	JNS	16$			;Yes - just display it
+	MOVB	AL, #'-'		;No - display "--------"
+	MOVB	AH, attrib
+	MOVL	ECX, #8
+	RSTOSW	[EDI]
+	JMP	22$.S
+
+;Here if need to insert 32 bit stack address
+
+tosstka:MOVW	AX, stkaddr+2
+	CALL	dspword
+	MOVL	EAX, stkaddr
+	CALL	dspword
+	ADDL	stkaddr, #10h.B
+	JMP	22$.S
+
+;Subroutine to display word
+
+dspword:MOVW	CX, #4
+30$:	ROLW	AX, #4			;Get next 4 bits
+	PUSHL	EAX
+	ANDB	AL, #0Fh
+	CMPB	AL, #09h
+	JLE	34$
+	ADDB	AL, #'A'-'0'-0Ah
+34$:	ADDB	AL, #'0'
+	MOVB	AH, attrib
+	STOSW	[EDI]			;No - store character and attribute
+	POPL	EAX
+	LOOP	CX, 30$
+	RET
+.PAGE
+	.SBTTL	Crash message text
+
+	DATA
+
+eline:	.BYTE	BTL
+	.REPT	9t
+	.NLIST
+	.BYTE	BHL
+	.LIST
+	.ENDR
+	.ASCII	"( Fatal system error )"
+	.REPT	7t
+	.NLIST
+	.BYTE	BHL
+	.LIST
+	.ENDR
+	.ASCII	"{ ++++ )"
+	.REPT	9t
+	.NLIST
+	.BYTE	BHL
+	.LIST
+	.ENDR
+	.BYTE	BTR
+	.BYTE	LF
+	.ASCII	{BVL}"EAX:& EBX:& ECX:& EDX:&"{BVL}{LF}
+	.ASCII	{BVL}"ESP:& EBP:& EDI:& ESI:&"{BVL}{LF}
+	.ASCII	{BVL}"CS:% SS:% DS:% ES:% FS:% GS:%    "{BVL}{LF}
+	.ASCII	{BVL}"EIP:& EFR:& TR:% LDT:%         "{BVL}{LF}
+	.ASCII	{BVL}"IDT:%-&   GDT:%-&              "{BVL}{LF}
+	.ASCII	{BVL}"ERR:& CR0:& CR2:& CR3:&"{BVL}{LF}
+	.ASCII	{BVL}"Data:         & & & &  "{BVL}{LF}
+	.ASCII	{BVL}"Stk:*> # # # #  "{BVL}{LF}
+	.ASCII	{BVL}"    *> # # # #  "{BVL}{LF}
+	.ASCII	{BVL}"    *> # # # #  "{BVL}{LF}
+	.ASCII	{BVL}"    *> # # # #  "{BVL}{LF}
+	.ASCII	{BVL}"    *> # # # #  "{BVL}{LF}
+	.ASCII	{BVL}"    *> # # # #  "{BVL}{LF}
+	.ASCII	{BVL}"    *> # # # #  "{BVL}{LF}
+	.ASCII	{BVL}"    *> # # # #  "{BVL}{LF}
+lastln:	.BYTE	BBL
+	.REPT	51t
+	.NLIST
+	.BYTE	BHL
+	.LIST
+	.ENDR
+	.BYTE	BBR
+	.BYTE	0
+.PAGE
+	.SBTTL	Data
+
+	DATA
+
+knlPhysReset::			;Physical reset vector
+	   .LONG physreset
+memfault:: .LONG 0		;Offset of last exec mode IFFAULT instruction
+memufault::.LONG 0		;Offset of last user mode IFFAULT instruction
+userdatsz::.LONG 0
+useradrsz::.LONG 0
+
+rmlastprot::
+	   .LONG 0
+
+savestk:   .LONG 0, 0
+savepgd:   .LONG 0
+temp:	   .LONG 0, 0
+
+stkaddr:   .LONG 0
+stkcnt:	   .BYTE 0
+attrib:	   .BYTE A_CNORM
+fpuignore::.BYTE 0		;Non-zero if should ignore FPU traps
+
+	.MOD	4
+msgbfr:	   .BYTE MT_SYSLOG, 1, 0, 0
+	   .LONG 0, 0, 0, 0
+msgend:
+
+	END

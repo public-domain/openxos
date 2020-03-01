@@ -1,0 +1,1773 @@
+	.TITLE	XFSCLS3 - XOS file service routines for XOS - part 3
+
+;++++
+; This software is in the public domain.  It may be freely copied and used
+; for whatever purpose you see fit, including commerical uses.  Anyone
+; modifying this software may claim ownership of the modifications, but not
+; the complete derived code.  It would be appreciated if the authors were
+; told what this software is being used for, but this is not a requirement.
+
+;   THIS SOFTWARE IS PROVIDED BY THE AUTHORS "AS IS" AND ANY EXPRESS OR
+;   IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
+;   OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+;   IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+;   INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+;   BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS
+;   OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+;   ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR
+;   TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
+;   USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+;----
+
+	.PROC	80486
+	.INCLUD	XOSINC:\XMAC\XOS.PAR
+	.INCLUD	XOSINC:\XMAC\XOSX.PAR
+	.INCLUD	XOSINC:\XMAC\XOSTIME.PAR
+	.INCLUD	XOSINC:\XMAC\XOSERR.PAR
+	.INCLUD	XOSINC:\XMAC\XOSDISK.PAR
+	.INCLUD	XOSINC:\XMAC\XOSXDISK.PAR
+	.INCLUD	XOSINC:\XMAC\XOSXXFS.PAR
+	.INCLUD	XOSINC:\XMAC\XOSLKE.PAR
+	.INCLUD	XOSINC:\XMAC\XOSXLKE.PAR
+
+	LKECONT
+
+
+$$CHKCHAIN=!0
+
+	CODE
+
+	.SBTTL	xfsclose - Close file
+
+;Here for the close device entry - get here in extended fork context
+;	c{EDI} = Offset of disk DCB
+;  On return:
+;	C:set = Error
+;	  c{EAX} = Error code
+;	  c{ECX} = Number of files deleted (0 or 1)
+;	C:clr = Normal
+;	  c{EAX} = 0
+;	  c{ECX} = Number of files deleted (0 or 1)
+
+xfsclose::
+	CALL	knlIoClsLock##		;Lock the QAB
+	MOVB	iorb_queue.B[ESI], #dcb_outframe
+	MOVL	iorb_routine.B[ESI], #xfsclose1
+	JMP	knlXfQueue##		;Switch to extended fork context
+
+;Here in extended fork context
+
+xfsclose1:
+.IF NE $$CHKCHAIN
+	CALL	checkchain#
+.ENDC
+	PUSHL	#0.B
+	CMPL	SS:xffParm##, #0.B	;Have any device parameters?
+	JE	2$.S			;No
+	MOVL	EBX, #xfsioparms#	;Yes - process parameters
+	MOVL	ECX, #knlComDPParms##
+	IFFAULT	knlQAdrErr0##
+	LFSL	EDX, SS:xffParm##
+	CALL	knlProcDevParm##
+	JNC	2$.S
+	MOVL	[ESP], EAX
+2$:	CALL	xfsclose2		;Do the rest of the close
+	JNC	4$.S
+	MOVL	[ESP], EAX
+4$:	CALL	xfswritefats#
+	JNC	6$.S
+	MOVL	[ESP], EAX
+6$:	POPL	EAX
+	JMP	knlXfCloseFin##
+.PAGE
+2$:	CRASH	FNOP			;[File Not OPen]
+
+;Subroutine to do the work for close
+
+xfsclose2::
+	CMPL	dcb_opencnt.B[EDI], #1.B ;Anyone else have this open?
+	JE	xfscfile		;No - go close the file
+	MOVL	EBX, dcb_dkfilepnt.B[EDI] ;Yes - get offset of buffer for base FIB
+	TESTL	EBX, EBX		;Make sure really have a file open
+	JE	2$.S
+	CALL	xfscloslk		;OK - remove any local locks
+	TESTB	SS:xffOption##, #C$DELETE ;Want to delete file?
+	JE	4$.S			;No
+	ORB	cb_sts.B[EBX], #CB$DELF	;Yes - indicate should delete it
+4$:	PUSHL	#0.B
+	TESTB	SS:xffCmd##, #O$OUT	;Open for output?
+	JE	10$.S			;No
+	CALL	xosdskFinOut##		;Yes - finish pending or defered output
+	MOVL	EBX, dcb_dkfilepnt.B[EDI] ;Restore offset of base FIB
+	JNC	6$.S
+	MOVL	[ESP], EAX
+6$:	TESTB	ff_status.B[EBX], #FS$MODIFIED ;Has the file been modified?
+	JE	10$.S			;No
+	TESTB	ff_status.B[EBX], #FS$DATESET ;Yes - has date/time been set?
+	JNE	10$.S			;Yes - leave it alone
+	CLI				;No - update modify date/time
+	MOVL	EAX, knlTickCnt##	;Use current date and time
+	PUSHL	knlDosDate##
+	STI
+	CALL	knlTick2DosTime##
+	MOVL	EBX, dcb_dkfilepnt.B[EDI]
+	MOVW	ff_time.B[EBX], AX	;Update time
+	POPL	EAX			;And date
+	MOVW	ff_date.B[EBX], AX
+	ORB	cb_sts.B[EBX], #CB$CHNGD ;Indicate base FIB has been changed
+10$:
+
+;qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq
+
+	TESTB	cb_sts.B[EBX], #CB$CHNGD ;Has the FIB been changed?
+	JE	12$.S			;No
+	CALL	xfsupdfile		;Yes - update file data on disk
+	MOVL	EBX, dcb_dkfilepnt.B[EDI] ;Restore offset of base FIB
+	JNC	12$.S			;Go on if OK
+	MOVL	[ESP], EAX
+12$:	POPL	EAX
+.IF NE $$CHKCHAIN
+	CALL	checkchain#
+.ENDC
+	BTL	EAX, #31t
+	RET
+.PAGE
+;Routine to remove local file-record locks on close operation
+
+xfscloslk:
+	PUSHL	ESI
+	MOVL	ESI, ff_lock.B[EBX]	;Get offset of first lock
+50$:	TESTL	ESI, ESI
+	JE	70$.S			;Finished processing locks
+	PUSHL	ESI			;Save offset of beginning of block
+	PUSHL	ECX
+	MOVL	ECX, #60t/fle_SIZE	;Get number of entries in a block
+	ADDL	ESI, #fl_1st.B		;Point to first lock in block
+55$:	MOVW	AX, SS:xffPda##		;Get PDA of requestor
+	CMPW	AX, fle_pda.B[ESI]	;Does it match the PDA of the lock?
+	JNE	65$.S			;No
+	MOVL	GS, EAX			;Yes
+	TESTB	GS:pdaStatus1##, #P1$DOSSEG ;Have a DOS environment?
+	JE	60$.S			;No
+	PUSHL	#GS_REAL16.B		;Yes
+	POPL	GS			;Point to real mode segment
+	MOVL	EAX, GS:dda_curpsp	;Get current PSP
+	SHRL	EAX, #4.B		;Make into 16-bit value
+60$:	CMPW	AX, fle_psp.B[ESI]	;Check against value in lock
+	JNE	65$.S			;Doesn't match - not this lock
+	CMPL	EDI, fle_dcb.B[ESI]	;Compare to handle in lock
+	JNE	65$.S
+	CLRL	EAX			;Clear this lock
+	MOVL	fle_offset.B[ESI], EAX
+	MOVL	fle_size.B[ESI], EAX
+	MOVL	fle_dcb.B[ESI], EAX
+	MOVL	fle_pda.B[ESI], EAX
+65$:	ADDL	ESI, #fle_SIZE.B	;Advance to next entry
+	LOOP	ECX, 55$
+	POPL	ECX
+	POPL	ESI
+	MOVL	ESI, fl_next.B[ESI]	;Point to next block in list
+	JMP	50$.S
+
+70$:	POPL	ESI
+	RET
+.PAGE
+	.SBTTL	xfscfile - Subroutine to close file
+
+;Subroutine to close file - must be called in extended fork context
+;	c{EDI} = Offset of DCB
+;	CALL	xfscfile
+;	C:set = Error
+;	  c{EAX} = Error code
+;	  c{ECX} = Number of files deleted (0 or 1)
+;	C:clr = Normal
+;	  c{EAX} = 0
+;	  c{ECX} = Number of files deleted (0 or 1)
+
+xfscfile::
+	CALL	xosdskFinOut##		;Finish pending or defered output
+	JNC	4$.S			;Go on if OK
+	PUSHL	EAX			;If error
+	CALL	4$			;Do the rest of the close
+	POPL	EAX			;But report the error
+	STC
+2$:	RET
+
+;Here with pending or defered output complete without errors
+
+4$:	MOVL	EBX, dcb_dkfilepnt.B[EDI] ;Get offset of buffer for base FIB
+	CALL	xosdskLockBufrW##	;Lock the file
+
+;Here to clean up any active record locks
+
+	PUSHL	EAX
+	PUSHL	ESI
+	MOVZWL	EAX, cb_opencnt.B[EBX]	;Get open count for FIB
+	DECL	EAX			;Check if zero
+	JE	6$.S			;Yes - remove all locks
+	CALL	xfscloslk		;No - only remove local locks
+	JMP	10$.S			;Done with lock processing
+
+6$:	MOVL	ESI, ff_lock.B[EBX]	;Get offset of first lock
+	TESTL	ESI, ESI		;Have any at all?
+	JE	10$.S			;No - nothing needed here
+	CLRL	EAX			;Yes - clear the pointer
+	MOVL	ff_lock.B[EBX], EAX
+8$:	PUSHL	fl_next.b[ESI]		;Save offset of next lock
+	CALL	knlGiveQel##		;Give up the QEL
+	POPL	ESI			;Restore offset of next lock block
+	TESTL	ESI, ESI		;Have another?
+	JNE	8$.S			;Yes - continue
+10$:	POPL	ESI
+	POPL	EAX
+
+;Here to delete file if need to
+
+	TESTB	SS:xffOption##, #C$DELETE ;Want to delete the file?
+	JE	12$.S			;No
+	ORB	cb_sts.B[EBX], #CB$DELF	;Yes - indicate should delete it
+12$:	CALL	xfschkdel		;See if should delete file
+	JNC	16$.S
+	TESTL	ECX, ECX		;Was the file deleted?
+	JNE	14$.S			;Yes - finished here
+	PUSHL	EAX			;No - save error code
+	CALL	18$			;Finish closing the file
+	POPL	EAX
+	STC
+14$:	RET
+
+;Here to update file date and time if necessary
+
+16$:	JE	14$.S			;Finished if file was deleted
+18$:	BTL	SS:xffCmd##, #O%OUT	;File open for output?
+	JNC	28$			;No
+	TESTB	ff_status.B[EBX], #FS$MODIFIED ;Has the file been modified?
+	JE	20$.S			;No
+	TESTB	ff_status.B[EBX], #FS$DATESET ;Yes - has date/time been set?
+	JNE	20$.S			;Yes - leave it alone
+	CLI				;No - update modify date/time
+	MOVL	EAX, knlTickCnt##	;Use current date and time
+	PUSHL	knlDosDate##
+	STI
+	CALL	knlTick2DosTime##
+	MOVL	EBX, dcb_dkfilepnt.B[EDI]
+	MOVW	ff_time.B[EBX], AX	;Update time
+	POPL	EAX			;And date
+	MOVW	ff_date.B[EBX], AX
+	ORB	cb_sts.B[EBX], #CB$CHNGD ;Indicate base FIB has been changed
+
+;Here to deallocate extra blocks allocated to the file if need to
+
+20$:	TESTB	SS:xffOption##, #C$NODEAL ;Want to suppress deallocation?
+	JNE	28$.S			;Yes
+	BTL	SS:xffCmd##, #O%OUT	;No - is file open for output?
+	JNC	28$.S			;No
+	MOVL	ECX, ff_size.B[EBX]	;Yes - do we need to reduce it?
+	MOVL	EAX, ff_alloc.B[EBX]
+	DECL	EAX
+	JS	28$.S			;No
+	MOVL	ESI, [EDI]
+	TESTL	ESI, ESI
+	JE	22$.S
+	IMULL	EAX, ucb_bpclus.B[ESI]	;Maybe
+	CMPL	ECX, EAX
+	JA	28$.S			;No
+	CALL	xfsreduce#		;Yes - reduce size of the file
+	JNC	28$.S			;Go on if OK
+	PUSHL	EAX			;Error - finish closing the file
+	JMP	24$.S
+
+22$:	PUSHL	#ER_MDCHG.B
+24$:	CALL	28$
+	JMP	32$.S
+
+;Here with file size reduced if necessary - now check for a rename on close
+;  request
+
+28$:	MOVL	EAX, dcb_cab.B[EDI]	;Want to change the file name?
+	TESTL	EAX, EAX
+	JE	30$.S			;No - go on
+	CMPB	cab_clsname.B[EAX], #0	;Maybe
+	JE	30$.S			;No
+	CALL	clsrename		;Yes - do rename on close
+	MOVL	EBX, dcb_dkfilepnt.B[EDI] ;Restore offset of the base FIB
+	JNC	30$.S			;Go on if OK
+	PUSHL	EAX
+	CALL	30$
+	POPL	EAX
+	STC
+	RET
+
+;Here if do not have a rename on close request
+
+30$:	CALL	xfscfil4		;Update the directory block from the FIB
+	JNC	34$.S
+	PUSHL	EAX
+	CALL	34$
+32$:	POPL	EAX
+	CLRL	ECX
+	STC
+	RET
+
+34$:	BTL	SS:xffCmd##, #O%COMPAT	 ;Decrement non-compatability mode
+	CMC				 ;  count if not open for compatability
+	SBBW	cb_nocomcnt.B[EBX], #0.B ;  mode
+	CMPW	cb_nocomcnt.B[EBX], #-1.B ;Is count OK?
+	JE	46$.S			;No
+	BTL	SS:xffCmd##, #O%XREAD	;Decrement exclusive read count if open
+	SBBW	cb_xrcnt.B[EBX], #0.B	;  for exclusive read access
+	CMPW	cb_xrcnt.B[EBX], #-1.B	;Is count OK?
+	JE	48$.S			;No
+	BTL	SS:xffCmd##, #O%XWRITE	;Decrement exclusive write count if open
+	SBBW	cb_xwcnt.B[EBX], #0.B	;  for exclusive write access
+	CMPW	cb_xwcnt.B[EBX], #-1.B	;Is count OK?
+	JE	50$.S			;No
+	BTL	SS:xffCmd##, #O%IN	;Decrement read count if open for input
+	SBBW	cb_readcnt.B[EBX], #0.B
+	CMPW	cb_readcnt.B[EBX], #-1.B ;Is the count OK?
+	JE	42$.S			;No
+	BTL	SS:xffCmd##, #O%OUT	 ;Decrement write count if open for
+	SBBW	cb_writecnt.B[EBX], #0.B ;  output
+	CMPW	cb_writecnt.B[EBX], #-1.B ;Is the count OK?
+	JE	44$.S			;No
+	CMPW	cb_opencnt.B[EBX], #0.B	;Is the file open count OK?
+	JE	40$.S			;No - fail big!
+	CALL	xfsgivefib		;Yes - give up the FIB buffer
+	CLRL	EAX
+	CLRL	ECX
+	RET
+
+40$:	CRASH	BFOC			;[Bad File Open Count]
+
+42$:	CRASH	BFRC			;[Bad File Read Count]
+
+44$:	CRASH	BFWC			;[Bad File Write Count]
+
+46$:	CRASH	BNCC			;[Bad No Compatability mode Count]
+
+48$:	CRASH	BXRC			;[Bad eXclusive Read Count]
+
+50$:	CRASH	BXWC			;[Bad eXclusive Write Count]
+.PAGE
+;Subroutine to rename file when closing it
+;	CALL	clsrename
+;	c{EBX} = Offset of file FIB
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+
+SAVEBITS=!O$NOQUE|O$OPNCLS|O$CRIT|O$COMPAT|O$XREAD|O$XWRITE|O$NOINH|O$OUT|O$IN
+
+2$:	MOVL	EAX, #ER_BDSPC
+	STC
+4$:	POPL	EDI
+	POPL	ESI
+	LEAVE
+	LEAVE
+	RET
+
+clsrename:
+	CLRL	EBX
+	CALL	knlOpeXSetup##		;Set up an opn_ stack frame
+	ENTER	of_SIZE, 2		;Then create our level 2 stack frame
+	PUSHL	ESI
+	MOVL	ESI, dcb_cab.B[EDI]
+	ADDL	ESI, #cab_clsname.B
+	PUSHL	EDI
+	LEAL	EDI, of_namshort[EBP]
+	PUSHL	SS
+	POPL	ES
+	CMPB	[ESI], #'.'		;Null name?
+	JE	2$.S			;Yes - fail
+	CLD
+	MOVL	ECX, #8+1
+	CALL	chkfield
+	JC	4$.S
+	MOVB	CL, #3+1
+	CALL	chkfield
+	JC	4$.S
+	CMPB	AL, #0
+	JNE	2$.S
+	POPL	EDI
+	POPL	ESI
+	MOVL	EBX, dcb_dkfilepnt.B[EDI]
+	MOVL	EBX, cb_dirfib.B[EBX]
+	CALL	xosdskLockBufrF##	;Try to lock the directory FIB
+	JE	8$.S			;If we got it
+	MOVL	EBX, dcb_dkfilepnt.B[EDI] ;Can't get it now - unlock file FIB
+	CALL	xosdskUnlkBufr##
+	MOVL	EBX, cb_dirfib.B[EBX]	;Lock the directory FIB
+	CALL	xosdskLockBufrW##
+	MOVL	EBX, dcb_dkfilepnt.B[EDI] ;And lock the file FIB again - we must
+	CALL	xosdskLockBufrW##	  ;  do this in this order to avoid a
+					;  possible deadlock.
+	CMPL	ff_dirpos.B[EBX], #-1.B	;Is the file still in a directory?
+	JE	10$.S			;No - forget this!
+8$:	MOVL	EBX, dcb_dkfilepnt.B[EDI] ;Save offset of the file FIB
+	PUSHL	EBX
+	MOVL	EBX, cb_dirfib.B[EBX]	;Get offset of the directory FIB
+	MOVL	dcb_dkfilepnt.B[EDI], EBX ;Make it currently open on this DCB
+	MOVL	dcb_dkcfib.B[EDI], EBX
+	ANDL	SS:xffCmd##, #SAVEBITS
+	ORL	SS:xffCmd##, #O$CREATE|O$FAILEX
+	MOVB	of_isname.B[EBP], #1	;Search for the new name, fail if we
+
+;;;;;	MOVB	of_gtname.B[EBP], #0	;  find it
+
+	CALL	xfsffil4#
+	POPL	EBX			;Restore offset of the file FIB
+	MOVL	dcb_dkfilepnt.B[EDI], EBX
+	MOVL	dcb_dkcfib.B[EDI], EBX
+	JC	10$.S			;If error
+	ORB	cb_sts.B[EBX], #CB$CHNGD ;Indicate FIB changed
+10$:	LEAVE
+	LEAVE
+	TESTB	cb_sts.B[EBX], #CB$CHNGD ;Has the FIB been changed?
+	JE	12$.S			;No
+	CALL	xfsupdfile		;Yes - update file data on disk
+	MOVL	EBX, dcb_dkfilepnt.B[EDI]
+	JC	14$.S
+12$:	ANDB	cb_sts.B[EBX], #~CB$CHNGD
+	PUSHL	EBX
+	MOVL	EBX, cb_dirfib.B[EBX]	;Unlock the directory FIB
+	CALL	xosdskUnlkBufr##
+	POPL	EBX
+	CLC
+	RET				;Finished
+
+;Here if error updating the directory
+
+14$:	PUSHL	EAX
+	CALL	12$
+	POPL	EAX
+	STC
+	RET
+.PAGE
+;Subroutine to check for valid DOS name or extension field
+;	c{ESI}    = Offset of string
+;	c{ES:EDI} = Address of name buffer
+;	CALL	chkfield
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+
+chkfield:
+	LODSB	[ESI]			;Get next character
+	CMPB	AL, #'a'		;Lower case?
+	JB	2$.S			;No
+	CMPB	AL, #'z'		;Maybe
+	JA	2$.S			;No
+	ADDB	AL, #'A'-'a'		;Yes - change to upper case
+2$:	STOSB	[EDI]			;Store character
+	CMPB	AL, #0			;End of field?
+	JE	10$.S			;Yes
+	CMPB	AL, #'.'		;Maybe
+	JE	10$.S			;Yes
+	CMPB	AL, #7Fh		;No - check for illegal characters
+	JA	8$.S
+	CMPB	AL, #20h
+	JB	8$.S
+	CMPB	AL, #'\'
+	JE	8$.S
+	CMPB	AL, #'/'
+	JE	8$.S
+	CMPB	AL, #'*'
+	JE	8$.S
+	CMPB	AL, #'?'
+	JE	8$.S
+6$:	LOOP	ECX, chkfield
+8$:	MOVL	EAX, #ER_BDSPC
+	STC
+10$:	RET
+.PAGE
+;Subroutine to close file which is internally open
+;	CALL	xfscfil2
+
+xfscfil2::
+	MOVL	EBX, dcb_dkfilepnt.B[EDI]
+	CALL	xfscfil4
+	CMPW	cb_opencnt.B[EBX], #0.B	;Is the file open count OK?
+	JE	10$.S			;No!
+xfsgivefib:
+	CALL	xosdskUnlkBufr##	;Unlock the file FIB
+xfsgivefib2::
+	PUSHL	#1.B
+2$:	PUSHL	cb_dirfib.B[EBX]	;Save offset of directory FIB
+	MOVL	EAX, 4.B[ESP]
+	SUBW	cb_opencnt.B[EBX], AX	;Reduce the open count
+	JS	10$.S
+	SUBW	cb_usecnt.B[EBX], AX	;Reduce the use count
+	JNE	8$.S			;Go on if still in use
+	JS	10$.S			;Make sure not a bad count
+	INCW	cb_usecnt.B[EBX]	;Idle now - make the count 1 so we
+	CMPL	ff_filename+0.B[EBX], #0.B
+	JNE	4$.S
+	CMPL	ff_filename+4.B[EBX], #0.B
+	JE	4$.S
+	PUSHL	ESI
+	MOVL	ESI, ff_filename+4.B[EBX]
+	MOVZBL	ECX, 2.B[ESI]
+	CALL	knlGiveXmb##
+	POPL	ESI
+4$:	PUSHL	cb_nextfib.B[EBX]	;  can give it up!
+	CALL	xosdskGiveBufr##	;Give up the base FIB buffer
+6$:	POPL	EBX			;Do we have another extended FIB?
+	TESTL	EBX, EBX
+	JE	8$.S			;No - all done here
+	PUSHL	cb_nextfib.B[EBX]	;Yes - save offset of next FIB (if any)
+	CALL	xosdskGiveBufr##	;Give up this one
+	JMP	6$.S			;Continue
+
+;Here when finished with the FIB and extended FIBs
+
+8$:	POPL	EBX			;Restore offset of directory FIB
+	TESTL	EBX, EBX
+	JNE	2$.S			;Continue if more to do
+	POPL	EAX			;Discard the number being closed
+	RET				;Finished
+
+10$:	CRASH	BDFC			;[BaD File Count]
+
+;Enter here to reduce open count of a FIB by N
+;	c{EAX} = Amount to reduce open count
+
+xfsgivefibn::
+	PUSHL	EAX
+	JMP	2$.S
+
+;Subroutine to update changed directory info and clear pointer to the FIB
+
+xfscfil4:
+	TESTB	cb_sts.B[EBX], #CB$CHNGD ;Has the FIB been changed?
+	JE	12$.S			;No
+	CALL	xfsupdfile		;Yes - update file data on disk
+	MOVL	EBX, dcb_dkfilepnt.B[EDI] ;Restore offset of base FIB
+	JNC	12$.S			;Go on if OK
+	CALL	12$			;Error - finishing closing the file
+	STC				;Indicate error
+	RET
+
+;Here with everything on disk updated
+
+12$:	MOVL	dcb_dkfilepnt.B[EDI], #0 ;File not open now
+ret004:	RET
+.PAGE
+;Subroutine to delete file if should (file must be locked)
+;	CALL	xfschkdel
+;	C:set = Error (file still locked if not deleted)
+;	  c{EAX} = Error code
+;	  c{ECX} = Delete count (0 or 1)
+;	C:clr = Normal
+;	  Z:set = File deleted
+;	    c{EAX} = 0
+;	    c{ECX} = 1
+;	  Z:clr = File not deleted (file still locked)
+
+xfschkdel:
+	TESTB	cb_sts.B[EBX], #CB$DELF	;Should we delete the file now?
+	JNE	4$.S			;Yes
+	CLRL	ECX			;No
+	TESTL	ESP, ESP		;Clear Z
+	RET				;And return
+
+;Here if want to delete file and device is write protected
+
+2$:	MOVL	EAX, #ER_WPRER
+	JMP	8$.S
+
+;Here if want to delete file and file is read-only
+
+3$:	MOVL	EAX, #ER_FILAD
+	JMP	8$.S
+
+;Here if should delete file now
+
+4$:	MOVL	ESI, [EDI]
+	TESTL	ESI, ESI
+	JE	knlNoUnit##
+	TESTB	ucb_sts1.B[ESI], #U1$WPROT ;Disk write protected?
+	JNE	2$.S			;Yes - fail
+	TESTB	ff_attrib.B[EBX], #A$RDONLY ;Read-only file?
+	JNE	3$.S			;Yes - fail
+	TESTB	ff_attrib.B[EBX], #A$DIRECT ;Is this a directory?
+	JE	6$.S			;No
+	CMPW	cb_opencnt.B[EBX], #1.B	;Yes - anyone else have it open?
+	JNE	10$.S			;Yes - fail
+	CALL	chkempdir		;No - see if its empty now
+	JC	8$.S			;If error
+6$:	MOVL	EAX, ff_dirpos.B[EBX]	;Get directory entry offset
+	TESTL	EAX, EAX		;Is this file in a directory now?
+	JS	14$.S			;No - so don't need to remove it!
+	BTSL	SS:xffCmd##, #O%XWRITE	;Get exclusive acces if don't have it
+	CMC				;  now (This may not really be exclusive
+	ADCW	cb_xrcnt.B[EBX], #0.B	;  since someone else may be writing
+					;  now, but this will keep others from
+					;  starting something which will
+					;  interfer with this!)
+	CALL	xfsfrmdir#		;Remove file from directory
+	JNC	14$.S			;If OK
+8$:	ANDB	cb_sts.B[EBX], #~CB$DELF ;If error
+	CLRL	ECX			;Report that file not deleted!
+	STC
+	RET
+
+;Here if directory which is to be deleted is currently open by someone else
+
+10$:	MOVL	EAX, #ER_BUSY
+	JMP	8$.S
+
+;Here with file removed from directory - now we must give up the FIBs for all
+;  of the file's directories up to the root
+
+14$:	CALL	xfsfinfrm#
+20$:	MOVL	EBX, dcb_dkfilepnt.B[EDI] ;Get offset of the file's FIB again
+	CMPL	ff_alloc.B[EBX], #-1.B	;Have we set up the pointers yet?
+	JNE	chkdel2.S		;Yes
+	CALL	xfsscanfats		;No - do it now
+	JNC	chkdel2.S		;OK - go on
+	MOVL	ff_alloc.B[EBX], #0	;Error - make it look like nothing
+	PUSHL	EAX			;  allocated
+	CALL	chkdel2			;Finish up as best we can
+	POPL	EAX			;Return the error (c{ECX} will be 1)
+	STC
+	RET
+
+chkdel2:BTL	SS:xffCmd##, #O%OUT	;Is file open for output?
+	JNC	22$.S			;No
+	DECW	cb_writecnt.B[EBX]	;Yes - reduce write count
+	JS	30$.S
+22$:	CMPW	cb_opencnt.B[EBX], #1.B	;Anyone else have this file open?
+	JNE	24$.S			;Yes - finish deleting it later
+	MOVL	ESI, [EDI]		;No
+	TESTL	ESI, ESI
+	JE	knlNoUnit##
+	MOVL	EDX, #ff_f1pnt		;Point to first pointer
+	MOVL	EBX, dcb_dkfilepnt.B[EDI]
+	CALL	xfsreduc4#		;Give up the file's clusters
+24$:	CALL	xfsgivefib		;Give up the file's FIB
+	MOVL	ECX, #1			;Return delete count of 1
+	CLRL	EAX			;Set Z to indicate file was deleted
+	RET				;And return
+
+;Here if write count for FIB went negative!
+
+30$:	CRASH	BDWC			;[BaD Write Count]
+.PAGE
+	.SBTTL	chkempdir - Subroutine to see if a directory is empty
+
+;Subroutine to see if a directory is empty
+;	c{EBX} = Offset of base FIB for file
+;	CALL	chkempdir
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal (directory is empty)
+
+chkempdir:
+	MOVL	dcb_dkfpos.B[EDI], #0	;Start at beginning of directory
+2$:	CALL	xfsrdpos		;Setup to read a block
+	JBE	14$.S			;If error or if finished
+	CALL	xosdskFindSBufr##	;Read the block
+	JC	14$.S			;If error
+	MOVL	ECX, #16t
+	MOVL	EDX, EBX
+4$:	CMPB	11t.B[EDX], #0Fh	;Long name slot?
+	JE	10$.S			;Yes - it does not count
+	MOVL	EAX, [EDX]		;No - get first 4 bytes of name
+	CMPB	AL, #0			;Unused entry?
+	JE	16$.S			;Yes - this directory must be empty!
+	CMPB	AL, #0E5h		;Deleted entry?
+	JE	10$.S			;Yes
+	CMPL	EAX, #'.   '		;No - self entry?
+	JE	6$.S			;Maybe
+	CMPL	EAX, #'..  '		;Parent entry?
+	JNE	8$.S			;No
+6$:	MOVL	EAX, 8.B[EDX]		;Maybe - check extension too
+	ANDL	EAX, #0FFFFFFh
+	CMPL	EAX, #'   '
+	JE	10$.S			;Yes
+8$:	TESTB	11t.B[EDX], #A$LABEL	;No - is this a "label"?
+	JE	12$.S			;No - directory is not empty
+10$:	ADDL	EDX, #32t.B		;Yes - bump to next directory entry
+	LOOP	ECX, 4$			;Continue if more to check in this block
+	CALL	xosdskRelsLkBufr##	;Give up the buffer
+	ADDL	dcb_dkfpos.B[EDI], #200h ;Bump position in file
+	JMP	2$.S			;Continue
+
+;Here if directory is not empty
+
+12$:	CALL	xosdskRelsLkBufr##	;Give up the buffer
+	MOVL	EAX, #ER_DIRNE		;Error = DIRectory Not Empty
+	STC
+14$:	MOVL	EBX, dcb_dkfilepnt.B[EDI]
+	RET
+
+;Here if directory is empty
+
+16$:	CALL	xosdskRelsLkBufr##
+	CLC
+	MOVL	EBX, dcb_dkfilepnt.B[EDI]
+ret006:	RET
+.PAGE
+	.SBTTL	xfsupdfile - Subroutine to update file data on disk
+
+;Subroutine to update file data on disk
+;	c{EDI] = Offset of DCB
+;	CALL	xfsupdfile
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+
+xfsupdfile::
+	MOVL	ESI, [EDI]		;Make sure have UCB offset
+	TESTL	ESI, ESI
+	JE	knlNoUnit##
+	CALL	xfswritefats#		;Write any FATs that have changed
+	JC	ret006.S		;If error
+	MOVL	EBX, dcb_dkfilepnt.B[EDI] ;Get offset of base FIB
+	CMPL	ff_dirpos.B[EBX], #-1.B	;Does this file have a directory entry?
+	JE	ret006.S		;No - finished (must have been opened
+	CLRL	EAX			;  as . or ..)
+	CALL	xfsgetdirbaseent	;Yes - get it
+	JC	ret006.S		;If error
+	ADDL	EDX, EBX
+	MOVL	ECX, dcb_dkfilepnt.B[EDI]
+	MOVL	EAX, ff_size.B[ECX]	;Store current file size in directory
+	TESTB	ff_attrib.B[ECX], #A$DIRECT ;Is this a directory?
+	JE	2$.S			;No
+	CLRL	EAX			;Yes - store size as 0!
+2$:	MOVL	de_size.B[EDX], EAX
+	MOVL	EAX, ff_f1pnt+1.B[ECX]	;Store first cluster in directory
+	MOVW	de_pntr.B[EDX], AX
+	TESTB	ucb_sts3.B[ESI], #U3$FAT32
+	JE	4$.S
+	SHRL	EAX, #16t
+	MOVW	de_pntrhi.B[EDX], AX
+4$:	MOVL	EAX, ff_time.B[ECX]	;Store date and time in directory
+	MOVL	de_time.B[EDX], EAX
+	MOVB	AL, ff_attrib.B[ECX]	;Get attribute byte
+	ANDB	AL, #3Fh		;Clear bits DOS does not want
+	MOVB	de_attrib.B[EDX], AL	;Store attribute bits in directory
+	CALL	xfswritedir#		;Write out the directory block
+	JC	8$.S			;If error
+	CALL	xosdskRelsLkBufr##	;OK - release the buffer
+	MOVL	EBX, dcb_dkfilepnt.B[EDI] ;Get offset of base FIB again
+	ANDB	cb_sts.B[EBX], #~CB$CHNGD ;Indicate FIB not changed now
+	RET				;Finished
+
+;Here if error writing the directory block
+
+8$:	CALL	xosdskGiveLkBufr##	;Give up the buffer
+	MOVL	EAX, #ER_DRWER		;Error = DiRectory Write ERror
+	STC				;Indicate error
+	RET				;And return
+.PAGE
+	.SBTTL	xfsgetdirent - Subroutine to get directory entry for file
+
+;Subroutine to get directory entry for file
+;	c{EAX} = Offset from base directory entry
+;	c{EBX} = Offset of file FIB
+;	CALL	xfsgetdirent
+;	C:set = Error, no buffer obtained
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  c{EAX} = Offset in directory of entry
+;	  c{EBX} = Offset of buffer containing entry - block is in-use and
+;		     locked
+;	  c{EDX} = Offset of directory entry relative to start of block
+
+xfsgetdirbaseent::
+	CLRL	EAX
+xfsgetdirent::
+	PUSHL	dcb_dkfilepnt.B[EDI]	;Save offset of file FIB
+	PUSHL	dcb_dkcfib.B[EDI]
+	PUSHL	dcb_dkfpos.B[EDI]	;And save current position in file
+	MOVL	EDX, cb_dirfib.B[EBX]	;Set to access directory entry
+	MOVL	dcb_dkfilepnt.B[EDI], EDX
+	MOVL	dcb_dkcfib.B[EDI], EDX
+	ADDL	EAX, ff_dirpos.B[EBX]
+	MOVL	dcb_dkfpos.B[EDI], EAX
+	ANDL	EAX, #1FFh		;Save offset of entry in block
+	PUSHL	EAX
+	CALL	xfspos			;Get physical position on disk
+	JC	4$.S
+	CALL	xosdskFindSBufr##	;Get the block
+4$:	POPL	EDX			;Restore offset of entry in block
+	MOVL	EAX, EDX		;Get position of entry in directory
+	ANDL	EAX, #1FFh
+	ADDL	EAX, dcb_dkfpos.B[EDI]
+	POPL	dcb_dkfpos.B[EDI]	;Restore position in file
+	POPL	dcb_dkcfib.B[EDI]	;Restore offset of file FIB
+	POPL	dcb_dkfilepnt.B[EDI]
+ret008:	RET				;Return
+.PAGE
+	.SBTTL	xfsmkfib - Subroutine to create fake FIB for new file
+
+;Subroutine to create fake FIB for new file - we have already determined that
+;  this will be a new FIB - there is no possiblity that it already exists
+;  - directory must be open and locked
+;	c(AL)  = Default attribute byte value
+;	c{EDX} = Offset on disk of first hole found
+;	c{EDI} = Offset of DCB
+;	CALL	xfsmkfib
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  c{EBX} = Offset of buffer containing fake FIB, FIB is in use and
+;		     locked
+
+xfsmkfib::
+	MOVL	ESI, [EDI]		;Is the disk write protected?
+	TESTL	ESI, ESI
+	JE	knlNoUnit##
+	TESTB	ucb_sts1.B[ESI], #U1$WPROT
+	JNE	knlWPrErr##		;Yes - fail
+	PUSHL	EDX			;Save position of directory hole
+	PUSHL	EAX			;Save attribute bits
+	CALL	xosdskGetSBufr##	;Get a buffer for the FIB
+	POPL	ECX
+	POPL	EDX
+	JC	ret008.S		;If error
+	MOVW	cb_lockxff.B[EBX], SS	;OK - lock it
+	INCL	SS:xffLockCnt##
+	MOVL	cb_dev.B[EBX], ESI	;Store UCB offset in the buffer header
+	PUSHL	ECX
+	CALL	xosdskClrBufr##		;Clear the buffer
+	INCW	cb_opencnt.B[EBX]	;Increment open count (xosdskGetSBufr
+	POPL	EAX			;  has already incremented the use
+					;  count)
+	MOVB	ff_attrib.B[EBX], AL	;Store attribute bits
+	MOVL	ff_dirpos.B[EBX], EDX	;Store position of directory hole
+	MOVB	AL, of_dentneed.B[EBP]	;Store number of extended directory
+	DECL	EAX			;  slots
+	MOVB	ff_dirsize.B[EBP], AL
+	MOVL	EAX, dcb_dkfilepnt.B[EDI]
+	MOVL	cb_dirfib.B[EBX], EAX	;Store offset of directory FIB
+	MOVL	ff_label.B[EBX], #'NFIB' ;Store label for debugging
+	MOVL	EDX, of_frame1.B[EBP]	;Point to the level 1 stack frame
+	BTL	SS:xffHvValue1##, #IOV1%GRPSIZE ;Group size specified?
+	JNC	4$.S			;No - use default value
+	MOVL	EAX, SS:opn_grpsize.B[EDX] ;Yes - get it
+	TESTL	EAX, EAX		;Make sure have real value
+	JNE	6$.S
+4$:	MOVL	EAX, ucb_grpsize.B[ESI]	;Get default group size
+	TESTB	ff_attrib.B[EBX], #A$DIRECT ;Is this a directory?
+	JE	6$.S			;No
+	MOVL	EAX, #1			;Yes - default group size is 1
+6$:	MOVL	ff_grpsize.B[EBX], EAX	;Store group size for file
+	TESTL	SS:xffHvValue1##, #IOV1$CDATE|IOV1$MDATE
+					;Was date/time specified?
+	JE	18$.S			;No - just use default
+	MOVB	ff_status.B[EBX], #FS$DATESET ;Yes - indicate date has been set
+	BTL	SS:xffHvValue1##, #IOV1%CDATE ;Have create data/time value?
+	JNC	12$.S			;No
+	MOVL	EAX, SS:opn_cdate+0.B[EDX] ;Yes - use it
+	TESTB	SS:opn_datefmt.B[EDX], #DF$DOSCDATE
+	MOVL	EDX, SS:opn_cdate+4.B[EDX]
+	JMP	14$.S
+
+;Here to use modify date/time
+
+12$:	MOVL	EAX, SS:opn_mdate+0.B[EDX]
+	TESTB	SS:opn_datefmt.B[EDX], #DF$DOSMDATE ;Already in DOS format?
+	MOVL	EDX, SS:opn_mdate+4.B[EDX]
+14$:	JNE	22$.S			;If already in DOS format
+	ADDL	EAX, #XT_SECOND		;knl format - round to 2-second value
+	ADCL	EDX, #0.B
+	PUSHL	EBX
+	CALL	knlSys2DosTime##	;Convert to DOS time format
+	XCHGL	EAX, EDX
+	CALL	knlSys2DosDate##	;Convert to DOS date format
+	JNC	16$.S
+	MOVL	EAX, #21h		;Before 1980 - make it 1-Jan-80
+16$:	SHLL	EAX, #16t
+	JMP	20$.S
+
+;Here to use default date/time
+
+18$:	CLI
+	MOVL	EDX, knlDosDate##
+	MOVL	EAX, knlTickCnt##	;Yes - get current date and time
+	STI
+	PUSHL	EBX
+	CALL	knlTick2DosTime##	;Convert to time DOS format
+	SHLL	EDX, #16t
+20$:	ORL	EAX, EDX
+22$:	POPL	EBX
+	MOVL	ff_time.B[EBX], EAX	;Store date and time in the FIB
+	MOVB	AL, ff_attrib.B[EBX]	;Save current attribute bits
+	MOVL	EDX, of_frame1.B[EBP]
+	MOVB	SS:opn_curattr.B[EDX], AL
+	BTL	SS:xffCmd##, #O%COMPAT	;Want compatability mode access?
+	JC	24$.S			;Yes
+	INCW	cb_nocomcnt.B[EBX]	;No - increment no compatability count
+24$:	TESTB	SS:xffCmd##, #O$OUT	;Doing output to file?
+	JE	26$.S			;No
+	INCW	cb_writecnt.B[EBX]	;Yes - increment write count for file
+26$:	TESTB	SS:xffCmd##, #O$IN	;Doing input from file?
+	JE	28$.S			;NO
+	INCW	cb_readcnt.B[EBX]	;Yes - increment read count for file
+28$:	BTL	SS:xffCmd##, #O%XREAD	;Want exclusive read access?
+	JNC	30$.S			;No
+	INCW	cb_xrcnt.B[EBX]		;Yes
+30$:	BTL	SS:xffCmd##, #O%XWRITE	;Want exclusive write access?
+	JNC	32$.S			;No
+	INCW	cb_xwcnt.B[EBX]		;Yes
+32$:	MOVB	AL, #0			;Indicate not rename
+	CALL	xfsputindir#		;Put new file in the directory
+	JC	34$.S			;If error
+	MOVL	EAX, dcb_dkfilepnt.B[EDI] ;OK
+	PUSHL	ff_f1pnt+1.B[EAX]	;Save cluster of the directory
+	PUSHL	EBX			;Save offset of file FIB
+	MOVL	EBX, cb_dirfib.B[EBX]
+	CALL	xosdskUnlkBufr##	;Unlock the directory FIB
+	POPL	EBX			;Restore offset of file FIB
+	MOVL	EAX, SS
+	CMPW	cb_lockxff.B[EBX], AX	;Make sure locked (DEBUG)
+	JNE	50$.S
+	MOVL	dcb_dkfilepnt.B[EDI], EBX
+	MOVL	dcb_dkcfib.B[EDI], EBX
+	CLRL	EAX
+	MOVL	dcb_dkfpos.B[EDI], EAX
+	LEAL	ECX, of_namshort[EBP]
+	LEAL	EDX, of_namlong[EBP]	;Store file name in the fib
+	CALL	storefname
+	POPL	ECX			;Restore directory cluster
+	CLC
+	RET
+
+34$:	PUSHL	EAX
+	CALL	xosdskGiveLkBufr##
+	POPL	EAX
+	STC
+	RET
+
+50$:	CRASH	BNLK			;[Buffer Not LocKed]
+.PAGE
+	.SBTTL	xfsrdfib - Subroutine to setup fake FIB for existing file
+
+;Subroutine to setup fake FIB for existing file - directory block containing
+;  file entry must be in-use  and directory must be open but not locked
+;	c{EDI} = Offset of DCB
+;	c{ESI} = Offset of UCB
+;	c{EBX} = Offset of buffer containing directory block
+;	c{EDX} = Offset in block of directory entry for file
+;	CALL	xfsrdfib
+;	C:set = Error, directory is open and locked, dcb_dkfilepnt points to
+;		  directory FIB
+;	  c{EAX} = Error code
+;	C:clr = Normal, directory is open but not locked, file is open and
+;		  locked, dcb_dkfilepnt points to file fib
+;	  c{EBX} = Offset of buffer containing base FIB for file
+;  Note that the directory block is NOT given up here under any conditions
+
+xfsrdfib::
+	MOVL	EAX, EDX		;Build a "block number" for the fake
+	ORB	AH, #02h		;  FIB as follows:
+	SHLL	EAX, #22t		;    1 (1) Entry # in block (4)
+	ORL	EAX, cb_block.B[EBX]	;    Directory block # (27)
+	MOVL	dcb_dkdblk.B[EDI], EAX
+	PUSHL	EBX			;Save offset of directory block buffer
+	PUSHL	EDX			;Save offset of entry in block
+	CALL	xosdskSrchSBufr##	;Search for the fake FIB for the file
+	JC	8$.S			;If error
+	JE	10$.S			;If not there
+	POPL	EAX			;Found it - discard unneeded items
+	POPL	EAX
+	MOVL	EAX, dcb_dkfilepnt.B[EDI] ;Make sure don't have a loop on the
+2$:	CMPL	EAX, EBX		  ;  disk
+	JE	4$.S
+	MOVL	EAX, cb_dirfib.B[EAX]
+	TESTL	EAX, EAX
+	JNE	2$.S
+	CALL	xosdskLockBufrW##	;OK - lock the FIB
+	MOVL	EAX, dcb_dkfilepnt.B[EDI] ;Make sure pointer to directory FIB
+	CMPL	cb_dirfib.B[EBX], EAX	  ;  is right
+	JNE	6$.S
+	CMPL	ff_alloc.B[EBX], #-1	;Do we have allocation data now?
+	JNE	32$			;Yes
+	JMP	26$			;No - get it if we need it
+
+;Here if have a loop on the disk - this directory entry points to itself or
+;  to one if its parent directories
+
+4$:	CALL	xosdskGiveBufr##	;Give up the buffer
+	MOVL	EAX, #ER_IPDIR		;Get error code
+	STC				;Indicate error
+	RET
+
+6$:	CRASH	BDFP			;[Bad Directory FIB Pointer]
+
+;Here if error
+
+8$:	POPL	EDX			;Fix up the stack
+	POPL	EBX
+	RET
+
+;Here if FIB not found in memory - must build it from the directory entry and
+;  FAT chain for the file
+
+10$:	CALL	xosdskLockBufrW##	;Lock the new FIB buffer
+	CALL	xosdskClrBufr##		;Clear the buffer
+	POPL	EDX			;Restore offset in block
+	POPL	ECX			;Restore offset of buffer for block
+	MOVL	EAX, dcb_dkfilepnt.B[EDI] ;Store offset of directory FIB buffer
+	MOVL	cb_dirfib.B[EBX], EAX
+	MOVL	EAX, dcb_dkfpos.B[EDI]	;Get offset in directory of directory
+	ANDL	EAX, #~1FFh		;  entry
+	ADDL	EAX, EDX
+	MOVL	ff_dirpos.B[EBX], EAX	;Store in file FIB
+	MOVB	AL, of_lgnum.B[EBP]
+	MOVB	ff_dirsize.B[EBX], AL
+	ADDL	EDX, ECX		;Make it a little easier to address the
+					;  directory entry
+	MOVL	ff_label.B[EBX], #'OFIB' ;Store label for debugging
+	MOVB	AL, de_attrib.B[EDX]
+	TESTB	AL, #A$DIRECT|A$LABEL|A$HIDDEN|A$SYSTEM ;Is this a normal file?
+	JNE	12$.S			;No
+	ORB	AL, #A$NORMAL		;Yes
+12$:	MOVB	ff_attrib.B[EBX], AL	;Store attribute byte in the FIB
+	MOVL	EAX, ucb_grpsize.B[ESI]	;Store group size (since the group size
+	MOVL	ff_grpsize.B[EBX], EAX	;  is not stored in the directory, we
+					;  always use the default for the disk)
+	MOVL	EAX, de_time.B[EDX]	;Store date and time for file
+	MOVL	ff_time.B[EBX], EAX
+	MOVL	EAX, de_size.B[EDX]	;Store file size in FIB
+	MOVL	ff_size.B[EBX], EAX
+	MOVL	ff_mxsz.B[EBX], EAX
+	CLRL	EAX
+	TESTB	ucb_sts3.B[ESI], #U3$FAT32 ;Have 32 bit FATs?
+	JE	14$.S			;No
+	MOVW	AX, de_pntrhi.B[EDX]	;Yes - get high 16 bits of cluster
+	SHLL	EAX, #16t		;  number
+14$:	MOVW	AX, de_pntr.B[EDX]	;Get low 16 bits of cluster number
+	TESTL	EAX, EAX		;Null file?
+	JNE	24$.S			;No
+	CLRL	EAX			;Yes - make sure length is 0
+	MOVL	ff_size.B[EBX], EAX
+	MOVL	ff_mxsz.B[EBX], EAX
+	JMP	32$.S			;All finished here
+
+;Here if error setting up the FIB pointers
+
+22$:	PUSHL	EAX
+	CALL	xosdskGiveLkBufr##	;Give up the buffer
+	POPL	EAX
+	STC
+	RET
+
+;Here if something allocated to the file
+
+24$:	MOVL	ff_f1pnt+1.B[EBX], EAX	;Store first cluster number
+	MOVL	ff_alloc.B[EBX], #-1	;Set amount allocated to -1 as flag
+					;  that the pointers are not set up
+	TESTB	ff_attrib.B[EBX], #A$DIRECT ;Is this a directory?
+	JNE	30$.S			;Yes
+26$:	TESTL	SS:xffNdValue1##, #IOV1$REQALLOC|IOV1$RQRALLOC
+					;No - does he want amount allocated?
+	JE	32$.S			;No - don't scan FATs yet
+30$:	CALL	xfsscanfats		;Yes - scan FATs now to get length
+	JC	22$.S
+32$:	INCW	cb_opencnt.B[EBX]	;Increment open count (xosdskSrchSBufr
+					;  already incremented the use
+					;  count)
+	MOVL	dcb_dkfilepnt.B[EDI], EBX
+	MOVL	dcb_dkcfib.B[EDI], EBX
+	CLRL	EAX
+	MOVL	dcb_dkfpos.B[EDI], EAX
+	PUSHL	EBX			;Save offset of file FIB
+	MOVL	EBX, cb_dirfib.B[EBX]
+	CALL	xosdskUnlkBufr##	;Unlock the directory FIB
+	POPL	EBX			;Restore offset of file FIB
+	LEAL	ECX, of_dirshort[EBP]
+	LEAL	EDX, of_dirlong[EBP]	;Store file name in the FIB
+	CALL	storefname
+	MOVL	EAX, SS
+	CMPW	cb_lockxff.B[EBX], AX	;Make sure locked (DEBUG)
+	JNE	44$.S
+	RET
+
+44$:	CRASH	BNLK			;[Buffer Not LocKed]
+.PAGE
+	.SBTTL	storefname - Store file name in a FIB
+
+;Subroutine to store the file name in the FIB - an exec buffer big enough to
+;  hold the name is allocated and its offset is stored in ff_filename.  Note
+;  that the length of the name is store as a word in the first 2 bytes and the
+;  size index for the buffer is stored in the third byte.  The name starts in
+;  the fourth byte.
+;	c{SS:ECX} = Address of short name string (ASCII)
+;	c{SS:EDX} = Address of long name string (Unicode)
+;	CALL	storefname
+
+storefname:
+
+;First store the short name (DOS 8x3 name) - We know this will always fit in
+;  the 16 byte field in the FIB.
+
+	PUSHL	EBX
+	ADDL	EBX, #ff_filedos.B	;Point to place to put short name
+	CMPB	SS:[ECX], #0		;Null name?
+	JE	4$.S			;Yes
+2$:	MOVB	AL, SS:[ECX]		;No - copy the name
+	INCL	ECX
+4$:	MOVB	[EBX], AL
+	INCL	EBX
+	CMPB	AL, #0
+	JNE	2$.S
+	CMPB	-2.B[EBX], #'.'		;Did it end in a period?
+	JNE	6$.S
+	MOVB	-2.B[EBX], #0
+6$:	POPL	EBX
+	MOVL	ECX, EDX
+8$:	CMPW	SS:[EDX], #0.B		;Determine length of the long name
+	JE	10$.S
+	ADDL	EDX, #2t.B
+	JMP	8$.S
+
+;Here at end of name
+
+10$:	SUBL	EDX, ECX
+	JNE	12$.S			;Make sure not null name
+	CLRL	EAX
+	MOVL	ff_filename+0.B[EBX], EAX
+	MOVL	ff_filename+4.B[EBX], EAX
+	RET
+
+12$:	CMPW	SS:-2.B[EDX+ECX], #'.'.B ;Was last character a period?
+	JNE	14$.S			;No
+	SUBL	EDX, #2t.B		;Yes - discard it
+14$:	PUSHL	ESI
+	SHRL	EDX, #1t
+	CMPL	EDX, #15t.B		;Do we need an exec buffer?
+	JG	18$.S			;Yes
+	LEAL	ESI, ff_filename.B[EBX]
+16$:	MOVB	AL, SS:[ECX]
+	ADDL	ECX, #2t.B
+	MOVB	[ESI], AL
+	INCL	ESI
+	DECL	EDX
+	JNE	16$.S
+	POPL	ESI
+	RET
+
+;Here if need to allocate an exec buffer for the file name
+
+18$:	PUSHL	EDX
+	ADDL	EDX, #4t.B
+	PUSHL	ECX
+	CALL	knlGetIndex##
+	PUSHL	ECX
+	CALL	knlGetXmb##
+	POPL	EAX
+	POPL	EDX			;Restore offset of name
+	POPL	ECX			;Restore length of name
+	JC	22$.S			;Forget it if can't get the memory
+	MOVL	ff_filename+0.B[EBX], #0
+	MOVL	ff_filename+4.B[EBX], ESI
+	MOVW	[ESI], CX		;Store length of name
+	MOVB	2.B[ESI], AL		;Store size index
+	ADDL	ESI, #3t.B
+20$:	MOVB	AL, SS:[EDX]		;Copy the name to the exec buffer
+	ADDL	EDX, #2t.B
+	MOVB	[ESI], AL
+	INCL	ESI
+	LOOP	ECX, 20$
+	MOVB	[ESI], #0		;Store final null
+22$:	POPL	ESI
+	RET
+.PAGE
+	.SBTTL	xfsscanfats - Subroutine to scan DOS FATs and set up pointers
+
+;Subroutine to scan DOS FATs and set up pointers in the fake FIB
+;	c{EDI} = Offset of DCB
+;	c{EBX} = Offset of base FIB (must be locked)
+;	CALL	xfsscanfats
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+
+;Define offsets in the stack frame for this routine
+
+$$$=!0
+FRM sf_clus  , 4t	;Cluster number
+FRM sf_alloc , 4t	;Amount allocated to file
+FRM sf_bfib  , 4t	;Offset of base FIB
+FRM sf_cfib  , 4t	;Offset of current FIB
+FRM sf_fibpnt, 4t	;Pointer to current FIB pointer
+FRM sf_left  , 4t	;Number of pointers left in FIB
+FRM sf_count , 4t	;Cluster count
+sf_SIZE=!$$$
+
+xfsscanfats::
+	ENTER	sf_SIZE, 0
+	MOVL	sf_bfib.B[EBP], EBX	;Save offset of base FIB
+	MOVL	sf_cfib.B[EBP], EBX	;Which is also the initial current FIB
+	MOVL	sf_alloc.B[EBP], #0	;Clear amount allocated
+	MOVL	ECX, ff_f1pnt+1.B[EBX]	;Get first cluster number
+	CMPL	ECX, #2.B		;Is this a valid cluster?
+	JB	8$.S			;No
+	CMPL	ECX, ucb_highcl.B[ESI]	;Maybe
+	JAE	10$.S			;No
+	LEAL	EAX, ff_f1pnt.B[EBX]	;Point to 1st FIB pointer
+	MOVL	sf_fibpnt.B[EBP], EAX
+	MOVL	sf_left.B[EBP], #ff_N1PNT
+2$:	MOVL	sf_clus.B[EBP], ECX
+4$:	MOVL	sf_count.B[EBP], #0	;Initialize cluster count
+	MOVL	EAX, sf_fibpnt.B[EBP]	;Point to FIB pointer
+	MOVL	1.B[EAX], ECX		;Store cluster number in pointer
+	INCL	sf_count.B[EBP]		;Count the cluster
+	CALL	xfsgetfatent#		;Get next cluster in file
+	JC	12$.S			;If error
+6$:	JS	26$			;If no more
+	CMPL	EAX, #2.B		;Is this a valid cluster?
+8$:	JB	16$.S			;No
+	CMPL	EAX, ucb_highcl.B[ESI]	;Maybe
+10$:	JAE	16$.S			;No
+	INCL	sf_clus.B[EBP]		;Yes - is next cluster contiguous?
+	CMPL	sf_clus.B[EBP], EAX
+	JNE	14$.S			;No
+	CMPB	sf_count.B[EBP], #255t	;Yes - room for it in this pointer?
+	JE	14$.S			;No
+	INCL	sf_count.B[EBP]		;Yes - count the cluster
+	CALL	xfsgetnxtfatent#	;Get next cluster
+	JNC	6$.S			;Continue if OK
+12$:	JMP	18$.S			;Error
+
+;Here if next cluster not contiguous or if the count is full
+
+14$:	MOVL	ECX, sf_fibpnt.B[EBP]
+	MOVL	EDX, sf_count.B[EBP]
+	MOVB	[ECX], DL		;Store count in pointer
+	ADDL	sf_alloc.B[EBP], EDX	;Bump amount allocated
+	ADDL	sf_fibpnt.B[EBP], #5.B	;Bump pointer to FIB pointer
+	DECL	sf_left.B[EBP]		;More space in this FIB?
+	MOVL	ECX, EAX		;Yes
+	JNE	2$.S			;Continue
+	MOVL	sf_clus.B[EBP], ECX	;No - save next cluster
+	CALL	xosdskGetSBufr##	;Get a system buffer
+	JC	18$.S			;If error
+	CALL	xosdskClrBufr##		;Clear the buffer
+	MOVL	EDX, sf_cfib.B[EBP]	;Get previous FIB
+	MOVL	EAX, sf_alloc.B[EBP]	;Get amount found allocated so far
+	MOVL	ff_roof.B[EDX], EAX	;Store as top of this FIB
+	MOVL	cb_nextfib.B[EDX], EBX	;Link next FIB
+	MOVL	cb_prevfib.B[EBX], EDX
+	MOVL	ff_floor.B[EBX], EAX	;Store as bottom of new FIB
+	MOVL	sf_cfib.B[EBP], EBX	;Make this the new current FIB
+	LEAL	EAX, ff_fxpnt.B[EBX]
+	MOVL	sf_fibpnt.B[EBP], EAX
+	MOVL	sf_left.B[EBP], #ff_NXPNT
+	MOVL	ECX, sf_clus.B[EBP]	;Restore current cluster
+	JMP	4$			;Continue
+
+;Here if have bad cluster number in FAT
+
+16$:	MOVL	EAX, #ER_FTPER		;Get error code
+
+;Here if error after a buffer has been allocated
+
+18$:	PUSHL	EAX			;Save error code
+	MOVL	ECX, sf_bfib.B[EBP]	;Point to the base FIB
+	MOVL	EBX, cb_nextfib.B[ECX]	;Give up any extended FIBs
+	TESTL	EBX, EBX
+	JE	22$.S
+	MOVL	cb_nextfib.B[ECX], #0
+20$:	PUSHL	cb_nextfib.B[EBX]	;Yes - save offset of next FIB (if any)
+	CALL	xosdskGiveBufr##	;Give up this one
+	POPL	EBX
+	TESTL	EBX, EBX
+	JNE	20$.S
+22$:	MOVL	EBX, sf_bfib.B[EBP]
+	PUSHL	EDI
+	CLRL	EAX
+	LEAL	EDI, ff_f1pnt+5.B[EBX]
+	PUSHL	DS
+	POPL	ES
+	MOVB	-5.B[EDI], AL
+	MOVL	ECX, #{ff_N1PNT-1}*5
+	CLD
+	CLRL	EAX
+	RSTOSB	[EDI]
+	POPL	EDI
+	DECL	EAX
+	MOVL	ff_alloc.B[EBX], EAX	;Put it back the way it was
+	POPL	EAX			;Restore error code
+	LEAVE
+	STC
+	RET
+
+;Here if already have a buffer allocated for an extended FIB - this should
+;  not be possible!
+
+24$:	CRASH	DDDE			;[DOS Disk Data Error]
+
+;Here at end of file
+
+26$:	MOVL	ECX, sf_fibpnt.B[EBP]
+	MOVL	EAX, sf_count.B[EBP]
+	MOVB	[ECX], AL		;Store count in pointer
+	ADDL	EAX, sf_alloc.B[EBP]	;Get final amount allocated
+	MOVL	EBX, sf_cfib.B[EBP]
+	MOVL	ff_roof.B[EBX], EAX	;Store as top of this FIB
+	MOVL	EBX, sf_bfib.B[EBP]	;Restore offset of base FIB
+	MOVL	ff_alloc.B[EBX], EAX	;Store total amount allocated
+	MULL	ucb_bpclus.B[ESI]	;Get bytes allocated
+	TESTB	ff_attrib.B[EBX], #A$DIRECT ;Is this a directory?
+	JNE	28$.S			;Yes - always use this as the size
+	CMPL	ff_size.B[EBX], EAX	;No - is the given size too big?
+	JA	28$.S
+	CMPL	ff_mxsz.B[EBX], EAX
+	JA	30$.S
+	CLC
+	LEAVE
+	RET
+
+;Here if written size is too large
+
+28$:	MOVL	ff_size.B[EBX], EAX	;Store allocated amount as file size
+30$:	MOVL	ff_mxsz.B[EBX], EAX
+	LEAVE
+	RET
+.PAGE
+	.SBTTL	xfsrdpos - Subroutine to get physical position for read
+
+;Subroutine to get physical position for read - file must be open and locked
+;	c{dcb_dkfpos{EDI}} = Desired position in file (bytes)
+;	c{EDI}             = Offset of DCB
+;	c{ESI}             = Offset of UCB
+;	CALL	xfsrdpos
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  Z:set = At end of file
+;	  Z:clr = Normal
+;	    c{dcb_dkdblk{EDI}} = Physical block on disk
+;	    c{ECX}             = Amount available from this position (bytes)
+;	    c{EBX}             = Offset of buffer for FIB containing pointer
+;	    c{EDX}             = Offset of pointer in FIB for position
+
+xfsrdpos::
+	MOVL	EBX, dcb_dkfilepnt.B[EDI] ;Point to base FIB
+	CMPL	ff_alloc.B[EBX], #-1.B	;Have we scanned the FATs yet?
+	JNE	2$.S			;Yes
+	CALL	xfsscanfats		;No - do it now
+	JC	4$.S			;If error
+2$:	MOVL	EAX, dcb_dkfpos.B[EDI]	;Get desired position
+	CMPL	EAX, ff_size.B[EBX]	;Past end of file now?
+	JB	6$.S			;No
+	CLRL	ECX			;Yes - set Z and clear C
+4$:	RET				;And return
+
+;Here if not at end of file
+
+6$:	MOVL	ESI, [EDI]
+	TESTL	ESI, ESI
+	JE	knlNoUnit##
+	CALL	xfspos			;Do most of the work
+	JC	4$.S
+	MOVL	EBX, dcb_dkfilepnt.B[EDI] ;Point to base FIB
+	MOVL	EAX, ff_size.B[EBX]	;Calculate amount left in file here
+	SUBL	EAX, dcb_dkfpos.B[EDI]
+	CMPL	ECX, EAX		;Want more than is there?
+	JBE	8$.S			;No
+	MOVL	ECX, EAX		;Yes - just take what is there
+8$:	TESTL	ECX, ECX		;Make sure not 0 (also clears Z)
+	JE	10$.S
+ret010:	RET
+
+;Here if have illegal format in the fake FIB - this should never happen since
+;  all fake FIBs are created here instead of being read from the disk - if
+;  a fake FIB is bad it must be because the routine that created it failed,
+;  not because the data on the disk is bad!
+
+10$:	CRASH	BDFF			;[BaD FIB Format]
+.PAGE
+	.SBTTL	xfswrpos - Subroutine to get physical position for write
+
+;Subroutine to get physical position for write - file must be open and locked
+;	c{dcb_dkfpos{EDI}} = Desired position in file (bytes)
+;	c{EDI}             = Offset of DCB
+;	c{ESI}             = Offset of UCB
+;	CALL	xfswrpos
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  c{dcb_dkdblk{EDI}} = Physical block on disk
+;	  c{ECX}             = Amount available from this position (bytes)
+;	  c{EBX}             = Offset of buffer for FIB containing pointer
+;	  c{EDX}             = Offset of pointer in FIB for position
+
+xfswrpos::
+	MOVL	EBX, dcb_dkfilepnt.B[EDI] ;Point to base FIB
+	CMPL	ff_alloc.B[EBX], #-1.B	;Have we scanned the FATs yet?
+	JNE	2$.S			;Yes
+	CALL	xfsscanfats		;No - do it now
+	JC	ret010.S		;If error
+2$:	MOVL	ESI, [EDI]
+	TESTL	ESI, ESI
+	JE	knlNoUnit##
+	MOVL	EAX, dcb_dkfpos.B[EDI]	;Get desired position
+	CMPL	EAX, ff_mxsz.B[EBX]	;Past end of file now?
+	JA	10$.S			;Yes
+	JNE	xfspos			;If not at end of file
+	MOVL	EDX, ff_alloc.B[EBX]	;At EOF - see if need to allocate more
+	IMULL	EDX, ucb_bpclus.B[ESI]
+	CMPL	EDX, EAX
+	JA	xfspos			;Still have something left to use
+	PUSHL	dcb_dkfpos.B[EDI]	;Need to allocate - save position
+	MOVL	EBX, dcb_dkpbfr.B[EDI]	;Have a pending write buffer?
+	ORL	EBX, EBX
+	JE	4$.S			;No
+	CALL	xosdskUnlkBufr##	;Yes - unlock it
+4$:	MOVL	EBX, dcb_dkfilepnt.B[EDI] ;Unlock the file
+	CALL	xosdskUnlkBufr##
+	CALL	xosdskGetDiskRes##	;Get the disk resource
+	JC	16$.S
+	CALL	xosdskLockBufrW##	;Lock the file again
+	CMPL	dcb_dkpbfr.B[EDI], #0.B	;Do we have a pending write buffer?
+	JE	6$.S			;No
+	MOVL	EBX, dcb_dkpbfr.B[EDI]	;Yes
+	CALL	xosdskLockBufrW##	;Lock the pending write buffer again
+	MOVL	EBX, dcb_dkfilepnt.B[EDI]
+6$:	MOVL	EDX, ff_alloc.B[EBX]	;Did the amount allocated increase while
+	IMULL	EDX, ucb_bpclus.B[ESI]	;  it was unlocked?
+	CMPL	EDX, EAX
+	JA	8$.S			;Yes - don't really need to extend it
+	MOVL	EAX, ff_grpsize.B[EBX]	;Get amount to extend the file
+	CALL	xfsextend		;Start extending the file
+	JC	14$.S			;If error
+	CALL	xfsextfin		;Finish extending it
+	JC	14$.S			;If error
+8$:	POPL	dcb_dkfpos.B[EDI]	;Restore position in file
+	CALL	xosdskGiveDiskRes##	;Give up the disk resource
+	JMP	xfspos			;Get position and return
+
+;Here if past end of file
+
+10$:	MOVL	EAX, #ER_EOF
+	STC
+	RET
+
+;Here if error extending file
+
+14$:	POPL	EBX			;Fix up the stack
+	CALL	xosdskGiveDiskRes##	;Give up the disk resource
+	STC				;Indicate error
+	RET				;And return
+
+;Here if error getting the disk resource
+
+16$:	CALL	xosdskLockBufrW##	;Lock the file again
+	STC
+	RET
+.PAGE
+	.SBTTL	xfspos - Subroutine to get physical position
+
+;Subroutine to get physical position in file
+;	c{dcb_dkfpos{EDI}} = Desired position in file (bytes)
+;	c{EDI}             = Offset of DCB
+;	c{ESI}             = Offset of UCB
+;	CALL	xfspos
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  c{dcb_dkdblk{EDI}} = Physical block on disk
+;	  c{ECX}             = Amount available from this position (bytes)
+;	  c{EBX}             = Offset of buffer for FIB containing pointer
+;	  c{EDX}             = Offset of pointer in FIB for position
+
+$$$=!0
+FRM dp_binclus, 4t		;Block in cluster
+FRM dp_cingrp , 4t		;Cluster in group
+dp_SIZE=!$$$
+
+xfspos::MOVL	EAX, dcb_dkfpos.B[EDI]
+xfspos2:CALL	xfsfndpnt		;Find pointer in the FIB
+	JC	10$.S			;If error
+	ENTER	dp_SIZE, 0
+	MOVL	dp_binclus.B[EBP], EAX	;Store block in cluster
+	MOVL	dp_cingrp.B[EBP], ECX	;Store cluster in group
+	MOVL	EAX, 1.B[EBX+EDX]	;Get cluster number
+	CMPL	EAX, #1.B		;Valid cluster?
+	JB	4$.S			;No!
+	JNE	6$.S			;Yes - does it point to root directory?
+	MOVL	ECX, ucb_rootblk.B[ESI]	;Yes
+	DECL	EAX
+	JMP	8$.S
+
+4$:	CRASH	CLS0			;[CLuSter 0]
+
+;Here if pointer is to "real" allocated disk block
+
+6$:	MOVL	ECX, ucb_fcblk.B[ESI]	;Get offset to first allocated block
+8$:	ADDL	EAX, dp_cingrp.B[EBP]	;Get cluster number
+	IMULL	EAX, ucb_clussize.B[ESI] ;Change to block number
+	ADDL	EAX, ECX		;Plus first allocated block gives disk
+					;  block number of beginning of cluster
+	ADDL	EAX, dp_binclus.B[EBP]	;Add in block in cluster
+	MOVL	dcb_dkdblk.B[EDI], EAX	;Store block number in DCB
+	MOVZBL	ECX, [EBX+EDX]		;Get count from pointer
+	SUBL	ECX, dp_cingrp.B[EBP]	;Minus cluster in group gives clusters
+					;  available in the group
+	IMULL	ECX, ucb_clussize.B[ESI] ;Change to blocks
+	SUBL	ECX, dp_binclus.B[EBP]	;Minus block in cluster give number of
+					;  blocks available in group
+	SHLL	ECX, #9t		;Change to bytes
+	MOVL	EAX, dcb_dkfpos.B[EDI]	;Compensate for position in block
+	ANDL	EAX, #01FFh
+	SUBL	ECX, EAX		;c{ECX} = Real, final amount available!
+	LEAVE
+	CLC
+10$:	RET
+.PAGE
+	.SBTTL	xfsfndpnt - Subroutine to find pointer in a file FIB
+
+;Subroutine to find pointer in a file FIB - the FIB containing the pointer is
+;  made the current FIB
+;	c{EAX} = Byte offset in file
+;	c{EDI} = Offset of DCB
+;	c{ESI} = Offset of UCB
+;	CALL	xfsfndpnt
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  c{EAX} = Block in cluster
+;	  c{ECX} = Cluster number within group
+;	  c{EBX} = Offset of buffer containing FIB
+;	  c{EDX} = Offset of pointer relative to start of FIB (which is now
+;		     the current FIB)
+
+xfsfndpnt::
+	MOVL	ESI, [EDI]		;Make sure have UCB offset
+	TESTL	ESI, ESI
+	JE	1$.S
+	CMPL	ucb_clussize.B[ESI], #0.B ;Make sure still file structured!
+1$:	JE	knlNoUnit##		;Else say not disk unit (since this
+					;  probably means it was dismounted
+					;  under us!)
+	MOVL	EBX, dcb_dkfilepnt.B[EDI] ;Point to base FIB
+	CMPL	ff_alloc.B[EBX], #-1.B	;Do we have allocation information now?
+	JE	6$.S			;No (possible if had FAT error)
+	MOVL	EBX, dcb_dkcfib.B[EDI]	;Yes - point to current FIB
+	SHRL	EAX, #9			;Change offset to block in file
+	CLRL	EDX			;Change to cluster in file and block
+	DIVL	ucb_clussize.B[ESI]	;  in cluster
+	PUSHL	EDX			;Save block in cluster
+2$:	CMPL	EAX, ff_floor.B[EBX]	;Compare to floor for this FIB
+	JAE	4$.S			;If above floor
+	MOVL	EBX, dcb_dkfilepnt.B[EDI] ;Backing up - must start at beginning
+					  ;  of file!
+4$:	CMPL	EAX, ff_roof.B[EBX]	;Above top of this FIB?
+	JB	10$.S			;No
+	MOVL	EBX, cb_nextfib.B[EBX]	;Yes - advance to next FIB
+	TESTL	EBX, EBX
+	JNE	2$.S			;Continue
+	CRASH	BDFF			;[BaD FIB Format]
+
+;Here if do not have allocation information for the file - this is possible
+;  if we have found a bad pointer in the FAT chain for the file
+
+6$:	MOVL	EAX, #ER_FTPER
+	STC
+	RET
+
+;Here with FIB which contains the pointer we want
+
+10$:	SUBL	EAX, ff_floor.B[EBX]	;Adjust for first cluster in FIB
+	MOVL	EDX, #ff_f1pnt		;Point to first pointer (assume base
+	MOVL	ECX, #ff_N1PNT		;  FIB)
+	CMPL	ff_floor.B[EBX], #0.B	;Is it the base FIB?
+	JE	12$.S			;Yes
+	MOVB	DL, #ff_fxpnt		;No - fix up pointer to first pointer
+	MOVB	CL, #ff_NXPNT
+12$:	PUSHL	EAX
+	CLRL	EAX
+14$:	MOVB	AL, [EBX+EDX]		;Get count for pointer
+	CMPB	AL, #0
+	JE	16$.S
+	SUBL	[ESP], EAX		;Reduce cluster number
+	JB	18$.S			;If there
+	ADDL	EDX, #5.B		;Bump pointer
+	LOOP	ECX, 14$		;Continue if more pointers in this FIB
+16$:	CRASH	BDFF			;[BaD FIB Format]
+
+;Here with pointer
+
+18$:	POPL	ECX
+	ADDL	ECX, EAX		;Get cluster number in group
+	POPL	EAX			;Restore block in cluster
+	MOVL	dcb_dkcfib.B[EDI], EBX	;Make this the current FIB
+	CLC
+	RET
+.PAGE
+	.SBTTL	xfsextend - Subroutine to start extending DOS file
+
+;Subroutine to start extending DOS file - this subroutine allocates blocks,
+;  marks them as allocated, but does not link them into the chain for the
+;  file
+;	c{EAX} = Amount to extend file (clusters)
+;	c{EBX} = Offset of base FIB for file
+;	c{EDI} = Offset of DCB
+;	CALL	xfsextend
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  c{EAX} = First cluster allocated
+;	  c{ECX} = Number of clusters allocated
+;	  c{EDX} = Last cluster in file
+;	  c{EBX} = Offset of buffer for FIB containing last pointer
+;	  c{ESI} = Offset in block of last pointer
+
+
+xfsextend::
+	CMPL	ff_alloc.B[EBX], #0.B	;Any allocated now?
+	JE	8$.S			;No - go handle that case
+	MOVL	ESI, [EDI]
+	TESTL	ESI, ESI
+	JE	knlNoUnit##
+	PUSHL	EAX			;Yes - save amount wanted
+	MOVL	EAX, ff_alloc.B[EBX]	;Get bytes allocated to the file
+	IMULL	EAX, ucb_bpclus.B[ESI]
+	DECL	EAX			;Minus 1
+	CALL	xfspos2			;Get physical block of end
+	JC	6$.S
+	PUSHL	EBX			;Save offset of FIB buffer
+	PUSHL	EDX			;Save offset of pointer
+	MOVZBL	EAX, [EBX+EDX]		;Get last cluster in file
+	DECL	EAX
+	ADDL	EAX, 1.B[EBX+EDX]
+	MOVL	ECX, 8.B[ESP]		;Restore amount wanted
+	MOVL	8.B[ESP], EAX		;Save last cluster
+	INCL	EAX			;Plus 1 gives first desired cluster
+	CALL	xfsallocc#		;Allocate space
+	POPL	ESI			;Restore address of pointer
+	POPL	EBX
+6$:	POPL	EDX			;Restore end of file
+	RET				;Return
+
+;Here if nothing allocated to the file now
+
+8$:	MOVL	ECX, EAX		;Get amount to get in right register
+	CLRL	EAX			;Get it anywhere
+	CALL	xfsallocc#		;Get space
+	JC	ret014.S		;If error
+	CLRL	EDX			;No current last cluster
+	MOVL	EBX, dcb_dkfilepnt.B[EDI] ;Return pointer to first pointer in
+	MOVL	ESI, #ff_f1pnt		  ;  the base FIB
+ret014:	RET				;Thats all
+.PAGE
+	.SBTTL	xfsextfin - Subroutine to finish extending DOS file
+
+;Subroutine to finish extending DOS file - links a previously allocated
+;  chain of blocks to the end of the list for the file and updates the FIB
+;  pointers - an additional FIB is allocated if the current FIB is full
+;	c{EAX} = First cluster allocated
+;	c{ECX} = Number of clusters allocated
+;	c{EDX} = Last cluster in file
+;	c{EBX} = Offset of buffer for FIB containing last pointer
+;	c{ESI} = Offset in block of last pointer
+;	CALL	xfsentfin
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  c{EBX} = Offset of base FIB for file
+
+xfsextfin::
+	TESTL	EDX, EDX		;Is this the initial allocation?
+	JNE	6$.S			;No
+	MOVL	1.B[EBX+ESI], EAX	;Yes - store cluster number in pointer
+	JMP	10$.S			;Go finish up
+
+;Here if this is not the initial allocation for the file - link the new clusters
+;  onto the end of the FAT chain for the file
+
+6$:	PUSHL	ECX
+	PUSHL	EBX
+	PUSHL	ESI
+	PUSHL	EAX
+	PUSHL	EDX
+	MOVL	ECX, EDX		;Get cluster number in right register
+	MOVL	ESI, [EDI]		;Get offset of the UCB
+	CALL	xfsgetfatent#		;Get current entry for this cluster
+	JC	14$.S			;If error
+	JNS	12$.S			;Bad FAT if not EOF
+	POPL	ECX
+	MOVL	EAX, [ESP]
+	CALL	xfsputfatent#
+	POPL	EAX			;Restore first cluster allocated
+	POPL	ESI			;Restore offset of pointer in FIB
+	POPL	EBX			;Restore offset of FIB buffer
+	POPL	ECX			;Restore amount size increased
+	JC	ret014.S
+	ORB	cb_sts.B[EBX], #CB$CHNGD ;Indicate this FAT changed
+	MOVZBL	EDX, [EBX+ESI]		;Get current size of last group
+	ADDL	EDX, 1.B[EBX+ESI]	;Plus cluster number
+	CMPL	EAX, EDX		;Is the allocation contiguous?
+	JNE	18$.S			;No
+10$:	MOVZBL	EDX, [EBX+ESI]		;Yes - get count again
+	ADDL	EDX, ECX		;Plus new amount?
+	CMPL	EDX, #255t		;Too big for the pointer?
+	JA	16$.S			;Yes
+	MOVB	[EBX+ESI], DL		;No - just update the count
+	ADDL	ff_roof.B[EBX], ECX	;And update top cluster number
+	JMP	24$			;Go on
+
+;Here if don't have proper EOF entry
+
+12$:	MOVL	EAX, #ER_FTPER		;Get error code
+14$:	ADDL	ESP, #20t.B		;Fix up the stack
+	STC
+	RET
+
+;Here if have too many clusters for a single pointer
+
+16$:	MOVB	[EBX+ESI], #255t	;Store maximum count for pointer
+	SUBL	EDX, #255t		;Get amount left over
+	ADDL	EAX, ECX		;And get cluster for next pointer
+	SUBL	EAX, EDX
+	ADDL	ff_roof.B[EBX], ECX
+	SUBL	ff_roof.B[EBX], EDX
+	JMP	20$.S
+
+;Here if need new pointer for the new space
+
+18$:	MOVL	EDX, ECX
+20$:	CMPL	ESI, #512t-10t		;Room for another pointer in this FIB?
+	JA	22$.S			;No
+	ADDL	ESI, #5.B		;Yes - bump pointer
+	MOVL	1.B[EBX+ESI], EAX	;Store cluster
+	MOVB	[EBX+ESI], DL		;And store count
+	ADDL	ff_roof.B[EBX], EDX	;Update top cluster for this FIB
+	JMP	24$.S			;Continue
+
+;Here if current FIB is full - must allocate another FIB
+
+22$:	PUSHL	ECX			;Save total amount
+	PUSHL	EDX			;Save amount for this pointer
+	PUSHL	EAX			;And save cluster
+	PUSHL	ff_roof.B[EBX]		;Save top cluster in file for this FIB
+	PUSHL	EBX
+	CALL	xosdskGetSBufr##	;Get block for next FIB
+	JC	14$.S			;If none available
+	CALL	xosdskClrBufr##		;Clear the buffer
+	POPL	EDX
+	MOVL	cb_nextfib.B[EDX], EBX	;Link new buffer to previous
+	MOVL	cb_prevfib.B[EBX], EDX
+	POPL	EAX			;Get cluster in file
+	MOVL	ff_floor.B[EBX], EAX
+	MOVL	ff_roof.B[EDX], EAX
+	ORB	cb_sts.B[EDX], #CB$CHNGD ;Indicate this FIB changed
+	ADDL	EAX, 4.B[ESP]
+	MOVL	ff_roof.B[EBX], EAX
+	POPL	EAX			;Get cluster number
+	MOVL	ff_fxpnt+1.B[EBX], EAX	;Store in first pointer
+	POPL	EDX			;Get amount for pointer
+	MOVB	ff_fxpnt+0.B[EBX], DL	;Store in pointer
+	ORB	cb_sts.B[EBX], #CB$CHNGD ;Indicate this FIB changed
+	POPL	ECX			;Get total amount size increased
+24$:	MOVL	EBX, dcb_dkfilepnt.B[EDI] ;Point to base FIB
+	ADDL	ff_alloc.B[EBX], ECX ;Increase allocated size of file
+	ORB	cb_sts.B[EBX], #CB$CHNGD ;Indicate this FIB changed
+	RET				;And return
+
+	LKEEND

@@ -1,0 +1,737 @@
+	.TITLE	ARPCLS - Internet ARP class driver for XOS
+
+;++++
+; This software is in the public domain.  It may be freely copied and used
+; for whatever purpose you see fit, including commerical uses.  Anyone
+; modifying this software may claim ownership of the modifications, but not
+; the complete derived code.  It would be appreciated if the authors were
+; told what this software is being used for, but this is not a requirement.
+
+;   THIS SOFTWARE IS PROVIDED BY THE AUTHORS "AS IS" AND ANY EXPRESS OR
+;   IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
+;   OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+;   IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+;   INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+;   BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS
+;   OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+;   ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR
+;   TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
+;   USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+;----
+
+	.PROC	80486
+	.INCLUD	XOSINC:\XMAC\XOS.PAR
+	.INCLUD	XOSINC:\XMAC\XOSX.PAR
+	.INCLUD XOSINC:\XMAC\XOSTIME.PAR
+	.INCLUD	XOSINC:\XMAC\XOSERR.PAR
+	.INCLUD	XOSINC:\XMAC\XOSNET.PAR
+	.INCLUD	XOSINC:\XMAC\XOSXNET.PAR
+	.INCLUD	XOSINC:\XMAC\XOSXSNAP.PAR
+	.INCLUD	XOSINC:\XMAC\XOSXARP.PAR
+	.INCLUD	XOSINC:\XMAC\XOSLKE.PAR
+	.INCLUD	XOSINC:\XMAC\XOSXLKE.PAR
+
+;This device class implements the Internet ARP protocol.  It is used in
+;  conjunction with IPSCLS.  It is intended to also be available for other
+;  protocol families, although none others currently use it.  The ARP device
+;  implemented by this class driver is only useful for getting statistics
+;  about ARP protocol usage.  It cannot do IO.
+
+MAJV   =!2t
+MINV   =!0t
+EDITNUM=!0t
+
+	LKEHEAD	ARPCLS, MAJV, MINV, EDITNUM, LKETYPE_CLASS
+.PAGE
+	.SBTTL	Protocol function dispatch table for ARP
+
+;Protocol function dispatch for IP
+
+	CODE
+
+arpdisp:.LONG	0		;npf_linkup   = 00 - Link up
+	.LONG	0		;npf_linkdown = 04 - Link down
+	.LONG	0		;npf_abort    = 08 - Abort output
+	.LONG	0		;npf_getaddr  = 0C - getaddr subroutine for
+				;		       protocol
+	.LONG	arprcv		;npf_receive  = 10 - Receive routine
+	.LONG	0		;npf_procarp  = 14 - Routine to process ARP
+				;		       packet
+
+	.SBTTL	SVC dispatch table for ARP class devices
+
+;SVC dispatch table for ARP class devices
+
+arpsvcdsp:
+	.LONG	knlRtnZero##	;sd_mount	=  0. - Mount
+	.LONG	knlRtnZero##	;sd_cleardev	=  4. - Clear device
+	.LONG	xosnetGiveDcb##	;sd_cleardcb	=  8. - Clear DCB
+	.LONG	knlRtnZero##	;sd_commit	= 12. - Commit data to disk
+	.LONG	knlRtnZero##	;sd_transold    = 16. - Transfer device/old
+	.LONG	knlRtnZero##	;sd_transnew    = 20. - Transfer device/new
+	.LONG	knlNullQio##	;sd_opena	= 24. - Open additional
+	.LONG	arpopen		;sd_open1	= 28. - Open device/file
+	.LONG	arpopen		;sd_devparm     = 32. - Device parameters
+	.LONG	knlIFnDev##	;sd_delete	= 36. - Delete file
+	.LONG	knlIFnDev##	;sd_rename	= 40. - Rename file
+	.LONG	knlIFnDevGQ##	;sd_inblock	= 44. - Input block
+	.LONG	knlIFnDevGQ##	;sd_outblock	= 48. - Output block
+	.LONG	knlIFnDevGQ##	;sd_outblockq	= 52. - Output block (XFF)
+	.LONG	knlIFnDevGQ##	;sd_outstring	= 56. - Output string
+	.LONG	knlRtnMOne##	;sd_getiosts	= 60. - Get input/output status
+	.LONG	knlIFnDevGQ##	;sd_special     = 64. - Special device function
+	.LONG	knlNullClose##	;sd_close	= 68. - Close file
+	.LONG	knlNullLabel##	;sd_label       = 72. - Get device label
+	.LONG	knlNullQioGQ##	;sd_commitfunc	= 76. - Commit data to disk
+	.LONG	knlInfoNone##	;sd_devinfo     = 80. - Get device info
+ARPSVCDSPSZ=!{$-arpsvcdsp}/4
+
+;Class function dispatch table for network class devices
+
+	.LONG	ARPCLSFMX
+arpcls:	.LONG	arpaddunit	;CF_ADDUNIT = 1. - Add unit
+	.LONG	arpunitinfo	;CF_PUNITS  = 2. - Get information about
+				;		     physical units
+	.LONG	knlIFnDev##	;CF_AUNITS  = 3. - Get information about active
+				;		     units
+ARPCLSFMX=!{$-arpcls}/4
+.PAGE
+;Device characteristics for ARP class devices
+
+	DATA
+
+	.MOD	4
+arpdctbl:
+ DCHARBGN  1, knlDCharValCom##
+ DCHARENT  CLASS  , TEXT, ,  8, knlDcMsgClass##  , knlDcGetClass##   , knlDcSetClass##   , 0
+ DCHARENT  SNAPDEV, TEXT, , 16, msgsnapdev       , getsnapdev        , 0                 , 0
+ DCHARENT  ETYPE  , HEXB, ,  2, msgetype         , xossnpGetPdbData##, setetype          , pdb_etypevalue
+ DCHARENT  PKTIN  , DECV, ,  4, xosnetMsgPktIn## , xossnpGetPdbData##, xossnpSetPdbData##, pdb_arpcntpktin
+ DCHARENT  BYTEIN , DECV, ,  4, knlDcMsgByteIn## , xossnpGetPdbData##, xossnpSetPdbData##, pdb_arpcntbytein
+ DCHARENT  PKTOUT , DECV, ,  4, xosnetMsgPktOut##, xossnpGetPdbData##, xossnpSetPdbData##, pdb_arpcntpktout
+ DCHARENT  BYTEOUT, DECV, ,  4, knlDcMsgByteOut##, xossnpGetPdbData##, xossnpSetPdbData##, pdb_arpcntbyteout
+ DCHARENT  NODST  , DECV, ,  4, msgnodst         , xossnpGetPdbData##, xossnpSetPdbData##, pdb_arpcntnodst
+ DCHARENT  BADHDR , DECV, ,  4, msgbadhdr        , xossnpGetPdbData##, xossnpSetPdbData##, pdb_arpcntbadhdr
+
+	CODE
+
+msgsnapdev:DCHARINFO  {SNAP device}
+msgetype:  DCHARINFO  {Ethertype value}
+msgnodst:  DCHARINFO  {Discarded - no destination for protocol}
+msgbadhdr: DCHARINFO  {Discarded - bad header}
+.PAGE
+;Device parameter table for ARP: opens
+
+	.MOD	4
+	.LONG	OPARMMAX
+arpopnparms:
+	.LONG	arpopngenparms	 ;IOPAR_xxxxxx = 00xx - Generic IO parameters
+	.LONG	knlNullFilParms##;IOPAR_FILxxx = 01xx - File system IO
+				 ;			  parameters
+	.LONG	knlNullTrmParms##;IOPAR_TRMxxx = 02xx - Terminal IO parameters
+OPARMMAX=!{$-arpopnparms}/4
+
+	.LONG	OPARMGENMAX	;Size of table
+arpopngenparms:
+	.LONG	0		;		= 0000h
+	.LONG	knlIopDummyN##	;IOPAR_FILOPTN  = 0001h
+	.LONG	knlIopDummyS##	;IOPAR_FILSPEC  = 0002h
+	.LONG	knlIopDevSts##	;IOPAR_DEVSTS   = 0003h
+	.LONG	knlIopUnitNum##	;IOPAR_UNITNUM  = 0004h
+	.LONG	knlIopGlbId##	;IOPAR_GLBID    = 0005h
+	.LONG	knlIopDelay##	;IOPAR_DELAY    = 0006h
+	.LONG	knlIopTimeOut##	;IOPAR_TIMEOUT  = 0007h
+	.LONG	0		;IOPAR_INPSTS   = 0008h
+	.LONG	0		;IOPAR_OUTSTS   = 0009h
+	.LONG	knlIopInpQLmt##	;IOPAR_INPQLMT	= 000Ah
+	.LONG	knlIopOutQLmt##	;IOPAR_OUTQLMT	= 000Bh
+OPARMGENMAX=!{$-arpopngenparms}/4
+.PAGE
+	.SBTTL	Initialization routine
+
+	INITSUB	arpinit
+
+;The command for installing ARPCLS is:
+;	LKELOAD ARPCLS
+
+arpinit:MOVL	EDI, #arpchk		;Install the IPS class
+	MOVL	EBX, #arpcls		;Offset of class function dispatch table
+	MOVL	EAX, #'ARP'
+	CLRL	EDX
+	MOVL	ESI, #arpccb
+	CALL	knlNewClass##
+	JC	4$.S			;If error
+	MOVL	ECX, #codetop		;OK
+	CLRL	EDX
+	CLRL	EAX
+4$:	MOVL	EBX, #QSTS$DONE
+	RET
+
+	CODE
+.PAGE
+	.SBTTL	arpaddunit - Subroutine to add ARP "unit"
+
+;Subroutine to add ARP "unit" - this is a logical unit which implements the
+;  ARP protocol for a single network interface unit
+;	c{ES:EDI} = Address of data block
+;	CALL	arpaddunit
+;	c{EAX} = Error code
+;	c{EBX} = Status bits
+;	c{ECX} = Item count
+
+$$$=!0
+FRM arpau_unit  , 4t		;Unit number
+FRM arpau_seqnum, 4t		;Initial TCP sequence number value
+FRM arpau_sdb   , 4t		;Offset of SDB
+FRM arpau_pdb   , 4t		;Offset of PDB
+arpau_SIZE=!$$$
+
+	DATA
+
+	.MOD	4
+arpaublk:				;Parameter description block for
+ DCHARBGN  2, knlDCharValCom##		;  adduparms
+ DCHARENT  UNIT   , DECV, ,  1, 0, 0, arpauunit   , 0
+ DCHARENT  SNAPDEV, TEXT, , 16, 0, 0, arpausnapdev, 0
+
+	CODE
+
+	IFFAULT	knlRtnAdrEr##
+arpaddunit:
+	LFSL	EDX, iorb_buffer2.B[ESI]
+	CALL	knlGiveQel##		;Give up the IORB
+	ENTER	arpau_SIZE, 0		;Allocate our stack frame
+	CLRL	EAX
+	LEAL	EDI, -arpau_SIZE[EBP]	;Clear our stack frame
+	MOVL	ECX, #arpau_SIZE/4
+	PUSHL	SS
+	POPL	ES
+	CLD
+	RSTOSL	[EDI]
+	DECL	arpau_unit.B[EBP]	;Indicate illegal unit number
+	MOVL	EBX, #arpaublk
+	MOVB	AL, #0			;Fail on bad names
+	CALL	knlAddUnitChar##	;Process the characteristics
+	JC	2$.S			;If error
+	CMPL	arpau_sdb.B[EBP], #0.B	;Was a SNAP device specified?
+	JE	1$.S			;No
+	CMPL	arpau_unit.B[EBP], #0.B	;Yes - was a unit number specified?
+	JGE	20$.S			;Yes
+1$:	MOVL	EAX, #ER_CHARM		;No - fail
+2$:	MOVL	EBX, #QSTS$DONE
+	CLRL	ECX
+	LEAVE
+	TOFORK
+ret002:	RET
+		
+;Here if address error with the IORB
+
+4$:	CALL	knlGiveQel##
+	MOVL	EAX, #ER_ADRER
+	JMP	2$.S
+
+;Here if cannot allocate exec memory
+
+10$:	MOVL	EBX, knlSvDataPnt##	;Give up all the memory we got here!
+	CALL	knlGiveXMem##
+14$:	CALL	knlGiveXRes##
+	JMP	2$.S
+
+;Here if have all required characteristics - we now allocate a PDB
+
+20$:	CALL	knlGetXRes##		;Get exec memory resource
+	PUSHL	ECX
+	MOVL	ECX, #pdb_arpSIZE+pdb_mSIZE ;Allocate a PDB (Protocol Data Block)
+	CALL	knlGetXMem##
+24$:	JC	10$.S			;If error
+	LEAL	EBX, pdb_mSIZE.B[EDI]
+	MOVL	arpau_pdb.B[EBP], EBX
+	MOVL	pdb_magic.B[EBX], #'PDB*'
+	MOVL	ESI, arpau_sdb.B[EBP]
+	MOVL	pdb_sdb.B[EBX], ESI	;Store offset of SDB in the PDB
+	MOVL	EAX, sdb_idb.B[ESI]
+	MOVL	pdb_idb.B[EBX], EAX
+	MOVL	pdb_name+0.B[EBX], #'ARP' ;Put name into the PDB
+	MOVL	EAX, arpau_unit.B[EBP]	;Add unit number
+	MOVB	pdb_unit.B[EBX], AL
+	PUSHL	EBX
+	ADDL	EBX, #pdb_name+3.B
+	CALL	knlPutDecNmbr##
+	POPL	EBX				 ;Store offset of subroutine to
+	MOVL	pdb_arpgenreq.B[EBX], #arpgenreq ;  generate ARP request packet
+	MOVL	pdb_disp.B[EBX], #arpdisp
+	MOVL	pdb_ccb.B[EBX], #arpccb	;Store offset of CCB
+	DECL	[EBX]			;Indicate no protocol specified yet
+	MOVL	EAX, arpPdbHead		;Link into our list of PDBs
+	MOVL	arpPdbHead, EBX
+	MOVL	pdb_nextd.B[EBX], EAX
+	CALL	knlGiveXRes##
+	CLRL	EAX			;Finished
+	MOVL	EBX, #QSTS$DONE
+	MOVL	ECX, #1
+	LEAVE
+	TOFORK
+	RET
+.PAGE
+;Subroutine called by adduparms for the "UNIT" parameter
+
+arpauunit:
+	CMPL	EAX, #9t.B		;Valid value?
+	JA	badcharv		;No - fail
+	MOVL	arpau_unit.B[EBP], EAX	;Yes - store it
+	CLC
+	RET
+
+;Subroutine called by adduparms for the "SNAPDEV" parameter
+
+arpausnapdev:
+	MOVL	ESI, xossnpSdbHead##	;Get offset of first network SDB
+2$:	TESTL	ESI, ESI		;Have another to check?
+	JE	8$.S			;If no more
+	MOVL	EAX, knlDcValue##+0	;This one?
+	CMPL	sdb_name+0.B[ESI], EAX
+	JNE	4$.S			;No
+	MOVL	EAX, knlDcValue##+4
+	CMPL	sdb_name+4.B[ESI], EAX
+	JNE	4$.S			;No
+	MOVL	EAX, knlDcValue##+8
+	CMPL	sdb_name+8.B[ESI], EAX
+	JNE	4$.S			;No
+	MOVL	EAX, knlDcValue##+12t
+	CMPL	sdb_name+12t.B[ESI], EAX
+	JE	6$.S			;Yes
+4$:	MOVL	ESI, sdb_nextd.B[ESI]	;No - advance to next
+	JMP	2$.S			;Continue
+
+;Here with SDB for the request network interface
+
+6$:	MOVL	arpau_sdb.B[EBP], ESI	;Store SDB offset
+	CLC
+	RET
+
+;Here if cannot find requested SNAP device
+
+8$:	MOVL	EAX, #ER_NSDEV
+	STC
+	RET
+.PAGE
+	.SBTTL	arpunitinfo - ARP phyical unit information function
+
+;Here for the get physical unit information class function (CL_PUNITS) for the
+;  ARP class
+;	c{EBX} = Offset of CCB
+;	c{ESI} = Offset of IORB
+;	CALL	arpunitinfo
+;	c{EAX} = Error code
+;	c{EBX} = Status bits
+;	c{ECX} = Item count
+;  A zero count (iorb_count) requests that the number of units only be returned
+;    in qab_amount.  A non-zero count indicates that a buffer is available for
+;    that many unit names (8 characters each, null padded).
+
+arpunitinfo:
+	MOVL	EAX, #ER_IFDEV
+	STC
+	RET
+.PAGE
+	.SBTTL	arpchk - Device check routine for ARP class devices
+
+;Device check routine for ARP class devices
+;	c{SS:EBX} = Address of device name (16 characters)
+;	CALL	arpchk
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  Z:clr = Not an ARP class device (EBX and ESI are preserved)
+;	  Z:set = IPS class device
+;	    c{EDI} = Offset of DCB
+
+arpchk:	MOVL	EAX, SS:[EBX]
+	ANDL	EAX, #0FFFFFFh
+	CMPL	EAX, #'ARP'		;Is this ARP*?
+	JNE	6$.S			;No
+	MOVL	EDI, arpPdbHead		;Yes - point to first ARP PDB
+	LEAL	ECX, 3.B[EBX]		;Get offset of 1st unit number character
+	CALL	xosnetSrchBlock##
+	JNE	6$.S
+	MOVL	EDX, #arpccb		;Get offset of our CCB
+	PUSHL	EDI			;Save offset of the PDB
+	PUSHL	ESI
+	PUSHL	SS:12t.B[EBX]		;Device name
+	PUSHL	SS:8.B[EBX]
+	PUSHL	SS:4.B[EBX]
+	PUSHL	SS:[EBX]
+	MOVZBL	EAX, pdb_unit.B[EDI]	;Primary unit number
+	PUSHL	EAX
+	PUSHL	#0.B			;Secondary unit number
+	PUSHL	#dcb_arpINDEX.B		;Size index
+	PUSHL	pdb_ccb.B[EDI]		;Offset of CCB
+	PUSHL	pdb_idb.B[EDI]		;Offset of IDB
+	PUSHL	#0.B			;Description bits
+	CALL	xosnetMakeDcb##		;Get a network DCB
+	POPL	ESI
+	POPL	EBX
+	JC	2$.S			;If error
+	MOVL	dcb_sdisp.B[EDI], #arpsvcdsp ;Store offset of SVC dispatch table
+	MOVL	dcb_netpdb.B[EDI], EBX	;Store offset of PDB in the DCB
+	MOVL	EAX, pdb_sdb.B[EBX]	;Store offset of the SDB in the DCB
+	MOVL	dcb_netsdb.B[EDI], EAX
+	MOVL	dcb_devchar.B[EDI], #arpdctbl ;Store offset of devchar table
+	CLRL	EAX			;Set Z
+2$:	RET				;And return
+
+;Here if not an ARP device
+
+6$:	CLC				;Clear C and leave Z clear
+	RET
+.PAGE
+	.SBTTL	getsnapdev - Here to get value of SNAPDEV characteristic
+
+;Here to get the value of the SNAPDEV device characteristic - SNAP device name
+
+getsnapdev:
+	MOVL	EBX, dcb_netsdb.B[EDI]	;Get offset of the SDB
+	LEAL	EAX, sdb_name.B[EBX]	;Get offset of interface name
+	RET
+
+	.SBTTL	setetype - Here to set value of the ETYPE characteristic
+
+;Here to set the value of the ETYPE device characteristic - ARP Ethertype
+
+setetype:
+	TESTL	EDX, EDX
+6$:	JNE	badcharv.S
+	MOVL	EBX, dcb_netpdb.B[EDI]	;Get offset of the PDB
+	MOVL	ESI, dcb_netsdb.B[EDI]	;Get offset of the SDB
+	CMPW	pdb_etypevalue.B[EBX], #0.B ;Do we already have an Ethertype?
+	JE	8$.S			;No - go on
+	PUSHL	EAX			;Yes - get rid of it
+	CALL	xossnpClrEType##
+	MOVL	EBX, dcb_netpdb.B[EDI]	;Restore offset of the PDB
+	CLRL	EAX			;Clear the Ethertype value
+	MOVL	pdb_etypevalue.B[EBX], EAX
+	POPL	EAX
+8$:	TESTL	EAX, EAX		;0 means none
+	JE	12$.S
+	JMP	xossnpSetEType##	;Go change Ethertype
+
+badcharv:
+	MOVL	EAX, #ER_CHARV
+	STC
+12$:	RET
+.PAGE
+	.SBTTL	sd_open - Open device
+
+;Here for the open device entry
+
+arpopen:CMPL	SS:xffParm##, #0.B
+	JE	4$.S
+	MOVL	EBX, #arpopnparms	;Process device parameters
+	MOVL	ECX, #knlComDPParms##
+	IFFAULT	knlRtnAdrEr##
+	LFSL	EDX, SS:xffParm##
+	JMP	knlProcDevParm##
+
+4$:	CLRL	EAX
+	RET
+.PAGE
+	.SBTTL	arprcv - Subroutine to process received ARP packet
+
+;Subroutine to process received ARP packet
+;	c{EBX} = Offset of packet buffer
+;	c{ECX} = Length
+;	c{EDX} = Offset of start of ARP header
+;	c{EDI} = Offset of ARP PDB
+;	c{ESI} = Offset of SDB
+;	CALL	arprcv
+
+arprcv:
+	CMPW	npb_magic.B[EBX], #NPB_MAGIC ;Is this really a network buffer?
+	JE	1$.S			;Yes
+	INT3
+
+1$:	LEAL	EAX, 0Eh.B[EBX]
+	CMPL	EAX, EDX
+	JE	2$.S
+	INT3
+
+2$:	MOVL	xxxEBX, EBX
+	MOVL	xxxEDX, EDX
+	MOVL	xxxECX, ECX
+	MOVL	xxxEDI, EDI
+	MOVL	xxxESI, ESI
+
+
+	INCL	pdb_arpcntpktin.B[EDI]
+	CMPL	ECX, #arp_SIZE-12t.B	;Is it big enought?
+	JB	8$.S			;No - discard it
+	MOVZBL	EAX, arp_hlen.B[EDX]	;Maybe
+	ADDL	EAX, EAX
+	ADDL	EAX, #arp_SIZE-12t.B
+	CMPL	ECX, EAX
+	JB	8$.S			;No
+	ADDL	pdb_arpcntbytein.B[EDI], EAX ;OK
+	MOVZWL	EAX, arp_hwtype.B[EDX]	;Make sure hardware type is right
+	CMPW	sdb_snaphwtype.B[ESI], AX
+	JNE	10$.S
+	MOVZBL	ECX, arp_hlen.B[EDX] 	;Get hardware address length
+	CMPB	sdb_snaphlen.B[ESI], CL	;Is it right?
+	JNE	10$.S			;No - fail
+	CMPB	arp_plen.B[EDX], #0
+	JE	10$.S
+	CMPB	arp_plen.B[EDX], #4
+	JA	10$.S
+	MOVZWL	EAX, arp_oper.B[EDX]	;Get the opcode value
+	XCHGB	AL, AH
+	TESTL	EAX, EAX		;Is it legal?
+	JE	10$.S			;No
+	CMPL	EAX, #2.B		;Maybe
+	JA	10$.S			;No
+4$:	PUSHL	EDI			;Yes - save offset of the APR PDB
+	MOVL	EDI, sdb_pdbhead.B[ESI]	;Get offset of first PDB
+	MOVZWL	EAX, arp_prot.B[EDX]	;Get protocol
+6$:	CMPW	pdb_etypevalue.B[EDI], AX ;This one?
+	JE	12$.S			;Yes
+	MOVL	EDI, [EDI]		;No - advance to next PDB
+	TESTL	EDI, EDI
+	JNE	6$.S			;Continue if more to check
+	POPL	EDI			;Restore offset of the ARP PDB
+	INCL	pdb_arpcntnodst.B[EDI]
+
+;;;;	JMP	ngvbfr2.S
+
+	CALL	xosnetGiveBufr##
+	RET
+
+;Here if have bad format
+
+8$:	ADDL	pdb_arpcntbytein.B[EDI], ECX
+10$:	INCL	pdb_arpcntbadhdr.B[EDI]
+
+;;;;	JMP	ngvbfr2.S
+
+	CALL	xosnetGiveBufr##
+	RET
+
+;Here with PDB which matches the request's protocol
+
+12$:	ENTER	parp_SIZE, 0
+	MOVB	AL, arp_oper+1.B[EDX]	;Save the opcode value
+	MOVB	parp_oper.B[EBP], AL
+	PUSHL	EDI
+	PUSHL	ESI
+	PUSHL	SS
+	POPL	ES
+	LEAL	ESI, arp_senderha.B[EDX] ;Get sender's hardware address (this
+	MOVZBL	ECX, arp_hlen.B[EDX]	 ;  will be between 1 and 6 bytes)
+	MOVB	parp_hlen.B[EBP], CL
+	CLD
+	LEAL	EDI, parp_sha.B[EBP]
+	CALL	arpcopyh		;Copy the sender's hardware address
+	LEAL	EDI, parp_spa.B[EBP]
+	MOVZBL	ECX, arp_plen.B[EDX]
+	MOVB	parp_plen.B[EBP], CL
+	MOVL	EAX, #4
+	CALL	arpcopy			;Copy the sender's protocol address
+	LEAL	EDI, parp_tha.B[EBP]
+	CALL	arpcopyh		;Copy the target hardware address
+	LEAL	EDI, parp_tpa.B[EBP]
+	MOVZBL	ECX, arp_plen.B[EDX]
+	MOVL	EAX, #4
+	CALL	arpcopy			;Copy the target protocol address
+	POPL	ESI
+	POPL	EDI
+	PUSHL	EBX
+	PUSHL	EDX
+	MOVL	EAX, pdb_disp.B[EDI]
+	CALLI	CS:npf_procarp.B[EAX]	;Process the ARP packet
+	JC	18$.S			;If error
+	POPL	EDX
+	POPL	EBX
+	CMPB	parp_oper.B[EBP], #1	;Is this a request?
+	JE	sndresp.S		;Yes
+14$:	LEAVE				;No - finished with it now
+	POPL	EDI
+ngvbfr2:CALL	xosnetGiveBufr##	;Don't send a response
+	RET
+
+;Here if the target protocol did not want the ARP packet
+
+18$:	LEAVE
+	POPL	EDI
+	INCL	pdb_arpcntnodst.B[EDI]
+;;;;	JMP	ngvbfr2.S
+
+	CALL	xosnetGiveBufr##
+	RET
+.PAGE
+;Here if need to send an ARP response
+
+sndresp:CALL	xossnpSetEcho##		;Set up SNAP header for the echo
+	JC	4$.S			;  packet
+	MOVB	arp_oper+1.B[EDX], #02	;Make this a response
+	MOVZBL	ECX, parp_hlen.B[EBP]	;Get hardware address length
+	MOVL	EAX, ECX
+	ADDL	EAX, EAX
+	ADDL	EAX, #arp_SIZE-12t.B
+	ADDL	npb_count.B[EBX], EAX	;Increase length of packet
+	INCL	pdb_arpcntpktout.B[EDI]
+	ADDL	pdb_arpcntbyteout.B[EDI], EAX
+	PUSHL	ESI
+	MOVL	ESI, sdb_idb.B[ESI]
+	PUSHL	EDI
+	PUSHL	ESI
+	LEAL	EDI, arp_senderha.B[EDX] ;Put our hardware address in the
+	PUSHL	DS			 ;  sender hardware address field
+	POPL	ES
+	ADDL	ESI, #idb_hwaddr
+	MOVZBL	ECX, parp_hlen.B[EBP]
+	CLD
+	RMOVSB	[EDI], [ESI]
+	LEAL	ESI, parp_tpa.B[EBP]	;Put the target protocol address in 
+	MOVB	CL, parp_plen.B[EBP]	;  the sender protocol address field
+	RMOVSB	[EDI], SS:[ESI]
+	LEAL	ESI, parp_sha.B[EBP]	;Put the sender hardware address in the
+	MOVB	CL, parp_hlen.B[EBP]	;  target hardware address field
+	RMOVSB	[EDI], SS:[ESI]
+	LEAL	ESI, parp_spa.B[EBP]	;Put the sender protocol address in the
+	MOVB	CL, parp_plen.B[EBP]	;  target sender address field
+	RMOVSB	[EDI], SS:[ESI]
+	POPL	ESI
+	POPL	EDI
+	MOVL	npb_outdone.B[EBX], #xosnetGiveBufr##
+					;Store offset of routine to execute
+					;  when output is done
+	CALL	xosnetSendPkt##		;Output the packet
+	POPL	ESI
+4$:	LEAVE
+	POPL	EDI
+
+;;;;	JC	ngvbfr2.S		;Give up the packet if error
+;;;;	RET				;Finished
+
+	JNC	8$.S
+6$:	CALL	xosnetGiveBufr##
+8$:	RET
+.PAGE
+;Subroutine to process ARP packet for protocols which do not use ARP
+
+arpnull:
+	MOVB	parp_oper.B[EBP], #0	;Don't send reply
+	RET
+
+arpcopyh:
+	MOVZBL	ECX, arp_hlen.B[EDX]
+	MOVL	EAX, #8
+arpcopy:SUBL	EAX, ECX
+	RMOVSB	[EDI], [ESI]
+	MOVL	ECX, EAX
+	MOVB	AL, #0
+	RSTOSB	[EDI]
+	RET
+.PAGE
+	.SBTTL	arpgenreq - Subroutine to generate an ARP request packet
+
+;Subroutine to generate an ARP request packet
+;	c{EAX} = Our protocol address
+;	c{ECX} = Destination protocol address
+;	c{EDX} = Offset of PDB for base protocol
+;	c{EDI} = Offset of ARP PDB
+;	c{ESI} = Offset of SDB
+;	CALL	arpgenreq
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  c{EBX} = Offset of packet
+
+$$$=!0
+FRM agr_opa, 4t
+FRM agr_dpa, 4t
+FRM agr_pdb, 4t
+agr_SIZE=!$$$
+
+arpgenreq:
+	ENTER	agr_SIZE, 0
+	MOVL	agr_opa.B[EBP], EAX
+	MOVL	agr_dpa.B[EBP], ECX
+	MOVL	agr_pdb.B[EBP], EDX
+	MOVL	ECX, sdb_snaphwhdrsz.B[ESI]
+	ADDL	ECX, #28t.B		;Get approximate size
+	CALL	xosnetGetBufr##		;Get a network buffer
+	JC	2$.S			;If no buffer available
+	MOVL	npb_outdone.B[EBX], #4$
+	MOVL	EAX, pdb_etypevalue.B[EDI]
+	CALL	xossnpSetPkt##		;Set up the SNAP header
+	JNC	6$.S			;If OK
+	PUSHL	EAX			;If error
+	CALL	xosnetGiveBufr##	;Discard the packet
+	POPL	EAX
+	STC				;Fail
+2$:	LEAVE
+4$:	RET
+
+;Here with SNAP header set up
+
+6$:	ADDL	npb_count.B[EBX], #8t.B
+	MOVL	ECX, agr_pdb.B[EBP]
+	MOVL	EAX, pdb_etypevalue.B[ECX] ;Get base Ethertype
+	MOVW	arp_prot.B[EDX], AX	;Put it in the packet
+	MOVZWL	EAX, sdb_snaphwtype.B[ESI] ;Get hardware type
+	MOVW	arp_hwtype.B[EDX], AX	;Put it in the packet
+	MOVW	arp_oper.B[EDX], #0100	;Make this a request
+	MOVB	AL, pdb_plen.B[ECX]	;Store address lengths
+	MOVB	arp_plen.B[EDX], AL
+	ADDB	AL, AL
+	MOVZBL	ECX, sdb_snaphlen.B[ESI]
+	MOVB	arp_hlen.B[EDX], CL
+	ADDB	AL, CL
+	ADDB	AL, CL
+	ADDB	npb_count.B[EBX], AL
+	PUSHL	ESI
+	PUSHL	EDI
+	MOVL	EDI, EDX
+	ADDL	EDI, #arp_senderha.B	;Store our hardware address
+	PUSHL	DS
+	POPL	ES
+	MOVL	ESI, sdb_idb.B[ESI]
+	ADDL	ESI, #idb_hwaddr
+	CLD
+	RMOVSB	[EDI], [ESI]
+	MOVB	CL, arp_plen.B[EDX]
+	LEAL	ESI, agr_opa.B[EBP]	;Store our protocol address
+	RMOVSB	[EDI], SS:[ESI]
+	MOVB	CL, arp_hlen.B[EDX]
+	CLRL	EAX			;Target hardware address is 0
+	RSTOSB	[EDI]
+	MOVB	CL, arp_plen.B[EDX]
+	LEAL	ESI, agr_dpa.B[EBP]	;Store target IP address
+	RMOVSB	[EDI], SS:[ESI]
+	POPL	EDI
+	POPL	ESI
+	CLRL	EAX			;Use hardware broadcast address
+	DECL	EAX
+	MOVL	EDX, EAX
+	PUSHL	ESI
+	MOVL	ESI, sdb_idb.B[ESI]
+	MOVL	ECX, idb_disp.B[ESI]
+	CALLI	CS:ndf_sethwa.B[ECX]
+	POPL	ESI
+	INCL	pdb_arpcntpktout.B[EDI]
+	ADDL	pdb_arpcntbyteout.B[EDI], #28t.B
+	LEAVE
+	RET
+.PAGE
+	.SBTTL	Data
+
+	DATA
+
+xxxEBX::.LONG	0
+xxxEDX::.LONG	0
+xxxECX::.LONG	0
+xxxEDI::.LONG	0
+xxxESI::.LONG	0
+
+arpPdbHead:.LONG 0		;Offset of first ARP PDB
+arpccb:    .BLKB ccb_SIZE	;ARP CCB
+
+	LKEEND

@@ -1,0 +1,1039 @@
+	.TITLE	USRRNDOS - Routines to load DOS images for execution for XOS
+
+;++++
+; This software is in the public domain.  It may be freely copied and used
+; for whatever purpose you see fit, including commerical uses.  Anyone
+; modifying this software may claim ownership of the modifications, but not
+; the complete derived code.  It would be appreciated if the authors were
+; told what this software is being used for, but this is not a requirement.
+
+;   THIS SOFTWARE IS PROVIDED BY THE AUTHORS "AS IS" AND ANY EXPRESS OR
+;   IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
+;   OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+;   IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+;   INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+;   BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS
+;   OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+;   ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR
+;   TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
+;   USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+;----
+
+	.PROC	80486
+	.INCLUD	XOSINC:\XMAC\XOS.PAR
+	.INCLUD	XOSINC:\XMAC\XOSX.PAR
+	.INCLUD	XOSINC:\XMAC\XOSERR.PAR
+	.INCLUD	XOSINC:\XMAC\XOSXTRM.PAR
+	.INCLUD	XOSINC:\XMAC\XOSDISK.PAR
+	.INCLUD	XOSINC:\XMAC\XOSXDISK.PAR
+	.INCLUD	XOSINC:\XMAC\EXE.PAR
+	.INCLUD	XOSINC:\XMAC\XOSDOS.PAR
+	.INCLUD	XOSINC:\XMAC\XOSRUN.PAR
+	.INCLUD	XOSINC:\XMAC\XOSXRUN.PAR
+
+	USERCODE
+
+;Here with a DOS EXE file to load or run
+
+usrrnexe::
+	CMPB	run_func#, #RFNC_RUN	;Is this a run function?
+	JE	usrrunexe.S		;Yes
+
+	.SBTTL	usrldexe - Load DOS EXE file as overlay
+
+;Here to load a DOS EXE file as an overlay
+
+usrloadexe:
+	CMPL	run_loadaddr#+4, #GS_REAL32|03h.B ;Loading into the DOS segment?
+	JNE	eriift.S		;No - fail
+	CMPL	run_relocval#+4, #GS_REAL32|03h.B ;Yes - relocating for DOS?
+	JNE	eriift.S		;No
+	TESTB	run_relocval#+0, #0Fh	;Yes - valid paragraph address?
+	JNE	eriift.S		;No
+	MOVL	ECX, #eh_SIZE-2		;Yes - read the EXE file header
+	MOVL	EBX, #run_header#+2
+	CALL	usrrnrdbytes#
+	JC	ret002.S		;If error
+	CALL	esetpos			;Do initial setup for read
+	JC	ret002.S		;If error
+	PUSHL	#GS_REAL16.B		;Get address for data
+	POPL	ES
+	MOVL	EBX, run_loadaddr#+0
+	PUSHL	EBX
+	CALL	usrrnrdblkr#		;Read the data
+	POPL	EBX
+	JC	ret002.S		;If error
+	MOVL	EAX, run_relocval#+0
+	SHRL	EAX, #4t
+	CALL	reloc			;Do relocation
+	JMP	usrrnclose#		;Close the file and return
+
+;Here if not loading overlay into the DOS segment
+
+eriift:	MOVL	EAX, #ER_IRFT
+	STC
+ret002:	RET
+.PAGE
+	.SBTTL	usrrunexe - Load DOS EXE file for execution in real mode
+
+;A DOS EXE file is loaded into the real mode segment as follows:
+;  000000-0003FF   8086 vector table
+;  000400-0004FF   8086 BIOS data area
+;  000500-0006FF   DOS data area
+;  000700-000FFF   Reserved
+;  001000-00100F   Memory allocation header for loaded program
+;  001010-00110F   Program segment prefix
+;  001110-9FFFFF   Loaded program
+
+;Here to load a DOS EXE file for execution in real mode
+
+usrrunexe:
+	CMPB	run_itype#, #0		;Is the image type known yet?
+	JNE	2$.S			;Yes
+	MOVB	run_itype#, #IT_EXE	;No - store image type now
+2$:	MOVL	ECX, #eh_SIZE-2		;Read file header
+	MOVL	EBX, #run_header#+2
+	CALL	usrrnrdbytes#
+	JC	4$.S			;If error
+	CALL	doscontext		;Get into correct context to finish this
+4$:	JC	ret002.S		;If error
+	JNE	ret002.S		;If finished for now
+	CALL	esetpos			;Do initial setup for read
+	JC	4$.S
+	MOVL	run_loadamt#, ECX	;Save amount to load
+	ADDL	ECX, #3.B
+	SHRL	ECX, #4
+	MOVL	EAX, ECX
+	ADDW	CX, run_header#+eh_minalc ;Get minimum space needed
+	JC	noemem
+	MOVL	run_minmem#, ECX
+	ADDW	AX, run_header#+eh_maxalc ;Get maximum wanted
+	JNC	6$.S
+	MOVW	AX, #0FFFFh
+6$:	MOVL	run_maxmem#, EAX
+	CALL	loaddos			;Load the program data
+	JC	dosfail			;If error
+					;OK - fall into doreloc on next page
+.PAGE
+;Here with the program loaded - now do relocation
+
+doreloc:MOVL	EAX, run_dospsp#	;Get offset of PSP
+	ADDL	EAX, #100h		;Get offset of loaded code
+	MOVL	EBX, EAX
+	SHRL	EAX, #4
+	CALL	reloc			;Do relocation
+	JC	dosfail			;Error - fail
+	CALL	usrrnclose#		;OK - close the file
+	BTL	run_option#, #R%DEBUG	;Debug load?
+	JC	debugld.S		;Yes
+	PUSHL	#GS_REAL32|03h.B	;No - initialize the standard protected
+	POPL	SS			;  mode stack
+	MOVL	ESP, #rmda_stack
+	MOVZWL	EAX, run_header#+eh_SS	;Get his starting SS
+	ADDL	EAX, run_memtop#	;Relocate it
+	PUSHL	EAX			;Stack it
+	MOVZWL	EAX, run_header#+eh_SP	;Get his starting SP
+	PUSHL	EAX			;Stack it
+	PUSHL	#0.B			;Stack interrupt number and item count
+	PUSHL	#20200h			;Stack EFR value
+	MOVZWL	EAX, run_header#+eh_CS	;Get his starting CS
+	ADDL	EAX, run_memtop#	;Relocate it
+	PUSHL	EAX			;Stack it
+	MOVZWL	EAX, run_header#+eh_IP	;Get his starting IP
+	PUSHL	EAX			;Stack it
+	MOVL	EAX, run_memtop#
+	SUBL	EAX, #10h.B
+	PUSHL	EAX			;Stack DS value
+	PUSHL	EAX			;Stack ES value
+	PUSHL	#0.B			;Stack FS value
+	PUSHL	#0.B			;Stack GS value
+	PUSHL	run_dosEAX#		;Stack initial value for EAX
+	JMP	rundon4
+.PAGE
+;Here if doing debug load
+
+debugld:CMPL	run_rlbaddr#, #0.B
+	JE	2$.S
+	LESL	EDI, run_rlbaddr#	;Get address of the relocation buffer
+	BTL	run_option#, #R%DOSEXEC	;DOS debug load?
+	JNC	6$.S			;No
+	SUBL	run_rlbsize#, #12t.B	;Yes - is there enough room?
+	JB	4$.S			;No - fail
+	MOVZWL	EAX, run_header#+eh_SS	;Yes - get his starting SS
+	ADDL	EAX, run_memtop#	;Relocate it
+	SHLL	EAX, #16t
+	MOVW	AX, run_header#+eh_SP	;And his starting SP
+	STOSL	[EDI]			;Store it
+	MOVZWL	EAX, run_header#+eh_CS	;Get his starting CS
+	ADDL	EAX, run_memtop#	;Relocate it
+	SHLL	EAX, #16t
+	MOVW	AX, run_header#+eh_IP	;And his starting IP
+	STOSL	[EDI]			;Store it
+	MOVL	EAX, run_dosEAX#	;And his EAX value
+	STOSL	[EDI]			;Store it
+2$:	JMP	rundon4
+
+;Here if debug buffer is not big enough
+
+4$:	MOVL	EAX, #ER_VALUE
+	STC
+	RET
+
+;Here if doing XOS debug load (complete load to same process space without
+;  starting the loaded program)
+
+6$:	SUBL	run_rlbsize#, #rd_data.B ;Is there enough room for the data?
+	JB	4$.S			;No - fail
+	MOVZWL	EAX, run_header#+eh_IP	;Get his starting EIP
+	MOVL	ES:rd_EIP.B[EDI], EAX	;Store it
+	MOVZWL	EAX, run_header#+eh_CS	;Get his starting CS
+	ADDL	EAX, run_memtop#	;Relocate it
+	MOVL	ES:rd_CS.B[EDI], EAX	;Store it
+	MOVZWL	EAX, run_header#+eh_SP	;Get his starting SP
+	MOVL	ES:rd_ESP.B[EDI], EAX	;Store it
+	MOVZWL	EAX, run_header#+eh_SS	;Get his starting SS
+	ADDL	EAX, run_memtop#	;Relocate it
+	MOVL	ES:rd_SS.B[EDI], EAX	;Store it
+	MOVL	EAX, run_memtop#
+	SUBL	EAX, #10h.B
+	MOVL	EDX, run_dospsp#	;Get relocation value for msect
+	ADDL	EDX, #100h
+rundon2:MOVL	ES:rd_ES.B[EDI], EAX	;Store initial segment register values
+	MOVL	ES:rd_DS.B[EDI], EAX
+	MOVL	ES:rd_FS.B[EDI], EAX
+	MOVL	ES:rd_GS.B[EDI], EAX
+	MOVL	EAX, run_dosEAX#	;Store initial EAX value
+	MOVL	ES:rd_EAX.B[EDI], EAX
+	CLRL	EAX			;Store initial values for the data
+	MOVL	ES:rd_EBX.B[EDI], EAX	;  registers
+	MOVL	ES:rd_ECX.B[EDI], EAX
+	MOVL	ES:rd_EDX.B[EDI], EAX
+	MOVL	ES:rd_EDI.B[EDI], EAX
+	MOVL	ES:rd_ESI.B[EDI], EAX
+	MOVL	ES:rd_EBP.B[EDI], EAX
+	ADDL	EDI, #rd_size.B
+	MOVL	EAX, run_loadamt#	;Get amount loaded (round up to whole
+	ADDL	EAX, #0FFFh		;  pages)
+	ANDL	EAX, #0FFFFF000h
+	STOSL	[EDI]
+	MOVL	EAX, #10001h		;Store number of segments and msects
+	STOSL	[EDI]			;  (1 of each)
+	MOVL	EAX, #08000FFFFh	;Store bits word and selector for
+	STOSL	[EDI]			;  segment
+	MOVL	EAX, #00010000h		;Store bits word and segment number
+	STOSL	[EDI]			;  for msect
+	MOVL	EAX, EDX		;Store offset of msect
+	STOSL	[EDI]
+	PUSHL	GS
+	POPL	ES			;Fall into rundon4 on next page
+.PAGE
+;Here with user registers set up, both for normal and debug loads
+
+rundon4:MOVL	EBX, run_dospsp#	;Link to previous PSP
+	MOVL	EAX, GS:dda_curpsp
+	MOVW	GS:16h.B[EBX], AX
+	SHRL	EBX, #4
+	MOVL	GS:dda_curpsp, EBX	;Make this the current PSP
+	BTL	run_option#, #R%DEBUG	;Debug load?
+	JC	4$.S			;Yes
+	CALL	usrrnfin#		;No - finish up
+	PUSHL	DS			;Give up our data segment
+	CALLF	svcMemRemove#
+
+;When get here, we are ready to "return" to start the program
+
+	POPL	EAX			;Get EAX value
+	CLRL	EBX			;Clear other registers
+	CLRL	ECX
+	CLRL	EDX
+	CLRL	ESI
+	CLRL	EDI
+	CLRL	EBP
+	CALLF	svcSchDismiss#		;Go start program
+
+;Here if doing debug load
+
+4$:	BTL	run_option#, #R%DOSEXEC	;DOS debug load?
+	JC	6$.S			;Yes - just return to the caller
+	LESL	ESI, run_rlbaddr#	;No - give him the full EFR value
+	MOVL	ES:rd_EFR[ESI], #00020200h
+	CLRL	EAX			;Return 0
+	RET
+
+;Here if doing DOS debug load
+
+6$:	PUSHL	DS			;Give up our data segment
+	CALLF	svcMemRemove#
+	CLRL	EAX
+	RET
+.PAGE
+;Here if do not have enough address space available
+
+noemem:	MOVL	EAX, #ER_NEMA
+	JMP	dosfail.S
+
+;Here with error after DOS sub-task may have been setup
+
+dosadef:MOVL	EAX, #ER_ADRER
+dosfail:PUSHL	EAX			;Give up the sub-task's memory
+	MOVL	EDI, #run_dosenv#	;Give up the DOS environment area if
+	CALL	umodmx			;  we have one
+	MOVL	EDI, #run_dospsp#	;Point to the PSP
+	MOVL	ESI, [EDI]		;Do we have one?
+	TESTL	ESI, ESI
+	JE	10$.S			;No
+	LEAL	EBX, GS:psp_htable.B[ESI] ;Yes - point to the DOS handle table
+	MOVL	ECX, #20t		;Give up all DOS handles
+2$:	MOVZBL	EAX, [EBX]
+	CMPB	AL, #0
+	JE	4$.S
+	CMPB	AL, #0FFh
+	JE	4$.S
+	CMPB	dxd_syshctbl[EAX], #0
+	JE	4$.S
+	DECB	dxd_syshctbl[EAX]
+	JNE	4$.S
+	DECL	EAX
+	PUSHL	EAX
+	PUSHL	#0.B
+	CALLF	svcIoClose#
+4$:	INCL	EBX
+	LOOP	ECX, 2$
+	CALL	umodmx2			;Give up the PSP
+10$:	POPL	EAX			;Restore error code
+	STC
+	RET				;Finished here - return with C set
+.PAGE
+;Subroutine to give up memory on error
+;	c{EDI} = Offset of pointer to memory
+;	CALL	umodmx
+
+umodmx:	MOVL	ESI, [EDI]
+	TESTL	ESI, ESI
+	JE	ret004.S
+umodmx2:CLRL	EBX
+	MOVL	[EDI], EBX
+	SHRL	ESI, #4
+	PUSHL	DS
+	PUSHL	#GS_REAL16.B
+	POPL	DS
+	MOVL	EAX, dda_curpsp
+	MOVW	-0Fh.B[ESI], AX
+	CALL	umodm1#
+	POPL	DS
+	RET
+.PAGE
+	.SBTTL	esetpos - Subroutine to setup to read EXE file
+
+;Subroutine to do setup to read EXE file
+;	CALL	esetpos
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  c{ECX} = Amount to read
+;	  c{EDX} = Offset in file to read from
+
+esetpos:MOVZWL	ECX, run_header#+eh_length ;Get actual length of file in bytes
+	MOVZWL	EBX, run_header#+eh_lstblk ;Get size of last block
+	TESTL	EBX, EBX		;0 here gets special treatment!
+	JE	2$.S
+	DECL	ECX			;Not 0 - calculate actual length
+	JLE	4$.S			;If bad length
+2$:	SHLL	ECX, #9t
+	ADDL	ECX, EBX
+	MOVZWL	EDX, run_header#+eh_hdrsz ;Get position in file for data
+	SHLL	EDX, #4t
+	SUBL	ECX, EDX		;Calculate amount to load
+	JLE	4$.S
+ret004:	RET
+
+;Here if error
+
+4$:	MOVL	EAX, #ER_IRFF
+	STC
+	RET
+.PAGE
+	.SBTTL	reloc - Subroutine to do relocation for EXE file
+
+;Subroutine to do relocation for EXE file
+;	c{EAX} = Amount for relocation
+;	c{EBX} = Base address of area being relocated
+;	CALL	reloc
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+
+reloc:	MOVL	run_memtop#, EAX	;Save relocation amount
+	MOVL	run_dosrel#, EBX	;And save base address
+	MOVZWL	EAX, run_header#+eh_relnum ;Get number of relocation items
+	TESTL	EAX, EAX		;Have any at all?
+	JE	4$.S			;No - nothing needed here
+	MOVL	run_relcnt#, EAX	;Yes - store count
+	MOVZWL	EDX, run_header#+eh_reloc ;Get position of relocation data
+	MOVL	ECX, #4			;Get count
+	MOVL	EBX, #run_seghdr#	;Get address
+	CALL	usrrnrdbyter#		;Read the first relocation item
+	JC	4$.S			;If error
+2$:	MOVZWL	EAX, run_seghdr#+2	;Get offset for relocation
+	SHLL	EAX, #4
+	MOVZWL	EBX, run_seghdr#+0
+	ADDL	EAX, EBX
+	ADDL	EAX, run_dosrel#
+	MOVL	EBX, run_memtop#
+	PUSHL	#GS_REAL16.B
+	POPL	ES
+	ADDW	ES:[EAX], BX		;Do relocation
+	CLC				;Clear C in case done
+	DECL	run_relcnt#		;More to do?
+	JE	4$.S			;No
+	MOVL	ECX, #4			;Yes - get count
+	MOVL	EBX, #run_seghdr#	;Get address
+	CALL	usrrnrdbytes#		;Read the relocation item
+	JNC	2$.S			;OK
+4$:	RET
+
+;Here if illegal relocation data
+
+8$:	MOVL	EAX, #ER_IRFF
+	STC
+ret006:	RET
+.PAGE
+	.SBTTL	usrrncom - Load or run DOS COM file
+
+;Here with a DOS COM file to load or run
+
+usrrncom::
+	CMPB	run_func#, #RFNC_RUN	;Is this a run function?
+	JE	usrruncom.S		;Yes
+
+	.SBTTL	usrloadcom - Load DOS COM file as overlay
+
+;Here to load a DOS COM file as an overlay
+
+usrloadcom:
+	CMPL	run_loadaddr#+4, #GS_REAL32|03h.B ;Loading into the DOS segment?
+4$:	JNE	eriift			;No - fail
+	CMPL	run_relocval#+4, #GS_REAL32|03h.B ;Yes - relocating for DOS?
+	JNE	4$.S			;No
+	CLRL	EDX			;Start at beginning of file
+	PUSHL	#GS_REAL16.B		;Get address for data
+	POPL	ES
+	MOVL	EBX, run_loadaddr#+0
+	MOVL	ECX, run_filelen#	;Get amount to read
+	JMP	usrrnrdblkr#		;Read the data and return
+.PAGE
+	.SBTTL	usrruncom - Load DOS COM file for execution in real mode
+
+;Here to load a DOS COM file for execution in real mode
+
+usrruncom:
+	CMPB	run_itype#, #0		;Is the image type known yet?
+	JNE	2$.S			;Yes
+	MOVB	run_itype#, #IT_COM	;No - store image type now
+2$:	CALL	doscontext
+4$:	JC	ret006.S		;If error
+	JNE	ret006.S		;If finished for now
+	MOVL	EAX, run_filelen#	;Get amount to load
+	MOVL	run_loadamt#, EAX
+	ADDL	EAX, #203h		;Get minimum paragraphs needed (allow
+	SHRL	EAX, #4			;  at least 256 bytes for a stack)
+	MOVL	run_minmem#, EAX
+	MOVL	run_maxmem#, #0FFFFh	;Take all we can get
+	CLRL	EDX			;Set position to start of file for read
+	CALL	loaddos			;Load the program
+	JC	4$.S			;If error
+	CALL	usrrnclose#		;OK - close the file
+	BTL	run_option#, #R%DEBUG	;Is this a debug load?
+	JC	8$.S			;Yes
+	PUSHL	#GS_REAL32|03h.B	;No - initialize the standard protected
+	POPL	SS			;  mode stack
+	MOVL	ESP, #rmda_stack
+	MOVL	EDX, run_dospsp#	;Get selector value
+	SHRL	EDX, #4
+	PUSHL	EDX			;Stack SS value
+	PUSHL	#0FFFEh			;Stack SP value
+	PUSHL	#0.B			;Stack interrupt number and item count
+	PUSHL	#20200h			;Stack EFR value
+	PUSHL	EDX			;Stack CS value
+	PUSHL	#100h			;Stack IP value
+	PUSHL	EDX			;Stack DS value
+	PUSHL	EDX			;Stack ES value
+	PUSHL	#0.B			;Stack FS value
+	PUSHL	#0.B			;Stack GS value
+	PUSHL	run_dosEAX#		;Stack initial value for EAX
+	JMP	rundon4
+
+;Here if doing debug load
+
+8$:	LESL	EDI, run_rlbaddr#
+	MOVL	EAX, run_dospsp#	;Get selector value
+	SHRL	EAX, #4
+	BTL	run_option#, #R%DOSEXEC	;Is this a DOS debug load?
+	JNC	10$.S			;No
+	SHLL	EAX, #16t		;Yes - get selector in the high 16 bits
+	MOVW	AX, #0FFFEh
+	STOSL	[EDI]			;Store his starting SP value
+	MOVW	AX, #100h
+	STOSL	[EDI]			;Store his starting IP value
+	JMP	rundon4
+
+;Here if doing XOS debug load
+
+10$:	MOVL	ES:rd_EIP.B[EDI], #100h	;Store initial EIP value
+	MOVL	ES:rd_CS.B[EDI], EAX
+	MOVL	ES:rd_SS.B[EDI], EAX
+	MOVL	ES:rd_ESP.B[EDI], #0FFFEh
+	MOVL	EDX, run_dospsp#	;Get relocation value for msect
+	JMP	rundon2			;Continue
+.PAGE
+	.SBTTL	loaddos - Subroutine to load dos program data
+
+;Subroutine to load DOS program data
+;	c{EDX} = Starting offset in file
+;	CALL	loaddos
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  c{EAX} = Offset of first location in real mode segment to zero
+
+2$:	STC
+	RET
+
+loaddos:MOVL	run_loadofs#, EDX	;Save offset in file
+	CLRL	EAX
+	MOVL	run_dosenv#, EAX
+	MOVL	run_dospsp#, EAX
+	BTL	run_option#, #R%DOSEXEC	;Called from DOS?
+	JC	samedos			;Yes - use existing process's memory
+
+;Here if this DOS program is being loaded by an XOS mode call - in this
+;  case we have to set up a new segment and initialize it to be a DOS segment
+
+	PUSHL	run_loadamt#		;Get amount to load
+	PUSHL	DS
+	PUSHL	#run_dosdata#
+	CALLF	svcMemDosSetup#		;Create and set up the real mode segment
+	TESTL	EAX, EAX
+	JS	2$.S			;If error
+
+;Now set up the DOS data area on page 0
+
+setdda:	PUSHL	#GS_REAL32.B
+	POPL	GS
+	PUSHL	GS
+	POPL	ES			;Store magic number to indicate have a
+	MOVL	GS:dda_magic, #'DOS*'	;  DOS environment
+	MOVL	EAX, run_dosfcbp#	;Get number of protected FCBs
+	MOVB	GS:dda_lolpfcb, AL
+
+;Next set up the DOS extended data area
+
+setdxd:	MOVL	ECX, run_dosfcbn#	;Calculate space needed for the FCB
+	CMPL	ECX, #16t		;  table
+	JAE	6$.S
+	MOVB	CL, #16t
+6$:	MOVB	GS:dxd_fcbnum, CL
+	MOVL	EDI, #dxd_fcbtbl
+	MOVL	EAX, #0FFh		;Initialize the FCB table
+	CLD
+	RSTOSL	[EDI]
+	ADDL	EDI, #0Fh.B
+	ANDL	EDI, #0FFFFFFF0h.B
+	MOVL	GS:dxd_free, EDI
+	MOVB	GS:dxd_switchchr, #'/'	;Store the default switch character
+
+;Set up the initial DOS memory header blocks
+
+	MOVL	EAX, run_dosbase#	;Point to start of DOS memory
+	MOVL	EDI, EAX		;Store real mode selector for first
+	SHRL	EAX, #4t		;  DOS memory header block
+	MOVL	GS:dda_lolfmcb, EAX
+	MOVB	GS:[EDI], #'M'		;Setup initial dummy memory area header
+	MOVW	GS:mh_size.B[EDI], #1
+	MOVL	EAX, EDI
+	SHRL	EAX, #4
+	MOVW	GS:mh_psp.B[EDI], AX
+	ADDL	EDI, #30h.B
+
+;Now set up the DOS environment strings (which come next in memory)
+
+	MOVL	run_dosenv#, EDI	;Store "PATH="
+	MOVL	GS:[EDI], #'PATH'
+	MOVB	GS:4.B[EDI], #'='
+	ADDL	EDI, #5.B
+	PUSHL	#TNB$NOFINALBS|TNB$SEMICOLON|TNB$DOSNAME|TNB$ALLDEF.B
+	PUSHL	CS			;Store the definition for the logical
+	PUSHL	#namepath		;  name CMD:
+	PUSHL	GS
+	PUSHL	EDI
+	PUSHL	#10000h
+	CALLF	svcIoTransName#
+	TESTL	EAX, EAX
+	JS	10$.S
+	ADDL	EDI, EAX
+10$:	MOVB	GS:[EDI], #0
+	INCL	EDI
+	MOVL	run_mempnt#, EDI
+	PUSHL	#0
+	PUSHL	GS
+	PUSHL	run_mempnt#
+	PUSHL	#7FFFFFFFh
+	CALLF	svcSysGetEnv#
+	TESTL	EAX, EAX
+	JS	12$.S
+	ADDL	run_mempnt#, EAX
+12$:	CALL	strspec
+	MOVL	EBX, run_mempnt#	;Point to first paragraph above the
+	ADDL	EBX, #0Fh.B		;  environment
+	ANDL	EBX, #0FFFFFFF0h.B
+	MOVL	EDX, run_dosenv
+	MOVB	ES:-10h.B[EDX], #'M'	;Set up memory area header for the
+	MOVL	EAX, EBX		;  environment area
+	SUBL	EAX, EDX		;Calculate size of the environment
+	SHRL	EAX, #4			;Change to paragraphs
+	MOVW	GS:mh_size-10h.B[EDX], AX
+	MOVW	GS:mh_psp-10h.B[EDX], #0FFFFh
+	MOVB	GS:[EBX], #'Z'		;Setup memory area header to indicate
+	MOVL	EAX, #0A0000h-10h	;  all the rest of memory is available
+	SUBL	EAX, EBX
+	SHRL	EAX, #4
+	MOVW	GS:mh_size.B[EBX], AX
+	JMP	getmem
+
+namepath:.ASCIZ "CMD:"
+.PAGE
+;Here when loading a DOS program as result of a DOS exec call.  In this case
+;  we load into the same segment and use the environment data already set
+;  up in the segment.  If this is not a DOS debug load, we must save the
+;  caller's registers in his table area
+
+samedos:MOVL	ESI, arg_filofs		;See how long the program name file
+	CLRL	EBX			;  specification is
+2$:	LODSB	[ESI]			;Get character
+	TESTB	AL, AL
+	JE	samedo2.S
+4$:	CMPB	AL, #FS_FILENAME	;Start of name?
+	JE	6$.S			;Yes
+	CMPB	AL, #FS_PATHNAME	;No - start of path?
+	JNE	2$.S			;No - skip it
+6$:	LODSB	[ESI]			;Get name or path character
+	TESTB	AL, AL			;End of specification?
+	JE	samedo2.S		;Yes
+	CMPB	AL, #0F0h		;No - special character?
+	JAE	4$.S			;Yes
+	INCL	EBX			;No - count it
+	JMP	6$.S			;Continue
+.PAGE
+;Here with length of file specification for program determined
+
+samedo2:PUSHL	#GS_REAL32|03h.B
+	POPL	GS
+	CMPL	run_envlist#+0, #0.B	;Was different environment data given?
+	JNE	12$.S			;Yes - copy it
+	MOVL	EDI, GS:dda_curpsp	;No - point to current PSP
+	SHLL	EDI, #4
+	CMPB	GS:psp_protflg.B[EDI], #0 ;Have protected mode selector?
+	MOVZWL	EDI, GS:psp_env.B[EDI]	;Get selector for the enviroment
+	JE	10$.S			;Not protected mode selector
+	MOVL	ES, EDI			;Get protected mode address
+	CLRL	EDI
+	JMP	14$.S
+
+;Here if have real mode environment selector
+
+10$:	SHLL	EDI, #4			;Change to offset
+	PUSHL	GS
+	POPL	ES
+	JMP	14$.S
+
+;Here to use environment strings given by the caller
+
+12$:	LESL	EDI, run_envlist#	;Point to data
+14$:	PUSHL	EDI			;Save offset of environment strings
+	CLRL	ECX			;  to use
+	DECL	ECX
+	CLRL	EAX
+16$:	RNSCASB	[EDI]			;Scan for end of string
+	CMPB	ES:[EDI], #0		;End of environment data?
+	JNE	16$.S			;No - continue
+	NEGL	ECX			;Yes - get length of the data area
+	PUSHL	ECX			;Save it
+	ADDL	EBX, ECX		;Add to length of file specification
+	ADDL	EBX, #0Fh+6.B		;Change to paragraphs (round up)
+	SHRL	EBX, #4
+	PUSHL	ES
+	PUSHL	DS
+	PUSHL	GS
+	POPL	DS
+	CALL	ugetmem#		;Allocate a block for a copy
+	POPL	DS
+	POPL	FS
+	PUSHL	GS
+	POPL	ES
+	POPL	ECX			;Restore length of environment strings
+	POPL	ESI			;Restore offset of environmnet strings
+	JC	22$.S			;If error
+	MOVL	run_dosenv#, EDI	;Store offset of start of environment
+	RMOVSB	[EDI], FS:[ESI]		;Copy environment strings
+	DECL	EDI
+	MOVL	run_mempnt#, EDI
+	CALL	strspec			;Store file specification
+	JC	22$.S
+	JMP	getmem.S		;Continue
+
+20$:	MOVL	EAX, #ER_ADRER
+	STC
+22$:	RET
+.PAGE
+;Here with the environment completely setup.  When get here the entire base
+;  memory area is allocated (the amount we think we need to load the program
+;  is physically allocated, the rest is virtually allocated) and the DOS memory
+;  block headers have been set up.  Now allocate DOS memory for the PSP and to
+;  load the program into and set up the PSP
+
+getmem:	MOVL	EBX, run_maxmem#	;Try to get maximum amount to allocate
+	PUSHL	DS
+	PUSHL	GS
+	POPL	DS
+	CALL	ugetmem#
+	POPL	DS
+	JNC	6$.S			;If got the maximum amount
+	CMPL	ECX, run_minmem#	;Can we get enough?
+	JAE	4$.S			;Yes - continue
+	MOVL	EAX, #ER_NEMA		;No
+2$:	JMP	dosfail
+
+;Here if can get enough memory for the program
+
+4$:	MOVL	EBX, ECX		;Get the space
+	PUSHL	DS
+	PUSHL	GS
+	POPL	DS
+	CALL	ugetmem#
+	POPL	DS
+	JC	2$.S			;This should not fail!
+6$:	MOVL	run_dospsp#, EDI
+	PUSHL	EDI			;Clear the PSP
+	PUSHL	GS
+	POPL	ES
+	MOVL	ECX, #256t/4
+	CLD
+	CLRL	EAX
+	RSTOSL	[EDI]
+	POPL	EDI
+	MOVL	EBX, EDI		;Store address of the handle table
+	SHLL	EBX, #12t
+	MOVB	BL, #18h
+	MOVL	ES:psp_hpnt.B[EDI], EBX
+	MOVW	ES:psp_hcnt.B[EDI], #20t ;Store length of the DOS handle table
+
+;We are now ready to set up the DOS handle table - there are 4 cases:
+;	1. DOS program loaded by XOS program
+;	2. DOS program loaded by XOS program into existing DOS process
+;	3. DOS program loaded by XOS program into same process (XOS
+;	     debug load)
+;	4. DOS program loaded by DOS program
+
+	BTL	run_option#, #R%DOSEXEC	;Called from DOS exec function?
+	JC	hndlsame		;Yes
+	BTL	run_option#, #R%DEBUG	;No - XOS debug load?
+	JC	hndldebug.S		;Yes
+	CMPL	GS:dda_curpsp, #0.B	;Is this the first PSP for the process?
+	JNE	hndlexist.S		;No
+					;Yes - fall into hndlnewp on next page
+.PAGE
+;Here if have a DOS program loaded by an XOS svcIoRun call into a new
+;  process.  In this case we must set up the system handle count table and the
+;  DOS handle table from the data stored in run_hndlmap.
+
+hndlnewp:				;Get amount to increment the XOS
+	PUSHL	#1.B			;  handle counts
+	JMP	2$.S			;Continue
+
+;Here if have a DOS program loaded by an XOS program into the same process
+;  (this is an XOS debug load) - This case is almost identical to the DOS
+;  program loaded into a new process except that we must also increment the
+;  system handle count table entry for each handle we use an extra time.
+
+hndldebug:				;Get amount to increment the system
+	PUSHL	#2.B			;  handle count
+2$:	PUSHL	DS			;Get the current system handle map
+	PUSHL	#run_hndlmap#
+	PUSHL	#4.B
+	CALLF	svcIoGetHndlMap#
+	POPL	EAX			;Restore handle count increment value
+	MOVL	ESI, run_dospsp#
+	ADDL	ESI, #psp_htable.B	;Get offset of the DOS handle table
+	MOVL	EBX, #1
+	MOVL	ECX, #3t		;Set up the first 3 handles
+	CALL	setuphndls
+	MOVW	GS:[ESI], #0FEFEh	;Skip DOS handles 3 and 4
+	ADDL	ESI, #2t.B
+	ADDL	EBX, #3t.B		;Skip system handles 3 to 5
+	MOVL	ECX, #15t		;Set up the last 15 handles
+	CALL	setuphndls
+	JMP	finmem			;Finished here
+
+;Subroutine to set up DOS handles
+;	c(AL)  = Amount to increment system handle count
+;	c{EBX} = First system handle number
+;	c{ECX} = Number of DOS handles to set up
+;	c{EDI} = Offset of system handle count table
+;	c{ESI} = Offset of first DOS handle table entry
+;	CALL	setuphndls
+
+setuphndls:
+	MOVB	GS:[ESI], #0FFh		;Assume system handle is not in use
+	DECL	EBX
+	BTL	run_hndlmap#, EBX	;Right?
+	INCL	EBX
+	JNC	4$.S			;No
+	CMPL	run_loadhndl#, EBX	;Yes - is it the load handle?
+	JE	4$.S			;Yes - skip it
+	ADDB	GS:dxd_syshctbl[EBX], AL ;No - bump the system handle count
+	MOVB	GS:[ESI], BL		;Store system handle in DOS handle table
+4$:	INCL	ESI			;Increment DOS handle table pointer
+	INCL	EBX			;Increment system handle number
+	LOOP	ECX, setuphndls		;Continue if more to do
+	RET
+.PAGE
+;Here if have DOS program loaded by XOS program into an existing DOS
+;  process - THIS WILL BE WRITTEN SOON!
+
+hndlexist:
+	HLT
+	NOP
+
+	JMP	finmem.S
+
+;Here if have a DOS program loaded by a DOS program - In this case we set
+;  up the handle table by copying the table of the parent DOS program and
+;  incrementing each corresponding entry in the system handle count table.
+
+hndlsame:
+	PUSHL	DS
+	PUSHL	GS
+	POPL	DS
+	MOVL	EBX, dda_curpsp		;Get offset of current PSP
+	SHLL	EBX, #4
+	CALL	doscopyhndls#		;Copy the DOS handle table
+	POPL	DS			;Fall into finmem on next page
+.PAGE
+;Here with the DOS IO handle table set up - now finish setting up the DOS
+;  memory image
+
+finmem:	MOVL	EDI, run_dospsp#	;Store default DOS termination vector
+	MOVL	GS:psp_term.B[EDI], #0ED000000+dosterm#
+	MOVL	GS:22h*4, #0ED000000+dosterm#
+	MOVL	EAX, GS:23h*4		;Save ^C vector
+	MOVL	GS:0Eh.B[EDI], EAX
+	MOVL	EAX, GS:24h*4		;Save critical error vector
+	MOVL	GS:12h.B[EDI], EAX
+	MOVW	GS:[EDI], #20CDh	;Put INT 20h instruction at PSP:0
+	MOVB	GS:5h.B[EDI], #09Ah	;Put JMPF at PSP:5
+	MOVL	GS:6h.B[EDI], #0F01DFEF0h ;Make it JMPF 0F01D:0FEF0!!
+	MOVZWL	EAX, GS:mh_size-10.B[EDI] ;Get size of the memory block
+	SHLL	EAX, #4			;Change to bytes
+	ADDL	EAX, EDI		;Calculate top of block
+	SHRL	EAX, #4			;Change to paragraphs
+	MOVW	GS:2h.B[EDI], AX	;Store top selector at PSP:2
+	MOVL	EBX, run_dosenv#	;Get offset of environment area
+	MOVL	EAX, EDI		;Make these memory blocks ours
+	SHRL	EAX, #4
+	MOVW	GS:mh_psp-10h.B[EBX], AX
+	MOVW	GS:mh_psp-10h.B[EDI], AX
+	SHRL	EBX, #4
+	MOVW	GS:2Ch.B[EDI], BX	;Store environment selector at PSP:2C
+;;;;;;	MOVL	EAX, run_dosdmym#	;Free up the dummy memory block
+;;;;;;	MOVW	GS:1-10h.B[EAX], #0
+	BTL	run_option#, #R%DOSEXEC	;Have we created a DOS sub-task?
+	JNC	38$.S			;No
+	ORB	run_status#, #RS$DOSTASK ;Yes - indicate have done this
+38$:	ADDL	EDI, #80h		;Get address of command line buffer
+	PUSHL	GS
+	POPL	ES
+	MOVL	ECX, run_argsize#	;Get argument count
+	TESTL	ECX, ECX		;Have any argument data?
+	JNE	setargs.S		;Yes
+	MOVB	GS:1.B[EDI], #CR	;No - store CR as terminator
+	JMP	setfcbs.S		;And go setup the default FCBs
+.PAGE
+;Here if have some argument data
+
+setargs:MOVL	ESI, arg_cmdofs
+	BTL	run_option#, #R%DOSEXEC	;Called from DOS exec function?
+	JC	7$.S			;Yes - don't have a command to skip
+4$:	LODSB	[ESI]			;No - skip command name
+	CMPB	AL, #' '
+	JE	6$.S
+	CMPB	AL, #HT
+	JE	6$.S
+	LOOP	ECX, 4$
+6$:	DECL	ESI
+7$:	CMPL	ECX, #126t.B		;Too much?
+	JBE	8$.S			;No
+	CLRL	ECX			;Yes - just give him what we can!
+	MOVB	CL, #126t
+8$:	MOVB	ES:[EDI], CL		;Store count
+	INCL	EDI
+	RMOVSB	[EDI], [ESI]		;Store characters
+	MOVB	ES:[EDI], #CR		;Store CR at end
+setfcbs:CLRL	EAX			;Assume FCBs are valid
+	MOVL	run_dosEAX#, EAX
+	MOVL	ESI, run_dospsp#	;Point to command string
+	PUSHL	GS
+	POPL	FS
+	MOVL	EDX, ESI
+	ADDL	ESI, #81h
+	ADDL	EDX, #5Ch.B		;Point to first FCB	
+	CMPL	run_fcb1#, #0.B		;Was first FCB specified?
+	JE	10$.S			;No
+	PUSHL	ESI			;Yes
+	MOVL	ESI, #run_fcb1#
+	MOVL	EDI, EDX
+	MOVL	ECX, #4
+	RMOVSL	[EDI], [ESI]
+	POPL	ESI
+	JMP	12$.S
+
+;Here if first FCB not specified
+
+10$:	MOVB	BL, #1			;Set up first FCB from the command
+	CALL	dosparse#		;  string
+	JNC	12$.S			;If OK
+	MOVB	run_dosEAX#+0, #0FFh	;Error - set AL to 0FFh
+12$:	ADDL	EDX, #10h.B		;Point to second FCB
+	CMPL	run_fcb2#, #0.B		;Was second FCB specified?
+	JE	14$.S			;No
+	MOVL	ESI, #run_fcb2#
+	MOVL	EDI, EDX
+	MOVL	ECX, #4
+	RMOVSL	[EDI], [ESI]
+	JMP	16$.S
+
+;Here if second FCB not specified
+
+14$:	MOVB	BL, #1			;Set up second FCB from the command
+	CALL	dosparse#		;  string
+	JNC	16$.S			;If OK
+	MOVB	run_dosEAX#+1, #0FFh	;Error - set AH to 0FFh
+16$:	MOVL	EAX, run_dospsp#	;Get offset of PSP
+	SHLL	EAX, #12t		;Change to selector in high 16 bits
+	MOVW	AX, #80h		;Get offset for default DTA
+	MOVL	GS:dda_dtaa, EAX 	;Store as initial DTA address
+	MOVL	ECX, run_loadamt#	;Get amount to load
+	MOVL	EBX, run_dospsp#	;Get address
+	ADDL	EBX, #100h
+	PUSHL	GS
+	POPL	ES
+	MOVL	EDX, run_loadofs#	;Get offset in file
+	CALL	usrrnrdblkr#		;Read the data
+22$:	PUSHL	EAX			;Save error code from the read
+	PUSHL	DS			;Give up the argument msect
+	PUSHL	#0.B
+	PUSHL	#0.B
+	PUSHL	#0.B
+	CALLF	svcMemChange#
+	POPL	EAX			;Restore error code from the read
+	BTL	EAX, #31t		;Set C if error on the read
+	RET				;All done here
+.PAGE
+	.SBTTL	doscontext - Subroutine to get into right context to load DOS program
+
+;Subroutine to get into right context to load DOS program
+;	CALL	doscontext
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  Z:clr = In original context, need to wait until done (in this case
+;		    we were always called from XOS protected mode)
+;	  Z:set = In final context, ready to load (this context is usually
+;		    set up as if called from a DOS program, either because
+;		    we were (DOS exec call) or because a new DOS context has
+;		    been created - an exception is an XOS debug load of a
+;		    DOS program - in this case we have an XOS protected
+;		    mode calling context here - this is OK since we never
+;		    refernce the registers saved on the stack in this case - we
+;		    check and do the right thing to return to the caller)
+
+doscontext:
+	BTL	run_option#, #R%DOSEXEC	;Is this a DOS exec?
+	JNC	usrrncontext#		;No - get into correct context to
+					;  finish this
+	BTSL	run_option#, #R%DEBUG	;Yes - force debug load
+	CLRL	EAX			;Clear C and set Z
+	RET				;Thats all
+.PAGE
+	.SBTTL	strspec - Subroutine to store file specification after environment
+
+;Subroutine to store file specification after the environment area
+
+strspec:MOVL	EDI, #run_parmlist#
+	PUSHL	DS
+	POPL	ES
+	CLD
+	MOVL	EAX, #{PAR$SET|REP_HEXV}|{4<8t}|{IOPAR_FILOPTN<16t}
+	STOSL	[EDI]
+	MOVL	EAX, #FO$DOSNAME|FO$NOPREFIX
+	STOSL	[EDI]
+	MOVL	EAX, #{PAR$GET|REP_STR}|{IOPAR_FILSPEC<16t}
+	STOSL	[EDI]
+	MOVL	EAX, #run_parmlist+32t
+	MOVB	[EAX], #0
+	STOSL	[EDI]
+	MOVL	EAX, DS
+	STOSL	[EDI]
+	MOVL	EAX, #16t
+	STOSL	[EDI]
+	CLRL	EAX
+	STOSB	[EDI]
+	PUSHL	run_loadhndl#
+	PUSHL	EAX
+	PUSHL	EAX
+	PUSHL	EAX
+	PUSHL	DS
+	PUSHL	#run_parmlist#
+	CALLF	svcIoInBlockP#
+	MOVL	EDX, EAX
+	MOVL	EDI, run_mempnt#
+	PUSHL	GS
+	POPL	ES
+	MOVB	AL, #0			;Put in three dummy bytes just like DOS
+	STOSB	[EDI]			;  does
+	INCL	EAX
+	STOSB	[EDI]
+	DECL	EAX
+	STOSB	[EDI]
+	MOVB	AL, run_parmlist#+32t	;Get device name
+	TESTL	EDX, EDX		;Did we really get a name?
+	JS	2$.S			;No
+	CMPW	run_parmlist#+22t, #2.B ;Yes - is it a single character name?
+	JE	4$.S			;Yes
+2$:	MOVB	AL, #'?'		;No - store ? as device name!
+4$:	STOSB	[EDI]			;Store device name
+	MOVB	AL, #':'		;Followed by a colon
+	STOSB	[EDI]
+	MOVL	ESI, #16t		;Find start of file path
+6$:	LODSB	[ESI]
+	CMPB	AL, #FS_PATHNAME
+	JE	12$.S
+	CMPB	AL, #0
+	JNE	6$.S
+10$:	MOVB	AL, #0
+	STOSB	[EDI]
+	MOVL	run_mempnt#, EDI
+	RET
+
+;Here with start of path
+
+12$:	LODSB	[ESI]			;Get character
+	CMPB	AL, #FS_FILENAME
+	JE	12$.S
+	CMPB	AL, #0
+	JE	10$.S
+	CMPB	AL, #FS_MIN
+	JAE	10$.S
+	STOSB	[EDI]
+	JMP	12$.S
+
+	END

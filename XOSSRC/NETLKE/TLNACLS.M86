@@ -1,0 +1,2025 @@
+	.TITLE	TLNACLS - TELNET server/client routines for XOS
+
+;++++
+; This software is in the public domain.  It may be freely copied and used
+; for whatever purpose you see fit, including commerical uses.  Anyone
+; modifying this software may claim ownership of the modifications, but not
+; the complete derived code.  It would be appreciated if the authors were
+; told what this software is being used for, but this is not a requirement.
+
+;   THIS SOFTWARE IS PROVIDED BY THE AUTHORS "AS IS" AND ANY EXPRESS OR
+;   IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
+;   OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+;   IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+;   INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+;   BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS
+;   OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+;   ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR
+;   TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
+;   USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+;----
+
+	.PROC	80486
+	.INCLUD	XOSINC:\XMAC\XOS.PAR
+	.INCLUD	XOSINC:\XMAC\XOSX.PAR
+	.INCLUD	XOSINC:\XMAC\XOSERR.PAR
+	.INCLUD	XOSINC:\XMAC\XOSTIME.PAR
+	.INCLUD	XOSINC:\XMAC\XOSNET.PAR
+	.INCLUD	XOSINC:\XMAC\XOSXNET.PAR
+	.INCLUD	XOSINC:\XMAC\XOSXIPS.PAR
+	.INCLUD	XOSINC:\XMAC\XOSXTCP.PAR
+	.INCLUD	XOSINC:\XMAC\XOSXTLN.PAR
+	.INCLUD	XOSINC:\XMAC\XOSTRM.PAR
+	.INCLUD	XOSINC:\XMAC\XOSXTRM.PAR
+	.INCLUD	XOSINC:\XMAC\XOSLKE.PAR
+	.INCLUD	XOSINC:\XMAC\XOSXLKE.PAR
+
+;This is the device driver which implements a Telnet server.  Unlike the other
+;  network drivers (such as XFP) it does not really implement a network device.
+;  Instead it creates a terminal interface device which is then used by
+;  the TRM class driver.  It is unusual in that it behaves somewhat like
+;  a true class driver, even though it is mostly a terminal interface device
+;  driver.  It DOES create a TLN device class, which is used to provide a hook
+;  for connecting an instance of Telnet to a TCP protocol device (using the
+;  ADDUNIT class funciton) and for recording statistics.  The TLNn device which
+;  is created CANNOT be used for IO.  It can be used to set or read DEVCHAR
+;  values.  The terminal class ADDUNIT function is not used with this device.
+;  Telnet terminal units are created upon demand to service incoming connection
+;  requests.  In this version, Telnet units can ONLY service incoming requests.
+;  They CANNOT be used for outgoing connections.  Once a Telnet device has been
+;  created for an incoming connection request, it is given a unique name which
+;  can then be opened directly if desired.
+
+;The Telnet devices are implemented using TWO DCBs.  A TLN DCB, which is
+;  basically a TCP DCB with a TRM TDB added on the end, is used.  The TDB
+;  part of this DCB is then linked to a normal TRM DCB.  During normal use
+;  as a terminal device, The TLN DCB is only used to manage network IO.  The
+;  parts of the DCB assoicated with linkage to a process are not used.
+
+;Note that this driver implements a simple ASCII only Telnet device.  It is
+;  intended for use in situations which do not require complete remote DOS
+;  console support, which is provided by the user mode server TLNSRV.  Since
+;  both TLNACLS and TLNSRV use the standard Telnet public port, they cannot
+;  both be loaded.
+
+MAJV   =!1t
+MINV   =!1t
+EDITNUM=!0t
+
+	LKEHEAD	TLNACLS, MAJV, MINV, EDITNUM, LKETYPE_CLASS
+
+TLNIRSIZE  =!116t	;Default input ring buffer size
+TLNIBSIZE  =!140t	;Default input line buffer size
+TLNOUTRSIZE=!512t	;Default output buffer size
+
+;Define receive state values
+
+RS_NORM    =!0t		;Normal character next
+RS_CMD     =!1t		;Command next
+RS_HAVESB  =!2t		;Have SB command
+RS_HAVESBC =!3t		;Have SBC command
+RS_HAVEWILL=!4t		;Have WILL command
+RS_HAVEWONT=!5t		;Have WONT command
+RS_HAVEDO  =!6t		;Have DO command
+RS_HAVEDONT=!7t		;Have DONT command
+
+;Define DCB symbols that need stuff from both XOSXNET.PAR and XOSXTRM.PAR
+
+dcb_tlntdb=!dcb_tlntdbbase+tdb_mSIZE
+
+	CODE
+
+	.SBTTL	SVC dispatch table for TLN devices
+
+;SVC dispatch table for TLN devices
+
+tlndsp:	.LONG	knlRtnZero##	;sd_mount	=  0. - Mount
+	.LONG	knlRtnZero##	;sd_cleardev	=  4. - Clear device
+	.LONG	tlncdcb		;sd_cleardcb	=  8. - Clear DCB
+	.LONG	knlRtnZero##	;sd_commit	= 12. - Commit data to disk
+	.LONG	knlRtnZero##	;sd_transold    = 16. - Transfer device/old
+	.LONG	knlRtnZero##	;sd_transnew    = 20. - Transfer device/new
+	.LONG	tlndevparm	;sd_opena	= 24. - Open additional
+	.LONG	tlndevparm	;sd_open1	= 28. - Open device/file
+	.LONG	tlndevparm	;sd_devparm     = 32. - Device parameters
+	.LONG	knlIFnDev##	;sd_delete	= 36. - Delete file
+	.LONG	knlIFnDev##	;sd_rename	= 40. - Rename file
+	.LONG	knlIFnDevGQ##	;sd_inblock	= 44. - Input block
+	.LONG	knlIFnDevGQ##	;sd_outblock	= 48. - Output block
+	.LONG	knlIFnDev##	;sd_outblockq	= 52. - Output block (XFF)
+	.LONG	knlIFnDevGQ##	;sd_outstring	= 56. - Output string
+	.LONG	knlRtnMOne##	;sd_getiosts	= 60. - Get input/output status
+	.LONG	knlIFnDevGQ##	;sd_special     = 64. - Special device function
+	.LONG	knlNullClose##	;sd_close	= 68. - Close file
+	.LONG	knlNullLabel##	;sd_label       = 72. - Get device label
+	.LONG	knlNullQioGQ##	;sd_commitfunc	= 76. - Commit data to disk
+	.LONG	knlInfoNone##	;sd_devinfo     = 80. - Get device info
+TLNDSPSZ=!{$-tlndsp}/4
+
+;Class function dispatch table for TLN class devices
+
+	.LONG	TLNCLSFMX
+tlncls::.LONG	tlnaddunit	;CF_ADDUNIT = 1. - Add unit
+	.LONG	tlnunitinfo	;CF_PUNITS  = 2. - Get information about
+				;		     physical units
+	.LONG	knlIFnDev##	;CF_AUNITS  = 3. - Get information about active
+				;		     units
+TLNCLSFMX=!{$-tlncls}/4
+.PAGE
+;TLN internal function dispatch table for TCP protocol level devices (TLNn)
+
+tlnfnc:	.LONG	xosnetRspDone##	;tcpf_synsent = 0.
+	.LONG	tlnnewsyn	;tcpf_synrcvd = 4.
+	.LONG	newsynack	;tcpf_ackrcvd = 8.
+	.LONG	tlnhavedata	;tcpf_estab   = 12.
+	.LONG	tlnrcvfin	;tcpf_rcvfin  = 16.
+	.LONG	tlnneedout	;tcpf_needout = 20.
+.PAGE
+;Terminal function dispatch table for Telnet devices
+
+trmfix:	.LONG	knlIFnDev##	;tf_enable    = -76. - Enable video
+	.LONG	knlIFnDev##	;tf_disable   = -72. - Disable video
+	.LONG	knlIFnDev##	;tf_vldbits   = -68. - Get valid mode bits
+	.LONG	knlIFnDev##	;tf_vldmodes  = -64. - Get bits for valid modes
+	.LONG	knlIFnDev##	;tf_curtyp    = -60. - Get/set cursor type
+	.LONG	knlIFnDev##	;tf_curpos    = -56. - Get/set cursor position
+	.LONG	knlIFnDev##	;tf_dsppag    = -52. - Set display page
+	.LONG	knlIFnDev##	;tf_scroll    = -48. - Scroll window
+	.LONG	knlIFnDev##	;tf_getatc    = -44. - Get attribute and char.
+	.LONG	knlIFnDev##	;tf_setatc    = -40. - Set attribute and char.
+	.LONG	knlIFnDev##	;tf_setchr    = -36. - Set character only
+	.LONG	knlIFnDev##	;tf_setpix    = -32. - Set graphics pixel
+	.LONG	knlIFnDev##	;tf_getpix    = -28. - Get graphics pixel
+	.LONG	knlIFnDev##	;tf_palreg    = -24. - Get or set palette
+				;			 registers
+	.LONG	knlIFnDev##	;tf_wrtstr    = -20. - Write string
+	.LONG	knlIFnDev##	;tf_attrib    = -16. - Get or set attributes
+	.LONG	0		;	      = -12. - Reserved
+	.LONG	knlIFnDev##	;tf_vdinb     =  -8. - INB instruction for
+				;			 display in real mode
+	.LONG	knlIFnDev##	;tf_vdoutb    =  -4. - OUTB instruction for
+tlntrmdsp:			;			 display in real mode
+	.LONG	knlRtnZero##	;tf_trans     =   0. - Transfer device
+	.LONG	knlRtnZero##	;tf_opena     =   4. - Open additional
+	.LONG	tlnopen		;tf_open1     =   8. - Open first time
+	.LONG	knlRtnZero##	;tf_stop      =  12. - Stop output
+	.LONG	tlnclrout	;tf_clrout    =  16. - Clear output buffer
+	.LONG	tlnechchr	;tf_echchr    =  20. - Echo character
+	.LONG	tlndoutchr	;tf_doutchr   =  24. - Direct output character
+	.LONG	tlndoutblk	;tf_doutblk   =  28. - Direct output block
+	.LONG	tlndoutstr	;tf_doutstr   =  32. - Direct output string
+	.LONG	knlIFnDev##	;tf_qoutchr   =  36. - Queued output character
+	.LONG	tlnqoutblk	;tf_qoutblk   =  40. - Queued output block
+	.LONG	tlnqoutstr	;tf_qoutstr   =  44. - Queued output string
+	.LONG	0		;	      =  48. - Reserved
+	.LONG	tlnidle		;tf_idle      =  52. - Set to idle state
+	.LONG	tlnresume	;tf_resume    =  56. - Resume output
+	.LONG	knlIFnDev##	;tf_mapscn    =  60. - Map screen buffer
+	.LONG	notmapped	;tf_dosset    =  64. - Setup terminal for DOS
+	.LONG	knlRtnZero##	;tf_dosupd    =  68. - Update page 0 for DOS
+	.LONG	ret004		;tf_dosuse    =  72. - Use DOS page 0 data
+	.LONG	tlndspmode	;tf_d86mode   =  76. - Get or set display mode
+	.LONG	knlIFnDev##	;tf_ldtxcs    =  80. - Load text character set
+	.LONG	knlIFnDev##	;tf_ldgfcs    =  84. - Load graphics char. set
+	.LONG	knlIFnDev##	;tf_setblk    =  88. - Set block specifier
+	.LONG	knlIFnDev##	;tf_addunit   =  92. - Add unit
+	.LONG	knlIFnDev##	;tf_ssread    =  96. - Screen symbiont read
+	.LONG	knlIFnDev##	;tf_sswrite   = 100. - Screen symbiont write
+	.LONG	knlIFnDev##	;tf_sswitch   = 104. - Screen symbiont switch
+	.LONG	knlIFnDev##	;tf_ssdone    = 108. - Screen symbiont done
+	.LONG	knlIFnDev##	;tf_ssnmbr    = 112. - Set or get number of
+				;			 virtual screens
+	.LONG	knlIFnDev##	;tf_ssopnal   = 116. - Open alarm window
+	.LONG	knlIFnDev##	;tf_sswrtalm  = 120. - Write to alarm window
+	.LONG	knlIFnDev##	;tf_ssclsalm  = 124. - Close alarm window
+	.LONG	knlRtnZero##	;tf_ssstatus  = 128. - Report screen status to
+				;			 screen symbiont
+	.LONG	knlIFnDev##	;tf_ssgetmod  = 132. - Get display page modified
+				;			 bits
+	.LONG	knlIFnDev##	;tf_dspcur    = 136. - Low level display cursor
+				;			 routine
+	.LONG	knlRtnZero##	;tf_updpbms   = 140. - Update page changed bits
+				;			 for single msect
+	.LONG	tlnsetdtr	;tf_setdtr    = 144. - Set or clear DTR output
+	.LONG	tlnsetrts	;tf_setrts    = 148. - Set or clear RTS output
+	.LONG	ret004		;tf_finout    = 152. - Ensure output is finished
+	.LONG	tlnimodechng	;tf_imodechng = 156. - Input mode change
+	.LONG	tlnomodechng	;tf_omodechng = 160. - Output mode change
+
+tlnkeydsp:
+	.LONG	knlIFnDev##	;kf_vdinb   =  0. - INB instruction for
+				;		      keyboad in real mode
+	.LONG	knlIFnDev##	;kf_vdoutb  =  4. - OUTB instruction for
+				;		      keyboard in real mode
+	.LONG	knlIFnDev##	;kf_keyint  =  8. - Attempt to execut keyboard
+				;		      interrupt routine in real
+				;		      mode
+	.LONG	knlIFnDev##	;kf_clrkeyi = 12. - Clear keyboard interrupt
+TRMFIXSIZE=!{$-trmfix}/4
+.PAGE
+;Device characteristics tables for the TLN devices
+
+	DATA
+
+	.MOD	4
+tlndctbl:
+ DCHARBGN  1, knlDCharValCom##
+ DCHARENT  CLASS   , TEXT, ,  8, knlDcMsgClass##   , knlDcGetClass##    , knlDcSetClass##    , 0
+ DCHARENT  TCPDEV  , TEXT, , 16, xostcpMsgTcpDev## , xostcpGetTcpDev##  , 0                  , 0
+ DCHARENT  RETRY1  , DECV, ,  1, xosipsMsgRetry1## , xosipsGetDpdbByte##, xosipsSetDpdbByte##, dpdb_tcptlnretry1
+ DCHARENT  RETRY2  , DECV, ,  1, xosipsMsgRetry2## , xosipsGetDpdbByte##, xosipsSetDpdbByte##, dpdb_tcptlnretry2
+ DCHARENT  RMTPORT , DECV, ,  4, msgrmtport        , xosipsGetDpdbData##, xosipsSetDpdbData##, dpdb_rmtport
+ DCHARENT  SESSION , TEXT, ,  8, knlTrmMsgSession##, getsession         , setsession         , 0
+ DCHARENT  MSGDST  , STR , , 16, knlTrmMsgMsgDst## , gettext            , settext            , dpdb_tcptlnmsgdst
+ DCHARENT  PROGRAM , STR , , 16, knlTrmMsgProgram##, gettext            , settext            , dpdb_tcptlnprogram
+ DCHARENT  PASSWORD, STR , ,  8, knlTrmMsgPWrd##   , gettext            , settext            , dpdb_tcptlnpassword
+ DCHARENT  INRBS   , DECV, ,  2, knlTrmMsgInRBS##  , xosipsGetDpdbData##, xosipsSetDpdbData##, dpdb_tcptlnirsize
+ DCHARENT  INLBS   , DECV, ,  2, knlTrmMsgInLBS##  , xosipsGetDpdbData##, xosipsSetDpdbData##, dpdb_tcptlnibsize
+ DCHARENT  OUTRS   , DECV, ,  2, msgoutrs          , xosipsGetDpdbData##, xosipsSetDpdbData##, dpdb_tcptlnoutrsize
+ DCHARENT  BYTEIN  , DECV, ,  4, knlDcMsgByteIn##  , xosipsGetDpdbData##, xosipsSetDpdbData##, dpdb_tcptlncntbytein
+ DCHARENT  BYTEOUT , DECV, ,  4, knlDcMsgByteOut## , xosipsGetDpdbData##, xosipsSetDpdbData##, dpdb_tcptlncntbyteout
+ DCHARENT  PROERR  , DECV, ,  4, msgproerr         , xosipsGetDpdbData##, xosipsSetDpdbData##, dpdb_tcptlncntproerr
+
+tlntrmdctbl:
+ DCHARBGN  2, knlDCharValCom##
+ DCHARENT  CLASS   , TEXT, ,  8, knlDcMsgClass##   , knlDcGetClass##   , knlDcSetClass##   , 0
+ DCHARENT  SESSION , TEXT, ,  8, knlTrmMsgSession##, knlTrmGetSession##, knlTrmSetSession##, 0
+ DCHARENT  MSGDST  , STR , , 16, knlTrmMsgMsgDst## , knlTrmGetText##   , knlTrmSetText##   , tdb_msgdst
+ DCHARENT  PROGRAM , STR , , 16, knlTrmMsgProgram##, knlTrmGetText##   , knlTrmSetText##   , tdb_program
+ DCHARENT  PASSWORD, STR , ,  8, knlTrmMsgPWrd##   , knlTrmGetText##   , knlTrmSetText##   , tdb_password
+ DCHARENT  INRBS   , DECV, ,  2, knlTrmMsgInRBS##  , knlTrmGet4Byte##  , 0                 , tdb_irsize
+ DCHARENT  INLBS   , DECV, ,  2, knlTrmMsgInLBS##  , knlTrmGet4Byte##  , 0                 , tdb_ibsize
+ DCHARENT  OUTRS   , DECV, ,  2, msgoutrs          , knlTrmGet4Byte##  , 0                 , tdb_tlnoutrsize
+
+	CODE
+
+msgrmtport:DCHARINFO  {Remote port}
+msgoutrs:  DCHARINFO  {Output ring buffer size}
+msgproerr: DCHARINFO  {Protocol errors}
+.PAGE
+	.SBTTL	tlninit - Initialization routine for TLN class devices
+
+	INITSUB	tlninit
+
+;The command for installing TLNCLS is:
+;	LKELOAD TLNCLS
+
+tlninit:MOVL	EDI, #tlnchk		;Install the TLN class
+	MOVL	EBX, #tlncls		;Offset of class function dispatch table
+	CLRL	ECX
+	MOVL	EAX, #'TLN'
+	CLRL	EDX
+	MOVL	ESI, #tlnccb
+	CALL	knlNewClass##
+	JC	10$.S
+	MOVL	ECX, #codetop
+	CLRL	EDX
+	CLRL	EAX
+10$:	MOVL	EBX, #QSTS$DONE
+	RET
+
+	CODE
+.PAGE
+	.SBTTL	tlnaddunit - Subroutine to add TLN "unit"
+
+;Subroutine to add TLN "unit" - this is a logical unit which implements the
+;  TELNET application level protocol for a single transport level (TCP) unit
+;  - multiple TLN units may be set up for different TCP units if desired
+;	c{ES:EDI} = Address of data block
+;	CALL	tlnaddunit
+;	c{EAX} = Error code
+;	c{EBX} = Status bits
+;	c{ECX} = Item count
+
+$$$=!0
+FRM tlnau_tcpdev, 16t	;TCP device name
+FRM tlnau_unit  , 4t	;Unit number
+FRM tlnau_port  , 4t	;Port number
+FRM tlnau_dpdb  , 4t	;Offset of DPDB
+FRM tlnau_pdb   , 4t	;Offset of PDB
+tlnau_SIZE=!$$$
+
+	DATA
+
+	.MOD	4
+tlnaublk:				;Parameter description block for
+ DCHARBGN  3, knlDCharValCom##		;  adduparms
+ DCHARENT  UNIT  , DECV, ,  1, knlDcMsgUnit##, 0, tlnauunit  , 0
+ DCHARENT  TCPDEV, TEXT, , 16, 0             , 0, tlnautcpdev, 0
+ DCHARENT  PORT  , DECV, ,  4, 0             , 0, tlnauport  , 0
+
+	CODE
+
+tlnaddunit:
+	ENTER	tlnau_SIZE, 0		;Allocate our stack frame
+	MOVL	EAX, #ER_NEMA
+	CMPL	knlMemAvail##, #10t.B	;Have at least 10 pages available?
+	JB	4$.S			;No - fail
+	CLRL	EAX			;Yes
+	DECL	EAX
+	MOVL	tlnau_tcpdev+0.B[EBP], EAX ;Store illegal values for TCP
+	MOVL	tlnau_unit.B[EBP], EAX	   ;  device name and unit number
+	MOVL	tlnau_port.B[EBP], #TCPP_TELNET ;Store default TCP port number
+	IFFAULT	6$
+	LFSL	EDX, iorb_buffer2.B[ESI]
+	CALL	knlGiveQel##		;Give up the IORB
+	MOVL	EBX, #tlnaublk		;Process the characteristics
+	MOVB	AL, #0			;Fail on bad names
+	CALL	knlAddUnitChar##
+	JC	4$.S			;If error
+	MOVL	EAX, tlnau_unit.B[EBP]	 ;Make sure TCP device and unit number
+	ORL	EAX, tlnau_tcpdev.B[EBP] ;  are specified
+	INCL	EAX
+	JNE	8$.S
+	MOVL	EAX, #ER_CHARM
+4$:	MOVL	EBX, #QSTS$DONE
+	CLRL	ECX
+	LEAVE
+	TOFORK
+	RET
+		
+;Here if address error with the IORB
+
+	FAULTHDR
+6$:	CALL	knlGiveQel##
+	MOVL	EAX, #ER_ADRER
+	JMP	4$.S
+
+;Here if have all required characteristics
+
+8$:	PUSHL	tlnau_unit.B[EBP]	;Stack unit number
+	PUSHL	#dpdb_tcptlnSIZE	;Stack DPDB size
+	PUSHL	#'TLN'			;Stack base name
+	PUSHL	#dcb_tlnINDEX.B		;Stack size index for DCB
+	PUSHL	#tlnccb			;Stack offset of the XFP CCB
+	PUSHL	xostcpTpdbHead##	;Stack offset of first TCP TPDB
+	PUSHL	#tlndpdbhead		;Stack offset of XFP DPDB head pointer
+	CALL	xosipsMakeDev##		;Create new network device
+	JC	4$.S			;If error
+	MOVL	tlnau_dpdb.B[EBP], EDI
+	MOVL	ECX, dpdb_name+0.B[EDI]
+10$:	MOVL	EDI, tlnau_dpdb.B[EBP]
+	MOVB	dpdb_tcptlnretry1.B[EDI], #RETRY_TRN1 ;Initialize default retry
+	MOVB	dpdb_tcptlnretry2.B[EDI], #RETRY_TRN2 ;  levels
+	MOVL	dpdb_tcptlnirsize.B[EDI], #TLNIRSIZE ;Store default buffer sizes
+	MOVL	dpdb_tcptlnibsize.B[EDI], #TLNIBSIZE
+	MOVL	dpdb_tcptlnoutrsize.B[EDI], #TLNOUTRSIZE
+	MOVL	EAX, tlnau_port.B[EBP]	;Store remote TCP port number
+	MOVL	dpdb_rmtport.B[EDI], EAX
+	PUSHL	EDI
+	PUSHL	ECX
+	PUSHL	EDI
+	PUSHL	dpdb_name+4.B[EDI]	;Device name
+	PUSHL	dpdb_name+0.B[EDI]
+	MOVZBL	EAX, dpdb_unit.B[EDI]	;Primary unit number
+	PUSHL	EAX
+	PUSHL	#0.B			;Secondary unit number
+	PUSHL	#dcb_ipsINDEX.B		;Size index
+	PUSHL	#tlnccb			;Offset of CCB
+	MOVL	ESI, dpdb_pdb.B[EDI]
+	PUSHL	pdb_idb.B[ESI]		;Offset of IDB
+	PUSHL	#DS$DUPLEX|DS$QOUT|DS$QIN ;Description bits
+	CALL	xosnetMakeDcb##		;Make a network DCB
+	POPL	EDI
+	MOVL	dcb_sdisp.B[EDI], #tlndsp ;OK - store offset of dispatch table
+	MOVL	dcb_tcpfuncdisp.B[EDI], #tlnfnc ;And of the TCP function table
+	DECL	dcb_ipshashnext[EDI]
+	DECL	dcb_ipsportnext.B[EDI]
+	MOVL	EDX, tlnau_dpdb.B[EBP]	;Get offset of the DPDB
+	MOVL	dcb_ipsdpdb.B[EDI], EDX	;Store it in the DCB
+	MOVL	EAX, dpdb_tpdb.B[EDX]	;Get offset of the TPDB
+	MOVL	dcb_ipstpdb.B[EDI], EAX	;Store it in the DCB
+	MOVL	EBX, dpdb_pdb.B[EDX]	;Get offset of the PDB
+	MOVL	dcb_netpdb.B[EDI], EBX	;Store it in the DCB
+	MOVL	ECX, pdb_sdb.B[EBX]	;Get offset of the SDB
+	MOVL	dcb_netsdb.B[EDI], ECX	;Store it in the DCB
+	ORB	dcb_ipssts1.B[EDI], #IPSS1$NOTDFLT
+	MOVL	dpdb_tcptlnprogram+0.B[EDX], #'SHEL' ;Assume don't want login
+	MOVB	dpdb_tcptlnprogram+4.B[EDX], #'L'
+	BTL	knlSysDescp##, #SYSD%LOGIN ;Right?
+	JNC	12$.S			;Yes
+	MOVL	dpdb_tcptlnprogram+0.B[EDX], #'LOGI' ;No
+	MOVB	dpdb_tcptlnprogram+4.B[EDX], #'N'
+12$:	MOVL	dpdb_tcptlnmsgdst+0.B[EDX], #'INIT'
+	MOVL	ECX, tlnau_port.B[EBP]
+	BTSL	ECX, #30t
+	CALL	xosipsGetPort##		;Assign the port
+14$:	JC	20$.S			;This should not fail
+	CALL	xostcpPutSynWait##	;Put the DCB in the SYN wait list
+	POPL	ECX
+	POPL	EDI
+	MOVL	EDI, dpdb_nextd.B[EDI]
+	TESTL	EDI, EDI
+	JE	18$.S
+	CMPL	ECX, dpdb_name+0.B[EDI]
+	JE	10$
+18$:	CALL	knlGiveXRes##
+	CLRL	EAX
+	JMP	4$
+
+;Here if error getting a network DCB - this should not happen since we made
+;  sure we had plenty of memory before we started!
+
+20$:	CRASH	NDCB
+.PAGE
+;Subroutine called by adduparms for the "UNIT" parameter
+
+tlnauunit:
+	CMPL	EAX, #100t.B		;Valid value?
+	JAE	4$.S
+	MOVL	tlnau_unit.B[EBP], EAX
+	CLC
+	RET
+
+4$:	MOVL	EAX, #ER_CHARV
+	STC
+	RET
+
+;Subroutine called by adduparms for the "TCPDEV" parameter
+
+tlnautcpdev:
+	MOVL	EAX, knlDcValue##+0
+	MOVL	tlnau_tcpdev+0.B[EBP], EAX
+	MOVL	EAX, knlDcValue##+4
+	MOVL	tlnau_tcpdev+4.B[EBP], EAX
+	MOVL	EAX, knlDcValue##+8
+	MOVL	tlnau_tcpdev+8.B[EBP], EAX
+	MOVL	EAX, knlDcValue##+12t
+	MOVL	tlnau_tcpdev+12t.B[EBP], EAX
+	RET
+
+;Subroutine called by adduparms for the "PORT" parameter
+
+tlnauport:
+	CMPL	EAX, #0FFFFh		;Legal value?
+	JA	4$.S			;No
+	TESTL	EAX, EAX		;Maybe
+	JE	4$.S			;No
+	MOVL	tlnau_port.B[EBP], EAX	;Yes - store it
+	RET
+.PAGE
+	.SBTTL	getsession - Get value of SESSION characteristic
+
+;Here to get the value of the SESSION characteristic
+
+getsession:
+	MOVL	ESI, dcb_ipsdpdb.B[EDI]
+	MOVL	EAX, #'YES'
+	TESTB	dpdb_tcptlnsts1[ESI], #TLNS1$SESSION
+	JNE	ret002.S
+	MOVL	EAX, #'NO'
+	RET
+
+	.SBTTL	setsession - Set value of SESSION characteristic
+
+;Here to set the value of the SESSION characteristic
+
+setsession:
+	MOVL	ESI, dcb_ipsdpdb.B[EDI]
+	CALL	knlGetYesNo##
+	JC	ret002.S
+	JE	4$.S
+	ANDB	dpdb_tcptlnsts1[ESI], #~TLNA1$SESSION
+	RET
+
+4$:	ORB	dpdb_tcptlnsts1[ESI], #TLNA1$SESSION
+ret002:	RET
+.PAGE
+	.SBTTL	gettext- Get value of PASSWORD or PROGRAM characteristic
+
+;Here to get the value of the PASSWORD or PROGRAM characteristic
+
+gettext:ADDL	EDX, dcb_ipsdpdb.B[EDI]
+	JMP	knlGetSysStr##
+
+	.SBTTL	settext - Set value of PASSWORD or PROGRAM characteristic
+
+;Here to set the value of the PASSWORD or PROGRAM characteristic
+
+settext:ADDL	EDX, dcb_ipsdpdb.B[EDI]
+	JMP	knlSetSysStr##
+.PAGE
+	.SBTTL	tlnnewsyn - Routine to handle new incoming SYN packets
+
+;Routine to handle new incoming SYN packets
+
+tlnnewsyn::				;Find the first free TLN subunit number
+	MOVL	EAX, #1			;Start looking for secondary unit 1
+	MOVL	EDX, tlnccb+ccb_dcbhead	;First scan the DCB list and find the
+	MOVL	ECX, dcb_name+0.B[EDI]	;  first DCB for this TLN unit and
+	MOVL	EBX, dcb_name+4.B[EDI]	;  network
+	MOVL	namebfr, EBX
+2$:	TESTL	EDX, EDX
+	JE	10$.S
+	CMPL	ECX, dcb_name+0.B[EDX]
+	JB	10$.S
+	JA	4$.S
+	CMPB	BL, dcb_name+4.B[EDX]
+	JB	4$.S
+	JE	6$.S
+4$:	MOVL	EDX, dcb_next.B[EDX]
+	JMP	2$.S
+
+;Here with first DCB for this TLN unit and network
+
+6$:	CMPW	AX, dcb_sunit.B[EDX]
+	JA	8$.S
+	JB	10$.S
+	INCL	EAX
+8$:	MOVL	EDX, dcb_next.B[EDX]
+	TESTL	EDX, EDX
+	JNE	6$.S
+10$:	PUSHL	EAX
+	MOVL	EBX, #namebfr+1		;Construct the corresponding name
+	CALL	knlPutDecNmbr##
+	PUSHL	EDI
+	PUSHL	namebfr			;Device name
+	PUSHL	dcb_name+0.B[EDI]
+	MOVL	ECX, dcb_ipsdpdb.B[EDI]	;Get space needed for output buffer
+	MOVL	EDX, dpdb_tcptlnoutrsize.B[ECX]
+	ADDL	EDX, #dcb_cSIZE+dcb_tlnSIZE+tdb_mSIZE+tdb_tlnSIZE
+	CALL	knlGetIndex##		;Change to size index
+	PUSHL	ECX
+	MOVZBL	EAX, dcb_punit.B[EDI]	;Primary unit number
+	PUSHL	EAX
+	MOVZWL	EAX, dcb_sunit.B[EDI]	;Secondary unit number
+	PUSHL	EAX
+	PUSHL	#dcb_ipsINDEX.B		;Size index
+	PUSHL	#tlnccb			;Offset of CCB
+	PUSHL	dcb_netidb.B[EDI]	;Offset of IDB
+	PUSHL	#DS$DUPLEX|DS$QOUT|DS$QIN ;Description bits
+	CALL	xosnetMakeDcb##		;Get a network DCB
+	POPL	EDX
+	POPL	ECX
+	JC	16$			;If error
+	MOVL	dcb_sdisp.B[EDI], #tlndsp ;Store offset of dispatch table
+	MOVL	dcb_tcpfuncdisp.B[EDI], #tlnfnc ;And of the TCP function table
+	DECL	dcb_ipshashnext[EDI]
+	DECL	dcb_ipsportnext.B[EDI]
+	MOVW	dcb_sunit.B[EDI], CX	;Store secondary unit number
+	MOVB	dcb_tlntdb+tdb_snum[EDI], CL
+	MOVB	AL, dcb_punit.B[EDX]	;Copy primary unit number
+	MOVB	dcb_punit.B[EDI], AL
+	MOVB	dcb_tlntdb+tdb_pnum[EDI], AL
+	MOVL	EAX, dcb_tcprcvputp.B[EDX] ;Copy offset of the recevied packet
+	MOVL	dcb_tcprcvputp.B[EDI], EAX ;  to the new DCB
+	MOVL	EAX, dcb_tcprcvputb.B[EDX]
+	MOVL	dcb_tcprcvputb.B[EDI], EAX
+	CLRL	EAX
+	MOVL	dcb_tcprcvputp.B[EDX], EAX
+	MOVL	dcb_tcprcvputb.B[EDX], EAX
+	MOVL	EAX, dcb_netsdb.B[EDX]	;Copy offset of the SDB to the new DCB
+	MOVL	dcb_netsdb.B[EDI], EAX
+	MOVL	EAX, dcb_netpdb.B[EDX]	;Copy offset of the PDB to the new DCB
+	MOVL	dcb_netpdb.B[EDI], EAX
+	MOVL	EAX, dcb_ipstpdb.B[EDX]	;Copy offset of the TPDB to the new DCB
+	MOVL	dcb_ipstpdb.B[EDI], EAX
+	MOVL	ECX, dcb_ipsdpdb.B[EDX]	;Copy offset of DPDB to the new DCB
+	MOVL	dcb_ipsdpdb.B[EDI], ECX
+	MOVW	AX, dpdb_tcptlnretry1.B[ECX] ;Store the retry limit values
+	MOVW	dcb_tcpretry1.B[EDI], AX
+	ORB	dcb_ipssts1.B[EDI], #IPSS1$NOTDFLT ;Indicate not default device
+	MOVL	dcb_tcprxmtave[EDI], #{TIMEOUT_TRNBGN/FDPERTICK}<3t
+	MOVL	dcb_tcprxmtint[EDI], #TIMEOUT_TRNBGN/FDPERTICK+4
+	PUSHL	EDX			;Save offset of server DCB
+	LEAL	ESI, dcb_tlntdb[EDI]
+	ORB	dcb_tlnsts1[EDI], #TLNS1$TDB ;Indicate have TDB
+	MOVL	dcb_netmode.B[EDI], #NMTCP$PUSH|NMTCP$CONP ;Store default modes
+	MOVL	EAX, dcb_ipsdpdb.B[EDI]
+	TESTB	dpdb_tcptlnsts1[EAX], #TLNS1$SESSION
+	JE	11$.S
+	ORB	tdb_stsmisc.B[ESI], #TSM$SESSION
+11$:	MOVL	EAX, dpdb_tcptlnpassword+0.B[ECX]
+	MOVL	tdb_password+0[ESI], EAX
+	MOVL	EAX, dpdb_tcptlnpassword+4.B[ECX]
+	MOVL	tdb_password+4[ESI], EAX
+	MOVL	EAX, dpdb_tcptlnpassword+8.B[ECX]
+	MOVL	tdb_password+8[ESI], EAX
+	MOVL	EAX, dpdb_tcptlnprogram+0.B[ECX]
+	MOVL	tdb_program+0[ESI], EAX
+	MOVL	EAX, dpdb_tcptlnprogram+4.B[ECX]
+	MOVL	tdb_program+4[ESI], EAX
+	MOVL	EAX, dpdb_tcptlnprogram+8.B[ECX]
+	MOVL	tdb_program+8[ESI], EAX
+	MOVL	EAX, dpdb_tcptlnprogram+12t.B[ECX]
+	MOVL	tdb_program+12t[ESI], EAX
+	MOVL	EAX, dpdb_tcptlnmsgdst+0.B[ECX]
+	MOVL	tdb_msgdst+0[ESI], EAX
+	MOVL	EAX, dpdb_tcptlnmsgdst+4.B[ECX]
+	MOVL	tdb_msgdst+4[ESI], EAX
+	MOVL	EAX, dpdb_tcptlnmsgdst+8.B[ECX]
+	MOVL	tdb_msgdst+8[ESI], EAX
+	MOVL	EAX, dpdb_tcptlnmsgdst+12t.B[ECX]
+	MOVL	tdb_msgdst+12t[ESI], EAX
+	MOVL	tdb_ddisp.B[ESI], #tlntrmdsp
+	MOVL	tdb_kdisp.B[ESI], #tlnkeydsp
+	MOVL	tdb_devchar.B[ESI], #tlntrmdctbl ;Store offset of device
+						 ;  characteristics table
+	MOVL	EAX, knlTrmLastTdb##	;Link into our chain of TDBs
+	MOVL	knlTrmLastTdb##, ESI
+	TESTL	EAX, EAX
+	JE	12$.S
+	MOVL	tdb_next.B[EAX], ESI
+	JMP	14$.S
+
+12$:	MOVL	knlTrmFirstTdb##, ESI
+14$:	CLRL	EAX
+	MOVL	tdb_next.B[ESI], EAX
+	MOVL	tdb_name+0.B[ESI], #'TRM' ;Put name in the TDB
+	MOVB	AL, dcb_name+3.B[EDI]
+	MOVB	tdb_name+3.B[ESI], AL
+	MOVL	EAX, dcb_name+4.B[EDI]
+	MOVL	tdb_name+4.B[ESI], EAX
+	LEAL	EDX, tdb_tlnoutring.B[ESI] ;Point to output ring buffer
+	MOVL	tdb_tlnoutrtak.B[ESI], EDX ;Initialize output pointers
+	MOVL	tdb_tlnoutrput.B[ESI], EDX
+	MOVL	ECX, dcb_ipsdpdb.B[EDI]
+	MOVL	EAX, dpdb_tcptlnoutrsize.B[ECX] ;Get size of output buffer
+	MOVL	tdb_tlnoutrsize.B[ESI], EAX
+	MOVL	tdb_typname.B[ESI], #'TLNT'
+	DECL	tdb_fnext.B[ESI]	;Indicate fork request not queued
+	MOVL	EDX, dpdb_tcptlnirsize.B[ECX] ;Get space needed for input buffers
+	ADDL	EDX, dpdb_tcptlnibsize.B[ECX]
+	SHLL	EDX, #2t
+	CALL	knlGetIndex##		;Change to size index
+	MOVB	dcb_tlnbsx[EDI], CL	;Save it to use when giving up the block
+	PUSHL	ESI
+	CALL	knlGetXmb##		;Get an exec memory block
+	MOVL	EDX, ESI
+	POPL	ESI
+	JC	15$.S			;If can't get one
+	MOVL	tdb_iring[ESI], EDX	;Store offset of input ring buffer
+	MOVL	tdb_irput[ESI], EDX	;Initialize pointers
+	MOVL	tdb_irtak[ESI], EDX
+	MOVL	ECX, dcb_ipsdpdb.B[EDI]
+	MOVL	EAX, dpdb_tcptlnirsize.B[ECX] ;Get length of ring buffer
+	MOVL	tdb_irsize[ESI], EAX	;Store it
+	LEAL	EDX, [EDX+EAX*4]	;Get offset of line buffer
+	MOVL	tdb_ibufr[ESI], EDX	;Store it
+	MOVL	EAX, dpdb_tcptlnibsize.B[ECX] ;Get length of line buffer
+	MOVL	tdb_ibsize[ESI], EAX	;Store that too
+	MOVL	ECX, dpdb_rmtport.B[ECX] ;Set it up to use our TCP port
+	BTSL	ECX, #30t
+	CALL	xosipsGetPort##
+	JNC	18$.S			;Go on if got the TCP port
+15$:	CALL	tlncdcb			;Can't get port - give up the new DCB
+	POPL	EDI
+16$:	MOVL	EBX, dcb_tcprcvputb.B[EDI]
+	CALL	xosnetGiveBufr##	;And give up the buffer and forget it
+	RET
+
+;Here with TCP port assigned
+
+18$:	POPL	EDX
+	MOVB	dcb_ipsprot.B[EDI], #IPP_TCP ;Accept the connection (this
+	CALL	xostcpAcceptSyn##	     ;  puts us in the TCP hash table)
+	MOVB	dcb_tcpstate.B[EDI], #TCPS_SYNRCVD
+	MOVB	dcb_tcpretrycnt.B[EDI], #4 ;Retry this 4 times
+20$:	MOVL	EBX, #rexmitsyn
+	MOVL	EAX, #2t*TICKSPERSEC
+	CALL	xostcpTimerReq##
+	JC	giveup.S
+	CALL	xostcpSendSynAck##	;Send back a SYN|ACK
+	JC	giveup.S
+	RET
+
+;Here when the SYN|ACK timer runs out
+
+rexmitsyn:
+	CLRL	EAX
+	MOVL	dcb_tcprxmtwake[EDI], EAX
+	MOVL	ESI, dcb_netidb.B[EDI]	;Restore offset of IDB
+	DECB	dcb_tcpretrycnt.B[EDI]	;Should we try this again?
+	JNS	20$.S			;Yes
+giveup:	CALL	xostcpHashClr##		;No - remove DCB from the hash table
+	CALL	xosipsGivePort##	;Give up the TCP port
+	CALL	tlncdcb			;Give up the DCB and return
+	CLC				;Make sure C is clear so the timer
+	RET				;  stuff will work right
+.PAGE
+;Here with ACK for our SYN|ACK - we now have a connection
+;	c{EAX} = Error code
+
+newsynack:
+	PUSHL	EAX
+	CALL	xostcpTimerRmv##	;Stop the timer
+	POPL	EAX
+	TESTL	EAX, EAX		;Error?
+	JS	giveup.S		;Yes
+	BTSL	dcb_tlntdb+tdb_imode[EDI], #TIM%HALFDUP ;Default is half-duplex
+	IBTSL	dcb_tlnlclreq, EDI, TNO_ECHO	;Request local ECHO and
+	IBTSL	dcb_tlnrmtreq, EDI, TNO_TFC	;  remote toggle flow control
+	MOVL	EBX, #newcmsg
+	CALL	tlnputstr
+	JMP	xostcpPush##
+.PAGE
+	.SBTTL	tlnrcvfin - Subroutine to handle received FIN
+
+;Subroutine to handle received FIN - get here whenever receive a FIN when in
+;  the ESTAB state - we reply with a FIN to get rid of the connection as soon
+;  as we can and notify the user of a "hangup"
+
+tlnrcvfin:
+	PUSHL	EDI
+	PUSHL	ESI
+	LEAL	ESI, dcb_tlntdb[EDI]
+	CALL	knlTrmHungUp##
+	POPL	ESI
+	POPL	ESI
+	RET
+
+	.SBTTL	finwait - Subroutine to handle packet when in FINWAIT state
+
+;Subroutine to handle packet when in the FINWAIT state
+
+finwait:
+	CRASH	????
+.PAGE
+	.SBTTL	tlnunitinfo - TLN class get phyical unit information function
+
+;Here for the get physical unit information class function (CL_PUNITS) for the
+;  TLN class
+;	c{EBX} = Offset of CCB
+;	c{ESI} = Offset of IORB
+;	CALL	tlnunitinfo
+;	c{EAX} = Error code
+;	c{EBX} = Status bits
+;	c{ECX} = Item count
+;  A zero count (iorb_count) requests that the number of units only be returned
+;    in qab_amount.  A non-zero count indicates that a buffer is available for
+;    that many unit names (8 characters each, null padded).
+
+tlnunitinfo:
+	MOVL	EAX, #ER_NIYT
+	STC
+	RET
+.PAGE
+	.SBTTL	tlnchk - Device check routine for TLN class devices
+
+;Device check routine for TLN class devices
+;	c{EBX:EAX} = Device name (8 bytes)
+;	CALL	tlnchk
+;	C:set = Error (match found)
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  Z:set = Match found
+;	    c{EDI} = Offset of DCB
+;	  Z:clr = Not found
+;  ESI is preserved
+
+tlnchk:	MOVL	EAX, SS:[EBX]
+	ANDL	EAX, #0FFFFFFh
+	CMPL	EAX, #'TLN'		;Is this TLN*?
+	JNE	10$			;No
+	TESTL	EBX, #0FFFFFF00h	;Yes - was a terminal number given?
+	JE	6$.S			;No
+	MOVL	EDI, tlnccb+ccb_dcbhead	;Yes - search the existing DCB's for
+	TESTL	EDI, EDI		;  a match first
+	JE	6$.S			;If none at all
+2$:	MOVL	EAX, SS:[EBX]		;This one?
+	CMPL	dcb_name+0.B[EDI], EAX
+	JNE	4$.S			;No
+	MOVL	EAX, SS:4.B[EBX]
+	CMPL	dcb_name+4.B[EDI], EAX
+	JNE	4$.S			;No
+	MOVL	EAX, SS:8.B[EBX]
+	CMPL	dcb_name+8.B[EDI], EAX
+	JNE	4$.S			;No
+	MOVL	EAX, SS:12t.B[EBX]
+	CMPL	dcb_name+12t.B[EDI], EAX
+	JE	8$.S			;Yes
+4$:	MOVL	EDI, dcb_next.B[EDI]	;No - advance to next
+	TESTL	EDI, EDI		;Go on if have another one
+	JNE	2$.S
+6$:	MOVL	EDI, tlndpdbhead	;Get offset of first TLN DPDB
+	LEAL	ECX, 3.B[EBX]		;Get offset of 1st unit number character
+	MOVL	EDX, #0
+	CALL	xosipsFindDev##		;Find matching network device
+	JC	8$.S			;If error
+	JNE	8$.S			;Or if not a match
+	MOVL	dcb_sdisp.B[EDI], #tlndsp ;Store offset of SVC dispatch table
+	MOVL	dcb_tcpfuncdisp.B[EDI], #tlnfnc ;Store offset of function
+						;  dispatch table
+	MOVL	dcb_devchar.B[EDI], #tlndctbl ;Use our device characteristics
+	MOVB	dcb_ipsprot.B[EDI], #IPP_TCP ;Store protocol value
+	MOVL	ECX, #80000401h		;Assign default port number
+	CALL	xosipsGetPort##
+	JC	12$.S
+	MOVL	EAX, dcb_ipsdpdb.B[EDI]	;Store remote port number
+	MOVL	EAX, dpdb_rmtport.B[EAX]	
+	XCHGB	AL, AH
+	MOVW	dcb_ipsrmtport.B[EDI], AX
+	CLRL	EAX			;Set Z
+8$:	RET				;And return
+
+10$:	CLC
+	RET
+
+;Here if can't allocate default port number
+
+12$:	PUSHL	EAX
+	CALL	tlncdcb
+	POPL	EAX
+	STC
+	RET
+.PAGE
+	.SBTTL	sd_cleardcb - Give up DCB
+
+;Here for the give up dcb entry
+;	CALL	tlncdcb
+
+tlncdcb:TESTB	dcb_tlnsts1[EDI], #TLNS1$TDB ;Do we have a TDB?
+	JE	14$.S			;No - go on
+	PUSHL	ESI			;Yes
+	LEAL	ESI, dcb_tlntdb[EDI]	;Point to the TDB
+	PUSHL	EDI
+	CALL	knlTrmHungUp##		;"Hang up" the terminal side of this
+	POPL	EDI
+	MOVL	EDX, #knlTrmFirstTdb##	;Find our TDB in the list of TDBs
+2$:	CMPL	[EDX], ESI
+	JE	6$.S
+	MOVL	EDX, [EDX]
+	TESTL	EDX, EDX
+	JE	4$.S
+	ADDL	EDX, #tdb_next.B
+	JMP	2$.S
+
+4$:	CRASH	BDTL			;[BaD TDB List]
+
+6$:	MOVL	EAX, tdb_next.B[ESI]	;Unlink this TDB
+	MOVL	[EDX], EAX
+	TESTL	EAX, EAX		;Was this the last one in the list?
+	JNE	10$.S			;No
+	LEAL	EAX, -tdb_next.B[EDX]	;Yes
+	CMPL	EDX, #knlTrmFirstTdb##	;Was it the only one?
+	JNE	8$.S			;No
+	CLRL	EAX
+8$:	MOVL	knlTrmLastTdb##, EAX
+10$:	MOVL	ESI, tdb_iring[ESI]	;Get offset of input buffer block
+	TESTL	ESI, ESI		;Really have one?
+	JE	12$.S			;No
+	MOVZBL	ECX, dcb_tlnbsx[EDI]	;Yes - get size index for the block
+	CALL	knlGiveXmb##		;Give it up
+12$:	POPL	ESI
+14$:	JMP	xostcpCDcb##
+.PAGE
+	.SBTTL	sd_devparm - Device parameter function
+
+;Here for the device parameter function and open entries
+;	c{SS:EDX} = Offset of name buffer
+;	c{EDI}    = Offset of DCB
+;	CALL	tlndevparm
+;	C:set = Error
+;	  c{EAX} = Error code
+;	  c{ECX} = 0
+;	C:clr = Normal
+;	  c{EAX} = 0
+;	  c{ECX} = 1
+
+tlndevparm:
+	TESTL	SS:xffCmd##, #O$PHYS|O$RAW ;Raw or physical IO?
+	JE	2$.S			;No - fail!
+	ANDB	SS:xffCmd##, #~{O$IN|O$OUT} ;No IO allowed
+	MOVL	ECX, #1
+	CLRL	EAX
+	RET
+
+2$:	CLRL	ECX
+	JMP	knlIFnDev#
+.PAGE
+	.SBTTL	tf_open - tlnopen - Open device
+
+;;;;;;; START OF TERMINAL DEVICE ROUTINES
+
+;Here for the tf_open dispatch - Open device
+;	c{ESI} = Offset of TDB
+;	CALL	tlnopen
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+
+tlnopen:CLRL	EAX
+ret004:	RET
+.PAGE
+	.SBTTL	tf_idle - tlnidle - Set to idle state
+
+;Here for the tf_idle dispatch - Set to idle state - Note that this routine is
+;  almost a copy of the tcpclear routine from TCPCLS.  A different version is
+;  needed here since this is not executed in extended fork context.
+;	c{ESI} = Offset of TDB
+;	CALL	tlnidle
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+
+tlnidle:PUSHL	EDI
+	PUSHL	ESI
+	LEAL	EDI, -dcb_tlntdb[ESI]
+	MOVL	ESI, dcb_netidb.B[EDI]
+	MOVZBL	EAX, dcb_tcpstate.B[EDI] ;Get connection state
+	JMPIL	clrdsp[EAX*4]		;Dispatch on the state
+
+	DATA
+
+clrdsp:	.LONG	clridle		;TCPS_CLOSED    = 0  - Idle
+	.LONG	clridle		;TCPS_LISTEN    = 1  - Waiting for SYN
+	.LONG	clrestab	;TCPS_SYNSENT   = 2  - SYN sent
+	.LONG	clrestab	;TCPS_SYNACKD   = 3  - ACK sent for SYN|ACK
+	.LONG	clrestab	;TCPS_SYNRCVD   = 4  - SYN received
+	.LONG	clrestab	;TCPS_ESTAB     = 5  - Connection established
+	.LONG	clridle		;TCPS_FINWAIT1  = 6  - FIN sent, waiting for FIN
+				;			 in reply and for ACK
+	.LONG	clridle		;TCPS_FINWAIT2  = 7  - ACK for FIN received,
+				;			 still waiting for FIN
+	.LONG	clridle		;TCPS_CLOSING   = 8  - Reply FIN received
+				;			 without ACK, waiting
+				;			 for ACK for the FIN
+	.LONG	clrclosewait	;TCPS_CLOSEWAIT = 9  - FIN received, waiting
+				;			 for process to close
+				;			 TCP device
+	.LONG	clridle		;TCPS_LASTACK   = 10 - Reply FIN sent, waiting
+				;			 for final ACK
+	.LONG	clridle		;TCPS_TIMEWAIT  = 11 - All finished - timing out
+				;			 port
+
+	CODE
+
+	RET
+
+;Here when clearing if have already received a FIN - in this case we send the
+;  reply FIN and then wait for the final ACK
+
+clrclosewait:
+	MOVB	dcb_tcpstate.B[EDI], #TCPS_LASTACK ;Update state
+	CALL	xostcpSendFin##		;Send a FIN
+	JMP	clridle.S
+
+;Here when clearing if a connection is established - we send a FIN and then
+;  wait for the reply FIN
+
+clrestab:				       ;Is the application level
+	TESTB	dcb_tcpsts1.B[EDI], #TCPS1$FATAL ;  protocol alive?
+	JE	4$.S			;Yes
+	CALL	xostcpGiveAll##		;No - make sure no buffers allocated
+4$:	MOVB	dcb_tcpstate.B[EDI], #TCPS_FINWAIT1 ;Update state
+	CALL	xostcpSendFin##		;Send a FIN
+	JNC	clridle.S
+	MOVB	dcb_tcpstate.B[EDI], #TCPS_TIMEWAIT ;Indicate almost idle
+	CALL	xostcpGiveAll##		;Make sure don't have any buffers
+clridle:POPL	ESI
+	POPL	EDI
+	RET
+.PAGE
+notmapped:
+	CLRL	EAX
+	CLRL	EDX
+	RET
+.PAGE
+	.SBTTL	tf_doutchr - tlndoutchr - Output character at main program level
+
+;Here for the tf_doutchr dispatch - Output character at main program level
+;	c(AL)  = Character to output
+;	c{ESI} = Offset of TDB
+;	CALL	tlndoutchr
+;	c{EAX} = Error code
+;	c{ECX} = Number of bytes output
+;	c{EBX} = Status bits
+
+tlndoutchr:
+	TESTB	tdb_stsout.B[ESI], #TSO$JUNK|TSO$JUNKX|TSO$HOLDS|TSO$HOLDP
+					;Should we junk or hold output?
+	JNE	6$.S			;Yes
+2$:	CALL	outchr			;No - store character in output buffer
+	JC	10$.S
+4$:	MOVL	ECX, #1			;Indicate 1 character output
+	MOVL	EBX, #QSTS$DONE
+outdok:	CLRL	EAX
+outsend:TESTB	tdb_stsout.B[ESI], #TSO$OUTA
+	JNE	5$.S
+	PUSHL	EAX
+	PUSHL	EBX
+	PUSHL	ECX
+	CALL	tlnresume
+	POPL	ECX
+	POPL	EBX
+	POPL	EAX
+5$:	RET				;Finished
+
+;Here if should junk or hold character
+
+6$:	TESTB	tdb_stsout.B[ESI], #TSO$JUNK|TSO$JUNKX ;Holding output?
+	JNE	4$.S			;No
+10$:	CLRL	EAX			;Nothing output, indicate should
+	CLRL	ECX			;  wait
+	MOVL	EBX, #QSTS$WAIT
+	RET
+.PAGE
+	.SBTTL	tf_doutblk - tlndoutblk - Output block at main program level
+
+;Here for the tf_doutblk dispatch - Output block at main program level
+;	c{ECX}    = Number of characters to output
+;	c{ES:EBX} = Address of block
+;	c{ESI}    = Offset of TDB
+;	CALL	tlndoutblk
+;	c{EAX} = Error code
+;	c{ECX} = Number of bytes output
+;	c{EBX} = Status bits
+
+tlndoutblk:
+	CLRL	EDX			;Initialize count
+2$:	FROMFORK
+	MOVB	AL, ES:[EBX]		;Get character
+	TOFORK
+	TESTB	tdb_stsout.B[ESI], #TSO$JUNK|TSO$JUNKX|TSO$HOLDS|TSO$HOLDP
+					;Are we junking or holding output?
+	JNE	6$.S			;Yes
+4$:	CALL	outchr			;No - store character in output buffer
+	JC	outwt.S			;If no more room
+	INCL	EBX			;Bump pointer
+	INCL	EDX			;Bump count
+	LOOP	ECX, 2$			;Loop if more to output
+outdn:	MOVL	EBX, #QSTS$DONE
+outrtn:	MOVL	ECX, EDX		;Get count in right register
+	JMP	outdok
+
+;Here if junking or holding output
+
+6$:	TESTB	tdb_stsout.B[ESI], #TSO$JUNK|TSO$JUNKX ;Holding output?
+	JE	outwt.S			;Yes
+8$:	ADDL	EDX, ECX		;No - report that everything was ouput
+	JMP	outdn.S
+
+;Here if should hold output
+
+outwt:	MOVL	EBX, #QSTS$WAIT		;Indicate should wait
+	JMP	outrtn.S
+.PAGE
+	.SBTTL	tf_doutstr - tlndoutstr - Output string at main program level
+
+;Here for the tf_outstr dispatch - Output string at main program level
+;	c{ES:EBX} = Address of string
+;	c{ESI}    = Offset of TDB
+;	CALL	tlndoutstr
+;	c{EAX} = Error code
+;	c{ECX} = Number of bytes output
+;	c{EBX} = Status bits
+
+tlndoutstr:
+	CLRL	EDX			;Initialize count
+2$:	FROMFORK
+	MOVB	AL, ES:[EBX]		;Get character
+	TOFORK
+	ORB	AL, AL			;End?
+	JE	outdn.S			;Yes
+	TESTB	tdb_stsout.B[ESI], #TSO$JUNK|TSO$JUNKX|TSO$HOLDS|TSO$HOLDP
+					;No - junking or holding output?
+	JNE	8$.S			;Yes
+4$:	CALL	outchr			;No - store character in output buffer
+	JC	outwt.S			;If must wait
+6$:	INCL	EBX			;Bump pointer
+	INCL	EDX			;Bump count
+	JMP	2$			;Continue
+
+;Here if junking or holding output (get here at fork level)
+
+8$:	TESTB	tdb_stsout.B[ESI], #TSO$JUNK|TSO$JUNKX ;Holding output?
+	JE	outwt.S			;Yes
+	JMP	6$.S			;No - must be junking output
+.PAGE
+	.SBTTL	tf_qoutblk - tlnqoutblk - Output block at fork level
+
+;Here for the tf_qoutblk dispatch - Output block at fork level
+;	c{ECX}    = Number of characters to output
+;	c{ES:EBX} = Address of block
+;	c{ESI}    = Offset of TDB
+;	CALL	tlnqoutblk
+;	c{EAX} = Error code
+;	c{ECX} = Amount output
+;	c{ESI} = Status bits
+
+tlnqoutblk:
+	CLRL	EDX			;Initialize count
+2$:	TESTB	tdb_stsout.B[ESI], #TSO$JUNK|TSO$JUNKX|TSO$HOLDS|TSO$HOLDP
+					;Are we junking or holding output?
+	JNE	10$.S			;Yes
+4$:	MOVB	AL, ES:[EBX]		;Get character
+	CALL	outchr			;Store character in output buffer
+	JC	14$.S			;If no more room
+	INCL	EBX			;Bump pointer
+	INCL	EDX			;Bump count
+	LOOP	ECX, 4$			;Loop if more to output
+	CLRL	EAX			;Return 0
+6$:	MOVL	ECX, EDX		;Get count in right register
+8$:	MOVL	EBX, #QSTS$DONE
+	JMP	outsend
+
+;Here if want to junk or hold output
+
+10$:	TESTB	tdb_stsout.B[ESI], #TSO$JUNK|TSO$JUNKX ;Holding output?
+	JE	14$.S			;Yes
+	ADDL	ECX, EDX		;No - just return and say we output
+	CLRL	EAX			;  everything
+	JMP	8$.S
+
+;Here if need to wait
+
+14$:	CALL	knlXfWaitNTO##		;Wait until have space
+	JNC	2$.S			;Go on if OK
+	JMP	6$.S			;If error
+.PAGE
+	.SBTTL	tf_qoutstr - tlnqoutstr - Output string at fork level
+
+;Here for the tf_outstrf dispatch - Output string at fork level
+;	c{ES:EBX} = Address of string
+;	c{ESI}    = Offset of TDB
+;	CALL	tlnqoutstr
+;	c{EAX} = Error code
+;	c{ECX} = Amount output
+;	c{ESI} = Status bits
+
+tlnqoutstr:
+	CLRL	ECX			;Initialize count
+2$:	MOVB	AL, ES:[EBX]		;Get character
+	CMPB	AL, #0			;Finished?
+	JE	8$.S			;Yes
+	TESTB	tdb_stsout.B[ESI], #TSO$JUNK|TSO$JUNKX ;Are we junking output?
+	JNE	6$.S			;Yes
+	TESTB	tdb_stsout.B[ESI], #TSO$HOLDS|TSO$HOLDP ;Are we holding output?
+	JNE	14$.S			;Yes
+	CALL	outchr			;No - store character in output buffer
+	JC	14$.S			;If no more room
+6$:	INCL	EBX			;Bump pointer
+	INCL	ECX			;Bump count
+	JMP	2$.S			;Continue
+
+;Here when finished
+
+8$:	CLRL	EAX			;Return 0
+10$:	MOVL	EBX, #QSTS$DONE
+	JMP	outsend
+
+;Here if need to wait
+
+14$:	CALL	knlXfWaitNTO##
+	JNC	2$.S			;Go on if OK
+	JMP	10$.S			;If error
+.PAGE
+	.SBTTL	tf_clrout - tlnclrout - Clear output ring buffer
+
+;Here for the tf_clrout dispatch - Clear output ring buffer
+
+tlnclrout:
+	CLRL	EAX
+	MOVL	tdb_tlnoutrput[ESI], EAX ;Reset putter and taker pointers
+	MOVL	tdb_tlnoutrtak[ESI], EAX
+	MOVL	tdb_outrcnt[ESI], EAX	;Clear the count
+	RET
+.PAGE
+	.SBTTL	outchr - Subroutine to store character in output ring
+
+;Subroutine to store character in output ring - may only be called at fork level
+;	c(AL) = Character
+;	c{ESI} = Offset of TDB
+;	CALL	outchr
+;	C:set = Must wait, no output done
+;	C:clr = Normal
+;  All registers except FS and GS are preserved
+
+outchr:	PUSHL	EDX
+	MOVL	EDX, tdb_tlnoutrsize.B[ESI] ;Room for more now?
+	SUBL	EDX, #3.B
+	CMPL	tdb_outrcnt[ESI], EDX
+	JBE	4$.S			;Yes - go on
+	PUSHAL				;No
+	PUSHL	ES
+	CALL	dumpoutring		;Dump out as much as we can
+	POPL	ES
+	POPAL
+	CMPL	tdb_outrcnt[ESI], EDX	;Did we free up any space?
+	JA	10$.S			;No - must wait now
+4$:	MOVL	EDX, tdb_tlnoutrput.B[ESI] ;Get putter pointer
+	MOVB	tdb_tlnoutring.B[ESI+EDX], AL ;Store character in ring
+	INCL	EDX			;Bump pointer
+	CMPL	EDX, tdb_tlnoutrsize.B[ESI]
+	JB	6$.S
+	CLRL	EDX
+6$:	MOVL	tdb_tlnoutrput.B[ESI], EDX
+	INCL	tdb_outrcnt[ESI]	;Bump count
+	POPL	EDX
+	CLC				;Indicate character stored
+	RET				;And return
+
+;Here if must wait
+
+10$:	POPL	EDX
+	STC				;Indicate must wait
+ret008:	RET				;And return
+.PAGE
+	.SBTTL	tlnechchr - Subroutine to echo character
+
+;Subroutine to echo character - may only be called at fork level
+;	c(AL) = Character
+;	c{ESI} = Offset of TDB
+;	CALL	tlnechchr
+;	C:set = Should stop echoing
+;	C:clr = Can continue echoing if need to
+
+tlnechchr:
+
+	ANDB	tdb_stsout.B[ESI], #{~TSO$OUTA}&0FFh
+	MOVL	EDX, tdb_tlnoutrsize.B[ESI] ;Room for more now?
+	SUBL	EDX, #3.B
+	CMPL	EDX, tdb_outrcnt[ESI]
+	JC	4$.S			;No
+	MOVL	EDX, tdb_tlnoutrput.B[ESI] ;Yes - get putter pointer
+	MOVB	tdb_tlnoutring.B[ESI+EDX], AL ;Store character in ring
+	INCL	EDX			;Bump pointer
+	CMPL	EDX, tdb_tlnoutrsize.B[ESI] ;At end of ring?
+	JB	2$.S			;No
+	CLRL	EDX			;Yes
+2$:	MOVL	tdb_tlnoutrput.B[ESI], EDX ;Store updated putter pointer
+	INCL	tdb_outrcnt [ESI]	;Bump count
+	MOVL	EDX, tdb_tlnoutrsize.B[ESI] ;See if still have room
+	SUBL	EDX, #4.B
+	CMPL	EDX, tdb_outrcnt[ESI]
+4$:	RET
+.PAGE
+	.SBTTL	tf_dspmode - tlndspmode - Get or set display mode
+
+;Here for the tf_dspmode dispatch - Get or set display mode
+;	c{EAX}    = Display mode bits
+;	c{ES:EBX} = Address of data block
+;	CALL	tlndspmode
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  c{EAX} = Current display mode
+
+;NEED TO ADD CODE HERE TO CHANGE LINE WIDTH AND OTHER STUFF!!!
+
+tlndspmode:
+	CMPB	AL, #0FFh		;Setting to "serial port" mode?
+	JE	4$.S			;Yes - thats OK
+	ORB	AL, Al			;No - just want current mode?
+	JNE	6$.S			;No - fail
+4$:	BTL	EAX, #DM%RTNDATA	;Want values returned?
+	JNC	5$.S			;No
+	CLRL	EAX			;Yes - zero stuff we don't support
+	IFFAULT	knlRtnAdrEr##		;Clear dm_textres, dm_prifont, and
+	MOVL	ES:[EBX], EAX		;  dm_secfont
+	IFFAULT	knlRtnAdrEr##
+	MOVL	ES:dm_disptype.B[EBX], EAX
+	MOVL	ES:dm_horiz.B[EBX], EAX
+	MOVL	ES:dm_vert.B[EBX], EAX
+	MOVL	ES:dm_columns.B[EBX], #80t ;THESE SHOULD BE DYNAMIC!!!!!
+	MOVL	ES:dm_rows.B[EBX], #24t
+5$:	MOVL	EAX, #0FFh		;Yes - indicate "serial port" mode
+	RET				;Thats all
+
+;Here if have illegal value for the display mode
+
+6$:	MOVL	EAX, #ER_VALUE
+	STC
+	RET
+.PAGE
+	.SBTTL	tf_setdtr - tlnsetdtr - Set or clear the DTR output
+
+;Here for the tf_setdtr dispatch - Set or clear the DTR modem control output
+;	c(AL)  = New state for bit
+;	c{ESI} = Offset of TDB
+;	CALL	tlnsetdtr
+
+tlnsetdtr:
+	CMPB	AL, #0			;Want to set the bit?
+	JNE	2$.S			;Yes
+;;;;;;;	ANDB	tdb_xxmdcon.B[ESI], #~CMMDC$DTR ;No - clear the bit
+	JMP	4$.S
+
+2$:
+;;;;;;;	ORB	tdb_xxmdcon.B[ESI], #CMMDC$DTR ;Set the bit
+4$:
+
+;;;;;;;	CODE HERE TO SEND MESSAGE ABOUT THIS
+
+	RET
+
+	.SBTTL	tf_setrts - tlnsetrts - Set or clear the RTS output
+
+;Here for the tf_setrts dispatch - Set or clear the RTS modem control output
+;	c(AL)  = New state for bit
+;	c{ESI} = Offset of TDB
+;	CALL	tlnsetrts
+
+tlnsetrts:
+	CMPB	AL, #0			;Want to set the bit?
+	JNE	6$.S			;Yes
+;;;;;;;	ANDB	tdb_xxmdcon.B[ESI], #~CMMDC$RTS ;No - clear the bit
+	JMP	4$.S
+
+6$:
+;;;;;;;	ORB	tdb_xxmdcon.B[ESI], #CMMDC$RTS ;Set the bit
+	JMP	4$.S
+.PAGE
+
+;;;;;;; END OF TERMINAL DEVICE ROUTINES
+.PAGE
+	.SBTTL	tf_resume - tlnresume - Resume output
+
+;Here for the tf_resume dispatch - Resume output
+
+tlnresume:
+	CMPL	dcb_tcpsndover-dcb_tlntdb[ESI], #0.B ;Have we overrun the
+						     ;  window?
+	JG	8$.S			;Yes - forget output for now
+	CMPL	tdb_outrcnt[ESI], #0.B	;No - have anything to output?
+	JE	6$.S			;No
+	PUSHL	EDI			;Yes
+	PUSHL	ESI
+	CALL	dumpoutring		;Yes - dump out as much as we can
+	CALL	xostcpPush#
+	POPL	ESI
+	POPL	EDI
+	CMPL	tdb_outrcnt[ESI], #0.B	;Have anything left to output?
+	JNE	8$.S			;Yes
+6$:	CALL	knlTrmDoEcho##		;No - see if anything to echo
+	JMP	knlTrmOutDone##		;Wake up anyone waiting for output
+
+;Here if could not output everything - indicate output is active
+
+8$:	ORB	tdb_stsout.B[ESI], #TSO$OUTA
+10$:	RET
+.PAGE
+;Subroutine to output the contents of the terminal output ring buffer - this
+;  subroutine copies as many characters as possible from the terminal output
+;  ring buffer to TCP packets.  Should only be called after checking for
+;  1 or more bytes in the ring buffer and that the output window is not
+;  overcommitted.  Stops when the output ring is empty or the output window
+;  becomes overcommitted or if retransmission is in progress.
+;	c{ESI} = Offset of terminal TDB
+;	CALL	dumpoutring
+;Warning: EDI and ESI are NOT preserved!
+
+dumpoutring:
+	MOVL	ECX, tdb_outrcnt[ESI]	;Get amount in the output ring
+	LEAL	EDI, -dcb_tlntdb[ESI]	;Point to the Telnet DCB
+	MOVL	ESI, dcb_netidb.B[EDI]	;And the network IDB
+	CALL	xostcpAlloc##		;Allocate packet space
+	JC	6$.S			;Forget it if error!
+2$:	TESTB	dcb_tcpsts1.B[EDI], #TCPS1$REXMIT
+	JNE	6$.S
+	CMPL	dcb_tcpsndover[EDI], #0.B
+	JG	6$.S
+	MOVL	EDX, dcb_tlntdb+tdb_tlnoutrtak[EDI]
+	MOVB	AL, dcb_tlntdb+tdb_tlnoutring[EDI+EDX]
+	INCL	EDX
+	CMPL	EDX, dcb_tlntdb+tdb_tlnoutrsize[EDI]
+	JB	4$.S
+	CLRL	EDX
+4$:	MOVL	dcb_tlntdb+tdb_tlnoutrtak[EDI], EDX
+	CALL	tlnputbyte
+	JC	6$.S
+	DECL	dcb_tlntdb+tdb_outrcnt[EDI]
+	JNE	2$.S
+6$:	RET
+.PAGE
+;Here when the network says it needs more output
+
+tlnneedout:
+	TESTB	dcb_tcpsts1.B[EDI], #TCPS1$REXMIT
+	JNE	4$.S
+	CMPL	dcb_tcpsndover[EDI], #0.B ;Have we overrun the window?
+	JG	4$.S			;Yes - not really ready for output!
+;;;;;;	MOVL	EAX, dcb_tcpsndwinm[EDI] ;No - is the window 3/4 open?
+;;;;;;	SHRL	EAX, #2t
+;;;;;;	CMPL	dcb_tcpsndwina[EDI], EAX
+;;;;;;	JB	4$.S			;No !!!!! NEED TIMEOUT HERE !!!!!
+	PUSHL	EDI			;Yes - start him up if there is
+	PUSHL	ESI			;  anything available to output
+	LEAL	ESI, dcb_tlntdb[EDI]
+	ANDB	tdb_stsout.B[ESI], #{~TSO$OUTA}&0FFh
+	CALL	tlnresume
+	POPL	ESI
+	POPL	EDI
+4$:	RET
+.PAGE
+	.SBTTL	tf_imodechng - tlnimodechng- Input mode change
+
+;Here for the tf_imodechng dispatch - Input mode change
+
+tlnimodechng:
+	RET
+
+	.SBTTL	tf_omodechng - tlnomodechng - Output mode change
+
+;Here for the tf_omodechng dispatch - Output mode change
+
+tlnomodechng:
+	RET
+.PAGE
+	.SBTTL	tlnhavedata - Telnet input data available routine
+
+;Telnet input data available routine - get here in the TCPS_ESTAB state with
+;  an input packet to process
+;	c{EBX} = Offset of input packet
+;	c{ECX} = Number of bytes available
+;	c{EDX} = Offset of start of data in packet
+;	CALL	tlnhavedata
+
+$$$=!0
+FRM thd_pktb , 4t	;Pointer to packet buffer
+FRM thd_pktp , 4t	;Pointer to next byte to process
+FRM thd_size , 4t	;Total number of bytes in packet
+FRM thd_count, 4t	;Number of bytes remaining to process
+thd_SIZE=!$$$
+
+tlnhavedata:
+	ENTER	thd_SIZE, 0
+	MOVL	thd_pktb.B[EBP], EBX
+	MOVL	thd_pktp.B[EBP], EDX
+	MOVL	thd_size.B[EBP], ECX
+	MOVL	thd_count.B[EBP], ECX
+	JREGZ	ECX, 4$			;If packet is empty
+	ADDL	dcb_tcprcvsnum.B[EDI], ECX ;Bump receive sequence number
+	SUBL	dcb_tcprcvwinb.B[EDI], ECX ;Reduce receive window size
+	CALL	xostcpSendAck##		;Send an ACK
+2$:	MOVL	EDX, thd_pktp.B[EBP]
+	MOVZBL	EAX, [EDX]		;Get byte from packet
+	INCL	thd_pktp.B[EBP]
+	MOVZBL	ECX, dcb_tlnrcvstate[EDI] ;Get receive state
+	JMPIL	rcvdsp[ECX*4]		;Dispatch on the state
+
+	DATA
+
+rcvdsp:	.LONG	rcvnorm		;RS_NORM     = 0 - Normal character next
+	.LONG	rcvcmd		;RS_CMD      = 1 - Command next
+	.LONG	havesb		;RS_HAVESB   = 2 - Have SB command
+	.LONG	havesbc		;RS_HAVESBC  = 3 - Have SBC command
+	.LONG	havewill	;RS_HAVEWILL = 4 - Have WILL command
+	.LONG	havewont	;RS_HAVEWONT = 5 - Have WONT command
+	.LONG	havedo		;RS_HAVEDO   = 6 - Have DO command
+	.LONG	havedont	;RS_HAVEDONT = 7 - Have DONT command
+
+	CODE
+
+;Here for command character to be treated as data
+
+rcvdata:MOVB	dcb_tlnrcvstate[EDI], #RS_NORM ;Reset the receive state
+
+;Here for normal received character
+
+rcvnorm:CMPB	AL, #0FFh		;Is this a Telnet escape?
+	JE	6$.S			;Yes
+	CMPB	AL, #0			;No - is this a null?
+	JE	rcvnext.S		;Yes - ignore it!
+	BTSL	EAX, #31t		;No - indicate image character
+rcvinp:	PUSHL	ESI
+	MOVL	ESI, dcb_ipsdpdb.B[EDI]	;Count the input byte
+	INCL	dpdb_tcptlncntbytein.B[ESI]
+	LEAL	ESI, dcb_tlntdb[EDI]	;Get offset of our terminal TDB
+	PUSHL	EDI
+	CALL	knlTrmInp##		;Give it to the terminal routine
+	POPL	EDI
+	POPL	ESI
+rcvnext:DECL	thd_count.B[EBP]
+	JNE	2$.S			;Continue if more to do
+4$:	MOVL	EBX, thd_pktb.B[EBP]
+	LEAVE
+	CALL	xosnetGiveBufr##	;Give up the packet buffer
+	RET
+
+;Here with the Telnet escape character (0FFh)
+
+6$:	MOVB	dcb_tlnrcvstate[EDI], #RS_CMD ;Update the receive state
+	JMP	rcvnext.S		;Continue
+.PAGE
+;Here when expecting byte following an 0FFh byte
+
+rcvcmd:	CMPB	AL, #0F0h		;Valid Telnet command?
+	JB	rcvdata			;No - treat it as data!
+	JMPIL	cmddsp-{0F0h*4}[EAX*4]	;Yes - dispatch on the command
+
+	DATA
+
+cmddsp:	.LONG	rcvdata		;TNC_SE   = F0 - End of subnegotiation
+	.LONG	rcvopdn		;TNC_NOP  = F1 - No operation
+	.LONG	cmddm		;TNC_DM   = F2 - Data mark
+	.LONG	cmdbrk		;TNC_BRK  = F3 - Out-of-band break character
+	.LONG	cmdip		;TNC_IP   = F4 - Interrupt process function
+	.LONG	cmdao		;TNC_AO   = F5 - Abort output function
+	.LONG	cmdayt		;TNC_AYT  = F6 - Are you there function
+	.LONG	cmdec		;TNC_EC   = F7 - Erase character function
+	.LONG	cmdel		;TNC_EL   = F8 - Erase line function
+	.LONG	cmdga		;TNC_GA   = F9 - Go ahead signal
+	.LONG	cmdsb		;TNC_SB   = FA - Start of subnegotiation
+	.LONG	cmdwill		;TNC_WILL = FB - Start of option negotiation
+	.LONG	cmdwont		;TNC_WONT = FC - Start of option negotiation
+	.LONG	cmddo		;TNC_DO   = FD - Start of option negotiation
+	.LONG	cmddont		;TNC_DONT = FE - Start of option negotiation
+	.LONG	rcvdata		;TCL_IAC  = FF - Data byte 0FFh
+
+	CODE
+.PAGE
+	.SBTTL	cmddm - Here for TNC_DM - Data mark
+
+;Here for TNC_DM command (F2) - Data mark
+
+cmddm:
+	JMP	rcvnext
+
+	.SBTTL	cmdbrk - Here for TNC_BRK - Out-of-band break character
+
+;Here for TNC_BRK command (F3) - Out-of-band break character
+
+cmdbrk:	PUSHL	EBX
+	PUSHL	EDX
+	PUSHL	ECX
+	PUSHL	EDI
+	CALL	knlTrmBreak##		;Give it to the terminal routine
+	POPL	EDI
+	POPL	ECX
+	POPL	EDX
+	POPL	EBX
+	JMP	rcvnext			;Continue
+.PAGE
+	.SBTTL	cmdip - Here for TNC_IP - Interrupt process function
+
+;Here for TNC_IP command (F4) - Interrupt process function
+
+cmdip:
+	JMP	rcvnext
+
+	.SBTTL	cmdao - Here for TNC_AO - Abort output function
+
+;Here for TNC_AO command (F5) - Abort output function
+
+cmdao:
+	JMP	rcvnext
+
+	.SBTTL	cmdayt - Here for TNC_AYT - Are you there function
+
+;Here for TNC_AYT command (F6) - Are you there function
+
+cmdayt:
+	JMP	rcvnext
+
+	.SBTTL	cmdec - Here for TNC_EC - Erase character function
+
+;Here for TNC_EC command (F7) - Erase character function
+
+cmdec:
+	JMP	rcvnext
+
+	.SBTTL	cmdel - Here for TNC_EL - Erase line function
+
+;Here for TNC_EL command (F8) - Erase line function
+
+cmdel:
+	JMP	rcvnext
+
+	.SBTTL	cmdga - Here for TNC_GA - Go ahead signal
+
+;Here for TNC_GA command (F9) - Go ahead signal
+
+cmdga:
+	JMP	rcvnext
+.PAGE
+	.SBTTL	cmdsb - Here for TNC_SB - Start of subnegotiation
+
+;Here for TNC_SB command (FA) - Start of subnegotiation
+
+cmdsb:	MOVB	dcb_tlnrcvstate[EDI], #RS_HAVESB ;Reset the receive state
+	MOVB	dcb_tlnsbpntr[EDI], #0	;Reset subnegotiation pointer
+	MOVB	dcb_tlnsbdata[EDI], #0FFh
+	JMP	rcvnext			;Continue
+
+;Here with first subnegotiation byte
+
+havesb:	CMPB	AL, #TNC_IAC		;Is this the command prefix?
+	JE	4$.S			;Yes
+	MOVZBL	EDX, dcb_tlnsbpntr[EDI]	;No - get pointer
+	CMPL	EDX, #TLNSBMAX.B	;Have too much data?
+	JAE	2$.S			;Yes
+	MOVB	dcb_tlnsbdata[EDI+EDX], AL ;No - store this byte
+	INCB	dcb_tlnsbpntr[EDI]	;Bump poiner
+2$:	JMP	rcvnext
+
+;Here with command prefix character
+
+4$:	MOVB	dcb_tlnrcvstate[EDI], #RS_HAVESBC ;Update the receive state
+	JMP	rcvnext			;Continue
+
+;Here with character following command prefix character
+
+havesbc:CMPB	AL, #TNC_SE		;End of subnegotiation sequence?
+	JNE	rcvopdn.S		;No - this is illegal - abandon the
+					;  subnegotiation sequence
+	MOVZBL	EAX, dcb_tlnsbdata+0[EDI] ;Get option byte
+	CMPL	EAX, #TNOMAXVAL		;Valid value?
+	JA	rcvopdn.S		;No - forget it!
+	CALLI	sbdsp[EAX*4]		;Yes - dispatch on the option
+rcvopdn:MOVB	dcb_tlnrcvstate[EDI], #RS_NORM ;Reset the state to normal
+	JMP	rcvnext			;Continue
+
+	DATA
+
+sbdsp:	.LONG	ret004		;TNO_BINARY  = 00 - Binary transmission
+	.LONG	ret004		;TNO_ECHO    = 01 - Echo
+	.LONG	ret004		;TNO_RCP     = 02 - Reconnection
+	.LONG	ret004		;TNO_SUPGA   = 03 - Suppress go ahead
+	.LONG	ret004		;TNO_NAMS    = 04 - Approx message size
+				;		      negotiation
+	.LONG	ret004		;TNO_STATUS  = 05 - Status
+	.LONG	ret004		;TNO_MARK    = 06 - Timing mark
+	.LONG	ret004		;TNO_RCTE    = 07 - Remote controlled trans and
+				;		      echo
+	.LONG	ret004		;TNO_OLW     = 08 - Output line width
+	.LONG	ret004		;TNO_OPS     = 09 - Output page size
+	.LONG	ret004		;TNO_OCRD    = 0A - Output CR disposition
+	.LONG	ret004		;TNO_OHTS    = 0B - Output horiz tab stops
+	.LONG	ret004		;TNO_OHTD    = 0C - Output horiz tab disposition
+	.LONG	ret004		;TNO_OFFD    = 0D - Output formfeed disposition
+	.LONG	ret004		;TNO_OVTS    = 0E - Output vert tab stops
+	.LONG	ret004		;TNO_OVTD    = 0F - Output vert tab disposition
+	.LONG	ret004		;TNO_OLFD    = 10 - Output linefeed disposition
+	.LONG	ret004		;TNO_XASCII  = 11 - Extended ASCI
+	.LONG	ret004		;TNO_LOGOUT  = 12 - Logout
+	.LONG	ret004		;TNO_BM      = 13 - Byte macro
+	.LONG	ret004		;TNO_DET     = 14 - Data entry terminal
+	.LONG	ret004		;	     = 15 - Reserved
+	.LONG	ret004		;TNO_SUPDUP  = 16 - SUPDUP
+	.LONG	ret004		;TNO_SDOUT   = 17 - SUPDUP output
+	.LONG	ret004		;TNO_TERM    = 18 - Terminal type
+	.LONG	ret004		;TNO_EOR     = 19 - End of record
+	.LONG	ret004		;TNO_TACACS  = 1A - TACACS user identification
+	.LONG	ret004		;TNO_OM      = 1B - Output marking
+	.LONG	ret004		;TNO_TLN     = 1C - Terminal location number
+	.LONG	ret004		;TNO_3270    = 1D - 3270 terminal mode
+	.LONG	ret004		;TNO_X3PAD   = 1E - X.3 Pad mode
+	.LONG	ret004		;TNO_NAWS    = 1F - Negotiate about window size
+	.LONG	ret004		;TNO_SPEED   = 20 - Terminal speed option
+	.LONG	ret004		;TNO_TFC     = 21 - Toggle flow control
+	.LONG	ret004		;TNO_LM      = 22 - Line mode
+	.LONG	ret004		;TNO_XLOC    = 23 - X-display location
+TNOMAXVAL=!{$-sbdsp}/4
+
+	CODE
+.PAGE
+	.SBTTL	cmdwill - Here for TNC_WILL - Start of option negotiation
+
+;Here for TNC_WILL command (FB) - Start of option negotiation - this is a
+;  request that the other side use an option (we can refuse if we want)
+
+cmdwill:MOVB	dcb_tlnrcvstate[EDI], #RS_HAVEWILL ;Update the receive state
+	JMP	rcvnext			;Continue
+
+havewill:
+	CMPB	AL, #TNOMAXVAL		;Valid option?
+	JA	4$.S			;No
+	BTL	avlrmtopt, EAX		;Yes - do we support it?
+	JNC	4$.S			;No
+	BTSL	dcb_tlnrmtopt[EDI], EAX	;Yes - is it enabled now?
+	JC	6$.S			;Yes - nothing more needed here
+	PUSHL	rmtchng[EAX*4]		;No - get offset of routine to call
+	BTZL	dcb_tlnrmtreq[EDI], EAX	;Are we requesting it now?
+	JC	2$.S			;Yes - don't send response but do call
+	PUSHL	EAX			;  our function
+	MOVB	AL, #TNC_IAC
+	CALL	tlnputbyte
+	MOVB	AL, #TNC_DO		;Send back DO
+	CALL	tlnputbyte
+	POPL	EAX
+	CALL	tlnputbyte
+2$:	POPL	ECX
+	CALLI	ECX
+	JMP	6$.S
+
+;Here if he is asking to use an option we cannot handle
+
+4$:	PUSHL	EAX
+	MOVB	AL, #TNC_IAC
+	CALL	tlnputbyte
+	MOVB	AL, #TNC_DONT
+	CALL	tlnputbyte
+	POPL	EAX
+	CALL	tlnputbyte
+6$:	CALL	xostcpPush##
+	MOVB	dcb_tlnrcvstate[EDI], #RS_NORM ;Reset the state to normal
+	JMP	rcvnext			;Continue
+.PAGE
+	.SBTTL	cmddo - Here for TNC_DO - Start of option negotiation
+
+;Here for TNC_DO command (FD) - Start of option negotiation - this is a request
+;  for us to use the indicated option (we can refuse if we want)
+
+cmddo:	MOVB	dcb_tlnrcvstate[EDI], #RS_HAVEDO ;Update the receive state
+	JMP	rcvnext			;Continue
+
+;Here with option value for TNC_DO
+
+havedo:	CMPB	AL, #TNOMAXVAL		;Valid option?
+	JA	4$.S			;No
+	BTL	avllclopt, EAX		;Yes - do we support it?
+	JNC	4$.S			;No
+	BTSL	dcb_tlnlclopt[EDI], EAX	;Yes - is it enabled now?
+	JC	8$.S			;Yes - nothing more needed here
+	PUSHL	lclchng[EAX*4]		;No - get offset of routine to call
+	BTZL	dcb_tlnlclreq[EDI], EAX	;Are we requesting it now?
+	JC	2$.S			;Yes - don't send response but do call
+	PUSHL	EAX			;  our function
+	MOVB	AL, #TNC_IAC
+	CALL	tlnputbyte
+	MOVB	AL, #TNC_WILL		;Send back WILL
+	CALL	tlnputbyte
+	POPL	EAX
+	CALL	tlnputbyte		;This will return to offset we pushed
+2$:	POPL	ECX
+	CALLI	ECX
+	JMP	8$.S
+
+;Here if we cannot enable the requested option
+
+4$:	PUSHL	EAX
+	MOVB	AL, #TNC_IAC
+	CALL	tlnputbyte
+	MOVB	AL, #TNC_WONT
+	CALL	tlnputbyte
+	POPL	EAX
+	CALL	tlnputbyte
+8$:	CALL	xostcpPush##
+	MOVB	dcb_tlnrcvstate[EDI], #RS_NORM ;Reset the state to normal
+	JMP	rcvnext			;Continue
+.PAGE
+	.SBTTL	cmdwont - Here for TNC_WONT - Start of option negotiation
+
+;Here for TNC_WONT command (FC) - Start of option negotiation - this is an
+;  indication that the other side will not use an option (we cannot refuse!)
+
+cmdwont:MOVB	dcb_tlnrcvstate[EDI], #RS_HAVEWONT ;Update the receive state
+	JMP	rcvnext			;Continue
+
+havewont:
+	CMPB	AL, #TNOMAXVAL		;Valid option?
+	JA	10$.S			;No - ignore it
+	BTZL	dcb_tlnrmtreq[EDI], EAX	;Yes - are we requesting it now?
+	JNC	4$.S			;No
+	MOVL	ECX, rmtchng[EAX*4]	;Yes - get offset of routine
+	JMP	8$.S
+
+4$:	BTZL	dcb_tlnrmtopt[EDI], EAX	;Is it enabled now?
+	JNC	10$.S			;No - ignore this
+	PUSHL	rmtchng[EAX*4]		;Yes - get offset of routine to call
+	PUSHL	EAX
+	MOVB	AL, #TNC_IAC
+	CALL	tlnputbyte
+	MOVB	AL, #TNC_DONT		;Send back DONT
+	CALL	tlnputbyte
+	POPL	EAX
+	CALL	tlnputbyte		;This will return to offset we pushed
+	POPL	ECX
+8$:	CALLI	ECX
+10$:	CALL	xostcpPush##
+	MOVB	dcb_tlnrcvstate[EDI], #RS_NORM ;Reset the state to normal
+	JMP	rcvnext			;Continue
+.PAGE
+	.SBTTL	cmddont - Here for TNC_DONT - Start of option negotiation
+
+;Here for TNC_DONT command (FE) - Start of option negotiation - this is a
+;  demand that we not use an option (we cannot refuse!)
+
+cmddont:MOVB	dcb_tlnrcvstate[EDI], #RS_HAVEDONT ;Update the receive state
+	JMP	rcvnext			;Continue
+
+havedont:
+	CMPB	AL, #TNOMAXVAL		;Valid option?
+	JA	10$.S			;No - ignore it (this is the right thing
+					;  to do since it cannot have a
+					;  different state since we don't know
+					;  anything about it
+	BTZL	dcb_tlnlclreq[EDI], EAX	;Yes - are we requesting it now?
+	JNC	4$.S			;No
+	MOVL	ECX, lclchng[EAX*4]	;Yes - get offset of routine
+	JMP	6$.S
+
+4$:	BTZL	dcb_tlnlclopt[EDI], EAX	;Is it enabled now?
+	JNC	10$.S			;No - ignore this
+	PUSHL	lclchng[EAX*4]		;Yes - get offset of routine to call
+	PUSHL	EAX
+	MOVB	AL, #TNC_IAC
+	CALL	tlnputbyte
+	MOVB	AL, #TNC_WONT		;Send back WONT
+	CALL	tlnputbyte
+	POPL	EAX
+	CALL	tlnputbyte		;This will return to offset we pushed
+	POPL	ECX
+6$:	CALLI	ECX
+10$:	CALL	xostcpPush##
+	MOVB	dcb_tlnrcvstate[EDI], #RS_NORM ;Reset the state to normal
+	JMP	rcvnext			;Continue
+.PAGE
+	.SBTTL	Routines to handle remote options
+
+	DATA
+
+;Dispatch table for change of state of remote options
+
+rmtchng:.LONG	ret004		;TNO_BINARY  = 00 - Binary transmission
+	.LONG	ret004		;TNO_ECHO    = 01 - Echo
+	.LONG	ret004		;TNO_RCP     = 02 - Reconnection
+	.LONG	ret004		;TNO_SUPGA   = 03 - Suppress go ahead
+	.LONG	ret004		;TNO_NAMS    = 04 - Approx message size
+				;		      negotiation
+	.LONG	ret004		;TNO_STATUS  = 05 - Status
+	.LONG	ret004		;TNO_MARK    = 06 - Timing mark
+	.LONG	ret004		;TNO_RCTE    = 07 - Remote controlled trans and
+				;		      echo
+	.LONG	ret004		;TNO_OLW     = 08 - Output line width
+	.LONG	ret004		;TNO_OPS     = 09 - Output page size
+	.LONG	ret004		;TNO_OCRD    = 0A - Output CR disposition
+	.LONG	ret004		;TNO_OHTS    = 0B - Output horiz tab stops
+	.LONG	ret004		;TNO_OHTD    = 0C - Output horiz tab disposition
+	.LONG	ret004		;TNO_OFFD    = 0D - Output formfeed disposition
+	.LONG	ret004		;TNO_OVTS    = 0E - Output vert tab stops
+	.LONG	ret004		;TNO_OVTD    = 0F - Output vert tab disposition
+	.LONG	ret004		;TNO_OLFD    = 10 - Output linefeed disposition
+	.LONG	ret004		;TNO_XASCII  = 11 - Extended ASCI
+	.LONG	ret004		;TNO_LOGOUT  = 12 - Logout
+	.LONG	ret004		;TNO_BM      = 13 - Byte macro
+	.LONG	ret004		;TNO_DET     = 14 - Data entry terminal
+	.LONG	ret004		;	     = 15 - Reserved
+	.LONG	ret004		;TNO_SUPDUP  = 16 - SUPDUP
+	.LONG	ret004		;TNO_SDOUT   = 17 - SUPDUP output
+	.LONG	ret004		;TNO_TERM    = 18 - Terminal type
+	.LONG	ret004		;TNO_EOR     = 19 - End of record
+	.LONG	ret004		;TNO_TACACS  = 1A - TACACS user identification
+	.LONG	ret004		;TNO_OM      = 1B - Output marking
+	.LONG	ret004		;TNO_TLN     = 1C - Terminal location number
+	.LONG	ret004		;TNO_3270    = 1D - 3270 terminal mode
+	.LONG	ret004		;TNO_X3PAD   = 1E - X.3 Pad mode
+	.LONG	ret004		;TNO_NAWS    = 1F - Negotiate about window size
+	.LONG	ret004		;TNO_SPEED   = 20 - Terminal speed option
+	.LONG	ret004		;TNO_TFC     = 21 - Toggle flow control
+	.LONG	ret004		;TNO_LM      = 22 - Line mode
+	.LONG	ret004		;TNO_XLOC    = 23 - X-display location
+
+	CODE
+.PAGE
+	.SBTTL	Routines to handle local options
+
+	DATA
+
+;Dispatch table for change of state of local options
+
+lclchng:.LONG	ret004		;TNO_BINARY  = 00 - Binary transmission
+	.LONG	lclecho		;TNO_ECHO    = 01 - Echo
+	.LONG	ret004		;TNO_RCP     = 02 - Reconnection
+	.LONG	ret004		;TNO_SUPGA   = 03 - Suppress go ahead
+	.LONG	ret004		;TNO_NAMS    = 04 - Approx message size
+				;		      negotiation
+	.LONG	ret004		;TNO_STATUS  = 05 - Status
+	.LONG	ret004		;TNO_MARK    = 06 - Timing mark
+	.LONG	ret004		;TNO_RCTE    = 07 - Remote controlled trans and
+				;		      echo
+	.LONG	ret004		;TNO_OLW     = 08 - Output line width
+	.LONG	ret004		;TNO_OPS     = 09 - Output page size
+	.LONG	ret004		;TNO_OCRD    = 0A - Output CR disposition
+	.LONG	ret004		;TNO_OHTS    = 0B - Output horiz tab stops
+	.LONG	ret004		;TNO_OHTD    = 0C - Output horiz tab disposition
+	.LONG	ret004		;TNO_OFFD    = 0D - Output formfeed disposition
+	.LONG	ret004		;TNO_OVTS    = 0E - Output vert tab stops
+	.LONG	ret004		;TNO_OVTD    = 0F - Output vert tab disposition
+	.LONG	ret004		;TNO_OLFD    = 10 - Output linefeed disposition
+	.LONG	ret004		;TNO_XASCII  = 11 - Extended ASCI
+	.LONG	ret004		;TNO_LOGOUT  = 12 - Logout
+	.LONG	ret004		;TNO_BM      = 13 - Byte macro
+	.LONG	ret004		;TNO_DET     = 14 - Data entry terminal
+	.LONG	ret004		;	     = 15 - Reserved
+	.LONG	ret004		;TNO_SUPDUP  = 16 - SUPDUP
+	.LONG	ret004		;TNO_SDOUT   = 17 - SUPDUP output
+	.LONG	ret004		;TNO_TERM    = 18 - Terminal type
+	.LONG	ret004		;TNO_EOR     = 19 - End of record
+	.LONG	ret004		;TNO_TACACS  = 1A - TACACS user identification
+	.LONG	ret004		;TNO_OM      = 1B - Output marking
+	.LONG	ret004		;TNO_TLN     = 1C - Terminal location number
+	.LONG	ret004		;TNO_3270    = 1D - 3270 terminal mode
+	.LONG	ret004		;TNO_X3PAD   = 1E - X.3 Pad mode
+	.LONG	ret004		;TNO_NAWS    = 1F - Negotiate about window size
+	.LONG	ret004		;TNO_SPEED   = 20 - Terminal speed option
+	.LONG	ret004		;TNO_TFC     = 21 - Toggle flow control
+	.LONG	ret004		;TNO_LM      = 22 - Line mode
+	.LONG	ret004		;TNO_XLOC    = 23 - X-display location
+
+	CODE
+.PAGE
+	.SBTTL	lclecho - Change local echo option
+
+;Here when changing the local echo option value
+
+lclecho:BTZL	dcb_tlntdb+tdb_imode[EDI], #TIM%HALFDUP ;Assume setting option
+	BTL	dcb_tlnlclopt[EDI], #TNO_ECHO ;Right?
+	JC	4$.S			;Yes
+	BTSL	dcb_tlntdb+tdb_imode[EDI], #TIM%HALFDUP ;No - clearing it
+4$:	MOVL	EAX, dcb_ipsdpdb.B[EDI]
+	TESTB	dpdb_tcptlnsts1[EAX], #TLNS1$SESSION ;Should we create a session?
+	JE	ret020.S		;No
+	TESTB	dcb_tlnsts1[EDI], #TLNS1$HAVESSN ;Yes - have we done it yet?
+	JNE	ret020.S		;Yes
+	ORB	dcb_tlnsts1[EDI], #TLNS1$HAVESSN ;No - do it now
+	MOVL	EAX, dcb_tlntdb+tdb_name+0[EDI] ;Get device name
+	MOVL	EBX, dcb_tlntdb+tdb_name+4[EDI]
+	CLRL	ECX			;No auto rate stuff
+	MOVL	EDX, #CR		;Say we have a CR
+	PUSHL	EDI
+	PUSHL	ESI
+	MOVL	ESI, dcb_ipsdpdb.B[EDI]	;Get create session symbiont name
+	ADDL	ESI, #dpdb_tcptlnmsgdst.B
+	MOVL	EDI, #tlnmsgsrc		;Get offset of source name string
+	CALL	knlLogInMsg##
+	POPL	ESI
+	POPL	EDI
+	JNC	ret020.S		;Go on if OK
+	MOVB	dcb_tcpstate.B[EDI], #TCPS_FINWAIT1 ;Error - update state
+	CALL	xostcpSendFin##		;Send a FIN
+	JC	giveup
+ret020:	RET				;Finished here
+.PAGE
+	.SBTTL	tlnputbyte - Subroutine to output byte
+
+;Subroutine to output byte
+;	c(AL) = Byte to output
+;	CALL	tlnputbyte
+
+tlnputbyte:
+	MOVL	EDX, dcb_ipsdpdb.B[EDI]	;Count the output byte
+	INCL	dpdb_tcptlncntbyteout.B[EDX]
+	JMP	xostcpPutByte##
+
+	.SBTTL	tlnputstr - Subroutine to output string
+
+;Subroutine to output string
+;	c{EBX} = Offset of string
+;	CALL	tlnputstr
+
+tlnputstr:
+	MOVB	AL, [EBX]		;Get byte
+	CMPB	AL, #0			;End of string?
+	JE	ret020.S		;Yes
+	INCL	EBX
+	MOVL	EDX, dcb_ipsdpdb.B[EDI]	;Count the output byte
+	INCL	dpdb_tcptlncntbyteout.B[EDX]
+	PUSHL	EBX
+	CALL	xostcpPutByte##
+	POPL	EBX
+	JMP	tlnputstr.S
+.PAGE
+	DATA
+
+tlnccb:     .BLKB  ccb_SIZE	;TELNET CCB
+tlndpdbhead:.LONG  0		;Offset of first TELNET DPDB
+namebfr:    .BLKB  8t		;Buffer for building device name
+tlnmsgsrc:  .ASCIZ "DEV^TLN"	;Source name for message to the login symbiont
+newcmsg:    .BYTE  TNC_IAC, TNC_WILL, TNO_ECHO
+	    .BYTE  TNC_IAC, TNC_DO, TNO_TFC, 0
+
+	  .MOD	4
+avllclopt:.LONG	0000000Ah	;Supported local options (bits 0 - 31, 1 means
+	  .LONG	00010000h	;  yes)
+avlrmtopt:.LONG	00000008h	;Supported remote options
+	  .LONG	00010002h	;       Option     Local Remote
+				;  0 = TNO_BINARY  = No  No
+				;  1 = TNO_ECHO    = Yes No
+				;  2 = TNO_RCP     = No  No
+				;  3 = TNO_SUPGA   = Yes Yes
+				;  4 = TNO_NAMS    = No  No
+				;  5 = TNO_STATUS  = No  No
+				;  6 = TNO_MARK    = No  No
+				;  7 = TNO_RCTE    = No  No
+				;  8 = TNO_OLW     = No  No
+				;  9 = TNO_OPS     = No  No
+				; 0A = TNO_OCRD    = No  No
+				; 0B = TNO_OHTS    = No  No
+				; 0C = TNO_OHTD    = No  No
+				; 0D = TNO_OFFD    = No  No
+				; 0E = TNO_OVTS    = No  No
+				; 0F = TNO_OVTD    = No  No
+				; 10 = TNO_OLFD    = No  No
+				; 11 = TNO_XASCII  = No  No
+				; 12 = TNO_LOGOUT  = No  No
+				; 13 = TNO_BM      = No  No
+				; 14 = TNO_DET     = No  No
+				; 15 = Reserved
+				; 16 = TNO_SUPDUP  = No  No
+				; 17 = TNO_SDOUT   = No  No
+				; 18 = TNO_TERM    = No  No
+				; 19 = TNO_EOR     = No  No
+				; 1A = TNO_TACACS  = No  No
+				; 1B = TNO_OM      = Yes Yes
+				; 1C = TNO_TLN     = No  No
+				; 1D = TNO_3270    = No  No
+				; 1E = TNO_X3PAD   = No  No
+				; 1F = TNO_NAWS    = No  No
+				; 20 = TNO_SPEED   = No  No
+				; 21 = TNO_TFC     = No  Yes
+				; 22 = TNO_LM      = No  No
+				; 23 = TNO_XLOC    = No  No
+
+	LKEEND

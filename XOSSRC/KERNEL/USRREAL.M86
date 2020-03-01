@@ -1,0 +1,953 @@
+	.TITLE	USRREAL - XOS user level kernel routines for real mode
+
+;++++
+; This software is in the public domain.  It may be freely copied and used
+; for whatever purpose you see fit, including commerical uses.  Anyone
+; modifying this software may claim ownership of the modifications, but not
+; the complete derived code.  It would be appreciated if the authors were
+; told what this software is being used for, but this is not a requirement.
+
+;   THIS SOFTWARE IS PROVIDED BY THE AUTHORS "AS IS" AND ANY EXPRESS OR
+;   IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
+;   OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+;   IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+;   INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+;   BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS
+;   OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+;   ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR
+;   TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
+;   USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+;----
+
+	.PROC	80486
+	.INCLUD	XOSINC:\XMAC\XOS.PAR
+	.INCLUD	XOSINC:\XMAC\XOSX.PAR
+	.INCLUD	XOSINC:\XMAC\XOSDOS.PAR
+	.INCLUD XOSINC:\XMAC\XOSERR.PAR
+	.INCLUD	XOSINC:\XMAC\XOSTRM.PAR
+	.INCLUD	XOSINC:\XMAC\XOSDPMI.PAR
+	.INCLUD	SVCDEF.INC
+
+	VUSERCODE
+	.STK16
+
+	.ALMEX
+	.LIST
+	.LIST
+
+	.MACRO	SD  pcnt, pname, vcnt, vname
+	.NLIST
+.IF B {vcnt}
+	.BYTE	0F4, 0, 0, 0
+.IFF
+real'vname==!0ED00:$-vusercodebase
+	.WORD	0F4F4, $$$val
+.ENDC
+$$$val=!$$$val+1
+	.LIST
+	.ENDM
+
+$$$val=!300h
+
+vusercodebase::
+	SVCDEFSYS
+
+	.MACRO	SD  pname, vname
+	.NLIST
+.IF B {vname}
+	.BYTE	0F4, 0, 0, 0
+.IFF
+	JMP	vname
+	NOP
+.ENDC
+	.LIST
+	.ENDM
+$=$-80h
+	SVCDEFUSER
+.PAGE
+mwaitcall==0ED00:{$-vusercodebase}
+$$$=!100h
+	.REPT	256t
+	.WORD	0F4F4h, $$$
+$$$=!$$$+1
+	.ENDR
+
+qwaitcall==0ED00:{$-vusercodebase}
+$$$=!200h
+	.REPT	256t
+	.WORD	0F4F4h, $$$
+$$$=!$$$+1
+	.ENDR
+
+qwaitxxx==!qwaitcall-mwaitcall
+
+;Here when protected mode INT "reflected" to real mode completes
+
+rmpmiret==0ED00:{$-vusercodebase}
+	PUSHFW
+	CALLF	realSchRMRet		;Return to protected mode
+
+realnull::
+	CLC
+	RETF
+
+;Default DOS termination routine
+
+dosterm::
+	PUSHL	#0.B
+	CALLF	realSchExit
+
+;Routine called when DOS program EXECed from protected mode exits
+
+protexecdone::
+	HLT
+	NOP
+.PAGE
+;Here for svcIoDevParm - format is:
+;	long      handle;	// Device handle
+;	char     *name;		// Address of file specification
+;	parmlist *parm;		// Address of parameter list
+;	value = svcIoDevParm(cmd, name, parm);
+;  Where value is 07FFFh if normal or error code (negative) if error
+
+$$$=6t
+BLX arg_parm, 4
+BLX arg_name, 4
+BLX arg_cmd , 4
+
+$$$=0
+FRM lcl_qab   , qab_SIZE
+lcl_SIZE=!$$$
+
+	.MOD	4
+IoDevParm:
+	MOVW	AX, #QFNC$WAIT|QFNC$DIO|QFNC_DEVPARM
+	JMP	opncom.S
+
+;Here for svcIoOpen - format is:
+;	long      handle;	// Device handle
+;	char     *name;		// Address of file specification
+;	parmlist *parm;		// Address of parameter list
+;	value = svcIoOpen(cmd, name, parm);
+;  Where value is the device handle (positive) or error code (negative)
+
+$$$=6t
+BLX arg_parm, 4
+BLX arg_name, 4
+BLX arg_cmd , 4
+
+$$$=0
+FRM lcl_qab   , qab_SIZE
+lcl_SIZE=!$$$
+
+	.MOD	4
+IoOpen:	MOVW	AX, #QFNC$WAIT|QFNC$DIO|QFNC_OPEN
+opncom:	ENTER	lcl_SIZE, 0		;Set up local stack frame
+	MOVW	lcl_qab+qab_func.B[BP], AX ;Store function
+	MOVL	EAX, arg_name.B[BP]	;Copy address of name
+	MOVL	lcl_qab+qab_buffer1.B[BP], EAX
+	MOVL	EAX, arg_cmd.B[BP]	;Copy command bits
+	MOVL	lcl_qab+qab_option.B[BP], EAX
+	MOVL	EAX, arg_parm.B[BP]	;Copy parameter list address
+	MOVL	lcl_qab+qab_parm.B[BP], EAX
+	CLRL	EAX
+	MOVL	lcl_qab+qab_parm+4.B[BP], EAX
+	MOVL	lcl_qab+qab_buffer1+4.B[BP], EAX
+	MOVL	lcl_qab+qab_buffer2+0.B[BP], EAX
+	MOVL	lcl_qab+qab_buffer2+4.B[BP], EAX
+	MOVL	lcl_qab+qab_vector.B[BP], EAX
+	PUSHL	#0.B
+	PUSHW	SS
+	LEAW	AX, lcl_qab.B[BP]
+	PUSHW	AX
+	CALLF	realIoQueue
+	TESTL	EAX, EAX		;Any errors?
+	JS	6$.S			;Yes
+	TESTB	lcl_qab+qab_error+3.B[BP], #80h ;Maybe
+	JNE	4$.S			;Yes
+	MOVL	EAX, lcl_qab+qab_handle.B[BP] ;No - return handle
+	CLRL	EDX
+	LEAVE
+	RETF	12t
+
+;Here if error detected
+
+4$:	MOVL	EAX, lcl_qab+qab_error.B[BP] ;Get error code
+	MOVXWL	EDX, lcl_qab+qab_error+2.B[BP]
+6$:	LEAVE
+	RETF	12t
+.PAGE
+;Here for svcIoClose - format is:
+;	long handle;		// Device handle
+;	long cmd;		// Command bits
+;	value = svcIoClose(handle, cmd);
+;  Where value is 0 or error code (negative)
+
+$$$=6t
+BLX arg_cmd   , 4	;Command bits
+BLX arg_handle, 4	;Device handle
+
+$$$=0
+FRM lcl_qab   , qab_SIZE
+lcl_SIZE=!$$$
+
+	.MOD	4
+IoClose:ENTER	lcl_SIZE, 0		;Set up local stack frame
+	MOVW	lcl_qab+qab_func.B[BP], #QFNC$DIO|QFNC$WAIT|QFNC_CLOSE
+					;Store function
+	MOVL	EAX, arg_handle.B[BP]	;Copy handle
+	MOVL	lcl_qab+qab_handle.B[BP], EAX
+	MOVL	EAX, arg_cmd.B[BP]	;Store command bits
+	MOVL	lcl_qab+qab_option.B[BP], EAX
+	CLRL	EAX
+	MOVL	lcl_qab+qab_buffer1+0.B[BP], EAX
+	MOVL	lcl_qab+qab_buffer1+4.B[BP], EAX
+	MOVL	lcl_qab+qab_buffer2+0.B[BP], EAX
+	MOVL	lcl_qab+qab_buffer2+4.B[BP], EAX
+	MOVL	lcl_qab+qab_parm+0.B[BP], EAX
+	MOVL	lcl_qab+qab_parm+4.B[BP], EAX
+	MOVL	lcl_qab+qab_vector.B[BP], EAX
+	PUSHL	#0.B
+	PUSHW	SS
+	LEAW	AX, lcl_qab.B[BP]
+	PUSHW	AX
+	CALLF	realIoQueue
+	TESTL	EAX, EAX		;Any errors?
+	JS	6$.S			;Yes
+	TESTB	lcl_qab+qab_error+3.B[BP], #80h ;Maybe
+	JE	6$.S			;No
+	MOVL	EAX, lcl_qab+qab_error.B[BP] ;Get error code
+	MOVXWL	EDX, lcl_qab+qab_error+2.B[BP]
+6$:	LEAVE
+	RETF	8t
+.PAGE
+;Here for svcIoSetPos - format is:
+;	long handle		// Device handle
+;	long pos;		// Position in file
+;	long mode;		// Mode: 0 = Absolute position
+;				//	 1 = Relative to current position
+;				//	 2 = Relative to end of file
+;				//	 3 = Return position only
+;	value = svcIoSetPos(handle, pos, mode);
+;  Where value is the current position in the file (positive) or error
+;    code (negative)
+
+$$$=6t
+BLX arg_mode  , 4
+BLX arg_pos   , 4
+BLX arg_handle, 4
+
+$$$=0
+FRM lcl_qab   , qab_SIZE	;QAB
+FRM lcl_parm  , 12t		;Parameter list
+lcl_SIZE=!$$$
+
+2$:	LEAVE
+	MOVL	EAX, #ER_IFDEV
+	MOVL	EDX, #-1
+	RETF	12t
+
+	.MOD	4
+IoSetPos:
+	ENTER	lcl_SIZE, 0		;Set up local stack frame
+	MOVZWL	EAX, arg_mode.B[BP]	;Get mode
+	CMPW	AX, #3.B		;Valid?
+	JA	2$.S			;No
+	MOVL	EAX, CS:posparm[EAX*2]	;Yes - get parameter header bytes
+	MOVL	lcl_parm+0.B[BP], EAX
+	MOVL	EAX, arg_pos.B[BP]	;Get his position value
+	MOVL	lcl_parm+4.B[BP], EAX
+	MOVB	lcl_parm+8.B[BP], #0	;Put 0 byte at end
+	LEAW	AX, lcl_parm.B[BP]	;Store address of parameter list
+	MOVW	lcl_qab+qab_parm+0.B[BP], AX
+	MOVW	lcl_qab+qab_parm+2.B[BP], SS
+	MOVL	lcl_qab+qab_func.B[BP], #QFNC$WAIT|QFNC$DIO|QFNC_INBLOCK
+					;Store function
+	MOVL	EAX, arg_handle.B[BP]	;Copy handle
+	MOVL	lcl_qab+qab_handle.B[BP], EAX
+	CLRL	EAX
+	MOVL	lcl_qab+qab_buffer1+0.B[BP], EAX
+	MOVL	lcl_qab+qab_count.B[BP], EAX
+	CALL	iocom2
+	TESTL	EAX, EAX		;Error?
+	JS	4$.S			;Yes
+	MOVL	EAX, lcl_parm+4.B[BP]	;No - get the position returned
+	MOVW	DX, lcl_parm+6.B[BP]
+4$:	LEAVE
+	RETF	12t
+
+	.MOD	4
+posparm:.BYTE	PAR$GET|PAR$SET|REP_DECV, 4
+	.WORD	IOPAR_ABSPOS
+	.BYTE	PAR$GET|PAR$SET|REP_DECV, 4
+	.WORD	IOPAR_RELPOS
+	.BYTE	PAR$GET|PAR$SET|REP_DECV, 4
+	.WORD	IOPAR_EOFPOS
+	.BYTE	PAR$GET|REP_DECV, 4
+	.WORD	IOPAR_ABSPOS
+.PAGE
+;Here for svcIoInSingleP - format is:
+;	long  handle;		// Device handle
+;	void *parm;		// Address of parameter list
+;	value = svcIoInSingleP(handle, parm);
+;  Where value is the input byte (8 bits, 0 filled to 32 bits) or an error
+;    code (negative)
+
+$$$=6t
+BLX arg_parm  , 4	;Parameter list address
+BLX arg_handle, 4	;Device handle
+
+$$$=0
+FRM lcl_qab   , qab_SIZE
+FRM lcl_buffer, 4
+lcl_SIZE=!$$$
+
+	.MOD	4
+IoInSingleP:
+	ENTER	lcl_SIZE, 0		;Set up local stack frame
+	MOVL	EAX, arg_handle.B[BP]	;Get handle
+	MOVL	lcl_qab+qab_handle.B[BP], EAX
+	MOVL	EAX, arg_parm.B[BP]	;Get address of parameter list
+	CALL	insingle
+	LEAVE
+	RETF	8t
+
+;Here for svcIoInSingle - format is:
+;	long      handle	// Device handle
+;	value = svcIoInSingle(handle);
+;  Where value is the input byte (8 bits, 0 filled to 32 bits) or an error
+;    code (negative)
+
+$$$=6t
+BLX arg_handle, 4	;Device handle
+
+$$$=0
+FRM lcl_qab   , qab_SIZE
+FRM lcl_buffer, 4
+lcl_SIZE=!$$$
+
+	.MOD	4
+IoInSingle:
+	ENTER	lcl_SIZE, 0		;Set up local stack frame
+	MOVL	EAX, arg_handle.B[BP]	;Get handle
+	MOVL	lcl_qab+qab_handle.B[BP], EAX
+	CLRL	EAX			;Get address of parameter list
+	CALL	insingle
+	LEAVE
+	RETF	4t
+
+insingle:
+	MOVL	lcl_qab+qab_parm+0.B[BP], EAX
+	MOVW	lcl_qab+qab_func.B[BP], #QFNC$WAIT|QFNC$DIO|QFNC_INBLOCK
+					;Store function
+	LEAW	AX, lcl_buffer.B[BP]	;Store buffer address
+	MOVW	lcl_qab+qab_buffer1+0.B[BP], AX
+	MOVW	lcl_qab+qab_buffer1+2.B[BP], SS
+	MOVL	lcl_qab+qab_count.B[BP], #1 ;Store count
+	CLRL	EAX
+	MOVL	lcl_qab+qab_buffer1+4.B[BP], EAX
+	MOVL	lcl_qab+qab_buffer2+0.B[BP], EAX
+	MOVL	lcl_qab+qab_buffer2+4.B[BP], EAX
+	MOVL	lcl_qab+qab_parm+4.B[BP], EAX
+	MOVL	lcl_qab+qab_vector.B[BP], EAX
+	PUSHL	#0.B
+	PUSHW	SS
+	LEAW	AX, lcl_qab.B[BP]
+	PUSHW	AX
+	CALLF	realIoQueue
+	TESTL	EAX, EAX		;Any errors?
+	JS	6$.S			;Yes
+	TESTB	lcl_qab+qab_error+3.B[BP], #80h ;Maybe
+	JNE	4$.S			;Yes
+	MOVZBL	EAX, lcl_buffer.B[BP]	;No - return byte which was input
+	RET
+
+;Here if error detected
+
+4$:	MOVL	EAX, lcl_qab+qab_error.B[BP] ;Get error code
+	MOVXWL	EDX, lcl_qab+qab_error+2.B[BP]
+6$:	RET
+.PAGE
+;Here for svcIoOutSingleP - format is:
+;	long  handle;		// Device handle
+;	char  data;		// Byte to output
+;	void *parm;		// Address of parameter list
+;	value = svcIoOutSingleP(handle, data, parm);
+;  Where value is the number of bytes output (1) or an error code (negative)
+
+$$$=6t
+BLX arg_parm  , 4	;Address of parameter list
+BLX arg_data  , 4	;Data byte to output
+BLX arg_handle, 4	;Device handle
+
+$$$=0
+FRM lcl_qab   , qab_SIZE
+FRM lcl_buffer, 2
+lcl_SIZE=!$$$
+
+	.MOD	4
+IoOutSingleP:
+	ENTER	lcl_SIZE, 0		;Set up local stack frame
+	MOVL	EAX, arg_handle.B[BP]	;Get handle
+	MOVL	lcl_qab+qab_handle.B[BP], EAX
+	MOVL	EAX, arg_parm.B[BP]	;Get address of parameter list
+	MOVL	lcl_qab+qab_parm+0.B[BP], EAX
+	MOVB	AL, arg_data.B[BP]	;Get data byte
+	CALL	outsingle
+	LEAVE
+	RETF	12t
+
+;Here for svcIoOutSingle - format is:
+;	long      handle	// Device handle
+;	char      data		// Byte to output
+;	value = svcIoOutSingle(handle, data);
+;  Where value is the number of bytes output (1) or an error code (negative)
+
+$$$=6t
+BLX arg_data  , 4	;Data byte to output
+BLX arg_handle, 4	;Device handle
+
+$$$=0
+FRM lcl_qab   , qab_SIZE
+FRM lcl_buffer, 2
+lcl_SIZE=!$$$
+
+	.MOD	4
+IoOutSingle:
+	ENTER	lcl_SIZE, 0		;Set up local stack frame
+	MOVL	EAX, arg_handle.B[BP]	;Get handle
+	MOVL	lcl_qab+qab_handle.B[BP], EAX
+	CLRL	EAX
+	MOVL	lcl_qab+qab_parm+0.B[BP], EAX
+	MOVB	AL, arg_data.B[BP]	;Get data byte
+	CALL	outsingle
+	LEAVE
+	RETF	8t
+
+outsingle:
+	MOVB	lcl_buffer.B[BP], AL	;Store data byte in buffer
+	MOVW	lcl_qab+qab_func.B[BP], #QFNC$WAIT|QFNC$DIO|QFNC_OUTBLOCK
+					;Store function
+	LEAW	AX, lcl_buffer.B[BP]	;Store buffer address
+	MOVW	lcl_qab+qab_buffer1+0.B[BP], AX
+	MOVW	lcl_qab+qab_buffer1+2.B[BP], SS
+	MOVL	lcl_qab+qab_count.B[BP], #1 ;Store count
+	CLRL	EAX
+outsng2:MOVL	lcl_qab+qab_parm+4.B[BP], EAX
+outsng3:MOVL	lcl_qab+qab_buffer1+4.B[BP], EAX
+	MOVL	lcl_qab+qab_buffer2+0.B[BP], EAX
+	MOVL	lcl_qab+qab_buffer2+4.B[BP], EAX
+	MOVL	lcl_qab+qab_vector.B[BP], EAX
+	PUSHL	#0.B
+	PUSHW	SS
+	LEAW	AX, lcl_qab.B[BP]
+	PUSHW	AX
+	CALLF	realIoQueue
+	TESTL	EAX, EAX		;Any errors?
+	JS	6$.S			;Yes
+	TESTB	lcl_qab+qab_error+3.B[BP], #80h ;Maybe
+	JNE	4$.S			;Yes
+	MOVL	EAX, lcl_qab+qab_amount.B[BP] ;No - return amount input
+	MOVXWL	EDX, lcl_qab+qab_amount+2.B[BP]
+	RET
+
+;Here if error detected
+
+4$:	MOVL	EAX, lcl_qab+qab_error.B[BP] ;Get error code
+	MOVXWL	EDX, lcl_qab+qab_error+2.B[BP]
+6$:	RET
+.PAGE
+;Here for svcIoInBlockP - format is:
+;	long      handle	// Device handle
+;	char far *buffer;	// Address of buffer
+;	long      count;	// Number of bytes to input
+;	void far *parm;		// Address of parameter list
+;	value = svcIoInBlockP(handle, buffer, count, parm);
+;  Where value is the number of bytes actually input (positive) or an error
+;    code (negative)
+
+$$$=6t
+BLX arg_parm  , 4	;Address of parameter list
+BLX arg_count , 4	;Number of bytes to input
+BLX arg_buffer, 4	;Address of buffer
+BLX arg_handle, 4	;Device handle
+
+$$$=0
+FRM lcl_qab   , qab_SIZE
+lcl_SIZE=!$$$
+
+	.MOD	4
+IoInBlockP:
+	MOVW	AX, #QFNC$WAIT|QFNC$DIO|QFNC_INBLOCK ;Get function value
+	JMP	iocommonp.S
+.PAGE
+;Here for svcIoInBlock - format is:
+;	long      handle	// Device handle
+;	char far *buffer;	// Address of buffer
+;	long      count;	// Number of bytes to input
+;	value = svcIoInBlock(handle, buffer, count);
+;  Where value is the number of bytes actually input (positive) or an error
+;    code (negative)
+
+$$$=6t
+BLX arg_count , 4	;Number of bytes to input
+BLX arg_buffer, 4	;Address of buffer
+BLX arg_handle, 4	;Device handle
+
+$$$=0
+FRM lcl_qab   , qab_SIZE
+lcl_SIZE=!$$$
+
+	.MOD	4
+IoInBlock:
+	MOVW	AX, #QFNC$WAIT|QFNC$DIO|QFNC_INBLOCK ;Get function value
+	JMP	iocommon.S
+.PAGE
+;Here for svcIoOutBlockP - format is:
+;	long      handle;	// Device handle
+;	char far *buffer;	// Address of buffer
+;	long      count;	// Number of bytes to output
+;	void far *parm;		// Address of parameter list
+;	value = svcIoOutBlockP(handle, buffer, count, parm);
+;  Where value is the number of bytes actually output (positive) or an error
+;    code (negative)
+
+$$$=6t
+BLX arg_parm  , 4	;Address of parameter list
+BLX arg_count , 4	;Number of bytes to output
+BLX arg_buffer, 4	;Address of buffer
+BLX arg_handle, 4	;Device handle
+
+$$$=0
+FRM lcl_qab   , qab_SIZE
+lcl_SIZE=!$$$
+
+	.MOD	4
+IoOutBlockP:
+	MOVW	AX, #QFNC$WAIT|QFNC$DIO|QFNC_OUTBLOCK ;Get function value
+	JMP	iocommonp.S
+.PAGE
+;Here for svcIoOutBlock - format is:
+;	long      handle	// Device handle
+;	char far *buffer;	// Address of buffer
+;	long      count;	// Number of bytes to output
+;	value = svcIoOutBlock(handle, buffer, count);
+;  Where value is the number of bytes actually output (positive) or an error
+;    code (negative)
+
+$$$=6t
+BLX arg_count , 4	;Number of bytes to output
+BLX arg_buffer, 4	;Address of buffer
+BLX arg_handle, 4	;Device handle
+
+$$$=0
+FRM lcl_qab   , qab_SIZE
+lcl_SIZE=!$$$
+
+	.MOD	4
+IoOutBlock:
+	MOVW	AX, #QFNC$WAIT|QFNC$DIO|QFNC_OUTBLOCK ;Get function value
+	JMP	iocommon.S
+.PAGE
+;Here for svcIoOutStringP - format is:
+;	long      handle	// Device handle
+;	char far *buffer;	// Address of buffer
+;	long      count;	// Maximum number of bytes to output
+;	void far *parm;		// Address of parameter list
+;	value = svcIoOutStringP(handle, buffer, count, parm);
+;  Where value is the number of bytes actually output (positive) or an error
+;    code (negative)
+
+$$$=6t
+BLX arg_parm  , 4	;Address of parameter list
+BLX arg_count , 4	;Number of bytes to output
+BLX arg_buffer, 4	;Address of buffer
+BLX arg_handle, 4	;Device handle
+
+$$$=0
+FRM lcl_qab   , qab_SIZE
+lcl_SIZE=!$$$
+
+	.MOD	4
+IoOutStringP:
+	MOVW	AX, #QFNC$WAIT|QFNC$DIO|QFNC_OUTSTRING ;Get function value
+					;Fall into iocommonp on next page
+.PAGE
+;Common routine for svcIoInBlockP, svcIoOutBlockP, and svcIoOutStringP
+;  - note: this routine must preserve all registers except EAX!
+;	c{EAX} = Value for qab_func
+
+iocommonp:
+	ENTER	lcl_SIZE, 0		;Set up local stack frame
+	MOVW	lcl_qab+qab_func.B[BP], AX ;Store function
+	MOVL	EAX, arg_handle.B[BP]	;Copy handle
+	MOVL	lcl_qab+qab_handle.B[BP], EAX
+	MOVL	EAX, arg_buffer.B[BP]	;Copy buffer address
+	MOVL	lcl_qab+qab_buffer1.B[BP], EAX
+	MOVL	EAX, arg_count.B[BP]	;Copy count
+	MOVL	lcl_qab+qab_count.B[BP], EAX
+	MOVL	EAX, arg_parm.B[BP]	;Copy parameter list address
+	MOVL	lcl_qab+qab_parm.B[BP], EAX
+	CLRL	EAX
+	CALL	iocom2
+	LEAVE
+	RETF	16t
+.PAGE
+;Here for svcIoOutString - format is:
+;	long      handle	// Device handle
+;	char far *buffer;	// Address of buffer
+;	long      count;	// Maximum number of bytes to output
+;	value = svcIoOutString(handle, buffer, count);
+;  Where value is the number of bytes actually output (positive) or an error
+;    code (negative)
+
+$$$=6t
+BLX arg_count , 4	;Number of bytes to output
+BLX arg_buffer, 4	;Address of buffer
+BLX arg_handle, 4	;Device handle
+
+$$$=0
+FRM lcl_qab   , qab_SIZE
+lcl_SIZE=!$$$
+
+	.MOD	4
+IoOutString:
+	MOVW	AX, #QFNC$WAIT|QFNC$DIO|QFNC_OUTSTRING ;Get function value
+					;Fall into iocommon on next page
+.PAGE
+;Common routine for svcIoInBlock, svcIoOutBlock, and svcIoOutString - note:
+;  this routine must preserve all registers except EAX!
+;	c{EAX} = Value for qab_func
+
+iocommon:
+	ENTER	lcl_SIZE, 0		;Set up local stack frame
+	MOVW	lcl_qab+qab_func.B[BP], AX ;Store function
+	MOVL	EAX, arg_handle.B[BP]	;Copy handle
+	MOVL	lcl_qab+qab_handle.B[BP], EAX
+	MOVL	EAX, arg_buffer.B[BP] ;Copy buffer address
+	MOVL	lcl_qab+qab_buffer1.B[BP], EAX
+	MOVL	EAX, arg_count.B[BP]	;Copy count
+	MOVL	lcl_qab+qab_count.B[BP], EAX
+	CLRL	EAX
+	MOVL	lcl_qab+qab_parm+0.B[BP], EAX
+	CALL	iocom2
+	LEAVE
+	RETF	12t
+
+iocom2:	MOVL	lcl_qab+qab_parm+4.B[BP], EAX
+	MOVL	lcl_qab+qab_buffer1+4.B[BP], EAX
+	MOVL	lcl_qab+qab_buffer2+0.B[BP], EAX
+	MOVL	lcl_qab+qab_buffer2+4.B[BP], EAX
+iocom4:	MOVL	lcl_qab+qab_vector.B[BP], EAX
+	PUSHL	#0.B
+	PUSHW	SS
+	LEAW	AX, lcl_qab.B[BP]
+	PUSHW	AX
+	CALLF	realIoQueue
+	TESTL	EAX, EAX		;Any errors?
+	JS	6$.S			;Yes
+	TESTB	lcl_qab+qab_error+3.B[BP], #80h ;Maybe
+	JNE	4$.S			;Yes
+	MOVL	EAX, lcl_qab+qab_amount.B[BP] ;No - return amount input
+	JMP	6$.S
+
+;Here if error detected
+
+4$:	MOVL	EAX, lcl_qab+qab_error.B[BP] ;Get error code
+6$:	MOVL	EDX, EAX
+	SARL	EDX, #16t
+	RET
+.PAGE
+	.SBTTL	svcIoPath - Path function
+
+;Here for svcIoPath - Format is:
+;	char far *name;		// Device name and new path
+;	long      option;	// Option bits
+;	char far *buffer;	// Buffer to receive path string
+;	long      size;		// Length of buffer
+;	value = svcIoPath(name, option, buffer, size);
+;  Value returned is the length of the string returned in buffer or negative
+;    error code if error
+
+$$$=!12t
+BLK arg_size  , 4t	;Length of buffer
+BLK arg_buffer, 4t	;Buffer for returned path string
+BLK arg_option, 4t	;Option bits
+BLK arg_name  , 4t	;Device name and new path
+
+$$$=!0
+FRM path_qab , qab_SIZE	;QAB
+FRM path_parm, 28t	;Parameter list
+path_SIZE=!$$$
+
+	.MOD	4
+IoPath:	ENTER	path_SIZE, 0
+	MOVW	path_qab+qab_func.B[EBP], #QFNC$WAIT|QFNC$DIO|QFNC_PATH
+						;Store function
+	MOVL	EAX, arg_name.B[EBP]	;Copy address of device name
+	MOVL	path_qab+qab_buffer1+0.B[EBP], EAX
+	MOVL	EAX, path_parm.B[EBP]
+	MOVL	path_qab+qab_parm+0.B[EBP], EAX
+	MOVL	path_qab+qab_parm+4.B[EBP], SS
+	MOVL	path_parm+0t.B[EBP], #{PAR$SET|REP_DECV}+{4<8t}+{IOPAR_FILOPTN<16t}
+	MOVL	EAX, arg_option.B[EBP]
+	MOVL	path_parm+4t.B[EBP], EAX
+	MOVL	path_parm+8t.B[EBP], #{PAR$GET|REP_STR}+{IOPAR_FILSPEC<16t}
+	MOVL	EAX, arg_buffer+0.B[EBP]
+	MOVL	path_parm+12t.B[EBP], EAX
+	MOVL	EAX, arg_size.B[EBP]
+	MOVL	path_parm+20t.B[EBP], EAX
+	CLRL	EAX
+	MOVL	path_parm+16t.B[EBP], EAX
+	MOVB	path_parm+24t.B[EBP], AL
+	CALL	outsng3			;Do the function
+	LEAVE
+	RETF	16t
+.PAGE
+	.SBTTL	svcIoSpecial - Special device functions
+
+;Here for svcIoSpecial - format is:
+;	long      handle;	// Device handle
+;	long      function;	// Function value
+;	long      count;	// Count value
+;	void far *buffer;	// Address value
+;	void far *parm;		// Address of parameter list
+;	value = svcIoSpecial(handle, function, count, buffer, parm);
+;  Where value depends on device and function if or normal or error code
+;    (negative) if error
+
+$$$=!6t
+BLX arg_parm    , 4t	;Address of parameter list
+BLX arg_count   , 4t	;Count value
+BLX arg_address , 4t	;Address value
+BLX arg_function, 4t	;Function value
+BLX arg_handle  , 4t	;Device handle
+
+$$$=!0
+FRM lcl_qab   , qab_SIZE	;QAB
+lcl_SIZE=!$$$
+
+	.MOD	4
+IoSpecial:
+	ENTER	lcl_SIZE, 0
+	MOVW	lcl_qab+qab_func.B[BP], #QFNC$WAIT|QFNC$DIO|QFNC_SPECIAL
+						;Store function
+	MOVL	EAX, arg_handle.B[BP]	;Copy handle argument
+	MOVL	lcl_qab+qab_handle.B[BP], EAX
+	MOVL	EAX, arg_address+0.B[BP] ;Copy address argument
+	MOVL	lcl_qab+qab_buffer1+0.B[BP], EAX
+	MOVL	EAX, arg_parmlist+0.B[BP] ;Copy address of parameter list
+	MOVL	lcl_qab+qab_parm+0.B[BP], EAX
+	MOVL	EAX, arg_function.B[BP] ;Get function value
+	MOVL	lcl_qab+qab_option.B[BP], EAX
+	MOVL	EAX, arg_count.B[BP]	;Get count value
+	MOVL	lcl_qab+qab_count.B[BP], EAX
+	CLRL	EAX
+	CALL	outsng2			;Do the function
+	LEAVE
+	RETF	20t
+.PAGE
+;Here for svcIoDelete - format is:
+;	long      cmd;		// Command bits
+;	char     *name;		// Address of file specification string
+;	parmlist *parm;		// Address of parameter list
+;	value = svcIoDelete(cmd, name, parm);
+;  Where value is the number of files deleted (positive) or an error
+;    code (negative)
+
+$$$=6t
+BLX arg_parmlist, 4	;Address of parameter list
+BLX arg_filespec, 4	;Address of file specification string
+BLX arg_cmd     , 4	;Command bits
+
+$$$=0
+FRM lcl_qab   , qab_SIZE
+lcl_SIZE=!$$$
+
+	.MOD	4
+IoDelete:
+	ENTER	lcl_SIZE, 0
+	MOVW	lcl_qab+qab_func.B[BP], #QFNC$WAIT|QFNC$DIO|QFNC_DELETE
+					;Get function
+	MOVL	EAX, arg_filespec+0.B[BP] ;Copy address of file specification
+	MOVL	lcl_qab+qab_buffer1+0.B[BP], EAX
+	MOVL	EAX, arg_parmlist+0.B[BP] ;Copy address of parameter list
+	MOVL	lcl_qab+qab_parm+0.B[BP], EAX
+	MOVL	EAX, arg_cmd.B[BP]	;Get command bits
+	MOVL	lcl_qab+qab_option.B[BP], EAX
+	CLRL	EAX			;Clear count
+	MOVL	lcl_qab+qab_count.B[BP], EAX
+	CALL	outsng2
+	LEAVE
+	RETF	12t
+.PAGE
+;Here for svcIoRename - format is:
+;	long      cmd;		// Command bits
+;	char     *oldname;	// Address of old file specification string
+;	char     *newname;	// Address of new file specification string
+;	parmlist *parm;		// Address of parameter list
+;	value = svcIoRename(cmd, oldname, newname, parm);
+;  Where value is the number of file renamed (positive) or an error
+;    code (negative)
+
+$$$=6t
+BLX arg_parmlist, 4	;Address of parameter list
+BLX arg_newfile , 4	;Address of new file specification string
+BLX arg_oldfile , 4	;Address of old file specification string
+BLX arg_cmd     , 4	;Command bits
+
+$$$=0
+FRM lcl_qab   , qab_SIZE
+lcl_SIZE=!$$$
+
+	.MOD	4
+IoRename:
+	ENTER	lcl_SIZE, 0
+	MOVW	lcl_qab+qab_func.B[BP], #QFNC$WAIT|QFNC$DIO|QFNC_RENAME
+					;Get function
+	MOVL	EAX, arg_oldfile+0.B[BP] ;Copy address of old file name
+	MOVL	lcl_qab+qab_buffer1+0.B[BP], EAX
+	MOVL	EAX, arg_newfile+0.B[BP] ;Copy address of new file name
+	MOVL	lcl_qab+qab_buffer2+0.B[BP], EAX
+	MOVL	EAX, arg_parmlist+0.B[BP] ;Copy address of parameter list
+	MOVL	lcl_qab+qab_parm+0.B[BP], EAX
+	MOVL	EAX, arg_cmd.B[BP]	;Get command bits
+	MOVL	lcl_qab+qab_option.B[BP], EAX
+	CLRL	EAX			;Clear count
+	MOVL	lcl_qab+qab_count.B[BP], EAX
+	MOVL	lcl_qab+qab_vector.B[BP], EAX
+	MOVL	lcl_qab+qab_buffer1+4.B[BP], EAX
+	MOVL	lcl_qab+qab_buffer2+4.B[BP], EAX
+	MOVL	lcl_qab+qab_parm+4.B[BP], EAX
+	CALL	iocom4
+	LEAVE
+	RETF	16t
+.PAGE
+;Here for svcIoCommit - format is:
+;	long handle;		// Device handle
+;	value = svcIoCommit(handle);
+;  Where value is 0 if normal or a negative error code if error
+
+$$$=6t
+BLX arg_handle, 4	;Device handle
+
+$$$=0
+FRM lcl_qab   , qab_SIZE
+lcl_SIZE=!$$$
+
+	.MOD	4
+IoCommit:
+	ENTER	lcl_SIZE, 0
+	MOVL	lcl_qab+qab_func.B[BP], #QFNC$WAIT|QFNC$DIO|QFNC_COMMIT
+					;Store function
+	MOVL	EAX, arg_handle.B[BP]	;Copy handle
+	MOVL	lcl_qab+qab_handle.B[BP], EAX
+	CLRL	EAX
+	MOVL	lcl_qab+qab_parm+0.B[BP], EAX
+	MOVL	lcl_qab+qab_parm+4.B[BP], EAX
+	MOVL	lcl_qab+qab_vector.B[BP], EAX
+	PUSHL	#0.B
+	PUSHW	SS
+	LEAW	AX, lcl_qab.B[BP]
+	PUSHW	AX
+	CALLF	realIoQueue
+	TESTL	EAX, EAX		;Any errors?
+	JS	6$.S			;Yes
+	TESTB	lcl_qab+qab_error+3.B[BP], #80h ;Maybe
+	JE	6$.S			;No
+4$:	MOVL	EAX, lcl_qab+qab_error.B[BP] ;Get error code
+6$:	MOVL	EDX, EAX
+	SARL	EDX, #16t
+	LEAVE
+	RETF	4t
+.PAGE
+	.SBTTL	svcIoClsChar - Set or set class characteristics values
+
+;Here for svcIoClsChar - format is:
+;	char   far *name;	// Address of class name string
+;	struct parm far *chrl;	// Address of characteristics list
+;	value = svcIoClsChar(name, chrl);
+;  Value returned is 7FFFh if normal or a negatiave error code if error
+
+$$$=!6t
+BLX arg_charlist, 4	;Address of parameter list
+BLX arg_clsname , 4	;Address of file specification string
+
+$$$=!0
+FRM lcl_qab   , qab_SIZE
+lcl_SIZE=!$$$
+
+	.MOD	4
+IoClsChar:
+	ENTER	lcl_SIZE, 0		;Set up local stack frame
+	MOVL	lcl_qab+qab_func.B[BP], #QFNC$WAIT|QFNC_CLASSFUNC
+	MOVL	lcl_qab+qab_option.B[BP], #CF_VALUES ;Store function
+	MOVL	EAX, arg_filespec.B[BP]	;Copy class name address
+	MOVL	lcl_qab+qab_buffer1+0.B[BP], EAX
+	MOVL	EAX, arg_parmlist.B[BP]	;Copy characteristics list address
+	MOVL	lcl_qab+qab_buffer2+0.B[BP], EAX
+	CLRL	EAX
+	MOVL	lcl_qab+qab_vector.B[BP], EAX
+	MOVL	lcl_qab+qab_parm+0.B[BP], EAX
+	MOVL	lcl_qab+qab_parm+4.B[BP], EAX
+	MOVL	lcl_qab+qab_buffer1+4.B[BP], EAX
+	MOVL	lcl_qab+qab_buffer2+4.B[BP], EAX
+	PUSHW	SS
+	LEAW	AX, lcl_qab.B[BP]
+	PUSHW	AX
+	CALLF	realIoQueue
+	TESTL	EAX, EAX		;Any errors?
+	JS	4$.S			;Yes
+	ORL	EAX, lcl_qab+qab_error.B[BP] ;Maybe
+	JS	4$.S			;Yes
+	MOVL	EAX, lcl_qab+qab_amount.B[BP] ;No - return amount
+4$:	MOVL	EDX, EAX
+	SARL	EDX, #16t
+	LEAVE
+	RETF	8t
+.PAGE
+	.SBTTL	svcIoDevChar - Set or set device characteristics values
+
+;Here for svcIoDevChar - format is:
+;	long   handle;		// Device handle
+;	struct parm far *chrl;	// Address of characteristics list
+;	value = svcIoDevChar(handle, chrl);
+;  Value returned is 7FFFh if normal or a negatiave error code if error
+
+$$$=!6t
+BLX arg_charlist, 4t	;Address of parameter list
+BLX arg_handle  , 4t	;Device handle
+
+$$$=!0
+FRM lcl_qab   , qab_SIZE
+lcl_SIZE=!$$$
+
+	.MOD	4
+IoDevChar:
+	ENTER	lcl_SIZE, 0		;Set up local stack frame
+	MOVL	lcl_qab+qab_func.B[BP], #QFNC$WAIT|QFNC_DEVCHAR
+	MOVL	lcl_qab+qab_option.B[BP], #DCF_VALUES ;Store function
+	MOVL	EAX, arg_handle.B[BP]	;Copy device handle
+	MOVL	lcl_qab+qab_handle.B[BP], EAX
+	MOVL	EAX, arg_parmlist.B[BP]	;Copy characteristics list address
+	MOVL	lcl_qab+qab_buffer2+0.B[BP], EAX
+	CLRL	EAX
+	MOVL	lcl_qab+qab_vector.B[BP], EAX
+	MOVL	lcl_qab+qab_parm+0.B[BP], EAX
+	MOVL	lcl_qab+qab_parm+4.B[BP], EAX
+	MOVL	lcl_qab+qab_buffer2+4.B[BP], EAX
+	PUSHW	SS
+	LEAW	AX, lcl_qab.B[BP]
+	PUSHW	AX
+	CALLF	realIoQueue
+	TESTL	EAX, EAX		;Any errors?
+	JS	4$.S			;Yes
+	ORL	EAX, lcl_qab+qab_error.B[BP] ;Maybe
+	JS	4$.S			;Yes
+	MOVL	EAX, lcl_qab+qab_amount.B[BP] ;No - return amount
+4$:	MOVL	EDX, EAX
+	SARL	EDX, #16t
+	LEAVE
+	RETF	8t
+
+	END

@@ -1,0 +1,623 @@
+	.TITLE	ENVIRON - Environment functions for XOS
+
+;++++
+; This software is in the public domain.  It may be freely copied and used
+; for whatever purpose you see fit, including commerical uses.  Anyone
+; modifying this software may claim ownership of the modifications, but not
+; the complete derived code.  It would be appreciated if the authors were
+; told what this software is being used for, but this is not a requirement.
+
+;   THIS SOFTWARE IS PROVIDED BY THE AUTHORS "AS IS" AND ANY EXPRESS OR
+;   IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
+;   OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+;   IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+;   INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+;   BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS
+;   OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+;   ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR
+;   TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
+;   USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+;----
+
+	.PROC	80486
+	.INCLUD	XOSINC:\XMAC\XOS.PAR
+	.INCLUD	XOSINC:\XMAC\XOSX.PAR
+	.INCLUD	XOSINC:\XMAC\XOSERR.PAR
+
+	DATA
+	CODE
+
+;Environment strings are stored in the PDA in the following format:
+;   Name    Size  Offset     Use
+;  eb_size    4      0.   Size of this block (bytes)
+;  eb_next    4      4.   Offset of next environment string block
+;  eb_pntr    4      8.   Offset of pointer to this block
+;             4     12.   Not used, must be 0
+;  eb_length  4     16.   Length of name (longs)
+;  eb_string  n     20.   Name string followed by definition string (name string
+;			    is null filled to even long boundry, definition
+;			    string is terminated by single null)
+
+	.SBTTL	svcSysGetEnv - SVC to get all environment strings
+
+;Here for the svcSysGetEnv SVC - get all environment strings
+;	long level;		// Level
+;	char far *buffer;	// Address of buffer
+;	long size;		// Size of buffer
+;	rtn = svcSysGetEnv(level, buffer, size);
+;  Value returned is the number of bytes stored in the buffer if normal or a
+;    negative error code if error
+
+;This call returns all environment strings for a process with each string
+;  stored as:
+;	envname=environment string
+;  Each string is null terminated. The next string is stored immediately
+;  following the null which terminates the preceeding string.  This call is
+;  intended mainly for use in setting up the DOS environment area for DOS
+;  images.  It can,  however, used for other purposes if desired.
+
+rsvcSysGetEnv::
+	MOVL	EBP, #pdaArg3#
+	CALL	vfixaddr#
+	JMP	2$.S
+
+psvcSysGetEnv::
+	SVCENTR	CNTSysGetEnv#
+	ORB	SS:pdaArg2#, #03
+2$:	CALL	getlevel		;Get PDA selector
+	JC	14$.S
+	IFFAULT	knlRtnAdrEr#
+	LESL	EDI, SS:pdaArg3#	;Get address of user's buffer
+	MOVL	EDX, GS:pdaEnvPnt#	;Point to first environment string
+	TESTL	EDX, EDX		;Have any at all?
+	JE	12$.S			;No
+4$:	MOVL	ECX, GS:eb_length.B[EDX] ;Get length of name part
+	SHLL	ECX, #4
+	LEAL	ESI, eb_string.B[EDX]
+6$:	LODSB	GS:[ESI]
+	CMPB	AL, #0
+	JE	8$.S
+	IFFAULT	knlRtnAdrEr#
+	STOSB	[EDI]
+	JMP	6$.S
+
+8$:	MOVB	AL, #'='
+	IFFAULT	knlRtnAdrEr#
+	STOSB	[EDI]
+	ADDL	ESI, #3.B		;Point to definition
+	ANDL	ESI, #0FFFFFFFCh.B
+10$:	LODSB	GS:[ESI]		;Copy the definition
+	IFFAULT	knlRtnAdrEr#
+	STOSB	[EDI]
+	CMPB	AL, #0
+	JNE	10$.S
+	MOVL	EDX, GS:eb_next.B[EDX]	;Advance to next block
+	TESTL	EDX, EDX
+	JNE	4$.S
+12$:	SUBL	EDI, SS:pdaArg3#	;Calculate amount stored
+	MOVL	EAX, EDI
+14$:	RET
+.PAGE
+	.SBTTL	svcSysFindEnv - SVC to find environment string
+
+;Here for the svcSysFindEnv SVC - Find environment string
+;	long level;		// Level: (bits 14 and 15 determine format)
+;				//   00 = Process ID (all 0 means self)
+;				//   01 = Low 8 bits gives offset up from
+;				//	    current process (rest ignored)
+;				//   10 = Low 8 bits gives offset down from
+;				//	    session process (rest ignored)
+;				//   11 = System level (rest ignored)
+;	char far *string;	// Address of string to search for
+;	char far *found;	// Address of buffer to receive found name
+;	char far *buffer;	// Address of buffer to receive definition
+;				//   found
+;	long length;		// Length of buffer
+;	long far *skip;		// Address of skip count value
+;	rtn = svcSysFindEnv(level, string, found, buffer, length, skip);
+;  Value returned is 0 if normal or negative error code if error
+
+$$$=!0
+FRM en_lenstr, 4t	;Length of environment string name
+FRM en_lendef, 4t	;Length of defination string
+FRM en_wild  , 1t	;Non-zero if need wild-card search
+FRM          , 3t
+FRM en_skip  , 4t
+FRM en_count , 4t
+FRM en_sbufr , 108t	;Search string buffer
+FRM en_junk  , 120t
+ls_SIZE=!$$$
+
+rsvcSysFindEnv::
+	MOVL	EBP, #pdaArg3#
+	CALL	vfixaddr#
+	SUBL	EBP, #8.B
+	CALL	vfixaddr#
+	SUBL	EBP, #8.B
+	CALL	vfixaddr#
+	SUBL	EBP, #12t.B
+	CALL	vfixaddr#
+	JMP	2$.S
+
+psvcSysFindEnv::
+	SVCENTR	CNTSysFindEnv#
+	ORB	SS:pdaArg2#, #03
+	ORB	SS:pdaArg4#, #03
+	ORB	SS:pdaArg6#, #03
+	ORB	SS:pdaArg9#, #03
+2$:	ENTER	ls_SIZE, 0		;Set up our stack frame
+	CALL	envsetup		;Do common set up
+	JC	lv004.S
+	CLRL	ECX
+	CMPL	SS:pdaArg10#, #0.B	;Did he give us a skip count?
+	JE	3$.S			;No
+	IFFAULT	knlRtnAdrErLv#
+	LGSL	ECX, SS:pdaArg10#	;Yes - get address of the skip count
+	IFFAULT	knlRtnAdrErLv#
+	MOVL	ECX, GS:[ECX]		;Get the skip count
+3$:	CALL	srchenv			;Search a single level
+	JE	envfnd.S		;If found it
+	MOVL	EAX, #ER_NTDEF		;Not found
+lv004:	LEAVE
+	RET
+
+;Here with match found
+
+envfnd:	PUSHL	ES
+	POPL	FS
+	CMPL	SS:pdaArg10#, #0.B	;Did he give us a skip count?
+	JE	4$.S			;No
+	LESL	EAX, SS:pdaArg10#	;Yes - get address of the skip count
+	IFFAULT	knlRtnAdrEr#
+	MOVL	ES:[EAX], ECX		;Update his skip count
+4$:	IFFAULT	knlRtnAdrErLv#
+	CMPL	SS:pdaArg5#, #0.B	;Does he want the found name?
+	JE	8$.S			;No
+	IFFAULT	knlRtnAdrErLv#
+	LESL	EDI, SS:pdaArg5#	;Yes - get address of found buffer
+	LEAL	ESI, eb_string.B[EBX]	;Point to start of name we found
+	CLRL	EDX
+6$:	LODSB	FS:[ESI]		;Get next character
+	IFFAULT	knlRtnAdrErLv#
+	STOSB	[EDI]			;Store character in user buffer
+	CMPB	AL, #0			;End?
+	JNE	6$.S			;No - continue
+8$:	IFFAULT	knlRtnAdrErLv#
+	LESL	EDI, SS:pdaArg7#	;Get address of definition buffer
+	MOVL	ECX, SS:pdaArg8#	;Get length of the buffer
+	CLRL	EDX
+	MOVL	EAX, FS:eb_length.B[EBX] ;Point to start of definition
+	LEAL	ESI, eb_string.B[EBX+EAX*4]
+10$:	LODSB	FS:[ESI]		;Get next character
+	IFFAULT	knlRtnAdrErLv#
+	STOSB	[EDI]			;Store character in user buffer
+	TESTB	AL, AL			;End?
+	JE	12$.S			;Yes
+	INCL	EDX			;No - count it
+	LOOP	ECX, 10$		;Continue if room for more
+	IFFAULT	knlRtnAdrErLv#		;Store 0FFh followed by NULL as last
+	MOVW	ES:-2.B[EDI], #0FFh	;  two characters in buffer
+12$:	MOVL	EAX, EDX		;Return length of definition
+	LEAVE
+	RET
+.PAGE
+	.SBTTL	svcSysDefEnv - SVC to define environment string
+
+;Here for the svcSysDefEnv SVC - Define environment string
+;	long level;		// Level: (bits 14 and 15 determine format)
+;				//   00 = Process ID (all 0 means self)
+;				//   01 = Low 8 bits gives offset up from
+;				//	    current process (rest ignored)
+;				//   10 = Low 8 bits gives offset down from
+;				//	    session process (rest ignored)
+;				//   11 = System level (rest ignored)
+;				//  Bits 8 to 13 are reserved and must be 0
+;	char far *string;	// Address of string to search for
+;	char far *define;	// Address of defination string
+;	rtn = svcSysDefEnv(level, string, define);
+;  Value returned is 0 if normal or negative error code if error
+
+rsvcSysDefEnv::
+	MOVL	EBP, #pdaArg3#
+	CALL	vfixaddr#
+	SUBL	EBP, #8.B
+	CALL	vfixaddr#
+	JMP	2$.S
+
+psvcSysDefEnv::
+	SVCENTR	CNTSysDefEnv#
+	ORB	SS:pdaArg2#, #03
+	ORB	SS:pdaArg4#, #03
+2$:	ENTER	ls_SIZE, 0		;Set up our stack frame
+	CALL	envsetup		;Do common set up
+	JC	4$.S			;If error
+	CMPB	en_wild.B[EBP], #0	;Have wild-card character in name?
+	JNE	6$.S			;Yes - error
+	CLRL	ECX			;Find first match
+	CALL	srchenv			;Search a single level
+	JNE	8$.S			;If not now defined
+	MOVL	ESI, EBX		;Defined - give up current definition
+	TOFORK
+	CALL	knlRmvPdaMemP#
+	FROMFORK
+	CMPL	SS:pdaArg5#, #0.B	;Null defination?
+	JNE	10$.S			;No - continue
+	CLRL	EAX			;Yes - all done
+4$:	LEAVE
+	RET
+
+;Here if wildcard in string
+
+6$:	MOVL	EAX, #ER_WLDNA
+	JMP	4$.S
+
+;Here if not now defined
+
+8$:	CMPL	SS:pdaArg5#, #0.B	;Want to delete definition?
+	JNE	10$.S			;No - continue
+	MOVL	EAX, #ER_NTDEF		;Error = NoT DEFined
+	JMP	4$.S
+
+;Here with a new string to define
+
+10$:	PUSHL	ES			;Save selector for PDA for defination
+	LESL	EDI, SS:pdaArg5#	;Point to defination string
+	CLRL	ECX
+	DECL	ECX
+	CLRL	EAX
+	IFFAULT	22$
+	RNSCASB	[EDI]			;Find end of string
+	NEGL	ECX			;Get length of string (including final
+	DECL	ECX			;  null)
+	MOVL	en_lendef.B[EBP], ECX	;Save it for later
+	POPL	ES			;Restore PDA selector
+	ADDL	ECX, #7.B		;Change to number of longs plus one
+	SHRL	ECX, #2			;  (round up)
+	ADDL	ECX, en_lenstr.B[EBP]	;Get total amount needed for block
+	SHLL	ECX, #2			;Change back to byte count
+	CALL	getenvblk		;Get PDA memory block
+	JC	4$.S
+	LEAL	EDI, eb_string.B[ESI]	;Store name of string
+	MOVL	EAX, en_lenstr.B[EBP]
+	MOVL	ECX, EAX
+	PUSHL	ESI
+	LEAL	ESI, en_sbufr.B[EBP]
+	RMOVSL	[EDI], SS:[ESI]
+	POPL	ESI
+	MOVL	ES:eb_length.B[ESI], EAX ;Store length of name
+	LEAL	EDI, eb_string.B[ESI+EAX*4] ;Point to place to put definition
+	LFSL	ESI, SS:pdaArg5#	;Get address of user buffer again
+	MOVL	ECX, en_lendef.B[EBP]	;Get length of definition
+	IFFAULT	20$
+12$:	RMOVSB	[EDI], FS:[ESI]		;Copy definition to block
+14$:	CLRL	EAX
+16$:	LEAVE
+	RET
+
+;Here if address error while reading definition from the user
+
+	FAULTHDR
+20$:	CALL	knlRmvPdaMemP#		;Give up the block
+
+	FAULTHDR
+22$:	MOVL	EAX, #ER_ADRER
+	JMP	16$.S
+.PAGE
+;Subroutine to do common set up for environment functions
+;	CALL	envsetup
+;	c[ES] = Selector for PDA to search
+
+envsetup:
+	CALL	getlevel		;Get level and find PDA
+	JC	10$
+	IFFAULT	knlRtnAdrEr#
+	LFSL	ESI, SS:pdaArg3#	;Get address of buffer containing string
+	MOVB	en_wild.B[EBP], #0	;Assume no wild-cards in name
+	LEAL	EDI, en_sbufr.B[EBP]
+	PUSHL	SS
+	POPL	ES
+	CLRL	ECX
+	MOVL	ECX, #100t
+	CLD
+	IFFAULT	knlRtnAdrEr#
+2$:	LODSB	FS:[ESI]		;Get byte
+	TESTB	AL, AL			;End of string?
+	JE	12$.S			;Yes
+	CMPB	AL, #'a'		;No - lower case?
+	JB	4$.S			;No
+	CMPB	AL, #'z'		;Maybe
+	JA	4$.S			;No
+	SUBB	AL, #'a'-'A'		;Yes - convert to upper case
+4$:	STOSB	[EDI]			;Store in our buffer
+	CMPB	AL, #'*'		;See if wild character
+	JE	6$.S
+	CMPB	AL, #'?'
+	JE	6$.S
+	CMPB	AL, #'{'
+	JE	6$.S
+	CMPB	AL, #'}'
+	JNE	8$.S
+6$:	MOVB	en_wild.B[EBP], #1	;Indicate have wild character
+8$:	LOOP	ECX, 2$			;Continue if room for more
+	MOVL	EAX, #ER_NTLNG		;Name is too long
+	STC
+10$:	RET
+
+;Here at end of string
+
+12$:	CLRL	EAX			;Make sure have last long filled with
+	STOSL	[EDI]			;  nulls
+	MOVB	AL, #104t		;Calculate length of string (in longs)
+	SUBB	AL, CL
+	SHRB	AL, #2
+	MOVL	en_lenstr.B[EBP], EAX	;Save it
+	PUSHL	GS
+	POPL	ES
+	CLC
+	RET
+.PAGE
+	.SBTTL	getlevel - Subroutine to get level for svcSysXxxEnv and svcIoXxxLog
+
+;Subroutine to get level for svcSysDefEnv, svcSysFindEnv, svcIoDefLog and
+;  svcIoFindLog
+;	CALL	getlevel
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  c[GS]  = Selector for PDA for logical name
+
+getlevel::
+	MOVL	EBX, SS:pdaArg1#	;Get value
+	ANDB	BH, #0C0h		;Remove extra bits
+	JNE	2$.S			;If don't want specific process
+	CALL	getproc#		;Get specified process
+	JC	4$.S			;If error
+	PUSHL	ES			;OK - get selector in right register
+	POPL	GS
+	RET
+
+;Here if not specifying a process directly
+
+2$:	CMPB	BH, #0C0h		;Want system level?
+	JNE	6$.S			;No
+	MOVW	GS, knlProcTable#+2	;Yes
+4$:	RET
+
+;Here if do not want system level
+
+6$:	TESTB	BH, #40h		;Want level relative to self?
+	JNE	8$.S			;Yes
+	SUBB	BL, SS:pdaPLevel#	;No - get number of levels to skip
+	NEGB	BL
+	JS	12$.S
+8$:	PUSHL	SS			;Start at current level
+	POPL	GS
+	CMPB	BL, #0			;Want current level?
+	JE	4$.S			;Yes
+10$:	MOVZWL	EAX, GS:pdaParProc#	;No - go back one more level
+	TESTL	EAX, EAX		;Make sure have parent
+	JE	12$.S
+	MOVW	GS, knlProcTable#[EAX*2]
+	DECB	BL			;Want this level?
+	JNE	10$.S			;No - continue
+	RET				;Yes - finished
+
+;Here if requested process level does not exist
+
+12$:	MOVL	EAX, #ER_NSP
+	STC
+	RET
+.PAGE
+	.SBTTL	srchenv - Subroutine to search single level for environment string
+
+;Subroutine to search single level for environment string
+;	c{ECX} = Skip count
+;	c[ES]  = Selector for PDA to search
+;	CALL	srchenv
+;	Z:set = Found
+;	  c{ES:EBX} = Address of definition block
+;	Z:clr = Not found
+
+srchenv:MOVZWL	EBX, ES:pdaEnvPnt#	;Get first string
+	TESTL	EBX, EBX
+	JE	10$.S
+	MOVL	en_skip.B[EBP], ECX	;Store skip count
+	MOVL	en_count.B[EBP], ECX
+2$:	DECL	en_skip.B[EBP]		;Need to skip more?
+	JS	4$.S			;No - go on
+	MOVL	EBX, ES:eb_next.B[EBX]	;Yes - advance to next
+	TESTL	EBX, EBX
+	JNE	2$.S			;Continue if more to skip
+	JMP	10$.S			;No more - return with Z clear
+
+;Here with initial items skiped
+
+4$:	CMPB	en_wild.B[EBP], #0	;Have wild-card character?
+	JNE	14$.S			;Yes - go handle that
+	MOVL	EAX, en_lenstr.B[EBP]	;No - get length of our string
+	CLD
+6$:	INCL	en_count.B[EBP]		;Bump count
+	CMPL	ES:eb_length.B[EBX], EAX ;Is this one the same length?
+	JNE	8$.S			;No - can't match!
+	LEAL	EDI, eb_string.B[EBX]	;Yes - set up for compare
+	LEAL	ESI, en_sbufr.B[EBP]
+	MOVL	ECX, EAX
+	RECMPSL	[EDI], SS:[ESI]
+	JE	20$.S			;If this is it
+8$:	MOVL	EBX, ES:eb_next.B[EBX]	;Not this one - advance to next
+	TESTL	EBX, EBX
+	JNE	6$.S			;Continue if more to check
+10$:	INCL	EBX			;Not found - clear Z
+	RET				;And return
+
+;Here if must do wild card search
+
+14$:	INCL	en_count.B[EBP]		;Bump count
+	PUSHL	EBX
+	PUSHL	EDX
+	LEAL	ESI, en_sbufr.B[EBP]
+	LEAL	EDI, eb_string.B[EBX]
+	LEAL	EBX, en_junk[EBP]
+	CLRL	EAX			;Do mixed case compare
+	CALL	knlWildCmp8#		;Compare the names
+	POPL	EDX
+	POPL	EBX
+	JC	18$.S			;If error
+	JE	20$.S			;If match
+	MOVL	EBX, ES:eb_next.B[EBX]	;Not this one - advance to next
+	TESTL	EBX, EBX
+	JNE	14$.S			;Continue if more to check
+	INCL	EBX			;Not found - clear Z
+18$:	RET				;And return
+
+;Here with matching entry
+
+20$:	MOVL	ECX, en_count.B[EBP]	;Get the count
+	RET				;Return with it
+.PAGE
+	.SBTTL	defenvstr - Subroutine to define environment string
+
+;Subroutine to define environment string for run SVC
+;	c{FS:EBX} = Address of definition (of form name=string)
+;	c{ECX}    = Number of characters available
+;	c[ES]     = Selector of PDA
+;	CALL	defenvstr
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  c{FS:EBX} = Address of character after terminating null
+;	  c{ECX}    = Updated number of characters available
+
+defenvstr::
+	MOVL	EDI, EBX		;Save offset
+	PUSHL	ECX			;Save characters available
+	CLRL	ECX			;Count characters in string
+	MOVB	AH, #0
+2$:	DECL	[ESP]			;Have another character available?
+	JLE	10$.S			;No
+	IFFAULT	knlRtnAdrEr#
+	MOVB	AL, FS:[EBX]		;Yes - get it
+	INCL	EBX
+	TESTB	AL, AL			;End of definition?
+	JE	10$.S			;Yes
+	INCL	ECX
+	CMPB	AL, #'='		;End of name?
+	JNE	2$.S			;No
+	TESTB	AH, AH			;Yes - first time?
+	JNE	2$.S			;No - just a normal character
+	INCB	AH			;Yes
+	DECL	ECX
+	JE	6$.S
+	MOVL	EDX,  ECX		;Save length of name
+	CLRL	ECX			;Reset count
+	JMP	2$.S			;Continue
+
+6$:	POPL	ECX
+	JMP	knlBadValue#
+
+;Here after scaning string
+
+10$:	TESTB	AH, AH			;Did we see an =?
+	JE	6$.S			;No - fail
+	PUSHL	ECX			;Save length of string
+	LEAL	EAX, 3.B[EDX]
+	ANDB	AL, #0FCh		;Get total space needed
+	ADDL	ECX, EAX
+	ADDL	ECX, #5.B
+	PUSHL	FS
+	PUSHL	EBX
+	CALL	getenvblk		;Get a PDA memory block
+	POPL	EBX
+	POPL	FS
+	POPL	ECX
+	JC	14$.S
+	LEAL	EAX, 3.B[EDX]
+	SHRL	EAX, #2			;Store length of name
+	MOVL	ES:eb_length.B[ESI], EAX
+	XCHGL	EDX, ECX
+	ADDL	ESI, #eb_string.B	;Point to place to put name
+	XCHGL	ESI, EDI
+	CLD
+	RMOVSB	[EDI], FS:[ESI]		;Store name string in block
+	MOVB	AL, #0
+	MOVL	ECX, EDI		;Null fill to long boundry
+	NEGL	ECX
+	ANDL	ECX, #3
+	RSTOSB	[EDI]
+	INCL	ESI			;Skip the =
+	MOVL	ECX, EDX
+	RMOVSB	[EDI], FS:[ESI]		;Store definition
+	STOSB	[EDI]			;Store final null
+14$:	POPL	ECX			;Get updated count
+	RET				;All done	
+
+.PAGE
+	.SBTTL	getenvblk - Subroutine to get PDA block for environment string
+
+;Subroutine to get PDA block for environmnet string
+;	c{ECX} = Size of block
+;	c[ES]  = Selector of PDA
+;	CALL	getenvblk
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  c{ESI} = Offset of block allocated
+
+getenvblk::
+	TOFORK
+	CALL	knlGetPdaMemP#		;Get memory block
+	JC	6$.S			;If error
+	FROMFORK
+	MOVZWL	EAX, ES:pdaEnvPnt#	;Link this block to our list
+	TESTL	EAX, EAX
+	JE	4$.S
+	LEAL	EBX, eb_next.B[ESI]
+	MOVL	ES:eb_pntr.B[EAX], EBX
+4$:	MOVL	ES:pdaEnvPnt#, ESI
+	MOVL	ES:eb_pntr.B[ESI], #pdaEnvPnt#
+	MOVL	ES:eb_next.B[ESI], EAX
+	RET
+
+;Here if error while at fork level
+
+6$:	FROMFORK
+	STC
+ret020:	RET
+.PAGE
+	.SBTTL	copyenviron - Subroutine to copy environment to child process
+
+;Subroutine to copy environment to child process - must be called after child
+;  process has been created but before it has been put in a run queue
+;	c[ES] = Selector of PDA for child process
+;	CALL	copyevniron
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+
+copyenviron::
+	CLD
+	MOVL	EDX, #pdaEnvPnt#	;(We need EDX below for linking!)
+	MOVL	EDI, SS:[EDX]		;Get offset of first environment block
+2$:	TESTL	EDI, EDI
+	JE	ret020.S
+	MOVZWL	ECX, SS:[EDI]		;Get length of block
+	SUBL	ECX, #eb_length.B
+	PUSHL	ECX
+	CALL	knlGetPdaMemP#		;Allocate PDA block for the child
+	POPL	ECX
+	JC	ret020.S		;If error
+	MOVL	ES:[EDX], ESI		;Link it in to our list
+	MOVL	ES:eb_pntr.B[ESI], EDX
+	LEAL	EDX, eb_next.B[ESI]
+	SHRL	ECX, #2
+	PUSHL	EDI
+	XCHGL	EDI, ESI		;Set up offsets
+	ADDL	EDI, #eb_length.B
+	ADDL	ESI, #eb_length.B
+	RMOVSL	[EDI], SS:[ESI]		;Copy the block
+	POPL	EDI
+	MOVL	EDI, SS:eb_next.B[EDI]	;Advance to next block
+	JMP	2$.S			;Continue
+
+	END
+

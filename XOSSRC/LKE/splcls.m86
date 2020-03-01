@@ -1,0 +1,656 @@
+	.TITLE	SPLCLS - Spooled class driver for XOS
+
+;*--------------------------------------------------------------------------*
+;* SPLCLS.M86
+;*
+;* Written by: John R. Goltz
+;*
+;* Edit History:
+;* 1.0.0  8-Nov-92 JRG - Original version
+;*
+;*--------------------------------------------------------------------------*
+
+;++++
+; This software is in the public domain.  It may be freely copied and used
+; for whatever purpose you see fit, including commerical uses.  Anyone
+; modifying this software may claim ownership of the modifications, but not
+; the complete derived code.  It would be appreciated if the authors were
+; told what this software is being used for, but this is not a requirement.
+
+;   THIS SOFTWARE IS PROVIDED BY THE AUTHORS "AS IS" AND ANY EXPRESS OR
+;   IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
+;   OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+;   IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+;   INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+;   BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS
+;   OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+;   ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR
+;   TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
+;   USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+;----
+
+	.PROC	80486
+	.INCLUD	XOSINC:\XMAC\XOS.PAR
+	.INCLUD	XOSINC:\XMAC\XOSX.PAR
+	.INCLUD	XOSINC:\XMAC\XOSERR.PAR
+	.INCLUD	XOSINC:\XMAC\XOSTIME.PAR
+	.INCLUD	XOSINC:\XMAC\XOSLKE.PAR
+	.INCLUD	XOSINC:\XMAC\XOSXLKE.PAR
+
+MAJV   =!1t
+MINV   =!1t
+EDITNUM=!0t
+
+;This class driver is a redirector only.  It implements only a minimal device
+;  which is only useful for setting or reading device characteristics values.
+;  It only supports physical or raw mode opens and does not support any IO
+;  operations. Non-physical or raw mode opens are redirected to the device
+;  specified by the device's SPOOL characteristic value.
+
+	LKEHEAD	SPLCLS, MAJV, MINV, EDITNUM, LKETYPE_CLASS
+
+;Define offsets in the SPL DCB
+
+$$$=!4
+BLK dcb_spclstime, 4t		;Default close-time interval
+BLK dcb_spsplspec, 4t		;Offset of the spool file specification buffer
+BLK dcb_spseqnum , 4t		;File name sequence number
+BLK dcb_spclsname, 4t		;Offset of the close name buffer
+BLK dcb_spclsmsg , 16t		;Close message destination
+dcb_spSIZE=!$$$
+
+	CODE
+
+;SVC dispatch table for SPL class devices
+
+spldsp: .LONG	knlRtnZero##	;sd_mount	=  0. - Mount
+	.LONG	knlRtnZero##	;sd_cleardev	=  4. - Clear device
+	.LONG	knlRtnZero##	;sd_cleardcb	=  8. - Clear DCB
+	.LONG	knlRtnZero##	;sd_commit	= 12. - Commit data to disk
+	.LONG	knlRtnZero##	;sd_transold    = 16. - Transfer device/old
+	.LONG	knlRtnZero##	;sd_transnew    = 20. - Transfer device/new
+	.LONG	knlNullQio##	;sd_opena	= 24. - Open additional
+	.LONG	splopen		;sd_open1	= 28. - Open device/file
+	.LONG	splopen		;sd_devparm     = 32. - Device parameters
+	.LONG	knlIFnDev##	;sd_delete	= 36. - Delete file
+	.LONG	knlIFnDev##	;sd_rename	= 40. - Rename file
+	.LONG	knlIllInpGQ##	;sd_inblock	= 44. - Input block
+	.LONG	knlIllOutGQ##	;sd_outblock	= 48. - Output block
+	.LONG	knlIllOut##	;sd_outblockq	= 52. - Output block (XFF)
+	.LONG	knlIllOutGQ##	;sd_outstring	= 56. - Output string
+	.LONG	knlIFnDevGQ##	;sd_getiosts	= 60. - Get input/output status
+	.LONG	knlIFnDevGQ##	;sd_special     = 64. - Special device function
+	.LONG	knlNullClose##	;sd_close	= 68. - Close file
+	.LONG	knlNullLabel##	;sd_label       = 72. - Get device label
+	.LONG	knlNullQioGQ##	;sd_commitfunc	= 76. - Commit data to disk
+	.LONG	knlInfoNone##	;sd_devinfo     = 80. - Get device info
+SPLDSPSZ=!{$-spldsp}/4
+
+;Class function dispatch table for SPL class devices
+
+	.LONG	CLSFMX
+splcls:	.LONG	spladdunit	;CF_ADDUNIT = 1. - Add unit
+	.LONG	splunitinfo	;CF_PUNITS  = 2. - Get information about
+				;		     physical units
+	.LONG	knlIFnDev##	;CF_AUNITS  = 3. - Get information about active
+				;		     units
+CLSFMX=!{$-splcls}/4
+
+;Class characteristics table for the SPL device class
+
+splcctbl:
+ DCHARBGN  1, knlDCharValCom##
+.PAGE
+;Device characteristics for SPL class devices
+
+	DATA
+
+	.MOD	4
+spldctbl:
+ DCHARBGN  2, knlDCharValCom##
+ DCHARENT  CLASS  , TEXT, , 8  , knlDcMsgClass##, knlDcGetClass##  , knlDcSetClass##  , 0
+ DCHARENT  SEQNUM , DECV, , 4  , msgseqnum      , knlDcGet4Byte##  , knlDcSet4Byte##  , dcb_spseqnum
+ DCHARENT  SPLSPEC, STR , , 256, msgsplspec     , getstring        , setstring        , dcb_spsplspec
+ DCHARENT  CLSNAME, STR , , 48 , msgclsname     , getstring        , setstring        , dcb_spclsname
+ DCHARENT  CLSMSG , TEXT, , 16 , msgclsmsg      , knlDcGetLongDcb##, knlDcSetLongDcb##, dcb_spclsmsg
+ DCHARENT  CLSTIME, DECV, , 4  , msgclstime     , knlDcGet4Byte##  , knlDcSet4Byte##  , dcb_spclstime
+
+	CODE
+
+msgseqnum: DCHARINFO  {Spooled name sequence number}
+msgsplspec:DCHARINFO  {Spooled file specification}
+msgclsname:DCHARINFO  {Closed file name}
+msgclsmsg: DCHARINFO  {Close message destination}
+msgclstime:DCHARINFO  {Close time-out (sec)}
+.PAGE
+	.SBTTL	Initialization routine
+
+	INITSUB	splinit
+
+splinit:MOVL	EDI, #splchk		;Install our class
+	MOVL	EBX, #splcls		;Offset of class function dispatch table
+	MOVL	EAX, #'SPL'
+	CLRL	EDX
+	MOVL	ECX, #splcctbl
+	MOVL	ESI, #splccb
+	CALL	knlNewClass##
+4$:	JC	10$.S			;This should not fail!
+	MOVL	ECX, #codetop
+	CLRL	EDX
+	CLRL	EAX
+10$:	MOVL	EBX, #QSTS$DONE
+	RET
+
+	CODE
+.PAGE
+	.SBTTL	spladdunit - Class function to add unit
+
+;Here for the CL_ADDUNIT function
+;	c{EBX} = Offset of CCB
+;	c{ESI} = Offset of IORB
+;	CALL	spladdunit
+;	c{EAX} = Error code
+;	c{EBX} = Status bits
+;	c{ECX} = Item count (number of units added)
+
+$$$=!0
+FRM au_unit, 4t		;Unit number
+au_SIZE=!$$$
+
+;Description block for addunitchar
+
+	DATA
+
+	.MOD	4
+splaublk:
+ DCHARBGN  3, knlDCharValCom##
+ DCHARENT  UNIT, DECV, , 1, 0, 0, splauunit, 0
+
+	CODE
+
+spladdunit:
+	ENTER	au_SIZE, 0		;Set up and initialize our stack frame
+	CLRL	EAX
+	DECL	EAX
+	MOVL	au_unit.B[EBP], EAX
+	IFFAULT	6$
+	LFSL	EDX, iorb_buffer2.B[ESI] ;Get address of add-unit
+					 ;  characteristics
+	CALL	knlGiveQel##		;Give up the IORB
+	MOVL	EBX, #splaublk		;Process the characteristics
+	MOVB	AL, #0			;Fail on bad names here
+	CALL	knlAddUnitChar##
+	JNC	16$.S			;If no error
+4$:	CLRL	ECX
+	MOVL	EBX, #QSTS$DONE
+	LEAVE				;Fail
+	TOFORK
+	STC
+	RET
+
+;Here if address error with IORB
+
+	FAULTHDR
+6$:	CALL	knlGiveQel##
+	MOVL	EAX, #ER_ADRER
+	JMP	4$.S
+
+;Here if unit is already defined
+
+12$:	MOVL	EAX, #ER_DUADF
+	JMP	4$.S
+
+;Here with all parameters processed
+
+16$:	MOVB	AL, au_unit.B[EBP]	;Get unit number
+	MOVL	EDI, splccb+ccb_dcbhead	;Point to first SPL DCB
+18$:	TESTL	EDI, EDI
+	JE	30$.S			;If no more DCBs
+	CMPB	dcb_punit.B[EDI], AL	;Same unit?
+	JE	12$.S			;Yes - fail
+20$:	MOVL	EDI, [EDI]		;Not this one - try next
+	JMP	18$.S			;Continue
+
+;Here if error when have exec memory resource
+
+26$:	CLRL	EAX			;Clear name in DCB so device can not
+	MOVL	dcb_name.B[EDI], EAX	;  be used!
+28$:	CALL	knlGiveXRes##		;Give up the exec memory resource
+	JMP	4$.S
+
+;Here if unit is not defined now
+
+30$:	CALL	knlGetXRes##		;Get exec memory resource
+	MOVL	ECX, #dcb_spSIZE+dcb_cSIZE ;Create a DCB
+	MOVL	EBX, #DS$SPOOL|DS$MLTUSER|DS$QOUT
+	MOVL	EDI, #spldsp
+	CALL	knlMakeDcb##
+32$:	JC	28$.S
+	MOVL	ESI, #splccb
+	CALL	knlLinkDcb##
+	JC	26$.S
+	MOVL	dcb_name+0.B[EDI], #'SPL' ;Setup device name
+	MOVL	dcb_devchar.B[EDI], #spldctbl ;Store offset of devchar table
+	MOVZBL	EAX, au_unit.B[EBP]	;Put in unit number
+	MOVB	dcb_punit.B[EDI], AL
+	LEAL	EBX, dcb_name+3.B[EDI]
+	CALL	knlPutDecNmbr##
+	CALL	knlGiveXRes##		;Give up the exec memory resource
+	CLRL	EAX			;Get our return value
+	MOVL	ECX, #1
+	MOVL	EBX, #QSTS$DONE
+	LEAVE
+	TOFORK
+	RET
+.PAGE
+;Subroutine called by adduchars when "UNIT" characteristic found
+
+splauunit:
+	CMPL	EAX, #99t
+	JAE	4$.S
+	MOVL	au_unit.B[EBP], EAX
+	CLC
+	RET
+
+;Here if bad characteristic value
+
+4$:	MOVL	EAX, #ER_CHARV		;Get error code
+	STC				;Fail
+	RET
+.PAGE
+;Here to get the value of the SPLSPEC or CLSNAME characteristic
+;	c{ES:EBX} = Address of buffer to receive value
+;	c{ECX}    = Length of buffer
+;	c{EDX}    = Offset of pointer in DCB
+;	c{EDI}    = Offset of DCB
+;	CALL	getstring
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  c{ECX} = Length of string stored
+
+getstring:
+	MOVL	EDX, [EDI+EDX]		;Get offset of string buffer
+	TESTL	EDX, EDX		;Really have a string?
+	JE	4$.S			;No
+	INCL	EDX			;Yes - point to the string
+	JMP	knlGetSysStr##		;Go give it to him
+
+;Here if don't have a string buffer allocated
+
+4$:	CLRL	ECX			;Give him an empty string
+	IFFAULT	knlRtnAdrEr##
+	MOVB	ES:[EBX], CL
+	RET
+.PAGE
+;Here to set the value of the SPLSPEC or CLSNAME characteristic
+;	c{ES:EBX} = Address of new value
+;	c{EDX}    = Offset of pointer in DCB
+;	c{EDI}    = Offset of DCB
+;	CALL	setstring
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+
+$$$=!0
+FRM ssn_size, 4t	;Length of string
+FRM ssn_str , 8t	;Address of string
+ssn_SIZE=!$$$
+
+setstring:
+	ENTER	ssn_SIZE, 0
+	MOVL	ssn_str+0.B[EBP], EBX
+	MOVL	ssn_str+4.B[EBP], ES
+	ADDL	EDI, EDX		;Point to pointer to string
+	PUSHL	EDI
+	MOVL	EDI, EBX
+	MOVL	ECX, #-1
+	CLD
+	CLRL	EAX
+	IFFAULT	knlRtnAdrErLv##
+	RNSCASB	[EDI]			;Find length of the string (including
+	NOTL	ECX			;  the terminating null)
+	POPL	EDI
+	CMPL	ECX, #254t		;Too long?
+	JA	12$.S			;Yes - fail
+	MOVL	ssn_size.B[EBP], ECX	;No
+	LEAL	EDX, 1.B[ECX]
+	CALL	knlGetIndex##		;Get size index for buffer for string
+	JC	10$.S
+	MOVL	ESI, [EDI]		;Do we have a buffer allocated now?
+	TESTL	ESI, ESI
+	JE	4$.S			;No
+	CMPL	ssn_size.B[EBP], #0.B	;Yes - removing definition?
+	JBE	2$.S			;Yes
+	CMPB	[ESI], CL		;No - is the buffer the right size?
+	JE	6$.S			;Yes
+2$:	PUSHL	ECX			;No
+	MOVZBL	ECX, [ESI]
+	MOVL	[EDI], #0		 ;Clear our pointer
+	CALL	knlGiveXmb##		;Give up the current buffer
+	POPL	ECX
+4$:	CMPL	ssn_size.B[EBP], #1.B	;Removing definition?
+	JBE	8$.S			;Yes - all done
+	CALL	knlGetXmb##		;No - allocate a buffer
+	JC	10$.S			;If error
+	MOVL	[EDI], ESI
+	MOVB	[ESI], CL
+6$:	LEAL	EDI, 1.B[ESI]
+	PUSHL	DS
+	POPL	ES
+	LFSL	ESI, ssn_str.B[EBP]
+	MOVL	ECX, ssn_size.B[EBP]
+	CLD
+	RMOVSB	[EDI], FS:[ESI]
+8$:	CLRL	EAX
+10$:	LEAVE
+	RET
+
+;Here if the string is too long
+
+12$:	MOVL	EAX, #ER_CHARS
+	LEAVE
+	STC
+	RET
+.PAGE
+	.SBTTL	splchk - Device check routine for SPL class devices
+
+;Device check routine for SPL class devices
+;	c{SS:EBX} = Address of device name (16 characters)
+;	c{SS:EDX}  = Address of file specification (not including device name)
+;	CALL	splchk
+;	C:set = Error (match found)
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  Z:set = Match found
+;	    c{EDI} = Offset of DCB
+;	  Z:clr = Not found
+;	    c{ESI} = Unchanged or reset to offset of knlFirstCcb
+
+splchk:	MOVL	EAX, SS:[EBX]		;Is this SPL*?
+	ANDL	EAX, #0FFFFFFh
+	CMPL	EAX, #'SPL'
+	JNE	10$.S			;No
+	MOVL	EDI, splccb+ccb_dcbhead	;Yes - point to first spooled DCB
+	TESTL	EDI, EDI
+	JE	8$.S
+4$:	MOVL	EAX, dcb_name+0.B[EDI]	;Does name match?
+	CMPL	SS:[EBX], EAX
+	JNE	6$.S			;No
+	MOVL	EAX, dcb_name+4.B[EDI]
+	CMPL	SS:4.B[EBX], EAX
+	JNE	6$.S			;No
+	MOVL	EAX, dcb_name+8.B[EDI]
+	CMPL	SS:8.B[EBX], EAX
+	JNE	6$.S			;No
+	MOVL	EAX, dcb_name+12t.B[EDI]
+	CMPL	SS:12t.B[EBX], EAX
+	JE	havespl.S		;Yes - this is it!
+6$:	MOVL	EDI, dcb_next.B[EDI]	;Not this one - try next
+	TESTL	EDI, EDI
+	JNE	4$.S			;Continue if another
+8$:	INCL	EDI			;No more - clear Z
+10$:	CLC
+	RET
+.PAGE
+;Here with a match on the device name
+
+havespl:CMPB	SS:xffFunc##, #QFNC_OPEN ;Open function?
+	JNE	2$.S
+	TESTL	SS:xffCmd##, #O$RAW|O$PHYS ;Want raw or physical mode?
+	JE	6$.S			;No
+2$:	CLRL	EDX			;Yes - set Z to indicate have device
+	RET				;Thats all
+
+;Here if no spool string specified - say no such device!
+
+4$:	MOVL	EAX, #ER_NSDEV
+	STC
+	RET
+
+;Here if not opening device in raw or physical mode - we need to redirect this
+;  to the indicated spool device and directory
+
+6$:	MOVL	EBX, dcb_spsplspec.B[EDI] ;No - get offset of file spec string
+	TESTL	EBX, EBX		;Do we have a buffer?
+	JE	4$.S			;No - fail!
+	INCL	EBX			;Yes - point to the string
+	PUSHL	DS
+	POPL	ES
+	PUSHL	EDX
+	PUSHL	EDI			;Save offset of our DCB
+	CALL	knlSetName##		;Setup the device name part
+	JC	8$.S			;If error
+	MOVL	EDI, [ESP]
+	MOVL	EAX, dcb_spseqnum.B[EDI]
+	MOVL	ESI, EBX
+	MOVL	EDI, 4t.B[ESP]
+	PUSHL	SS
+	POPL	ES
+	CLD
+	MOVL	ECX, #FILESPCSIZE-4
+	CALL	copyname
+8$:	JC	10$.S
+	MOVL	ES:[EDI], #0		;Store final null
+	MOVL	EDX, 4.B[ESP]		;Point to buffer
+	MOVL	FS, SS:xffPda##		;Get PDA selector for session process
+	MOVZWL	EAX, FS:pdaSesProc##
+	ADDL	EAX, EAX
+	ADDL	EAX, #knlProcTable##
+	MOVW	FS, [EAX]
+	LEAL	EBX, opn_devname.B[EBP]	;Get offset of name
+	MOVL	ESI, #havephy
+	MOVL	EDI, EDX
+	MOVL	ECX, SS:xffCmd##
+	CALL	knlLogNameExpand##	;Expand logical name if have one
+10$:	POPL	EDI
+	JC	12$.S
+	ANDL	SS:xffCmd##, #O$OUT|O$NODFWR|O$CRIT
+	ORL	SS:xffCmd##, #O$CREATE|O$TRUNCA|O$REQFILE
+	MOVZBL	EAX, dcb_spclsmsg.B[EDI] ;Do we need a CAB now?
+	ORL	EAX, dcb_spclstime.B[EDI]
+	ORL	EAX, dcb_spclsname.B[EDI]
+	JE	22$			;No
+	CALL	knlGetCab##		;Yes - get a CAB
+	JC	12$.S
+	CMPL	dcb_spclsname.B[EDI], #0.B ;Do we have a close name?
+	JE	18$.S			;No
+	CMPB	cab_clsname.B[ESI], #0	;Yes - already have a close name?
+	JNE	18$.S			;Yes - forget our name
+	MOVL	EAX, dcb_spseqnum.B[EDI] ;Get sequence number
+	PUSHL	EDI
+	PUSHL	ESI
+	PUSHL	dcb_spclsname.B[EDI]
+	LEAL	EDI, cab_clsname.B[ESI]
+	POPL	ESI
+	INCL	ESI
+	PUSHL	DS
+	POPL	ES
+	MOVL	ECX, #32t
+	CALL	copyname		;Copy the close name to the CAB
+	POPL	ESI
+	JNC	14$.S			;Go on if OK
+	POPL	EDI			;Error
+	MOVB	cab_clsname.B[ESI], #0	;Indicate no close name in the CAB
+	CALL	knlCheckCab##		;Give up CAB if should
+	STC
+12$:	POPL	EDX
+	RET
+
+14$:	JREGZ	ECX, 16$		;Did we just fill the field?
+	MOVB	[EDI], #0		;No - add a final null
+16$:	POPL	EDI
+18$:	MOVL	EAX, dcb_spclstime.B[EDI] ;Do we have a time value?
+	TESTL	EAX, EAX
+	JE	20$.S			;No
+	CMPL	cab_count.B[ESI], #0.B	;Yes - already have a value?
+	JNE	20$.S			;Yes - forget our value
+	MOVW	cab_time.B[ESI], AX	;No - store our value
+	MOVW	cab_count.B[ESI], AX
+	MOVW	AX, SS:xffPda##
+	MOVW	cab_pda.B[ESI], AX
+	MOVW	AX, SS:xffHandle##
+	MOVW	cab_handle.B[ESI], AX
+20$:	CMPL	dcb_spclsmsg.B[EDI], #0.B ;Do we have a message destination?
+	JE	22$.S			;No
+	CMPB	cab_clsmsg.B[ESI], #0	;Yes - already have a destination?
+	JNE	22$.S			;Yes - forget our message destination
+	PUSHL	EDI			;No - use our message destination
+	PUSHL	ESI
+	ADDL	EDI, #dcb_spclsmsg.B
+	ADDL	ESI, #cab_clsmsg.B
+	XCHGL	ESI, EDI
+	PUSHL	DS
+	POPL	ES
+	MOVL	ECX, #4t
+	CLD
+	RMOVSL	[EDI], [ESI]
+	POPL	ESI
+	POPL	EDI
+22$:	POPL	EDX			;Restore offset of name buffer
+	INCL	dcb_spseqnum.B[EDI]	;Bump our sequence number
+	MOVB	AL, dcb_punit.B[EDI]	;Save spool device unit number
+	MOVB	SS:xffSpoolUnit##, AL
+	MOVL	ESI, #knlFirstCcb##	;Reset ESI to restart device search
+	LEAL	EBX, opn_devname.B[EBP]	;Get offset of new device name
+	ORB	SS:xffStatus1##, #XF1$SPOOL ;Indicate spooled device (this also
+	RET				    ;  clears Z to indicate not found)
+.PAGE
+;Here with physical name from knlLogNameExpand
+;	c{SS:EBX} = Address of physical name
+;	c{SS:EDI} = Address of original name buffer
+;	c{SS:EDX} = Address of full expanded name
+;	CALL	havephy
+
+havephy:PUSHL	EDI
+	MOVL	EDI, EDX
+	MOVL	EDX, opn_frame1.B[EBP]
+	MOVL	EAX, SS:[EBX]		;Store physical device name
+	MOVL	SS:opn_devname+0.B[EDX], EAX
+	MOVL	EAX, SS:4.B[EBX]
+	MOVL	SS:opn_devname+4.B[EDX], EAX
+	MOVL	EAX, SS:8.B[EBX]
+	MOVL	SS:opn_devname+8.B[EDX], EAX
+	MOVL	EAX, SS:12t.B[EBX]
+	MOVL	SS:opn_devname+12t.B[EDX], EAX
+	PUSHL	SS
+	POPL	ES
+	MOVL	ECX, #-1
+	CLRL	EAX
+	CLD
+	PUSHL	EDI
+	RNSCASB	[EDI]			;Find length of the expanded name string
+	NOTL	ECX			;  (including the terminating null)
+	POPL	ESI			;Copy the expanded name to our buffer
+	POPL	EDI
+	RMOVSB	[EDI], SS:[ESI]
+	RET				;Return with C clear
+.PAGE
+	.SBTTL	copyname - Subroutine to copy name string
+
+;Subroutine to copy name string and insert sequence number if needed - does not
+;  store final null
+;	c{EAX}    = Sequence number
+;	c{ECX}    = Maximum length of buffer to receive name
+;	c{ES:EDI} = Address of buffer to receive name
+;	c{ESI}    = Offset of name string
+;	CALL	copyname
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  c{ECX}    = Number of characters not stored
+;	  c{ES:EDI} = Address of next byte in buffer
+
+copyname:
+	PUSHL	EAX			;Save sequence number
+2$:	LODSB	[ESI]			;Get character
+	CMPB	AL, #'/'		;Slash?
+	JNE	4$.S			;No
+	MOVB	AL, #'\'		;Yes - change to back-slash
+4$:	CMPB	AL, #'#'		;Want sequence number here?
+	JNE	22$.S			;No - go on
+	LODSB	[ESI]			;Get number of digits wanted
+	CMPB	AL, #0			;Is it there?
+	JE	22$.S			;No
+	CMPB	AL, #'1'		;Yes - too small?
+	JAE	12$.S			;No
+10$:	MOVB	AL, #1			;Yes - make it 1
+12$:	CMPB	AL, #'6'		;Too large?
+	JBE	14$.S			;No
+	MOVB	AL, #6			;Yes - make it 6
+14$:	ANDL	EAX, #0Fh.B		;Get number
+	SUBL	ECX, EAX		;Will it fit?
+	JLE	24$.S			;No - fail
+	PUSHL	ESI
+	MOVL	ESI, EAX		;Save field with for later
+	MOVL	EAX, 4.B[ESP]		;Get sequence number
+	PUSHL	ECX
+	CLRL	ECX
+16$:	CLRL	EDX
+	IDIVL	lit10			;Get a digit
+	PUSHL	EDX
+	INCL	ECX
+	TESTL	EAX, EAX		;Need more?
+	JNE	16$.S			;Yes - continue
+	SUBL	ESI, ECX		;Calculate number of fill charaters
+	JGE	18$.S			;If it fits in the field
+	ADDL	ECX, ESI		;Value too big - discard some digits
+	SHLL	ESI, #2
+	SUBL	ESP, ESI
+	JMP	20$.S			;Continue
+
+;Here if value is too small for the field - fill it with 0s (also get here if
+;  it just fits, in which case this code does nothing since ECX = 0)
+
+18$:	MOVB	AL, #'0'
+	PUSHL	ECX
+	MOVL	ECX, ESI
+	RSTOSB	[EDI]
+	POPL	ECX
+20$:	POPL	EAX			;Get a digit value
+	ADDB	AL, #'0'
+	STOSB	[EDI]			;Store in name
+	LOOP	ECX, 20$		;Continue if more to store
+	POPL	ECX
+	POPL	ESI
+	JMP	2$.S			;Continue
+
+;Here with character other than #
+
+22$:	CMPB	AL, #0			;End of string?
+	JE	28$.S			;Yes
+	STOSB	[EDI]			;Store character in buffer
+	LOOP	ECX, 2$			;No - continue more room
+24$:	MOVL	EAX, #ER_BDSPC		;Too long - fail
+	STC
+28$:	POPL	EDX
+	RET
+.PAGE
+	.SBTTL	sd_open - Open device
+
+;Here for the open device entry
+;	c{EDI} = Offset of DCB
+
+splopen:BTL	SS:xffCmd##, #O%ODF
+	JNC	2$.S			;If no illegal options
+	MOVL	EAX, #ER_NTFIL
+2$:	RET
+.PAGE
+	.SBTTL	CF_PUNITS - Get device unit information
+
+;Here for the get device information entry
+;	c{EDI}    = Offset of DCB
+
+splunitinfo:
+	MOVL	EAX, #ER_NIYT
+	STC
+	RET
+.PAGE
+	.SBTTL	SPL class driver data
+
+	DATA
+
+lit10: .LONG	10t
+splccb:.BLKB	ccb_SIZE	;SPL CCB
+
+	LKEEND

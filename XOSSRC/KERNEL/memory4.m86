@@ -1,0 +1,1134 @@
+	.TITLE	MEMORY4 - Linear address memory routines for XOS
+
+;++++
+; This software is in the public domain.  It may be freely copied and used
+; for whatever purpose you see fit, including commerical uses.  Anyone
+; modifying this software may claim ownership of the modifications, but not
+; the complete derived code.  It would be appreciated if the authors were
+; told what this software is being used for, but this is not a requirement.
+
+;   THIS SOFTWARE IS PROVIDED BY THE AUTHORS "AS IS" AND ANY EXPRESS OR
+;   IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
+;   OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+;   IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+;   INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+;   BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS
+;   OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+;   ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR
+;   TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
+;   USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+;----
+
+	.PROC	80486
+	.INCLUD	XOSINC:\XMAC\XOS.PAR
+	.INCLUD	XOSINC:\XMAC\XOSX.PAR
+	.INCLUD	XOSINC:\XMAC\XOSDOS.PAR
+	.INCLUD	XOSINC:\XMAC\XOSDPMI.PAR
+	.INCLUD	XOSINC:\XMAC\XOSERR.PAR
+	.INCLUD	XOSINC:\XMAC\PCAT.PAR
+
+	CODE
+
+	.SBTTL	svcMemCopy2PM - Copy data to protected mode memory
+
+;Here for the svcMemCopy2PM SVC - Copy data to protected mode memory from real
+;  mode memory.  This function can only be called from real mode.
+;	void *dest;		// Protected mode address for destination
+;	void *src;		// Real mode address for source
+;	long  count;		// Number of bytes to copy
+;	rtn = svcMemCopy2PM(dest, src, count);
+;  Value returned is 0 if normal or a negative error code if error
+
+rsvcMemCopy2PM::
+	ORB	SS:pdaArg1#, #03h	;Make sure have user mode selector
+	IFFAULT	knlRtnAdrEr#
+	LESL	EDI, SS:pdaArg2#	;Get destination address
+	MOVZWL	ESI, SS:pdaArg3#+0	;Get source address
+	MOVZWL	EAX, SS:pdaArg3#+2
+	SHLL	EAX, #4
+	ADDL	ESI, EAX
+	PUSHL	#GS_REAL16.B
+	POPL	FS
+	MOVL	EAX, SS:pdaArg4#	;Get amount to copy
+	MOVL	ECX, EDI		;Get destination long aligned
+	NEGL	ECX
+	ANDL	ECX, #03h.B
+	SUBL	EAX, ECX
+	IFFAULT	knlRtnAdrEr#
+	RMOVSB	[EDI], FS:[ESI]
+	MOVL	ECX, EAX
+	SHRL	ECX, #2t		;Copy most of the data as longs
+	IFFault	knlRtnAdrEr#
+	RMOVSL	[EDI], FS:[ESI]
+	MOVL	ECX, EAX
+	ANDL	ECX, #03h.B		;Copy any bytes left over
+	IFFAULT	knlRtnAdrEr#
+	RMOVSB	[EDI], FS:[ESI]
+	CLRL	EAX			;Return 0
+	RET
+.PAGE
+	.SBTTL	svcMemDescAlloc - Allocate local descriptors
+
+;Here for the svcMemDescAlloc SVC - Allocate local descriptors.  This function
+;  is intended for use by the DPMI routines only.  It should not be used
+;  directory by user programs.
+;	long selector;		// First selector to try to allocate - if
+;				//   bit 31 is set search for available
+;				//   selectors starting with the given one
+;	long num;		// Number of selectors to allocate
+;	long kind;		// Selector kind
+;	rtn = svcMemDescAlloc(selector, num, kind);
+;  Value returned is the selector allocated if normal or a negative error code
+;    if error
+
+psvcMemDescAlloc::
+	SVCENTR	CNTMemDescAlloc#
+	MOVL	EBP, SS:pdaArg1#	;Get first slot to check
+	ANDL	EBP, #0FFF8h
+	MOVL	EDI, SS:pdaArg2#	;Get number desired
+	MOVB	AL, SS:pdaArg3#	;Get segment kind
+	TESTB	AL, #03h		;Is it a DPMI kind?
+	JE	knlBadValue#		;No - fail
+	PUSHL	EAX			;Yes - save segment kind
+	MOVL	EDX, SS:pdaSegTbl#
+	TESTB	SS:pdaArg1#+3, #80	;Want to search for available selector?
+	JE	10$.S			;No
+	MOVL	ECX, SS:pdaSegMax#	;Yes - get number of slots to check
+	SUBL	ECX, EBP
+	JLE	10$.S			;If at or past current end of LDT
+	SHRL	ECX, #3t
+	CLRL	EAX			;Initialize number found
+2$:	CMPB	sd_kind.B[EBP+EDX], #0	;Is this one available?
+	JE	4$.S			;Yes
+	CLRL	EAX			;No - reset number found
+	JMP	8$.S
+
+;Here with an available selector found
+
+4$:	TESTL	EAX, EAX		;Is the the first in a group?
+	JNE	6$.S			;No
+	MOVL	ESI, EBP		;Yes - remember it
+6$:	INCL	EAX			;Increment number found
+	CMPL	EAX, EDI		;Have enough now?
+	JAE	12$.S			;Yes
+8$:	ADDL	EBP, #8t.B		;No - bump pointer
+	LOOP	ECX, 2$			;Continue if more to check
+	TESTL	EAX, EAX		;No more - are we in a group now?
+	JNE	12$.S			;Yes
+10$:	MOVL	ESI, EBP		;No - update where to allocate
+
+;Here when ready to actually allocate selectors.  If we have gone past the
+;  current end of the LDT, makeseg will increate size of the LDT.
+
+12$:	POPL	EAX			;Restore segment kind
+	MOVL	ECX, EDI		;Get number of selectors wanted
+	LEAL	EBP, 7.B[ESI]		;Get first selector to allocate
+	PUSHL	EBP
+14$:	PUSHL	EAX
+	PUSHL	EBP
+	PUSHL	ECX
+	MOVL	EBX, #ST_32RWDATA 	;Get a selector
+	CALL	makeseg#
+	POPL	ECX
+	JC	20$.S			;If error
+	ADDL	EBP, SS:pdaLdtPnt#
+	MOVB	mb_data+st_class.B[EBP], #0 ;OK - clear the G and D bits
+	POPL	EBP
+	POPL	EAX
+	ADDL	EBP, #8t.B
+	LOOP	ECX, 14$
+	POPL	EAX			;Return first selector allocated
+	RET
+
+;Here if error alocatting a selector - give up any selectors already allocated
+;  (this will happen if we are trying to expand the table and can not do so
+;  for some reason)
+
+20$:	POPL	EBP
+	POPL	ECX			;Discard segment kind
+	MOVL	ECX, EBP
+	POPL	EBP			;Restore first selector allocated
+	SUBL	ECX, EBP		;Get number of selectors already
+	SHRL	ECX, #3t		; allocated
+	DECL	ECX
+	JLE	24$.S			;If none allocated
+	PUSHL	EAX			;Save the error code from makeseg
+22$:	PUSHL	EBP
+	PUSHL	ECX
+	CALL	remove2#
+	POPL	ECX
+	POPL	EBP
+	ADDL	EBP, #8h.B
+	LOOP	ECX, 22$
+	POPL	EAX
+24$:	RET
+.PAGE
+	.SBTTL	svcMemDescFree - Free local descriptor
+
+;Here for the svcMemDescFree SVC - Free local descriptor.  This function is
+;  intended to be used by the DPMI routines only.  It should not be used
+;  directly by user programs.
+;	long selector;		// Selector to free - bit 2 must be set
+;	rtn = svcMemDescFree(selector);
+;  Value returned is 0 if normal or a negative error code if error
+
+psvcMemDescFree::
+	SVCENTR	CNTMemDescFree#
+	CALL	getsel			;Get his selector
+	JC	ret002.S		;If error
+	ORL	EBP, #04h
+	MOVL	EDX, SS:pdaSegTbl#
+	TESTB	sd_kind-4.B[EBP+EDX], #02h ;Can we give up this selector?
+	JE	4$.S			;No
+2$:	CALL	remove2#		;Yes - give it up
+	CLRL	EAX			;OK - return 0
+	RET
+
+;Here if cannot give up this selector because it is the wrong kind
+
+4$:	MOVL	EAX, #ER_BDSEL		;No - fail
+ret002:	RET
+.PAGE
+	.SBTTL	svcMemDescWrite - Write local descriptor
+
+;Here for the svcMemDescWrite SVC - Write local descriptor
+;	long   selector;	// Selector
+;	struct data *data[];	// Address of data structure
+;	rtn = svcMemDescWrite(selector, data);
+;  Value returned is 0 if normal or a negative error code if error
+
+psvcMemDescWrite::
+	SVCENTR	CNTMemDescWrite#
+	ORB	SS:pdaArg2#, #03h
+	CALL	getsel			;Get selector
+	JC	ret002.S		;If error
+	IFFAULT	knlRtnAdrEr#
+	LESL	ESI, SS:pdaArg3#	;Get address of user's buffer
+	CLD
+	IFFAULT	knlRtnAdrEr#
+	MOVL	EBX, ES:[ESI]
+	MOVL	ECX, EBX
+	IFFAULT	knlRtnAdrEr#
+	MOVL	EAX, ES:4.B[ESI]
+	MOVB	BL, AL
+	ROLL	EAX, #8
+	MOVB	BH, AL
+	RORL	EBX, #16t		;c{EBX} = Linear address
+	SHRL	EAX, #16t		;c[AX] = Access bits
+	SHLL	ECX, #16t
+	MOVB	CL, AH
+	ANDB	CL, #0Fh
+	RORL	ECX, #16t		;c{ECX} = Limit value
+	INCL	ECX
+	TESTB	AH, #80h		;Page granularity?
+	JE	4$.S			;No
+	SHLL	ECX, #12t		;Yes - convert size to bytes
+4$:	ADDL	EBP, SS:pdaLdtPnt#
+	JMP	strdesc
+.PAGE
+	.SBTTL	svcMemDescRead - Read descriptor
+
+;Here for the svcMemDescRead SVC - Read local descriptor
+;	long   selector;	// Selector
+;	struct data *data[];	// Address of data structure
+;	rtn = svcMemDescRead(selector, data);
+;  Value returned is 0 if normal or a negative error code if error
+
+psvcMemDescRead::
+	SVCENTR	CNTMemDescRead#
+	ORB	SS:pdaArg2#, #03h
+	IFFAULT	knlRtnAdrEr#
+	LESL	EDI, SS:pdaArg3#	;Get address of user's buffer
+	CLD
+	MOVZWL	EBP, SS:pdaArg1#	;Get selector
+	BTL	EBP, #2t		;Local selector?
+	JNC	2$.S			;No
+	ANDL	EBP, #0FFFFFFF8h.B	;Yes
+	CMPL	EBP, SS:pdaSegMax#	;Possible value?
+	JAE	8$.S			;No - fail
+	MOVL	EDX, SS:pdaSegTbl#	;Yes
+	TESTB	sd_kind.B[EBP+EDX], #03h ;Is it a valid segment?
+	JE	8$.S			;No
+	ADDL	EBP, SS:pdaLdtPnt#
+	MOVL	EAX, mb_data+0.B[EBP]	;Yes - get the descriptor
+	MOVL	EDX, mb_data+4.B[EBP]
+	JMP	4$.S
+
+;Here if a global selector was specified
+
+2$:	ANDL	EBP, #0FFFFFFF8h.B
+	MOVL	EBX, EBP
+	CMPL	EBX, gseltop#		;Valid selector?
+	JAE	8$.S			;No
+	MOVL	EDX, gdtable+4[EBX]	;Maybe
+	TESTB	DH, #80h
+	JE	8$.S			;No
+	MOVB	AL, DH
+	ANDB	AL, #60h		;Yes - is it a user selector?
+	CMPB	AL, #60h
+	JNE	8$.S			;No
+	MOVL	EAX, gdtable+0[EBX]
+4$:	IFFAULT	knlRtnAdrEr#
+	STOSL	[EDI]
+	MOVL	EAX, EDX
+	IFFAULT	knlRtnAdrEr#
+	STOSL	[EDI]
+	CLRL	EAX
+	RET
+
+;Here if error
+
+8$:	MOVL	EAX, #ER_BDSEL		;Get error code
+	RET
+.PAGE
+	.SBTTL	svcMemDescSet - Set local descriptor
+
+;Here for the svcMemDescSet SVC - Set local descriptor
+;	long selector;		// Selector
+;	long func;		// Function
+;				//   SDF_BASE   = 1 - Set segment base linear
+;				//			address
+;				//   SDF_LIMIT  = 2 - Set segment limit
+;				//   SDF_ACCESS = 3 - Set access bits
+;	long data;		// Data value
+;	rtn = svcMemDescSet(selector, func, data);
+;  Value returned is the  selector modified if normal or a negative error
+;    code if error
+
+psvcMemDescSet::
+	SVCENTR	CNTMemDescSet#
+	CALL	getsel			;Get selector
+	JC	6$.S			;If error
+	ADDL	EBP, SS:pdaLdtPnt#
+	MOVL	EAX, SS:pdaArg2#	;Get function
+	CMPL	EAX, #SDFMAX.B		;Valid function?
+	JA	4$.S			;No
+	JMPIL	sdfdsp[EAX*4]		;Yes - dispatch on the function
+
+;Here if have illegal function value
+
+4$:	MOVL	EAX, #ER_FUNC
+6$:	RET
+
+	DATA
+
+sdfdsp:	.LONG	4$		;	    = 0 - Illegal
+	.LONG	sdfbase		;SDF_BASE   = 1 - Set base linear address
+	.LONG	sdflimit	;SDF_LIMIT  = 2 - Set limit
+	.LONG	sdfaccess	;SDF_ACCESS = 3 - Set access bits
+SDFMAX=!{$-sdfdsp}/4-1
+
+	CODE
+.PAGE
+;Here for the SDF_BASE function - Set base linear address
+
+sdfbase:MOVZWL	EAX, mb_data+st_atrb.B[EBP] ;Get current access bits
+	MOVL	EBX, SS:pdaArg3#	;Get new base linear address
+	JMP	2$.S
+
+;Here for the SDF_ACCESS function - Set access bits
+
+sdfaccess:
+	MOVB	BL, mb_data+st_base+2.B[EBP] ;Get existing base linear address
+	MOVB	BH, mb_data+st_baseh.B[EBP]
+	SHLL	EBX, #16t
+	MOVW	BX, mb_data+st_base.B[EBP]
+	MOVL	EAX, SS:pdaArg3#	;Get new access bits
+2$:	MOVL	ECX, mb_data+st_limit-2.B[EBP] ;Get existing limit value
+	MOVB	CL, mb_data+st_atrb+1.B[EBP]
+	ANDB	CL, #0Fh
+	MOVB	CH, #0
+	RORL	ECX, #16t
+	INCL	ECX
+	TESTB	mb_data+st_atrb+1.B[EBP], #80h
+	JE	strdesc.S
+	SHLL	ECX, #12t
+	JMP	strdesc.S
+
+;Here for the SDF_LIMIT function - Set limit
+
+sdflimit:
+	MOVB	BL, mb_data+st_base+2.B[EBP] ;Get existing base linear address
+	MOVB	BH, mb_data+st_baseh.B[EBP]
+	SHLL	EBX, #16t
+	MOVW	BX, mb_data+st_base.B[EBP]
+	MOVL	ECX, SS:pdaArg3#	;Get new limit value
+	INCL	ECX			;Change to size
+	JNE	4$.S			;If not asking for it all!
+	MOVL	ECX, #0FFFFF000h	;He wants it all - give him one page
+					;  less so we can handle it (this is
+					;  really the same since he can't have
+					;  it all anyway!)
+4$:	MOVW	AX, mb_data+st_atrb.B[EBP] ;Get current access bits
+	ANDB	AH, #7Fh		;Assume need byte granularity
+	CMPL	ECX, #100000h		;Can we use byte granularity?
+	JBE	strdesc.S		;Yes
+	TESTL	ECX, #0FFFh		;No - can we use page granularity?
+	JNE	6$.S			;No - fail
+	ORB	AH, #80h		;Yes
+
+;Here to store value into local descriptor
+;	c[AX]  = Access bits
+;	c{EBX} = Linear address
+;	c{ECX} = Segment size (bytes)
+;	c{EBP} = Descriptor index + offset of LDB block
+
+strdesc:TESTB	AL, #10h		;Is the "must be 1" bit set?
+	JE	knlBadValue		;No - fail
+	ORB	AL, #60h		;Yes - force it to be user level
+	TESTB	AL, #80h		;Is the present bit set?
+	JE	14$.S			;No
+	TESTB	AL, #08h		;Yes - code segment?
+	JE	6$.S			;No
+	TESTB	AL, #04h		;Yes - conforming segment?
+	JNE	knlBadValue		;Yes - this is not allowed
+6$:	MOVL	EDX, #la_system		;Get highest valid linear address
+	CMPL	EBX, EDX		;Valid linear address?
+	JA	16$.S			;No - fail
+	SUBL	EDX, EBX		;Calculate maximum valid size
+	JREGZ	ECX, 8$			;0 really means 4GB, which is never OK!
+	CMPL	ECX, EDX		;Is the size OK?
+	JBE	10$.S			;Yes - go on
+8$:	MOVL	ECX, EDX		;No - just make it as big as we can!
+10$:	TESTB	AH, #80h		;Page granularity?
+	JE	12$.S			;No
+	SHRL	ECX, #12t		;Yes - convert limit to pages
+12$:	CMPL	ECX, #100000h		;Valid size?
+	JBE	14$.S			;Yes
+	MOVL	ECX, #100000h		;No - make as big as we can
+14$:	DECL	ECX			;Change size to limit value
+	MOVW	mb_data+st_limit.B[EBP], CX ;Yes - store low 16 bits of limit
+	SHRL	ECX, #8t		;Get high 4 bits of limit value
+	ANDB	AH, #0F0h		;Merge it in
+	ORB	AH, CH			 ;Store access bits and high 4 bits of
+	MOVW	mb_data+st_atrb.B[EBP], AX ;  limit value				
+	MOVW	mb_data+st_base.B[EBP], BX ;Store low 16 bits of linear address
+	SHRL	EBX, #16t		;Get high 16 bits of linear address
+	MOVB	mb_data+st_base+2.B[EBP], BL ;Store high 16 bits
+	MOVB	mb_data+st_baseh.B[EBP], BH
+	CLRL	EAX			;Return 0
+	RET
+
+;Here if have illegal linear address
+
+16$:	MOVL	EAX, #ER_BDLA
+	RET
+.PAGE
+	.SBTTL	svcMemDescFind - Find local descriptor
+
+;Here for the svcMemDescFind SVC - Find local descriptor given selector kind
+;  and linear address
+;	long kind;		// Selector kind
+;	long la;		// Linear address
+;	rtn = svcMemDescFind(kind, la);
+;  Value returned is the selector found if normal or a negative error code
+;     if error
+
+psvcMemDescFind::
+	SVCENTR	CNTMemDescFind#
+	MOVB	AL, SS:pdaArg1#	;Get selector kind
+	MOVL	ESI, SS:pdaArg2#	;Get linear address
+	MOVL	EBP, SS:pdaLdtPnt#	;See if we already have the selector
+	MOVL	ECX, SS:pdaSegMax#
+	SHRL	ECX, #3t
+	MOVL	EBX, ESI		;Get high 16 bits in BX for comparasions
+	SHRL	EBX, #16t
+	MOVL	EDX, SS:pdaSegTbl#
+	SUBL	EDX, EBP
+	SUBL	EDX, #mb_data.B
+4$:	CMPB	sd_kind.B[EBP+EDX], AL	;Is this the right kind of segment?
+	JNE	6$.S			;No
+	CMPW	mb_data+st_base.B[EBP], SI ;Yes - check the linear address
+	JNE	6$.S
+	CMPB	mb_data+st_base+2.B[EBP], BL
+	JNE	6$.S
+	CMPB	mb_data+st_baseh.B[EBP], BH
+	JE	10$.S			;If found it
+6$:	ADDL	EBP, #8.B		;Not this one - bump pointer
+	LOOP	ECX, 4$			;Continue if more to check
+	MOVL	EAX, #ER_SELNA
+	RET
+
+;Here with matching descriptor
+
+10$:	LEAL	EAX, mb_data+7.B[EBP]	;Get selector value to return
+	SUBL	EAX, SS:pdaLdtPnt#
+	RET
+.PAGE
+	.SBTTL	svcMemBlkAlloc - Allocate linear address space block
+
+;Here for the svcMemBlkAlloc SVC - Allocate linear address space block
+;	long lapn;		// Linear address page number
+;	long size;		// Size
+;	long bits;		// Page bits
+;	long clientnum;		// DPMI client number
+;	rtn = svcMemBlkAlloc(lapn, size, bits, clientnum);
+;  Value returned is the starting page number for the block allocated if
+;    normal or a negative error code if error
+
+psvcMemBlkAlloc::
+	SVCENTR	CNTMemBlkAlloc#
+	MOVL	EDX, SS:pdaArg1#
+	ORL	EDX,EDX			;THIS VERSION CAN'T HANDLE A SPECIFIED
+	JNE	knlBadValue#		;  LINEAR ADDRESS!!
+	MOVL	EBP, #0FFFFh
+	MOVL	ECX, SS:pdaArg2#	;Get size
+	SHLL	ECX, #12t		;Change to number of bytes
+	MOVL	EAX, #LAT_DPMI
+	CALL	allocla			;Allocate linear address space
+	JC	4$.S			;If error
+	MOVL	EDX, SS:lad_base.B[ESI+EDI] ;OK - get linear address
+	SHRL	EDI, #4t		;Get LAD handle
+	PUSHL	EDI
+	CALL	knlFindMsect#		;See if it exists now
+	POPL	EDI
+	JC	10$.S			;If error
+	JE	6$.S			;Also error if it exists
+	MOVL	ECX, SS:pdaArg2#	;Get size
+	SHLL	ECX, #12t		;Change to number of bytes
+	MOVL	EAX, SS:pdaArg3#	;Get the page bits
+	PUSHL	EDI
+	CALL	chngmsect4#		;Create the msect
+	POPL	EDX
+	JC	8$.S			;If error
+	MOVL	EAX, SS:pdaArg4#	;Get the DOS task number
+	MOVB	mdb_tasknum.B[EDI], AL	;Store it in the MDB
+	MOVL	EDI, mdb_la.B[EDI]	;Get linear address of memory block
+	PUSHL	EDI
+	TESTB	SS:pdaArg3#, #PG$VIRTUAL ;Virtual pages?
+	JNE	2$.S			;Yes
+	SHLL	ECX, #10t		;No - get number of longs in the block
+	PUSHL	#GS_USERLA.B
+	POPL	ES
+	CLRL	EAX			;Clear the block
+	CLD
+	RSTOSL	[EDI]
+2$:	POPL	EAX			;Restore linear address
+	SHRL	EAX, #12t		;Change to page number
+4$:	RET				;Finished
+
+;Here if cannot create the msect
+
+6$:	MOVL	EAX, #ER_LASNA
+	JMP	10$.S
+
+8$:	MOVL	EDI, EDX
+10$:	PUSHL	EAX
+	SHLL	EDI, #4t
+	CALL	givela
+	POPL	EAX
+	STC
+	RET
+.PAGE
+	.SBTTL	svcMemBlkChange - Change size of existing linear address space block
+
+;Here for the svcMemBlkChange SVC - Change size of existing linear address
+;  space block
+;	long lapn;		// Linear address page number
+;	long size;		// Size (pages, -1 to return current size)
+;	long bits;		// Page bits
+;	long dostask;		// DOS task number
+;	rtn = svcMemBlkChange(lapn, size, bits, dostask);
+;  Value returned is the starting page number for the block allocated (may be
+;    changed) or the size of the block (if size argument is -1) if normal or a
+;    negative error code if error
+
+psvcMemBlkChange::
+	SVCENTR	CNTMemBlkChange#
+	MOVL	EDX, SS:pdaArg1#	;Get linear address space page number
+	SHLL	EDX, #12t		;Change to linear address
+	MOVL	EBP, #0FFFFh
+	CALL	knlFindMsect#
+	JC	4$.S			;If error
+	JNE	8$.S			;Also error if it does not exist
+	MOVL	EAX, SS:pdaArg4#	;Get the DOS task number
+	CMPB	mdb_tasknum.B[EDI], AL	;Does it match?
+	JNE	8$.S			;No - say its not there!
+	MOVL	ECX, SS:pdaArg2#	;Yes - get size
+	CMPL	ECX, #-1.B		;Want size returned?
+	JE	10$.S			;Yes
+	SHLL	ECX, #12t		;No - change to number of bytes
+	MOVL	EAX, SS:pdaArg3#	;Get the page bits
+	CALL	chngmsect6#		;Change size of the msect
+	JC	4$.S			;If error
+	TESTL	EDI, EDI		;Did we give up the msect?
+	JE	knlRtnZero#		;Yes - return 0
+	MOVL	EAX, mdb_la.B[EDI]	;No - get linear address of memory block
+	SHRL	EAX, #12t		;Change to page number
+4$:	RET
+
+;Here if msect does not exist
+
+8$:	MOVL	EAX, #ER_NOMEM
+	RET
+
+;Here if want size returned
+
+10$:	MOVL	EAX, mdb_size.B[EDI]	;Get size in pages
+	RET
+.PAGE
+	.SBTTL	svcMemBlkType - Change or return page types in linear address space block
+
+;Here for the svcMemBlkType SVC - Change or return page types in linear address
+;  space block
+;	long lapn;		// Linear address page number of first page
+;				//   in block
+;	long fpage;		// Page number in block of first page to change
+;	long number;		// Number of pages to change or 0 to get type
+;				/    of page
+;	long bits;		// Page bits
+;	long dostask;		// DOS task number
+;	rtn = svcMemBlkType(lapn, fpage, number, bits, dostask);
+;  Value returned is page bits (if 3rd argument is 0) or number of pages changed
+;    if normal or a negative error code if error.
+
+psvcMemBlkType::
+	SVCENTR	CNTMemBlkType#
+	MOVL	EDX, SS:pdaArg1#	;Get linear address space page number
+	SHLL	EDX, #12t		;Change to linear address
+	MOVL	EBP, #0FFFFh
+	CALL	knlFindMsect#
+	JC	4$.S			;If error
+	JNE	8$.S			;Also error if it does not exist
+	MOVL	EAX, SS:pdaArg5#	;Get the DOS task number
+	CMPB	mdb_tasknum.B[EDI], AL	;Does it match?
+	JNE	8$.S			;No - say its not there!
+	MOVL	EBX, SS:pdaArg2#	;Get first page to change
+	MOVL	EDX, mdb_size.B[EDI]	;Get size of the msect
+	SUBL	EDX, EBX		;Minus first page gives number available
+	JLE	8$.S			;  to change
+	SHLL	EBX, #12t		;Change to byte offset in block
+	MOVL	ECX, SS:pdaArg3#	;Get number of pages to change
+	ORL	ECX, ECX
+	JLE	gettype.S		;If want to get current page type
+	CMPL	ECX, EDX		;Changing too many?
+	JBE	4$.S			;No
+	MOVL	ECX, EDX		;Yes - reduce the number
+4$:	MOVL	EDX, SS:pdaArg4#	;Get the new page bits
+	PUSHL	ECX
+	CALL	pagetype2#		;Change the page types
+	JC	10$.S			;If error
+	POPL	EAX			;OK - return number of pages changed
+	RET
+
+;Here if block does not exist or if the DOS task number is wrong
+
+8$:	MOVL	EAX, #ER_NOMEM
+	RET
+
+;Here if error changing page types
+
+10$:	POPL	EDX			;Get number we tried to change
+	SUBL	EDX, ECX		;Calculate number actually changed
+	JE	12$.S			;Return error if none changed
+	MOVL	EAX, EDX		;One or more changed, give good return
+12$:	RET
+
+;Here to return bits for page
+
+gettype:ADDL	EBX, mdb_la.B[EDI]
+	SHRL	EBX, #10t		;Get index to page table entry
+	IFFAULT	20$
+	MOVL	EDX, pgtable[EBX]	;Get page table entry
+	TESTL	EDX, EDX		;Is the page allocated at all
+	JE	20$.S
+	MOVL	EAX, #PG$READ		;Pages are always readable
+	TESTB	DL, #01h		;Is the page virtual?
+	JNE	14$.S			;No
+	ORB	AL, #PG$VIRTUAL		;Yes
+14$:	TESTB	DL, #02h		;Is the page writable?
+	JE	16$.S			;No
+	ORB	AL, #PG$WRITE		;Yes
+16$:	RET
+
+	FAULTHDR
+20$:	MOVL	EAX, #ER_NOMEM
+	RET
+.PAGE
+	.SBTTL	svcMemBlkFree - Give up all linear address space blocks for DOS task
+
+;Here for the svcMemBlkFree SVC - Give up all linear address space blocks for
+;  DOS task
+;	long dostask;		// DOS task number
+;	rtn = svcMemBlkFree(dostask);
+;  Value returned is the number of blocks given up if normal or a negative
+;    error code if error
+
+psvcMemBlkFree::
+	SVCENTR	CNTMemBlkFree#
+	MOVL	EBX, #pdaDpmiFMdb#	;Point to DPMI MDB list head pointer
+	PUSHL	SS
+	POPL	ES
+	PUSHL	#0.B
+4$:	MOVL	EDI, ES:[EBX]		;Get next MDB
+	TESTL	EDI, EDI		;Have another?
+	JE	8$.S			;No - finished here
+	MOVB	AL, mdb_tasknum.B[EDI]	;Yes - is it for the correct task?
+	CMPB	AL, SS:pdaArg1#
+	JNE	6$.S			;No - go on
+	PUSHL	ES			;Yes - give it up
+	PUSHL	EBX
+	MOVL	EBP, #0FFFFFFFFh
+	CALL	memremove#
+	POPL	EBX
+	POPL	ES
+	JC	10$.S			;If error
+	INCL	[ESP]			;Count it
+	JMP	4$.S			;Continue
+
+;Here if don't want to give up this one
+
+6$:	MOVL	EBX, EDI		;Advance to next MDB
+	PUSHL	DS
+	POPL	ES
+	JMP	4$.S			;Continue
+
+;Here when finished
+
+8$:	POPL	EAX			;Get number removed
+	RET				;Return it
+
+;Here if error giving up an msect
+
+10$:	POPL	ECX			;Discard the count
+	RET				;Return the error code
+.PAGE
+	.SBTTL	getsel - Subroutine to get selector argument
+
+;Subroutine to get selector argument
+;	c{SS:pdaArg1} = Selector
+;	CALL	getsel
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  c{EDX} = Offset of IDT
+;	  c{EBP} = Selector index
+
+getsel:	MOVZWL	EBP, SS:pdaArg1#	;Get selector
+	ANDL	EBP, #0FFFFFFF8h.B
+	CMPL	EBP, SS:pdaSegMax#	;Possible value?
+	JAE	4$.S			;No - fail
+	MOVL	EDX, SS:pdaSegTbl#	;Yes
+	TESTB	sd_kind.B[EBP+EDX], #03h ;Is it a valid segment?
+	JNE	6$.S			;Yes
+4$:	MOVL	EAX, #ER_BDSEL		;No
+	STC
+6$:	RET
+.PAGE
+;The linear address space is managed using a linked list of LADs (Linear
+;   Address Data Blocks).  Each LAD has the following format:
+;      Offset  Size    Use
+;	 0	2    Handle of next LAD
+;	 2	2    Handle of previous LAD
+;	 4	1    Type of area
+;	 5      1    Status bits
+;	 6	2    Not used
+;        8	4    Base of area
+;	 12	4    Size of area
+
+;   LADs with low handles have special uses as follows:
+;     Handle    Use
+;	1    Bottom of memory (base = 0, size = 110000)
+;	2    Middle of memory (base = 80000000, size = 1000, used to reserve
+;	       area containing address 80000000 because of bug in early 386s)
+;	3    Top of memory (base = F8000000, size 0)
+;	4    First allocated LAD
+;   All LADs for allocated chunks are linked in order of increasing base
+;   linear addresses.  Holes are defined when the difference between the base
+;   plus size of an LAD and the base of the next LAD is non-zero.
+
+	.SBTTL	checkla - Subroutine to check (and correct) linear address allocation
+
+;Subroutine to check (and correct) linear address space allocation for a
+;  segment when the size of an msect is changed - this routine does not reduce
+;  the linear address space allocation - this is only done when the entire
+;  segment is given up - given the amount of good this would really do, it is
+;  just not worth the cost to check for reducing the allocation every time the
+;  size of an msect is changed!
+;	c{ECX} = New size for msect in bytes
+;	c{EDX} = Virtual address of base of msect
+;	c{EBP} = LDT index for segment
+;	CALL	checkla
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal - all registers are preserved
+
+checkla::
+	PUSHL	ECX
+	PUSHL	EAX
+	PUSHL	EDX
+	PUSHL	ESI
+	PUSHL	EBX
+	PUSHL	EDI
+	CMPL	EBP, #0FFFFFFF8h.B	;Real mode segment?
+	JNE	2$.S			;No
+	MOVL	EAX, SS:pdaLATable#	;Yes
+	MOVB	SS:{LAH_BOTTOM*16t}+lad_type.B[EAX], #LAT_RM
+	MOVL	EDX, SS:pdaSegTbl#
+	MOVB	sd_lad.B[EBP+EDX], #LAH_BOTTOM
+	JMP	ckladon.S		;Thats all
+
+;Here if do not want the real mode linear address space
+
+2$:	JB	3$.S			;If don't have a DPMI msect
+	ADDL	ECX, #0FFFh		;Have DPMI msect - round up to whole
+	ANDL	ECX, #0FFFFF000h	;  pages
+	MOVZWL	EDI, mdb_lad.B[EDI]	;Point to LAD for msect
+	JMP	35$.S			;Continue
+
+;Here if do not have a DPMI msect
+
+3$:	ADDL	ECX, EDX		;Get number of linear address space
+	ADDL	ECX, #003FFFFFh		;  bytes needed to hold this msect
+	ANDL	ECX, #0FFC00000h	;  (round up to 4MB blocks)
+	MOVL	EDX, SS:pdaSegTbl#
+	MOVZWL	EDI, sd_lad.B[EBP+EDX]	;Point to LAD for segment
+35$:	SHLL	EDI, #4t
+	JNE	6$.S			;If linear address space is allocated
+	MOVL	EAX, #LAT_XOS		;None allocated - get some now
+	CALL	allocla
+	JC	4$.S			;If error
+	CMPL	EBP, #0FFFFFFFFh.B	;Is this a DPMI msect?
+	JNE	10$.S			;No - go finish up
+	MOVL	EDX, [ESP]		;Yes - store the LAD handle in the MDB
+	SHRL	EDI, #4
+	MOVL	mdb_lad.B[EDX], EDI
+ckladon:POPL	EDI			;Finished now
+	POPL	EBX
+	POPL	ESI
+	POPL	EDX
+	POPL	EAX
+	POPL	ECX
+	RET
+
+;Here if error
+
+4$:	MOVL	16t.B[ESP], EAX		;If error
+	JMP	ckladon.S
+
+;Here if already have some linear address space allocated - see if we have
+;  enough
+
+6$:	MOVL	ESI, SS:pdaLATable#
+	CMPL	SS:lad_size.B[ESI+EDI], ECX ;Is it big enough now?
+	JAE	ckladon.S		;Yes - nothing needed here
+	PUSHL	SS:lad_base.B[ESI+EDI] ;No - save current base
+	CALL	changela		;Change the size of the area
+	POPL	ECX
+	JC	4$.S			;If error
+	CMPL	EBP, #0FFFFFFFFh.B	;OK - is this a DPMI msect?
+	JE	ckladon.S		;Yes - finished now
+	SUBL	ECX, SS:lad_base.B[ESI+EDI] ;No - did the base change?
+	JE	10$.S			;No
+	MOVL	EAX, SS:pdaSegTbl#	;Yes
+	MOVL	EDX, sd_fmdb.B[EBP+EAX]	;Point to the first MDB
+	ANDL	EDX, #0FFFFFFh
+	JE	10$.S			;If none
+8$:	SUBL	mdb_la.B[EDX], ECX	;Fix up the linear address
+	MOVL	EDX, [EDX]		;Advance to next MDB
+	TESTL	EDX, EDX
+	JNE	8$.S			;Continue if have another
+10$:	MOVL	EAX, SS:lad_base.B[ESI+EDI]
+	ADDL	EBP, SS:pdaLdtPnt#
+	MOVW	mb_data+st_base.B[EBP], AX ;Store linear address in LDT
+	SHRL	EAX, #16t
+	MOVB	mb_data+st_base+2.B[EBP], AL
+	MOVB	mb_data+st_baseh.B[EBP], AH
+	MOVL	EAX, SS:lad_size.B[ESI+EDI] ;Get size
+	SHRL	EAX, #12t		;Change to number of pages
+	DECL	EAX			;Minus 1
+	MOVW	mb_data+st_limit.B[EBP], AX ;Store in LDT
+	SHRL	EAX, #16t
+	ANDB	AL, #0Fh
+	ANDB	mb_data+st_limith.B[EBP], #0F0h
+	ORB	mb_data+st_limith.B[EBP], AL
+
+	SUBL	EBP, SS:pdaLdtPnt#
+	MOVL	EDX, SS:pdaSegTbl#
+	MOVL	EAX, EDI
+	SHRL	EAX, #4t
+	MOVW	sd_lad.B[EBP+EDX], AX
+	MOVZWL	EDI, sd_lnksel.B[EBP+EDX] ;Get selector for linked segment
+	ANDL	EDI, #0FFFFFFF8h.B
+	CMPL	EDI, EBP		;Is another segment linked?
+	JE	ckladon			;No
+	MOVW	CX, sd_lad.B[EBP+EDX]	;Yes - get LAD handle
+	ADDL	EBP, SS:pdaLdtPnt#
+	MOVL	EBX, mb_data+0.B[EBP]	;And get part of the LDT we need to
+	MOVL	EAX, mb_data+4.B[EBP]	;  copy
+	ANDL	EAX, #0FF0F00FFh
+	SUBL	EBP, SS:pdaLdtPnt#
+12$:	MOVW	SS:sd_lad.B[EDI+EDX], CX ;Store LAD index
+	ADDL	EDI, SS:pdaLdtPnt#
+	MOVL	SS:mb_data+0.B[EDI], EBX ;Store LDT data
+	ANDL	SS:mb_data+4.B[EDI], #0F0FF00h
+	ORL	SS:mb_data+4.B[EDI], EAX
+	SUBL	EDI, SS:pdaLdtPnt#
+	MOVZWL	EDI, SS:sd_lnksel.B[EDI+EDX] ;Advance to next linked segment
+	ANDL	EDI, #0FFFFFFF8h.B
+	CMPL	EDI, EBP
+	JNE	12$.S			;Continue if another one
+	JMP	ckladon
+.PAGE
+	.SBTTL	givela - Subroutine to give up linear address space
+
+;Subroutine to give up linear address space
+;	c{EDI} = Index for LAD
+;	CALL	givela
+;	C:clr always
+
+givela::TESTL	EDI, EDI		;Really have any linear space?
+	JE	4$.S			;No - nothing needed here
+	PUSHL	ESI			;Yes - get offset of the linear address
+	MOVL	ESI, SS:pdaLATable#	;  table
+	CMPB	SS:lad_type.B[ESI+EDI], #0.B ;Is the LAD in use?
+	JE	6$.S			;No - fail big!
+	MOVB	SS:lad_type.B[ESI+EDI], #0 ;Yes - indicate no longer in use
+	CMPL	EDI, #LAH_BOTTOM.B	;Is this the real mode segment?
+	JE	2$.S			;Yes - finished now
+	PUSHL	EBX
+	PUSHL	EDX
+	MOVZWL	EBX, SS:lad_prev.B[ESI+EDI] ;Get previous LAD
+	MOVZWL	EDX, SS:[ESI+EDI]	;Get next LAD
+	MOVL	EAX, EDX
+	SHLL	EDX, #4t
+	MOVW	SS:lad_prev.B[ESI+EDX], BX ;Remove this LAD from the memory
+	SHLL	EBX, #4t		   ;  list
+	MOVW	SS:[ESI+EBX], AX
+	PUSHL	SS:pdaLAFree#		;Put this LAD on the free list
+	POPL	SS:[ESI+EDI]
+	MOVL	SS:pdaLAFree#, EDI
+	DECL	SS:pdaLABlks#		;Reduce linear address block count
+	MOVL	EAX, SS:lad_size.B[ESI+EDI] ;Reduce linear address byte count
+	SUBL	SS:pdaLAInUse#, EAX
+	POPL	EDX
+	POPL	EBX
+2$:	POPL	ESI
+4$:	RET
+
+;Here if trying to free up an LAD which is already free!
+
+6$:	CRASH	LASF			;[Linear Address Space is Free]
+.PAGE
+	.SBTTL	allocla - Subroutine to allocate linear address space
+
+;Subroutine to allocate linear address space
+;	c{EAX} = Block type, status bits, and DOS task number
+;	c{ECX} = Number of bytes wanted
+;	CALL	allocla
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  c{ESI} = Offset of linear address table in the PDA
+;	  c{EDI} = Index for LAD
+
+allocla:PUSHL	EAX			;Save block type
+	MOVL	EBX, #LAH_BOTTOM*16t	;Point to the bottom block
+	MOVL	ESI, SS:pdaLATable#
+2$:	MOVZBL	EDX, SS:[ESI+EBX]	;Get index for next block
+	SHLL	EDX, #4t
+	MOVL	EAX, SS:lad_size.B[ESI+EBX] ;Get size of block
+	ADDL	EAX, #003FFFFFh		;Round up to 4MB
+	ANDL	EAX, #0FFC00000h
+	ADDL	EAX, SS:lad_base.B[ESI+EBX]
+	NEGL	EAX
+	ADDL	EAX, SS:lad_base.B[ESI+EDX]
+	CMPL	ECX, EAX		;Is it big enough?
+	JBE	10$.S			;Yes - go use it
+	CMPL	EDX, #LAH_TOP*16t.B	;No - are we at the top?
+	JE	6$.S			;Yes - no space available!
+	MOVL	EBX, EDX		;No - advance pointers
+	JMP	2$.S
+
+;Here if cannot find a big enough hole or if can't expand the linear address
+;  table
+
+4$:	ADDL	ESP, #12t
+6$:	POPL	EAX			;Fix up the stack
+	MOVL	EAX, #ER_LASNA		;Get error code
+	STC
+	RET
+
+;Here with a big enough hole
+
+10$:	MOVL	EAX, SS:lad_size.B[ESI+EBX] ;Calculate offset of the hole we
+	ADDL	EAX, #003FFFFFh		    ;  just found
+	ANDL	EAX, #0FFC00000h
+	ADDL	EAX, SS:lad_base.B[ESI+EBX]
+	MOVL	EDI, SS:pdaLAFree#	;Get an LAD from the free list
+	TESTL	EDI, EDI
+	JNE	14$.S			;Continue if have one
+
+;Here if the LAD free list is empty - try to expand the LAD table
+
+	PUSHL	EAX
+	PUSHL	ECX
+	PUSHL	EDX
+	MOVL	ECX, SS:[ESI]		;Get current size
+	PUSHL	ECX
+	ADDL	ECX, #100h-mb_data	;Increase it by 16 entries
+	CALL	knlChngPdaMem#
+	POPL	EDX			;Restore old size
+	JC	4$.S			;If error
+	MOVL	SS:pdaLAFree#, EDX	;OK - set up a free list in the new
+	MOVL	EDI, EDX		;  space
+	MOVL	ECX, #15t
+12$:	LEAL	EAX, 10h.B[EDX]
+	MOVL	SS:[ESI+EDX], EAX
+	ADDL	EDX, #10h.B
+	LOOP	ECX, 12$
+	CLRL	EAX
+	MOVL	SS:[ESI+EDX], EAX
+	POPL	EDX
+	POPL	ECX
+	POPL	EAX
+
+;Here with an LAD we can use
+
+14$:	PUSHL	SS:[ESI+EDI]		;Remove block from the free list
+	POPL	SS:pdaLAFree#
+	MOVL	SS:lad_base.B[ESI+EDI], EAX ;Store offset of area
+	MOVL	SS:lad_size.B[ESI+EDI], ECX ;Store size of area
+	ADDL	SS:pdaLAInUse#, ECX
+	MOVL	EAX, EDX		;Link this block into the memory list
+	SHRL	EAX, #4t
+	MOVW	SS:[ESI+EDI], AX
+	MOVL	EAX, EBX
+	SHRL	EAX, #4t
+	MOVW	SS:lad_prev.B[ESI+EDI], AX
+	MOVL	EAX, EDI
+	SHRL	EAX, #4t
+	MOVW	SS:[ESI+EBX], AX
+	MOVW	SS:lad_prev.B[ESI+EDX], AX
+	POPL	SS:lad_type.B[ESI+EDI]	;Store block type, status bits, and
+					;  DOS task number
+	INCL	SS:pdaLABlks#		;Increase linear address block count
+	CLC
+	RET				;Finished
+.PAGE
+	.SBTTL	changela - Subroutine to change size of linear address space area
+
+;Subroutine to change size of linear address space area
+;	c{ECX} = Number of bytes wanted
+;	c{EDI} = Index fo LAD
+;	CALL	changela
+;	C:set = Error, current allocation unchanged
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  c{ESI} = Offset of linear address table in the PDA
+;	  c{EDI} = Index for LAD (may be different)
+
+changela::
+	MOVL	ESI, SS:pdaLATable#	;Get offset of the linear address table
+	MOVZWL	EDX, SS:[ESI+EDI]	;See how much is available here
+	SHLL	EDX, #4t
+	MOVL	EAX, SS:lad_base.B[ESI+EDX]
+	SUBL	EAX, SS:lad_base.B[ESI+EDI]
+	CMPL	EAX, ECX		;Is it enough?
+	JB	4$.S			;No
+	MOVL	EAX, ECX		;Yes
+	SUBL	EAX, SS:lad_size.B[ESI+EDI] ;Adjust total for process
+	ADDL	SS:pdaLAInUse#, EAX
+	MOVL	SS:lad_size.B[ESI+EDI], ECX ;Just grab the space!
+	RET				;Finished
+
+;If if don't have enough memory available to get started
+
+;;;2$:	MOVL	EAX, #ER_NEMA
+;;;	STC
+;;;	RET
+
+;Here if there is not enough room to expand the allocated linear address space
+;  in place - we must move it!  Note that since linear address blocks always
+;  start on a 4MB boundry, each block starts at the beginning of a page table.
+;  Thus to more linear address space all we need to do is more the pointers to
+;  the page tables in the top level table.  We do not need to allocate or
+;  deallocate any page tables.
+
+4$:	PUSHL	SS:lad_base.B[ESI+EDI]	;Yes - save current base
+	PUSHL	SS:lad_size.B[ESI+EDI]	;Save current size
+	PUSHL	SS:[ESI+EDI]		;Save current link indexes
+	PUSHL	SS:lad_type.B[ESI+EDI]	;Save block type
+	PUSHL	ECX
+	CALL	givela			;Give up this linear address space
+	POPL	ECX
+	MOVL	EAX, [ESP]		;Restore block type
+	CALL	allocla			;Allocate a piece which is big enough
+	JNC	chngla2.S		;Go on if OK
+
+;Here if cannot get the requested new size - In this case the original
+;  allocation has been given up, but only the la_next and la_prev items have
+;  been modified.  We restore the previous la_next and la_prev values and fix
+;  up the matching items in the previous and next entries, thus putting things
+;  back to the way they were before we gave up the original block.
+
+	POPL	EDX			;Restore block type
+	POPL	EBX			;Restore original link indexes (only
+					;  used if have error here)
+	POPL	ECX			;Restore original size
+	XCHGL	EAX, [ESP]		;Restore original base, save error code
+	MOVL	SS:lad_type.B[ESI+EDI], EDX ;Restore type, status, and DOS
+					    ;  task number fields
+	MOVL	SS:lad_size.B[ESI+EDI], ECX ;Restore size
+	MOVL	SS:lad_base.B[ESI+EDI], EAX ;Restore base
+	MOVL	EAX, SS:[ESI+EDI]	;Remove this entry from the free list
+	MOVL	SS:pdaLAFree#, EAX	;  (note that it will always be the
+					;  first entry on the free list!)
+	MOVL	SS:[ESI+EDI], EBX	;Restore orginal link indexes
+	MOVL	EAX, EDI
+	SHRL	EAX, #4t
+	MOVZWL	EDX, BX			;Fix up back pointer in next entry
+	SHLL	EDX, #4t
+	MOVW	SS:2.B[ESI+EDX], AX
+	SHRL	EBX, #16t		;Fix up forward pointer in previous
+	SHLL	EBX, #4t		;  entry
+	MOVW	SS:[ESI+EBX], AX
+	POPL	EAX			;Restore error code
+	STC				;Indicate error
+	RET
+.PAGE
+;Here with the required amount of linear address allocated - now we must copy
+;  the map entries to the new area.  As indicated above, all we need to do is
+;  more the top level page directory pointers, which is realitively simple and
+;  quick.
+
+chngla2:POPL	EBX			;Discard block type
+	POPL	EBX			;Discard original link indexes
+	POPL	ECX			;Restore original size
+	POPL	EDX			;Restore original base
+	PUSHL	EDI			;Save new index
+	MOVL	EDI, SS:lad_base.B[ESI+EDI] ;Get new base
+	SHRL	EDI, #20t
+	ADDL	EDI, #pdaPageDir#
+	PUSHL	SS
+	POPL	ES
+	MOVL	ESI, EDX
+	SHRL	ESI, #20t
+	ADDL	ESI, #pdaPageDir#
+	ADDL	ECX, #003FFFFFh		;Get number of directory pointers to
+	SHRL	ECX, #22t		;  move
+	CMPL	ESI, EDI		;Moving up
+	JB	6$.S			;Yes
+	CLD				;No - moving down
+4$:	LODSL	SS:[ESI]
+	MOVL	SS:-4.B[ESI], #0
+	STOSL	[EDI]			;Store pointer
+	LOOP	ECX, 4$
+	JMP	10$.S
+
+;Here if have to move the area to a higher linear address - we must copy
+;  backwards to avoid overlap problems
+
+6$:	STD				;Moving up
+	LEAL	ESI, -4.B[ESI+ECX*4]	;Adjust offsets
+	LEAL	EDI, -4.B[EDI+ECX*4]
+8$:	LODSL	ES:[ESI]
+	MOVL	ES:4.B[ESI], #0
+	STOSL	[EDI]			;Store pointer
+	LOOP	ECX, 8$
+10$:	POPL	EDI			;Restore new index
+	MOVL	ESI, SS:pdaLATable#	;Restore offset of the linear address
+retcc:	CLC				;  table
+	RET				;Finished
+
+	END

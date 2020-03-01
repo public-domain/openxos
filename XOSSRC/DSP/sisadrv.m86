@@ -1,0 +1,1296 @@
+	.TITLE	SISADRV - Loadable driver extensions for SIS 6326 display
+
+;++++
+; This software is in the public domain.  It may be freely copied and used
+; for whatever purpose you see fit, including commerical uses.  Anyone
+; modifying this software may claim ownership of the modifications, but not
+; the complete derived code.  It would be appreciated if the authors were
+; told what this software is being used for, but this is not a requirement.
+
+;   THIS SOFTWARE IS PROVIDED BY THE AUTHORS "AS IS" AND ANY EXPRESS OR
+;   IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
+;   OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+;   IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+;   INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+;   BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS
+;   OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+;   ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR
+;   TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
+;   USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+;----
+
+	.PROC	80486
+	.INCLUD	XOSINC:\XMAC\XOS.PAR
+	.INCLUD	XOSINC:\XMAC\XOSX.PAR
+	.INCLUD	XOSINC:\XMAC\XOSERR.PAR
+	.INCLUD	XOSINC:\XMAC\XOSDOS.PAR
+	.INCLUD	XOSINC:\XMAC\XOSTRM.PAR
+	.INCLUD	XOSINC:\XMAC\XOSXTRM.PAR
+	.INCLUD	XOSINC:\XMAC\PCAT.PAR
+	.INCLUD	XOSINC:\XMAC\XOSLKE.PAR
+	.INCLUD	XOSINC:\XMAC\XOSXLKE.PAR
+	.INCLUD	VGAADRV.PAR
+	.INCLUD	SIS6326.PAR
+
+	.ALMEX
+
+;This LKE provides routines to use the SIS 6326 display adapter in graphics
+;  modes.  It must be loaded after the standard VGA driver (VGAADRV) is
+;  loaded.  Note that only one VGA extension driver can be loaded.
+
+MAJV   =!1t
+MINV   =!0t
+EDITNUM=!0t
+
+;Define offsets in our extended parameter block
+
+$$$=!0
+BLK ati_refdiv  , 4t
+BLK ati_reffreq , 4t
+BLK ati_chiptype, 1t
+BLK ati_clktype , 1t
+BLK ati_ramtype , 1t
+BLK ati_dactype , 1t
+BLK ati_memtype , 1t
+BLK ati_cxclk   , 1t
+BLK ati_mclkindx, 1t
+BLK ati_memcycle, 1t
+BLK ati_minfreq , 4t
+BLK ati_maxfreq , 4t
+BLK ati_dramclk , 4t
+BLK ati_vramclk , 4t
+BLK ati_nadj    , 4t
+BLK ati_clktbl  , 4t*16t
+ati_SIZE=!$$$
+XMBINDEX ati_INDEX, ati_SIZE
+
+	LKEHEAD  SISADRV, MAJV, MINV, EDITNUM, LKETYPE_DEVICE
+
+;Once-only initizliation routine
+
+	INITSUB	sisainit
+
+sisainit:
+	MOVL	EDI, xosconFDhdb##	;Get offset of the first DHDB
+	ORL	EDI, EDI
+	JE	2$.S
+	CLRL	EBX			;Find the display device
+4$:	MOVW	CX, #1039h
+	CALLI	knxPciFindVendor##
+	JC	2$.S			;If not there
+	MOVL	EDX, #pciidtbl		;Found one - see if this is a device
+	MOVL	ECX, #PCIIDTBLSZ	;  we can handle
+6$:	CMPW	AX, CS:[EDX]
+	JE	8$.S			;Yes
+	ADDL	EDX, #2t.B
+	LOOP	ECX, 6$
+	INCB	BH
+	JNE	4$.S			;No - continue looking
+2$:	MOVL	EAX, #ER_PDNAV
+	STC
+ret004:	RET
+
+;Here with a device we know about - read the PCI configuration registers
+;  to get the addresses we need.
+
+8$:	MOVB	dhdb_pciaddr.B[EDI], BH	;Save the device/function number
+	MOVL	dhdb_pciid.B[EDI], EAX	;Save the device ID
+	MOVB	BL, #10h		;Get the display aperture address
+	CALLI	knxPciReadConfig##
+	ANDL	EAX, #0FFFFFFF0h.B
+	MOVL	dhdb_pgaddr.B[EDI], EAX
+	MOVB	BL, #14h		;Get the register aperture addrss
+	CALLI	knxPciReadConfig##
+	ANDL	EAX, #0FFFFFFF0h.B
+	MOVL	dhdb_praddr.B[EDI], EAX
+
+;Read some of the board registers to verify that everything is right
+
+.PAGE
+
+;Map the linear aperature - We always map 8MB, which is the maximum size, so
+;  we don't have to worry about the actual size.
+
+	MOVL	ECX, #2048t		;Number of display pages to map (8M)
+	MOVL	EBX, #la_graphdisp	;Linear address for screen buffer
+	MOVL	EDX, dhdb_pgaddr.B[EDI]	;Physical address
+	PUSHL	EDI
+	MOVL	EDI, #-1
+	MOVL	EAX, #27h
+	CALL	knlMapPhyPages##	;Map the pages
+	POPL	EDI
+	JC	10$.S			;If error
+	MOVL	ECX, #16t		;Number of register pages to map (64K)
+	MOVL	EBX, #la_graphdisp+800000h ;Linear address for registers
+	MOVL	EDX, dhdb_praddr.B[EDI]	;Physical address
+	PUSHL	EDI
+	MOVL	EDI, #-1
+	MOVL	EAX, #27h
+	CALL	knlMapPhyPages##	;Map the pages
+	POPL	EDI
+10$:	JC	20$			;If error
+	MOVL	dhdb_vgaddr.B[EDI], #graphdisp
+	MOVL	dhdb_vraddr.B[EDI], #graphdisp+800000h
+
+;Update all current TDBs for the display with our values
+
+	LEAL	EDX, dhdb_tdbtbl[EDI]
+	MOVL	ECX, #VDSPMAX
+12$:	MOVL	ESI, [EDX]
+	ADDL	EDX, #4t.B
+	TESTL	ESI, ESI
+	JE	14$.S
+	MOVL	tdb_vgaddr.B[ESI], #graphdisp
+	MOVL	tdb_vraddr.B[ESI], #graphdisp+800000h
+	MOVL	EAX, dhdb_gbfrsize.B[EDI]
+	SHLL	EAX, #20t
+	MOVL	tdb_gbfrsize[ESI], EAX
+	MOVL	EAX, dhdb_xioreg.B[EDI]
+	MOVL	tdb_xioreg.B[ESI], EAX
+14$:	LOOP	ECX, 12$
+
+;Now change the basic VGA driver's links to point to our routines
+
+	MOVL	xosvgaSetGraphic##, #sissetgraphic
+	MOVL	xosvgaSetDHS##, #sissetdhs
+	MOVL	xosvgaSetPage##, #sissetpage
+	MOVL	xosvgaClrBuffer##, #sisclrbuffer
+	MOVL	EAX, #sissetgvf
+	MOVL	EBX, #xosvgaSetGVF##
+	CALL	knlStoreCode##
+	MOVL	EAX, #sisgetgvf
+	MOVL	EBX, #xosvgaGetGVF##
+	CALL	knlStoreCode##
+	MOVL	EAX, #sisgetcurpos
+	MOVL	EBX, #xosvgaGGetCurPos##
+	CALL	knlStoreCode##
+	MOVL	EAX, #sissetcurpos
+	MOVL	EBX, #xosvgaGSetCurPos##
+	CALL	knlStoreCode##
+	MOVL	EAX, #sissetcurcol
+	MOVL	EBX, #xosvgaGSetCurCol##
+	CALL	knlStoreCode##
+	MOVL	EAX, #sissetcurpat
+	MOVL	EBX, #xosvgaGSetCurPat##
+	CALL	knlStoreCode##
+
+18$:	CLRL	EAX
+	CLRL	EDX
+	MOVL	ECX, #codetop
+20$:	RET
+
+	CODE
+.PAGE
+;Subroutine to do first part of setting to a graphic display mode - in this
+;  case we attempt to make both the horizontal and vertical resolution at
+;  least as great as specified.  Note that we only support six standard
+;  resolution combinations: 640 x 480, 800 x 600, 1024 x 768, 1152 x 864,
+;  and 1280 x 960.  We also support 3 modes which specify the color depth:
+;    mode 2: hi-color - 1-5-5-5 (xRGB) using 16 bits
+;    mode 3: hi-color - 5-6-5 (RGB) using 16 bits
+;    mode 4: true-color - 8-8-8-8 (xRGB) using 32 bits
+;  We DO NOT support any palette based modes!
+;	CALL	sissetgraphic
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+
+sissetgraphic:
+	MOVB	AL, adm_bits.B[EBP]
+	CMPB	AL, #DM_HCGx15
+	JE	2$.S
+	CMPB	AL, #DM_HCG16
+	JE	2$.S
+	CMPB	AL, #DM_TCGx24
+	JE	2$.S
+	MOVL	EAX, #ER_VALUE
+	STC
+	RET
+
+;Here with a valid mode
+
+2$:	MOVL	EBX, #sistable1
+	MOVL	ECX, #6
+	MOVL	EAX, adm_dv+dm_horiz.B[EBP] ;Get desired horizontal resolution
+4$:	CMPL	EAX, tbl_horiz.B[EBX]	;Is this config OK?
+	JBE	6$.S			;Yes
+	ADDL	EBX, #SISTABLESZ
+	LOOP	ECX, 4$
+	JMP	10$.S
+
+;Here with config with large enough horizontal resolution
+
+6$:	MOVL	EAX, adm_dv+dm_vert.B[EBP] ;Get desired vertical resolution
+8$:	CMPL	EAX, tbl_vert.B[EBX]	;Is this config OK?
+	JBE	12$.S			;Yes
+	ADDL	EBX, #SISTABLESZ
+	LOOP	ECX, 8$
+10$:	SUBL	EBX, #SISTABLESZ
+12$:	CLC
+	RET
+.PAGE
+;Subroutine to set extended registers for the current mode
+
+$$$=!0
+FRM dhs_dotclock, 4t
+FRM dhs_on      , 4t
+FRM dhs_off     , 4t
+FRM dhs_latency , 4t
+FRM dhs_pagesz  , 4t
+FRM dhs_xd      , 4t
+FRM dhs_xn      , 4t
+FRM dhs_xclks   , 4t		;xclks per qword value
+dhs_SIZE=!$$$
+
+sissetdhs:
+	MOVL	EDX, tdb_vraddr.B[ESI]
+	CMPB	tdb_mode[ESI], #DM_TEXT	;In text mode?
+	JNE	4$.S			;No
+;;;;;;	ANDL	CRTC_GEN_CNTL[EDX], #~CRTC_EXT_DISP_EN
+					;Yes - disable graphic mode
+;;;;;;	ANDL	DAC_CNTL[EDX], #~DAC_8BIT_EN ;Set DAC for 6-bit operation
+	JMP	xosvgaSetDhs4##		;Continue
+
+;Here if in a graphic mode
+
+4$:	PUSHL	EDI
+	ENTER	dhs_SIZE, 0
+
+
+	MOVL	EDI, tdb_dhdb.B[ESI]
+	MOVL	EBX, tdb_table.B[ESI]
+	MOVZBL	ECX, tdb_vertfreq.B[ESI]
+
+;Set the general registers
+
+	MOVL	EDX, tdb_bioreg[ESI]	;Get port for the sequencer index
+	ADDL	EDX, #P_EGASEQINDX-P_EGABASE.B
+
+
+
+;Set the sequencer registers and the SIS extended registers
+
+	MOVL	EDX, tdb_bioreg[ESI]	;Get port for the sequencer index
+	ADDL	EDX, #P_EGASEQINDX-P_EGABASE.B
+
+	INT3
+
+	MOVW	AX, #2101h
+	OUTW	[DX]
+	MOVW	AX, #0F02h
+	OUTW	[DX]
+	MOVW	AX, #0D04h
+	OUTW	[DX]
+
+	MOVW	AX, #8605h		;Make sure these registers are unlocked
+	OUTW	[DX]
+
+	MOVW	AX, #8A06h		;Graphics mode
+	OUTW	[DX]
+
+	MOVW	AX, #6407h
+	OUTW	[DX]			;SR7
+
+	MOVB	AL, #0Ah
+	MOVB	AH, tbl_seqregs_A[EBX+ECX]
+	OUTW	[DX]			;SRA
+
+	INCL	EAX
+	MOVB	AH, #60h
+	OUTW	[DX]			;SRB
+
+	INCL	EAX
+	OUTB	[DX]			;SRC
+	INCL	EDX
+	INB	[DX]
+
+	ANDB	AL, #1Fh
+	ORB	AL, #80h
+	MOVB	AH, AL
+	MOVB	AL, #0Ch
+	DECL	EDX
+	OUTW	[DX]
+
+
+	MOVB	AL, #12h
+	MOVB	AH, tbl_seqregs_12[EBX+ECX]
+	OUTW	[DX]			;SR12
+	MOVL	EAX, dhdb_pgaddr.B[EDI]	;Set the linear buffer address and size
+	SHRL	EAX, #11t		;  into registers 20 and 21
+	MOVB	AL, #20h
+	OUTW	[DX]
+	SHRL	EAX, #8t
+	ORB	AH, #80h
+	MOVB	AL, #21h
+	OUTW	[DX]
+	MOVW	AX, #4027h		;Enable access to the memory mapped
+	OUTW	[DX]			;  registers
+
+
+; CODE GOES HERE TO SET THE CLOCK FREQUENCY
+
+
+
+;Set the CRTC registers
+
+	A2IOP	P_EGACCRTINDX-P_EGASEQINDX
+	CLRL	EAX
+
+	INT3
+
+	MOVB	AH, tbl_crtregs_0.B[EBX+ECX]
+	OUTW	[DX]
+	INCL	EAX
+	MOVB	AH, tbl_crtregs_1.B[EBX]
+	OUTW	[DX]
+	INCL	EAX
+	MOVB	AH, tbl_crtregs_2.B[EBX+ECX]
+	OUTW	[DX]
+	INCL	EAX
+	MOVB	AH, tbl_crtregs_3.B[EBX+ECX]
+	OUTW	[DX]
+	INCL	EAX
+	MOVB	AH, tbl_crtregs_4.B[EBX+ECX]
+	OUTW	[DX]
+	INCL	EAX
+	MOVB	AH, tbl_crtregs_5.B[EBX+ECX]
+	OUTW	[DX]
+	INCL	EAX
+	MOVB	AH, tbl_crtregs_6.B[EBX+ECX]
+	OUTW	[DX]
+	INCL	EAX
+	MOVB	AH, tbl_crtregs_7.B[EBX+ECX]
+	OUTW	[DX]
+	INCL	EAX
+	MOVB	AH, #0			;CRT8
+	OUTW	[DX]
+	INCL	EAX
+	MOVB	AH, tbl_crtregs_9.B[EBX+ECX]
+	OUTW	[DX]
+	INCL	EAX
+	MOVB	AH, #0
+	OUTW	[DX]			;CRTA
+	INCL	EAX
+	OUTW	[DX]			;CRTB
+	INCL	EAX
+	OUTW	[DX]			;CRTC
+	INCL	EAX
+	OUTW	[DX]			;CRTD
+	INCL	EAX
+	OUTW	[DX]			;CRTE
+	INCL	EAX
+	OUTW	[DX]			;CRTF
+	INCL	EAX
+	MOVB	AH, tbl_crtregs_10.B[EBX+ECX]
+	OUTW	[DX]
+	INCL	EAX
+	MOVB	AH, tbl_crtregs_11.B[EBX+ECX]
+	OUTW	[DX]
+	INCL	EAX
+	MOVB	AH, tbl_crtregs_12.B[EBX]
+	OUTW	[DX]
+	INCL	EAX
+	MOVB	AH, tbl_crtregs_13.B[EBX]
+	OUTW	[DX]
+	INCL	EAX
+	MOVB	AH, #60h
+	OUTW	[DX]			;CRT14
+	INCL	EAX
+	MOVB	AH, tbl_crtregs_15.B[EBX+ECX]
+	OUTW	[DX]
+	INCL	EAX
+	MOVB	AH, tbl_crtregs_16[EBX+ECX]
+	OUTW	[DX]
+	INCL	EAX
+	MOVB	AH, #0A3h
+	OUTW	[DX]			;CRT17
+	INCL	EAX
+	MOVB	AH, #0FFh
+	OUTW	[DX]			;CRT18
+	INCL	EAX
+
+;Set the graphics controller registers
+
+	A2IOP	P_EGAGCINDX-P_EGACCRTINDX
+	CLRL	EAX
+	OUTW	[DX]			;GC0
+	INCL	EAX
+	OUTW	[DX]			;GC1
+	INCL	EAX
+	OUTW	[DX]			;GC2
+	INCL	EAX
+	OUTW	[DX]			;GC3
+	INCL	EAX
+	OUTW	[DX]			;GC4
+	INCL	EAX
+	MOVB	AH, #10h
+	OUTW	[DX]			;GC5
+	INCL	EAX
+	MOVB	AH, #05h
+	OUTW	[DX]			;GC6
+	INCL	EAX
+	MOVB	AH, #0
+	OUTW	[DX]			;GC7
+	INCL	EAX
+	MOVB	AH, #0FFh
+	OUTW	[DX]			;GC8
+
+;Set the attribute controller registers	
+
+	A2IOP	P_EGAATTRIB-P_EGAGCINDX
+
+
+;Set the DAC registers
+
+	A2IOP	P_EGADACWINDX-P_EGAATTRIB
+	CLRL	EAX
+	OUTB	[DX]
+	A2IOP	P_EGADACDATA-P_EGADACWINDX
+26$:	OUTB	[DX]
+	OUTB	[DX]
+	OUTB	[DX]
+	INCL	EAX
+	CMPB	AL, #0
+	JNE	26$.S
+
+	INT3
+
+	LEAVE
+	POPL	EDI
+	RET
+.PAGE
+	.SBTTL	waitforfifo - Subroutine to wait until fifo slots available
+
+;Subroutine to wait until fifo slots are available
+;	c{EAX} = Number of slots
+;	CALL	waitforfifo
+
+waitforfifo:
+;;;;;;	MOVL	EAX, FIFO_STAT[EDX]
+	CMPW	AX, CX
+	JA	waitforfifo.S
+	RET
+.PAGE
+	.SBTTL	sissetpage - Subroutine to set high order display start bits
+
+;Subroutine to set high order display start bits
+;	c{EBX} = Display start value (bytes)
+;	c{ESI} = Offset of TDB
+;	CALL	atisetpage
+
+sissetpage:
+	CMPB	tdb_mode[ESI], #DM_TEXT	;Text mode?
+	JBE	10$.S			;Yes - nothing to do here
+	MOVL	EDX, tdb_vraddr.B[ESI]	;No - point to our registers
+;;;;;;	MOVL	EAX, CRTC_OFF_PITCH[EDX]
+	ANDL	EAX, #0FFF00000h
+	SHRL	EBX, #1t
+	ORL	EAX, EBX
+;;;;;;	MOVL	CRTC_OFF_PITCH[EDX], EAX
+;;;;;;	MOVL	DST_OFF_PITCH[EDX], EAX
+;;;;;;	MOVL	SRC_OFF_PITCH[EDX], EAX
+10$:	RET
+.PAGE
+	.SBTTL	sisclrbuffer - Subroutine to clear the display buffer
+
+;Subroutine to clear the display buffer
+;	c{ESI} = Offset of TDB
+;	CALL	sisclrbuffer
+
+sisclrbuffer:
+
+	MOVL	ECX, tdb_horiz[ESI]	;Get number of pixels in the buffer
+	IMULL	ECX, tdb_vert[ESI]
+	SHRL	ECX, #1t		;Change to number of longs to store
+	CLRL	EAX
+	MOVL	EDI, tdb_vgaddr.B[ESI]	;Get offset of the buffer
+	PUSHL	DS
+	POPL	ES
+	CLD
+	RSTOSL	[EDI]
+	RET
+.PAGE
+	.SBTTL	sissetgvf - Subroutine to set vertical frequency
+
+;Subroutine to set vertical frequency
+;	c{EAX} = Desired frequency
+;	c{ESI} = Offset of TDB
+;	CALL	sissetgvf
+
+sissetgvf:
+	CMPL	EAX, #80t.B		;Want highest possible frequency?
+	JA	10$.S			;Yes
+	MOVL	EBX, #freqtbl		;No - scan the table
+	MOVL	ECX, #5t
+4$:	CMPB	AL, CS:[EBX]		;This one?
+	JBE	6$.S			;Yes
+	INCL	EBX			;No - continue if more to check
+	LOOP	ECX, 4$
+	DECL	EBX
+6$:	SUBL	EBX, #freqtbl
+	MOVB	tdb_vertfreq[ESI], BL	;Store frequency index
+	RET
+
+10$:	MOVB	tdb_vertfreq[ESI], #6
+	RET
+
+	.SBTTL	sisgetgvf - Subroutine to get vertical frequency
+
+;Subroutine to set vertical frequence
+;	c{ESI} = Offset of TDB
+;	CALL	sisgetgvf
+;	c{EAX} = Current value
+
+sisgetgvf:
+	MOVZBL	EAX, tdb_vertfreq[ESI]
+	MOVB	AL, CS:freqtbl[EAX]
+	CLC
+	RET
+.PAGE
+	.SBTTL	sisgetcurpos - Subroutine to get the current cursor postion
+
+;Mach64 cursor positioning is somewhat unusual.
+;  1. The cursor is "always" 64 x 64.
+;  2. A horizontal offset can be specified which reduces the horizontal size
+;	from the LEFT.
+;  3. A vertical offset can be specified which reduces the vertical size from
+;	the BOTTOM.
+;  4. The cursor position cannot be negative.
+;  To position the cursor partly off the left of the screen, the horizontal
+;    position must be 0 and the horizontal offset must be used to display a
+;    partitial at the left edge.
+;  To position the cursor partly off the top of the screen, the vertical
+;    position must be 0 and the cursor definition pointer and the vertical
+;    offset must be used to display a partial cursor at the top edge of the
+;    screen.
+
+;Subroutine to get the current cursor postion
+;	c{ES:EBX} = Address of array to receive values
+;	c{ESI}    = Offset of TDB
+;	CALL	sisgetcurpos
+;	C{EAX} = 0 if cursor disabled, 1 if cursor enabled, negative error
+;		   code if error
+
+sisgetcurpos:
+	MOVL	EAX, tdb_gcxpos[ESI]
+	IFFAULT	knlRtnAdrEr##
+	MOVL	ES:[EBX], EAX
+	MOVL	EAX, tdb_gcypos[ESI]
+	IFFAULT	knlRtnAdrEr##
+	MOVL	ES:4.B[EBX], EAX
+	MOVZBL	EAX, tdb_gcenable[ESI]
+	RET
+
+	.SBTTL	sissetcurpos - Subroutine to set the cursor postion
+
+;Subroutine to set the cursor postion
+;	c{EAX} = Function bits
+;	c{ECX} = X position
+;	c{EDX} = Y position
+;	c{ESI} = Offset of TDB
+;	CALL	sissetcurpos
+;	C{EAX} = 0 if normal, negative error code if error
+
+sissetcurpos:
+	TESTB	AL, #02h		;Want to set the position?
+	JE	2$.S			;No
+	MOVL	tdb_gcxpos[ESI], ECX	;Yes - store new values
+	MOVL	tdb_gcypos[ESI], EDX
+2$:	TESTB	AL, #01h		;Want to enable the cursor now?
+	JNE	4$.S			;Yes
+	MOVL	ECX, tdb_vraddr.B[ESI]	;No - disable it now
+;;;;;;	ANDL	GEN_TEST_CNTL[ECX], #~GEN_CUR_ENABLE
+4$:	PUSHL	EAX			;Save the function bits
+	MOVL	ECX, tdb_gcxpos[ESI]
+	MOVL	EDX, tdb_gcypos[ESI]
+	CLRL	EBX			;Assume no offset needed
+	SUBL	ECX, tdb_gcxhot[ESI]	;Adjust X position for hot-spot offset
+	JNS	8$.S			;Go on if not off left edge
+	CMPL	ECX, #-64t.B		;Completely off left edge?
+	JL	6$.S			;Yes
+	NEGL	ECX			;No - use the correct offset value
+	MOVB	BL, CL
+	CLRL	ECX
+	JMP	8$.S
+
+;Here if cursor is completely off the left edge of the screen - position it
+;  off the right edge!
+
+6$:	MOVL	ECX, tdb_horiz[ESI]
+8$:	SUBL	EDX, tdb_gcyhot[ESI]	;Adjust Y position for hot-spot offset
+	JNS	12$.S			;Go on if not off top
+	CMPL	EDX, #-64t.B		;Completely off top?
+	JL	10$.S			;Yes
+	NEGL	EDX			;No
+	MOVB	BH, DL
+	CLRL	EDX
+	JMP	12$.S
+
+;Here if cursor is completely off the top of the screen - position it off
+;  the bottom!
+
+10$:	MOVL	EDX, tdb_vert[ESI]
+
+;When get here, we have the hardware position values as follows:
+;	c{ECX} = X position
+;	c{EDX} = Y position
+;	c(BL)  = X offset
+;	c(BH)  = Y offset
+
+12$:	MOVL	EAX, EDX
+	SHLL	EAX, #16t
+	MOVW	AX, CX
+	MOVL	EDX, tdb_vraddr.B[ESI]
+	PUSHL	EAX			;Save the position value for now
+	MOVZBL	EAX, BH			;Construct the offset value
+	MOVL	ECX, EAX
+	SHLL	EAX, #16t
+	MOVB	AL, BL
+;;;;;;	MOVL	CUR_HORZ_VERT_OFF[EDX], EAX ;Store offset value
+	SHLL	ECX, #4t
+	ADDL	ECX, tdb_gbfrsize[ESI]
+	SUBL	ECX, #400h
+	SHRL	ECX, #3t
+;;;;;;	MOVL	CUR_OFFSET[EDX], ECX	;Store adjusted definition offset
+	POPL	EAX
+14$:
+;;;;;;	MOVL	CUR_HORZ_VERT_POSN[EDX], EAX ;Store position value
+	POPL	EAX			;Restore function bits
+	TESTB	AL, #01h		;Want to enable the cursor now?
+	JE	16$.S			;No
+	MOVL	ECX, tdb_vraddr.B[ESI]	;Yes - enable it now
+;;;;;;	ORL	GEN_TEST_CNTL[ECX], #GEN_CUR_ENABLE
+16$:	CLRL	EAX
+	RET
+.PAGE
+	.SBTTL	sissetcurcol - Subroutine to get the cursor colors
+
+;Subroutine to get the cursor colors (only the first two colors are used)
+;	c{ECX}    = Number of colors to set
+;	c{ES:EBX} = Address of color array
+;	c{ESI}    = Offset of TDB
+;	CALL	sissetcurcol
+;	C{EAX} = 0 if normal, negative error code if error
+
+sissetcurcol:
+	CMPL	ECX, #0			;Must any colors to set?
+	JE	4$.S			;No
+	MOVL	EDX, tdb_vraddr.B[ESI]	;Yes
+	IFFAULT	knlRtnAdrEr##
+	MOVL	EAX, ES:[EBX]		;Get the forground color value
+	CALL	curcolfix
+;;;;;;	MOVL	CUR_CLR1[EDX], EAX
+	CMPL	ECX, #1.B		;Have a background color?
+	JBE	4$.S			;No
+	IFFAULT	knlRtnAdrEr##
+	MOVL	EAX, ES:4t.B[EBX]	;Yes - get the background color
+	CALL	curcolfix
+;;;;;;	MOVL	CUR_CLR0[EDX], EAX
+4$:	CLRL	EAX
+	RET
+
+;Subroutine to fix up the color format for the cursor color registers
+;	C{EAX} = User supplied color value (format depends on mode)
+;	CALL	curcolfix
+;	C{EAX} = Value of cursor color register (always 8-8-8-x)
+
+curcolfix:
+	CMPB	tdb_mode[ESI], #DM_TCGx24 ;Using a 32 bit mode?
+	JAE	8$.S			;Yes
+	SHLL	EAX, #3t		;No - must convert from 5-6-5 or
+	PUSHL	ECX
+	MOVZBL	ECX, AL			; x-5-5-5 to x-8-8-8
+	MOVB	AL, #0
+	SHLL	EAX, #2t
+	CMPB	tdb_mode[ESI], #DM_HCGx15
+	JNE	6$.S
+	ADDL	EAX, EAX
+6$:	MOVB	CH, AH
+	MOVB	AH, #0
+	SHLL	EAX, #3t
+	ORL	EAX, ECX
+	POPL	ECX
+8$:	SHLL	EAX, #8t		;Finally, convert to 8-8-8-x
+	RET
+.PAGE
+	.SBTTL	sissetcurpat - Subroutine to set the cursor pattern
+
+;Subroutine to set the graphics cursor pattern - the graphics cursor is
+;  left disabled
+;	c(AL)     = Width
+;	c(AH)     = Height
+;	c(CL)     = X hot offset
+;	c(CH)     = Y hot offset
+;	c{FS:EBX} = Address of pattern map
+;	c{GS:EDX} = Address of mask map
+;	c{ESI}    = Offset of TDB
+;	CALL	sissetcurpat
+;	C{EAX} = 0 if normal, negative error code if error
+
+;The bit-maps we are given are single pixel bit-maps with each line starting
+;  at a byte boundry.
+
+$$$=!0
+FRM pat_height  , 4t
+FRM pat_width   , 4t
+FRM pat_pixcnt  , 4t
+pat_SIZE=!$$$
+
+sissetcurpat:
+	ENTER	pat_SIZE, 0
+	CMPB	AL, #0			;Make sure width and height are
+	JE	2$.S			;  between 1 and 64
+	CMPB	AL, #64t
+	JA	4$.S
+	CMPB	AH, #0
+2$:	JE	knlBadValueLv##
+	CMPB	AH, #64t.B
+4$:	JA	knlBadValueLv##
+	CMPB	CL, AL			;Make sure hot-spot is with-in the
+	JAE	6$.S			;  cursor
+	CMPB	CH, AH
+6$:	JAE	knlBadValueLv##
+	MOVB	tdb_gcxhot[ESI], CL	;Store hot-spot position
+	MOVB	tdb_gcyhot[ESI], CH
+	MOVZBL	ECX, AL			;Store width
+	MOVL	pat_width.B[EBP], ECX
+	MOVB	CL, AH
+	MOVL	pat_height.B[EBP], ECX	;Store height
+
+	MOVL	ECX, tdb_vraddr.B[ESI]	;Disable the cursor
+;;;;;;;	ANDL	GEN_TEST_CNTL[ECX], #~GEN_CUR_ENABLE
+
+	MOVL	EDI, tdb_vgaddr.B[ESI]
+	ADDL	EDI, tdb_gbfrsize[ESI]
+	SUBL	EDI, #400h
+	PUSHL	EDI
+
+	MOVL	ECX, #16t*64t/4		;Initialize the entire cursor bit-map
+	PUSHL	DS			;  as transparent pixels
+	POPL	ES
+	MOVL	EAX, #0AAAAAAAAh
+	CLD
+	RSTOSL	[EDI]
+	POPL	EDI
+
+	CLRL	EAX
+	CLRL	ECX
+10$:	PUSHL	pat_width.B[EBP]
+	POPL	pat_pixcnt.B[EBP]
+	IFFAULT	knlRtnAdrErLv##
+12$:	XORB	CL, #07h
+	BTL	FS:[EBX], ECX
+	JNC	14$.S
+	BTSL	[EDI], EAX
+14$:	INCL	EAX
+	IFFAULT	knlRtnAdrErLv##
+	BTL	GS:[EDX], ECX
+	JC	16$.S
+	BTZL	[EDI], EAX
+16$:	INCL	EAX
+	XORB	CL, #07h
+	INCL	ECX
+	DECL	pat_pixcnt.B[EBP]
+	JNE	12$.S
+	DECL	ECX
+	ORB	CL, #07h
+	INCL	ECX
+	DECL	EAX
+	ORB	AL, #7Fh
+	INCL	EAX
+	DECL	pat_height.B[EBP]
+	JNE	10$.S
+	LEAVE
+	CLRL	EAX
+	RET
+.PAGE
+;Table of acceptable PCI chip ID values - these are almost but not exactly the
+;  same as the chip ID values for the CONFIG_CHIP_ID register
+
+	.MOD	2
+pciidtbl:
+	.WORD	6326h
+PCIIDTBLSZ=!{$-pciidtbl}/2
+
+	.MOD	4
+names:	.LONG	name6326
+
+pixwid:	.LONG	30303		;DM_HCGx15 = 2 - High color (1-5-5-5, xRGB)
+	.LONG	40404		;DM_HCG16  = 3 - High color (5-6-5, RGB)
+	.LONG	60606		;DM_TCGx24 = 4 - True color (8-8-8-8, xRGB)
+
+chnmsk:	.LONG	4210		;DM_HCGx15 = 2 - High color (1-5-5-5, xRGB)
+	.LONG	4210		;DM_HCG16  = 3 - High color (5-6-5, RGB)
+	.LONG	8080		;DM_TCGx24 = 4 - True color (8-8-8-8, xRGB)
+
+widbits:.BYTE	03h		;DM_HCGx15 = 2 - High color (1-5-5-5, xRGB)
+	.BYTE	04h		;DM_HCG16  = 3 - High color (5-6-5, RGB)
+	.BYTE	06h		;DM_TCGx24 = 4 - True color (8-8-8-8, xRGB)
+
+widwid:	.BYTE	16t		;DM_HCGx15 = 2 - High color (1-5-5-5, xRGB)
+	.BYTE	16t		;DM_HCG16  = 3 - High color (5-6-5, RGB)
+	.BYTE	32t		;DM_TCGx24 = 4 - True color (8-8-8-8, xRGB)
+
+freqtbl:.BYTE	55t, 60t, 65t, 70t, 75t, 80t, 85t
+memsize:.BYTE	1, 1, 2, 2, 3, 3, 4, 4, 5, 6, 7, 8, 10t, 12t, 14t, 16t
+postdiv:.BYTE	1, 2, 4, 8, 3, 0, 6, 12t
+
+	.SBTTL	Graphic mode initialization tables for VGA registers
+
+	DATA
+
+lit23:	.LONG	23t
+lit24:	.LONG	24t
+
+name6326:.ASCIZ	"SIS6326"
+
+	.MOD	4
+
+;Define macros used to generate the initialization tables
+
+	.MACRO	TABLE  n
+;;;;	.NLIST
+
+	.ALMEX
+
+	.MOD	4
+
+	.MACRO	T  a1,a2,a3,a4,a5
+sistable''a'n::
+	.ENDM
+
+	.MACRO	L  lbl
+.IF DEF lbl
+  .IF NE lbl-{$-sistable'n}
+	.IRP	p, >lbl
+	.IRP	q, >{$-sistable'n}
+	.ERROR	Incorrect label offset: lbl =  p, should be q
+	.ENDR
+	.ENDR
+  .ENDC
+.IFF
+  lbl=!$-sistable'n
+.ENDC
+	.ENDM
+
+	.MACRO	B  a1,a2,a3,a4,a5
+	.BYTE	0''a'n
+	.ENDM
+
+	.MACRO	W  a1,a2,a3,a4,a5
+	.WORD	0''a'n
+	.ENDM
+
+	.MACRO	Q  a1,a2,a3,a4,a5
+	.LONG	a'n''
+	.ENDM
+
+	.MACRO	H  a1,a2,a3,a4,a5
+	.LONG	0''a'n''h
+	.ENDM
+
+	.MACRO	CRT0  f
+	.BYTE	crt_htotal_''f''_'n&0FFh
+	.ENDM
+
+	.MACRO	CRT1  f
+	.BYTE	crt_hdispend_00_'n&0FFh
+	.ENDM
+
+	.MACRO	CRT2  f
+	.BYTE	crt_hblkstrt_''f''_'n&0FFh
+	.ENDM
+
+	.MACRO	CRT3  f
+	.BYTE	crt_hblkend_''f''_'n&1Fh
+	.ENDM
+
+	.MACRO	CRT4  f
+	.BYTE	crt_hsynstrt_''f''_'n&0FFh
+	.ENDM
+
+	.MACRO	CRT5  f
+	.BYTE	crt_hsynend_''f''_'n&1Fh
+	.ENDM
+
+	.MACRO	CRT6  f
+	.BYTE	crt_vtotal_''f''_'n&1Fh
+	.ENDM
+
+	.MACRO	CRT7  f
+bit7=!{{crt_vsynstrt_''f''_'n>9}&01h}<7
+bit6=!{{crt_vdispend_00_'n>9}&01h}<6
+bit5=!{{crt_vtotal_''f''_'n>9}&01h}<5
+bit4=!10h
+bit3=!{{crt_vblkstrt_''f''_'n>8}&01h}<3
+bit2=!{{crt_vsynstrt_''f''_'n>8}&01h}<2
+bit1=!{{crt_vdispend_00_'n>8}&01h}<1
+bit0=!{crt_vtotal_''f''_'n>8}&01h
+	.BYTE	bit7|bit6|bit5|bit4|bit3|bit2|bit1|bit0
+	.ENDM
+
+	.MACRO	CRT9  f
+bit6=!40
+bit5=!{{crt_vblkstrt_''f''_'n>8}&01h}<5
+	.BYTE	bit6|bit5+1
+	.ENDM
+
+	.MACRO	CRT10  f
+	.BYTE	crt_vsynstrt_''f''_'n&0FFh
+	.ENDM
+
+	.MACRO	CRT11  f
+bit5=!20
+	.BYTE	bit5|{crt_vsynend_''f''_'n&0Fh}
+	.ENDM
+
+	.MACRO	CRT12  f
+	.BYTE	crt_vdispend_00_'n&0FFh
+	.ENDM
+
+	.MACRO	CRT13  f
+	.BYTE	{{{crt_hdispend_00_'n}+1}*16t}&0FFh
+	.ENDM
+
+	.MACRO	CRT15  f
+	.BYTE	crt_vblkstrt_''f''_'n&0FFh
+	.ENDM
+
+	.MACRO	CRT16  f
+	.BYTE	crt_vblkend_''f''_'n&0FFh
+	.ENDM
+
+	.MACRO	SEQA  f
+bit4=!{{crt_hblkend_''f''_'n>6}&0Fh}<4
+bit3=!{{crt_hsynstrt_''f''_'n>8}&01h}<3
+bit2=!{{crt_hblkstrt_''f''_'n>8}&01h}<2
+bit1=!{{crt_hdispend_00_'n>8}&01h}<1
+bit0=!{crt_htotal_''f''_'n>8}&01h
+	.BYTE	bit74|bit3|bit2|bit1|bit0
+	.ENDM
+
+	.MACRO	SEQ12  f
+bit74=!{{{{{crt_hdispend_00_'n}+1}*16t}>8}&0Fh}<4
+bit3=!{{crt_vsynstrt_''f''_'n>10}&01h}<3
+bit2=!{{crt_vblkstrt_''f''_'n>10}&01h}<2
+bit1=!{{crt_vdispend_00_'n>10}&01h}<1
+bit0=!{crt_vtotal_''f''_'n>10}&01h
+	.BYTE	bit74|bit3|bit2|bit1|bit0
+	.ENDM
+
+
+	VALUES
+	.MOD	4
+;;;;	.LIST
+	.ENDM
+
+TF_none=!0
+
+
+	.MACRO	S  sym,freq,a1,a2,a3,a4,a5
+crt_'sym'_'freq'_'1=!a1't
+crt_'sym'_'freq'_'2=!a2't
+crt_'sym'_'freq'_'3=!a3't
+crt_'sym'_'freq'_'4=!a4't
+crt_'sym'_'freq'_'5=!a5't
+	.ENDM
+
+S htotal  , 55,  95, 131, 163, 179,  199
+S htotal  , 60,  95, 131, 163, 179,  199
+S htotal  , 65,  95, 131, 163, 179,  199
+S htotal  , 70,  95, 131, 163, 179,  199
+S htotal  , 75,  95, 131, 163, 179,  199
+S htotal  , 80,  95, 131, 163, 179,  199
+S htotal  , 85,  95, 131, 163, 179,  199
+
+S hdispend, 00,  79,  99, 127, 143,  159
+
+S hblkstrt, 55,  80, 100, 128, 144,  160
+S hblkstrt, 60,  80, 100, 128, 144,  160
+S hblkstrt, 65,  80, 100, 128, 144,  160
+S hblkstrt, 70,  80, 100, 128, 144,  160
+S hblkstrt, 75,  80, 100, 128, 144,  160
+S hblkstrt, 80,  80, 100, 128, 144,  160
+S hblkstrt, 85,  80, 100, 128, 144,  160
+
+S hsynstrt, 55,  85, 101, 129, 145,  169
+S hsynstrt, 60,  85, 101, 129, 145,  169
+S hsynstrt, 65,  85, 101, 129, 145,  169
+S hsynstrt, 70,  85, 101, 129, 145,  169
+S hsynstrt, 75,  85, 101, 129, 145,  169
+S hsynstrt, 80,  85, 101, 129, 145,  169
+S hsynstrt, 85,  85, 101, 129, 145,  169
+
+S hsynend , 55,  93, 129, 161, 177,  197
+S hsynend , 60,  93, 129, 161, 177,  197
+S hsynend , 65,  93, 129, 161, 177,  197
+S hsynend , 70,  93, 129, 161, 177,  197
+S hsynend , 75,  93, 129, 161, 177,  197
+S hsynend , 80,  93, 129, 161, 177,  197
+S hsynend , 85,  93, 129, 161, 177,  197
+
+S hblkend , 55,  94, 130, 162, 178,  198
+S hblkend , 60,  94, 130, 162, 178,  198
+S hblkend , 65,  94, 130, 162, 178,  198
+S hblkend , 70,  94, 130, 162, 178,  198
+S hblkend , 75,  94, 130, 162, 178,  198
+S hblkend , 80,  94, 130, 162, 178,  198
+S hblkend , 85,  94, 130, 162, 178,  198
+
+S vtotal  , 55, 523, 624, 844, 957, 1052
+S vtotal  , 60, 523, 624, 844, 957, 1052
+S vtotal  , 65, 523, 624, 844, 957, 1052
+S vtotal  , 70, 523, 624, 844, 957, 1052
+S vtotal  , 75, 523, 624, 844, 957, 1052
+S vtotal  , 80, 523, 624, 844, 957, 1052
+S vtotal  , 85, 523, 624, 844, 957, 1052
+
+S vdispend, 00, 479, 599, 767, 863, 1023
+
+S vblkstrt, 55, 480, 600, 768, 864, 1024
+S vblkstrt, 60, 480, 600, 768, 864, 1024
+S vblkstrt, 65, 480, 600, 768, 864, 1024
+S vblkstrt, 70, 480, 600, 768, 864, 1024
+S vblkstrt, 75, 480, 600, 768, 864, 1024
+S vblkstrt, 80, 480, 600, 768, 864, 1024
+S vblkstrt, 85, 480, 600, 768, 864, 1024
+
+S vsynstrt, 55, 481, 601, 769, 865, 1025
+S vsynstrt, 60, 481, 601, 769, 865, 1025
+S vsynstrt, 65, 481, 601, 769, 865, 1025
+S vsynstrt, 70, 481, 601, 769, 865, 1025
+S vsynstrt, 75, 481, 601, 769, 865, 1025
+S vsynstrt, 80, 481, 601, 769, 865, 1025
+S vsynstrt, 85, 481, 601, 769, 865, 1025
+
+S vsynend , 55, 520, 621, 841, 954, 1049
+S vsynend , 60, 520, 621, 841, 954, 1049
+S vsynend , 65, 520, 621, 841, 954, 1049
+S vsynend , 70, 520, 621, 841, 954, 1049
+S vsynend , 75, 520, 621, 841, 954, 1049
+S vsynend , 80, 520, 621, 841, 954, 1049
+S vsynend , 85, 520, 621, 841, 954, 1049
+
+S vblkend , 55, 521, 622, 842, 955, 1050
+S vblkend , 60, 521, 622, 842, 955, 1050
+S vblkend , 65, 521, 622, 842, 955, 1050
+S vblkend , 70, 521, 622, 842, 955, 1050
+S vblkend , 75, 521, 622, 842, 955, 1050
+S vblkend , 80, 521, 622, 842, 955, 1050
+S vblkend , 85, 521, 622, 842, 955, 1050
+
+
+
+;Define values used in the initialization tables
+
+;The following tables provide values for the video clock and the first 4
+;  CRTC registers for each supported vertical frequency and resolution
+;  combination.  The tables are accessed as an array of structures with the
+;  format:
+;	struct
+;	{  long vertfreq;
+;	    struct
+;	    {	long clockfreq;
+;		long crtc_h_total_disp;
+;		long crtc_h_sync_strt_wid;
+;		long crtc_v_total_disp;
+;		long crtc_v_sync_strt_wid;
+;	    } crtcdata[5];
+;	};
+
+	.MACRO	VALUES
+;	640       800      1024      1152      1280
+;	 x         x         x         x         x
+;	480       600       768       864       960
+ T        1,        2,        3,        4,        5
+L tbl_font				;Font index value
+ B        0,        0,        0,        0,        0
+ B        0,        0,        0,        0,        0
+ B        0,        0,        0,        0,        0
+ B        0,        0,        0,        0,        0
+L tbl_pgsize				;Page size for 16-bit pixel modes
+ Q 614400, 960000,1572864,1990656,2457600
+L tbl_horiz				;Screen width (pixels)
+ Q      640,      800,     1024,     1152,     1280
+L tbl_vert				;Screen height (pixels)
+ Q      480,      600,      768,      864,      960
+L tbl_columns				;Screen width (columns)
+ Q        0,        0,        0,        0,        0
+L tbl_rows				;Screen height (rows)
+ Q        0,        0,        0,        0,        0
+L tbl_dotclock				;Dot clock
+ Q  23100,  36300,  57750,  80663,  90200 ;55Hz
+ Q  25200,  39600,  63000,  87996,  98400 ;60Hz
+ Q  27300,  42900,  68250,  95329, 106600 ;65Hz
+ Q  29400,  46200,  73500, 102662, 114800 ;70Hz
+ Q  31500,  49500,  78750, 109995, 123000 ;75Hz
+ Q  33600,  52800,  84000, 117328, 131200 ;80Hz
+ Q  35700,  56100,  89250, 124661, 139400 ;85Hz
+
+L tbl_crtregs_0
+ CRT0 55
+ CRT0 60
+ CRT0 65
+ CRT0 70
+ CRT0 75
+ CRT0 80
+ CRT0 85
+
+L tbl_crtregs_1
+ CRT1 00
+
+L tbl_crtregs_2
+ CRT2 55
+ CRT2 60
+ CRT2 65
+ CRT2 70
+ CRT2 75
+ CRT2 80
+ CRT2 85
+
+L tbl_crtregs_3
+ CRT3 55
+ CRT3 60
+ CRT3 65
+ CRT3 70
+ CRT3 75
+ CRT3 80
+ CRT3 85
+
+L tbl_crtregs_4
+ CRT4 55
+ CRT4 60
+ CRT4 65
+ CRT4 70
+ CRT4 75
+ CRT4 80
+ CRT4 85
+
+L tbl_crtregs_5
+ CRT5 55
+ CRT5 60
+ CRT5 65
+ CRT5 70
+ CRT5 75
+ CRT5 80
+ CRT5 85
+
+L tbl_crtregs_6
+ CRT6 55
+ CRT6 60
+ CRT6 65
+ CRT6 70
+ CRT6 75
+ CRT6 80
+ CRT6 85
+
+L tbl_crtregs_7
+ CRT7 55
+ CRT7 60
+ CRT7 65
+ CRT7 70
+ CRT7 75
+ CRT7 80
+ CRT7 85
+
+;;;8 = 0
+
+L tbl_crtregs_9
+ CRT9 55
+ CRT9 60
+ CRT9 65
+ CRT9 70
+ CRT9 75
+ CRT9 80
+ CRT9 85
+
+;;;A = 0
+;;;B = 0
+;;;C = 0
+;;;D = 0
+;;;E = 0
+;;;F = 0
+
+L tbl_crtregs_10
+ CRT10 55
+ CRT10 60
+ CRT10 65
+ CRT10 70
+ CRT10 75
+ CRT10 80
+ CRT10 85
+
+L tbl_crtregs_11
+ CRT11 55
+ CRT11 60
+ CRT11 65
+ CRT11 70
+ CRT11 75
+ CRT11 80
+ CRT11 85
+
+L tbl_crtregs_12
+ CRT12 00
+
+L tbl_crtregs_13
+ CRT13 00
+
+;;;14 = 60
+
+L tbl_crtregs_15
+ CRT15 55
+ CRT15 60
+ CRT15 65
+ CRT15 70
+ CRT15 75
+ CRT15 80
+ CRT15 85
+
+L tbl_crtregs_16
+ CRT16 55
+ CRT16 60
+ CRT16 65
+ CRT16 70
+ CRT16 75
+ CRT16 80
+ CRT16 85
+
+;;;17 = A3
+;;;18 = FF
+
+L tbl_seqregs_A
+ SEQA 55
+ SEQA 60
+ SEQA 65
+ SEQA 70
+ SEQA 75
+ SEQA 80
+ SEQA 85
+
+L tbl_seqregs_12
+ SEQ12 55
+ SEQ12 60
+ SEQ12 65
+ SEQ12 70
+ SEQ12 75
+ SEQ12 80
+ SEQ12 85
+
+	.ENDM
+
+	.MOD	4
+sistables::
+
+	.ALMEX
+
+	TABLE	1
+SISTABLESZ=!$-sistables
+	TABLE	2
+	TABLE	3
+	TABLE	4
+	TABLE	5
+
+regsave:.BLKL	256t
+	.LONG	-1
+
+	LKEEND

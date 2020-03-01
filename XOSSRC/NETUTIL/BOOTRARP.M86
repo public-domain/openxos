@@ -1,0 +1,697 @@
+	.TITLE	BOOTRARP - RARP routines XOS boot server
+
+;++++
+; This software is in the public domain.  It may be freely copied and used
+; for whatever purpose you see fit, including commerical uses.  Anyone
+; modifying this software may claim ownership of the modifications, but not
+; the complete derived code.  It would be appreciated if the authors were
+; told what this software is being used for, but this is not a requirement.
+
+;   THIS SOFTWARE IS PROVIDED BY THE AUTHORS "AS IS" AND ANY EXPRESS OR
+;   IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
+;   OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+;   IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+;   INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+;   BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS
+;   OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+;   ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR
+;   TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
+;   USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+;----
+
+	.PROC	80386
+
+	.INCLUD	XOSINC:\XMAC\STDIO.PAR
+	.INCLUD	XOSINC:\XMAC\XOS.PAR
+	.INCLUD	XOSINC:\XMAC\XOSERR.PAR
+	.INCLUD	XOSINC:\XMAC\XOSNET.PAR
+	.INCLUD	BOOTSRV.PAR
+
+;This module contains the RARP server.  This version only supports Ethernet
+;  with 6 byte hardware addresses.
+
+;The RARP data file consists of a number of lines, each of which begins with
+;  a single character type identifier.  The valid line formats are:
+;    D dev prot
+;    A hwaddr paddr
+;  Where:
+;    dev    = Device name, final semicolon is optional (SNAP0, SNAP1:, etc)
+;		- must be a SNAP class device
+;    prot   = Network protcol in hex or decimal byte notation (80-35 or 8.6)
+;    hwaddr = Hardware address in hex or decimal byte notation
+;    paddr  = Protocol address in hex or decimal byte notation
+;A file must contain at least one D line followed by one or more A lines.
+;  Each A line applies to the device and protocol specified in the preceeding
+;  D line.  A file may contains as many D lines as desired.  When setting up
+;  the internal table for a network interface, only those D lines specifying
+;  the name of the device being set up are used.  All protocols specified must
+;  have been previously set up to be used by the network device and must point
+;  to a device whose local protocol level address has been set up.
+
+	.STDSEGS
+
+RARPBFRSIZE=!512t
+
+;Define offsets in the RARP data block
+
+$$$=!0
+BLK rdb_qab   , qab_SIZE	;Input QAB
+BLK rdb_parm  , 16t		;Parameter list
+BLK rdb_name  , 12t		;Name of network interface device
+BLK rdb_hwaddr, 8t		;Hardware address
+BLK rdb_pdb   , 4t		;Offset of first PDB
+BLK rdb_buffer, RARPBFRSIZE	;Data buffer
+rdb_SIZE=!$$$
+
+;Define offsets in the protocol data block (PDB)
+
+$$$=!0
+BLK pdb_next  , 4t		;Offset of next PDB for same RARP device
+BLK pdb_prot  , 4t		;Protocol value
+BLK pdb_addr  , 4t		;Address associated with protocol
+BLK pdb_table , 4t		;Offset of protocol data table
+BLK pdb_size  , 4t		;Number of protocol data table entries
+BLK pdb_pntr  , 4t		;Pointer used when building data table
+pdb_SIZE=!$$$
+
+	.PSECT	_OTEXT_p
+
+	.SBTTL	fncrarpdev - Subroutine to process RARPDEV keyword for procarg
+
+;Subroutine process the RARPDEV keyword for procarg
+;	result = fncrarpdev(arg_spec *arg);
+;  result = TRUE if OK, FALSE if error
+
+fncrarpdev::
+	PUSHL	ESI
+	PUSHL	EDI
+	PUSHL	#IV_RARPINPUT.B		;Set the RARP input done vector
+	PUSHL	#84h+{VT_XOSS<8t}
+	PUSHL	CS
+	PUSHL	#rarpinputdone
+	CALLF	svcSchSetVector#
+	MOVL	EBX, #sivfmsg#		;If error
+	TESTL	EAX, EAX
+	JS	fail2#
+	MOVL	EAX, #rdb_SIZE
+	CALL	getimem#		;Get memory
+	MOVW	[EDI], #QFNC_INBLOCK	;Set up the input QAB
+	MOVB	rdb_qab+qab_vector.B[EDI], #IV_RARPINPUT
+	MOVL	rdb_qab+qab_count.B[EDI], #RARPBFRSIZE
+	LEAL	EAX, rdb_buffer.B[EDI]
+	MOVL	rdb_qab+qab_buffer1+0.B[EDI], EAX
+	MOVL	rdb_qab+qab_buffer1+4.B[EDI], DS
+	LEAL	EBX, rdb_parm.B[EDI]
+	MOVL	rdb_qab+qab_parm+0.B[EDI], EBX
+	MOVL	rdb_qab+qab_parm+4.B[EDI], DS
+	MOVL	[EBX], #{PAR$GET|REP_HEXV}+{8<8t}+{IOPAR_NETRMTHWAR<16t}
+	CLRL	EAX
+	MOVB	12t.B[EBX], AL
+	MOVL	rdb_pdb.B[EDI], EAX
+	MOVL	netiname+0, EAX		;Clear the physical device name field
+	MOVL	netiname+2, EAX
+	MOVL	netiname+4, EAX
+	MOVL	ESI, 12t.B[ESP]		;Get offset of argument data structure
+	MOVL	EBX, #openparms		;Get offset of parameter list to use
+	CALL	opendev#		;Open the device
+	MOVL	EBX, #conmsg
+	JC	fail2#			;If error
+	MOVL	rdb_qab+qab_handle.B[EDI], EAX ;Store the handle
+	MOVL	pcharqab+qab_handle, EAX
+	MOVL	icharqab+qab_handle, EAX
+	MOVL	EBX, #notnetmsg
+	CMPL	openclass+0, #'SNAP'	;Is this s SNAP class device?
+	JNE	fail1#
+	MOVL	EAX, netiname+0		;Store physical device name in the RDB
+	MOVL	rdb_name+0.B[EDI], EAX
+	MOVL	EAX, netiname+2
+	MOVL	rdb_name+2.B[EDI], EAX
+	MOVL	EAX, netiname+4
+	MOVL	rdb_name+4.B[EDI], EAX
+	PUSHL	DS			;Get the name of the network interface
+	PUSHL	#icharqab		;  device
+	CALLF	svcIoQueue#
+	MOVL	EBX, #cgnetmsg
+ 	TESTL	EAX, EAX
+	JS	3$.S
+	MOVL	EAX, icharqab+qab_error
+	TESTL	EAX, EAX
+	JS	3$.S
+	MOVL	EBX, #netdev		;Put colon at end of name
+2$:	INCL	EBX
+	CMPB	[EBX], #0
+	JNE	2$.S
+	MOVB	[EBX], #':'
+	PUSHL	#O$PHYS			;Open the interface device
+	PUSHL	DS
+	PUSHL	#netdev
+	PUSHL	#0.B
+	PUSHL	#0.B
+	CALLF	svcIoOpen#
+	MOVL	EBX, #conetmsg
+	TESTL	EAX, EAX
+3$:	JS	6$.S
+	MOVL	acharqab+qab_handle, EAX
+	PUSHL	DS			;Get the device's hardware address
+	PUSHL	#acharqab
+	CALLF	svcIoQueue#
+	MOVL	EBX, #cgnamsg
+	TESTL	EAX, EAX
+	JS	6$.S
+	MOVL	EAX, acharqab+qab_error
+	TESTL	EAX, EAX
+	JS	6$.S
+	PUSHL	acharqab+qab_handle
+	PUSHL	#0.B
+	CALLF	svcIoClose#
+	MOVL	EAX, hwaddr+0		;Store the hardware address
+	MOVL	rdb_hwaddr+0.B[EDI], EAX
+	MOVL	EAX, hwaddr+4
+	MOVL	rdb_hwaddr+4.B[EDI], EAX
+	CALL	rarpproc		;Read the data file and set up our table
+	JC	6$.S			;If error
+	PUSHL	DS			;Start input
+	PUSHL	EDI
+	CALLF	svcIoQueue#
+	TESTL	EAX, EAX
+	JNS	10$.S			;If OK
+	MOVL	EBX, #csiomsg		;If error
+6$:	JMP	fail2#
+
+;Here with initialization for the network device complete
+
+10$:	MOVL	EDI, #initmsg		;All finished with the unit - tell the
+	MOVL	ECX, #INITMSGSIZE	;  user about this
+	CALL	response#
+	CLRL	EAX			;Return TRUE
+	INCL	EAX
+	POPL	EDI
+	POPL	ESI
+	RET
+
+	.PSECT	_TEXT_p
+.PAGE
+	.SBTTL	rarpinputdone - Software interrupt routine for RARP input available
+
+;Here if have error on input
+
+inerr:	NOP				;NEED TO DO SOMETHING GOOD HERE!!!
+
+;Here when finished with input
+
+indism:	POPAL				;Restore registers
+	CALLF	svcSchDismiss#		;And dismiss
+
+;Software interrupt routine for RARP input available
+
+rarpinputdone:
+	PUSHAL				;Save registers
+	MOVL	EDI, 64t.B[ESP]
+inloop:	TESTB	rdb_qab+qab_status+1.B[EDI], #QSTS$DONE>8 ;Have any input now?
+	JE	indism.S		;No
+	CMPL	rdb_qab+qab_error.B[EDI], #0.B ;Yes - have error on the input?
+	JS	inerr.S			;Yes - go handle that
+	CMPL	rdb_qab+qab_amount.B[EDI], #28t.B ;Is the packet long enough?
+	JB	10$.S			;No - discard the packet
+	CMPL	rdb_buffer+4.B[EDI], #03000406h	;Check field lengths and
+	JNE	10$.S				;  operation
+	CMPL	rdb_buffer+14t.B[EDI], #0.B ;Is the sender's IP address given?
+	JNE	10$.S			;Yes - discard the packet
+	MOVZWL	EAX, rdb_buffer+2.B[EDI] ;Get the protocol type
+	MOVL	ESI, rdb_pdb.B[EDI]	;Get first PDB
+2$:	CMPL	pdb_prot.B[ESI], EAX	;This one?
+	JE	3$.S			;Yes
+	MOVL	ESI, [ESI]		;No - advance to next PDB
+	TESTL	ESI, ESI		;Continue if have another PDB
+	JNE	2$.S
+	JMP	10$.S			;No more - discard the packet
+
+;Here with PDB for the protocol
+
+3$:	MOVL	EAX, pdb_addr.B[ESI]	;Store our IP address as the sender
+	MOVL	rdb_buffer+14t.B[EDI], EAX ;  IP address
+	MOVL	EAX, rdb_buffer+8t.B[EDI] ;Get sender's hardware address
+	MOVZWL	EDX, rdb_buffer+12t.B[EDI]
+	MOVL	ECX, pdb_size.B[ESI]	;Get number of entries in the table
+	MOVL	ESI, pdb_table.B[ESI]	;Point to the address table
+	TESTL	ESI, ESI		;Do we have a table?
+	JE	10$.S			;No - forget it!
+4$:	CMPL	[ESI], EAX		;Compare to table entry
+	JNE	6$.S
+	CMPL	4t.B[ESI], EDX
+	JE	fndit.S			;If found it
+6$:	ADDL	ESI, #12t.B		;Bump pointer
+	LOOP	ECX, 4$			;Continue if more to check
+10$:	JMP	indone.S		;Not found - forget it!
+
+;Here with table entry for the hardware address
+
+fndit:	MOVL	rdb_buffer+18t.B[EDI], EAX ;Store as target hardware address
+	MOVW	rdb_buffer+22t.B[EDI], DX
+	MOVL	EAX, 8.B[ESI]		;Get corresponding IP address
+	MOVL	rdb_buffer+24t.B[EDI], EAX ;Store it as the target IP address
+	MOVL	EAX, rdb_hwaddr+0.B[EDI]  ;Store our hardware address as the
+	MOVL	rdb_buffer+8t.B[EDI], EAX ;  sender hardware address
+	MOVL	EAX, rdb_hwaddr+4.B[EDI]
+	MOVW	rdb_buffer+12t.B[EDI], AX
+	MOVB	rdb_buffer+7t.B[EDI], #4 ;Change operation to RARP reply
+	PUSHL	rdb_qab+qab_handle.B[EDI] ;Send the reply packet
+	PUSHL	DS
+	LEAL	EAX, rdb_buffer.B[EDI]
+	PUSHL	EAX
+	PUSHL	#28t.B
+	PUSHL	DS
+	LEAL	EAX, rdb_parm.B[EDI]
+	MOVL	[EAX], #{PAR$SET|REP_HEXV}+{8<8t}+{IOPAR_NETRMTHWAS<16t}
+	PUSHL	EAX
+	CALLF	svcIoOutBlockP#
+	TESTL	EAX, EAX
+	JS	14$.S			;If error
+indone:	MOVB	rdb_qab+qab_vector.B[EDI], #0
+	MOVL	rdb_parm.B[EDI], #{PAR$GET|REP_HEXV}+{8<8t}+{IOPAR_NETRMTHWAR<16t}
+	PUSHL	DS
+	PUSHL	EDI
+	CALLF	svcIoQueue#
+	TESTL	EAX, EAX
+	JS	12$.S
+	MOVB	rdb_qab+qab_vector.B[EDI], #IV_RARPINPUT
+	JMP	inloop
+
+;Here if error queueing input
+
+12$:	NOP				;NEED TO LOG THIS AND DELAY A SHORT
+	JMP	indism			; TIME AND TRY AGAIN!
+
+;Here if error sending the RARP reply
+
+14$:	NOP				;NEED TO LOG THIS!
+	JMP	indone.S
+.PAGE
+	.SBTTL	rarpproc - Subroutine to process the RARP data file
+
+;Subroutine to process the RARP data file
+;	c{EDI} = Offset of the RARP data block
+;	CALL	rarpproc
+;	C:set = Error
+;	  c{EBX} = Offset of 1st message string
+;	  c{EAX} = Error code or offset of 2nd message string
+;	C:clr = Normal
+
+rarpproc:
+	ENTER	read_SIZE, 0
+	MOVL	ESI, #rarpdata#		;Open the data file
+	CALL	opendata#
+	JC	6$.S
+	MOVL	read_stream.B[EBP], EAX	;Save the stream pointer
+	MOVL	ESI, rdb_pdb.B[EDI]	;Do we have any PDBs now?
+	TESTL	ESI, ESI
+	JE	4$.S			;No
+2$:	PUSHL	[ESI]			;Save offset of next PDB
+	PUSHL	pdb_table		;Stack offset of the data table
+	PUSHL	ESI
+	CALL	free#			;Give up the PDB
+	POPL	ECX
+	CALL	free#			;Give up the data table
+	POPL	ECX
+	POPL	ESI			;Get offset of next PDB
+	TESTL	ESI, ESI		;Have another?
+	JNE	2$.S			;Yes
+	CLRL	EAX			;No
+	MOVL	rdb_pdb.B[EDI], EAX
+
+;Here with file open and previous tables (if any) given up - first we read the
+;  file to see how many items are specified for this interface
+
+4$:	CLRL	EAX			;Clear the count
+	MOVL	read_count.B[EBP], EAX
+	MOVL	EAX, #readacount
+	MOVL	EDX, #readdsetup
+	MOVL	ECX, #illfmt#
+	LEAL	EBX, rdb_buffer.B[EDI]
+	LEAL	ESI, rdb_name.B[EDI]
+	CALL	readdata#
+6$:	JC	10$.S
+	MOVL	ESI, rdb_pdb.B[EDI]	;Point to first PDB
+	TESTL	ESI, ESI
+	JE	16$.S			;If none
+8$:	MOVL	EAX, pdb_size.B[ESI]	;Get size of the table we need
+	TESTL	EAX, EAX
+	JE	10$.S			;If nothing found
+	IMULL	EAX, #12t.B		;Get space needed for table
+	CALL	getmem#
+	JC	14$.S
+	MOVL	pdb_table.B[ESI], EAX	;Store offset of the table
+	MOVL	pdb_pntr.B[ESI], EAX	;Initialize pointer for readread
+	MOVL	ESI, [ESI]		;Get offset of next PDB
+	TESTL	ESI, ESI
+	JNE	8$.S			;Go on if more
+	PUSHL	#0.B			;Set back to beginning of file
+	PUSHL	#0.B
+	PUSHL	read_stream.B[EBP]
+	CALL	fseek#
+	ADDL	ESP, #12t.B
+	MOVL	EBX, #errdfmsg#
+	TESTL	EAX, EAX
+	JS	12$.S			;If error
+	MOVL	EAX, #readaread
+	MOVL	EDX, #readdfind
+	MOVL	ECX, #illfmt#
+	LEAL	EBX, rdb_buffer.B[EDI]
+	LEAL	ESI, rdb_name.B[EDI]
+	CALL	readdata#		;Read file again and store data
+	JC	10$.S			;If error
+	PUSHL	read_stream.B[EBP]	;OK - close the file
+	CALL	fclose#
+	POPL	ECX
+	CLRL	EAX
+10$:	LEAVE
+	RET
+
+;Here if have error return from a C run-time function
+
+12$:	MOVL	EAX, errno#		;Get error code
+14$:	STC				;Indicate error
+	LEAVE
+ret008:	RET
+
+16$:	MOVL	EAX, rdb_name+0.B[EDI]
+	MOVL	ndefdev+0, EAX
+	MOVL	EAX, rdb_name+4.B[EDI]
+	MOVL	ndefdev+4, EAX
+	MOVL	EAX, rdb_name+8.B[EDI]
+	MOVL	ndefdev+8, EAX
+	MOVL	EBX, #ndefmsg
+	CLRL	EAX
+	JMP	14$.S
+.PAGE
+	.SBTTL	readdsetup - Subroutine called by readdata to set up protocol
+
+;Subroutine called by readdata to set up the protocol value from a D line
+;	c{EAX} = Protocol value
+;	c{ESI} = Offset of next character in the D line
+;	CALL	readdsetup
+;	C:set = Error
+;	  c{EBX} = Offset of 1st message string
+;	  c{EAX} = Error code or offset of 2nd message string
+;	C:clr = Normal
+
+readdsetup:
+	MOVL	ECX, #2			;Get the protocol value
+	CALL	getaddress#
+	JC	ret008.S		;If error
+	MOVL	EAX, read_value.B[EBP]	;OK - Save the protocol value
+	MOVL	read_thisprot.B[EBP], EAX
+	CALL	findprot		;Have we aready set this up?
+	JNC	18$			;Yes
+	CLRL	EAX			;Start with first protocol value for
+2$:	MOVL	protvals, EAX		;  device
+	PUSHL	DS
+	PUSHL	#pcharqab
+	CALLF	svcIoQueue#		;Get next protocol
+	TESTL	EAX, EAX
+	JS	8$
+	MOVL	EAX, pcharqab+qab_error
+	TESTL	EAX, EAX
+	JS	8$.S
+	MOVL	EAX, protvxos		;Get protocol returned
+	TESTL	EAX, EAX		;Have another one?
+	JE	10$.S			;No - didn't find it!
+	CMPL	read_thisprot.B[EBP], EAX ;Yes - is this the one we want?
+	JNE	2$.S			;No - continue
+	MOVL	ESI, #protdev
+	MOVL	EAX, protvald+0		;Yes - set up the device name
+	MOVL	[ESI], EAX
+	MOVL	EAX, protvald+4
+	MOVL	4.B[ESI], EAX
+	CLRL	EAX
+	MOVL	8.B[ESI], EAX
+4$:	INCL	ESI
+	CMPB	[ESI], #0
+	JNE	4$.S
+	MOVB	[ESI], #':'
+	PUSHL	#O$PHYS			;Open the device associated with the
+	PUSHL	DS			;  protocol
+	PUSHL	#protdev
+	PUSHL	DS
+	PUSHL	#0.B
+	CALLF	svcIoOpen#
+	TESTL	EAX, EAX
+	JS	8$.S
+	MOVL	ncharqab+qab_handle, EAX ;OK - store handle
+	PUSHL	DS			;Get protocol associated with this
+	PUSHL	#ncharqab		;  device
+	CALLF	svcIoQueue#
+	TESTL	EAX, EAX
+	JS	6$.S
+	MOVL	EAX, ncharqab+qab_error
+	TESTL	EAX, EAX
+	JNS	16$.S
+6$:	PUSHL	EAX
+	PUSHL	ncharqab+qab_handle
+	PUSHL	#0.B
+	CALLF	svcIoClose#
+	POPL	EAX
+8$:	MOVL	EBX, #errgpmsg
+	MOVL	EDX, #errgpdev
+	JMP	12$.S
+
+;Here if don't have an entry for the protocol
+
+10$:	MOVL	EBX, #pndfmsg
+	MOVL	EDX, #pndfdev
+12$:	MOVL	ECX, rdb_name+0.B[EDI]
+	MOVL	[EDX], ECX
+	MOVL	ECX, rdb_name+4.B[EDI]
+	MOVL	4.B[EDX], ECX
+	MOVL	ECX, rdb_name+8.B[EDI]
+	MOVL	8.B[EDX], ECX
+	STC
+14$:	RET
+
+;Here with address for device associated with the protocol
+
+16$:	PUSHL	ncharqab+qab_handle
+	PUSHL	#0.B
+	CALLF	svcIoClose#
+	MOVL	EAX, #pdb_SIZE		;OK - allocate a PDB
+	CALL	getmem#
+	MOVL	EBX, #nemamsg#
+	JC	14$.S
+	MOVL	ESI, EAX
+	MOVL	EAX, rdb_pdb.B[EDI]
+	MOVL	rdb_pdb.B[EDI], ESI
+	MOVL	[ESI], EAX
+	MOVL	EAX, read_thisprot.B[EBP]
+	MOVL	pdb_prot.B[ESI], EAX
+	MOVL	EAX, ipaddr
+	MOVL	pdb_addr.B[ESI], EAX
+	CLRL	EAX
+	MOVL	pdb_table.B[ESI], EAX
+	MOVL	pdb_size.B[ESI], EAX
+18$:	MOVL	read_pnt2.B[EBP], ESI
+	RET
+.PAGE
+	.SBTTL	readdfind - Subroutine called by readdata to find protocol
+
+;Subroutine called by readdata to find the protocol value from a D line in our
+;  protocol table
+;	c{EAX} = Protocol value
+;	CALL	readdfind
+;	C:set = Error
+;	  c{EBX} = Offset of 1st message string
+;	  c{EAX} = Error code or offset of 2nd message string
+;	C:clr = Normal
+;	  c{ESI} = Offset of PDB for protocol
+
+readdfind:
+	MOVL	ECX, #2			;Get the protocol value from the file
+	CALL	getaddress#
+	JC	8$.S			;If error
+	MOVL	EAX, read_value.B[EBP]	;OK - get protocol value
+findprot:
+	MOVL	ESI, rdb_pdb.B[EDI]	;Point to first PDB
+	TESTL	ESI, ESI
+	JE	6$.S
+4$:	CMPL	pdb_prot.B[ESI], EAX	;This one?
+	JE	8$.S			;Yes
+	MOVL	ESI, [ESI]
+	TESTL	ESI, ESI
+	JNE	4$.S
+6$:	MOVL	EBX, #pndfmsg
+	CLRL	EAX
+	STC
+8$:	RET
+.PAGE
+	.SBTTL	readacount - Subroutine called by readdata to count A lines
+
+;Subroutine called by readdata to count A lines
+;	CALL	readacount
+;	C:clr always
+
+readacount:
+	MOVL	EAX, read_pnt2.B[EBP]
+	INCL	pdb_size.B[EAX]
+	CLRL	EAX
+ret010:	RET
+.PAGE
+	.SBTTL	readaread - Subroutine called by readdata to process A lines
+
+;Subroutine called by readdata to process A lines
+;	CALL	readaread
+
+readaread:
+	LEAL	ESI, rdb_buffer+1.B[EDI] ;Point to start of data on line
+	MOVL	ECX, #6t		;Get hardware address
+	CALL	getaddress#
+	JC	ret010.S
+	MOVL	EDX, read_pnt2.B[EBP]
+	MOVL	EBX, pdb_pntr.B[EDX]	;Store hardware address
+	MOVL	EAX, read_value+0.B[EBP]
+	MOVL	[EBX], EAX
+	MOVL	EAX, read_value+4.B[EBP]
+	MOVL	4.B[EBX], EAX
+	MOVL	ECX, #4t		;Get IP address
+	CALL	getaddress#
+	JC	ret010.S
+	MOVL	EDX, read_pnt2.B[EBP]	;Store IP address
+	MOVL	EBX, pdb_pntr.B[EDX]
+	MOVL	EAX, read_value+0.B[EBP]
+	MOVL	8.B[EBX], EAX
+	ADDL	pdb_pntr.B[EDX], #12t	;Bump pointer
+	JMP	checkeol#
+.PAGE
+	.SBTTL	Data
+
+	.PSECT	_DATA_p
+
+errgpmsg:.ASCIZ "Error getting protocol for RARP device _"
+errgpdev:.BLKB  12t
+pndfmsg: .ASCIZ "Protocol not defined for RARP device _"
+pndfdev: .BLKB  12t
+ndefmsg: .ASCII "No matching device entry found in the RARP data file for _"
+ndefdev: .BLKB  12t
+
+	.SBTTL	Once-only data
+
+	.PSECT	_ODATA_p
+
+ipserrmsg:.ASCIZ "Cannot open corresponding IPS device"
+adrerrmsg:.ASCIZ "Cannot get network address for RARP device"
+notnetmsg:.ASCIZ "RARP device is not a SNAP class device"
+cgnetmsg: .ASCIZ "Cannot get network interface device name"
+conetmsg: .ASCIZ "Cannot open network interface device"
+cgnamsg:  .ASCIZ "Cannot get RARP device network address"
+conmsg:   .ASCIZ "Cannot open SNAP level network device"
+csiomsg:  .ASCIZ "Cannot queue initial RARP input request"
+initmsg:  .ASCII {MT_INTRMDMSG}"% BOOTSRV: RARP server initialized for _"
+netiname: .BLKB  12t
+INITMSGSIZE=!$-initmsg
+protdev:  .BLKB  12t
+
+	  .MOD   4
+openparms:.BYTE	 PAR$SET|REP_HEXV, 4 ;Parameters for open of network interface
+	  .WORD	 IOPAR_FILOPTN	     ;  device
+	  .LONG  FO$XOSNAME|FO$NOPREFIX
+	  .BYTE  PAR$GET|REP_STR, 0
+	  .WORD  IOPAR_FILSPEC
+	  .LONG  netiname
+	  .LONG  !netiname
+	  .WORD  12t
+	  .WORD  0
+	  .BYTE  PAR$GET|REP_TEXT, 8t
+	  .WORD  IOPAR_CLASS
+openclass:.LONG  0, 0
+	  .BYTE  PAR$SET|REP_HEXV, 4t
+	  .WORD  IOPAR_NETPROTOCOL
+	  .LONG  PROT_RARP
+	  .BYTE  0
+
+	  .MOD   4
+ichars:   .BYTE  PAR$GET|REP_TEXT, 8t
+	  .LONG  'NETD', 'EV'
+netdev:   .BLKB  8t
+	  .BYTE  0, 0
+
+	  .MOD   4
+icharqab: .WORD  QFNC$WAIT|QFNC_DEVCHAR ;qab_func    = 0.  - Function
+	  .WORD  0		;qab_status  = 2.  - Returned status
+	  .LONG  0		;qab_error   = 4.  - Error code
+	  .LONG  0		;qab_amount  = 8.  - Amount transfered
+	  .LONG  0		;qab_handle  = 12. - Device handle
+	  .BYTE  0		;qab_vector  = 16. - Vector for interrupt
+	  .BYTE  0, 0, 0	;Reserved
+	  .LONG  DCF_VALUES	;qab_option  = 20. - Option bits
+	  .LONG  0		;qab_count   = 24. - Amount to transfer
+	  .LONG  0, 0		;qab_buffer1 = 28. - Pointer to data buffer
+	  .LONG  ichars, !ichars;qab_buffer2 = 36.
+	  .LONG  0, 0		;qab_parm    = 44. - Pointer to parameter list
+
+	  .MOD   4
+achars:   .BYTE  PAR$GET|REP_HEXB, 8t
+	  .LONG  'NETA', 'DDR'
+hwaddr:   .LONG  0, 0
+	  .BYTE  0
+
+	  .MOD   4
+acharqab: .WORD  QFNC$WAIT|QFNC_DEVCHAR ;qab_func    = 0.  - Function
+	  .WORD  0		;qab_status  = 2.  - Returned status
+	  .LONG  0		;qab_error   = 4.  - Error code
+	  .LONG  0		;qab_amount  = 8.  - Amount transfered
+	  .LONG  0		;qab_handle  = 12. - Device handle
+	  .BYTE  0		;qab_vector  = 16. - Vector for interrupt
+	  .BYTE  0, 0, 0	;Reserved
+	  .LONG  DCF_VALUES	;qab_option  = 20. - Option bits
+	  .LONG  0		;qab_count   = 24. - Amount to transfer
+	  .LONG  0, 0		;qab_buffer1 = 28. - Pointer to data buffer
+	  .LONG  achars, !achars;qab_buffer2 = 36.
+	  .LONG  0, 0		;qab_parm    = 44. - Pointer to parameter list
+
+pchars:   .MOD   4
+	  .BYTE  PAR$SET|REP_DATAB, 4t
+	  .LONG  'ETYP', 'ENXT'
+protvals: .LONG  0
+	  .BYTE  PAR$GET|REP_DATAB, 4t
+	  .LONG  'ETYP', 'ENXT'
+protvxos: .LONG  0
+	  .BYTE  PAR$GET|REP_DATAB, 8t
+	  .LONG  'ETYP', 'EDEV'
+protvald: .LONG  0, 0
+	  .BYTE  0
+
+	  .MOD   4
+pcharqab: .WORD  QFNC$WAIT|QFNC_DEVCHAR ;qab_func    = 0.  - Function
+	  .WORD  0		;qab_status  = 2.  - Returned status
+	  .LONG  0		;qab_error   = 4.  - Error code
+	  .LONG  0		;qab_amount  = 8.  - Amount transfered
+	  .LONG  0		;qab_handle  = 12. - Device handle
+	  .BYTE  0		;qab_vector  = 16. - Vector for interrupt
+	  .BYTE  0, 0, 0	;Reserved
+	  .LONG  DCF_VALUES	;qab_option  = 20. - Option bits
+	  .LONG  0		;qab_count   = 24. - Amount to transfer
+	  .LONG  0, 0		;qab_buffer1 = 28. - Pointer to data buffer
+	  .LONG  pchars, !pchars;qab_buffer2 = 36.
+	  .LONG  0, 0		;qab_parm    = 44. - Pointer to parameter list
+
+;;;;;;;;;;;;;;;
+
+	  .MOD   4
+nchars:	  .BYTE  PAR$GET|REP_HEXV, 4t
+	  .LONG  'IPAD', 'DR'
+ipaddr:	  .LONG  0
+	  .BYTE  0
+
+	  .MOD   4
+ncharqab: .WORD  QFNC$WAIT|QFNC_DEVCHAR ;qab_func    = 0.  - Function
+	  .WORD  0		;qab_status  = 2.  - Returned status
+	  .LONG  0		;qab_error   = 4.  - Error code
+	  .LONG  0		;qab_amount  = 8.  - Amount transfered
+	  .LONG  0		;qab_handle  = 12. - Device handle
+	  .BYTE  0		;qab_vector  = 16. - Vector for interrupt
+	  .BYTE  0, 0, 0	;Reserved
+	  .LONG  DCF_VALUES	;qab_option  = 20. - Option bits
+	  .LONG  0		;qab_count   = 24. - Amount to transfer
+	  .LONG  0, 0		;qab_buffer1 = 28. - Pointer to data buffer
+	  .LONG  nchars, !nchars;qab_buffer2 = 36.
+	  .LONG  0, 0		;qab_parm    = 44. - Pointer to parameter list
+
+	.END

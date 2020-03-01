@@ -1,0 +1,990 @@
+	.TITLE	MOUSEACLS - Serial port mouse driver
+
+;++++
+; This software is in the public domain.  It may be freely copied and used
+; for whatever purpose you see fit, including commerical uses.  Anyone
+; modifying this software may claim ownership of the modifications, but not
+; the complete derived code.  It would be appreciated if the authors were
+; told what this software is being used for, but this is not a requirement.
+
+;   THIS SOFTWARE IS PROVIDED BY THE AUTHORS "AS IS" AND ANY EXPRESS OR
+;   IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
+;   OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+;   IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+;   INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+;   BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS
+;   OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+;   ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR
+;   TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
+;   USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+;----
+
+;This is a very simple driver that implements an input only serial mouse
+;  port using a standard COM port and supports only the Microsoft mouse
+;  protocol with the 3-button extension.  The MOUSEn device implemented
+;  cannot do input or output.  Its only use is to obtain and set device
+;  characteristics values.  This device is only really useful when attached
+;  to a console device.  This is done by setting the value of the CONDEV
+;  characteristic for the mouse device.
+
+;Note that inorder to avoid introducing delays when handling the 3-button
+;  protocol extension, we do not ever wait to see if we have a 4th input
+;  byte but always report the information from the first 3 bytes followed
+;  by a seperate report for the 4th byte if it is seen.  Normally this will
+;  not be visible to the program, since we do not report redundent events
+;  and a center button event without movement (hopefully the normal case)
+;  will look like a redundent event in the first 3 bytes.  If a center
+;  button change is seen with movement, it will generate two seperate
+;  reports, the first indicating the movement with no button change, and
+;  the second indicating the center button change without movement.
+
+	.PROC	80486
+	.INCLUD	XOSINC:\XMAC\XOS.PAR
+	.INCLUD	XOSINC:\XMAC\XOSX.PAR
+	.INCLUD	XOSINC:\XMAC\XOSTIME.PAR
+	.INCLUD	XOSINC:\XMAC\XOSERR.PAR
+	.INCLUD	XOSINC:\XMAC\XOSTRM.PAR
+	.INCLUD	XOSINC:\XMAC\XOSXTRM.PAR
+	.INCLUD	XOSINC:\XMAC\PCAT.PAR
+	.INCLUD	XOSINC:\XMAC\XOSLKE.PAR
+	.INCLUD	XOSINC:\XMAC\XOSXLKE.PAR
+
+MAJV   =!1t
+MINV   =!0t
+EDITNUM=!0t
+
+	LKEHEAD	MSEACLS, MAJV, MINV, EDITNUM, LKETYPE_CLASS
+
+RINGSIZE=!50t
+
+;Define offsets for device dependent part of the mouse DCB
+
+$$$=!4
+BLK dcb_maioreg  , 4t
+BLK dcb_maint    , 4t
+BLK dcb_malostchr, 4t
+BLK dcb_madhdb   , 4t		;Offset of DHDB of linked console device
+BLK dcb_macondev , 4t		;Unit number of associated console device
+				;The next 4 items must be in this order!
+BLK dcb_maheader , 1t
+BLK dcb_mabyte3  , 1t
+BLK dcb_mabyte1  , 1t
+BLK dcb_mabyte2  , 1t
+BLK dcb_malasthb , 1t
+BLK dcb_mauart   , 1t
+BLK dcb_mastate  , 1t
+BLK              , 1t
+BLK dcb_macurbut , 1t		;Fork level button state
+BLK dcb_malastbut, 1t
+BLK              , 2t
+BLK dcb_maxcnt   , 4t		;Total X count since last signal
+BLK dcb_maycnt   , 4t		;Total Y count since last signal
+BLK dcb_masigcnt , 4t		;Signal count
+BLK dcb_mataker  , 4t
+BLK dcb_maputter , 4t
+BLK dcb_macount  , 4t
+BLK dcb_maring   , RINGSIZE*4t
+dcb_maSIZE=!$$$
+
+;Define values for dcb_mastate
+
+MS_HEADER=!0t			;Header byte next
+MS_BYTE1 =!1t			;Byte 1 next
+MS_BYTE2 =!2t			;Byte 2 next
+MS_BYTE3 =!3t			;Byte 3 next
+
+;Define values for the dcb_mauart byte (UART type)
+
+TRMU_8250 =!1t			;Old 8250
+TRMU_16450=!2t			;8250A/16450
+TRMU_16550=!3t			;16550 with 16 byte FIFO
+
+	CODE
+
+	.SBTTL	SVC dispatch table for MOUSE class devices
+
+;SVC dispatch table for MOUSE class devices
+
+mseadsp:.LONG	knlRtnZero##	;sd_mount	=  0. - Mount
+	.LONG	knlRtnZero##	;sd_cleardev	=  4. - Clear device
+	.LONG	knlRtnZero##	;sd_cleardcb	=  8. - Clear DCB
+	.LONG	knlRtnZero##	;sd_commit	= 12. - Commit data to disk
+	.LONG	knlRtnZero##	;sd_transold    = 16. - Transfer device/old
+	.LONG	knlRtnZero##	;sd_transnew    = 20. - Transfer device/new
+	.LONG	knlNullQio##	;sd_opena	= 24. - Open additional
+	.LONG	knlRtnZero##	;sd_open1	= 28. - Open device/file
+	.LONG	knlRtnZero##	;sd_devparm     = 32. - Device parameters
+	.LONG	knlIFnDev##	;sd_delete	= 36. - Delete file
+	.LONG	knlIFnDev##	;sd_rename	= 40. - Rename file
+	.LONG	mseainpblk	;sd_inblock	= 44. - Input block
+	.LONG	knlIllOutGQ##	;sd_outblock	= 48. - Output block
+	.LONG	knlIllOutGQ##	;sd_outblockq	= 52. - Output block (XFF)
+	.LONG	knlIllOutGQ##	;sd_outstring	= 56. - Output string
+	.LONG	knlRtnMOne##	;sd_getiosts	= 60. - Get input/output status
+	.LONG	knlIFnDevGQ##	;sd_special     = 64. - Special device function
+	.LONG	mseaclose	;sd_close	= 68. - Close file
+	.LONG	knlNullLabel##	;sd_label       = 72. - Get device label
+	.LONG	knlNullQioGQ##	;sd_commitfunc	= 76. - Commit data to disk
+	.LONG	knlInfoNone##	;sd_devinfo     = 80. - Get device info
+MSEADSPSZ=!{$-mseadsp}/4
+
+;Class function dispatch table for MOUSE class devices
+
+	.LONG	CLSFMX
+mseacls:.LONG	mseaaddunit	;CF_ADDUNIT = 1. - Add unit
+	.LONG	mseaunitinfo	;CF_PUNITS  = 2. - Get information about
+				;		     physical units
+	.LONG	knlIFnDev##	;CF_AUNITS  = 3. - Get information about active
+				;		     units
+CLSFMX=!{$-mseacls}/4
+.PAGE
+;Device parameter table for printer IO operations
+
+	.MOD	4
+	.LONG	PARMMAX
+mseaioparms:
+	.LONG	mseaiogenparms	 ;IOPAR_xxxxxx = 00xx - Generic IO parameters
+	.LONG	knlNullFilParms##;IOPAR_FILxxx = 01xx - File system IO
+				 ;			  parameters
+	.LONG	knlNullTrmParms##;IOPAR_TRMxxx = 02xx - Terminal IO parameters
+PARMMAX=!{$-mseaioparms}/4
+
+	.LONG	PARMGENMAX
+mseaiogenparms:
+	.LONG	0		;		   = 0000h
+	.LONG	knlIopFilOptn##	;IOPAR_FILOPTN     = 0001h
+	.LONG	knlIopFilSpec##	;IOPAR_FILSPEC     = 0002h
+	.LONG	knlIopDevSts##	;IOPAR_DEVSTS      = 0003h
+	.LONG	knlIopUnitNum##	;IOPAR_UNITNUM     = 0004h
+	.LONG	knlIopGlbId##	;IOPAR_GLBID       = 0005h
+	.LONG	knlIopDelay##	;IOPAR_DELAY       = 0006h
+	.LONG	knlIopTimeOut##	;IOPAR_TIMEOUT     = 0007h
+	.LONG	0		;IOPAR_INPSTS      = 0008h
+	.LONG	0		;IOPAR_OUTSTS	   = 0009h
+	.LONG	knlIopInpQLmt##	;IOPAR_INPQLMT	   = 000Ah
+	.LONG	knlIopOutQLmt##	;IOPAR_OUTQLMT	   = 000Bh
+	.LONG	0		;IOPAR_SIVECT1     = 000Ch
+	.LONG	0		;IOPAR_SIVECT2     = 000Dh
+	.LONG	0		;IOPAR_SIDATA      = 000Eh
+	.LONG	knlIopNumOpen##	;IOPAR_NUMOPEN     = 000Fh
+	.LONG	0		;IOPAR_BUFRLMT	   = 0010h
+PARMGENMAX=!{$-mseaiogenparms}/4
+.PAGE
+;Device characteristics for MSEA devices
+
+	DATA
+
+	.MOD	4
+mseadctbl:
+ DCHARBGN  1, knlDCharValCom##
+ DCHARENT  CLASS , TEXT, , 8, knlDcMsgClass##, knlDcGetClass##, knlDcSetClass##, 0
+ DCHARENT  INT   , DECV, , 1, knlDcMsgInt##  , knlDcGet4Byte##, 0              , dcb_maint
+ DCHARENT  IOREG , HEXV, , 4, knlDcMsgIoReg##, knlDcGet4Byte##, 0              , dcb_maioreg
+ DCHARENT  UART  , TEXT, , 8, msguart        , getuart        , 0              , dcb_mauart
+ DCHARENT  CONDEV, DECV, , 4, condevmsg      , knlDcGet4Byte##, setcondev      , dcb_macondev
+
+	CODE
+msguart:  DCHARINFO  {UART type}
+condevmsg:DCHARINFO  {Associated console device unit}
+.PAGE
+	.SBTTL	initser - Serial port mouse driver initialization routine
+
+	INITSUB	mseainit
+
+mseainit:
+	MOVL	EDI, #mseachk		;Install our class
+	MOVL	EBX, #mseacls		;Offset of class function dispatch table
+	MOVL	EAX, #'MOUS'
+	MOVL	EDX, #'EA'
+	CLRL	ECX			;No class characteristics
+	MOVL	ESI, #mseaccb
+	CALL	knlNewClass##
+4$:	JC	10$.S			;This should not fail!
+	MOVL	ECX, #codetop
+	CLRL	EDX
+	CLRL	EAX
+10$:	MOVL	EBX, #QSTS$DONE
+	RET
+
+	CODE
+.PAGE
+	.SBTTL	mseaaddunit - Subroutine to add mouse port unit
+
+;Subroutine to add mouse port unit
+;	c(AL) = Major unit number
+;	c(AH) = Minor unit number
+;	CALL	mseaaddunit
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+
+$$$=!0
+FRM mau_unit   , 4	;Unit number
+FRM mau_introut, 4	;Interrupt routine offset
+FRM mau_ioreg  , 4	;Base IO register number
+FRM mau_int    , 4	;Interrupt level
+mau_SIZE=!$$$
+
+;Description block for addunitchar
+
+	DATA
+
+	.MOD	4
+mseaublk:
+ DCHARBGN  2, knlDCharValCom##
+ DCHARENT  UNIT   , DECV, , 4, 0, 0, mseauunit  , 0
+ DCHARENT  IOREG  , HEXV, , 4, 0, 0, mseauioreg , 0
+ DCHARENT  INT    , DECV, , 1, 0, 0, mseauint   , 0
+
+	CODE
+
+mseaaddunit:
+	ENTER	mau_SIZE, 0		;Set up and initialize our stack frame
+	CLRL	EAX
+	DECL	EAX
+	MOVL	mau_unit.B[EBP], EAX
+	MOVL	mau_ioreg.B[EBP], EAX
+	MOVL	mau_int.B[EBP], EAX
+	IFFAULT	6$
+	LFSL	EDX, iorb_buffer2.B[ESI] ;Get address of add-unit
+					 ;  characteristics
+	CALL	knlGiveQel##		;Give up the IORB
+	MOVL	EBX, #mseaublk		;Point to our description block
+	MOVB	AL, #0			;Fail if bad name
+	CALL	knlAddUnitChar##
+	JC	6$.S			;If error
+	MOVL	EAX, mau_ioreg.B[EBP]	;Did we get all of the required values?
+	MOVL	EDX, EAX
+	ORL	EAX, mau_unit.B[EBP]
+	ORL	EAX, mau_int.B[EBP]
+	INCL	EAX
+	JE	10$.S			;No
+	ADDL	EDX, #3.B		;Now check to see if physical interface
+	MOVB	AL, #5			;  exists
+	OUTB	[DX]			;Point to the line control register
+	IOPAUSE				;See if we can change it
+	INB	[DX]
+	CMPB	AL, #5
+	JNE	4$.S
+	MOVB	AL, #3
+	OUTB	[DX]
+	IOPAUSE
+	INB	[DX]
+	CMPB	AL, #3
+	JE	12$.S
+4$:	MOVL	EAX, #ER_PDNAV		;Fail if does not exist
+6$:	MOVL	EBX, #QSTS$DONE
+	CLRL	ECX
+	LEAVE
+	TOFORK
+	STC
+	RET
+
+;Here if a required parameter is missing
+
+10$:	MOVL	EAX, #ER_CHARM
+	JMP	6$.S
+
+;Here if the interface exists
+
+12$:	MOVB	CL, mau_int.B[EBP]	;Get interrupt number
+	CALL	knlChkIRqAvl##		;See if the vector is available
+	JC	6$.S			;If not available
+	CALL	knlGetXRes##		;Get exec memory resource
+	MOVL	ECX, #dcb_maSIZE+dcb_cSIZE ;OK - create a DCB
+	MOVL	EBX, #DS$PHYS
+	MOVL	EDI, #mseadsp
+	CALL	knlMakeDcb##
+	JC	18$.S
+	MOVL	ESI, #mseaccb
+	CALL	knlLinkDcb##
+	JC	16$.S
+	MOVL	dcb_name+0.B[EDI], #'MOUS' ;Setup device name
+	MOVW	dcb_name+4.B[EDI], #'EA'
+	MOVL	dcb_devchar.B[EDI], #mseadctbl ;Store offset of devchar table
+	MOVZBL	EAX, mau_unit.B[EBP]	;Put in unit number
+	MOVB	dcb_punit.B[EDI], AL
+	LEAL	EBX, dcb_name+6.B[EDI]
+	CALL	knlPutDecNmbr##
+	MOVL	dcb_fdisp.B[EDI], #mseafork ;Store offset of our fork routine
+	MOVL	dcb_macondev.B[EDI], #-1 ;Indicate no linked console device
+	PUSHL	EDI
+	MOVL	ECX, #MSEAINTSZ		;Get space for interrupt code
+	CALL	knlGetXCode##
+	JNC	20$.S			;OK
+	CLRL	EBX			;If error
+	MOVL	ES, EBX
+	MOVB	gdtable+GS_CODEALS+5, BL ;Disable the allaised code space
+	POPL	EDI
+16$:	MOVL	dcb_name.B[EDI], #0
+18$:	CALL	knlGiveXRes##		;Give up the exec memory resource
+	JMP	6$
+
+;Here with memory allocated for the interrupt code
+
+20$:	MOVL	mau_introut.B[EBP], EDI	;Remember where code is going
+	MOVL	ESI, #mseaint		;Copy prototype interrupt routine
+	SHRL	ECX, #2
+	MOVB	gdtable+GS_CODEALS+5, #DT_RWDATA+PL_0 ;Enable alaised code
+	PUSHL	#GS_CODEALS.B			      ;  segment
+	POPL	ES
+	CLD
+	RMOVSL	[EDI], ES:[ESI]
+	MOVL	EBX, #mseaoas		;Setup our once-a-second routine
+	CALL	knlSetupOAS##
+	CALL	knlGiveXRes##		;Give up the exec memory resource
+	MOVL	EDI, mau_introut.B[EBP]	;Fix up the interrupt code
+	MOVW	AX, #GS_CODEALS
+	MOVL	ES, EAX
+	MOVL	EAX, [ESP]
+	MOVL	ES:{fix1-mseaint}+1.B[EDI], EAX
+	CLRL	EAX
+	MOVL	ES, EAX
+	MOVB	gdtable+GS_CODEALS+5, AL ;Disable the allaised code space
+	POPL	EDI			;Restore offset of our new DCB
+	MOVL	EDX, mau_ioreg.B[EBP]
+	MOVL	dcb_maioreg[EDI], EDX	;Store base IO registser number
+	A2IOP	P_COMINTENB		;Point to interrupt enable regsiter
+	MOVB	AL, #05h		;Enable input interrupts
+	OUTB	[DX]
+	IOPAUSE
+	A2IOP	P_COMMODMCON-P_COMINTENB ;Point to modem control reg
+	MOVB	AL, #0Bh		;Set all modem outputs and set master
+	OUTB	[DX]			;  interrupt enable bit
+	MOVL	EDX, dcb_maioreg[EDI]	;Point to the line control register
+	A2IOP	P_COMLINECON
+	MOVB	AL, #82h		;Enable access to the baud rate
+					;  registers
+	CLI				;Can't have interrupts while have the
+	OUTB	[DX]			;  baud rate registers enabled
+	IOPAUSE
+	A2IOP	P_COMBRLSB-P_COMLINECON	;Point to divisor LSB register
+	MOVB	AL, #60h		;Get low byte
+	OUTB	[DX]
+	IOPAUSE
+	A2IOP	P_COMBRMSB-P_COMBRLSB	;Point to divisor MSB register
+	MOVB	AL, #0			;Get high byte
+	OUTB	[DX]			;Output MSB
+	IOPAUSE				;Point to the line control
+	A2IOP	P_COMLINECON-P_COMBRMSB	;  register again
+	MOVB	AL, #02h		;Enable access to the data registers now
+	OUTB	[DX]			;  and set for 7-bit data, no parity
+	STI				;Interrupts are OK now
+	LEAL	EDX, dcb_name.B[EDI]	;Get device name
+	MOVL	EBX, mau_introut.B[EBP]	;Get address of interrupt routine
+	MOVB	CL, mau_int.B[EBP]	;Get interrupt number
+	MOVB	dcb_maint.B[EDI], CL	;Remember it
+	MOVB	CH, #DT_INT+PL_0	;Set up our interrupt vector
+	CALL	knlSetIRq##
+	PUSHL	#1.B			;Assume this will work
+	MOVL	ECX, #8			;Try to reset it up to 8 times!
+22$:	MOVL	EDX, dcb_maioreg.B[EDI]
+	INB	[DX]			;Read the input data register
+	IOPAUSE
+	A2IOP	P_COMLINESTS-P_COMRDATA	;Read the line status register
+	INB	[DX]
+	IOPAUSE
+	A2IOP	P_COMMODMSTS-P_COMLINESTS
+	INB	[DX]			;Read the modem status register
+	IOPAUSE
+	A2IOP	P_COMINTID-P_COMMODMSTS	;Read the interrupt ID register
+	INB	[DX]
+	IOPAUSE
+	INB	[DX]			;Twice
+	TESTB	AL, #01			;Is the device idle?
+	JNE	24$.S			;Yes
+	LOOP	ECX, 22$		;No - try again if should
+	MOVL	[ESP], #0		;Can't make it idle - return 0
+24$:	A2IOP	P_COMSCRATCH-P_COMINTID	;Scratch register
+	MOVB	AL, #05Ah		;Test value 1
+	OUTB	[DX]
+	IOPAUSE
+	INB	[DX]
+	IOPAUSE
+	CMPB	AL, #05Ah
+	JNE	30$.S			;Its a 8250
+	MOVB	AL, #0A5h		;Test value 2
+	OUTB	[DX]
+	IOPAUSE
+	INB	[DX]
+	IOPAUSE
+	CMPB	AL, #0A5h
+	JE	32$.S			;Its not a 8250
+
+;Here if have original 8250
+
+30$:	MOVB	dcb_mauart.B[EDI], #TRMU_8250
+	JMP	36$.S
+
+32$:	A2IOP	P_COMFIFOCTL-P_COMSCRATCH ;FIFO control register
+	MOVB	AL, #1			;Enable FIFO
+	OUTB	[DX]
+	IOPAUSE
+	INB	[DX]			;See if FIFO enabled
+	ANDB	AL, #0C0h
+	CMPB	AL, #0C0h
+	JE	34$.S			;Its a 16550
+	MOVB	dcb_mauart.B[EDI], #TRMU_16450
+	JMP	36$.S
+
+;Here if have a 16550
+
+34$:	MOVB	dcb_mauart.B[EDI], #TRMU_16550
+36$:	MOVL	ECX, mau_int.B[EBP]	;Enable our interrupt
+	CALL	knlEnableInt##
+	MOVL	EDX, dcb_maioreg[EDI]
+	A2IOP	P_COMMODMCON		;Point to modem control reg
+	MOVB	AL, #0Ah		;Clear RTS
+	OUTB	[DX]
+	MOVL	EAX, #20t		;Wait for a short time
+	CALL	knlTimeWait##
+	MOVB	AL, #0Bh		;Set RTS
+	OUTB	[DX]
+	POPL	ECX			;Get our return value
+	CLRL	EAX
+	MOVL	EBX, #QSTS$DONE
+	LEAVE
+	TOFORK
+	RET
+.PAGE
+;Subroutine called by addunitchar for the "UNIT" characteristic
+
+mseauunit:
+	CMPL	EAX, #100h		;Reasonable value?
+	JAE	2$.S			;No
+	MOVL	mau_unit.B[EBP], EAX	;Store value
+	CLC
+	RET
+
+;Subroutine called by addunitchar for the "IOREG" characteristic
+
+mseauioreg:
+	CMPL	EAX, #100h		;Reasonable value?
+	JB	4$.S			;No
+	CMPL	EAX, #1000h		;Is this a reasonable value?
+2$:	JAE	knlBadCharV##		;No - fail
+	MOVL	mau_ioreg.B[EBP], EAX	;Store value
+	CLC
+	RET
+
+;Subroutine called by addunitchar for the "INT" characteristic
+
+mseauint:
+	CMPL	EAX, #2.B		;See if valid interrupt level
+4$:	JB	knlBadCharV##		;Too small
+	JNE	6$.S			;Not level 2
+	MOVB	AL, #9			;Level 2 - change it to level 9
+6$:	CMPL	EAX, #16t.B		;Too large?
+	JAE	2$.S
+	MOVL	mau_int.B[EBP], EAX	;Store interrupt level
+	CLC
+	RET
+ .PAGE
+;Here to set the value of the CONDEV characteristic
+
+setcondev:
+	CMPL	EAX, #255t		;Possible unit number?
+	JA	knlBadCharV##		;No - fail
+	MOVL	EBX, xosconFDhdb##	;Yes - get first DHDB in system
+2$:	TESTL	EBX, EBX		;More?
+	JE	knlBadCharV##		;No - fail
+	MOVL	ESI, dhdb_tdbtbl[EBX]	;Yes - get first TDB for console
+	TESTL	ESI, ESI		;Have at least one?
+	JE	4$.S			;No - fail
+	CMPB	tdb_pnum.B[ESI], AL	;Yes - this unit?
+	JE	6$.S			;Yes - found it
+4$:	MOVL	EBX, [EBX]		;No - advance to next DHDB
+	JMP	2$.S			;Continue
+
+;Here with the requested console unit
+
+6$:	MOVL	dcb_madhdb.B[EDI], EBX	;Remember the linked DHDB
+	MOVL	dcb_macondev.B[EDI], EAX ;And remember the unit number
+	CMPL	dhdb_kbmouse.B[EBX], #0.B ;Is console already linked to a mouse?
+	JE	10$.S			;No
+	MOVL	EAX, dhdb_kbmouse.B[EBX] ;Yes - but not any more!
+	MOVL	dcb_macondev.B[EAX], #-1
+	MOVL	dcb_madhdb.B[EAX], #0
+10$:	MOVL	dhdb_kbmouse.B[EBX], EDI
+	CLRL	EAX			;Clear the mouse state
+	MOVL	dcb_maxcnt.B[EDI], EAX
+	MOVL	dcb_maycnt.B[EDI], EAX
+	MOVB	dcb_malastbut.B[EDI], AL
+	RET
+
+;Here to get the value of the UART characteristic
+
+getuart:MOVZBL	EBX, [EDI+EBX]
+	MOVL	EAX, CS:urtname+0-8[EBX*8]
+	MOVL	EDX, CS:urtname+4-8[EBX*8]
+	RET
+
+	.MOD	4
+urtname:.LONG	'8250', 0	;TRMU_8250  = 1 - Original 8250
+	.LONG	'1645', '0'	;TRMU_16450 = 2 - 8250A/16450
+	.LONG	'1655', '0'	;TRMU_16550 = 3 - 16550
+.PAGE
+	.SBTTL	CF_PUNITS - Get device unit information
+
+;Here for the get device information entry
+;	c{EDI}    = Offset of DCB
+
+mseaunitinfo:
+	MOVL	EAX, #ER_NIYT
+	STC
+	RET
+.PAGE
+	.SBTTL	mseachk - Device check routine for MOUSEA devices
+
+;Device check routine for MOUSEA devices
+;	c{SS:EBX} = Address of device name (16 bytes)
+;	CALL	mseachk
+;	C:set = Error (match found)
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  Z:set = Match found
+;	    c{EDI} = Offset of DCB
+;	  Z:clr = Not found
+;  EBX and ESI are preserved
+
+mseachk:CMPL	SS:[EBX], #'MOUS'
+	JNE	10$.S			;No
+	CMPW	SS:4.B[EBX], #'EA'
+	JNE	10$.S
+	MOVL	EDI, mseaccb+ccb_dcbhead ;Yes - point to first printer DCB
+	TESTL	EDI, EDI
+	JE	8$.S
+4$:	MOVL	EAX, dcb_name+4.B[EDI]	;Does name match?
+	CMPL	SS:4.B[EBX], EAX
+	JNE	6$.S			;No
+	MOVL	EAX, dcb_name+8.B[EDI]
+	CMPL	SS:8.B[EBX], EAX
+	JNE	6$.S			;No
+	MOVL	EAX, dcb_name+12t.B[EDI]
+	CMPL	SS:12t.B[EBX], EAX
+	JE	12$.S			;Yes - this is it!
+6$:	MOVL	EDI, dcb_next.B[EDI]	;Not this one - try next
+	TESTL	EDI, EDI
+	JNE	4$.S			;Continue if another
+8$:	INCL	EDI			;No more - clear Z
+10$:	CLC
+12$:	RET
+.PAGE
+	.SBTTL	sd_inblock - Input block
+
+
+;Here for the sd_qinpblk entry - Input block
+;	c{ESI} = Offset of IORB
+;	c{EDI} = Offset of DCB
+;	CALL	mseainpblk
+;	c{EAX} = Error code
+;	c{ECX} = Amount output
+;	c{EBX} = Status bits
+
+mseainpblk:
+	CALL	knlIoQabLock##		;Lock the QAB
+	JC	2$.S			;If error
+	CALL	knlIoReadLock##		;Lock the buffer
+	JC	2$.S			;If error
+	MOVB	iorb_queue.B[ESI], #dcb_inpframe
+	MOVL	iorb_routine.B[ESI], #mseainpblk1
+	JMP	knlXfQueue##		;Switch to extended fork context
+
+;Here if error locking the buffer
+
+2$:	TOFORK
+	RET
+
+;Here in extended fork context
+
+mseainpblk1:
+	MOVL	SS:xffTimeOut##, #-1	;Default is no time-out
+	CMPL	SS:xffParm##, #0.B	;Have any device parameters?
+	JE	4$.S			;No
+	MOVL	EBX, #mseaioparms	;Yes - process parameters
+	MOVL	ECX, #knlComDPParms##
+	IFFAULT	knlQAdrErr0##
+	LFSL	EDX, SS:xffParm##
+	CALL	knlProcDevParm##
+	JC	10$.S
+4$:	MOVL	ECX, SS:xffCount##	;Get count
+	JREGZ	ECX, 8$
+	CMPL	ECX, #16t
+	JL	knlICnDev##
+	MOVB	AL, dcb_macurbut.B[EDI] ;Store button bits
+	CMPB	dcb_malastbut.B[EDI], AL
+	JNE	6$.S
+	MOVL	EAX, dcb_maycnt.B[EDI]
+	ORL	EAX, dcb_maycnt.B[EDI]
+	JNE	6$.S
+	MOVL	EAX, SS:xffTimeOut##
+	CALL	knlXfWait##
+	JC	10$.S
+6$:	LESL	EBX, SS:xffBuffer1##	;Get address of buffer
+	MOVZBL	EAX, dcb_macurbut.B[EDI] ;Store button bits
+	MOVB	dcb_malastbut.B[EDI], AL
+	MOVL	ES:[EBX], EAX
+	MOVL	EAX, dcb_maxcnt.B[EDI]	;Store X count
+	MOVL	ES:4.B[EBX], EAX
+	MOVL	EAX, dcb_maycnt.B[EDI]	;Store Y count
+	MOVL	ES:8.B[EBX], EAX
+	CLRL	EAX			;Clear the counts
+	MOVL	dcb_maxcnt.B[EDI], EAX
+	MOVL	dcb_maycnt.B[EDI], EAX
+	MOVL	EDX, knlTickCnt##	;Get the current time
+	DIVL	knlLitTPD##		;Convert to system format
+	MOVL	ES:12t.B[EBX], EAX ;Store it
+	MOVL	ECX, #16t
+	CLRL	EAX
+8$:	MOVL	EBX, #QSTS$DONE
+	RET
+
+;Here if error
+
+10$:	CLRL	ECX			;Say nothing output for now!
+	JMP	8$.S
+.PAGE
+	.SBTTL	sd_close - Close routine
+
+;Here for the sd_close function
+
+mseaclose:
+	CMPL	dcb_opencnt.B[EDI], #1.B ;Anyone else have this open?
+	JG	knlNullClose##
+	MOVL	dcb_masigcnt.B[EDI], #0
+	JMP	knlNullClose##
+
+	.SBTTL	Mouse port interrupt routines
+
+;The following is a prototype for the interrupt service routine entry code
+;  - this code is copied for each unit by mseaddunit
+
+mseaint:PUSHAL				;Save all registers
+	PUSHL	DS
+	PUSHL	ES
+	PUSHL	FS
+	PUSHL	GS
+	MOVW	AX, #GS_DATA		;Make our data addressable
+	MOVL	DS, EAX
+fix1:	MOVL	EDI, #0			;Get offset of DCB for this port
+	MOVL	EDX, dcb_maioreg.B[EDI]	;Get base IO register for serial port
+	A2IOP	P_COMINTID		;Point to interrupt ID register
+	INB	[DX]
+	ANDL	EAX, #07h.B
+	JMPIL	CS:mseidsp[EAX*4]	;Dispatch on the interrupt
+MSEAINTSZ=!$-mseaint
+
+;Interrupt dispatch table
+
+	.MOD	4
+mseidsp:.LONG	mdmchg		;000 - Modem status change
+	.LONG	intdone		;001
+	.LONG	nextint		;010 - Xmit done (not possible)
+	.LONG	intdone		;011
+	.LONG	inpavl		;100 - Input available
+	.LONG	intdone		;101
+	.LONG	inperr		;110 - Input error
+	.LONG	intdone		;111
+.PAGE
+;Here for input available interrupt
+
+inpavl:	SUBL	EDX, #2.B		;Point to data register
+	INB	[DX]			;Get the data byte
+
+	MOVL	EBX, debpnt
+	CMPL	EBX, #debend
+	JAE	1$.S
+	MOVB	[EBX], AL
+	INCL	debpnt
+1$:
+
+	TESTB	AL, #40h		;Is it a header byte?
+	JNE	inpheader.S		;Yes
+	MOVZBL	ECX, dcb_mastate.B[EDI]	;No - get our state
+	JMPIL	statetbl[ECX*4]
+
+	DATA
+
+statetbl:
+	.LONG	nextint		;MS_HEADER = 0 - Header byte next
+	.LONG	inpbyte1	;MS_BYTE1  = 1 - Byte 1 next
+	.LONG	inpbyte2	;MS_BYTE2  = 2 - Byte 2 next
+	.LONG	inpbyte3	;MS_BYTE3  = 3 - Byte 3 next
+
+	CODE
+
+;Here with a header byte - This byte contains the left and right button state
+;  bits and the high order 2 bits of the X and Y distance values.
+
+inpheader:
+	MOVB	dcb_maheader.B[EDI], AL	;Store value
+	MOVB	dcb_mastate.B[EDI], #MS_BYTE1
+	JMP	nextint.S
+
+;Here with the first byte following the header byte - This byte contains the
+;  low order 6 bits of the X distance value.
+
+inpbyte1:
+	MOVB	dcb_mabyte1.B[EDI], AL
+	INCB	dcb_mastate.B[EDI]
+	JMP	nextint.S
+
+;Here with the second byte following the header byte - This byte contains the
+;  low order 6 bits of the Y distance value.
+
+inpbyte2:
+	MOVB	dcb_mabyte2.B[EDI], AL
+	INCB	dcb_mastate.B[EDI]
+	MOVB	AL, dcb_malasthb.B[EDI]	;Has a button changed?
+	XORB	AL, dcb_maheader.B[EDI]
+	TESTB	AL, #30h
+	JNE	2$.S			;Yes - always report this
+	TESTB	dcb_maheader.B[EDI], # 0Fh ;No - have any movement?
+	JNE	2$.S			;Yes
+	CMPW	dcb_mabyte1.B[EDI], #0.B ;Maybe
+	JE	nextint.S		;No - nothing needed here
+2$:	MOVL	EAX, dcb_maheader.B[EDI] ;Get value
+	MOVB	dcb_malasthb.B[EDI], AL
+4$:	CMPL	dcb_macount.B[EDI], #RINGSIZE ;Any space in the ring?
+	JAE	10$.S			;No - forget it!
+	MOVL	EBX, dcb_maputter.B[EDI] ;Yes - get putter pointer
+	MOVL	dcb_maring.B[EDI+EBX*4], EAX ;Store data in ring
+	INCL	EBX			;Bump pointer
+	CMPL	EBX, #RINGSIZE		;Past end of ring?
+	JB	6$.S			;No
+	CLRL	EBX			;Yes - reset pointer
+6$:	MOVL	dcb_maputter.B[EDI], EBX ;Update pointer
+	INCL	dcb_macount.B[EDI]	;Bump count
+	CALL	knlReqFork##		;Request fork
+nextint:MOVL	EDX, dcb_maioreg[EDI]	;Get base IO register for serial port
+	A2IOP	P_COMINTID		;Point to interrupt ID register
+	INB	[DX]
+	ANDL	EAX, #07h.B
+	JMPIL	CS:mseidsp[EAX*4]	;Dispatch on the next interrupt
+
+;Here with the third byte following the header byte - This is the 3rd button
+;  extension byte - it only contains the state of the 3rd button in bit 5.
+
+inpbyte3:
+	MOVB	dcb_mabyte3.B[EDI], AL
+	SHLL	EAX, #8t
+	MOVB	AL, dcb_maheader.B[EDI]
+	ANDB	AL, #30h
+	JMP	4$.S
+
+;Here if the interrupt ring is full - discard the character
+
+10$:	INCL	dcb_malostchr.B[EDI]	;Count the lost character
+	JMP	nextint.S		;Continue
+
+;Here for input error interrupt
+
+inperr:	A2IOP	P_COMLINESTS-P_COMINTID	;Point to line status register
+12$:	INB	[DX]			;Read the register
+	JMP	nextint.S		;Otherwise ignore it!
+
+;Here for modem status change interrupt
+
+mdmchg:	A2IOP	P_COMMODMSTS-P_COMINTID	;Point to modem status register
+	JMP	12$.S			;Continue
+
+;Here when have no more interrupt conditions to service
+
+intdone:MOVB	AL, #INT_EOI		;Release interrupt controller
+	CLI
+	CMPB	dcb_maint.B[EDI], #7	;High interrupt?
+	JBE	14$.S			;No
+	OUTB	P_INC2P0		;Yes - release 2nd interrupt controller
+14$:	OUTB	P_INC1P0		;Always release 1st interrupt controller
+	JMP	knlDismissInt2##	;Check for scheduling and dismiss
+.PAGE
+	.SBTTL	msefork - Mouse port fork routine
+
+;Here at fork level for mouse port
+;  The data in the interrupt ring is 4 bytes for each event with the following
+;  format:
+;	Byte      Description
+;	  0   Mouse header byte:
+;		5: Left button state
+;		4: Right button state
+;		3: X7
+;		2: X6
+;		1: Y7
+;		0: Y6
+;	  1   Third button state
+;		5: Center button state
+;	  2   X value, bits 5-0
+;	  3   Y value, bits 5-0
+;  The signal data passed to the user consists of 5 items as follows:
+;	User data item
+;	Button states (0LMR0000)
+;	X count
+;	Y count
+;	Time of day (fractional days)
+
+2$:	RET
+
+mseafork:
+4$:	CMPB	dcb_macount.B[EDI], #0	;Anything in the interrupt ring?
+	JE	2$.S			;No - nothing more to do here
+	MOVZBL	EBX, dcb_mataker.B[EDI] ;Yes - get taker pointer
+	MOVL	EDX, dcb_maring.B[EDI+EBX*4] ;Get data
+	INCL	EBX			;Bump pointer
+	CMPL	EBX, #RINGSIZE		;Past end of ring?
+	JB	6$.S			;No
+	CLRL	EBX			;Yes
+6$:	MOVL	dcb_mataker.B[EDI], EBX
+	DECL	dcb_macount.B[EDI]	;Reduce ring count
+	MOVL	EBX, forkpnt
+	CMPL	EBX, #forkend
+	JAE	8$.S
+	MOVL	[EBX], EDX
+	ADDL	forkpnt, #4t.B
+8$:	MOVB	AL, DL			;Rearange the button bits:
+	ANDL	EAX, #30h		;  xxLRxxxx -> 0LMR0000
+	ADDB	AL, #20h
+	ANDL	EAX, #50h
+	ANDB	DH, #20h
+	ORB	AL, DH
+	MOVB	dcb_macurbut.B[EDI], AL	;Store the button bits for now
+	MOVL	EAX, EDX		;Get high 2 bits of the X value
+	SHLL	EAX, #6t
+	MOVB	CL, DL			;Get high 2 bits of the Y value
+	ANDL	ECX, #0Ch.B
+	SHLL	ECX, #4t
+	SHRL	EDX, #16t		;Get remaining bits of both values
+	ANDL	EDX, #3F3Fh
+	ORB	AL, DL			;Get complete X value
+	MOVXBL	EAX, AL			;Sign extend the X value
+	ADDL	dcb_maxcnt.B[EDI], EAX	;Add in the X value
+	ORB	CL, DH			;Get complete Y value
+	MOVXBL	ECX, CL			;Sign extend the Y value
+	ADDL	dcb_maycnt.B[EDI], ECX	;Add in the Y value
+	MOVL	EBX, dcb_madhdb.B[EDI]	;Get the linked console DHDB
+	TESTL	EBX, EBX
+	JE	14$.S			;Forget it if no console linked
+	MOVL	EBX, dhdb_curtdb.B[EBX]	;Get current console TDB
+	TESTL	EBX, EBX		;Just to be safe!
+	JE	14$.S
+	MOVL	EBX, [EBX]		;Get linked DCB
+	TESTL	EBX, EBX
+	JE	14$.S			;If no linked DCB
+	CLRL	EAX
+	CMPW	dcb_trhusvect.B[EBX], #0.B ;Do we want a signal?
+	JE	knlResumeInput##	;No - resume input
+	CMPL	dcb_masigcnt.B[EDI], #0.B ;Have any signals outstanding now?
+	JE	10$.S			;No
+	MOVB	AL, dcb_macurbut.B[EDI]	;Yes - did the button state change?
+	CMPB	AL, dcb_malastbut.B[EDI]
+	JE	4$			;No - finished for now
+10$:	CMPL	dcb_masigcnt.B[EDI], #10t.B ;Yes - have too many signals?
+	JA	12$.S			;Yes - forget it for now
+	CALL	reqsignal2		;No - request a signal
+12$:	JMP	4$			;Continue
+
+14$:	RET
+.PAGE
+;Subroutine called when a mouse signal is granted
+;	c(AL)  = Grant function
+;	c{EDI} = Offset of MSEA DCB
+;	CALL	mseagrant
+
+mseagrant:
+	CMPB	AL, #SGF_GRANTED	;Signal granted?
+	JNE	6$.S			;No
+	DECL	dcb_masigcnt.B[EDI]	;Yes - reduce the signal count
+	JNS	2$.S
+	MOVL	dcb_masigcnt.B[EDI], #0
+2$:	JNE	4$.S
+	MOVL	EAX, dcb_maxcnt.B[EDI]	;Need another signal?
+	ORL	EAX, dcb_maycnt.B[EDI]
+	JNE	reqsignal.S		;Yes
+4$:	RET				;No - finished here
+
+;Here if signal was not granted for some reason - clear the mouse state
+
+6$:	CLRL	EAX
+	MOVL	dcb_masigcnt.B[EDI], EAX
+	MOVL	dcb_maxcnt.B[EDI], EAX
+	MOVL	dcb_maycnt.B[EDI], EAX
+	RET
+.PAGE
+;Subroutine to request a mouse signal
+;	c{EDI} = Offset of MSEA DCB
+;	CALL	reqsignal
+
+reqsignal:
+	MOVL	EBX, dcb_madhdb.B[EDI]	;Get the linked console DHDB
+	TESTL	EBX, EBX
+	JE	4$.S			;Forget it if no console linked
+	MOVL	EBX, dhdb_curtdb.B[EBX]	;Get current console TDB
+	TESTL	EBX, EBX		;Just to be safe!
+	JE	4$.S
+	MOVL	EBX, [EBX]		;Get linked DCB
+	TESTL	EBX, EBX
+	JE	4$.S			;Forget it if no DCB linked
+
+reqsignal2:
+
+	CMPW	dcb_trhusvect.B[EBX], #0.B ;Want this interrupt?
+	JE	4$.S			;No - ignore this
+	CALL	knlGetQel##		;Yes - need to give him a signal now
+	JC	4$.S
+	MOVB	slb_szindx.B[ESI], #0
+	MOVL	EAX, dcb_trhusdata.B[EBX] ;Store interrupt data
+	MOVL	slb_data+0.B[ESI], EAX
+	MOVZBL	EAX, dcb_macurbut.B[EDI] ;Store button bits
+	MOVB	dcb_malastbut.B[EDI], AL
+	MOVL	slb_data+4.B[ESI], EAX
+	MOVL	EAX, dcb_maxcnt.B[EDI]	;Store X count
+	MOVL	slb_data+8.B[ESI], EAX
+	MOVL	EAX, dcb_maycnt.B[EDI]	;Store Y count
+	MOVL	slb_data+12t.B[ESI], EAX
+	CLRL	EAX			;Clear the counts
+	MOVL	dcb_maxcnt.B[EDI], EAX
+	MOVL	dcb_maycnt.B[EDI], EAX
+	MOVL	EDX, knlTickCnt##	;Get the current time
+	DIVL	knlLitTPD##		;Convert to system format
+	MOVL	slb_data+16t.B[ESI], EAX ;Store it
+	MOVZWL	EAX, dcb_trhusvect.B[EBX]
+	MOVL	ECX, #5t
+	MOVW	ES, dcb_trhuspda.B[EBX]
+	MOVB	BH, #2
+	MOVB	BL, #SIGT_NORMAL
+	MOVL	EDX, #mseagrant
+	CALL	knlReqSignal##
+	JC	4$.S			;If error
+	INCL	dcb_masigcnt.B[EDI]	;Count the outstanding signal
+4$:	RET
+.PAGE
+	.SBTTL	seroad - Once-a-second routine
+
+;Once-a-second routine
+
+mseaoas:MOVL	EDI, mseaccb+ccb_dcbhead ;Point to our first DCB
+
+2$:
+
+;;;;; CODE HERE TO MAKE SURE DON'T WAIT FOR 4TH BYTE FOR TOO LONG!
+
+10$:	MOVL	EDI, dcb_next.B[EDI]	;Advance to next DCB
+	TESTL	EDI, EDI		;Any more?
+	JNE	2$			;Yes - continue
+	RET				;No - finished
+.PAGE
+	.SBTTL	Data
+
+	DATA
+
+	.MOD	4
+mseaccb: .BLKB	ccb_SIZE	;MOUSEA CCB
+
+forkpnt::.LONG	forkbfr
+forkbfr::.BLKL	400t
+forkend::.LONG	0
+
+debpnt::.LONG	debug
+debug::	.BLKB	1000t
+debend::.LONG	0
+
+	LKEEND

@@ -1,0 +1,1045 @@
+	.TITLE	TCPCLS3 - TCP routines for XOS (part 2)
+
+;++++
+; This software is in the public domain.  It may be freely copied and used
+; for whatever purpose you see fit, including commerical uses.  Anyone
+; modifying this software may claim ownership of the modifications, but not
+; the complete derived code.  It would be appreciated if the authors were
+; told what this software is being used for, but this is not a requirement.
+
+;   THIS SOFTWARE IS PROVIDED BY THE AUTHORS "AS IS" AND ANY EXPRESS OR
+;   IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
+;   OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+;   IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+;   INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+;   BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS
+;   OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+;   ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR
+;   TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
+;   USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+;----
+
+	.PROC	80486
+	.INCLUD	XOSINC:\XMAC\XOS.PAR
+	.INCLUD	XOSINC:\XMAC\XOSX.PAR
+	.INCLUD	XOSINC:\XMAC\XOSTIME.PAR
+	.INCLUD	XOSINC:\XMAC\XOSERR.PAR
+	.INCLUD	XOSINC:\XMAC\XOSNET.PAR
+	.INCLUD	XOSINC:\XMAC\XOSXNET.PAR
+	.INCLUD	XOSINC:\XMAC\XOSXIPS.PAR
+	.INCLUD	XOSINC:\XMAC\XOSXTCP.PAR
+	.INCLUD	XOSINC:\XMAC\XOSLKE.PAR
+	.INCLUD	XOSINC:\XMAC\XOSXLKE.PAR
+
+	LKECONT
+
+;This file contains routines for receiving packets
+
+	.EXPORT	xostcpWaitWin
+	.EXPORT	xostcpFatal
+	.EXPORT	xostcpGiveAll
+	.EXPORT	xostcpHashClr
+	.EXPORT	xostcpHashSet
+	.EXPORT	xostcpPutBlk
+	.EXPORT	xostcpSendAck
+	.EXPORT	xostcpSendFin
+	.EXPORT	xostcpSendReset
+	.EXPORT xostcpTimerReq
+	.EXPORT	xostcpTimerRmv
+
+	.SBTTL	xostcpSendReset - Subroutine to send a RST packet
+
+;Subroutine to send a RST packet
+
+xostcpSendReset::
+	MOVL	ECX, #60t
+	CALL	xosnetGetBufr##		;Get a network buffer
+	JC	2$.S			;Forget it if can't get one
+	CALL	tcpsetpkt		;Set up the packet header
+	JC	6$.S
+	MOVZBL	ECX, npb_tpofs.B[EBX]
+	MOVL	EAX, dcb_tcpoutsnum[EDI]
+	MOVL	npb_seqnum.B[EBX], EAX
+	XCHGB	AL, AH
+	RORL	EAX, #16t
+	XCHGB	AL, AH
+	MOVL	tcp_seqnum.B[EBX+ECX], EAX
+	CLRL	EAX
+	MOVL	tcp_acknum.B[EBX+ECX], EAX
+	MOVW	tcp_window.B[EBX+ECX], AX
+	ORB	tcp_code.B[EBX+ECX], #TCPC$RST ;Make this a reset packet
+	CALL	tcpchksum		;Calculate the checksum
+	CALL	xosipsSendSetup##
+	MOVL	ESI, dcb_netsdb.B[EDI]
+	MOVL	EAX, #xosnetGiveBufr##
+	CALL	xossnpSendPkt##		;Send the packet and then give it up
+	MOVL	EAX, dcb_ipstpdb.B[EDI]	;Count the reset
+	INCL	tpdb_tcpcntrstsent[EAX]
+	CLC
+2$:	RET
+
+6$:	CALL	xosnetGiveBufr##
+	STC
+	RET
+.PAGE
+	.SBTTL	xostcpSendFin - Subroutine to send a FIN packet
+
+;Subroutine to send a FIN packet
+
+xostcpSendFin::				;Must be called in extended fork context
+	ORB	dcb_tcpsts2.B[EDI], #TCPS2$NEEDFIN ;Request a FIN
+	BTZL	dcb_netmode.B[EDI], #NMTCP%CONSEND ;Disable Nagel
+	BTSL	dcb_netmode.B[EDI], #NMTCP%PUSH ;Push it
+	MOVL	EBX, #dummy
+	PUSHL	CS
+	POPL	ES
+	MOVL	ECX, #1
+	JMP	tcpputblk2
+
+dummy:	.BYTE	0
+.PAGE
+	.SBTTL	xostcpSendAck - Subroutine to send ACK packet
+
+;Subroutine to send ACK packet
+;	CALL	xostcpSendAck
+
+xostcpSendAck::
+	MOVL	EAX, dcb_tcprcvsnum.B[EDI] ;Do we really need an ACK now?
+	CMPL	dcb_tcprcvtnum.B[EDI], EAX
+	JE	2$.S			;No
+tcpsendackf::				;Yes
+	CMPL	dcb_tcpackwake[EDI], #0.B ;Is the ACK timer running now?
+	JNE	2$.S			;Yes - nothing needed now
+	MOVL	EBX, #tcpacktimeout	;No - start the timer
+	MOVL	EAX, #TIMEOUT_ACK/FDPERTICK
+	PUSHL	ESI
+	CALL	knlWakeRequest##
+	JC	4$.S			;If error starting timer
+	MOVL	dcb_tcpackwake[EDI], ESI ;OK - finished for now
+	POPL	ESI
+2$:	RET
+
+;Here if can't enter timer request - just send the ACK now
+
+4$:	POPL	ESI
+	JMP	tcpsendacknow.S
+
+;Here when the ACK timer runs out
+
+tcpacktimeout:
+	CMPL	ESI, dcb_tcpackwake[EDI]
+	JNE	6$.S
+	CLRL	EAX
+	MOVL	dcb_tcpackwake[EDI], EAX
+	CALL	tcpsendacknow
+	CLC
+	RET
+
+6$:	CRASH	BWKB
+
+tcpsendacknow::
+	MOVL	ECX, #60t
+	CALL	xosnetGetBufr##		;Get a network buffer
+	JC	2$.S			;Forget it if can't get one
+	CALL	tcpsetpkt		;Set up the packet header
+	JNC	8$.S
+	CALL	xosnetGiveBufr##
+	RET
+
+8$:	MOVZBL	ECX, npb_tpofs.B[EBX]
+	MOVL	EAX, dcb_tcpoutsnum[EDI]
+	MOVL	npb_seqnum.B[EBX], EAX
+	XCHGB	AL, AH
+	RORL	EAX, #16t
+	XCHGB	AL, AH
+	MOVL	tcp_seqnum.B[EBX+ECX], EAX
+	CALL	tcpsetack		;Store ACK number and window size in
+	CALL	xosipsSendSetup##	;  packet
+	MOVL	ESI, dcb_netsdb.B[EDI]
+	MOVL	EAX, #xosnetGiveBufr##
+	CALL	xossnpSendPkt##		;Send the packet and then give it up
+	RET
+.PAGE
+	.SBTTL	tcpsetpkt - Subroutine to set up the TCP packet header
+
+;Subroutine to set up the TCP (and lower) level packet headers
+;	c{EBX} = Offset of packet buffer
+;	CALL	tcpsetpkt
+;	C:set = Error code
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  c(AL)  = Value stored in npb_apofs
+;	  c{EDX} = Offset of first byte after TCP header
+;  EBX is respected
+
+tcpsetpkt::
+	CLRL	EAX			;Yes
+	MOVL	EDX, #IPP_TCP<8t	;Get transport protocol type
+	CALL	xosipsSetPkt##		;Set up IP (and lower) level headers
+	JC	4$.S			;If error
+	MOVL	EAX, dcb_ipslclport.B[EDI] ;Get port numbers
+	XCHGB	AL, AH
+	MOVL	tcp_srcport.B[EDX], EAX ;Store in packet
+	CLRL	EAX
+	MOVL	tcp_acknum.B[EDX], EAX	;Clear remaining fields
+	MOVL	tcp_checksum.B[EDX], EAX
+	MOVL	npb_apcnt.B[EBX], EAX
+	MOVB	AL, #50h		;Set offset field
+	MOVL	tcp_offset.B[EDX], EAX
+	MOVB	AL, npb_tpofs.B[EBX]
+	ADDB	AL, #tcp_options
+	MOVB	npb_apofs.B[EBX], AL
+	ADDL	npb_count.B[EBX], #tcp_options.B ;Update byte counts
+	ADDL	EDX, #tcp_options.B	;Point to start of data area (assuming
+4$:	RET				;  no options)
+.PAGE
+	.SBTTL	xostcpHashSet - Subroutine to place DCB in the TCP hash table
+
+;Subroutine to place DCB in the IP hash table
+;	c{EBX} = Hash index
+;	c{EDI} = Offset of DCB
+;	CALL	xostcpHashSet
+
+xostcpHashSet::
+	CMPL	dcb_ipshashnext[EDI], #-1.B
+	JNE	4$.S
+	MOVL	EAX, dcb_ipstpdb.B[EDI]
+	MOVL	EAX, tpdb_tcprcvhash.B[EAX]
+	PUSHL	[EAX+EBX*4]
+	POPL	dcb_ipshashnext[EDI]
+	MOVL	[EAX+EBX*4], EDI
+	RET
+
+4$:	CRASH	IPHE			;[IP Hash Error]
+.PAGE
+	.SBTTL	xostcpHashClr - Subroutine to remove DCB from the TCP hash table
+
+;Subroutine to remove DCB from the TCP hash table
+;	c{EDI} = Offset of DCB
+;	CALL	xostcpHashClr
+
+xostcpHashClr:
+	CMPL	dcb_ipshashnext[EDI], #-1.B ;Still in the hash table?
+	JE	ret026.S		;No - nothing needed here
+	CALL	tcpcalhash		;Yes - remove DCB from the hash table
+	MOVL	EAX, dcb_ipstpdb.B[EDI]
+	MOVL	EAX, tpdb_tcprcvhash[EAX]	   ;Get address of hash table
+	LEAL	EBX, -dcb_ipshashnext.B[EAX+EBX*4] ;  entry minus off of link
+						   ;  in the DCB
+2$:	CMPL	dcb_ipshashnext.B[EBX], EDI ;Is it the next one?
+	JE	6$.S			;Yes
+	MOVL	EBX, dcb_ipshashnext.B[EBX] ;No - advance to next
+	TESTL	EBX, EBX		;Have another one to check?
+	JNE	2$.S			;Yes - continue
+	CRASH	BNHL			;[Bad Network Hash List]
+
+4$:	CRASH	NIHL			;[Not In Hash List]
+
+;Here with our DCB
+
+6$:	PUSHL	dcb_ipshashnext.B[EDI]	;Remove from list
+	POPL	dcb_ipshashnext.B[EBX]
+	MOVL	dcb_ipshashnext.B[EDI], #-1
+	RET
+
+	.SBTTL	tcpcalhash - Subroutine to calculate TCP hash index from DCB
+
+;Subroutine to calculate TCP hash index from DCB
+;	c{EDI} = Offset of DCB
+;	CALL	tcpcalhash
+;	c{EBX} = Hash index
+
+tcpcalhash::
+	PUSHL	ESI
+	CLRL	EBX
+	MOVL	ECX, #8			;Number of bytes to use
+	LEAL	ESI, dcb_ipsrmtaddr.B[EDI] ;First byte to use
+	CLD
+10$:	LODSB	[ESI]			  ;  order
+	ROLB	BL, #1
+	XORB	BL, AL
+	LOOP	ECX, 10$
+	POPL	ESI
+ret026:	RET
+.PAGE
+	.SBTTL	xostcpChkWin - Subroutine to wait until window is open
+
+;Subroutine to wait until window is open
+;	c{EAX} = Time-out value (fractional days)
+;	c{EDI} = Offset of DCB
+;	CALL	xostcpWaitWin
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+
+;NOTE:	We always allow one more byte than indicated by the window so we
+;	will have somthing to send as a window probe.
+
+xostcpWaitWin::
+	CMPB	dcb_tcpstate.B[EDI], #TCPS_ESTAB ;Do we have a connection?
+	JE	2$.S
+	CMPB	dcb_tcpstate.B[EDI], #TCPS_CLOSEWAIT ;Maybe
+	JNE	4$.S			;No - fail
+2$:	CMPL	dcb_tcpoutwina[EDI], #0.B ;Yes - have any space now?
+	JGE	8$.S			;Yes
+	PUSHL	EAX			;No - save time-out value
+
+	CMPL	dcb_tcpoutpkt+npb_nextsnd[EDI], #-1.B
+	JNE	3$.S
+	CALL	xostcpCheckSend
+3$:
+	MOVL	EAX, [ESP]
+	CALL	xosnetSndWait##		;Wait for a while
+	JC	10$.S			;If error
+	POPL	EAX			;OK - restore time-out value
+	JMP	xostcpWaitWin.S		;Go check again
+
+;Here if do not have a connection
+
+4$:	MOVL	EAX, #ER_NCLST		;Assume have had fatal error
+	TESTB	dcb_tcpsts2.B[EDI], #TCPS2$FATAL ;Right?
+	JNE	6$.S			;Yes
+	MOVB	AL, #ER_NCCLR&0FFh	;No - return right error code
+6$:	STC
+8$:	RET
+
+;Here if error while waiting
+
+10$:	ADDL	ESP, #4.B		;Discard time-out value
+	JMP	xostcpFatal
+.PAGE
+	.SBTTL	xostcpPutBlk - Subroutine to store output data into a TCP packet
+
+;Subroutine to store output data into the TCP output ring buffer - must be
+;  called in extended fork context
+;	c{ES:EBX} = Address of buffer containing data
+;	c{ECX}    = Amount to output
+;	c{EDI}    = Offset of DCB
+;	c{ESI}    = Offset of SDB
+;	CALL	xostcpPutBlk
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+
+$$$=!0
+FRM ts_buffer, 8
+FRM ts_count , 4
+ts_SIZE=!$$$
+
+1$:	MOVL	EAX, #ER_NOOUT
+	STC
+	RET
+
+xostcpPutBlk::
+	TESTB	dcb_tcpsts2.B[EDI], #TCPS2$SENTFIN|TCPS2$NEEDFIN
+	JNE	1$.S
+tcpputblk2:
+	ENTER	ts_SIZE, 0
+	MOVL	ts_buffer+0.B[EBP], EBX	;Store buffer address
+	MOVL	ts_buffer+4.B[EBP], ES
+	MOVL	ts_count.B[EBP], ECX	;Store amount to store
+2$:	MOVL	EAX, SS:xffTimeOut##
+	CALL	xostcpWaitWin		;Wait for available space
+	JC	20$			;If error
+	MOVL	ECX, ts_count.B[EBP]
+	CMPL	ECX, dcb_tcpoutwina[EDI] ;Will it all fit in the window?
+	JLE	4$.S			;Yes
+	MOVL	ECX, dcb_tcpoutwina[EDI] ;No - just do as much as we can + 1
+	INCL	ECX
+4$:	MOVL	EAX, dcb_tcpoutsize[EDI] ;Determine space available before end
+	SUBL	EAX, dcb_tcpoutput[EDI]	 ;  of the output buffer
+	CMPL	ECX, EAX		;Is it enought?
+	JLE	6$.S			;Yes
+	MOVL	ECX, EAX		;No - just copy as much as we can this
+					;  time
+6$:
+	MOVL	EAX, #3
+	CALL	putinxxx
+
+	SUBL	ts_count.B[EBP], ECX	;Reduce amount left
+	PUSHL	EDI
+	PUSHL	ESI
+	LFSL	ESI, ts_buffer.B[EBP]
+	ADDL	ts_buffer.B[EBP], ECX
+	MOVL	EAX, dcb_tcpoutput[EDI]
+	MOVL	EDX, EAX
+	ADDL	EAX, ECX
+	CMPL	EAX, dcb_tcpoutsize[EDI]
+	JL	8$.S
+	CLRL	EAX
+8$:	MOVL	dcb_tcpoutput[EDI], EAX
+	SUBL	dcb_tcpoutwina[EDI], ECX
+	MOVL	EDI, dcb_tcpoutbufr[EDI]
+	ADDL	EDI, EDX
+	PUSHL	DS
+	POPL	ES
+	CLD
+	CMPL	ECX, #8.B		;More than 8 bytes to store?
+	JBE	10$.S			;No
+	MOVL	EAX, ECX		;Yes - get destination to a long
+	MOVL	ECX, EDI		;  boundry
+	NEGL	ECX
+	ANDL	ECX, #03h.B
+	SUBL	EAX, ECX
+	RMOVSB	[EDI], FS:[ESI]
+	MOVL	ECX, EAX
+	SHRL	ECX, #2t		;Change to number of longs (round down)
+	RMOVSL	[EDI], FS:[ESI]		;Copy most of it
+	MOVL	ECX, EAX		;Copy any bytes left over
+	ANDL	ECX, #3.B
+10$:	RMOVSB	[EDI], FS:[ESI]
+	POPL	ESI
+	POPL	EDI
+
+	MOVL	EAX, #13h
+	MOVL	ECX, ts_count.B[EBP]
+	CALL	putinxxx
+
+	CMPL	ts_count.B[EBP], #0.B	;Are we finished?
+	JNE	2$			;No - continue
+
+	BTL	dcb_netmode.B[EDI], #NMTCP%PUSH ;Should we push this data?
+	JNC	12$.S			;No
+	MOVL	EAX, dcb_tcpoutput[EDI]	;Yes - update the push pointer
+	MOVL	dcb_tcpoutpush[EDI], EAX
+12$:	CMPL	dcb_tcpoutpkt+npb_nextsnd[EDI], #-1.B
+	CLC
+
+;;;;	JNE	20$.S
+	JNE	30$.S
+
+	CALL	xostcpCheckSend
+20$:	LEAVE
+ret030:	RET
+
+
+
+30$:	MOVL	EAX, #23h
+	CALL	putinxxx
+	CLC
+	LEAVE
+	RET
+.PAGE
+;Subroutine to check if should send data - This routines implements the Nagle
+;  slow start algorithm and the send-side SWS avoidance algorithm.  The
+;  caller must verify that no output is in progress before calling this
+;  routine.
+;	c{EDI} = Offset of DCB
+;	CALL	xostcpCheckSend
+;	C:set = Error
+;	  c{EAX} = XOS error code
+;	C:clr = Normal
+
+;NOTE:	Sending a FIN is handled somewhat strangely here.  To send a FIN,
+;	1 byte is stored in the buffer and the TCPS2$NEEDFIN status bit is
+;	set.  Once this bit is set, no additional data can be store into
+;	the ring buffer.  When the last data in the ring buffer is to be
+;	sent and the TCPS2$NEEDFIN bit is set the following is done:
+;	  If there is more than 1 byte to send, everything but the last
+;	    byte is packetized and sent normally.
+;	  If there is exactly 1 byte to send, a 0 length packet with the
+;	    FIN bit set is sent instead.
+;	This allows the normal transmission and retransmission logic to
+;	handle FINs without any additional special checks.
+
+xostcpCheckSend::
+
+	MOVL	EAX, #4
+	CALL	putinxxx
+
+	PUSHL	#0.B			;Indicate not pushed
+	MOVL	ECX, dcb_tcpoutput[EDI]	;Get number of bytes available
+	SUBL	ECX, dcb_tcpouttake[EDI]
+	JE	10$.S			;If nothing to do here
+	JGE	2$.S
+	ADDL	ECX, dcb_tcpoutsize[EDI]
+2$:	CMPL	dcb_tcpoutwina[EDI], #0.B ;Has the window been overcommitted?
+	JGE	4$.S			;No
+	ADDL	ECX, dcb_tcpoutwina[EDI] ;Yes - only send as much as he wants
+4$:
+	MOVL	EAX, #5
+	CALL	putinxxx
+
+	TESTL	ECX, ECX		;Still have something to send?
+	JE	10$.S			;No
+	CMPL	dcb_tcpoutpush[EDI], #-1.B ;Has something been pushed?
+	JE	8$.S			;No
+	MOVL	EAX, dcb_tcpoutput[EDI] ;Maybe
+	SUBL	EAX, dcb_tcpoutpush[EDI]
+	JGE	6$.S
+	ADDL	EAX, dcb_tcpoutsize[EDI]
+6$:	CMPL	EAX, ECX
+	JGE	8$.S			;No
+	MOVB	[ESP], #TCPC$PSH	;Yes
+8$:	TESTB	dcb_tcpsts2.B[EDI], #TCPS2$FORCE
+	JNE	22$.S
+	CMPL	ECX, dcb_tcpmaxseg[EDI]	;Yes - can we output a full packet?
+	JGE	22$.S			;Yes - always send it
+
+;;;;	CMPB	[ESP], #0		;No - has it been pushed?
+;;;;	JE	10$.S			;No - send nothing now !!! TIMER ???
+
+	BTL	dcb_netmode.B[EDI], #NMTCP%CONSEND ;Yes - are we using Negal?
+	JNC	18$.S			;No
+	MOVL	EAX, dcb_tcpouttake[EDI] ;Yes - is anything unACKed?
+	CMPL	EAX, dcb_tcpoutack[EDI]
+	JE	18$.S			;No - continue
+10$:	ADDL	ESP, #4t.B		;Yes - no output now!
+	CMPL	dcb_tcpoutwina[EDI], #0.B ;Is the window closed
+	MOVL	EAX, dcb_tcpoutput[EDI]	 ;Get the actual output window size
+	SUBL	EAX, dcb_tcpouttake[EDI] ;  (not adjusted for buffered bytes)
+	JGE	12$.S
+	ADDL	EAX, dcb_tcpoutsize[EDI]
+12$:	ADDL	EAX, dcb_tcpoutwina[EDI]
+	JG	14$.S			;If some window is available
+	CALL	tcprexmitreq		;Window is closed - start the
+14$:	CLC				;  retransmit timer for a window probe
+	RET
+
+;Here if error setting up the packet
+
+16$:	ADDL	ESP, #4t.B
+	STC
+	RET
+
+;When get here, Negal has said we can send data - now check for SWS
+
+18$:	MOVL	EAX, dcb_tcpoutwinm[EDI] ;Get 1/4 of the maximum window offered
+	SHRL	EAX, #2t
+	MOVL	EDX, ECX
+	CMPL	dcb_tcpoutwina[EDI], #0.B
+	JL	20$.S
+	ADDL	EDX, dcb_tcpoutwina[EDI]
+20$:	CMPL	EDX, EAX		;Is the available window this large?
+	JL	10$.S			;No - don't send now
+22$:	TESTB	dcb_tcpsts2.B[EDI], #TCPS2$REXMIT ;Are we retransmitting now?
+	JNE	10$.S			;Yes - can't send it now
+	CMPL	ECX, dcb_tcpmaxseg[EDI] ;No - have more than the maximum packet
+					;  size?
+	JLE	24$.S			;No
+	MOVL	ECX, dcb_tcpmaxseg[EDI]	;Yes - only send a maximum packet
+24$:	LEAL	EBX, dcb_tcpoutpkt[EDI]	;Point to our output packet buffer
+	PUSHL	ECX
+	CALL	tcpsetpkt		;Set up the packet header
+	POPL	ECX
+	JC	16$.S			;If error
+	ADDL	npb_count.B[EBX], ECX
+	MOVL	npb_apcnt.B[EBX], ECX
+	MOVL	ESI, dcb_tcpoutbufr[EDI]
+	ADDL	ESI, dcb_tcpouttake[EDI]
+	PUSHL	DS
+	POPL	ES
+	CLD
+	PUSHL	ECX
+	PUSHL	EDI
+	MOVL	EAX, dcb_tcpoutsize[EDI] ;Is the data wrapped?
+	SUBL	EAX, dcb_tcpouttake[EDI]
+	MOVL	EDI, EDX
+	CMPL	EAX, ECX
+	JGE	30$.S			;No
+	PUSHL	ECX
+	SUBL	[ESP], EAX
+	MOVL	ECX, EAX
+	SHRL	ECX, #2
+	RMOVSL	[EDI], [ESI]
+	ANDL	EAX, #03h.B
+	JE	26$.S
+	MOVL	ECX, EAX
+	RMOVSB	[EDI], [ESI]
+26$:	POPL	ECX
+	MOVL	EAX, [ESP]
+	MOVL	ESI, dcb_tcpoutbufr[EAX]
+
+;Here with data copied to end of the output ring buffer - it's now possible
+;  that our output is not byte aligned, so we fix that now if necessary
+
+28$:	TESTL	EDI, #03h
+	JE	30$.S
+	MOVSB	[EDI], [ESI]
+	JMP	28$.S
+
+;Here if the data in the output ring buffer is not wrapped - Note that we just
+;  round up to a whole number of longs here.  The may cause us to access up
+;  to 3 bytes beyond the end of the packet in the output ring. This is OK,
+;  since we don't use the last 4 bytes of the ring buffer.
+
+30$:	ADDL	ECX, #3.B
+	SHRL	ECX, #2
+	RMOVSL	[EDI], [ESI]
+	POPL	EDI
+	POPL	ECX
+	MOVL	EAX, dcb_tcpoutsnum[EDI]
+	MOVL	dcb_tcpoutpkt+npb_seqnum[EDI], EAX
+	MOVZBL	EDX, npb_tpofs.B[EBX]
+	XCHGB	AL, AH
+	RORL	EAX, #16t
+	XCHGB	AL, AH
+	MOVL	tcp_seqnum.B[EBX+EDX], EAX
+	ADDL	dcb_tcpoutsnum[EDI], ECX ;Bump send sequence number
+	MOVL	EAX, dcb_tcpouttake[EDI] ;Advance the output ring buffer
+	ADDL	EAX, ECX		 ;  taker pointer
+	CMPL	EAX, dcb_tcpoutsize[EDI]
+	JL	32$.S
+	SUBL	EAX, dcb_tcpoutsize[EDI]
+32$:	MOVL	dcb_tcpouttake[EDI], EAX ;Update the taker pointer
+	MOVZBL	EDX, npb_tpofs.B[EBX]	;Empty
+	CMPL	EAX, dcb_tcpoutput[EDI]	;Is the ring buffer "empty" now?
+	JNE	36$.S			;No - go on
+	TESTB	dcb_tcpsts2.B[EDI], #TCPS2$NEEDFIN ;Yes - do we need a FIN?
+	JE	36$.S			;No
+	DECL	npb_count.B[EBX]	;Yes - reduce the length of this
+	DECL	npb_apcnt.B[EBX]	;  packet by 1
+	JNE	34$.S			;If not empty now just send it
+	ORB	tcp_code.B[EBX+EDX], #TCPC$FIN ;Empty - make this a FIN packet
+	ORB	dcb_tcpsts2.B[EDI], #TCPS2$SENTFIN ;Indicate FIN has been sent
+	MOVB	[ESP], #0		;Don't set PSH with FIN
+	JMP	36$.S
+
+;Here if we have a packet to send before a FIN packet - back up the taker
+;  pointer one byte
+
+34$:	DECL	dcb_tcpoutsnum[EDI]	;Reduce the send sequence number
+	DECL	dcb_tcpouttake[EDI]	;Reduce the taker pointer
+	JNS	36$.S
+	MOVL	EAX, dcb_tcpoutsize[EDI]
+	DECL	EAX
+	MOVL	dcb_tcpouttake[EDI], EAX
+36$:	POPL	EAX
+	ORB	tcp_code.B[EBX+EDX], AL	;Set the PSH bit if need to
+	CALL	tcpsetack		;Set the ACK number and calculate the
+					;  TCP checksum
+	CALL	xosipsSendSetup##	;Set up IP part of packet header
+	MOVL	ESI, dcb_netsdb.B[EDI]	;Get SDB offset
+	MOVL	ECX, npb_count.B[EBX]
+	MOVL	EAX, #1
+	CALL	putinxxx
+
+.IF NE $$TCPTIME
+	PUSHL	EAX
+	MOVL	EDX, tcptimepnt#
+	MOVL	EAX, knlTickTtl##
+	MOVL	[EDX], EAX
+	MOVL	4.B[EDX], #0
+	MOVL	8.B[EDX], #0
+	MOVL	EAX, npb_apcnt.B[EBX]
+	MOVL	12t.B[EDX], EAX
+	ADDL	EDX, #16t.B
+	CMPL	EDX, #tcptimeend#
+	JB	38$.S
+	MOVL	EDX, #tcptimering#
+38$:	MOVL	tcptimepnt#, EDX
+	POPL	EAX
+.ENDC
+
+	TESTB	dcb_tcpsts1.B[EDI], #TCPS1$TIMING ;Are we timing now?
+	JNE	40$.S			;Yes - go on
+	MOVL	EAX, knlTickTtl##	;No - time this packet
+	MOVL	dcb_tcprndbgn[EDI], EAX
+	MOVL	EAX, dcb_tcpoutsnum[EDI]
+	MOVL	dcb_tcprndsnum[EDI], EAX
+	ORB	dcb_tcpsts1.B[EDI], #TCPS1$TIMING ;Indicate timing now
+40$:	MOVL	EAX, #tcpsenddone
+	CALL	xossnpSendPkt##		;Output the packet and return
+	JC	44$.S
+	CMPL	dcb_tcprxmtwake[EDI], #0.B
+	JE	tcprexmitreq
+44$:	RET
+
+;Here when output of a data packet is complete
+
+tcpsenddone:
+	CALL	xostcpCheckSend
+	RET
+.PAGE
+;Here if have timeout before receiving an ACK for a packet we have
+;  sent - We send a single packet from the output ring buffer.  If the
+;  window is closed (possible if the other end has reduced his window
+;  from the right) we send a 1-byte window probe packet. Normal output
+;  is resumed as soon as this packet is ACKed.
+
+2$:	CLC
+	RET
+
+tcprexmit:
+	MOVL	dcb_tcprxmtwake[EDI], #0
+	CMPL	dcb_tcpoutpkt+npb_nextsnd[EDI], #-1 ;Are we still outputting
+						    ;  our packet?
+	JNE	tcprexmitreq		;Yes - just restart the timer
+	MOVL	ESI, dcb_netsdb.B[EDI]	;Get offset of the SDB
+	MOVL	EAX, dcb_tcpouttake[EDI] ;Get distance between the taker
+	SUBL	EAX, dcb_tcpoutack[EDI]	 ;  and ACK pointers
+	JGE	4$.S
+	ADDL	EAX, dcb_tcpoutsize[EDI]
+4$:	JNE	8$.S			;Go on if something unACKed
+	CMPL	dcb_tcpoutwina[EDI], #0.B ;Is the window closed?
+	JG	xostcpCheckSend		;No - this is very strange - just try
+					;  to start output again
+	MOVL	EDX, dcb_tcpoutput[EDI]	;Yes - is anything unsent?
+	CMPL	EDX, dcb_tcpouttake[EDI]
+	JE	2$.S			;No - nothing to probe with now
+
+;Here if we need a window probe - In this case we adjust our various numbers
+;  to make it look like the first unsent byte has been sent but not ACKed so
+;  we will retransmit it using the normal retransmit logic.  After the packet
+;  has been constructed, we unadjust these values.  Note that this means that
+;  we may get an ACK for a supposedly unsent byte.  The procack code allows
+;  for this.
+
+	INCL	dcb_tcpoutsnum[EDI]
+	INCL	EAX
+	MOVL	EDX, dcb_tcpouttake[EDI]
+	INCL	EDX
+	CMPL	EDX, dcb_tcpoutsize[EDI]
+	JL	6$.S
+	CLRL	EDX
+6$:	MOVL	dcb_tcpouttake[EDI], EDX
+	INCL	dcb_tcpoutwina[EDI]
+	PUSHL	#1.B
+	JMP	10$.S
+
+;Check number of retries
+
+8$:	PUSHL	#0.B
+10$:	INCB	dcb_tcpretrycnt.B[EDI]	;Increment the retry count
+	MOVB	DL, dcb_tcpretrycnt.B[EDI] ;Get retry number
+	CMPB	DL, dcb_tcpretry1.B[EDI];At first threshold?
+	JG	12$.S
+	JNE	14$.S			;No - go on
+	PUSHL	EAX
+	MOVL	EAX, dcb_ipsrmtaddr.B[EDI] ;Yes - remove entry from the routing
+	PUSHL	EDI			  ;  table to force us to re-do whatever
+	MOVL	EDI, dcb_netpdb.B[EDI]	  ;  we do to get the hardware address
+	PUSHL	EBX
+	CALL	xosipsRtRmvOne##
+	POPL	EBX
+	POPL	EDI
+	POPL	EAX
+	JMP	14$.S
+
+;Here if past the first threshold - fail if we do not have an address for the
+;  packet
+
+12$:	PUSHL	EAX
+	MOVL	EAX, dcb_ipsrmtaddr.B[EDI]
+	PUSHL	EDI
+	MOVL	ESI, dcb_netsdb.B[EDI]
+	MOVL	EDI, dcb_netpdb.B[EDI]
+	PUSHL	EBX
+	CALL	xosipsRtChkAddr##
+	POPL	EBX
+	POPL	EDI
+	POPL	EAX
+	JC	30$
+14$:	MOVL	EDX, dcb_tcprndave[EDI] ;Double the retransmit interval
+	MOVL	dcb_tcprndvar[EDI], EDX
+	SHLL	dcb_tcprxmtint[EDI], #1
+	SHLL	dcb_tcprndave[EDI], #1
+	MOVL	dcb_tcprndvar[EDI], #0
+	CMPL	dcb_tcprxmtint[EDI], #TIMEOUT_TRNMAX/FDPERTICK ;Too big?
+	JB	16$.S			;No
+	MOVL	dcb_tcprxmtint[EDI], #TIMEOUT_TRNMAX/FDPERTICK    ;Yes - set it
+	MOVL	dcb_tcprndave[EDI], #{TIMEOUT_TRNMAX/FDPERTICK}*2 ;  to the max
+16$:
+.IF NE $$TCPTIME
+	PUSHL	EAX
+	MOVL	EDX, tcptimepnt#
+	MOVL	EAX, knlTickTtl##
+	MOVL	[EDX], EAX
+	MOVW	4.B[EDX], #-1
+	MOVL	EAX, dcb_tcprxmtint[EDI]
+	MOVW	6.B[EDX], AX
+	MOVL	EAX, dcb_tcprndave[EDI]
+	ADDL	EAX, EAX
+	MOVW	8t.B[EDX], AX
+	MOVL	EAX, dcb_tcprndvar[EDI]
+	SHLL	EAX, #2t
+	MOVW	10t.B[EDX], AX
+	MOVL	12t.B[EDX], #0
+	ADDL	EDX, #16t.B
+	CMPL	EDX, #tcptimeend#
+	JB	18$.S
+	MOVL	EDX, #tcptimering#
+18$:	MOVL	tcptimepnt#, EDX
+	POPL	EAX
+.ENDC
+	MOVB	DL, dcb_tcpretrycnt.B[EDI]
+	CMPB	[ESP], #0		;Are we probing the window?
+	JNE	20$.S			;Yes
+	CMPB	dcb_tcpretry2.B[EDI], #0 ;No - want infinite retry?
+	JNE	22$.S			;No
+20$:	CMPB	DL, #255t		;Yes - at maximum value?
+	JB	22$.S			;No
+	DECB	dcb_tcpretrycnt.B[EDI]	;Yes - keep it there
+	JMP	24$.S
+
+;Here if should check for too many retransmits
+
+22$:	CMPB	DL, dcb_tcpretry2.B[EDI] ;At second threshold?
+	JAE	30$.S			;Yes - its time to fail!
+24$:	SUBL	dcb_tcpoutsnum[EDI], EAX ;Adjust the send sequence number
+	ADDL	dcb_tcpoutwina[EDI], EAX ;And the available output window
+	MOVL	EAX, dcb_tcpoutack[EDI]	 ;Back up the taker pointer to the ACK
+	MOVL	dcb_tcpouttake[EDI], EAX ;  pointer
+	ANDB	dcb_tcpsts2.B[EDI], #~TCPS2$REXMIT
+	ORB	dcb_tcpsts2.B[EDI], #TCPS2$FORCE
+	MOVL	EAX, dcb_ipstpdb.B[EDI]	;Count the retransmission
+	INCL	tpdb_tcpcntrexmit[EAX]
+	CALL	xostcpCheckSend		;Send a packet
+	CALL	tcprexmitreq		;Restart the timer (SHOULD CHANGE THIS
+					;  TO REUSE THE SAME WAKE BLOCK!!!)
+	ANDB	dcb_tcpsts2.B[EDI], #~TCPS2$FORCE
+	POPL	EAX
+	CMPB	AL, #0			;Was this a window probe?
+	JE	28$.S			;No
+	DECL	dcb_tcpoutsnum[EDI]
+	DECL	dcb_tcpoutwina[EDI]
+	DECL	dcb_tcpouttake[EDI]
+	JNS	28$.S
+	MOVL	EAX, dcb_tcpoutsize[EDI]
+	DECL	EAX
+	MOVL	dcb_tcpouttake[EDI], EAX
+	CLC
+	RET
+
+;Here if not sending a window probe
+
+28$:	ORB	dcb_tcpsts2.B[EDI], #TCPS2$REXMIT ;Indicate retransmitting
+	CLC
+	RET
+
+;Here if have retransmitted a packet too many times
+
+30$:	ADDL	ESP, #4t.B
+	MOVL	EAX, #ER_NCLST		;Get error code
+	CALL	xostcpGiveAll		;Give up all buffers
+	CALL	tcplost#		;Indicate connection lost
+	CLC
+	RET
+.PAGE
+	.SBTTL	tcprexmitreq - Subroutine to enter retransmit wake request for TCP
+
+;Subroutine to enter retransmit wake request for TCP
+;	CALL	tcprexmitreq
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+
+tcprexmitreq::
+	MOVL	EAX, dcb_tcprxmtint[EDI] ;Get the retransmit interval
+	MOVL	EBX, #tcprexmit
+xostcpTimerReq:
+	PUSHL	ESI
+	CMPL	dcb_tcprxmtwake[EDI], #0.B ;Have a timer going now?
+	JE	4$.S			;No
+	MOVL	ESI, dcb_tcprxmtwake[EDI] ;Yes - clear it first
+	CALL	knlWakeRemove##
+4$:	CALL	knlWakeRequest##	;Enter the wake request
+	MOVL	dcb_tcprxmtwake[EDI], ESI ;Store offset of the timer block (this
+	POPL	ESI			  ;  will be 0 if an error occured)
+	RET				;Finished
+
+	.SBTTL	xostcpTimerRmv - Subroutine to remove retransmit wake request for TCP
+
+;Subroutine to remove retransmit wake request for TCP
+;	CALL	xostcpTimerRmv
+
+xostcpTimerRmv::
+	CMPL	dcb_tcprxmtwake[EDI], #0.B ;Have a timer going now?
+	JE	ret040.S		;No
+	PUSHL	ESI			;Yes - kill it
+	MOVL	ESI, dcb_tcprxmtwake[EDI]
+	CALL	knlWakeRemove##
+	CLRL	ESI
+	MOVL	dcb_tcprxmtwake[EDI], ESI
+	POPL	ESI
+ret040:	RET
+.PAGE
+	.SBTTL	tcpsetack - Subroutine to set up ACK number and window value
+
+;Subroutine to set up ACK number and window value in TCP header and to
+;  calculate and store the checksum for the TCP packet
+;	c{EBX} = Offset of packet
+;	c{EDI} = Offset of DCB
+;	CALL	tcpsetack
+
+tcpsetack::
+	CMPL	dcb_tcpackwake[EDI], #0.B ;Is the ACK timer running now?
+	JE	2$.S			;No
+	PUSHL	ESI			;Yes - stop it
+	MOVL	ESI, dcb_tcpackwake[EDI]
+	CLRL	EAX
+	MOVL	dcb_tcpackwake[EDI], EAX
+	CALL	knlWakeRemove##
+	POPL	ESI
+2$:	MOVZBL	ECX, npb_tpofs.B[EBX]
+	MOVL	EAX, dcb_tcprcvsnum.B[EDI] ;Get receive sequence number
+	MOVL	dcb_tcprcvtnum.B[EDI], EAX ;Remember we have sent an ACK for it
+	XCHGB	AL, AH			;Change to network byte order
+	RORL	EAX, #16t
+	XCHGB	AL, AH
+	MOVL	tcp_acknum.B[EBX+ECX], EAX ;Store in the packet
+	MOVL	EAX, dcb_tcprcvwinb.B[EDI] ;Get window size
+	MOVL	dcb_tcprcvwina.B[EDI], EAX ;Remember we have sent this value
+	XCHGB	AL, AH			;Change to network byte order
+	MOVW	tcp_window.B[EBX+ECX], AX ;Store in the packet
+	ORB	tcp_code.B[EBX+ECX], #TCPC$ACK
+tcpchksum::
+	MOVL	EDX, dcb_ipstpdb.B[EDI]	;Get offset of the TPDB
+	INCL	tpdb_tcpcntpktout.B[EDX] ;Bump output counts
+	MOVL	ECX, npb_count.B[EBX]	;Get total length of packet
+	MOVZBL	EAX, npb_tpofs.B[EBX]	;Get offset of start of TCP part
+	SUBL	ECX, EAX		;Calculate length of TCP part
+	ADDL	tpdb_tcpcntbyteout.B[EDX], ECX
+	MOVL	EAX, dcb_netpdb.B[EDI]	;Need to calculate checksum value?
+tcpchksum2::
+	TESTB	pdb_ipchksumh[EAX], #PCSH$GEN
+	JE	ret040.S		;No - nothing more needed here
+	PUSHL	ESI			;The first 2 longs for the pseudo-header
+					;  are found in the IP header
+	MOVZBL	ESI, npb_npofs.B[EBX]	     ;Get offset of the IP header source
+	LEAL	ESI, ip_srcipaddr.B[ESI+EBX] ;  IP address field
+	CLD
+	LODSL	[ESI]			;Get first 32 bits
+	ADDL	EAX, [ESI]		;Add in next 32 bits (destination IP
+	ADCL	EAX, #0.B		;  address)
+	MOVZBL	ESI, npb_tpofs.B[EBX]	;Point to the TCP header
+	ADDL	ESI, EBX
+	MOVW	tcp_checksum.B[ESI], #0	;Make sure checksum field is 0
+	MOVL	EDX, npb_count.B[EBX]	;Get total length of TCP part (including
+	MOVZBL	ECX, npb_tpofs.B[EBX]	;  the TCP header)
+	SUBL	EDX, ECX
+	MOVL	ECX, EDX		;Copy it for use below as a count
+	XCHGB	DL, DH
+	SHLL	EDX, #16t		;Position it for the checksum
+	MOVB	DH, #IPP_TCP		;Include the protocol value
+	ADDL	EAX, EDX		;Add into checksum value
+	ADCL	EAX, #0.B
+	CALL	xosipsChkSumFin##	;Calculate checksum for data part of
+	NOTL	EAX			;  the packet
+	MOVZBL	ECX, npb_tpofs.B[EBX]	;Store final checksum value
+	MOVW	tcp_checksum.B[EBX+ECX], AX
+	POPL	ESI
+	RET
+.PAGE
+	.SBTTL	xostcpFatal - Subroutine to indicate have had fatal application error
+
+;Subroutine to indicate have had fatal application level protocol error
+;	CALL	xostcpFatal
+;	C:set always
+;  EAX is preserved
+
+xostcpFatal:
+	PUSHL	EAX
+	ORB	dcb_tcpsts2.B[EDI], #TCPS2$FATAL ;Indicate fatal error
+	CALL	xostcpGiveAll		;Give up all buffers we have
+	CALL	xostcpSendReset
+	CALL	xostcpHashClr		;Remove for the input hash list
+	MOVB	dcb_tcpstate.B[EDI], #TCPS_CLOSED ;Indicate idle
+4$:	POPL	EAX
+	STC
+	RET
+.PAGE
+	.SBTTL	xostcpGiveAll - Subroutine to give up all packet buffers
+
+;Subroutine to give up all packet buffers
+;	c{EDI} = Offset of DCB
+;	CALL	xostcpGiveAll
+;  c{EAX} is respected
+
+xostcpGiveAll::
+	PUSHL	EAX
+	CALL	xostcpTimerRmv		;Stop retransmit timer if its running
+	CMPL	dcb_tcpackwake[EDI], #0.B ;Is the ACK timer running?
+	JE	2$.S			;No
+	PUSHL	ESI			;Yes - stop it
+	MOVL	ESI, dcb_tcpackwake[EDI]
+	CLRL	EAX
+	MOVL	dcb_tcpackwake[EDI], EAX
+	CALL	knlWakeRemove##
+	POPL	ESI
+2$:	POPL	EAX
+giveal2:MOVL	EBX, dcb_tcprcvoosl[EDI] ;Do we have any out-of-sequence
+	TESTL	EBX, EBX		 ;  packets?
+	JE	6$.S			;No
+	CLRL	ECX			;Yes
+	MOVL	dcb_tcprcvoosl[EDI], ECX
+	CALL	xosnetGiveList##
+6$:	MOVL	EBX, dcb_tcprcvtakb.B[EDI] ;Do we have any receive packets?
+	CLRL	ECX
+	TESTL	EBX, EBX
+	JE	xostcpClearSnd.S	;No
+	MOVL	dcb_tcprcvtakb.B[EDI], ECX ;Yes
+	MOVL	dcb_tcprcvtakp.B[EDI], ECX
+	MOVL	dcb_tcprcvtakc.B[EDI], ECX
+	MOVL	dcb_tcprcvavl[EDI], ECX
+	MOVL	dcb_tcprcvputb.B[EDI], ECX
+	MOVL	dcb_tcprcvputp.B[EDI], ECX
+	MOVL	dcb_tcprcvcnt[EDI], ECX
+	CALL	xosnetGiveList##
+xostcpClearSnd:
+	MOVL	dcb_tcpouttake[EDI], ECX
+	MOVL	dcb_tcpoutput[EDI], ECX
+	MOVL	dcb_tcpoutack[EDI], ECX
+	MOVL	dcb_tcpoutpush[EDI], ECX
+	ANDB	dcb_tcpsts2.B[EDI], #~{TCPS2$NEEDFIN|TCPS2$SENTFIN}
+10$:	RET
+.PAGE
+
+;	c[AX] = Function
+;		  1 = about to send
+;		  2 = ACK done
+;		  3 = put block
+;		  4 = check send (before check)
+;		  5 = check send (after check)
+;	c[CX] = Amount
+
+;Data stored:
+;  0  2  Function
+;  2  2  dcb_tcpoutput
+;  4  2  dcb_tcpoutack
+;  6  2  dcb_tcpouttake
+;  8  2  dcb_tcpoutpush
+; 10  2  dcb_tcpoutwina
+; 12  2
+; 14  2  amount
+
+putinxxx::
+	CMPW	dcb_ipslclport.B[EDI], #7571t
+	JNE	8$.S
+	CMPL	dcb_ipsrmtaddr.B[EDI], #0900050Ah
+	JNE	8$.S
+	PUSHL	EDX
+	MOVL	EDX, xxxpnt
+	CMPL	EDX, #xxxend
+	JL	2$.S
+	MOVL	EDX, #xxxrng
+	MOVL	xxxpnt, EDX
+2$:	MOVW	[EDX], AX
+	MOVL	EAX, dcb_tcpoutput[EDI]
+	MOVW	2.B[EDX], AX
+	MOVL	EAX, dcb_tcpoutack[EDI]
+	MOVW	4.B[EDX], AX
+	MOVL	EAX, dcb_tcpouttake[EDI]
+	MOVW	6.B[EDX], AX
+	MOVL	EAX, dcb_tcpoutpush[EDI]
+	MOVW	8.B[EDX], AX
+	MOVL	EAX, dcb_tcpoutwina[EDI]
+	MOVW	10t.B[EDX], AX
+	MOVW	14t.B[EDX], CX
+	ADDL	xxxpnt, #16t.B
+	POPL	EDX
+8$:	RET
+
+	DATA
+
+xxxrng::.BLKW	512t*8
+xxxend::.LONG	0FFFFFFFFh
+xxxpnt::.LONG	xxxrng
+
+xdatatop::
+
+	CODE
+
+xcodetop::
+
+	LKEEND

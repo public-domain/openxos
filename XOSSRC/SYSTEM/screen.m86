@@ -1,0 +1,1658 @@
+	.TITLE	SCREEN - Screen symbiont for XOS
+
+;++++
+; This software is in the public domain.  It may be freely copied and used
+; for whatever purpose you see fit, including commerical uses.  Anyone
+; modifying this software may claim ownership of the modifications, but not
+; the complete derived code.  It would be appreciated if the authors were
+; told what this software is being used for, but this is not a requirement.
+
+;   THIS SOFTWARE IS PROVIDED BY THE AUTHORS "AS IS" AND ANY EXPRESS OR
+;   IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
+;   OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+;   IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+;   INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+;   BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS
+;   OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+;   ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR
+;   TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
+;   USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+;----
+
+	.PROC	80386
+	.INCLUD	XOSINC:\XMAC\XOS.PAR
+	.INCLUD	XOSINC:\XMAC\XOSX.PAR
+	.INCLUD	XOSINC:\XMAC\XOSTRM.PAR
+	.INCLUD	XOSINC:\XMAC\XOSXTRM.PAR
+	.INCLUD	XOSINC:\XMAC\XOSTIME.PAR
+
+	.SEG	code_s, CODE, 32BIT
+	.MSECT	code_m, code_s, ADDR=1000
+	.PSECT	code_p, code_m
+	.SEG	data_s, DATA, 32BIT
+	.MSECT	data_m, data_s, ADDR=1000
+	.PSECT	data_p, data_m
+
+;This program provides services needed to switch virtual console screens.
+;  It is initialized as a symbiont with the following command line:
+;	SCREEN pid name:num
+;	  Where pid  = PID of requesting process - used for response messages
+;		name = Base name of the display device (such as TRM0)
+;		num  = Number of virtual screens to create
+;  This is normally done using the SYMBIONT command as follows:
+;	SYMBIONT SCREEN name:num
+
+;When switching screens the state of the display is saved and restored by
+;  this program using the svcScnXxxxx system calls. For text mode, this
+;  includes the complete display buffer contents. For graphic modes, the
+;  screen buffer contents is not saved or restored.  For text mode, this
+;  program displays and responds to the screen switch menu independent of
+;  the application using the screen.  For graphic modes, the application
+;  using the screen is responsible for displaying and responding to the
+;  screen switch menu.  Normally, the only application that directly accesses
+;  the display in a graphic mode is the XWS server, so this does not cause
+;  a problem.
+
+;When the display is in text mode and a message is received indicating that
+;  the PRTSCN key has been pressed, the following actions are taken:
+;	1. The first page of display memory is read and virtualized and the
+;	   display is blocked.
+;	2. The screen select menu is directly written to the display buffer.
+;	3. The screen is unblocked.
+;	4. If anything is written to the first page of the screen, it is
+;	   copied to the real display buffer every 1/20 second, respecting
+;	   the screen select menu.
+;  When a message is received indicating that a key has been pressed, the
+;  following actions are taken:
+;	1. If the key requests that the menu be removed, the first page is
+;	   written from the virtual buffer and the page is unvirtualized.
+;	2. If the key requests a screen switch, the remainder of the display
+;	   buffer is read and virtualized, the current screen is switched,
+;	   and the new screen is written an unvirtualized.
+;	3. All other keys are ignored.
+;When the display is in a graphic mode and a message is received indicating
+;  that the PRTSCN key has been pressed, a message is sent to the program
+;  that has been registered to handle screen switching for that screen.  If
+;  no program is registered, the PRTSCN key is ignored.
+
+VERSION=!4t
+EDITNO =!0t
+
+phybufr=!3F0000h	;Address where physical display buffer is mapped
+scnbufr=!400000h	;Address for first virtual screen buffer
+MAXSCNS=!23t		;Maximum number of virtual screens (this is the
+			;  maximum number which will fit in the menu without
+			;  scrolling - if we need to make it bigger, we must
+			;  be able to scroll the menu!)
+VECT_MESSAGE=!24t	;Signal vector for message received
+VECT_PFTIMER=!25	;Signal vector for page fault timer
+
+;Define offsets in the virtual screen data blocks
+
+$$$=!0
+BLK vs_next   , 4t	;Offset of next VSB
+BLK vs_prev   , 4t
+BLK vs_mode   , 1t	;Screen mode
+BLK vs_status , 1t	;Status bits
+BLK vs_num    , 1t	;Virtual screen number
+BLK           , 1t
+BLK vs_xtdb   , 4t	;Exec offset of exec TDB for screen
+BLK vs_buffer , 4t	;Memory offset for virtual buffer
+BLK vs_name   , 8t	;Name of terminal
+BLK vs_prgaddr, 36t	;IPM address for registered program
+BLK vs_prgname, 36t	;Name of program to display in session menu
+BLK vs_pglist , 32t*4	;Page list
+vs_SIZE=!$$$
+
+;Define bits for the vs_status byte
+
+VS$INUSE  =!01h		;Screen is in use
+.PAGE
+	.SBTTL	Start of program
+
+	.PSECT	code_p
+	.START	start
+
+start:	MOVL	EAX, #!data_p
+	MOVL	DS, EAX
+	PUSHL	ES
+	PUSHL	EDI
+	PUSHL	DS			;Change our process name
+	PUSHL	#ourname
+	CALLF	svcSysSetPName##
+	PUSHL	DS			;Find top of our data segment
+	PUSHL	#data_p
+	PUSHL	#0.B
+	PUSHL	#-1.B
+	CALLF	svcMemChange##
+	ADDL	EAX, #data_p
+	MOVL	memalloc, EAX		;Store highest
+	POPL	EDI
+	POPL	ES
+	MOVL	ESI, ES:arg_cmdofs	;Get offset of argument string
+	CALL	skipwsp
+	JE	badarg
+4$:	MOVB	AL, ES:[ESI]
+	INCL	ESI
+	CMPB	AL, #0
+	JE	notodo
+	CMPB	AL, #' '
+	JE	6$.S
+	CMPB	AL, #HT
+	JNE	4$.S
+6$:	MOVL	EDI, #dststr
+8$:	MOVB	AL, ES:[ESI]
+	INCL	ESI
+	CMPB	AL, #0
+	JE	10$.S
+	CMPB	AL, #' '
+	JE	10$.S
+	MOVB	[EDI], AL
+	INCL	EDI
+	JMP	8$.S
+
+10$:	MOVB	[EDI], #0
+	CMPB	AL, #0			;End here?
+	JE	notodo			;Yes - nothing to do!
+	MOVW	CX, #':'+':'*100h	;Value must end with :
+	CALL	getdecarg		;Get decimal value for unit number
+	JC	badarg			;If bad value
+	MOVL	unitnum, EDX		;Save unit number
+	MOVW	CX, #' '
+	CALL	getdecarg		;Get number of virtual screens
+	JC	badarg
+	CMPL	EDX, #1
+	JG	12$.S
+	MOVL	EDX, #2
+12$:	CMPL	EDX, #MAXSCNS		;Is it too big?
+	JBE	14$.S			;No
+	MOVL	EDX, #MAXSCNS		;Yes - just set up as many as we can
+14$:	MOVL	numscns, EDX		;Save it
+	CMPB	ES:[ESI], #0		;More arguments?
+	JNE	badarg			;Yes - error
+	PUSHL	ES			;No - give up the argument segment
+	CALLF	svcMemRemove##
+	PUSHL	#VECT_MESSAGE.B		;Set the message available vector
+	PUSHL	#84h+{VT_XOSS<8}
+	PUSHL	CS
+	PUSHL	#havemsg
+	CALLF	svcSchSetVector##
+	MOVL	EBX, #msgsfmsg
+	TESTL	EAX, EAX
+	JS	fail
+	PUSHL	#VECT_PFTIMER.B		;Set the page fault timer vector
+	PUSHL	#84h+{VT_XOSS<8}
+	PUSHL	CS
+	PUSHL	#pftimer
+	CALLF	svcSchSetVector##
+	TESTL	EAX, EAX
+	JS	fail
+	MOVL	EDI, #trmname+3		;Construct terminal name
+	MOVL	EAX, unitnum
+	CALL	strnmbr
+	MOVL	[EDI], #'S1:'
+	INCL	EDI			;Save pointer to place to put virtual
+	MOVL	tnpnt, EDI		;  screen number
+	MOVL	EAX, DS
+	MOVL	ES, EAX
+	PUSHL	#0.B			;Open the terminal
+	PUSHL	DS
+	PUSHL	#trmname
+	PUSHL	#0.B
+	PUSHL	#0.B
+	CALLF	svcIoOpen##
+	TESTL	EAX, EAX
+	JS	nottrm
+	PUSHL	EAX
+	PUSHL	EAX
+	PUSHL	DS
+	PUSHL	#trmchar
+	CALLF	svcIoDevChar##
+	TESTL	EAX, EAX
+	JS	nottrm
+	PUSHL	#0.B			;Close the terminal (device descriptor
+	CALLF	svcIoClose##		;  is already on the stack)
+	MOVL	EAX, trmdsptype		;Copy values for the addunit calls
+	MOVL	aucdsptype, EAX
+	MOVL	EAX, trmioreg
+	MOVL	aucioreg, EAX
+	MOVL	EAX, trmkbioreg
+	MOVL	auckbioreg, EAX
+	MOVB	AL, trmkbint
+	MOVB	auckbint, AL
+
+;Loop to add all of the desired terminal units, one per virtual screen
+
+	MOVL	ECX, numscns		;Get number of screens to set up
+	MOVL	scnnum, #1		;Initialize screen number
+	DECL	ECX
+16$:	INCL	scnnum
+	MOVL	EAX, scnnum		;Store screen number for addunit
+	MOVB	aucscrnnum, AL
+	PUSHL	DS
+	PUSHL	#auqab
+	CALLF	svcIoQueue##		;Add a terminal unit
+	TESTL	EAX, EAX
+	JS	18$.S			;If error
+	MOVL	EAX, auqab+qab_error
+	TESTL	EAX, EAX
+18$:	JS	adderr
+	LOOP	ECX, 16$			;OK - continue if more to add
+
+;Here with all terminal units added, now create our internal data structures
+
+	MOVL	scnnum, #1
+20$:	MOVL	ECX, #vs_SIZE		;Get memory for a VSB
+	CALL	getmem
+	MOVL	EAX, scnnum		;Store pointer to the VSB in the
+	MOVL	vstbl-4[EAX*4], ESI	;  virtual screen table
+	MOVB	vs_mode.B[ESI], #0FFh	;Initialize the VSB
+	MOVB	DL, #0			;Assume not screen 1
+	CMPL	EAX, #1.B		;Right
+	JA	205$.S			;Yes
+	MOVB	DL, #VS$INUSE		;No
+205$:	MOVB	vs_status.B[ESI], DL
+	SHLL	EAX, #17t
+	ADDL	EAX, #scnbufr-20000h
+	MOVL	vs_buffer.B[ESI], EAX
+	MOVB	vs_prgaddr.B[ESI], #0	;Clear registered program address
+	MOVB	vs_prgname.B[ESI], #0	;Clear name to display
+	MOVL	EAX, prevvsb
+	TESTL	EAX, EAX
+	JE	21$.S
+	MOVL	[EAX], ESI
+21$:	MOVL	vs_prev.B[ESI], EAX
+	MOVL	prevvsb, ESI
+	MOVL	EAX, scnnum		;Store number of this screen
+	MOVB	vs_num.B[ESI], AL
+	MOVL	EDI, tnpnt		;Construct name of this screen
+	CALL	strnmbr
+	MOVW	[EDI], #0
+	MOVL	EAX, trmname+0
+	MOVL	vs_name+0.B[ESI], EAX
+	MOVL	EAX, trmname+4
+	MOVL	vs_name+4.B[ESI], EAX
+	MOVB	[EDI], #':'
+	PUSHL	#0.B			;Open the virtual screen
+	PUSHL	DS
+	PUSHL	#trmname
+	PUSHL	#0.B
+	PUSHL	#0.B
+	CALLF	svcIoOpen##
+	MOVL	EBX, #cntopnmsg
+	TESTL	EAX, EAX
+	JS	22$.S
+	PUSHL	EAX
+	PUSHL	EAX			;Get exec offset of exec TDB for
+	PUSHL	#0.B
+	CALLF	svcScnUtil##		;  the virtual screen
+	MOVL	EBX, #badtdbmsg
+	TESTL	EAX, EAX
+22$:	JS	fail
+	MOVL	vs_xtdb.B[ESI], EAX	;Save it
+	PUSHL	EAX			;Get the page list for the display
+					;  buffer
+	CLRL	EAX			;Assume screen 1
+	CMPL	scnnum, #1.B		;Right?
+	JE	24$.S			;Yes
+	MOVB	AL, #SSR$BLKVIRT	;No - block all virtualized pages
+24$:	PUSHL	EAX
+	PUSHL	#0.B
+	PUSHL	#32t.B
+	PUSHL	DS
+	LEAL	EAX, vs_pglist.B[ESI]
+	PUSHL	EAX
+	PUSHL	#0.B
+	PUSHL	#0.B
+	CALLF	svcScnTrans##
+	MOVL	EBX, #badpglmsg
+	TESTL	EAX, EAX
+	JS	22$.S
+	PUSHL	#0.B			;Close the virtual screen
+	CALLF	svcIoClose##
+	INCL	scnnum			;Continue if more screens for this
+	MOVL	EAX, scnnum		;  terminal
+	CMPL	EAX, numscns
+	JBE	20$
+	MOVL	[ESI], #0		;Clear last link
+	MOVL	EAX, vstbl		;First screen is the current screen
+	MOVL	curscn, EAX
+
+;Here with all display related internal data set up
+
+	PUSHL	vs_xtdb.B[ESI]		;Map the physical buffer
+	PUSHL	DS
+	PUSHL	#phybufr
+	PUSHL	#64t*1024t
+	CALLF	svcScnMapBufr##
+	MOVL	EBX, #cntmapmsg
+	TESTL	EAX, EAX
+	JS	26$.S
+	PUSHL	DS			;Virtually allocate our screen buffer
+	PUSHL	#scnbufr
+	PUSHL	#PG$READ|PG$WRITE|PG$VIRTUAL
+	MOVL	EAX, numscns
+	SHLL	EAX, #17t
+	PUSHL	EAX
+	CALLF	svcMemChange##
+	MOVL	EBX, #bfralcmsg
+	TESTL	EAX, EAX
+26$:	JS	fail
+	MOVL	EDI, #msgname+11t	;Construct message name
+	MOVL	EAX, unitnum
+	CALL	strnmbr
+	PUSHL	#O$IN|O$OUT.B		;Open the message device
+	PUSHL	DS
+	PUSHL	#msgname
+	PUSHL	#0.B
+	PUSHL	#0.B
+	CALLF	svcIoOpen##
+	MOVL	EBX, #msgerrmsg
+	TESTL	EAX, EAX
+	JS	fail			;If error
+	MOVL	msgqab+qab_handle, EAX	;OK - store message device handle
+	CMPW	dststr, #'0'		;Was a requestor address given?
+	JE	28$.S			;No - skip the symbiont message
+	MOVL	ESI, #finmsg1		;Yes - construct final message to the
+	MOVL	EDI, #msgbfr		;  requestor
+	PUSHL	DS
+	POPL	ES
+	MOVL	ECX, #FINMSG1SZ
+	CLD
+	RMOVSB	[EDI], [ESI]
+	MOVL	ESI, #trmname
+	MOVB	CL, #3
+	RMOVSB	[EDI], [ESI]
+	MOVL	EAX, unitnum		;Put unit number into name
+	CALL	strnmbr
+	MOVL	ESI, #finmsg2
+	MOVL	ECX, #FINMSG2SZ
+	RMOVSB	[EDI], [ESI]
+	MOVL	EAX, numscns
+	CALL	strnmbr
+	MOVL	ESI, #finmsg3
+	MOVL	ECX, #FINMSG3SZ
+	RMOVSB	[EDI], [ESI]
+	MOVL	ECX, EDI
+	MOVL	EDI, #msgbfr
+	SUBL	ECX, EDI
+	CALL	response
+28$:	MOVW	msgqab+qab_func, #QFNC_INBLOCK
+	MOVB	msgqab+qab_vector, #VECT_MESSAGE
+	MOVL	msgqab+qab_buffer1, #msgbfr ;Store offset of message
+	MOVL	msgqab+qab_count, #MSGBFRSIZE ;Store size of message buffer
+	PUSHL	DS			;Start message input
+	PUSHL	#msgqab
+	CALLF	svcIoQueue##
+	PUSHL	#0.B			;Set software interrupt level to 0
+	CALLF	svcSchSetLevel##	;  to allow interrupts
+	JMP	mainloop		;Initialization is complete
+.PAGE
+;Here if bad requestor PID specified
+
+badpid:	MOVL	EBX, #badpidmsg
+	JMP	fail.S
+
+;Here if invalid arguments
+
+badarg:	MOVL	EBX, #badargmsg
+	JMP	fail.S
+
+xfail:	CALL	alert
+terminate:
+	PUSHL	#1.B
+	CALLF	svcSchExit##
+
+;Here if no terminals specified
+
+notodo:	MOVL	EBX, #notodomsg
+	JMP	fail.S
+
+;Here if terminal does not exist or is not a display
+
+nottrm:	MOVL	EBX, #nottrmmsg
+	JMP	fail.S
+
+;Here if error adding a screen unit
+
+adderr:	MOVL	EBX, #adderrmsg
+
+;Here if fatal error
+
+fail:	PUSHL	#O$IN|O$OUT.B		;Open a message device for the
+	PUSHL	DS			;  error response
+	PUSHL	#gmdname
+	PUSHL	#0.B
+	PUSHL	#0.B
+	CALLF	svcIoOpen##
+	TESTL	EAX, EAX
+	JS	xfail			;If error
+	MOVL	msgqab+qab_handle, EAX	;Store message device handle
+	SUBL	ESP, #100t.B		;Allocate a buffer
+	PUSHL	DS
+	POPL	ES
+	MOVL	EDI, ESP
+	MOVL	ESI, #failmsg1
+	MOVL	ECX, #failsz1
+	CLD
+	RMOVSB	[EDI], [ESI]
+	MOVL	ESI, EBX
+4$:	LODSB	[ESI]
+	STOSB	[EDI]
+	ORB	AL, AL
+	JNE	4$.S
+	DECL	EDI
+	MOVL	ESI, #failmsg2
+	MOVL	ECX, #failsz2
+	RMOVSB	[EDI], [ESI]
+	MOVL	ECX, EDI
+	SUBL	ECX, ESP
+	MOVL	EDI, ESP
+	CALL	response
+	JMP	terminate.S
+.PAGE
+mainloop:
+	PUSHL	#0.B			;Wait for interrupt
+	PUSHL	#0.B
+	PUSHL	#-1.B
+	CALLF	svcSchSuspend##
+.PAGE
+	.SBTTL	alert - Subroutine to generate alert box
+
+;Subroutine to generate alert box - this is used to notify the user of a
+;  problem whenever we cannot get a response to the requestor for some reason
+;	c{EDI} = Offset of message text
+;	CALL	alert
+
+alert:	PUSHL	#1.B			;FOR NOW, JUST EXIT!!!!
+	CALLF	svcSchExit##
+.PAGE
+	.SBTTL	response - Subroutine to generate intermediate response message
+
+;Subroutine to generate intermediate response message
+;	c{EDI} = Offset of message
+;	c{ECX} = Length of message
+;	CALL	response
+
+response:
+	MOVL	EAX, msgqab+qab_handle	;Is the message device open?
+	TESTL	EAX, EAX
+	JNE	4$.S			;Yes - us it
+	MOVB	msgname+4, #0		;No - must open it just for this
+	PUSHL	#O$IN|O$OUT
+	PUSHL	DS
+	PUSHL	#msgname
+	PUSHL	#0.B
+	PUSHL	#0.B
+	CALLF	svcIoOpen##
+	TESTL	EAX, EAX
+	JS	8$.S
+	MOVL	msgqab+qab_handle, EAX
+4$:	PUSHL	EAX
+	PUSHL	DS
+	PUSHL	EDI
+	PUSHL	ECX
+	PUSHL	DS
+	PUSHL	#moparm
+	CALLF	svcIoOutBlockP##
+8$:	RET
+.PAGE
+	.SBTTL	havemsg - Message available routine
+
+;Get here as a result of a software interrupt when have a message has been
+;  received
+
+havemsg:PUSHAL				;Save registers
+	PUSHL	ES
+	PUSHL	FS
+	PUSHL	GS
+2$:	CMPL	msgqab+qab_error, #0.B	;Any errors?
+	JNE	nxtmsg.S		;Yes - ignore this
+	MOVB	AL, msgbfr+sss_pnum	;Get primary unit number
+	CMPB	AL, unitnum		;Is it ours?
+	JNE	nxtmsg.S		;No!
+	MOVZBL	EAX, msgbfr+sss_snum	;Yes - get secondary unit number
+	CMPB	AL, numscns		;Valid secondary unit number?
+	JA	nxtmsg.S		;No
+	MOVL	ESI, vstbl-4[EAX*4]	;Yes - get offset of its VSB
+	CMPB	msgbfr+sss_dspmode, #DM_TEXT ;Text mode?
+	JNE	4$.S			;No
+	MOVB	vs_prgaddr.B[ESI], #0	;Yes - unregister any associated program
+4$:	MOVB	AL, msgbfr+sss_func	;No - get function
+	CMPB	AL, #MT_SSSTATUS	;Screen status report?
+	JE	ssstatus		;Yes
+	CMPB	AL, #MT_SSALMCHAR	;No - menu character?
+	JE	menuchar		;Yes
+	CMPB	AL, #MT_SSPAGEFLT	;No - page fault report?
+	JE	pagefault		;Yes
+	CMPB	AL, #MT_SSREGPRG	;No - request to register program?
+	JE	register		;Yes
+	CMPB	AL, #MT_SSREPORT	;No - action report from program?
+	JE	report			;Yes
+nxtmsg:	MOVB	msgqab+qab_vector, #0	;Restart message input
+	PUSHL	DS
+	PUSHL	#msgqab
+	CALLF	svcIoQueue##
+	TESTL	EAX, EAX
+	JS	8$.S
+	MOVB	msgqab+qab_vector, #VECT_MESSAGE
+	TESTB	msgqab+qab_status+1, #QSTS$DONE>8 ;Did we get another message?
+	JNE	2$			;Yes - process it
+8$:	POPL	GS			;No - restore registers
+	POPL	FS
+	POPL	ES
+	POPAL
+	CALLF	svcSchDismiss##		;And dismiss the interrupt
+.PAGE
+	.SBTTL	pagefault - Page fault report
+
+;Here for a page fault report - This message reports that an access has been
+;  made to a blocked terminal page.  There are two cases:
+;	1. The session menu is on the screen and an attempt was made to
+;	   access a visible page (all of which have been blocked).  In this
+;	   case, all pages are unblocked and a 1/20 second timer is started.
+;	   After 1/20 second, any visible pages which have been modified are
+;	   copied to the physical buffer (masked by the area covered by the
+;	   menu).  If there are any changes, the timer is restarted.  If there
+;	   are no changes, the visible are blocked again.  This will always
+;	   involve the current screen.
+;	2. An access was made to a non-modified page which has not been
+;	   virtualized.  In this case the page is intialized according to the
+;	   page list value and is fully virtualized and unblocked.
+
+pagefault:
+	CMPL	menucnt, #0.B		;Is the menu on the screen?
+	JE	initpage		;No - go initialize the page that was
+					;  accessed
+	CMPL	ESI, curscn		;Yes - is this for the current screen?
+	JNE	initpage		;No
+
+;Here if have the menu on the screen and this is for the current screen - in
+;  this case, only the visible pages are blocked.
+
+	PUSHL	vs_xtdb.B[ESI]		 ;Unblock the visible pages and wake
+	PUSHL	#SSW$WRITE|SSW$UNBLKONLY ;  up anyone who is waiting
+	PUSHL	menupage
+	PUSHL	menucnt
+	PUSHL	DS
+	LEAL	EAX, vs_pglist.B[ESI]
+	PUSHL	EAX
+	PUSHL	DS
+	PUSHL	vs_buffer.B[ESI]
+	CALLF	svcScnTrans##
+	MOVB	menublkd, #0
+	CMPL	menutmr, #0.B		;Already requested a signal?
+	JNE	nxtmsg			;Yes - finsihed here
+	PUSHL	#3.B			;No - request alarm signal in 1/20
+	PUSHL	#0.B			;  second
+	PUSHL	#VECT_PFTIMER.B
+	PUSHL	#0.B
+	PUSHL	#0.B
+	PUSHL	#XT_SECOND/20t
+	CALLF	svcSchAlarm##
+	TESTL	EAX, EAX
+	JS	nxtmsg
+	MOVL	menutmr, EAX
+	JMP	nxtmsg
+
+;Here if the menu is not on the screen or this is not for the current screen -
+;  Note that it should not be possible to get here for the current screen
+;  since the only time any of its pages should be blocked is when the menu
+;  is on the screen.
+
+;Note that when realizing character/attribute pages we initialize the page
+;  with the value specified in the page list.  For character generator pages
+;  we just touch the page to allocate it!  Its fairly complex to initialize a
+;  character generator page and the code to do this is already in the kernel,
+;  so it seems reasonable to let the kernel initialize it.  It turns out that
+;  in the most common case, it isn't even necessary to initialize it!  Also,
+;  this means we don't have to worry about accessing the kernel's font tables.
+
+initpage:
+	MOVL	EDI, msgbfr+sss_offset	;Get the offset in the screen buffer
+	MOVL	EDX, EDI		;Get the page number
+	SHRL	EDX, #12t
+	MOVL	ECX, EDI
+	ANDL	ECX, #0FFFh		;Get offset in page
+	CMPL	ECX, #0FFCh		;Might it span to the next page?
+	JBE	4$.S			;No
+	TESTB	vs_pglist+3.B[ESI+EDX*4], #02h ;Yes - is this page blocked?
+	JNE	4$.S			;Yes - unblock this page (if the access
+					;  really spans to the next page we
+					;  will get another report and that
+					;  time this page will not be blocked.
+	INCL	EDX			;No - unblock the next page
+	ADDL	EDI, #10.B
+4$:	ANDL	EDI, #0FFFFF000h
+	ADDL	EDI, vs_buffer.B[ESI]
+	CMPL	EDX, #16t.B		;Character generator page?
+	JB	6$.S			;No
+	TESTB	[ESI], #0		;Yes - just touch the page to
+	JMP	8$.S			;  allocate it
+
+;Here if not a character generator page - initialize it
+
+6$:	MOVL	EAX, vs_pglist.B[ESI+EDX*4] ;No - get page list entry
+	MOVL	EBX, EAX		;Change to a 32-bit value
+	SHLL	EAX, #16t
+	MOVW	AX, BX
+	PUSHL	DS			;Initialize the buffer page
+	POPL	ES
+	CLD
+	MOVL	ECX, #1024t
+	RSTOSL	[EDI]
+8$:	PUSHL	vs_xtdb.B[ESI]		 ;Unblock the page, update our page
+	PUSHL	#SSW$WRITE|SSW$UNBLKONLY ;  list, and wake up anyone who is
+	PUSHL	EDX			 ;  waiting
+	PUSHL	#1.B
+	PUSHL	DS
+	LEAL	EAX, vs_pglist.B[ESI]
+	PUSHL	EAX
+	PUSHL	DS
+	PUSHL	vs_buffer.B[ESI]
+	CALLF	svcScnTrans##
+	JMP	nxtmsg
+.PAGE
+;Here with the alarm signal 1/20 second after unblocking the virtualized
+;  visible pages when the session menu is on the screen
+
+
+
+pftimer:PUSHAL
+	PUSHL	#!data_p.B
+	POPL	DS
+	MOVL	menutmr, #0		;Clear the alarm handle
+	CMPL	menucnt, #0.B		;Still have a menu on the screen?
+	JE	10$.S			;No - nothing to do here
+	MOVL	ESI, curscn		;Yes
+	PUSHL	vs_xtdb.B[ESI]		;Update the physical screen if
+	PUSHL	menupage		;  necessary
+	PUSHL	menucnt
+	PUSHL	#30t.B			;Menu width
+	MOVL	EAX, numscns		;Menu height
+	ADDL	EAX, #2t.B
+	PUSHL	EAX
+	PUSHL	menubgn
+	PUSHL	DS
+
+$$$$mask::
+
+	PUSHL	vs_buffer.B[ESI]
+	CALLF	svcScnMaskWrt##
+	TESTL	EAX, EAX
+	JLE	8$.S			;If error or if nothing modified this
+	PUSHL	#3.B			;  time
+	PUSHL	#0.B			;Request another alarm signal in 1/20
+	PUSHL	#VECT_PFTIMER.B		;  second
+	PUSHL	#0.B
+	PUSHL	#0.B
+	PUSHL	#XT_SECOND/20t
+	CALLF	svcSchAlarm##
+	TESTL	EAX, EAX
+	JS	10$.S
+	MOVL	menutmr, EAX
+	JMP	10$.S
+
+;Here if nothing was modified during the previous 1/20 second - the visible
+;  pages have been blocked again
+
+8$:	MOVB	menublkd, #1
+10$:	POPAL
+	CALLF	svcSchDismiss##
+.PAGE
+	.SBTTL	register - Request to register program
+
+;Here for a request to register a program to handle screen switching
+
+register:
+	MOVL	ECX, #8t
+	PUSHL	DS
+	POPL	ES
+	CLD
+	PUSHL	EDI
+	PUSHL	ESI
+	LEAL	EDI, vs_prgaddr.B[ESI]	;Save the program's IPM address
+	MOVL	ESI, #rcvstr
+	RMOVSL	[EDI], [ESI]
+	POPL	ESI
+	POPL	EDI
+	CLRL	EAX			;Send a reponse to the program
+	MOVL	EAX, numscns
+	SHLL	EAX, #16t
+	CALL	sendaction
+	JMP	nxtmsg
+.PAGE
+	.SBTTL	report - Action report from program
+
+;Here for an action report from a program which is handling screen switching
+
+report:	MOVZBL	EAX, msgbfr+sss_action
+	CMPB	AL, #0			;Want to terminate the system-shift
+					;  state?
+	JNE	scrn			;No - go switch screens
+clrsss:	PUSHL	vs_xtdb.B[ESI]		;Yes - clear the system-shift state
+	PUSHL	#SSW$WRITE|SSW$CLRSSS
+	PUSHL	#0.B
+	PUSHL	#0.B
+	PUSHL	#0.B
+	PUSHL	#0.B
+	PUSHL	#0.B
+	PUSHL	#0.B
+	CALLF	svcScnTrans##
+	JMP	nxtmsg
+.PAGE
+	.SBTTL	menuchar - Menu character
+
+;Here for character when the session select menu is on the screen - also get
+;  here for make or break of PRTSCN key at all times
+
+menuchar:
+	MOVW	AX, msgbfr+sss_char	;Get character
+	ORB	AH, AH			;Is it a break code?
+	JS	nxtmsg			;Yes - ignore it
+	CMPB	vs_prgaddr.B[ESI], #0	;No - is a program registered for
+					;  this screen?
+	JNE	haveprg			;Yes
+dochar:	CMPB	AL, #7Fh		;No - is it the PRTSCN key?
+	JE	ssmake			;Yes
+	CMPL	menucnt, #0.B		;Yes - is session memu on screen?
+	JE	nxtmsg			;No - ignore this!
+	PUSHL	EDI
+	PUSHL	CS			;No - see if its something else we
+	POPL	ES			;  want
+	MOVL	EDI, #codetbl
+	MOVL	ECX, #CODENUM
+	CLD
+	RNSCASB	[EDI]
+	MOVZBL	EAX, CS:codevsn-codetbl-1[EDI] ;Get corresponding virtual screen
+	POPL	EDI			       ;  number
+	JNE	nxtmsg			;Nothing we want - ignore it
+	CMPB	AL, #80h		;Special code?
+	JB	scrn.S			;No
+	JMPIL	codedsp-200[EAX*4]
+
+	.PSECT	data_p
+
+codedsp:.LONG	return
+	.LONG	esckey
+	.LONG	goup
+	.LONG	godown
+	.LONG	gohome
+	.LONG	goend
+
+	.PSECT	code_p
+
+;Here for the home key
+
+gohome:	MOVL	ESI, vstbl
+	JMP	8$.S
+
+;Here for the end key
+
+goend:	MOVL	EAX, numscns
+	MOVL	ESI, vstbl-4[EAX*4]
+	JMP	8$.S
+
+;Here for a key that moves the selection up
+
+goup:	MOVL	EAX, selscn
+	MOVL	ESI, vs_prev.B[EAX]
+	JMP	6$.S
+
+;Here for a key that moves the selection down
+
+godown:	MOVL	EAX, selscn
+	MOVL	ESI, [EAX]
+6$:	TESTL	ESI, ESI
+	JE	nxtmsg
+8$:	XCHGL	ESI, selscn
+	CALL	menuline
+	MOVL	ESI, selscn
+	CALL	menuline
+	JMP	nxtmsg
+.PAGE
+;Here for the return key
+
+return:	MOVL	EAX, selscn
+	MOVZBL	EAX, vs_num.B[EAX]
+
+;Here with a screen number
+
+scrn:	CMPL	EAX, numscns		;Is this a valid virtual screen for
+					;  this terminal?
+	JA	nxtmsg			;No - ignore it!
+	MOVL	ESI, vstbl-4[EAX*4]	;Get offset of VSB for new screen
+	CMPL	ESI, curscn		;Is this the current screen?
+	JE	esckey			;Yes - just remove menu
+	MOVL	scnnum, EAX		;No - remember it
+	CMPB	msgbfr+sss_dspmode, #DM_TEXT ;Text mode screen?
+	JNE	6$.S			;No - we don't save anything
+	MOVL	EBX, curscn		;Yes
+	CMPB	menublkd, #0		;Are the visible pages blocked?
+	JE	4$.S			;No
+	PUSHL	vs_xtdb.B[EBX]		 ;Yes - unblock the visible pages and
+	PUSHL	#SSW$WRITE|SSW$UNBLKONLY ;  wake up anyone who is waiting
+	PUSHL	menupage
+	PUSHL	menucnt
+	PUSHL	DS
+	LEAL	EAX, vs_pglist.B[EBX]
+	PUSHL	EAX
+	PUSHL	DS
+	PUSHL	vs_buffer.B[EBX]
+	CALLF	svcScnTrans##
+	MOVB	menublkd, #0
+4$:	PUSHL	vs_xtdb.B[EBX]		;Virtualize all display pages for this
+	PUSHL	#SSR$READ.B		;  screen
+	PUSHL	#0.B
+	PUSHL	#32t.B
+	PUSHL	DS
+	LEAL	EAX, vs_pglist.B[EBX]
+	PUSHL	EAX
+	PUSHL	DS
+	PUSHL	vs_buffer.B[EBX]
+	CALLF	svcScnTrans##
+6$:	MOVL	menucnt, #0		;Indicate menu not on screen
+	MOVL	EAX, scnnum
+	PUSHL	vs_xtdb.B[ESI]
+	PUSHL	#SSW$WRITE|SSW$SWITCH|SSW$CLRSSS
+	PUSHL	#0.B			;Restore all display pages for this
+	PUSHL	#32t.B			;  screen (If the new screen is in
+	PUSHL	DS			;  graphics mode all this will do is
+	LEAL	EAX, vs_pglist.B[ESI]	;  clear the system-shift state - the
+	PUSHL	EAX			;  graphics mode program is expected
+	PUSHL	DS			;  to do the rest!) This also switches
+	PUSHL	vs_buffer.B[ESI]	;  screens and wakes up anyone who is
+	CALLF	svcScnTrans##		;  waiting for a blocked page.
+
+	MOVL	curscn, ESI		;Remember this is the current screen
+	CMPL	vs_prgaddr.B[ESI], #0.B	;Is a program registered for this
+					;  screen?
+	JE	givepages.S		;No
+	MOVL	EAX, #0FFFFh		;Yes - tell it what has happened
+	CALL	sendaction
+givepages:
+	PUSHL	DS			;Give up all buffer pages for this
+	PUSHL	#scnbufr		;  screen
+	MOVL	EAX, vs_buffer.B[ESI]
+	SUBL	EAX, #scnbufr
+	PUSHL	EAX
+	ADDL	EAX, #10000h
+	PUSHL	EAX
+	PUSHL	#PG$READ|PG$WRITE|PG$VIRTUAL.B
+	CALLF	svcMemPageType##
+	JMP	nxtmsg
+.PAGE
+;Here for an alarm character from a screen which has a program registered
+;  to handle screen switching
+
+haveprg:MOVL	EAX, msgbfr+sss_char	;Get data
+	CALL	sendaction		;Send message to program
+	JNC	nxtmsg
+
+;Here if error sending action message - assume the process has terminated
+
+	MOVW	AX, msgbfr+sss_char	;Error - restore character
+	JMP	dochar			;And process it
+.PAGE
+;Here for make of the system-shift key - if the system-shift menu is already
+;  on the screen we just remove it, if not, we setup the contents of the
+;  menu and place it on the screen
+;	c{ESI} = Offset of VSB
+
+ssmake:	CMPL	menucnt, #0.B		;Is the session memu on screen?
+	JNE	esckey			;Yes - remove it!
+	PUSHL	vs_xtdb.B[ESI]		;No - get screen description
+	PUSHL	#DM$RTNDATA
+	PUSHL	DS
+	PUSHL	#modeblk
+	CALLF	svcTrmDspMode##
+	TESTL	EAX, EAX
+	JS	nxtmsg			;If error
+	MOVL	EAX, modeblk+dm_columns	;Yes - get screen width in bytes
+	ADDL	EAX, EAX
+	MOVL	scnwidth, EAX
+	MOVL	EAX, curscn
+	MOVL	selscn, EAX
+
+;Here to place session select menu on the screen
+
+	PUSHL	ESI			;Save the VSB
+	MOVL	ESI, vstbl		;Point to first VSB
+
+;Update program names for each screen
+
+updloop:MOVL	EAX, vs_name+0.B[ESI]
+	MOVL	ctname+0, EAX
+	MOVL	EAX, vs_name+4.B[ESI]
+	MOVL	ctname+4, EAX
+	PUSHL	DS
+	PUSHL	#chrqab
+	CALLF	svcIoQueue##		;Get the information
+	LEAL	EDI, vs_prgname.B[ESI]	;Point to place to put the name
+	ORL	EAX, chrqab+qab_error	;Error?
+	JNS	20$.S			;No - go on
+	MOVL	ECX, #24t		;Yes - clear the field
+12$:	PUSHL	DS
+	POPL	ES
+	CLD
+	MOVB	AL, #' '		;Clear the field
+	RSTOSB	[EDI]
+	JMP	30$.S			;Do fixup and try next screen
+
+;Here on successful get of program name
+
+20$:	MOVL	EBX, #pnbfr		;Point to the name
+	MOVL	ECX, #24t
+25$:	MOVB	AL, [EBX]		;Get character of name
+	INCL	EBX
+	CMPB	AL, #0			;At end of name?
+	JE	12$.S			;Yes - clear rest of field
+	MOVB	[EDI], AL		;No - store into name buffer
+	INCL	EDI
+	LOOP	ECX, 25$
+
+30$:	MOVL	ESI, [ESI]		;Advance to next VSB
+	TESTL	ESI, ESI
+	JNE	updloop			;Continue if more to do
+	POPL	ESI			;Restore current VSB
+.PAGE
+;Finished updating window data - Now display it.  We virtualize all visible
+;  display pages and then write our menu directly to the display buffer.
+
+upddone:MOVZBL	EAX, modeblk+dm_actpage	 ;Calculate offset in display buffer
+	IMULL	EAX, modeblk+dm_pagesize ;  of start of active page
+	MOVL	menubgn, EAX
+	MOVL	ECX, EAX		;Calculate end of active page
+	ADDL	ECX, modeblk+dm_pagesize
+	CLRL	EDX			;Get first page to virtualize
+	IDIVL	lit1000h
+	PUSHL	EAX
+	LEAL	EAX, 0FFFh[ECX]		;Get last page to virtualize
+	IDIVL	lit1000h
+	POPL	EDX
+	SUBL	EAX, EDX		;Get number of pages to virtualize
+	JNE	2$.S
+	INCL	EAX
+2$:	MOVL	menupage, EDX
+	MOVL	menucnt, EAX
+	PUSHL	vs_xtdb.B[ESI]
+	PUSHL	#SSR$READ|SSR$FCURSOR|SSR$BLKVIRT|SSR$VIRTALL.B
+	PUSHL	EDX			;Virtualize and block the pages,
+	PUSHL	EAX			;  freeze the cursor position
+	PUSHL	DS
+	LEAL	EAX, vs_pglist.B[ESI+EDX*4]
+	PUSHL	EAX
+	PUSHL	DS
+	PUSHL	vs_buffer.B[ESI]
+	CALLF	svcScnTrans##
+	MOVB	menublkd, #1		;Indicate visible pages are blocked
+	MOVL	EDI, scnwidth		;Calculate offset in display buffer
+	ADDL	EDI, #phybufr-60t	;  of first menu character
+	ADDL	EDI, menubgn
+	MOVL	menuleft, EDI
+	TESTL	EAX, EAX
+	JS	3$.S
+	MOVL	ECX, EAX
+	MOVL	EDX, menubgn
+	SHRL	EDX, #1t
+	SUBL	EAX, EDX
+	JLE	3$.S			;If cursor is above displayed area
+	CLRL	EDX
+	IDIVL	modeblk+dm_columns	;Get row and column for cursor
+	MOVL	EBX, numscns
+	ADDL	EBX, #2t.B
+	CMPL	EAX, EBX
+	JGE	3$.S			;If below menu
+	MOVL	EBX, modeblk+dm_columns
+	SUBL	EBX, #30t.B
+	CMPL	EDX, EBX
+	JB	3$.S			;If to left of menu
+	PUSHL	vs_xtdb.B[ESI]		;Under menu - remove the cursor
+	PUSHL	#-1.B
+	CALLF	svcScnUtil##
+3$:	MOVL	ESI, #blinet		;Write top line of menu
+	CALL	copyline
+	MOVL	ESI, vstbl		;Loop on all of the VSB to write the
+4$:	MOVZBL	EDI, vs_num.B[ESI]
+	IMULL	EDI, scnwidth
+	ADDL	EDI, menuleft
+	MOVW	[EDI], #13B3h		;Left side
+	MOVW	AX, #7120h		;Next character is blank or blinking
+	CMPL	ESI, curscn		;  arrow to indicate current screen
+	JNE	6$.S
+	MOVW	AX, #0F110h
+6$:	MOVW	2.B[EDI], AX
+	MOVB	AL, vs_num.B[ESI]	;Next character is screen "number"
+	ADDB	AL, #'0'		;  (1-9 or A-)
+	CMPB	AL, #'9'
+	JBE	8$.S
+	ADDB	AL, #'A'-'0'-10t
+8$:	MOVB	AH, #71h		;Assume in use
+	TESTB	vs_status.B[ESI], #VS$INUSE
+	JNE	10$.S
+	MOVB	AH, #73h		;Not in use, make it dim
+10$:	MOVW	4.B[EDI], AX
+	MOVW	6.B[EDI], #71DEh	;Seperator
+	CALL	menuline2
+	MOVW	[EDI], #13B3h		;Right side
+	MOVL	ESI, [ESI]		;Advance to next VSB
+	TESTL	ESI, ESI
+	JNE	4$.S			;Continue if more to do
+	MOVL	EDI, numscns		;Finished - write the bottom line
+	INCL	EDI
+	IMULL	EDI, scnwidth
+	ADDL	EDI, menuleft
+	MOVL	ESI, #blineb
+	CALL	copyline
+	JMP	nxtmsg			;Finished here
+.PAGE
+;Subroutine to display one menu line
+;	c{ESI} = Offset of VSB for screen for line
+;	CALL	menuline
+;	c{EDI} = Pointer to next character position after name field
+
+menuline:
+	MOVZBL	EDI, vs_num.B[ESI]
+	IMULL	EDI, scnwidth
+	ADDL	EDI, menuleft
+menuline2:
+	MOVW	AX, #7120h		;Leading blank
+	CMPL	ESI, selscn
+	JNE	12$.S
+	MOVB	AH, #31h
+12$:	MOVW	8.B[EDI], AX
+	ADDL	EDI, #10t.B		;Next store the program name
+	LEAL	EBX, vs_prgname.B[ESI]
+	MOVL	ECX, #25t
+14$:	MOVB	AL, [EBX]
+	INCL	EBX
+	CMPB	AL, #0
+	JE	16$.S
+	MOVW	[EDI], AX
+	ADDL	EDI, #2t.B
+	LOOP	ECX, 14$
+	RET
+
+16$:	DECL	ECX			;Fill out the line with blanks
+	JE	18$.S
+	PUSHL	DS
+	POPL	ES
+	CLD
+	MOVB	AL, #' '
+	RSTOSW	[EDI]
+18$:	RET
+.PAGE
+;Here for make of the ESC key
+
+esckey:	CMPL	menucnt, #0.B		;Is the menu displayed now?
+	JE	clrsss			;No - just clear the system-shift
+					;  state (This should not happen but
+					;  there may be some possible races!)
+	CMPL	menutmr, #0.B		;Yes - is the timer running?
+	JE	4$.S			;No
+	PUSHL	#1.B			;Yes - stop it
+	PUSHL	menutmr
+	PUSHL	#0.B
+	PUSHL	#0.B
+	PUSHL	#0.B
+	PUSHL	#0.B
+	CALLF	svcSchAlarm##
+	MOVL	menutmr, #0
+4$:	PUSHL	vs_xtdb.B[ESI]		;Unvirtualize the visible pages
+	PUSHL	#SSW$WRITE|SSW$CLRSSS
+	MOVL	EDX, menupage
+	PUSHL	EDX
+	PUSHL	menucnt
+	PUSHL	DS
+	LEAL	EAX, vs_pglist.B[ESI+EDX*4]
+	PUSHL	EAX
+	PUSHL	DS
+	PUSHL	vs_buffer.B[ESI]
+	CALLF	svcScnTrans##
+	MOVL	menucnt, #0
+	JMP	givepages
+.PAGE
+;Here for screen status report message (MT_SSSTATUS)
+
+ssstatus:
+	MOVZBL	EAX, msgbfr+sss_status	;Get the status value
+	CMPL	EAX, #MAXSTS.B		;Legal value?
+	JAE	nxtmsg			;No - ignore this message
+	JMPIL	stsdsp[EAX*4]		;Yes - dispatch on the value
+
+	.PSECT	data_p
+
+stsdsp:	.LONG	idle		; 0 - Screen is idle
+	.LONG	inuse		; 1 - Screen is in use
+	.LONG	scnclrd		; 2 - Non-current screen has been initialized
+				;	for text mode and cleared
+	.LONG	fntclrd		; 3 - Non-current screen has been initialized
+				;	for text mode
+	.LONG	graphics	; 4 - Non-current screen has been initialized
+				;	for graphics mode
+	.LONG	esckey		; 5 - Current screen has been reset while
+				;	session menu is on the screen
+MAXSTS=!{$-stsdsp}/4
+	.PSECT	code_p
+
+;Here for an idle report
+
+idle:	ANDB	vs_status.B[ESI], #~VS$INUSE ;Indicate idle
+	JMP	nxtmsg
+
+;Here for an in-use report
+
+inuse:	ORB	vs_status.B[ESI], #VS$INUSE ;Indicate in use
+	JMP	nxtmsg
+
+;Here for a text mode screen cleared report - In this case we give up our
+;  entire virtual buffer for the screen, update all of the page table entries,
+;  and wake up the process which is initializing the screen.
+
+scnclrd:CLRL	EAX
+	JMP	4$.S
+
+;Here for a text mode fonts cleared report - In this case we give up the upper
+;  64KB of the virtual buffer for the screen, update the page table entries
+;  for these pages and wake up the process which is initializing the screen.
+
+fntclrd:MOVL	EAX, #16t		;This code either operates on the
+4$:	MOVL	EDX, EAX		;  entire virtual buffer (if clearing
+	SHLL	EAX, #12t		;  the screen) or on the high half (if
+	MOVL	ECX, vs_buffer.B[ESI]	;  only clearing fonts)
+	SUBL	ECX, #scnbufr
+	ADDL	EAX, ECX
+	ADDL	ECX, #20000h
+	PUSHL	DS			;Give up the buffer pages
+	PUSHL	#scnbufr
+	PUSHL	EAX
+	PUSHL	ECX
+	PUSHL	#PG$READ|PG$WRITE|PG$VIRTUAL.B
+	CALLF	svcMemPageType##
+	PUSHL	vs_xtdb.B[ESI]		;Update our page list and block all
+	PUSHL	#SSR$READ|SSR$BLKVIRT.B	;  buffer pages
+	MOVL	ECX, #32t		;Get number of pages
+	SUBL	ECX, EDX
+	PUSHL	EDX
+	PUSHL	ECX
+	PUSHL	DS
+	LEAL	EAX, vs_pglist.B[ESI]
+	PUSHL	EAX
+	PUSHL	#0.B
+	PUSHL	#0.B
+	CALLF	svcScnTrans##
+	MOVZWL	EAX, msgbfr+sss_status+2
+	PUSHL	vs_xtdb.B[ESI]
+	PUSHL	EAX
+	CALLF	svcScnUtil##
+	JMP	nxtmsg
+
+;Here for a graphics mode screen initialized report - In this case we just
+;  give up our entire virtual buffer for the screen.  We clear the page table
+;  entries but only to make debugging a little easier.  We do not need to
+;  wake up anyone.
+
+graphics:
+	PUSHL	DS			;Give up the buffer pages for this
+	PUSHL	#scnbufr		;  screen
+	MOVL	EAX, vs_buffer.B[ESI]
+	SUBL	EAX, #scnbufr
+	PUSHL	EAX
+	ADDL	EAX, #20000h
+	PUSHL	EAX
+	PUSHL	#PG$READ|PG$WRITE|PG$VIRTUAL.B
+	CALLF	svcMemPageType##
+	LEAL	EDI, vs_pglist.B[ESI]	;Clear the page list
+	PUSHL	DS
+	POPL	ES
+	MOVL	ECX, #32t
+	CLD
+	CLRL	EAX
+	RSTOSL	[EDI]
+	JMP	nxtmsg			;Thats all
+.PAGE
+;Subroutine to send an MT_SSACTION message to a registered program
+;	c{EAX} = Data to send
+;	c{ESI} = Offset of VSB
+;	CALL	sendaction
+;	C:clr = Normal
+;	C:set = Error
+;	  c{EAX} = Error code
+
+sendaction:
+	MOVW	actbfr+sss_func, #MT_SSACTION
+	MOVB	DL, unitnum		;Store primary unit number
+	MOVB	actbfr+sss_pnum, DL
+	MOVB	DL, vs_num.B[ESI]
+	MOVB	actbfr+sss_snum, DL
+	MOVL	actbfr+sss_achar, EAX	;Store data values
+	LEAL	EAX, vs_prgaddr.B[ESI]
+	MOVL	actpnt, EAX
+	PUSHL	msgqab+qab_handle	;Send the message
+	PUSHL	DS
+	PUSHL	#actbfr
+	PUSHL	#8t.B
+	PUSHL	DS
+	PUSHL	#actparm
+	CALLF	svcIoOutBlockP##
+	TESTL	EAX, EAX		;Error?
+	JNS	4$.S			;No
+	MOVB	vs_prgaddr.B[ESI], #0	;Yes - unregister the program
+	STC				;Set C to report the error
+4$:	RET
+.PAGE
+;SUbroutine to copy a line to the session select menu
+;	c{EDI} = Offset in screen buffer for first character
+;	c{ESI} = Offset of line to copy
+;	CALL	copyline
+
+copyline:
+	PUSHL	DS
+	POPL	ES
+	CLD
+	MOVL	ECX, #30t/2
+	RMOVSL	[EDI], [ESI]
+	RET
+.PAGE
+	.SBTTL	strnmbr - Subroutine to store decimal number in memory
+
+;Subroutine to store decimal number in memory
+;	c{EAX} = Value to store
+;	c{EDI} = Pointer to place to put number
+;	CALL	strnmbr
+
+strnmbr:CLRL	EDX
+	DIVL	lit10
+	PUSHL	EDX
+	TESTL	EAX, EAX
+	JE	2$.S
+	CALL	strnmbr
+2$:	POPL	EAX
+	ADDB	AL, #'0'
+	MOVB	[EDI], AL
+	INCL	EDI
+	RET
+.PAGE
+	.SBTTL	getdecarg - Subroutine to get decimal argument value
+
+;Subroutine to get decimal argument value
+;	c(CL)     = First valid terminator
+;	c(CH)     = Second valid terminator
+;	c{ES:ESI} = Pointer to argument string
+;	CALL	getdecarg
+;	C:set = Error
+;	C:clr = Normal
+;	  c(AL)     = Stopper character
+;	  c{EDX}    = Value
+;	  c{ES:ESI} = Updated pointer
+
+getdecarg:
+	CALL	skipwsp			;Skip leading whitespace
+	CLRL	EDX			;Clear value
+	CLRL	EAX
+2$:	MOVB	AL, ES:[ESI]		;Get character
+	INCL	ESI
+	CMPB	AL, CL			;Valid terminator?
+	JE	10$.S			;Yes
+	CMPB	AL, CH
+	JE	10$.S
+	CMPB	AL, #'0'		;Digit?
+	JB	8$.S
+	CMPB	AL, #'9'
+	JA	8$.S			;No
+	ANDB	AL, #0F			;Get value
+	IMULL	EDX, #10t.B
+	ADDL	EDX, EAX
+	JMP	2$.S			;Continue
+
+;Here with non-digit - error
+
+8$:	STC
+10$:	RET
+.PAGE
+	.SBTTL	getmem - Subroutine to allocate memory for data block
+
+;Subroutine to allocate memory for data block
+;	c{ECX} = Bytes needed
+;	CALL	getmem
+;	C{ESI} = Offset of block obtained
+
+getmem:	MOVL	EAX, mempnt		;See if this will fit
+	ADDL	EAX, ECX
+	CMPL	EAX, memalloc
+	JBE	4$.S			;Yes
+	PUSHL	DS			;No - expand our memory
+	PUSHL	#data_p
+	PUSHL	#PG$READ|PG$WRITE.B
+	MOVL	EAX, ECX
+	ADDL	EAX, mempnt
+	SUBL	EAX, #data_p
+	PUSHL	EAX
+	CALLF	svcMemChange##
+	TESTL	EAX, EAX
+	JS	10$.S			;If error
+	ADDL	EAX, EDX
+	MOVL	memalloc, EAX		;Store new allocation top
+4$:	MOVL	ESI, mempnt
+	ADDL	mempnt, ECX
+	RET
+
+;Here if cannot allocate the memory we need
+
+10$:	MOVL	EBX, #nomemmsg		;Get offset of message
+	JMP	fail			;Go fail
+.PAGE
+	.SBTTL	skipwsp - Subroutine to skip leading whitespace
+
+;Subroutine to skip leading whitespace
+;	CALL	skipwsp
+
+2$:	INCL	ESI
+skipwsp:MOVB	AL, ES:[ESI]
+	ORB	AL, AL
+	JE	4$.S
+	CMPB	AL, #' '
+	JE	2$.S
+	CMPB	AL, #HT
+	JE	2$.S
+4$:	RET
+.PAGE
+
+debug::	MOVB	actbfr, AL
+	PUSHL	#DH_STDOUT.B
+	PUSHL	DS
+	PUSHL	#actbfr
+	PUSHL	#1.B
+	CALLF	svcIoOutBlock##
+	RET
+
+.PAGE
+	.SBTTL	Data
+
+;Define tables which translate between internal keyboard scan-codes and
+;  virtual screen numbers
+
+	.MACRO	CODES
+	XX	ISC_ENT    , 80h
+	XX	ISC_ESC    , 81h
+	XX	ISC_1      , 1t		; 1 - virtual screen 1
+	XX	ISC_2      , 2t		; 2 - virtual screen 2
+	XX	ISC_3      , 3t		; 3 - virtual screen 3
+	XX	ISC_4      , 4t		; 4 - virtual screen 4
+	XX	ISC_5      , 5t		; 5 - virtual screen 5
+	XX	ISC_6      , 6t		; 6 - virtual screen 6
+	XX	ISC_7      , 7t		; 7 - virtual screen 7
+	XX	ISC_8      , 8t		; 8 - virtual screen 8
+	XX	ISC_9      , 9t		; 0 - virtual screen 9
+	XX	ISC_A      , 10t	; A - virtual screen 10
+	XX	ISC_B      , 11t	; B - virtual screen 11
+	XX	ISC_C      , 12t	; C - virtual screen 12
+	XX	ISC_D      , 13t	; D - virtual screen 13
+	XX	ISC_E      , 14t	; E - virtual screen 14
+	XX	ISC_F      , 15t	; F - virtual screen 15
+	XX	ISC_G      , 16t	; G - virtual screen 16
+	XX	ISC_H      , 17t	; H - virtual screen 17
+	XX	ISC_I      , 18t	; I - virtual screen 18
+	XX	ISC_J      , 19t	; J - virtual screen 19
+	XX	ISC_K      , 20t	; K - virtual screen 20
+	XX	ISC_L      , 21t	; L - virtual screen 21
+	XX	ISC_M      , 22t	; M - virtual screen 22
+	XX	ISC_N      , 23t	; N - virtual screen 23
+	XX	ISC_UPARW  , 82h
+	XX	ISC_LTARW  , 82h
+	XX	ISC_KPUPARW, 82h
+	XX	ISC_KPLTARW, 82h
+	XX	ISC_DNARW  , 83h
+	XX	ISC_RTARW  , 83h
+	XX	ISC_KPDNARW, 83h
+	XX	ISC_KPRTARW, 83h
+	XX	ISC_HOME   , 84h
+	XX	ISC_KPHOME , 84h
+	XX	ISC_END    , 85h
+	XX	ISC_KPEND  , 85h
+	.ENDM
+
+;Generate table of internal keyboard scan-codes
+
+	.MACRO	XX iscode, vsnum
+	.BYTE	iscode
+	.ENDM
+
+codetbl:CODES
+CODENUM=$-codetbl
+
+;Generate table of corresponding virtual screen numbers
+
+	.MACRO	XX iscode, vsnum
+	.BYTE	vsnum
+	.ENDM
+
+codevsn:CODES
+.PAGE
+	.PSECT	data_p
+	.STACK	stack
+
+	  .BLKB	512t
+stack:
+
+ourname:  .ASCIZ "ScrnSymbiont"
+failmsg1: .ASCII {MT_FINALERR}"? SCREEN: "
+failsz1=!$-failmsg1
+failmsg2: .ASCIZ ", terminating"
+failsz2=!$-failmsg2
+noargmsg: .ASCIZ "No arguments given"
+badpidmsg:.ASCIZ "Bad requestor PID"
+badargmsg:.ASCIZ "Illegal argument"
+nottrmmsg:.ASCIZ "Terminal does not exist or is not a display"
+cntopnmsg:.ASCIZ "Error opening added display device"
+badtdbmsg:.ASCIZ "Error getting exec TDB offset"
+badpglmsg:.ASCIZ "Error getting initial page list for screen"
+cntmapmsg:.ASCIZ "Error mapping physical display buffer"
+bfralcmsg:.ASCIZ "Error allocating screen save buffer"
+adderrmsg:.ASCIZ "Error adding console unit"
+msgsfmsg: .ASCIZ "Cannot set signal vector"
+msgerrmsg:.ASCIZ "Cannot open message device"
+nomemmsg: .ASCIZ "Not enough memory"
+notodomsg:.ASCIZ "No displays to service"
+
+	.MACRO	VERMAC  ver, edit
+	.ASCII {MT_FINALMSG}"SCREEN: v'ver'.'edit - Initialization complete for "
+	.ENDM
+
+finmsg1:  VERMAC  >VERSION, >EDITNO
+FINMSG1SZ=!$-finmsg1
+finmsg2:  .ASCII ": for "
+FINMSG2SZ=!$-finmsg2
+finmsg3:  .ASCIZ " screens"
+FINMSG3SZ=!$-finmsg3
+gmdname:  .ASCIZ "IPM:"
+msgname:  .ASCIZ "IPM:SYS^TRM"{0,0,0}
+trmclass: .ASCIZ "TRM:"
+
+	  .MOD   4
+screenseg:.LONG  0		;Segement selector for screen dumps
+dststr:   .BLKB  36t		;Response message destination string
+rcvstr:	  .BLKB  36t		;Received message origin string
+	  .MOD   4
+
+mempnt:	  .LONG	 memtop		;Offset of available memory for getmem
+memalloc: .LONG	 0		;Highest offset + 1 allocated
+lit10:	  .LONG	 10t
+sssize:   .LONG  0		;Size of system-shift window
+sspos:    .LONG  0		;Position of system-shift window
+
+trmname:.ASCIZ	"TRM##S##:"
+
+	.MACRO	LABEL  text, attr
+	.NLIST
+	.IRPC	q,{text}
+	.WORD	attr*100h+'''q'''
+	.ENDR
+	.LIST
+	.ENDM
+
+;Border strings for system-shift menu
+
+blinet:	.BYTE	0D5, 13, 0CD, 13, 0CD, 13, 0CD, 13, 0CD, 13, 0CD, 13, 0CD, 13
+	LABEL	{ Session Select }, 31
+	.BYTE	0CD, 13, 0CD, 13, 0CD, 13, 0CD, 13, 0CD, 13, 0CD, 13, 0B8, 13
+
+blineb:	.BYTE	0D4, 13, 0CD, 13, 0CD, 13, 0CD, 13, 0CD, 13, 0CD, 13
+	LABEL	{ XOS System Menu }, 31
+	.BYTE	0CD, 13, 0CD, 13, 0CD, 13, 0CD, 13, 0CD, 13, 0CD, 13, 0BE, 13
+
+chrname: .ASCIZ	"PROCESS:"
+
+pnbfr:	.BLKB	36t		;Buffer for process name
+
+	.MOD	4
+auchar:	.BYTE	PAR$SET|REP_DECV, 1
+	.ASCII	"UNIT"{0,0,0,0}
+aucunitnum:
+	.BYTE	0
+	.BYTE	PAR$SET|REP_TEXT, 4
+	.ASCII	"TYPE"{0,0,0,0}
+aucdsptype:
+	.LONG	0
+	.BYTE	PAR$SET|REP_DECV, 1
+	.ASCII	"SCREEN"{0,0}
+aucscrnnum:
+	.BYTE	0
+	.BYTE	PAR$SET|REP_HEXV, 4
+	.ASCII	"IOREG"{0,0,0}
+aucioreg:
+	.LONG	0
+	.BYTE	PAR$SET|REP_HEXV, 4
+	.ASCII	"KBIOREG"{0}
+auckbioreg:
+	.LONG	0
+	.BYTE	PAR$SET|REP_HEXV, 1
+	.ASCII	"KBINT"{0,0,0}
+auckbint:
+	.BYTE	1t
+	.BYTE	0
+
+	.MOD	4
+trmchar:.BYTE	PAR$GET|REP_TEXT, 4
+	.ASCII	"TYPE"{0,0,0,0}
+trmdsptype:
+	.LONG	0
+	.BYTE	PAR$GET|REP_HEXV, 4
+	.ASCII	"IOREG"{0,0,0}
+trmioreg:
+	.LONG	0
+	.BYTE	PAR$GET|REP_HEXV, 4
+	.ASCII	"KBIOREG"{0}
+trmkbioreg:
+	.lONG	0
+	.BYTE	PAR$GET|REP_HEXV, 1
+	.ASCII	"KBINT"{0,0,0}
+trmkbint:
+	.BYTE	0
+	.BYTE	0
+
+	.MOD	4
+chrlist:.BYTE	PAR$SET|REP_TEXT, 8t
+	.ASCII	"CONTRM"{0,0}
+ctname:	.BLKB	8t
+	.BYTE	PAR$GET|REP_STR, 12t
+	.ASCII	"NAME"{0,0,0,0}
+	.LONG	pnbfr, !pnbfr
+	.WORD	36t, 0
+	.BYTE	0
+
+	.MOD	4
+chrqab:	.WORD	QFNC$WAIT|QFNC_CLASSFUNC
+				;qab_func    = 0.  - Function
+	.WORD	0		;qab_status  = 2.  - Returned status
+	.LONG	0		;qab_error   = 4.  - Error code
+	.LONG	0		;qab_amount  = 8.  - Amount transfered
+	.LONG	0		;qab_handle  = 12. - Device handle
+	.BYTE	0		;qab_vector  = 16. - Vector for interrupt
+	.BYTE	0, 0, 0		;Reserved
+	.LONG	DCF_VALUES	;qab_option  = 20. - Option bits
+	.LONG	0		;qab_count   = 24. - Amount to transfer
+	.LONG	chrname, !chrname
+				;qab_buffer1 = 28. - Pointer to data buffer
+	.LONG	chrlist, !chrlist
+				;qab_buffer2 = 36. - Pointer to destination
+				;		       string
+	.LONG	0, 0		;qab_parm    = 44. - Pointer to parameter list
+
+	.MOD	4
+auqab:	.WORD	QFNC$WAIT|QFNC_CLASSFUNC
+				;qab_func    = 0.  - Function
+	.WORD	0		;qab_status  = 2.  - Returned status
+	.LONG	0		;qab_error   = 4.  - Error code
+	.LONG	0		;qab_amount  = 8.  - Amount transfered
+	.LONG	0		;qab_handle  = 12. - Device handle
+	.BYTE	0		;qab_vector  = 16. - Vector for interrupt
+	.BYTE	0, 0, 0		;Reserved
+	.LONG	CF_ADDUNIT	;qab_option  = 20. - Option bits
+	.LONG	0		;qab_count   = 24. - Amount to transfer
+	.LONG	trmclass, !trmclass
+				;qab_buffer1 = 28. - Pointer to data buffer
+	.LONG	auchar, !auchar	;qab_buffer2 = 36. - Pointer to destination
+				;		       string
+	.LONG	0, 0		;qab_parm    = 44. - Pointer to parameter list
+
+
+actparm:.BYTE	PAR$SET|REP_STR, 0
+	.WORD	IOPAR_MSGRMTADDRS
+actpnt:	.LONG	rcvstr, !rcvstr
+	.WORD	32t, 32t
+	.BYTE	0
+
+moparm:	.BYTE	PAR$SET|REP_STR, 0
+	.WORD	IOPAR_MSGRMTADDRS
+	.LONG	dststr, !dststr
+	.WORD	32t, 32t
+	.BYTE	0
+
+miparm:	.BYTE	PAR$GET|REP_STR, 0
+	.WORD	IOPAR_MSGRMTADDRR
+	.LONG	rcvstr, !rcvstr
+	.WORD	32t, 32t
+	.BYTE	0
+
+	.MOD	4
+msgqab:	.WORD	QFNC_INBLOCK	;qab_func    = 0.  - Function
+	.WORD	0		;qab_status  = 2.  - Returned status
+	.LONG	0		;qab_error   = 4.  - Error code
+	.LONG	0		;qab_amount  = 8.  - Amount transfered
+	.LONG	0		;qab_handle  = 12. - Device handle
+	.BYTE	0		;qab_vector  = 16. - Vector for interrupt
+	.BYTE	0, 0, 0		;Reserved
+	.LONG	0		;qab_option  = 20. - Option bits
+	.LONG	MSGBFRSIZE	;qab_count   = 24. - Amount to transfer
+	.LONG	msgbfr, !msgbfr	;qab_buffer1 = 28. - Pointer to data buffer
+	.LONG	0, 0		;qab_buffer2 = 36. - Not used
+	.LONG	miparm, !miparm	;qab_parm    = 44. - Pointer to parameter list
+
+unitnum: .LONG	0		;Primary unit number for display
+scnnum:  .LONG	0		;Virtual screen number
+numscns: .LONG	0		;Number of virtual screens
+curscn:	 .LONG	0		;Offset of VSB for current screen
+selscn:	 .LONG	0		;Offset of VSB for selected screen
+tnpnt:	 .LONG	0
+scnwidth:.LONG	0
+prevvsb: .LONG	0		;Offset of previous VSB
+
+lit1000h:.LONG	1000h
+menubgn: .LONG	0
+menucnt: .LONG	0
+menupage:.LONG	0
+menuleft:.LONG	0
+menutmr: .LONG	0		;Alarm handle for menu timer
+menublkd:.BYTE	0
+	 .BYTE	0, 0, 0
+
+vstbl:	.BLKL	MAXSCNS		;Virtual screen table
+modeblk:.BLKB	dm_SIZE		;Data block for svcTrmDspMode SVC
+msgbfr:	.BLKB	128t		;Message buffer
+MSGBFRSIZE = $-msgbfr
+
+actbfr: .BLKB	16t
+
+	 .EVEN
+memtop:

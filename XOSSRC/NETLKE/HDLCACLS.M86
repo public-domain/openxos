@@ -1,0 +1,1523 @@
+	.TITLE	HDLCACLS - HDLC (NRM, primary) class driver for XOS
+
+;++++
+; This software is in the public domain.  It may be freely copied and used
+; for whatever purpose you see fit, including commerical uses.  Anyone
+; modifying this software may claim ownership of the modifications, but not
+; the complete derived code.  It would be appreciated if the authors were
+; told what this software is being used for, but this is not a requirement.
+
+;   THIS SOFTWARE IS PROVIDED BY THE AUTHORS "AS IS" AND ANY EXPRESS OR
+;   IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
+;   OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+;   IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+;   INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+;   BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS
+;   OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+;   ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR
+;   TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
+;   USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+;----
+
+	.PROC	80486
+	.INCLUD	XOSINC:\XMAC\XOS.PAR
+	.INCLUD	XOSINC:\XMAC\XOSX.PAR
+	.INCLUD	XOSINC:\XMAC\XOSTIME.PAR
+	.INCLUD	XOSINC:\XMAC\XOSERR.PAR
+	.INCLUD	XOSINC:\XMAC\XOSNET.PAR
+	.INCLUD	XOSINC:\XMAC\XOSXNET.PAR
+	.INCLUD	XOSINC:\XMAC\XOSLKE.PAR
+	.INCLUD	XOSINC:\XMAC\XOSXLKE.PAR
+
+;This device class implements the link-level HDLC protocol.  It is for use
+;  with serial devices.  This version implements the unbalanced (half-duplex)
+;  mode with normal response mode.  It implements a primary station only.
+
+;  Note that unlike the SNAP driver, this driver uses a single PDB (protocol
+;  data block) which is allocated along with the SDB.  This driver does not
+;  support multiple protocols or any higher level protocols.
+
+MAJV   =!1t
+MINV   =!2t
+EDITNUM=!0t
+
+	LKEHEAD	HDLCACLS, MAJV, MINV, EDITNUM, LKETYPE_CLASS
+
+;Define offsets in the HDLCA device part of a network DCB
+
+$$$=!dcb_netcommon
+BLK dcb_hdlcnextadr , 4t	;Offset of DCB for next HDLC address
+BLK dcb_hdlcsndhldh , 4t	;Send held packet list head pointer
+BLK dcb_hdlcsndhldt , 4t	;Send held packet list tail pointer
+BLK dcb_hdlcrcvpkth , 4t	;Received packet list head pointer
+BLK dcb_hdlcrcvpktt , 4t	;Received packet list tail pointer
+BLK dcb_hdlcrcvpktc , 1t	;Received packet list packet count
+BLK dcb_hdlcaddr    , 1t	;HDLC address for output
+BLK dcb_hdlcsndseq  , 1t	;Send sequence number
+BLK dcb_hdlcrcvseq  , 1t	;Receive sequence number
+BLK dcb_hdlcackseq  , 1t	;ACK sequence number
+BLK dcb_hdlcsndhldc , 1t	;Number of pending output packets
+BLK                 , 1t
+BLK dcb_hdlcstatus  , 1t	;Status bits
+BLK dcb_hdlcstate   , 1t	;Link state
+BLK                 , 3t
+BLK dcb_hdlcsndwake , 4t	;Offset of retransmit timer wake block
+BLK dcb_hdlcretrycnt, 4t	;Retry counter
+BLK dcb_hdlcerror   , 4t	;Output error code
+dcb_hdlcSIZE=!$$$
+XMBINDEX dcb_hdlcINDEX, dcb_cSIZE+dcb_hdlcSIZE
+
+;Define values for dcb_hdlcstatus
+
+HDLCA$INPOK  =!40h		;Input is OK
+HDLCA$NOACK  =!20h		;No ack received for output
+HDLCA$NULLINP=!10h		;Input was null
+HDLCA$HAVINP =!08h		;Have had input since poll sent
+
+;Define values for dcb_hdlcstate
+
+ST_IDLE=!0t			;Link is idle
+ST_SNRM=!1t			;SNRM command has been sent
+ST_CON =!2t			;Link is connected
+ST_DISC=!3t			;DISC command has been sent
+
+;Define offsets in the HDLCA SDB
+
+$$$=!sdb_SIZE
+BLK sdb_hdlcamaxpktsz, 4t	;Maximum HDLC packet size
+BLK sdb_hdlcastatus  , 1t
+BLK                  , 3t
+sdb_hdlcaSIZE=!$$$
+
+;Define bits for sdb_hdlcastatus
+
+HDLC$POLLQUED=!40h		;Packet with poll bit queued
+HDLC$POLLSENT=!20h		;Packet with poll bit sent
+
+;Define offsets in the HDLCA part of the PDB (Protocol Data Block)
+
+$$$=!8t
+BLK pdb_hdlcdcbhead  , 4t	;Address list head pointer
+BLK pdb_hdlcretrycnt , 4t	;Initial retry count value
+BLK pdb_hdlcretrytime, 4t	;Retry time interval
+BLK pdb_hdlccntnodst , 4t	;Count - discarded - no receiver
+BLK pdb_hdlccntnotcon, 4t	;Count - discarded - not connected
+BLK pdb_hdlccntinnact, 4t	;Count - discarded - input not active
+BLK pdb_hdlccntiovr  , 4t	;Count - discarded - input overflow
+BLK pdb_hdlccntoutseq, 4t	;Count - discarded - out of sequence
+BLK pdb_hdlccntrexmit, 4t	;Count - restransmitted packets
+pdb_hdlcSIZE=!$$$
+
+	CODE
+.PAGE
+	.SBTTL	SVC dispatch table for HDLCA class devices
+
+;SVC dispatch table for HDLCA class devices
+
+hdlcdsp:.LONG	knlRtnZero##	;sd_mount	=  0. - Mount
+	.LONG	knlRtnZero##	;sd_cleardev	=  4. - Clear device
+	.LONG	xosnetGiveDcb##	;sd_cleardcb	=  8. - Clear DCB
+	.LONG	knlRtnZero##	;sd_commit	= 12. - Commit data to disk
+	.LONG	knlRtnZero##	;sd_transold    = 16. - Transfer device/old
+	.LONG	knlRtnZero##	;sd_transnew    = 20. - Transfer device/new
+	.LONG	knlNullQio##	;sd_opena	= 24. - Open additional
+	.LONG	hdlcopen	;sd_open1	= 28. - Open device/file
+	.LONG	hdlcopen	;sd_devparm     = 32. - Device parameters
+	.LONG	knlIFnDev##	;sd_delete	= 36. - Delete file
+	.LONG	knlIFnDev##	;sd_rename	= 40. - Rename file
+	.LONG	hdlcinpblk	;sd_inblock	= 44. - Input block
+	.LONG	hdlcoutblk	;sd_outblock	= 48. - Output block
+	.LONG	hdlcoutblk1	;sd_outblockq	= 52. - Output block (XFF)
+	.LONG	knlIFnDevGQ##	;sd_outstring	= 56. - Output string
+	.LONG	knlRtnMOne##	;sd_getiosts	= 60. - Get input/output status
+	.LONG	hdlcspecial	;sd_special     = 64. - Special device function
+	.LONG	hdlcclose	;sd_close	= 68. - Close file
+	.LONG	knlNullLabel##	;sd_label       = 72. - Get device label
+	.LONG	knlNullQioGQ##	;sd_commitfunc	= 76. - Commit data to disk
+	.LONG	hdlcdevinfo	;sd_devinfo     = 80. - Get device info
+HDLCDSPSZ=!{$-hdlcdsp}/4
+
+;Class function dispatch table for HDLCA class devices
+
+	.LONG	CLSFMX
+hdlccls:.LONG	hdlcaaddunit	;CF_ADDUNIT =  8. - Add unit
+	.LONG	hdlcaunitinfo	;CF_PUNITS  =  9. - Get information about
+				;		      physical units
+	.LONG	knlIFnDevGQ##	;CF_AUNITS  = 10. - Get information about active
+				;		      units
+CLSFMX=!{$-hdlccls}/4
+.PAGE
+;Device characteristics tables for HDLCA devices
+
+	DATA
+
+	.MOD	4
+hdlcdctbl:
+ DCHARBGN  1, knlDCharValCom##
+ DCHARENT  CLASS   , TEXT, ,  8, knlDcMsgClass##  , knlDcGetClass##   , knlDcSetClass##   , 0
+ DCHARENT  NETDEV  , TEXT, , 16, xosnetMsgDev##   , hdlcgetnetdev     , 0                 , 0
+ DCHARENT  RETRYCNT, DECV, ,  4, msgretrycnt      , getpdbdata        , setpdbdata        , pdb_hdlcretrycnt
+ DCHARENT  RETRYTIM, DECV, ,  4, msgretrytim      , getretrytime      , setretrytime      , pdb_hdlcretrytime
+ DCHARENT  PKTIN   , DECV, ,  4, xosnetMsgPktIn## , xosnetGetSdbData##, xosnetSetSdbData##, sdb_cntpktin
+ DCHARENT  BYTEIN  , DECV, ,  4, knlDcMsgByteIn## , xosnetGetSdbData##, xosnetSetSdbData##, sdb_cntbytein
+ DCHARENT  PKTOUT  , DECV, ,  4, xosnetMsgPktOut##, xosnetGetSdbData##, xosnetSetSdbData##, sdb_cntpktout
+ DCHARENT  BYTEOUT , DECV, ,  4, knlDcMsgByteOut##, xosnetGetSdbData##, xosnetSetSdbData##, sdb_cntbyteout
+ DCHARENT  NODST   , DECV, ,  4, msgnodst         , getpdbdata        , setpdbdata        , pdb_hdlccntnodst
+ DCHARENT  NOTCON  , DECV, ,  4, msgnotcon        , getpdbdata        , setpdbdata        , pdb_hdlccntnotcon
+ DCHARENT  INNOTACT, DECV, ,  4, msginnotact      , getpdbdata        , setpdbdata        , pdb_hdlccntinnact
+ DCHARENT  INOVRFLW, DECV, ,  4, msginovrflw      , getpdbdata        , setpdbdata        , pdb_hdlccntiovr
+ DCHARENT  OUTSEQ  , DECV, ,  4, msgoutseq        , getpdbdata        , setpdbdata        , pdb_hdlccntoutseq
+ DCHARENT  REXMIT  , DECV, ,  4, msgrexmit        , getpdbdata        , setpdbdata        , pdb_hdlccntrexmit
+
+;Class characteristics tables for the HDLCA device class
+
+hdlccctbl:
+ DCHARBGN  2, knlDCharValCom##
+ DCHARENT  NUMBER , DECV, , 4, msgnumber , knlGetSysVal##, 0             , hdlcadcbnum
+ DCHARENT  MAXIMUM, DECV, , 4, msgmaximum, knlGetSysVal##, knlSetSysVal##, hdlcadcbmax
+ DCHARENT  LIMIT  , DECV, , 4, msglimit  , knlGetSysVal##, knlSetSysVal##, hdlcadcblmt
+
+	CODE
+
+msgretrycnt:DCHARINFO  {Number of times to retry output}
+msgretrytim:DCHARINFO  {Retry time interval (milliseconds)}
+msgnumber:  DCHARINFO  {Number of in use HDLCA devices}
+msgmaximum: DCHARINFO  {Maximum number of in use HDLCA devices}
+msglimit:   DCHARINFO  {Maximum number of HDLCA devices allowed}
+msgnodst:   DCHARINFO  {Discarded - no destination for HDLC input}
+msgnotcon:  DCHARINFO  {Discarded - not connected}
+msginnotact:DCHARINFO  {Discarded - input not active}
+msginovrflw:DCHARINFO  {Discarded - input overflow}
+msgoutseq:  DCHARINFO  {Discarded - out of sequence packet}
+msgrexmit:  DCHARINFO  {Number of retransmitted packets}
+.PAGE
+;Device parameter table for HDLCA: opens
+
+	.MOD	4
+	.LONG	OPARMMAX
+hdlcopnparms:
+	.LONG	hdlcopngenparms	 ;IOPAR_xxxxxx = 00xx - Generic IO parameters
+	.LONG	knlNullFilParms##;IOPAR_FILxxx = 01xx - File system IO parameters
+	.LONG	knlNullTrmParms##;IOPAR_TRMxxx = 02xx - Terminal IO parameters
+	.LONG	0		 ;IOPAR_DSKxxx = 03xx - Disk IO parameters
+	.LONG	0		 ;IOPAR_TAPxxx = 04xx - Tape IO parameters
+	.LONG	hdlcopnnetparms	 ;IOPAR_NETxxx = 05xx - Network IO parameters
+OPARMMAX=!{$-hdlcopnparms}/4
+
+	.LONG	OPARMGENMAX	;Size of table
+hdlcopngenparms:
+	.LONG	0		;		   = 0000h
+	.LONG	knlIopDummyN##	;IOPAR_FILOPTN     = 0001h
+	.LONG	knlIopDummyS##	;IOPAR_FILSPEC     = 0002h
+	.LONG	knlIopDevSts##	;IOPAR_DEVSTS      = 0003h
+	.LONG	knlIopUnitNum##	;IOPAR_UNITNUM     = 0004h
+	.LONG	knlIopGlbId##	;IOPAR_GLBID       = 0005h
+	.LONG	knlIopDelay##	;IOPAR_DELAY       = 0006h
+	.LONG	knlIopTimeOut##	;IOPAR_TIMEOUT     = 0007h
+	.LONG	0		;IOPAR_INPSTS      = 0008h
+	.LONG	0		;IOPAR_OUTSTS      = 0009h
+	.LONG	knlIopInpQLmt##	;IOPAR_INPQLMT     = 000Ah
+	.LONG	knlIopOutQLmt##	;IOPAR_OUTQLMT     = 000Bh
+	.LONG	0		;IOPAR_SIVECT1     = 000Ch
+	.LONG	0		;IOPAR_SIVECT2     = 000Dh
+	.LONG	0		;IOPAR_SIDATA      = 000Eh
+	.LONG	knlIopNumOpen##	;IOPAR_NUMOPEN     = 000Fh
+	.LONG	knlIopBufrLmt##	;IOPAR_BUFRLMT	   = 0010h
+OPARMGENMAX=!{$-hdlcopngenparms}/4
+
+	.LONG	OPARMNETMAX
+hdlcopnnetparms:
+	.LONG	0		;		   = 0500h
+	.LONG	0		;IOPAR_NETSUBUMASK = 0501h
+	.LONG	0		;IOPAR_NETPROTOCOL = 0502h
+	.LONG	0		;IOPAR_NETLCLPORT  = 0503h
+	.LONG	0		;IOPAR_NETRMTHWAS  = 0504h
+	.LONG	0		;IOPAR_NETRMTHWAR  = 0505h
+	.LONG	hdlcopnrmtnetas	;IOPAR_NETRMTNETAS = 0506h
+OPARMNETMAX=!{$-hdlcopnnetparms}/4
+
+;Device parameter table for HDLCA: IO operations
+
+	.LONG	PARMMAX
+hdlcioparms:
+	.LONG	hdlciogenparms	 ;IOPAR_xxxxxx = 00xx - Generic IO parameters
+	.LONG	knlNullFilParms##;IOPAR_FILxxx = 01xx - File system IO parameters
+	.LONG	knlNullTrmParms##;IOPAR_TRMxxx = 02xx - Terminal IO parameters
+	.LONG	0		 ;IOPAR_DSKxxx = 03xx - Disk IO parameters
+	.LONG	0		 ;IOPAR_TAPxxx = 04xx - Tape IO parameters
+	.LONG	hdlcionetparms	 ;IOPAR_NETxxx = 05xx - Network IO parameters
+PARMMAX=!{$-hdlcioparms}/4
+
+	.LONG	PARMGENMAX	;Size of table
+hdlciogenparms:
+	.LONG	0		;		   = 0000h
+	.LONG	knlIopFilOptn##	;IOPAR_FILOPTN     = 0001h
+	.LONG	knlIopFilSpec##	;IOPAR_FILSPEC     = 0002h
+	.LONG	knlIopDevSts##	;IOPAR_DEVSTS      = 0003h
+	.LONG	knlIopUnitNum##	;IOPAR_UNITNUM     = 0004h
+	.LONG	knlIopGlbId##	;IOPAR_GLBID       = 0005h
+	.LONG	knlIopDelay##	;IOPAR_DELAY       = 0006h
+	.LONG	knlIopTimeOut##	;IOPAR_TIMEOUT     = 0007h
+	.LONG	0		;IOPAR_INPSTS      = 0008h
+	.LONG	0		;IOPAR_OUTSTS      = 0009h
+	.LONG	knlIopInpQLmt##	;IOPAR_INPQLMT     = 000Ah
+	.LONG	knlIopOutQLmt##	;IOPAR_OUTQLMT     = 000Bh
+	.LONG	0		;IOPAR_SIVECT1     = 000Ch
+	.LONG	0		;IOPAR_SIVECT2     = 000Dh
+	.LONG	0		;IOPAR_SIDATA      = 000Eh
+	.LONG	knlIopNumOpen##	;IOPAR_NUMOPEN     = 000Fh
+	.LONG	knlIopBufrLmt##	;IOPAR_BUFRLMT	   = 0010h
+PARMGENMAX=!{$-hdlciogenparms}/4
+
+	.LONG	PARMNETMAX
+hdlcionetparms:
+	.LONG	0		;		   = 0500h
+	.LONG	0		;IOPAR_NETSUBUMASK = 0501h
+	.LONG	0		;IOPAR_NETPROTOCOL = 0502h
+	.LONG	0		;IOPAR_NETLCLPORT  = 0503h
+	.LONG	0		;IOPAR_NETRMTHWAS  = 0504h
+	.LONG	0		;IOPAR_NETRMTHWAR  = 0505h
+	.LONG	hdlcioprmtnetas	;IOPAR_NETRMTNETAS = 0506h
+	.LONG	0		;IOPAR_NETRMTNETAR = 0507h
+	.LONG	0		;IOPAR_NETRMTPORTS = 0508h
+	.LONG	0		;IOPAR_NETRMTPORTR = 0509h
+	.LONG	0		;IOPAR_NETDSTNAME  = 050Ah
+	.LONG	xosnetIopSMode##;IOPAR_NETSMODE    = 050Bh
+	.LONG	xosnetIopCMode##;IOPAR_NETCMODE    = 050Ch
+PARMNETMAX=!{$-hdlcionetparms}/4
+.PAGE
+	.SBTTL	Initialization routine
+
+	INITSUB	inithdlca
+
+;The command for installing HDLCACLS is:
+;	LKELOAD HDLCACLS
+
+inithdlca:
+	MOVL	EDI, #hdlcchk		;Install our class
+	MOVL	EBX, #hdlccls		;Offset of class function dispatch table
+	MOVL	EAX, #'HDLC'
+	MOVL	EDX, #'A'
+	MOVL	ECX, #hdlccctbl
+	MOVL	ESI, #hdlcaccb
+	CALL	knlNewClass##
+4$:	JC	10$.S			;This should not fail!
+	MOVL	ECX, #codetop
+	CLRL	EDX
+	CLRL	EAX
+10$:	MOVL	EBX, #QSTS$DONE
+	RET
+
+	CODE
+.PAGE
+	.SBTTL	hdlcaaddunit - Class function to add unit
+
+;Here for the CL_ADDUNIT function
+;	c{ES:EDI} = Address of parameter block
+;	CALL	hdlcaaddunit
+;	c{EAX} = Error code
+;	c{EBX} = Status bits
+;	c{ECX} = Item count
+
+;Description block for addunitchar
+
+	DATA
+
+	.MOD	4
+hdlcaaublk:
+ DCHARBGN  3, knlDCharValCom##
+ DCHARENT  UNIT  , DECV, ,  1, 0, 0, lauunit, 0
+ DCHARENT  NETDEV, TEXT, , 16, 0, 0, launetdev, 0
+
+	CODE
+
+$$$=!0
+FRM hau_unit, 4t		;Unit number
+FRM hau_idb , 4t		;Offset of IDB
+FRM hau_char, 8t		;Address of chracteristics list
+hau_SIZE=!$$$
+
+hdlcaaddunit:
+	ENTER	hau_SIZE, 0		;Set up and initialize our stack frame
+	CLRL	EAX
+	DECL	EAX
+	MOVL	hau_unit.B[EBP], EAX
+	MOVL	hau_idb.B[EBP], EAX
+	IFFAULT	6$
+	LFSL	EDX, iorb_buffer2.B[ESI]
+	MOVL	hau_char+0.B[EBP], EDX
+	MOVL	hau_char+4.B[EBP], FS
+	CALL	knlGiveQel##		;Give up the IORB
+	MOVL	EBX, #hdlcaaublk	;Process the characteristics
+	MOVB	AL, #1			;Ignore bad names here
+	CALL	knlAddUnitChar##
+	JNC	8$.S			;If no error
+4$:	CLRL	ECX
+	MOVL	EBX, #QSTS$DONE
+	LEAVE				;Fail
+	TOFORK
+	STC
+	RET
+
+;Here if address error with IORB
+
+	FAULTHDR
+6$:	CALL	knlGiveQel##
+7$:	MOVL	EAX, #ER_ADRER
+	JMP	4$.S
+
+;Here with all parameters processed - make sure we got everything we need
+
+8$:	MOVL	EAX, hau_unit.B[EBP]
+	ORL	EAX, hau_idb.B[EBP]
+	INCL	EAX
+	JNE	16$.S
+	MOVL	EAX, #ER_CHARM
+	JMP	4$.S
+
+;Here if HDLCA unit is already defined
+
+12$:	MOVL	EAX, #ER_DUADF
+	JMP	4$.S
+
+;Here with all needed parameters found
+
+16$:	MOVB	AL, hau_unit.B[EBP]
+	MOVL	ESI, firstsdb		;Point to first HDLCA SDB
+18$:	TESTL	ESI, ESI
+	JE	22$.S			;If no more SDBs
+	CMPB	sdb_unit.B[ESI], AL	;Same unit?
+	JE	12$.S			;Yes - fail
+20$:	MOVL	ESI, [ESI]		;Not this one - try next
+	JMP	18$.S			;Continue
+
+;Here if this unit not defined now
+
+22$:	CALL	knlGetXRes##		;Get exec memory resource
+	MOVL	ECX, #sdb_mSIZE+sdb_hdlcaSIZE+pdb_mSIZE+pdb_hdlcSIZE
+	CALL	knlGetXMem##		;Allocate exec memory for the SDB and
+					;  the PDB
+	JC	30$			;If error
+	LEAL	ESI, sdb_mSIZE[EDI]
+	MOVL	sdb_magic.B[ESI], #'SDB*'
+	MOVL	EDX, hau_idb.B[EBP]	;Store offset of associated IDB
+	MOVL	sdb_idb.B[ESI], EDX
+	MOVL	idb_sdbhead.B[EDX], ESI
+	MOVL	idb_sdbtail.B[EDX], ESI
+	MOVL	EAX, idb_hwpktsz.B[EDX]	;Store maximum packet size
+	SUBL	EAX, #8.B
+	MOVL	sdb_hdlcamaxpktsz.B[ESI], EAX
+	MOVL	sdb_sapvalue.B[ESI], #0FFFFh ;Store the dummy SAP value
+	MOVL	sdb_abort.B[ESI], #hdlcaabort ;Store offset of abort output
+					      ;  routine
+	MOVL	sdb_receive.B[ESI], #hdlcrcvpkt ;Store offset of receive routine
+	MOVL	EAX, lastsdb		;Link into our chain of SDBs
+	TESTL	EAX, EAX
+	JE	24$.S
+	MOVL	[EAX], ESI
+	JMP	26$.S
+
+24$:	MOVL	firstsdb, ESI
+26$:	MOVL	lastsdb, ESI
+	MOVL	EAX, hau_unit.B[EBP]
+	MOVB	sdb_unit.B[ESI], AL
+	LEAL	EBX, sdb_name+5.B[ESI]	;Construct unit name
+	MOVL	-5.B[EBX], #'HDLC'
+	MOVB	-1.B[EBX], #'A'
+	CALL	knlPutDecNmbr##
+	LEAL	EBX, sdb_hdlcaSIZE+pdb_mSIZE.B[ESI] ;Store offset of our PDB
+	MOVL	sdb_pdbhead.B[ESI], EBX
+	MOVL	sdb_pdbtail.B[ESI], EBX
+	MOVL	pdb_sdb.B[EBX], ESI	;Set up the PDB
+	MOVL	EAX, sdb_idb.B[ESI]
+	MOVL	pdb_idb.B[EBX], EAX
+	MOVL	EAX, sdb_name+0.B[ESI]
+	MOVL	pdb_name+0.B[EBX], EAX
+	MOVL	EAX, sdb_name+4.B[ESI]
+	MOVL	pdb_name+4.B[EBX], EAX
+	MOVL	pdb_hdlcretrycnt.B[EBX], #3
+	MOVL	pdb_hdlcretrytime.B[EBX], #TICKSPERSEC/2
+	CLRL	EAX
+30$:	CALL	knlGiveXRes##
+	JMP	4$
+.PAGE
+;Subroutine called by adduchars when "NETDEV" characteristic found
+
+launetdev:
+	MOVL	EAX, knlDcValue##+0
+	ANDL	EAX, #0FFFFFFh
+	ANDL	EAX, #'NET'
+	JNE	8$.S
+	MOVL	EAX, knlDcValue##+8
+	ORL	EAX, knlDcValue##+12t
+	JNE	8$.S
+	MOVL	ESI, xosnetIdbHead##	;Get offset of first IDB
+	TESTL	ESI, ESI
+	JE	8$.S			;If none
+	MOVL	EAX, knlDcValue##+4
+4$:	CMPL	idb_name+4.B[ESI], EAX	;Check name
+	JE	10$.S			;If match
+	MOVL	ESI, [ESI]		;Different - advance to next IDB
+	TESTL	ESI, ESI
+	JNE	4$.S			;Continue if have another
+8$:	MOVL	EAX, #ER_CHARV		;No match found - fail
+	STC
+	RET
+
+;Here with IDB for interface
+
+10$:	CMPL	idb_sdbhead.B[ESI], #0.B ;Is this interface in use now?
+	JNE	8$.S			;Yes - fail
+	MOVL	hau_idb.B[EBP], ESI	;No - OK
+	RET
+
+;Subroutine called by adduchars when "UNIT" characteristic found
+
+lauunit:MOVL	hau_unit.B[EBP], EAX
+	CLC
+	RET
+.PAGE
+;Here to get the value of the NETDEV characteristic
+
+hdlcgetnetdev:
+	MOVL	EBX, dcb_netidb.B[EDI]	;Get offset of the IDB
+	MOVL	EAX, idb_name+0.B[EBX]	;Get NET device name
+	MOVL	EDX, idb_name+4.B[EBX]
+	RET
+.PAGE
+	.SBTTL	getpdbdata - Subroutine to get data item from a PDB
+
+;Subroutine to get data item from a PDB for QFNC_DEVCHAR
+;	c{EBX} = Offset of item
+;	c{EDI} = Offset of DCB
+;	CALL	getpdbdata
+;	C:clr always
+;	c{EAX} = Data value
+
+getpdbdata:
+	ADDL	EBX, dcb_netpdb.B[EDI]	;Point to the data item
+	MOVL	EAX, [EBX]		;Get value
+	CLC
+	RET				;Thats all
+
+	.SBTTL	setpdbdata - Subroutine to set data item in a PDB
+
+;Subroutine to set data item in a PDB for QFNC_DEVCHAR
+;	c{EAX} = Data value
+;	c{EBX} = Offset of item
+;	c{EDI} = Offset of DCB
+;	CALL	setpdbdata
+;	C:clr always
+
+setpdbdata:
+	ADDL	EBX, dcb_netpdb.B[EDI]	;Point to the data item
+	MOVL	[EBX], EAX		;Store value
+	CLC
+	RET				;Thats all
+
+	.SBTTL	getretrytime
+
+getretrytime:
+	ADDL	EBX, dcb_netpdb.B[EDI]	;Point to the data item
+	IMULL	EAX, [EBX], #MSPERTICK	;Get value
+	CLC
+	RET				;Thats all
+
+	.SBTTL	setretrytime
+
+setretrytime:
+	ADDL	EBX, dcb_netpdb.B[EDI]	;Point to the data item
+	ADDL	EAX, #MSPERTICK-1
+	MOVL	ECX, #MSPERTICK
+	CLRL	EDX
+	IDIVL	ECX
+	CMPL	EAX, #2t.B
+	JA	4$.S
+	MOVB	AL, #2
+4$:	MOVL	[EBX], EAX		;Store value
+	CLC
+	RET				;Thats all
+.PAGE
+	.SBTTL	hdlcaunitinfo - HDLCA class get phyical unit information function
+
+;Here for the get physical unit information class function (CL_PUNITS) for the
+;  HDLCA class
+;	c{EBX} = Offset of CCB
+;	c{ESI} = Offset of IORB
+;	CALL	hdlcaunitinfo
+;	c{EAX} = Error code
+;	c{EBX} = Status bits
+;	c{ECX} = Item count
+;  A zero count (iorb_count) requests that the number of units only be returned
+;    in qab_amount.  A non-zero count indicates that a buffer is available for
+;    that many unit names (8 characters each, null padded).
+
+hdlcaunitinfo:
+	MOVL	EAX, #ER_NIYT
+	STC
+	RET
+.PAGE
+	.SBTTL	hdlcaabort - Subroutine to abort all HDLCA output
+
+;Subroutine to abort all HDLCA output
+;	c{ESI} = Offset of SDB
+;	CALL	hdlcaabort
+
+hdlcaabort:
+	MOVL	EDI, sdb_pdbhead.B[ESI]	;Get first PDB
+2$:	TESTL	EDI, EDI
+	JE	ret008.S
+	CALLI	pdb_abort.B[EDI]
+	MOVL	EDI, [EDI]
+	JMP	2$.S
+.PAGE
+	.SBTTL	hdlcchk - Device check routine for HDLCA devices
+
+;Device check routine for HDLCA devices
+;	c{SS:EBX} = Address of device name (16 characters)
+;	CALL	hdlcachk
+;	C:set = Error (match found)
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  Z:set = Match found
+;	    c{EDI} = Offset of DCB
+;	  Z:clr = Not found
+;  ESI is preserved
+
+hdlcchk:CMPL	SS:[EBX], #'HDLC'	;Is this for HDLCA*?
+	JNE	8$.S			;No
+	CMPB	SS:4.B[EBX], #'A'	;Maybe
+	JNE	8$.S			;No
+	MOVL	EAX, SS:8.B[EBX]
+	ORL	EAX, SS:12t.B[EBX]
+	JNE	8$.S
+	MOVL	EDI, firstsdb		;Yes - point to first SDB
+	TESTL	EDI, EDI
+	JE	8$.S			;If none at all
+	MOVL	EAX, SS:4.B[EBX]	;Does name match?
+4$:	CMPL	sdb_name+4.B[EDI], EAX
+	JE	10$.S			;Yes - this is it!
+	MOVL	EDI, [EDI]		;Not this one - try next
+	TESTL	EDI, EDI
+	JNE	4$.S			;Continue if another
+8$:	TESTL	ESP, ESP		;No more - clear Z
+ret008:	RET
+
+;Here with match on name
+
+10$:	PUSHL	ESI
+	PUSHL	EDI			;Save offset of the SDB
+	MOVL	ESI, sdb_idb.B[EDI]	;Get offset of the IDB for netgetdcb
+	MOVL	EDI, #DS$DUPLEX		;Get description bits
+	MOVL	EDX, #hdlcaccb		;Get offset of our CCB
+	MOVL	ECX, #dcb_hdlcINDEX
+	CALL	xosnetGetDcb##		;Get a HDLCA DCB
+	POPL	EBX			;Restore offset of the SDB
+	POPL	ESI
+	JC	ret010.S		;If error
+	MOVL	dcb_sdisp.B[EDI], #hdlcdsp ;Store offset of SVC dispatch table
+	MOVL	dcb_devchar.B[EDI], #hdlcdctbl ;Store offset of devchar table
+	MOVB	dcb_bufrlmt.B[EDI], #4	;Default buffer limit is 4
+	MOVL	dcb_netsdb.B[EDI], EBX	;Store offset of the SDB in the DCB
+	MOVL	EAX, sdb_pdbhead.B[EBX]	;Store offset of the PDB in the DCB
+	MOVL	dcb_netpdb.B[EDI], EAX
+	CLRL	EAX			;Set Z
+ret010:	RET				;And return
+.PAGE
+	.SBTTL	hdlcioprmtnetas - Process IOPAR_NETRMTNETAS device parameter
+
+;Here to process the IOPAR_NETRMTHWAR device parameter - Remote hardware address
+;  for input
+
+	DPARMHDR  BOTH, HEXV, 1
+hdlcopnrmtnetas:
+	CLC
+	RET
+
+	DPARMHDR  BOTH, HEXV, 1
+hdlcioprmtnetas:
+	TESTB	AH, #PAR$SET		;Want to set value?
+	JE	2$.S			;No
+	PUSHL	EAX			;Yes
+	CALL	knlGetParm##		;Get value
+	JC	4$.S
+	MOVB	dcb_hdlcaddr.B[EDI], AL
+	POPL	EAX
+2$:	TESTB	AH, #PAR$GET		;Want value returned?
+	JE	6$.S			;No
+	MOVZBL	EAX, dcb_hdlcaddr.B[EDI]
+	JMP	knlStrParm4##
+
+4$:	POPL	EDX
+6$:	RET
+.PAGE
+;Here for the get device information entry
+;	c{ECX}    = Length of user buffer
+;	c{ES:EDI} = Address of user buffer
+;	c{ESI}    = Offset of DCB
+;	CALL	hdlcdevinfo
+
+hdlcdevinfo:
+	MOVL	EAX, #ER_NIYT
+	STC
+	RET
+.PAGE
+	.SBTTL	sd_open - Open device
+
+;Here for the open device entry (sd_open) - also used for the device parameters
+;  entry (sd_parm)
+;	c{EDI} = Offset of DCB
+;	CALL	hdlcopen
+;	  c{EAX} = Error code
+;	  c{ECX} = 0
+;	C:clr = Normal
+;	  c{ECX} = 1
+
+hdlcopen:
+	MOVL	EAX, opn_rmtnetas+0[EBP] ;Get the remote address
+	MOVL	EDX, opn_rmtnetas+4[EBP]
+	TESTL	EAX, #0FFFFFF00h	;Is it valid?
+	JNE	8$.S			;No
+	TESTL	EDX, EDX		;Maybe
+	JNE	8$.S			;No
+	MOVB	dcb_hdlcaddr.B[EDI], AL ;Yes
+	MOVL	EBX, dcb_netpdb.B[EDI]	;Link the DCB into the address list
+	MOVL	EAX, pdb_hdlcdcbhead.B[EBX]
+	MOVL	dcb_hdlcnextadr.B[EDI], EAX
+	MOVL	pdb_hdlcdcbhead.B[EBX], EDI
+	CMPL	SS:xffParm##, #0.B
+	JE	6$.S
+	MOVL	EBX, #hdlcopnparms	;Process device parameters
+	MOVL	ECX, #knlComDPParms##
+	LFSL	EDX, SS:xffParm##
+	CALL	knlProcDevParm##
+	JC	10$.S
+6$:	CLRL	EAX
+	MOVL	ECX, #1
+	RET
+
+;Here if have an illegal remote address
+
+8$:	MOVL	EAX, #ER_NILAD
+	STC
+10$:	CLRL	ECX
+	RET
+.PAGE
+	.SBTTL	sd_close - Close device
+
+;Here for the close device entry
+;	c{ECX} = Close option bits
+;	c{EDI} = Offset of DCB
+;	c{ESI} = Offset of device table entry
+;	CALL	hdlcclose
+;	C:set = Error or not ready
+;	  c{EAX} = Error code (0 means not ready)
+;	C:clr = Normal
+
+hdlcclose:
+	CALL	knlIoClsLock##		;Lock the QAB
+	MOVB	iorb_queue.B[ESI], #dcb_outframe
+	MOVL	iorb_routine.B[ESI], #hdlcclose1
+	JMP	knlXfQueue##		;Switch to extended fork context
+
+	FAULTHDR
+2$:	MOVL	[ESP], #ER_ADRER
+	JMP	4$.S
+
+;Here in extended fork context
+
+hdlcclose1:
+	PUSHL	#0.B
+	CMPL	SS:xffParm##, #0.B	;Have any device parameters?
+	JE	4$.S			;No
+	MOVL	EBX, #hdlcioparms	;Yes - process parameters
+	MOVL	ECX, #knlComDPParms##
+	IFFAULT	2$
+	LFSL	EDX, SS:xffParm##
+	CALL	knlProcDevParm##
+	JNC	4$.S
+	MOVL	[ESP], EAX
+4$:	CALL	timerrmv		;Kill possible retransmit timer
+	CALL	hdlcunlistdcb		;Remove DCB from the address list
+	CALL	giveall			;Give up all input and output packets
+	POPL	EAX			;Restore error code
+	JMP	knlXfCloseFin##		;Go finish up
+.PAGE
+	.SBTTL	giveall - Subroutine to give up all input and output packets
+
+;Subroutine to give up all input and output packets
+;	c{EDI} = Offset of DCB
+;	CALL	giveall
+
+giveall:MOVL	EBX, dcb_hdlcrcvpkth.B[EDI] ;Have any input packets buffered?
+	TESTL	EBX, EBX
+	JE	2$.S			;No
+	CLRL	EAX
+	MOVL	dcb_hdlcrcvpkth.B[EDI], EAX ;Yes
+	MOVL	dcb_hdlcrcvpktt.B[EDI], EAX
+	CALL	xosnetGiveList##	;Give them up
+2$:	MOVL	EBX, dcb_hdlcsndhldh.B[EDI] ;Have any output packets held?
+	TESTL	EBX, EBX
+	JE	ret020.S		;No
+	CLRL	EAX
+	MOVL	dcb_hdlcsndhldh.B[EDI], EAX ;Yes
+	MOVL	dcb_hdlcsndhldt.B[EDI], EAX
+	MOVB	dcb_hdlcsndhldc.B[EDI], AL
+	CALL	xosnetGiveList##	;Give them up
+	JMP	timerrmv
+.PAGE
+	.SBTTL	hdlcspecial - Special device function
+
+;Here for the QFNC_SPECIAL queued IO function
+;  Value returned depends of function if normal or is negative error code
+;    if error
+
+hdlcspecial:
+	CALL	knlIoQabLock##		;Lock the QAB
+	JC	2$.S			;If error
+	CALL	knlIoParmLock##		;Lock all parameter pages
+	JC	2$.S			;If error
+	MOVB	iorb_queue.B[ESI], #dcb_outframe
+	MOVL	iorb_routine.B[ESI], #hdlcspec1
+	JMP	knlXfQueue##		;Switch to extended fork context
+
+2$:	TOFORK
+ret020:	RET
+
+;Here in extended fork context
+
+hdlcspec1:
+	MOVL	SS:xffTimeOut##, #XT_SECOND*2 ;Default time-out is 2 seconds
+	CMPL	SS:xffParm##, #0.B	;Have any device parameters?
+	JE	6$.S			;No
+	MOVL	EBX, #hdlcioparms	;Process parameters
+	MOVL	ECX, #knlComDPParms##
+	IFFAULT	knlQAdrErr0##
+	LFSL	EDX, SS:xffParm##
+	CALL	knlProcDevParm##
+	JC	ret020.S
+6$:	MOVZBL	EAX, SS:xffOption##	;Get function
+	CMPL	EAX, #HDLCSFMAX.B	;Legal function?
+	JAE	knlIFnDev##		;No
+	MOVL	dcb_hdlcerror.B[EDI], #0 ;Yes - clear saved error
+	JMPIL	CS:hdlcsfdsp[EAX*4]	;Dispatch on the subfunction
+
+;Dispatch table for special device functions for GPIB/CIC interface
+
+	.MOD	4
+hdlcsfdsp:
+	.LONG	knlIFnDev##	;	       = 0. - Illegal
+	.LONG	hdlcsdfclrinp	;HDLCS_CLRINP  = 1. - Clear input mode
+	.LONG	hdlcsdfconnect	;HDLCS_CONNECT = 2. - Connect
+	.LONG	hdlcsdfdiscon	;HDLCS_DISCON  = 3. - Disconnect
+HDLCSFMAX=!{$-hdlcsfdsp}/4
+.PAGE
+;Here for the HDLCS_CLRINP special device funciton - clear input mode
+
+hdlcsdfclrinp:
+	ANDB	dcb_hdlcstatus.B[EDI], #~HDLCA$INPOK ;Allow output
+	CLRL	EAX
+errc1:	CLRL	ECX
+	MOVL	EBX, #QSTS$DONE
+	RET
+
+;Here for the HDLCS_CONNECT special device function - connect
+
+hdlcsdfconnect:
+	MOVB	dcb_hdlcstate.B[EDI], #ST_SNRM ;Indicate sending SNRM
+	ORB	dcb_hdlcstatus.B[EDI], #HDLCA$INPOK ;Indicate input is OK now
+	CALL	giveall			   ;Give up all buffered input and
+	MOVB	dcb_hdlcsndseq.B[EDI], #0 ;  output packets
+	MOVB	dcb_hdlcrcvseq.B[EDI], #0 ;Clear the sequence numbers
+	MOVB	dcb_hdlcackseq.B[EDI], #0
+	MOVL	ECX, #2t
+	CALL	xosnetGetBufr##		;Get a packet
+	JC	10$.S			;If error
+	MOVB	AL, dcb_hdlcaddr.B[EDI] ;Put address in the packet
+	MOVB	[EBX], AL
+	MOVB	1.B[EBX], #93h		;Store control byte (SNRM)
+	MOVL	EAX, SS:xffCount##	;Get number of retries
+	TESTL	EAX, EAX
+	JNE	4$.S
+	MOVB	AL, #4
+4$:	PUSHL	EAX
+6$:	MOVL	npb_count.B[EBX], #2
+	MOVL	npb_outdone.B[EBX], #ret008 ;Store offset of output done routine
+	MOVL	ESI, dcb_netidb.B[EDI]
+	PUSHL	EBX
+	CALL	xosnetSendPkt##		;Send the packet
+	POPL	EBX
+	JC	errc2.S			;If error
+	MOVL	EAX, SS:xffTimeOut##
+	CALL	xosnetWaitPkt##
+	JC	errc2.S
+	CMPB	dcb_hdlcstate.B[EDI], #ST_CON ;Did we get the UA already?
+	JE	good2.S			;Yes - go on
+	MOVL	EAX, SS:xffTimeOut##	;No - wait for it
+	CALL	xosnetRspWait##
+	JNC	12$.S			;If OK
+	CMPL	EAX, #ER_NORSP.B	;Error - was it no response?
+	JNE	errc2.S			;No
+	DECB	[ESP]			;Yes - should we try again?
+	JNE	6$.S			;Yes
+	MOVL	EAX, #ER_NSNOD		;No - get right error code
+errc2:	POPL	ECX			;Fix up the stack
+	PUSHL	EAX
+	CALL	xosnetGiveBufr##	;Give up our packet
+	POPL	EAX
+10$:	MOVB	dcb_hdlcstate.B[EDI], #ST_IDLE
+	ANDB	dcb_hdlcstatus.B[EDI], #~HDLCA$INPOK
+	JMP	errc1
+
+;Here with a response
+
+12$:	CMPB	dcb_hdlcstate.B[EDI], #ST_CON ;Is the state OK?
+	JNE	6$.S			;No - keep trying
+good2:	POPL	EAX			;Yes - fix up the stack
+	CALL	xosnetGiveBufr##	;Give up our packet
+	CLRL	EAX			;Finished
+	MOVL	ECX, #1
+	MOVL	EBX, #QSTS$DONE
+	RET
+.PAGE
+;Here for the HDLCS_DISCON special device function - disconnect
+
+hdlcsdfdiscon:
+	CMPB	dcb_hdlcstate.B[EDI], #ST_CON ;Are we connected now?
+	JNE	nncon			;No - fail
+	MOVB	dcb_hdlcstate.B[EDI], #ST_DISC ;Yes - indicate sending DISC
+	ORB	dcb_hdlcstatus.B[EDI], #HDLCA$INPOK ;Indicate input is OK now
+	CALL	giveall			   ;Give up all buffered input and
+	MOVB	dcb_hdlcsndseq.B[EDI], #0 ;  output packets
+	MOVB	dcb_hdlcrcvseq.B[EDI], #0 ;Clear the sequence numbers
+	MOVB	dcb_hdlcackseq.B[EDI], #0
+	MOVL	ECX, #2t
+	CALL	xosnetGetBufr##		;Get a packet
+	JC	errc1			;If error
+	MOVB	AL, dcb_hdlcaddr.B[EDI] ;Put address in the packet
+	MOVB	[EBX], AL
+	MOVB	1.B[EBX], #53h		;Store control byte (DISC)
+	MOVL	EAX, SS:xffCount##	;Get number of retries
+	TESTL	EAX, EAX
+	JNE	4$.S
+	MOVB	AL, #4
+4$:	PUSHL	EAX
+6$:	MOVL	npb_count.B[EBX], #2
+	MOVL	npb_outdone.B[EBX], #ret008 ;Store offset of output done routine
+	MOVL	ESI, dcb_netidb.B[EDI]
+	PUSHL	EBX
+	CALL	xosnetSendPkt##		;Send the packet
+	POPL	EBX
+	JC	8$.S			;If error
+	MOVL	EAX, SS:xffTimeOut##
+	CALL	xosnetWaitPkt##
+	JC	8$.S
+	CMPB	dcb_hdlcstate.B[EDI], #ST_IDLE ;Did we get the DM already?
+	JE	14$.S			;Yes - go on
+	MOVL	EAX, SS:xffTimeOut##	;No - wait for it
+	CALL	xosnetRspWait##
+	JNC	12$.S			;If OK
+	CMPL	EAX, #ER_NORSP.B	;Error - was it no response?
+	JNE	8$.S			;No
+	DECB	[ESP]			;Yes - should we try again?
+	JNE	6$.S			;Yes
+8$:	JMP	errc2			;No - go fail
+
+;Here with a response
+
+12$:	CMPB	dcb_hdlcstate.B[EDI], #ST_IDLE ;Is the state OK?
+	JNE	6$.S			;No - keep trying
+14$:	JMP	good2			;OK - go finish up
+.PAGE
+	.SBTTL	sd_inpblock - Input block
+
+;Here for the sd_inpblock entry - input block
+;	c{ESI} = Offset of IORB
+;	c{EDI} = Offset of DCB
+;	CALL	hdlcinpblock
+;	c{EAX} = Error code
+;	c{ECX} = Amount output
+;	c{EBX} = Status bits
+
+$$$=!0
+FRM iox_rmthwa, 8t		;Address to receive the remote hardware address
+iox_SIZE=!$$$
+
+hdlcinpblk:
+	CALL	knlIoQabLock##		;Lock the QAB
+	JC	2$.S			;If error
+	CALL	knlIoReadLock##		;Lock all buffer pages
+	JC	2$.S			;If error
+	MOVB	iorb_queue.B[ESI], #dcb_inpframe
+	MOVL	iorb_routine.B[ESI], #hdlcinpblk1
+	JMP	knlXfQueue##		;Switch to extended fork context
+
+2$:	TOFORK
+	RET
+
+3$:	CLRL	ECX
+	MOVL	EBX, #QSTS$DONE
+	RET	
+
+;Here in extended fork context
+
+hdlcinpblk1:
+	MOVL	EAX, dcb_hdlcerror.B[EDI]
+	TESTL	EAX, EAX
+	JS	3$.S
+	ENTER	iox_SIZE, 0
+	MOVL	SS:xffTimeOut##, #-1
+	CLRL	EAX
+	MOVL	iox_rmthwa+0.B[EBP], EAX
+	CMPL	SS:xffParm##+0, EAX
+	JE	4$.S
+	MOVL	EBX, #hdlcioparms	;Process parameters
+	MOVL	ECX, #knlComDPParms##
+	LFSL	EDX, SS:xffParm##
+	CALL	knlProcDevParm##
+	JC	6$.S			;If error
+4$:	CMPL	SS:xffCount##, #0.B	;Really want to do input?
+	JNE	10$.S			;Yes
+	CLRL	EAX			;No - finished now
+	CLRL	EAX
+6$:	MOVL	EBX, #QSTS$DONE
+	LEAVE
+	RET
+
+;Here to really do input
+
+10$:	CMPL	dcb_hdlcrcvpkth.B[EDI], #0.B ;Yes - have a packet now?
+	JNE	12$.S			;Yes
+	MOVL	EAX, SS:xffTimeOut##	;No - wait for input to appear
+	CALL	knlXfWait##
+	JC	6$.S			;If error
+12$:	MOVL	EBX, dcb_hdlcrcvpkth.B[EDI] ;OK - get offset of the packet
+	MOVL	EAX, npb_next.B[EBX]	;Unlink it
+	MOVL	dcb_hdlcrcvpkth.B[EDI], EAX
+	TESTL	EAX, EAX
+	JNE	14$.S
+	MOVL	dcb_hdlcrcvpktt.B[EDI], EAX
+14$:	DECB	dcb_hdlcrcvpktc.B[EDI]	;Reduce number of packets buffered
+	MOVZBL	ESI, npb_npofs.B[EBX]	;Point to the data
+	ADDL	ESI, EBX
+	PUSHL	#QSTS$DONE		;Get final status bits
+	MOVL	ECX, npb_count.B[EBX]
+	INCL	ESI			;Discard the address byte
+	DECL	ECX
+	TESTB	[ESI], #01h		;Numbered data packet?
+	JNE	16$.S			;No
+	INCL	ESI			;Yes - discard the control byte
+	DECL	ECX
+	JMP	17$.S
+
+16$:	ORB	[ESP], #QSTS$OOBD	;No - indicate have out-of-band data
+17$:	TESTL	ECX, ECX		;Was the packet too small?
+	JG	18$.S			;No
+	CALL	xosnetGiveBufr##	;Yes - discard the buffer
+	JMP	10$.S			;And try again
+
+;Here with a packet to input
+
+18$:	CMPL	ECX, SS:xffCount##	;Will it all fit in his buffer?
+	JBE	20$.S			;Yes
+	MOVL	ECX, SS:xffCount##	;No - just give him what will fit
+	BTSL	[ESP], #QSTS%TRUNC	;Indicate truncation
+20$:	PUSHL	ECX
+	PUSHL	EDI
+	LESL	EDI, SS:xffBuffer1##	;Get address of buffer
+	CMPL	ECX, #4.B		;4 bytes or fewer?
+	JBE	22$.S			;Yes
+	MOVL	EAX, ECX		;No
+	CLRL	ECX			;Get destination long aligned
+	SUBL	ECX, EDI
+	ANDL	ECX, #03.B
+	SUBL	EAX, ECX
+	RMOVSB	[EDI], [ESI]
+	MOVL	ECX, EAX
+	SHRL	ECX, #2
+	RMOVSL	[EDI], [ESI]		;Copy most of the data 4 bytes at a time
+	MOVL	ECX, EAX
+	ANDL	ECX, #03.B
+22$:	RMOVSB	[EDI], [ESI]		;Copy anything left over
+	POPL	EDI
+	CMPL	iox_rmthwa+0.B[EBP], #0.B ;Does he want the remote address?
+	JE	24$.S			;No
+	MOVL	ESI, dcb_netidb.B[EDI]	;Yes - get remote address
+	CALLI	idb_gethwa.B[ESI]
+	LESL	ECX, iox_rmthwa.B[EBP]	;Get address where he wants the value
+	MOVL	ES:[ECX], EAX		;Give him the remote address value
+	MOVL	ES:4.B[ECX], EDX
+24$:	PUSHL	#0.B
+	CALL	xosnetGiveBufr##	;Give up the buffer
+	POPL	EAX
+	POPL	ECX
+	POPL	EBX
+	LEAVE
+	RET
+.PAGE
+	.SBTTL	hdlcrcvpkt - Subroutine called when packet has been input for HDLCA device
+
+;Subroutine called when packet has been input for an HDLCA device
+;	c{EBX} = Offset of start of packet
+;	c{ECX} = Length of packet
+;	c{ESI} = Offset of SDB
+;	CALL	hdlcrcvpkt
+
+hdlcrcvpkt:
+	MOVB	AL, [EBX]		;Get address from packet
+	MOVL	EDI, sdb_pdbhead.B[ESI]	;Point to our only PDB
+	MOVL	EDX, pdb_hdlcdcbhead.B[EDI] ;Find corresponding DCB
+2$:	TESTL	EDX, EDX
+	JE	4$.S
+	CMPB	dcb_hdlcaddr.B[EDX], AL
+	JE	10$.S
+	MOVL	EDX, dcb_hdlcnextadr.B[EDX]
+	JMP	2$.S
+
+;Here if no DCB for HDLC address
+
+4$:	INCL	pdb_hdlccntnodst.B[EDI] ;Count the error
+	JMP	8$.S			;Discard the packet
+
+;Here if input is now allowed now
+
+6$:	INCL	pdb_hdlccntinnact.B[EDI] ;Count the error
+8$:	CALL	xosnetGiveBufr##	;Discard the packet
+	RET
+
+;Here with DCB for HDLC address
+
+10$:	MOVL	EDI, EDX
+	TESTB	dcb_hdlcstatus.B[EDI], #HDLCA$INPOK ;Can we take input now?
+	JE	6$.S			;No
+	MOVB	AL, 1.B[EBX]		;Yes - get the control byte
+	MOVZBL	EDX, dcb_hdlcstate.B[EDI] ;Dispatch on the link state
+	JMPIL	CS:isdsp[EDX*4]
+
+	.MOD	4
+isdsp:	.LONG	isidle		;ST_IDLE = 0 - Link is idle
+	.LONG	issnrm		;ST_SNRM = 1 - SNRM command has been sent
+	.LONG	iscon		;ST_CON  = 2 - Link is connected
+	.LONG	isdisc		;ST_DISC = 3 - DISC command has been sent
+.PAGE
+;Here with input packet when state is ST_SNRM
+
+issnrm:	CMPB	AL, #73h		;Is this a UA response?
+	JNE	6$.S			;No
+	MOVB	dcb_hdlcstate.B[EDI], #ST_CON ;Yes - update the state
+	JMP	4$.S			;Continue
+
+;Here with input packet when state is ST_DISC
+
+isdisc:	CMPB	AL, #1FH		;Is this a DM response?
+	JNE	6$.S			;No
+	MOVB	dcb_hdlcstate.B[EDI], #ST_IDLE ;Yes - update the state
+4$:	CALL	xosnetGiveBufr##	;Give up the packet
+	ANDB	dcb_hdlcstatus.B[EDI], #~HDLCA$INPOK ;No more input now
+	JMP	xosnetRspDoneOut##	;Wake him up
+
+;Here with packet which we cannot accept because state is ST_SNRM,
+;  ST_DISC, or ST_IDLE
+
+6$:	MOVL	EAX, dcb_netpdb.B[EDI]
+	INCL	pdb_hdlccntnotcon.B[EAX]
+	CALL	xosnetGiveBufr##
+	RET
+
+;Here with input packet when state is ST_IDLE
+
+isidle:	ANDB	AL, #03h		;Is this an unnumbered response?
+	CMPB	AL, #03h
+	JNE	6$.S			;No
+	MOVB	AL, 1.B[EBX]		;Yes
+
+;Here with input packet when state is ST_CON
+
+iscon:	TESTB	AL, #01h		;Does this packet ack anything?
+	JE	8$.S			;Yes
+	TESTB	AL, #02h		;Maybe
+	JNE	18$.S			;No - go on
+8$:	SHRB	AL, #5t			;Yes - get ack number
+	PUSHL	EBX
+	MOVL	EBX, dcb_hdlcsndhldh.B[EDI] ;Get first held output packet
+	TESTL	EBX, EBX
+	JE	16$.S			;If none at all
+10$:	CMPB	AL, npb_seqnum.B[EBX]	;Is this one acked?
+	JE	14$.S			;No - finished here
+
+;NEED BETTER CHECK HERE FOR VALID ACK VALUE!!!!!
+
+	MOVL	EDX, npb_next.B[EBX]	;Yes - remove this packet from the
+	MOVL	dcb_hdlcsndhldh.B[EDI], EDX
+	TESTL	EDX, EDX
+	JNE	12$.S
+	MOVL	dcb_hdlcsndhldt.B[EDI], EDX
+12$:	DECB	dcb_hdlcsndhldc.B[EDI]
+	CALL	xosnetGiveBufr##
+	MOVL	EBX, EDX
+	TESTL	EBX, EBX
+	JNE	10$.S
+14$:	CMPL	dcb_hdlcsndhldh.B[EDI], #0.B ;Still have any held packets?
+	JNE	16$.S			;Yes
+	CALL	timerrmv		;No - stop the retransmit timer
+
+;Here with acks processed
+
+16$:	POPL	EBX
+18$:	TESTB	1.B[EBX], #10h		;Is the P/F bit set?
+	JE	24$.S			;No
+	ANDB	dcb_hdlcstatus.B[EDI], #~HDLCA$INPOK ;Yes - indicate no more
+						      ;  input allowed
+24$:	TESTB	1.B[EBX], #01h		;Data packet?
+	JE	rcvdata.S		;Yes
+	TESTB	1.B[EBX], #02h		;No - unnumbered packet?
+	JNE	unnum.S			;Yes
+
+;Here with a supervisory command/response
+
+	JMP	rcvc2.S
+
+;Here with an unnumbered packet
+
+unnum:	CMPB	1.B[EBX], #97h		;Is this a FRMR?
+	JNE	rcvc2.S			;No - just give it to the user
+	PUSHL	4.B[EBX]		;Save data from the packet
+	CALL	xosnetGiveBufr#		;Give up the packet
+	CALL	giveall			;Give up any buffered packets
+	POPL	EDX			;Get the data bits
+	MOVL	EAX, #ER_NPERR		;Assume network protocol error
+	TESTB	AL, #08h		;Sequence error?
+	JE	28$.S			;No
+	MOVB	AL, #ER_NPSQE&0FFh	;Yes
+28$:	TESTB	AL, #04h		;Packet too big?
+	JE	30$.S			;No
+	MOVB	AL, #ER_NDRTL&0FFh	;Yes
+30$:	MOVL	dcb_hdlcerror.B[EDI], EAX ;Save the error code
+	JMP	knlResumeInput##	;Terminate any current input operation
+.PAGE
+;Here with a data packet
+
+rcvdata:MOVB	AL, 1.B[EBX]		;Get the send sequence number
+	SHRB	AL, #1t
+	ANDB	AL, #07h
+	CMPB	AL, dcb_hdlcrcvseq.B[EDI] ;Is this the one we are expecting?
+	JE	2$.S			;Yes - go on
+
+;Here if this packet is out of sequence
+
+	MOVL	EAX, dcb_netpdb.B[EDI]	;Count the error
+	INCL	pdb_hdlccntoutseq.B[EAX]
+	CALL	xosnetGiveBufr##	;Discard the packet
+	RET
+
+;Here with the expected packet
+
+2$:	INCB	dcb_hdlcrcvseq.B[EDI]
+	ANDB	dcb_hdlcrcvseq.B[EDI], #07h
+rcvc2:	MOVB	AL, dcb_hdlcrcvpktc.B[EDI] ;Can we take another packet?
+	CMPB	AL, dcb_bufrlmt.B[EDI]
+	JAE	8$.S			;No
+	MOVL	EAX, dcb_hdlcrcvpktt.B[EDI] ;Yes - link to end of list
+	TESTL	EAX, EAX
+	JNE	4$.S
+	MOVL	dcb_hdlcrcvpkth.B[EDI], EBX
+	JMP	6$.S
+
+4$:	MOVL	npb_next.B[EAX], EBX
+6$:	MOVL	dcb_hdlcrcvpktt.B[EDI], EBX
+	MOVL	npb_next.B[EBX], #0
+	INCB	dcb_hdlcrcvpktc.B[EDI]	;Count the packet
+	MOVL	npb_count.B[EBX], ECX	;Store data size in packet
+	CLRL	EAX
+	JMP	knlResumeInput##	;Continue with input
+
+;Here if can not take the received packet
+
+8$:	MOVL	EAX, dcb_netpdb.B[EDI]	;Count the error
+	INCL	pdb_hdlccntiovr.B[EAX]
+	CALL	xosnetGiveBufr##	;Discard the packet
+	RET
+.PAGE
+	.SBTTL	sd_outblock - Output block
+
+;Here for the sd_outblock entry - output block
+;	c{ESI} = Offset of IORB
+;	c{EDI} = Offset of DCB
+;	CALL	hdlcoutblk
+;	c{EAX} = Error code
+;	c{ECX} = Amount output
+;	c{EBX} = Status bits
+
+hdlcoutblk:
+	CALL	knlIoQabLock##		;Lock the QAB
+	JC	2$.S			;If error
+	CALL	knlIoWriteLock##	;Lock the buffer pages
+	JC	2$.S
+	MOVB	iorb_queue.B[ESI], #dcb_outframe
+	MOVL	iorb_routine.B[ESI], #hdlcoutblk1
+	JMP	knlXfQueue##		;Switch to extended fork context
+
+2$:	TOFORK
+	RET
+
+;Here if cannot accept another output packet
+
+4$:	MOVL	EAX, #ER_NCONG
+	JMP	8$.S
+
+;Here if cannot do output now
+
+6$:	MOVL	EAX, #ER_OUTNE
+8$:	CLRL	ECX
+	MOVL	EBX, #QSTS$DONE
+	RET	
+
+nncon:	MOVL	EAX, #ER_NNCON
+	JMP	8$.S
+
+;Here in extended fork context
+
+hdlcoutblk1:
+	MOVL	EAX, dcb_hdlcerror.B[EDI]
+	TESTL	EAX, EAX
+	JS	8$.S
+	MOVL	SS:xffTimeOut##, #-1
+	CMPL	SS:xffParm##, #0.B	;Have any parameters?
+	JE	12$.S			;No
+	MOVL	EBX, #hdlcioparms	;Yes - process parameters
+	MOVL	ECX, #knlComDPParms##
+	LFSL	EDX, SS:xffParm##
+	CALL	knlProcDevParm##
+	JC	16$.S			;If error
+12$:	CLRL	EAX
+	MOVL	ECX, SS:xffCount##
+	TESTL	ECX, ECX
+	JE	38$			;If nothing to output
+	TESTB	dcb_hdlcstatus.B[EDI], #HDLCA$INPOK ;Can we do output now?
+	JNE	6$.S			;No - fail
+	INCL	ECX			;Yes
+	TESTB	SS:xffFunc##+1, #QFNC$OOBD>8t ;Sending out-of-band data?
+	JNE	14$.S			;Yes
+	CMPB	dcb_hdlcstate.B[EDI], #ST_CON ;No - are we connected?
+	JNE	nncon.S			;No - fail
+	CMPB	dcb_hdlcsndhldc.B[EDI], #7 ;Yes - can we output another packet?
+	JAE	4$.S			;No - fail!
+	INCL	ECX			;Yes - fix up the length
+14$:	MOVL	ESI, dcb_netsdb.B[EDI]	;Yes - get offset of our SDB
+	CALL	xosnetGetBufr##		;Allocate a buffer
+16$:	JC	42$			;If error
+	PUSHL	ESI
+	MOVL	ESI, sdb_idb.B[ESI]
+	CALLI	idb_setpkt.B[ESI]
+	POPL	ESI
+	MOVL	EAX, EDX		;Calculate offset of the next level
+	SUBL	EAX, EBX		;  header
+	MOVB	npb_npofs.B[EBX], AL	;Store it
+	MOVB	AL, dcb_hdlcaddr.B[EDI] ;Get HDLC address
+	BTZL	dcb_netmode.B[EDI], #NMODE%BRDCST ;Should this be broadcast?
+	JNC	18$.S			;No
+	MOVB	AL, #0FFh		;Yes
+18$:	MOVB	[EDX], AL		;Store address in the packet
+	TESTB	SS:xffFunc##+1, #QFNC$OOBD>8t ;Sending out-of-band data?
+	JE	20$.S			;No
+	PUSHL	ESI
+	LFSL	ESI, SS:xffBuffer1#	;Get address of the caller's buffer
+	CLD
+	LODSB	FS:[ESI]		;Yes - get the control byte
+	DECL	SS:xffCount##
+	ORB	AL, #03h		;Force it to be an unnumbered packet
+	ANDB	AL, #~10h		;Clear the poll bit
+	JMP	22$.S
+
+;Here if not sending out-of-band data
+
+20$:	MOVB	AL, dcb_hdlcsndhldc.B[EDI] ;Can we take another packet now?
+	CMPB	AL, dcb_bufrlmt.B[EDI]
+	MOVL	EAX, #ER_TMORQ
+	JAE	40$			;No - fail!
+	MOVB	AL, dcb_hdlcsndseq.B[EDI] ;Get current send sequence number
+	INCB	dcb_hdlcsndseq.B[EDI]	;Increment the sequence number
+	ANDB	dcb_hdlcsndseq.B[EDI], #07h ;Modulo 8
+	MOVB	npb_seqnum.B[EBX], AL	;Store sequence number in our header
+	ADDB	AL, AL			;Put sequence number in right position
+	MOVB	AH, dcb_hdlcrcvseq.B[EDI] ;Get current receive sequence number
+	SHLB	AH, #5t
+	ORB	AL, AH	
+	PUSHL	ESI
+	LFSL	ESI, SS:xffBuffer1#	;Get address of the caller's buffer
+	CLD
+22$:	TESTB	SS:xffFunc##+1, #QFNC$POLL>8 ;Want to make this a poll?
+	JE	24$.S			;No
+	ORB	AL, #10h		;Yes - set the P/F bit
+	ORB	dcb_hdlcstatus.B[EDI], #HDLCA$INPOK ;Indicate input is OK now
+24$:	MOVB	1.B[EBX], AL		;Store control byte
+	ADDL	EDX, #2.B		;Point to first data byte
+	MOVL	ECX, SS:xffCount##
+	LEAL	EAX, 2.B[ECX]
+	MOVL	npb_count.B[EBX], EAX
+	CLRL	EAX
+	MOVL	npb_next.B[EBX], EAX
+	PUSHL	EDI
+	MOVL	EDI, EDX
+	PUSHL	DS
+	POPL	ES
+	MOVL	EAX, ECX		;Copy user's data to our buffer
+	SHRL	ECX, #2t
+	CLD
+	RMOVSL	[EDI], FS:[ESI]
+	MOVL	ECX, EAX
+	ANDL	ECX, #03.B
+	RMOVSB	[EDI], FS:[ESI]
+	POPL	EDI
+	POPL	ESI
+	PUSHL	EDI
+	MOVL	npb_outdone.B[EBX], #xosnetOutDone##
+	MOVL	ECX, npb_count.B[EBX]	;Get size of the packet
+	ADDL	sdb_cntbyteout.B[ESI], ECX ;Count the output packet
+	INCL	sdb_cntpktout.B[ESI]
+	PUSHL	EBX
+	MOVL	ESI, sdb_idb.B[ESI]	;Get offset of IDB
+	MOVL	npb_outdone.B[EBX], #ret008 ;Store offset of output done routine
+	CALL	xosnetSendPkt##		;Send the packet
+	POPL	EBX
+	POPL	EDI
+26$:	JC	40$.S			;If error
+	MOVL	EAX, SS:xffTimeOut#
+	CALL	xosnetWaitPkt##		;Wait until its been output
+	JC	40$.S
+	TESTB	SS:xffFunc##+1, #QFNC$OOBD>8t ;OK - sending out-of-band data?
+	JE	28$.S			;No
+	CALL	xosnetGiveBufr##	;Yes - give up the buffer
+	JMP	36$.S			;Continue
+
+;Here if not sending out-of-band data
+
+28$:	CMPL	dcb_hdlcsndwake.B[EDI], #0.B ;Is the output timer runing now?
+	JNE	30$.S			;Yes
+	MOVL	EAX, dcb_netpdb.B[EDI]	;No - start it now
+	MOVL	EAX, pdb_hdlcretrytime.B[EAX]
+	PUSHL	EBX
+	MOVL	EBX, #hdlcrexmit
+$$$$rex::
+	CALL	knlWakeRequest##
+	POPL	EBX
+	JC	40$.S			;Fail if can't start timer (unlikely!)
+	MOVL	dcb_hdlcsndwake.B[EDI], ESI
+	MOVL	EAX, dcb_netpdb.B[EDI]	;OK - initialize the retry counter
+	MOVL	EAX, pdb_hdlcretrycnt.B[EAX]
+	MOVL	dcb_hdlcretrycnt.B[EDI], EAX
+30$:	MOVL	EAX, dcb_hdlcsndhldt.B[EDI] ;Link packet to end of the send
+	TESTL	EAX, EAX		     ;  held packet list
+	JE	32$.S
+	MOVL	npb_next.B[EAX], EBX
+	JMP	34$.S
+
+32$:	MOVL	dcb_hdlcsndhldh.B[EDI], EBX
+34$:	MOVL	dcb_hdlcsndhldt.B[EDI], EBX
+	INCB	dcb_hdlcsndhldc.B[EDI]	;Count the held output packet
+
+36$:	CLRL	EAX
+	MOVL	ECX, SS:xffCount##	;Get amount we output
+38$:	MOVL	EBX, #QSTS$DONE
+	RET
+
+;Here if error sending the packet
+
+40$:	CALL	xosnetGiveBufr#
+42$:	CLRL	ECX
+	JMP	38$.S
+.PAGE
+	.SBTTL	hdlcrexmit - Routine to retransmit output packet
+
+;Here when the retransmit timer goes off
+
+hdlcrexmit:
+	CLRL	EAX
+	MOVL	dcb_hdlcsndwake.B[EDI], EAX
+	DECL	dcb_hdlcretrycnt.B[EDI] ;Have we done this enough?
+	JS	6$.S			;Yes
+	MOVL	EBX, dcb_hdlcsndhldt.B[EDI] ;No - get packet to retransmit
+	CMPL	npb_nextsnd.B[EBX], #-1.B ;Is the packet being output now?
+	JNE	4$.S			;Yes - can't output it again!
+	MOVL	ESI, dcb_netidb.B[EDI]	;Get offset of the IDB
+	MOVL	npb_outdone.B[EBX], #ret008 ;Store offset of output done routine
+	CALL	xosnetSendPkt##		;Send the packet again
+	JC	8$.S			;If error
+	MOVL	EAX, dcb_netpdb.B[EDI]	;OK - count the retransmission
+	INCL	pdb_hdlccntrexmit.B[EAX]
+4$:	MOVL	EAX, dcb_netpdb.B[EDI]	;Restart the timer
+	MOVL	EAX, pdb_hdlcretrytime.B[EAX]
+	MOVL	EBX, #hdlcrexmit
+	CALL	knlWakeRequest##
+	JC	8$.S			;Fail if can't start timer (unlikely!)
+	MOVL	dcb_hdlcsndwake.B[EDI], ESI
+	RET
+
+;Here if error - if input is active, terminate it with the error, otherwise
+;  store the error to be reported next time input or output is done
+
+6$:	MOVL	EAX, #ER_NOACK
+8$:	MOVL	dcb_hdlcerror.B[EDI], EAX ;Store the error code
+	JMP	knlResumeInput##	;Terminate possible input operation
+.PAGE
+	.SBTTL	hdlcgetinput - Subroutine to get input packet
+
+hdlcgetinput:
+	CALL	knlXfTimeWait##
+	MOVL	EAX, #ER_NORSP
+	STC
+	RET
+.PAGE
+	.SBTTL	timerrmv - Subroutine to remove retransmit wake request
+
+;Subroutine to remove retransmit wake request
+;	CALL	timerrmv
+
+timerrmv:
+	CMPL	dcb_hdlcsndwake.B[EDI], #0.B ;Have a timer going now?
+	JE	4$.S			;No
+	PUSHL	ESI			;Yes - kill it
+	MOVL	ESI, dcb_hdlcsndwake.B[EDI]
+	CALL	knlWakeRemove##
+	CLRL	ESI
+	MOVL	dcb_hdlcsndwake.B[EDI], ESI
+	POPL	ESI
+4$:	RET
+.PAGE
+	.SBTTL	hdlcunlistdcb - Subourtine to remove DCB from the HDLC address list
+
+;Subroutine to remove DCB from the HDLC address list
+;	c{EDI} = Offset of DCB
+;	CALL	hdlcunlistdcb
+;  c{EAX} is preserved
+
+hdlcunlistdcb:
+	MOVL	EBX, dcb_netpdb.B[EDI]	;Get offset of the PDB
+	LEAL	EDX, pdb_hdlcdcbhead.B[EBX] ;Get offset of first pointer
+4$:	CMPL	[EDX], EDI
+	JE	6$.S
+	MOVL	EDX, [EDX]
+	TESTL	EDX, EDX
+	JE	10$.S
+	ADDL	EDX, #dcb_hdlcnextadr.B
+	JMP	4$.S
+
+6$:	PUSHL	dcb_hdlcnextadr.B[EDI]
+	POPL	[EDX]
+	RET
+
+10$:	CRASH	DNAL			;[DCB Not in Address List]
+.PAGE
+	.SBTTL	HDLCA class driver data
+
+	DATA
+
+firstsdb:   .LONG  0		;Offset of first SAP data block
+lastsdb:    .LONG  0		;Offset of last SAP data block
+hdlcadcbnum:.LONG  0		;Number of in use network DCBs
+hdlcadcbmax:.LONG  0		;Maximum in use network DCBs
+hdlcadcblmt:.LONG  10000t	;Maximum number of network DCBs allowed
+hdlcaccb:   .BLKB  ccb_SIZE	;HDLCA CCB
+thisetpdb:  .LONG  0
+
+	LKEEND

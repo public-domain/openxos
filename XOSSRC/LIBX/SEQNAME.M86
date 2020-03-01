@@ -1,0 +1,262 @@
+	.TITLE	setupseqname - Function to set up unique sequential name
+
+;++++
+; This software is in the public domain.  It may be freely copied and used
+; for whatever purpose you see fit, including commerical uses.  Anyone
+; modifying this software may claim ownership of the modifications, but not
+; the complete derived code.  It would be appreciated if the authors were
+; told what this software is being used for, but this is not a requirement.
+
+;   THIS SOFTWARE IS PROVIDED BY THE AUTHORS "AS IS" AND ANY EXPRESS OR
+;   IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
+;   OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+;   IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+;   INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+;   BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS
+;   OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+;   ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR
+;   TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
+;   USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+;----
+
+	.PROC	80386
+
+	.INCLUD	XOSINC:\XMAC\STDIO.PAR
+	.INCLUD	XOSINC:\XMAC\CTYPE.PAR
+	.INCLUD	XOSINC:\XMAC\XOS.PAR
+	.INCLUD	XOSINC:\XMAC\XOSERR.PAR
+	.INCLUD	XOSINC:\XMAC\XOSTIME.PAR
+
+	.STDSEGS
+
+	.PSECT	_TEXT_p
+
+;Function to set up unique sequential name
+;	char     *name;
+;	int       create;	// Non-zero if should create new file
+;	int rtn = setupseqname(name, create);
+
+arg_name  =!8t
+arg_create=!12t
+
+	.ENTRY	setupseqname
+setupseqname:
+	PUSHL	EBP
+	MOVL	EBP, ESP
+	MOVL	EBX, arg_name.B[EBP]	;First find the beginning of the
+	MOVL	EDX, EBX		;  file name part of the specification
+6$:	MOVB	AL, [EBX]
+	INCL	EBX
+	CMPB	AL, #0
+	JE	10$.S
+	CMPB	AL, #':'
+	JE	8$.S
+	CMPB	AL, #'/'
+	JE	8$.S
+	CMPB	AL, #'\'
+	JNE	6$.S
+8$:	MOVL	EDX, EBX
+	JMP	6$.S
+
+10$:	MOVL	namebgn, EDX
+	MOVL	ECX, #38t		;Now build the search string
+	MOVL	EBX, #srchstr
+	CLRL	EAX
+	MOVL	wnfbegin, EAX
+12$:	MOVB	AL, [EDX]		;Get next character
+	INCL	EDX
+	CMPB	AL, #0			;End of string?
+	JE	srchrdy.S		;Yes
+	CMPB	AL, #'?'		;No - check for invalid characters
+	JE	14$.S
+	CMPB	AL, #'*'
+	JE	14$.S
+	CMPB	AL, #'{'
+	JE	14$.S
+	CMPB	AL, #'}'
+	JE	14$.S
+	CMPB	AL, #'#'		;OK - wild numeric field?
+	JE	16$.S			;Yes - go handle that
+	MOVB	[EBX], AL		;No - store character
+	INCL	EBX			;Bump poiner
+	LOOP	ECX, 12$		;Continue if room for more
+14$:	MOVL	EAX, #ER_BDSPC
+	POPL	EBP
+	RET
+
+;Here with the start of a wild numeric field
+
+16$:	CMPL	wnfbegin, #0.B		;Is this the first one?
+	JNE	14$.S			;No - fail!
+	DECL	EDX
+	CLRL	EAX
+18$:	INCL	EAX
+	INCL	EDX
+	CMPB	[EDX], #'#'		;Another #?
+	JE	18$.S			;Yes
+	CMPL	EAX, #8t.B		;Is the field too big?
+	JA	14$.S			;Yes - fail
+	SUBL	ECX, EAX		;Have enough room left?
+	JS	14$.S			;No - fail!
+	MOVL	wnfsize, EAX		;Yes - store size of the field
+	MOVL	wnfbegin, EBX		;Remember where it starts
+20$:	MOVB	[EBX], #'?'		;Store n question marks
+	INCL	EBX
+	DECL	EAX
+	JNE	20$.S
+	JMP	12$.S			;Continue
+.PAGE
+;Here with the search string constructed
+
+srchrdy:MOVB	[EBX], #0		;Store final null
+	CMPL	wnfbegin, #0.B		;Did we have a wild numeric field?
+	JE	28$			;No
+	PUSHL	#O$ODF			;Yes - open the directory
+	PUSHL	DS
+	PUSHL	arg_name.B[EBP]
+	PUSHL	#0.B
+	PUSHL	#0.B
+	CALLF	svcIoOpen##
+	ORL	EAX, EAX
+	JS	14$.S			;If error
+	MOVL	dirhndl, EAX		;OK - store directory handle
+
+;Now we must search the directory and find the file with the highest value
+;  in the wild numeric field
+
+	MOVL	hghval, #-1		;Initialize the value
+4$:	PUSHL	#0.B			;Find next file in the directory
+	PUSHL	DS
+	PUSHL	#srchstr
+	PUSHL	DS
+	PUSHL	#srchparms
+	CALLF	svcIoDevParm##
+	ORL	EAX, EAX
+	JS	10$.S			;If error
+	MOVL	EBX, wnfbegin		;OK - get value of the wild numeric
+	ADDL	EBX, #fndname-srchstr.B	;  field from the returned file name
+	MOVL	ECX, wnfsize
+	CLRL	EDX
+8$:	MOVB	AL, [EBX]		;Get character
+	CMPB	AL, #'0'		;Numeric?
+	JB	4$.S			;No - skip this one
+	CMPB	AL, #'9'		;Maybe
+	JA	4$.S			;No
+	INCL	EBX			;Yes - add in to value
+	IMULL	EDX, #10t.B
+	ANDL	EAX, #0Fh.B
+	ADDL	EDX, EAX
+	LOOP	ECX, 8$			;If more to collect
+	CMPL	hghval, EDX		;Is this a new high value?
+	JGE	4$.S			;No
+	MOVL	hghval, EDX		;Yes - remember it
+	JMP	4$.S			;Continue
+
+;Here with error while searching the directory
+
+10$:	CMPL	EAX, #ER_FILNF.B	;File not found error?
+	JE	20$.S			;Yes - this is the normal way to end
+	PUSHL	EAX			;No
+	PUSHL	dirhndl
+	PUSHL	#0.B
+	CALLF	svcIoClose##
+	POPL	EAX
+14$:	POPL	EBP
+	RET
+
+;Here with the directory search complete - we now have the highest numeric
+; value for the wild numeric field
+
+20$:	PUSHL	dirhndl			;Close the directory
+	PUSHL	#0.B
+	CALLF	svcIoClose##
+	CMPL	arg_create.B[EBP], #0.B	;Do we want to create a new file?
+	JE	22$.S			;No
+	INCL	hghval			;Yes - increase the value
+	MOVL	EAX, hghval
+	MOVL	EDX, wnfsize
+	CMPL	EAX, maxval-4[EDX*4]	;Too big?
+	JA	34$.S			;Yes - fail!
+22$:	CMPL	hghval, #0.B		;Did we find anything at all?
+	JNS	24$.S			;Yes
+	CLRL	EAX			;No - use 0
+	MOVL	hghval, EAX
+
+;Now construct the actual name to use from the search string and the value
+;  we just determined
+
+24$:	MOVL	EDI, namebgn
+	MOVL	EBX, #srchstr
+26$:	MOVB	AL, [EBX]		;Get character
+	INCL	EBX
+	CMPB	AL, #'?'		;Start of numeric field?
+	JE	30$.S			;Yes
+	MOVB	[EDI], AL		;No - store in name
+	INCL	EDI
+	CMPB	AL, #0			;End?
+	JNE	26$.S			;No - continue
+28$:	CLRL	EAX			;Yes - finished
+	POPL	EBP
+	RET
+
+;Here with the numeric field
+
+30$:	PUSHL	EBX			;Put the number into the name
+	PUSHL	hghval
+	PUSHL	wnfsize
+	PUSHL	#wnffmt
+	PUSHL	EDI
+	CALL	sprintf#
+	ADDL	ESP, #16t.B
+	ADDL	EDI, EAX
+	POPL	EBX
+32$:	CMPB	[EBX], #'?'		;Scan past the numeric field
+	JNE	26$.S
+	INCL	EBX
+	JMP	32$.S
+
+;Here if we tried to increment the value past the maximum value
+
+34$:	MOVL	EAX, #ER_VALUE
+	POPL	EBP
+	RET
+.PAGE
+	.SBTTL	Data
+
+wnffmt:	.ASCIZ	"%0*d"
+
+	.MOD	4
+maxval:	.LONG	9t
+	.LONG	99t
+	.LONG	999t
+	.LONG	9999t
+	.LONG	99999t
+	.LONG	999999t
+	.LONG	9999999t
+	.LONG	99999999t
+
+	.PSECT	_DATA_p
+
+	.MOD	4
+wnfbegin:.LONG  0
+wnfsize: .LONG  0
+namebgn: .LONG  0
+hghval:  .LONG  0
+srchstr: .BLKB  40t
+fndname: .BLKB  60t
+
+	.MOD	4
+srchparms:
+	.BYTE	PAR$SET|REP_HEXV, 4
+	.WORD	IOPAR_DIRHNDL
+dirhndl:.LONG	0
+	.BYTE	PAR$SET|REP_HEXV, 4
+	.WORD	IOPAR_FILOPTN
+	.LONG	FO$NOPREFIX|FO$FILENAME
+	.BYTE	PAR$GET|REP_STR, 0
+	.WORD	IOPAR_FILSPEC
+	.LONG	fndname, !fndname
+	.WORD	60t, 60t
+	.BYTE	0
+
+	.END

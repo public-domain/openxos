@@ -1,0 +1,1165 @@
+	.TITLE	ENSMADRV - Network device driver for Standard Microsystems Corp. SMC91C90 for XOS
+
+;++++
+; This software is in the public domain.  It may be freely copied and used
+; for whatever purpose you see fit, including commerical uses.  Anyone
+; modifying this software may claim ownership of the modifications, but not
+; the complete derived code.  It would be appreciated if the authors were
+; told what this software is being used for, but this is not a requirement.
+
+;   THIS SOFTWARE IS PROVIDED BY THE AUTHORS "AS IS" AND ANY EXPRESS OR
+;   IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
+;   OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+;   IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+;   INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+;   BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS
+;   OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+;   ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR
+;   TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
+;   USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+;----
+
+	.PROC	80486
+	.INCLUD	XOSINC:\XMAC\XOS.PAR
+	.INCLUD	XOSINC:\XMAC\XOSX.PAR
+	.INCLUD	XOSINC:\XMAC\XOSERR.PAR
+	.INCLUD	XOSINC:\XMAC\XOSTIME.PAR
+	.INCLUD	XOSINC:\XMAC\XOSXNET.PAR
+	.INCLUD XOSINC:\XMAC\XOSXEN.PAR
+	.INCLUD XOSINC:\XMAC\PCAT.PAR
+	.INCLUD	XOSINC:\XMAC\XOSLKE.PAR
+	.INCLUD	XOSINC:\XMAC\XOSXLKE.PAR
+
+;This device driver supports the Standard Microsystems Corporation SMC91C90
+;  Ethernet chip.
+
+;First include the SMC91C90 chip definitions
+
+	.INCLUD	SMC9190.PAR
+.PAGE
+MAJV   =!1t
+MINV   =!1t
+EDITNUM=!0t
+
+;1.0.0 - 27-Jul-94
+;	Initial version, created from ENFJADRV 1.0.0
+
+	LKEHEAD	ENSMADRV, MAJV, MINV, EDITNUM, LKETYPE_DEVICE
+
+;Note that the SMC91C90 uses internal register bank pointer and a packet
+;  address pointer registers that represent hidden state.  Normally, it would
+;  be necessary to save and restore these registers when servicing interrupts.
+;  We eliminate this requirement by only accessing chip registers at fork level,
+;  effectively making ALL chip access single threaded.  The only exception to
+;  this is the addunit routine, which does access the chip registers from main
+;  program level.  This is not a problem, this at the time this code is
+;  executed, the device is not completely set up and no interrupts or fork
+;  level activity that accesses the chip is possible.
+
+;This version of the driver does not use the chip's ability to queue multiple
+;  transmit requests.  It allocates a single transmit packet, which is used
+;  for all transmits.  This eliminates the need to use the chip's packet
+;  allocation mechanism during operation.  This eliminates the overhead of
+;  an allocation done interrupt for every output.  This results in somewhat
+;  slower overall output, since there is effectively no overlap between the
+;  CPU and the chip for processing output requests, which seems to be a good
+;  trade-off for less overhead and simplier code.
+
+;Define offsets in the device dependent part of the IDB for this device
+
+$$$=!idb_SIZE
+BLK idb_ensmatcr    , 2t		;Value for P_B0TCR register
+BLK idb_ensmarcr    , 2t		;Value for P_B0RCR register
+BLK idb_ensmabfrsize, 1t		;Buffer size value
+BLK                 , 3t
+idb_ensmaSIZE=!$$$
+.PAGE
+;Device characteristics for ENSMA NET devices
+
+	DATA
+
+	.MOD	4
+ensmadctbl:
+ DCHARBGN  1, knlDCharValCom##
+ DCHARENT  CLASS   , TEXT, , 8, knlDcMsgClass##   , knlDcGetClass##, knlDcSetClass##, 0
+ DCHARENT  TYPE    , TEXT, , 4, knlDcMsgType##    , knlDcGet4Byte##, 0              , dcb_type
+ DCHARENT  IOREG   , HEXV, , 4, knlDcMsgIoReg##   , dcgetioreg     , 0              , 0
+ DCHARENT  INT     , DECV, , 1, knlDcMsgInt##     , dcgetint       , 0              , 0
+ DCHARENT  NETADDR , HEXB, , 6, xosnetMsgNetAddr##, dcgetnetaddr   , 0              , 0
+ DCHARENT  TP      , TEXT, , 4, msgtp             , dcgetyesno     , dcsetyesno     , IC$TP
+ DCHARENT  FULLDUP , TEXT, , 4, msgfulldup        , dcgetyesno     , dcsetyesno     , IC$FULLDUP
+ DCHARENT  LOWTHRES, TEXT, , 4, msglowthres       , dcgetyesno     , dcsetyesno     , IC$LOWTHRES
+ DCHARENT  MEMSIZE , DECV, , 1, msgmemsize        , dcgetvalue     , 0              , idb_ensmabfrsize
+ DCHARENT  FASTMEM , TEXT, , 4, msgfastmem        , dcgetyesno     , dcsetyesno     , IC$FASTBFR
+ DCHARENT  BUSWIDTH, DECV, , 1, msgbuswidth       , dcgetwidth     , 0              , 0
+ DCHARENT  FULLSTEP, TEXT, , 4, msgfullstep       , dcgetyesno     , dcsetyesno     , IC$FULLSTEP
+ DCHARENT  LINKTEST, TEXT, , 4, msglinktest       , dcgetyesno     , dcsetyesno     , IC$LINKTEST
+ DCHARENT  CHKCAR  , TEXT, , 4, msgchkcar         , dcgetyesno     , dcsetyesno     , IC$CHKCAR
+ DCHARENT  CHKSQET , TEXT, , 4, msgchksqet        , dcgetyesno     , dcsetyesno     , IC$CHKSQET
+ DCHARENT  ALLMC   , TEXT, , 4, msgallmc          , dcgetyesno     , dcsetyesno     , IC$ALLMC
+ DCHARENT  PRM     , TEXT, , 4, msgprm            , dcgetyesno     , dcsetyesno     , IC$PRM
+ DCHARENT  LINKOK  , TEXT, , 4, msglinkok         , dcgetlinkok    , 0              , 0
+ DCHARENT  PKTIN   , DECV, , 4, xosnetMsgPktIn##  , dcgetvalue     , dcsetvalue     , idb_cntpktin
+ DCHARENT  BYTEIN  , DECV, , 4, knlDcMsgByteIn##  , dcgetvalue     , dcsetvalue     , idb_cntbytein
+ DCHARENT  PKTOUT  , DECV, , 4, xosnetMsgPktOut## , dcgetvalue     , dcsetvalue     , idb_cntpktout
+ DCHARENT  BYTEOUT , DECV, , 4, knlDcMsgByteOut## , dcgetvalue     , dcsetvalue     , idb_cntbyteout
+ DCHARENT  BCPKTIN , DECV, , 4, xosnetMsgBcPktIn##, dcgetvalue     , dcsetvalue     , idb_cntbcpktin
+ DCHARENT  NOSAP   , DECV, , 4, xosnetMsgNoSap##  , dcgetvalue     , dcsetvalue     , idb_cntnosap
+ DCHARENT  BADSIZE , DECV, , 4, xosnetMsgBadSize##, dcgetvalue     , dcsetvalue     , idb_cntbadsize
+ DCHARENT  NOSBFR  , DECV, , 4, xosnetMsgNoSBfr## , dcgetvalue     , dcsetvalue     , idb_cntnosbfr
+ DCHARENT  NOIBFR  , DECV, , 4, msgnoibfr         , dcgetvalue     , dcsetvalue     , idb_cntnoibfr
+ DCHARENT  IFRAME  , DECV, , 4, msgfrmerr         , dcgetvalue     , dcsetvalue     , idb_cntfa
+ DCHARENT  ICRC    , DECV, , 4, xosnetMsgCrcErr## , dcgetvalue     , dcsetvalue     , idb_cntcrc
+ DCHARENT  IOVRRN  , DECV, , 4, xosnetMsgOvrErr## , dcgetvalue     , dcsetvalue     , idb_cntrover
+ DCHARENT  OCSEN   , DECV, , 4, msgxcsenerr       , dcgetvalue     , dcsetvalue     , idb_cntcsense
+ DCHARENT  OUNDRN  , DECV, , 4, msgxunderr        , dcgetvalue     , dcsetvalue     , idb_cntxunder
+ DCHARENT  OHUNG   , DECV, , 4, xosnetMsgXHung##  , dcgetvalue     , dcsetvalue     , idb_cntxhung
+ DCHARENT  OHTBT   , DECV, , 4, msgxhtbterr       , dcgetvalue     , dcsetvalue     , idb_cnthrtbt
+ DCHARENT  OJABBER , DECV, , 4, msgojabber        , dcgetvalue     , dcsetvalue     , idb_cntjabber
+ DCHARENT  OOWC    , DECV, , 4, msgxowcerr        , dcgetvalue     , dcsetvalue     , idb_cntowcol
+ DCHARENT  OCOL    , DECV, , 4, msgxcolerr        , dcgetvalue     , dcsetvalue     , idb_cntnumcol
+ DCHARENT  OXCOL   , DECV, , 4, msgxxcolerr       , dcgetvalue     , dcsetvalue     , idb_cntabort
+
+	CODE
+
+msgshielded:DCHARINFO  {Twisted-pair cable (if used) is shielded}
+msgtp:      DCHARINFO  {Interface uses twisted-pair cable}
+msgfulldup: DCHARINFO  {Full duplex operation}
+msglowthres:DCHARINFO  {Low squelch threshold}
+msgmemsize: DCHARINFO  {Buffer memory size (KB)}
+msgfastmem: DCHARINFO  {Interface uses fast buffer memory}
+msgbuswidth:DCHARINFO  {Bus width (bits)}
+msgfullstep:DCHARINFO  {Use full step AUI signaling}
+msglinktest:DCHARINFO  {TP link test functions enabled}
+msgchkcar:  DCHARINFO  {Stop transmission if no carrier}
+msgchksqet: DCHARINFO  {Stop transmission if SQET error}
+msgallmc:   DCHARINFO  {Receive all multicast frames}
+msgprm:     DCHARINFO  {Promiscuous receive mode}
+msglinkok:  DCHARINFO  {TP link connected}
+msgnoibfr:  DCHARINFO  {Discarded - no interface buffer available}
+msgfrmerr:  DCHARINFO  {Number of input framing errors}
+msgxcsenerr:DCHARINFO  {Number of output carrier lost errors}
+msgxunderr: DCHARINFO  {Number of output underrun errors}
+msgxhtbterr:DCHARINFO  {Number of output heartbeat errors}
+msgojabber: DCHARINFO  {Number of output jabber errors}
+msgxowcerr: DCHARINFO  {Number of output out of window collisions}
+msgxcolerr: DCHARINFO  {Number of output collisions}
+msgxxcolerr:DCHARINFO  {Number of excessive output collisions}
+.PAGE
+;Protocol translation table which converts from standard internal protocol
+;  values to device protocol values
+
+	.MOD	4
+etypetbl:
+	.LONG	-1		;	  =80000000 - Illegal
+	.BYTE	81, 0BA, 0, 0	;PROT_SSL1=80000001 - SSL 1st Ethernet protocol
+	.BYTE	81, 0BB, 0, 0	;PROT_SSL2=80000002 - SSL 2nd Ethernet protocol
+	.BYTE	81, 0BC, 0, 0	;PROT_SSL3=80000003 - SSL 3rd Ethernet protocol
+	.BYTE	81, 0BD, 0, 0	;PROT_SSL4=80000004 - SSL 4th Ethernet protocol
+	.BYTE	81, 0BE, 0, 0	;PROT_SSL5=80000005 - SSL 5th Ethernet protocol
+	.BYTE	81, 0BF, 0, 0	;PROT_SSL6=80000006 - SSL 6th Ethernet protocol
+	.BYTE	81, 0C0, 0, 0	;PROT_SSL7=80000007 - SSL 7th Ethernet protocol
+	.BYTE	81, 0C1, 0, 0	;PROT_SSL8=80000008 - SSL 8th Ethernet protocol
+	.LONG	-1		;	  =80000009 - Illegal
+	.LONG	-1		;	  =8000000A - Illegal
+	.LONG	-1		;	  =8000000B - Illegal
+	.LONG	-1		;	  =8000000C - Illegal
+	.LONG	-1		;	  =8000000D - Illegal
+	.LONG	-1		;	  =8000000E - Illegal
+	.LONG	-1		;	  =8000000F - Illegal
+	.BYTE	8 , 0  , 0, 0	;0PROT_IP =80000010 - Internet IP protocol
+	.BYTE	8 , 6  , 0, 0	;PROT_ARP =80000011 - Internet ARP protocol
+	.BYTE	80, 35 , 0, 0	;PROT_RARP=80000012 - Internet RARP protocol
+ETYPEMAX=!{$-etypetbl}/4-1
+.PAGE
+	.SBTTL	Initialization routine
+
+	INITSUB	initensma
+
+initensma:
+	MOVL	EBX, #'ESMA'		;Get network driver name
+	MOVL	EDX, #ensmaaddunit	;Get offset of dispatch table
+	CALL	xosnetNewDrive##	;Register this network driver
+	JC	4$.S
+	MOVL	ECX, #codetop
+	CLRL	EDX
+	CLRL	EAX
+4$:	MOVL	EBX, #QSTS$DONE
+	RET
+
+	CODE
+.PAGE
+	.SBTTL	ensmaaddunit - Subroutine to add Ethernet interface unit
+
+;Subroutine to add Ethernet interface unit
+;	c(AL) = Unit number
+;	CALL	ensmaaddunit
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+
+$$$=!0
+FRM eau_unit   , 4t	;Unit number
+FRM eau_irout  , 4t	;Interrupt routine offset
+FRM eau_ioreg  , 4t	;Base IO register number
+FRM eau_int    , 4t	;Interrupt level
+eau_SIZE=!$$$
+
+	DATA
+
+	.MOD	4
+ensmaaublk:				;Parameter block for addunitchar
+ DCHARBGN  2, knlDCharValCom##
+ DCHARENT  UNIT    , DECV, , 1, knlDcMsgUnit## , 0, retclc         , 0
+ DCHARENT  TYPE    , TEXT, , 4, knlDcMsgType## , 0, retclc         , 0
+ DCHARENT  IOREG   , HEXV, , 4, knlDcMsgIoReg##, 0, ensmaauioreg   , 0
+ DCHARENT  INT     , DECV, , 1, knlDcMsgInt##  , 0, ensmaauint     , 0
+
+	CODE
+
+ensmaaddunit::
+	ENTER	eau_SIZE, 0		;Allocate our stack frame
+	MOVL	eau_unit.B[EBP], EAX	;Store unit number
+	CLRL	EAX
+	DECL	EAX
+	MOVL	eau_ioreg.B[EBP], EAX	;Store illegal values for port and
+	MOVL	eau_int.B[EBP], EAX	;  interrupt level
+	MOVL	EBX, #ensmaaublk	;Process the characteristics
+	MOVB	AL, #0			;Fail if have a bad name
+	CALL	knlAddUnitChar##
+	JC	2$.S			;If error
+	MOVL	EAX, eau_ioreg.B[EBP]	;Did we get all of the values we need?
+	ORL	EAX, eau_int.B[EBP]
+	JS	10$			;No - fail
+
+;Now check to see if the physical interface exists
+
+	MOVL	EDX, eau_ioreg.B[EBP]	;First see if we can change the bank
+	A2IOP	P_B0BSR			;  select register and leave bank 0
+	MOVB	AL, #3			;  selected
+	OUTB	[DX]
+	IOPAUSE
+	INB	[DX]
+	ANDB	AL, #03h
+	CMPB	AL, #3t
+	JNE	6$.S
+	MOVB	AL, #0
+	OUTB	[DX]
+	IOPAUSE
+	INB	[DX]
+	ANDB	AL, #03h
+	CMPB	AL, #0t
+	JNE	6$.S
+	A2IOP	P_B0RCR-P_B0BSR		;Point to the receive control register
+	MOVW	AX, #RCR$EPHRST		;Reset the board
+	OUTW	[DX]
+	MOVL	EAX, #3
+	CALL	knlTimeWait##		;Wait for a short time
+2$:	JC	8$.S
+	CLRL	EAX			;Remove the reset condition
+	OUTW	[DX]
+	MOVL	EAX, #3
+	CALL	knlTimeWait##		;Wait for a short time
+	JC	8$.S
+	A2IOP	P_B0BSR-P_B0RCR		;Now select register bank 2
+	MOVB	AL, #2
+	OUTB	[DX]
+	A2IOP	P_B2RFIFO-P_B2BSR	;Check the receive FIFO register value
+	INB	[DX]
+	CMPB	AL, #80h
+	JNE	6$.S
+	A2IOP	P_B2TFIFO-P_B2RFIFO	;Also check the transmit FIFO register
+	INB	[DX]			;  value
+	CMPB	AL, #80h
+	JNE	6$.S
+	A2IOP	P_B2BSR-P_B2TFIFO	;Now select register bank 1
+	MOVB	AL, #1
+	OUTB	[DX]
+	A2IOP	P_B1CON-P_B1BSR		;Reload parameters from EEPROM
+	MOVW	AX, #CON$CRENB|CON$TEENB|CON$RELOAD
+	OUTW	[DX]
+	MOVL	ECX, #10t
+4$:	MOVB	AL, #2			;Wait for a short while
+	CALL	knlTimeWait##
+	JC	8$.S
+	INB	[DX]
+	TESTB	AL, #CON$RELOAD		;Is the reload finished?
+	LOOPNE	ECX, 4$
+	JE	14$.S			;Go on if it cleared
+6$:	MOVL	EAX, #ER_PDNAV		;Interface is not there!
+8$:	LEAVE
+	CLRL	ECX
+	MOVL	EBX, #QSTS$DONE
+	TOFORK
+	STC
+ret002:	RET
+
+;Here if a required characteristic is missing
+
+10$:	MOVL	EAX, #ER_CHARM
+	JMP	8$.S
+
+;Here if error while have the exec memory resource
+
+12$:	CALL	knlGiveXRes##
+	JMP	8$.S
+
+;Here if the interface exists
+
+14$:	A2IOP	P_B1BSR-P_B1CON
+	MOVB	AL, #2			;Select register bank 2
+	OUTB	[DX]
+	A2IOP	P_B2MMUCR-P_B2BSR	;Point to MMU command register
+	MOVB	AL, #MMUCMD_ALLOC+6	;Allocate transmit packet
+	OUTB	[DX]
+	A2IOP	P_B2APNR-P_B2MMUCR
+	MOVL	ECX, #10t
+16$:	INB	[DX]
+	TESTB	AL, #80h
+	JE	17$.S
+	MOVL	EAX, #3
+	CALL	knlTimeWait##
+	JC	8$.S
+	LOOP	ECX, 16$
+	JMP	6$.S
+
+17$:	A2IOP	P_B2TPNR-P_B2APNR	;Set the transmit packet number
+	OUTB	[DX]
+	CALL	knlGetXRes##		;Get exec memory resource
+	MOVB	CL, eau_int.B[EBP]	;Get interrupt number
+	CALL	knlChkIRqAvl##		;Is it available?
+	JC	12$.S			;No - fail
+	MOVL	ECX, #ENSMAINTSZ	;Yes - get space for interrupt code
+	CALL	knlGetXCode##
+	JC	12$.S
+	MOVL	eau_irout.B[EBP], EDI	;Remember where code is going
+	MOVL	ESI, #ensmaint		;Copy prototype
+	SHRL	ECX, #2
+	MOVB	gdtable+GS_CODEALS+5, #DT_RWDATA+PL_0 ;Enable aliased code space
+	PUSHL	#GS_CODEALS.B
+	POPL	ES
+	CLD
+	RMOVSL	[EDI], ES:[ESI]
+	MOVL	ECX, #idb_mSIZE+idb_ensmaSIZE ;Get size for our IDB
+	MOVL	EDX, #ensmadctbl	;Get offset of device characteristics
+	MOVL	EAX, eau_unit.B[EBP]	;Get unit number
+	CALL	xosnetMakeIdb##		;Make our IDB
+	JNC	18$.S			;OK
+	CLRL	EBX			;Error
+	MOVL	ES, EBX
+	MOVB	gdtable+GS_CODEALS+5, BL ;Disable the aliased code space
+	JMP	12$
+
+;Here with IDB allocated
+
+18$:	MOVL	idb_typname.B[ESI], #'ESMA';Store type name
+	MOVB	idb_iftype.B[ESI], #IFT_MULTI ;Store interface type
+	MOVB	idb_hwhdrsz.B[ESI], #14t ;Store hardware header size
+	MOVL	idb_hwpktsz.B[ESI], #1500t ;Store maximum packet size
+	MOVB	idb_hlen.B[ESI], #6t	;Store hardware address size
+	MOVB	idb_hwtype+1.B[ESI], #01h ;Store hardware type value for APR
+	MOVB	idb_cntoffset.B[ESI], #en_count ;Store offset of count field
+	MOVW	idb_hwtype.B[ESI], #0100h ;Store hardware address type
+	MOVL	idb_iopprotocol.B[ESI], #xossnpNetIopSapAddr##
+	MOVL	idb_makedcb.B[ESI], #xossnpMakeDcb##
+	MOVL	idb_netclose1.B[ESI], #xossnpNetClose1##
+	MOVL	idb_setpkt.B[ESI], #setpkt
+	MOVL	idb_setecho.B[ESI], #setecho
+	MOVL	idb_sendpkt.B[ESI], #sendpkt
+	MOVL	idb_rcvpkt.B[ESI], #rcvpkt
+	MOVL	idb_getetype.B[ESI], #getetype
+	MOVL	idb_sethwa.B[ESI], #sethwa
+	MOVL	idb_gethwa.B[ESI], #gethwa
+	MOVL	idb_lnkctl.B[ESI], #knlIFnDev##
+	MOVL	idb_icmpecho.B[ESI], #ret002
+	MOVB	idb_state.B[ESI], #LNKS_ESTAB
+	MOVL	idb_xmtavail.B[ESI], #1
+	MOVL	idb_fdisp.B[ESI], #ensmafork ;Store offset of fork routine
+	MOVL	EAX, ensmalidb		;Link into our list of IDBs
+	MOVL	ensmalidb, ESI
+	TESTL	EAX, EAX
+	JE	20$.S
+	MOVL	idb_nextd.B[EAX], ESI
+	JMP	22$.S
+
+20$:	MOVL	ensmafidb, ESI
+	MOVL	EBX, #ensmaoas		;Set up our once-a-second routine the
+	CALL	knlSetupOAS##		;  first time though here
+22$:	MOVL	EDI, eau_irout.B[EBP]	;Fix up the interrupt code
+	PUSHL	#GS_CODEALS
+	POPL	ES
+	MOVL	ES:{fix1-ensmaint}+1.B[EDI], ESI
+	MOVL	EAX, EDI
+	SUBL	EAX, #ensmaint
+	SUBL	ES:{fix2-ensmaint}+1.B[EDI], EAX
+	CLRL	EAX
+	MOVL	ES, EAX
+	MOVB	gdtable+GS_CODEALS+5, AL ;Disable the aliased code space
+	MOVL	EDX, eau_ioreg.B[EBP]
+	MOVL	idb_bioreg.B[ESI], EDX	;Store base IO register number
+	A2IOP	P_B1BSR			;Select register bank 1
+	MOVB	AL, #1
+	OUTB	[DX]
+	PUSHL	ESI
+	ADDL	ESI, #idb_hwaddr
+	A2IOP	P_B1ENA-P_B1BSR
+	MOVL	ECX, #6			;Store the board's Ethernet address
+24$:	INB	[DX]
+	MOVB	[ESI], AL
+	INCL	ESI
+	INCL	EDX
+	LOOP	ECX, 24$
+	MOVW	[ESI], #0
+	POPL	ESI
+	A2IOP	P_B1CFG-{P_B1ENA+6}	;Get the configuration bits
+	INW	[DX]
+	CLRL	ECX
+	TESTB	AH, #CFG$FULSTP>8t
+	JE	26$.S
+	BTSL	ECX, #IC%FULLSTEP
+26$:	TESTB	AH, #CFG$SQLLVL>8t
+	JE	28$.S
+	BTSL	ECX, #IC%LOWTHRES
+28$:	TESTB	AH, #CFG$AUISEL>8t
+	JNE	30$.S
+	BTSL	ECX, #IC%TP
+30$:	TESTB	AL, #CFG$16BIT
+	JE	32$.S
+	BTSL	ECX, #IC%16BITBUS
+32$:	TESTB	AL, #CFG$DISLT
+	JNE	34$.S
+	BTSL	ECX, #IC%LINKTEST
+34$:	TESTB	AL, #CFG$FSTRAM
+	JE	36$.S
+	BTSL	ECX, #IC%FASTBFR
+36$:	MOVL	idb_config.B[ESI], ECX
+	A2IOP	P_B1BSR-P_B1CFG
+	MOVB	AL, #0
+	OUTB	[DX]
+	A2IOP	P_B0MSR-P_B0BSR		;Get the memory size
+	CLRL	EAX
+	INB	[DX]
+	CMPB	AL, #0FFh
+	JNE	40$.S
+	INCL	EAX
+40$:	SHRL	EAX, #2t		;Change to KB
+	MOVB	idb_ensmabfrsize[ESI], AL ;Store the memory size
+	MOVL	EBX, #temp+3		;Build name for interrupt table
+	CLRL	EAX
+	MOVL	1.B[EBX], EAX
+	MOVL	EAX, eau_unit.B[EBP]
+	CALL	knlPutDecNmbr##
+	MOVL	EDX, #temp
+	MOVL	EBX, eau_irout.B[EBP]	;Get address of interrupt routine
+	MOVB	CL, eau_int.B[EBP]	;Get interrupt number
+	MOVB	idb_intlvl.B[ESI], CL	;Remember it
+	MOVB	CH, #DT_TRAP+PL_0	;Set up our interrupt vector
+	CALL	knlSetIRq##
+	CALL	knlGiveXRes##		;Give up the exec memory resource
+	MOVL	EDX, idb_bioreg.B[ESI]
+	A2IOP	P_B0TCR			;Set the transmit control register
+	MOVW	AX, #TCR$PADEN|TCR$TXENA
+	OUTW	[DX]
+	MOVW	idb_ensmatcr[ESI], AX
+	A2IOP	P_B0RCR-P_B0TCR
+	MOVW	AX, #RCR$STRPCRC|RCR$RXEN
+	OUTW	[DX]
+	MOVW	idb_ensmarcr[ESI], AX
+	A2IOP	P_B0BSR-P_B0RCR		;Select register bank 2
+	MOVB	AL, #2
+	OUTB	[DX]
+	A2IOP	P_B2INTMR-P_B2BSR	;Enable interrupts
+	MOVB	AL, #INTMR$EPH|INTMR$ROVRN|INTMR$TDONE|INTMR$RDONE
+	OUTB	[DX]
+	MOVL	ECX, eau_int.B[EBP]	;Enable our interrupt
+	CALL	knlEnableInt##
+	CLRL	EAX			;Get our return value
+	MOVL	ECX, #1
+	MOVL	EBX, #QSTS$DONE
+	LEAVE
+	TOFORK
+	RET
+.PAGE
+;Subroutine called by addunitchar for the "IOREG" characteristic
+
+ensmaauioreg:
+	CMPL	EAX, #0FFFh		;Valid port address?
+	JA	badcv.S			;No - fail
+	CMPL	EAX, #100h		;Maybe
+	JB	badcv.S			;No - fail
+	MOVL	eau_ioreg.B[EBP], EAX	;Yes - store it
+	CLC
+	RET
+
+;Subroutine called by addunitchar for the "INT" characteristic
+
+ensmaauint:
+	CMPL	EAX, #15t.B		;Valid interrupt level?
+	JA	badcv.S			;No - fail
+	CMPB	AL, #2			;Maybe
+	JB	badcv.S			;No - fail
+	JNE	2$.S
+	MOVB	AL, #9
+2$:	MOVL	eau_int.B[EBP], EAX	;Yes - store it
+	RET
+
+;Here if bad characteristic value
+
+badcv:	MOVL	EAX, #ER_CHARV		;Get error code
+	STC				;Fail
+	RET
+.PAGE
+;Here to get the value of the IOREG characteristic
+
+dcgetioreg:
+	MOVL	ESI, dcb_netidb.B[EDI]
+	MOVL	EAX, idb_bioreg.B[ESI]
+	CLRL	EDX
+	RET
+
+;Here to get the value of the INT characteristic
+
+dcgetint:
+	MOVL	ESI, dcb_netidb.B[EDI]
+	MOVZBL	EAX, idb_intlvl.B[ESI]
+	CLRL	EDX
+	RET
+
+;Here to get the value of the NETADDR characteristic
+
+dcgetnetaddr:
+	MOVL	ESI, dcb_netidb.B[EDI]
+	MOVL	EAX, idb_hwaddr+0[ESI]
+	MOVL	EDX, idb_hwaddr+4[ESI]
+	RET
+.PAGE
+;Here to get the value of the BUSWIDTH characteristic
+
+dcgetwidth:
+	MOVL	ESI, dcb_netidb.B[EDI]
+	MOVL	EAX, #8t		;Assume 8 bits
+	TESTB	idb_config.B[ESI], #IC$16BITBUS ;Right?
+	JE	4$.S			;Yes
+	MOVB	AL, #16t		;No - its 16 bits
+	RET
+
+;Here to get value of characteristic with a value of YES or NO
+
+dcgetyesno:
+	MOVL	ESI, dcb_netidb.B[EDI]
+2$:	MOVL	EAX, #'NO'		;Assume NO
+	TESTL	idb_config.B[ESI], EBX	;Right?
+	JE	4$.S			;Yes
+	MOVL	EAX, #'YES'		;No
+4$:	RET
+
+;Here to set value of characteristic with a value of YES or NO
+
+dcsetyesno:
+	CALL	knlGetYesNo##
+	JC	4$.S
+	MOVL	ESI, dcb_netidb.B[EDI]
+	JNE	6$.S
+	ORL	idb_config.B[ESI], EBX	;Yes
+	JMP	8$.S
+
+6$:	NOTL	EBX
+	ANDL	idb_config.B[ESI], EBX	;No
+8$:	MOVL	EDX, idb_bioreg.B[ESI]
+	A2IOP	P_B2BSR
+	MOVB	AL, #1
+	OUTB	[DX]
+	A2IOP	P_B1CFG-P_B1BSR
+	INW	[DX]
+	ANDL	EAX, #CFG$RAMSZ|0010h|CFG$INTSEL
+	MOVL	ECX, idb_config.B[ESI]
+	BTL	ECX, #IC%FULLSTEP
+	JNC	10$.S
+	ORB	AH, #CFG$FULSTP>8t
+10$:	BTL	ECX, #IC%LOWTHRES
+	JNC	12$.S
+	ORB	AH, #CFG$SQLLVL>8t
+12$:	BTL	ECX, #IC%TP
+	JC	14$.S
+	ORB	AH, #CFG$AUISEL>8t
+14$:	BTL	ECX, #IC%16BITBUS
+	JNC	16$.S
+	ORB	AL, #CFG$16BIT
+16$:	BTL	ECX, #IC%LINKTEST
+	JC	18$.S
+	ORB	AL, #CFG$DISLT
+18$:	BTL	ECX, #IC%FASTBFR
+	JNC	20$.S
+	ORB	AL, #CFG$FSTRAM
+20$:	OUTW	[DX]
+	A2IOP	P_B1BSR-P_B1CFG
+	MOVB	AL, #0
+	OUTB	[DX]
+	A2IOP	P_B0TCR-P_B1BSR
+	INW	[DX]
+	ANDB	AH, #{~{TCR$SSQETE|TCR$FDUPLX|TCR$MONCSN}>8t}&0FFh
+	BTL	ECX, #IC%CHKSQET
+	JNC	22$.S
+	ORB	AH, #TCR$SSQETE>8t
+22$:	BTL	ECX, #IC%FULLDUP
+	JNC	24$.S
+	ORB	AH, #TCR$FDUPLX>8t
+24$:	BTL	ECX, #IC%CHKCAR
+	JNC	26$.S
+	ORB	AH, #TCR$MONCSN>8t
+26$:	OUTW	[DX]
+	A2IOP	P_B0RCR-P_B0TCR
+	INW	[DX]
+	ANDB	AL, #~{RCR$ALLMC|RCR$PRMSMD}
+	BTL	ECX, #IC%ALLMC
+	JNC	28$.S
+	ORB	AL, #RCR$ALLMC
+28$:	BTL	ECX, #IC%PRM
+	JNC	30$.S
+	ORB	AL, #RCR$PRMSMD
+30$:	OUTW	[DX]
+	A2IOP	P_B0BSR-P_B0RCR		;Leave the chip pointer to register
+	MOVB	AL, #2			;  bank 2
+	OUTB	[DX]
+	RET
+
+;Here to get a 4-byte value from the IDB
+
+dcgetvalue:
+	ADDL	EBX, dcb_netidb.B[EDI]	;Point to the value
+	MOVL	EAX, [EBX]		;Get it
+	CLRL	EDX			;Only 32 bits
+	RET
+
+;Here to set a 4-byte value in the IDB
+
+dcsetvalue:
+	ADDL	EBX, dcb_netidb.B[EDI]	;Point to the value
+	MOVL	[EBX], EAX		;Set it
+	CLC
+	RET				;Thats all
+.PAGE
+;Here to get the value of the LINKOK characteristic - this returns the current
+;  TP link status
+
+dcgetlinkok:
+	MOVL	ESI, dcb_netidb[EDI]	;Get offset of the IDB
+	MOVL	EDX, idb_bioreg.B[ESI]
+	A2IOP	P_B2BSR
+	MOVB	AL, #0			;Select register bank 0
+	OUTB	[DX]
+	A2IOP	P_B0EPHSR-P_B0BSR
+	INW	[DX]			;Get the EPH status
+	TESTB	AH, #EPHSR$LINKOK>8t
+	MOVL	EAX, #'NO'
+	JE	4$.S
+	MOVL	EAX, #'YES'
+4$:	PUSHL	EAX
+	A2IOP	P_B0BSR-P_B0EPHSR	;Set back to register bank 0
+	MOVB	AL, #2
+	OUTB	[DX]
+	POPL	EAX
+	CLC
+	RET
+.PAGE
+;Here to set the value of the PRM characteristic
+
+dcsetprm:
+	MOVL	ESI, dcb_netidb.B[EDI]
+	CALL	knlGetYesNo##
+	JC	10$.S
+	JE	2$.S			;If he said YES
+	ANDB	idb_config.B[ESI], #{~IC$PRM}&0FFh ;He said NO
+	JMP	4$.S
+
+2$:	ORB	idb_config.B[ESI], #IC$PRM
+4$:
+
+;NEED CODE HERE TO CHANGE BIT IN INTERFACE (MAYBE)
+
+10$:	RET
+.PAGE
+	.SBTTL	getetype - Subroutine to get Ethertype value for device
+
+;Subroutine to get Ethertype value for device
+;	c{EAX} = Standard Ethertype value
+;	CALL	getetype
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  c{EAX} = Device Ethertype value
+
+getetype:
+	CMPL	EAX, #-1.B		;Is this the default Ethertype?
+	JE	6$.S			;Yes - pass it through
+	BTZL	EAX, #31t		;No - is this an internal Ethertype ID?
+	JNC	2$.S			;No
+	CMPL	EAX, #ETYPEMAX.B	;Yes - legal Ethertype value?
+	JA	4$.S			;No - fail
+	MOVL	EAX, CS:etypetbl[EAX*4]	;Yes - get corresponding Ethertype value
+	CMPL	EAX, #-1.B		;Valid value?
+	JE	4$.S			;No - fail
+2$:	XCHGB	AL, AH			;Must be above 1500 so as not to
+	CMPL	EAX, #1500t		;  conflict with 802.3 format packets
+	JBE	4$.S
+	XCHGB	AL, AH
+	TESTL	EAX, #0FFFF0000h	;Must be a 16 bit value
+	JE	6$.S			;OK
+4$:	MOVL	EAX, #ER_NILPC		;If bad protocol value
+	STC
+6$:	RET
+.PAGE
+	.SBTTL	sethwa - Subroutine to store remote hardware address in packet
+
+;Subroutine to store remote hardware address in packet
+;	c{EDX,EAX} = Remote hardware address
+;	c{EBX}     = Offset of packet buffer
+;	CALL	sethwa
+
+sethwa:	MOVL	[EBX], EAX
+	MOVW	4.B[EBX], DX
+	RET
+
+	.SBTTL	gethwa - Subroutine to get source hardware address from packet
+
+;Subroutine to get source hardware address from packet
+;	c{EBX} = Offset of packet buffer
+;	CALL	sethwa
+;	c{EDX,EAX} = Source hardware address
+
+gethwa:	MOVL	EAX, 6.B[EBX]
+	MOVZWL	EDX, 10t.B[EBX]
+	RET
+.PAGE
+	.SBTTL	setecho - Subroutine to set up echo packet header
+
+;Subroutine to set up hardware level packet header for echoed packet - the
+;  packet is set up to be an echo for the current receive packet
+;	c{EBX} = Offset of packet buffer
+;	CALL	setecho
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  c{ECX} = Offset of start of software part of received packet
+;	  c{EDX} = Offset of start of software part of echo packet
+
+setecho:MOVL	EAX, en_srchwadr+0.B[EBX] ;Copy source to destination
+	MOVL	en_dsthwadr+0.B[EBX], EAX
+	MOVW	DX, en_srchwadr+4.B[EBX]
+	MOVW	en_dsthwadr+4.B[EBX], DX
+	JMP	4$.S
+
+	.SBTTL	setpkt - Subroutine to set up packet header
+
+;Subroutine to set up hardware level packet header
+;	c{EBX} = Offset of packet buffer
+;	CALL	setpkt
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  c{EDX} = Offset of start of software part of packet
+
+setpkt:	MOVW	en_ethertype.B[EBX], AX	;Store Ethertype value
+4$:	MOVL	EAX, idb_hwaddr+0[ESI]	  ;Store our address in the packet
+	MOVL	en_srchwadr+0.B[EBX], EAX ;  as the source address
+	MOVL	EAX, idb_hwaddr+4[ESI]
+	MOVW	en_srchwadr+4.B[EBX], AX
+	MOVB	npb_lpofs.B[EBX], #en_data ;Store offset of first 2 levels
+	MOVB	npb_npofs.B[EBX], #en_data
+	MOVL	npb_count.B[EBX], #en_data ;Store initial total size
+	LEAL	EDX, en_data.B[EBX]	;Get pointer to next header
+	CLC
+	RET
+.PAGE
+	.SBTTL	sendpkt - Subroutine to send a packet over the network
+
+;Subroutine to send a packet over the network - must be called from fork level,
+;  does not wait for completion
+;	c{EBX} = Offset of packet to send
+;	c{ESI} = Offset of IDB
+;	CALL	sendpkt
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;  EBX is preserved
+
+sendpkt:CLD
+	PUSHL	EDI
+	MOVL	ECX, npb_count.B[EBX]	;Get amount to output
+	CMPL	ECX, #1514t		;Is it too big?
+	JBE	2$.S			;No
+	MOVL	ECX, #1514t		;Yes - just send what we can
+2$:	MOVL	EDX, idb_bioreg.B[ESI]
+	A2IOP	P_B2DPNTR		;Reset the data pointer
+	MOVL	EAX, #DPNTR$INCR+2
+	OUTW	[DX]
+	A2IOP	P_B2DATA-P_B2DPNTR	;Point to the data register
+	MOVL	EAX, ECX
+	ANDL	EAX, #0FFFFFFFEh.B
+	ADDL	EAX, #6.B
+	OUTW	[DX]			;Output count (forced even)
+	MOVZBL	EAX, npb_sizex.B[EBX]	;Get size index for buffer
+	MOVL	EAX, knlXmbSize##[EAX*4]
+	SUBL	EAX, #npb_mSIZE.B
+	MOVL	EDI, EBX
+	PUSHL	ESI
+6$:	CMPL	ECX, EAX		;Is this the last chunk?
+	JBE	8$.S			;Yes
+	SUBL	ECX, EAX		;No - calculate amount left after this
+	PUSHL	ECX
+	MOVL	ECX, EAX
+	SHRL	ECX, #2			;Get number of longs in this chunk
+	MOVL	ESI, EDI
+	ROUTSL	[ESI]			;Copy chunk to the interface
+	MOVL	EDI, npc_link.B[EDI]	;Point to next chunk
+	MOVZBL	EAX, npc_sizex.B[EDI]	;Get size of buffer
+	MOVL	EAX, knlXmbSize##[EAX*4]
+	SUBL	EAX, #npc_mSIZE.B	;Get size
+	POPL	ECX			;Restore amount left to copy
+	JMP	6$.S			;Continue
+
+;Here with last chunk of packet to output
+
+8$:	PUSHL	ECX			;Save original count
+	SHRL	ECX, #1			;Get number of words (round down)
+	MOVL	EAX, ECX
+	SHRL	ECX, #1			;Get number of longs (round down)
+	MOVL	ESI, EDI
+	ROUTSL	[ESI]
+	MOVL	ECX, EAX		;Copy last word if necessary
+	ANDL	ECX, #01h.B
+	ROUTSW	[ESI]
+	POPL	EAX			;Restore original count
+	TESTB	AL, #01			;Odd number of bytes?
+	MOVW	AX, #0
+	JE	10$.S			;No
+	MOVB	AL, [ESI]		;Yes - get last byte
+	MOVB	AH, #20h		;Indicate its odd
+10$:	OUTW	[DX]			;Output the last word
+	POPL	ESI
+	POPL	EDI
+	A2IOP	P_B2MMUCR-P_B2DATA
+	MOVB	AL, #MMUCMD_QPFT	;Send the packet
+	OUTB	[DX]
+	MOVB	idb_outtimer.B[ESI], #2	;Start 2 second time-out
+retclc:	CLC				;Clear C
+ret010:	RET				;And return
+.PAGE
+	.SBTTL	Network interface interrupt routines
+
+;The following is a prototype for the interrupt service routine entry code
+;  - this code is copied for each unit by ensmaaddunit
+
+ensmaint:
+	PUSHAL				;Save registers
+	PUSHL	DS
+	PUSHL	ES
+	PUSHL	FS
+	PUSHL	GS
+	PUSHL	#GS_DATA.B		;Make our data addressable
+	POPL	DS
+fix1:	MOVL	EDI, #0			;Get offset of IDB for this interface
+fix2:	JMP	ensmaintcom		;Go to the common interrupt routine
+
+ENSMAINTSZ=!$-ensmaint
+
+;Common interrupt routine
+
+ensmaintcom:
+	CALL	knlReqFork##		;Request fork
+	MOVB	AL, #INT_EOI
+	CLI
+	CMPB	idb_intlvl.B[EDI], #7	;High interrupt?
+	JBE	4$.S			;No
+	OUTB	P_INC2P0		;Yes - release 2nd interrupt controller
+4$:	OUTB	P_INC1P0		;Release first interrupt controller
+	JMP	knlDismissInt2##	;Check for scheduling and dismiss
+.PAGE
+	.SBTTL	ensmafork - Fork routine
+
+;Get here at fork level after interrupt from the Ethernet interface card
+
+ensmafork:
+	MOVL	ESI, EDI		;Get offset of the IDB in right register
+	INCL	idb_cntint.B[ESI]	;Count the interrupt
+fkloop:	MOVL	EDX, idb_bioreg.B[ESI]	;Get interrupt bits
+	A2IOP	P_B2INTSR
+fklop2:	INB	[DX]
+	TESTB	AL, #INTSR$EPH|INTSR$ROVRN|INTSR$TDONE|INTSR$RDONE
+	JE	1$.S
+;;;;;;	JE	ret010.S
+	TESTB	AL, #INTSR$ROVRN
+	JE	chkrcv.S		;No - go check for receive done
+	INCL	idb_cntrover.B[ESI]	;Yes - count the error
+	MOVB	AL, #INTAR$ROVRN	;Acknowledge the interrupt condition
+	OUTB	[DX]
+	JMP	fklop2
+
+1$:	MOVL	EDX, idb_bioreg.B[ESI]
+	A2IOP	P_B0BSR
+	INB	[DX]
+	ANDB	AL, #03h
+	CMPB	AL, #2t
+	JE	ret010.S
+	CRASH	RGSL
+
+;Here to check for receive done
+
+chkrcv:	TESTB	AL, #INTSR$RDONE	;Have a receive packet now?
+	JE	chkxmit			;No - go check for transmit done
+	MOVL	EDX, idb_bioreg.B[ESI]
+	A2IOP	P_B2RFIFO		;Get the receive packet number
+	INW	[DX]
+	A2IOP	P_B2DPNTR-P_B2RFIFO	;Set to read the packet
+	MOVL	EAX, #DPNTR$RCV|DPNTR$INCR|DPNTR$READ+0
+	OUTW	[DX]
+	A2IOP	P_B2DATA-P_B2DPNTR	;Point to data port
+	INW	[DX]			;Get (and discard) the receive status
+	CLRL	EAX			;  word
+	INW	[DX]			;Get receive byte count
+	SUBL	EAX, #5t.B
+	CMPL	EAX, #60t.B		;Is the packet big enough?
+	JL	8$.S			;No - ignore the packet!
+	MOVL	ECX, EAX		;Yes
+	CLRL	EDI
+	CALL	xosnetGetBufr##		;Get a network buffer
+	JC	10$.S			;Can't get a buffer - junk the packet!
+	MOVL	npb_count.B[EBX], ECX	;Store length in packet header
+	MOVL	EDX, idb_bioreg.B[ESI]	;Point to the data port
+	A2IOP	P_B2DATA
+	MOVL	EDI, EBX
+	PUSHL	DS
+	POPL	ES
+	PUSHL	ECX
+	SHRL	ECX, #1t		;Get number of words (round down)
+	MOVL	EAX, ECX
+	SHRL	ECX, #1t		;Get number of longs (round down)
+	CLD
+	RINSL	[EDI]			;Copy data to our buffer
+	MOVL	ECX, EAX
+	ANDL	ECX, #01h.B		;Copy 2nd to last word if necessary
+	RINSW	[EDI]
+	INW	[DX]			;Get last word
+	TESTB	AH, #20h		;Have odd number of bytes?
+	JE	2$.S			;No
+	STOSB	[EDI]			;Yes - store last byte in the packet
+	JMP	4$.S			;Continue
+
+;Here if have even number of bytes
+
+2$:	DECL	npb_count.B[EBX]	;Fix up the packet length
+4$:	INCL	idb_cntpktin.B[ESI]	;Count the receive packet
+	MOVL	EAX, npb_count.B[EBX]
+	ADDL	idb_cntbytein.B[ESI], EAX
+	CMPL	[EBX], #-1.B		;Is this a broadcast packet?
+	JNE	6$.S			;No
+	CMPW	4.B[EBX], #-1.B		;Maybe
+	JNE	6$.S			;No
+	INCL	idb_cntbcpktin.B[ESI]	;Yes - count it
+6$:	POPL	ECX			;Restore amount transfered
+	MOVL	EDX, idb_bioreg.B[ESI]	;Give up the frame buffer in the
+	A2IOP	P_B2MMUCR		;  interface
+	MOVB	AL, #MMUCMD_RLSRF
+	OUTB	[DX]
+	CALL	rcvpkt			;Process the received packet
+	JMP	fkloop			;See if have any more packets to get
+
+;Here if packet is too small (should not happen since interface should have
+;  already discarded small packets!)
+
+8$:	INCL	idb_cntfa[ESI]		;Count the error
+	JMP	12$.S			;Continue
+
+;Here if can't get a buffer for the input packet
+
+10$:	INCL	idb_cntnosbfr.B[ESI]	;Count the error
+12$:	MOVL	EDX, idb_bioreg.B[ESI]	;Discard the frame buffer in the
+	A2IOP	P_B2MMUCR		;  interface
+	MOVB	AL, #MMUCMD_RLSRF
+	OUTB	[DX]
+	JMP	fkloop
+.PAGE
+;Here with all receive conditions handled - now check for xmit conditions
+
+chkxmit:TESTB	AL, #INTSR$TDONE	;Transmit done?
+	JE	chkeph.S		;No
+	MOVL	EDX, idb_bioreg.B[ESI]	;Yes
+	A2IOP	P_B2DPNTR		;Set the data pointer
+	MOVL	EAX, #DPNTR$READ+0
+	OUTW	[DX]
+	IOPAUSE
+	A2IOP	P_B2DATA-P_B2DPNTR	;Point to the data register
+	INW	[DX]			;Get the status word
+	TESTB	AL, #EPHSR$TGOOD	;Successful transmit?
+	JNE	10$.S			;Yes
+	TESTW	AX, #EPHSR$LATCOL|EPHSR$16COL
+	JE	2$.S
+	PUSHL	#ER_NCONG.B
+	JMP	6$.S
+
+2$:	TESTB	AH, #EPHSR$TUNRRN>8t
+	JE	4$.S
+	PUSHL	#ER_LSTER.B
+	JMP	6$.S
+
+4$:	PUSHL	#ER_DEVER.B
+6$:	A2IOP	P_B2BSR-P_B2DATA	;Select register bank 0
+	MOVB	AL, #0
+	OUTB	[DX]
+	A2IOP	P_B0TCR-P_B0BSR
+	MOVB	AL, idb_ensmatcr[ESI]	;Re-enable the transmitter
+	OUTB	[DX]
+	A2IOP	P_B0BSR-P_B0TCR		;Select register bank 2
+	MOVB	AL, #2
+	OUTB	[DX]
+	JMP	12$.S
+
+;Here if output is complete without errors
+
+10$:	PUSHL	#0.B			;Indicate no errors
+12$:	MOVL	EDX, idb_bioreg.B[ESI]
+	A2IOP	P_B2INTAR		;Reset the output done interrupt
+	MOVB	AL, #INTAR$TDONE
+	OUTB	[DX]
+	POPL	EAX			;Get error code
+	CALL	xosnetFinXmit##		;Do output done processing
+	JMP	fkloop			;Continue
+.PAGE
+;Here to check for low priority error conditions
+
+chkeph:	TESTB	AL, #INTSR$EPH
+	JE	fkloop
+	A2IOP	P_B2BSR-P_B2INTSR	;Select register bank 0
+	MOVB	AL, #0
+	OUTB	[DX]
+	A2IOP	P_B0EPHSR-P_B0BSR	;Read the EPH status register
+	INW	[DX]
+	TESTB	AH, #EPHSR$TUNRRN>8t	;Transmit underrun?
+	JE	4$.S			;No
+	INCL	idb_cntxunder[ESI]	;Yes - count it
+4$:	TESTB	AH, #EPHSR$LSTCAR>8t	;Lost carrier?
+	JE	6$.S			;No
+	INCL	idb_cntcsense[ESI]	;Yes - count it
+6$:	TESTB	AL, #EPHSR$SQET		;SQET error?
+	JE	8$.S			;No
+	INCL	idb_cnthrtbt[ESI]	;Yes - count it
+8$:	TESTB	AH, #EPHSR$LATCOL>8t	;Late collision?
+	JE	10$.S			;No
+	INCL	idb_cntowcol[ESI]	;Yes - count it
+10$:	TESTB	AL, #EPHSR$16COL	;More than 16 collisions?
+	JE	12$.S			;No
+	INCL	idb_cntabort[ESI]
+12$:	TESTB	AH, #EPHSR$CNTROL>8t	;Counter overflow?
+	JE	14$.S			;No
+	A2IOP	P_B0ECR-P_B0EPHSR	;Yes - read the counter
+	INW	[DX]
+	MOVL	ECX, EAX
+	ANDL	ECX, #0Fh.B
+	ADDL	idb_cntnumcol[ESI], ECX
+	SHRL	EAX, #4t
+	ANDL	ECX, #0Fh.B
+	ADDL	idb_cntnumcol[ESI], ECX
+	SHRL	EAX, #4t
+	ANDL	ECX, #0Fh.B
+	ADDL	idb_cntnumcol[ESI], ECX
+	SHRL	EAX, #4t
+	ANDL	ECX, #0Fh.B
+	ADDL	idb_cntnumcol[ESI], ECX
+14$:	MOVL	EDX, idb_bioreg.B[ESI]
+	MOVW	AX, idb_ensmatcr[ESI]	;Make sure transmit enable is set
+	A2IOP	P_B0TCR
+	OUTW	[DX]
+	A2IOP	P_B0BSR-P_B0TCR		;Set back to register bank 2
+	MOVB	AL, #2
+	OUTB	[DX]
+	JMP	fkloop
+.PAGE
+	.SBTTL	rcvpkt - Subroutine to process received packet
+
+;Subroutine to process received packet
+;	c{EBX} = Offset of packet
+;	c{ECX} = Size of packet
+;	c{ESI} = Offset of IDB
+;	CALL	rcvpkt
+
+rcvpkt:	MOVL	npb_count.B[EBX], ECX	;Store total count in packet
+	MOVB	npb_lpofs.B[EBX], #en_data ;Store header offsets
+	MOVB	npb_npofs.B[EBX], #en_data
+	SUBL	ECX, #en_data.B		;Adjust the count
+	LEAL	EDX, en_data.B[EBX]	;Point to start of data
+	MOVZWL	EAX, en_ethertype.B[EBX] ;Get Ethertype value from the packet
+	JMP	xossnpRcv##		;Process the received packet
+.PAGE
+	.SBTTL	ensmaoas - Once-a-second routine
+
+ensmaoas:
+	MOVL	ESI, ensmafidb		;Get offset of first IDB
+4$:	TESTL	ESI, ESI		;More to check?
+	JE	10$.S			;No
+	CMPB	idb_outtimer.B[ESI], #0	;Yes - need to time output?
+	JE	6$.S			;No
+	DECB	idb_outtimer.B[ESI]	;Yes - has it timed out?
+	JNE	6$.S			;No
+	INCL	idb_cntxhung[ESI]	;Yes - count it
+	TOFORK				;Raise to fork level
+	MOVL	EAX, #ER_DEVER		;Report this as a device error
+	STC
+	CALL	xosnetFinXmit##		;Do output done processing
+	FROMFORK			;Back to main program level
+6$:	MOVL	ESI, idb_nextd.B[ESI]	;Advance to next IDB
+	JMP	4$.S			;Continue
+
+10$:	RET
+.PAGE
+	.SBTTL	calhash - Subroutine to calculate bit in the mult-cast hash table
+
+;Subroutine to calculate bit in the multi-cast hash table
+;	c{ESI} = Offset of node address string
+;	CALL	calhash
+;	c(AH) = {EBX} = Hash index (0 - 63t)
+
+POLYL=!1DB6h
+POLYH=!04C1h
+
+calhash:PUSHL	EBP
+	MOVL	EAX, #0FFFFh		;Initialize CRC value
+	MOVL	EDX, EAX
+	MOVB	CH, #3t	  		;Do 3 words of address
+2$:	MOVB	CL, #16t  		;Set innerloop count
+	MOVW	BP, [ESI]  		;Get a word of address
+	ADDL	ESI, #2.B		;Bump pointer
+4$:	MOVL	EBX, EDX		;Get crch
+	ROLW	BX, #1			;Bit31 to LSB
+	XORL	EBX, EBP		;Combine with incoming
+	SALW	AX, #1			;Shift left entire crc
+	RCLW	DX, #1
+	ANDL	EBX, #1.B		;Get control bit
+	JE	6$.S			;Zero = no xor
+	XORL	EAX, #POLYL		;XOR CRC with polynomial
+	XORL	EDX, #POLYH
+6$:	ORL	EAX, EBX		;Or in control bit
+	RORW	BP, #1			;Rotate incoming word right 1
+	DECB	CL			;Decrement bit counter
+	JNE	4$.S			;Loop a word
+	DECB	CH			;Decrement word counter
+	JNE	2$.S			;Loop 3 words
+
+;When get here have CRC in AX-DX, now reverse bit order
+
+	MOVL	ECX, #10t
+8$:	SALB	AL, #1 			;Shift out of al left
+	RCRB	AH, #1 			;Right thru carry into ah
+	LOOP	ECX, 8$			;Do 9 times to get last bit thru carry
+	MOVZBL	EBX, AH			;Get the hash index
+	POPL	EBP
+	RET
+.PAGE
+	.SBTTL	Data
+
+	DATA
+
+ensmafidb:.LONG	0		;Offset of first IDB for this type of interface
+ensmalidb:.LONG	0		;Offset of last IDB for this type of interface
+temp:	  .LONG 'NET', 0
+
+	LKEEND

@@ -1,0 +1,3154 @@
+	.TITLE	TLNSRV - Telnet server for XOS
+
+;++++
+; This software is in the public domain.  It may be freely copied and used
+; for whatever purpose you see fit, including commerical uses.  Anyone
+; modifying this software may claim ownership of the modifications, but not
+; the complete derived code.  It would be appreciated if the authors were
+; told what this software is being used for, but this is not a requirement.
+
+;   THIS SOFTWARE IS PROVIDED BY THE AUTHORS "AS IS" AND ANY EXPRESS OR
+;   IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
+;   OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+;   IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+;   INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+;   BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS
+;   OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+;   ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR
+;   TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
+;   USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+;----
+
+	.PROC	80386
+
+	.INCLUD	XOSINC:\XMAC\STDIO.PAR
+	.INCLUD	XOSINC:\XMAC\PROCARG.PAR
+	.INCLUD	XOSINC:\XMAC\CTYPE.PAR
+	.INCLUD	XOSINC:\XMAC\XOS.PAR
+	.INCLUD	XOSINC:\XMAC\XOSERR.PAR
+	.INCLUD	XOSINC:\XMAC\XOSNET.PAR
+	.INCLUD XOSINC:\XMAC\XOSTRM.PAR
+	.INCLUD	XOSINC:\XMAC\XOSDDSP.PAR
+
+	.STDSEGS
+
+;This program is initialized as a symbiont with the following command:
+
+;	SYMBIONT TLNSRV NUMOPEN=n NUMCON=m TLNPORT=p PCNDEV=pcn TLNDEV=tcp \
+;		LOGLEVEL=l LOGFILE=log
+;	  Where:
+;		NUMOPEN  = Number of opens to queue for the device
+;		NUMCON   = Maximum number of connections to allow for the device
+;		TLNPORT  = TCP port to listen on for incomming connections
+;		PCNDEV   = Name of PCN device to use
+;		TLNDEV   = Name of TCP device to use
+;		LOGLEVEL = Specifies the logging level, default is 3
+;		LOGFILE  = Specifies file for log output, if not specified no
+;			   log output is generated
+
+;  Note that multiple TCP devices may be specified.  The NUMOPEN, NUMCON,
+;  TLNPORT, and PCNDEV values must PRECEED the TLNDEV specification.  If
+;  NUMOPEN is not specified, a value of 4 is used.  Once specified, the
+;  NUMOPEN value remains in effect until a different value is specified.
+;  If NUMCON is not specified, a value of 20 is used.  Once specified, the
+;  NUMCON value remains in effect until a different value is specified.  If
+;  TLNPORT is not specified, a value of 23 (the standard Telnet port) is used.
+;  This value also remains in effect until changed.  PCNDEV specifies the PCN
+;  device to use for creating sessions.  If it is not specified, PCN1: is
+;  used.  This value remains in effect until changed.  Note that multiple TCP
+;  devices can use the same PCN device if desired.  At least one TLNDEV name
+;  must be specified.
+
+;  This program uses two "pseudo-threads"; one for TCP input and one for TCP
+;  output.  The TCP input thread is a simple software interrupt routine which
+;  handles the TCP input ready interrupt.  It process data from the TCP input
+;  data stream and generates a PCN output data stream and a TCP supervisory
+;  output data stream.  The PCN data is output using simple blocking IO calls
+;  since the PCN device never blocks for output.  TCP output is started if
+;  supervisory data is generated and TCP output is idle.  The TCP output
+;  thread is somewhat more complex.  It is made up of the TCP output done
+;  software interrupt routine and the PCN input done software interrupt
+;  routine.  When the TCP output done interrupt occures, a check is made
+;  to see if there is any TCP supervisory output to handle and if so, it is
+;  output and the interrupt is dismissed.  If there is no supervisory output,
+;  a PCN input is queued and the interrupt is dismissed.  When the PCN input
+;  done interrupt occures, the PCN input data stream is processed.  If any
+;  TCP output was generated (the usual case), TCP output is started and the
+;  interrupt is dismissed.  If no TCP output was generated, another PCN input
+;  is queued and the interrupt is dismissed.
+.PAGE
+VERSION=!1t		;Version number
+EDITNO =!1t		;Edit number
+
+	.MACRO	IBTL  addr, index, bit
+.IF NB {index}
+	BTL	{addr}+{{bit}/32t}*4[index], #{bit}&1Fh
+.IFF
+	BTL	{addr}+{{bit}/32t}*4, #{bit}&1Fh
+.ENDC
+	.ENDM
+
+	.MACRO	IBTZL  addr, index, bit
+.IF NB {index}
+	BTZL	{addr}+{{bit}/32t}*4[index], #{bit}&1Fh
+.IFF
+	BTZL	{addr}+{{bit}/32t}*4, #{bit}&1Fh
+.ENDC
+	.ENDM
+
+	.MACRO	IBTSL  addr, index, bit
+.IF NB {index}
+	BTSL	{addr}+{{bit}/32t}*4[index], #{bit}&1Fh
+.IFF
+	BTSL	{addr}+{{bit}/32t}*4, #{bit}&1Fh
+.ENDC
+	.ENDM
+
+TCPIBFRSZ =!560t
+TCPOBFRSZ =!560t
+TCPSBFRSZ =!200t
+PCNIBFRSZ =!560t
+PCNOBFRSZ =!560t
+TLNSBMAX  =!20t
+SCNBUFSIZE=!8t
+
+VECT_TCPOPEN  =!50t		;Interrupt for TCP open complete
+VECT_TCPINPUT =!51t		;Interrupt for TCP input ready
+VECT_TCPOUTPUT=!52t		;Interrupt for TCP output done
+VECT_TCPCLOSE =!53t		;Interrupt for TCP close complete
+VECT_PCNINPUT =!54t		;Interrupt for PCN input ready
+VECT_PCNOUTPUT=!55t		;Interrupt for PCN output done
+VECT_PCNLVMAP =!56t		;Interrupt for PCN leave mapped mode event
+VECT_PCNIDLE  =!57t		;Interrupt for PCN terminal idle event
+
+;Define receive state values
+
+RS_NORM    =!0t		;Normal character next
+RS_CMD     =!1t		;Command next
+RS_HAVESB  =!2t		;Have SB command
+RS_HAVESBC =!3t		;Have SBC command
+RS_HAVEWILL=!4t		;Have WILL command
+RS_HAVEWONT=!5t		;Have WONT command
+RS_HAVEDO  =!6t		;Have DO command
+RS_HAVEDONT=!7t		;Have DONT command
+
+;Define offsets in the TDD (TCP Device Data block).  There is one TDD for
+;  each TCP device being handled.  TDDs are statically allocated during
+;  initialization.
+
+$$$=!0
+BLK tdd_next    , 4t		;Offset of next TDD
+BLK tdd_firsttod, 4t		;Offset of first TOD
+BLK tdd_firsttcd, 4t		;Offset of first TCD
+BLK tdd_lasttcd , 4t		;Offset of last TCD
+BLK tdd_bufrbase, 4t		;Offset of base of screen buffer area
+BLK tdd_tcpname , 16t		;Name for TCP opens
+BLK tdd_pcnname , 16t		;Name of PCN device to use
+tdd_SIZE=!$$$
+
+;Define offsets in the TOD (TCP Open Data block).  There is one TOD for each
+;  queued open for each TCP device.  TODs are statically allocated during
+;  initialization.
+
+$$$=!0
+BLK tod_next   , 4t		;Offset of next TOD
+BLK tod_tdd    , 4t		;Offset of TDD
+BLK tod_oqab   , qab_SIZE	;QAB for open
+BLK tod_oparm  , 12t		;Parameter list for open
+BLK tod_rmtneta, 4t		;Remote IP address
+BLK            , 4t
+BLK tod_rmtport, 4t		;Remote TCP port
+BLK            , 4t		;End of parameter list
+tod_SIZE=!$$$
+
+;Define offsets in the TCD (TCP Connection Data block).  There is one TCD
+;  for each active TCP connection.  TCDs are dynamically allocated as
+;  connections are established.
+
+tcd_mSIZE=!124t
+$$$=!-tcd_mSIZE
+BLK tcd_disptype, 4t		;Display type value
+BLK tcd_tohold  , 4t		;Amount of normal output held off
+BLK tcd_scrnbufr, 4t		;Offset of screen buffer
+BLK tcd_rmtneta , 4t		;Remote IP address
+BLK tcd_rmtport , 4t		;Remote TCP port
+BLK tcd_todsp   , 4t		;TCP output done dispatch offset
+BLK tcd_tocnt   , 4t		;TCP data output byte count
+BLK tcd_topnt   , 4t		;TCP data output byte pointer
+BLK tcd_tscnt   , 4t		;TCP supervisory output byte count
+BLK tcd_tsput   , 4t		;TCP supervisory output putter pointer
+BLK tcd_tstak   , 4t		;TCP supervisory output taker pointer
+BLK tcd_tsend   , 4t		;Offset of end of TCP supervisory output buffer
+				;  plus 1
+BLK tcd_tipnt   , 4t		;TCP input byte pointer
+BLK tcd_popnt   , 4t		;PCN output byte pointer
+BLK tcd_pipnt   , 4t		;PCN input byte pointer
+BLK tcd_lclreq  , 8t		;Requested local options
+BLK tcd_lclopt  , 8t		;Enabled local options
+BLK tcd_rmtreq  , 8t		;Requested remote options
+BLK tcd_rmtopt  , 8t		;Enabled remote options
+BLK tcd_scrnpage, 4t		;Offset of start of current screen buffer page
+BLK tcd_shdwpage, 4t		;Offset of start of current shadow buffer page
+BLK tcd_scrnpnt , 4t		;Pointer to screen buffer
+BLK tcd_shdwpnt , 4t		;Pointer to shadow buffer
+BLK tcd_scrndiff, 4t		;Offset of start of difference area in screen
+				;  buffer
+BLK tcd_shdwdiff, 4t		;Offset of start of difference area in shadow
+				;  buffer
+BLK tcd_left    , 4t		;Number of while longs left on current page
+BLK tcd_dpgbits , 4t		;Display page changed bits
+.IF NE $$$
+	.IRP	q, >$$$
+	.ERROR	Offset error for tcd_xxxxxx definitions, tcd_next = q'h
+	.ENDR
+.ENDC
+BLK tcd_next    , 4t		;Offset of next TCD
+BLK tcd_prev    , 4t		;Offset of previous TCD
+BLK tcd_tdd     , 4t		;Offset of TDD
+				;WARNING: Following 4 items must be in this
+				;  order
+BLK tcd_status0 , 1t
+BLK tcd_status1 , 1t
+BLK tcd_xosmode , 1t
+BLK tcd_rcvstate, 1t
+BLK tcd_sbpntr  , 1t
+BLK tcd_shiftbts, 1t		;Shift bits for ANSI mode
+BLK tcd_punit   , 1t		;Primary PCN unit number
+BLK tcd_sunit   , 1t		;Secondary PCN unit number
+BLK tcd_count   , 4t
+BLK tcd_temp    , 4t
+BLK tcd_putrtn  , 4t
+BLK tcd_saveESI , 4t
+BLK tcd_saveEDI , 4t
+BLK tcd_tiqab   , qab_SIZE	;TCP input QAB
+BLK tcd_toqab   , qab_SIZE	;TCP output QAB
+BLK tcd_piqab   , qab_SIZE	;PCN input QAB
+BLK tcd_poqab   , qab_SIZE	;PCN output QAB
+BLK tcd_tibufr  , TCPIBFRSZ	;TCP input buffer
+BLK tcd_tobufr  , TCPOBFRSZ	;TCP output buffer
+BLK tcd_tsbufr  , TCPSBFRSZ	;TCP supervisory output buffer
+BLK tcd_pibufr  , PCNIBFRSZ	;PCN input buffer
+BLK tcd_pobufr  , PCNOBFRSZ	;PCN output buffer
+BLK tcd_sbdata  , TLNSBMAX	;Data for sub-negoiation
+tcd_SIZE=!$$$
+
+;Define bits for tcd_status0
+
+TS0$TCPCLSD=!08h		;TCP device has been closed
+TS0$CLOSE  =!04h		;Connection is being closed
+TS0$INPDONE=!02h		;TCP input is complete when closing
+TS0$OUTDONE=!01h		;TCP output (and PCN input) is complete when
+				;  closing
+
+;Define bits for tcd_status1
+
+TS1$XOSKB  =!40h
+TS1$OUTACT =!20h		;TCP output is active
+TS1$INPPROC=!10h		;PCN input is being processed
+TS1$MAPPROC=!08h		;TCP leave mapped mode interrupt being processed
+
+TS1$LVMHLD =!02h		;Have held off a PCN leave mapped mode interrupt
+TS1$INPHLD =!01h		;Have held off a PCN input done interrupt
+
+;Define bits for tcd_shiftbts
+
+SB$ALT    =!04h			;ALT key is pressed
+SB$CONTROL=!02h			;CONTROL key is pressed
+SB$SHIFT  =!01h			;SHIFT key is pressed
+
+	.PSECT	_ODATA_p
+
+argmsect:.LONG	0
+
+kwnumopen: .ASCIZ "NUMOPEN"
+kwnumcon:  .ASCIZ "NUMCON"
+kwpcndev:  .ASCIZ "PCNDEV"
+kwtlnport: .ASCIZ "TLNPORT"
+kwtlndev:  .ASCIZ "TLNDEV"
+kwloglevel:.ASCIZ "LOGLEVEL"
+kwlogfile: .ASCIZ "LOGFILE"
+
+keyword:.LONG	kwnumopen , ASF$VALREQ|ASF$LSVAL, 0, fncnumopen , 0
+	.LONG	kwnumcon  , ASF$VALREQ|ASF$LSVAL, 0, fncnumcon  , 0
+	.LONG	kwpcndev  , ASF$VALREQ|ASF$LSVAL, 0, fncpcndev  , 0
+	.LONG	kwtlnport , ASF$VALREQ|ASF$NVAL , 0, fnctlnport , 0
+	.LONG	kwtlndev  , ASF$VALREQ|ASF$LSVAL, 0, fnctlndev  , 0
+	.LONG	kwloglevel, ASF$VALREQ|ASF$NVAL , 0, fncloglevel, 0
+	.LONG	kwlogfile , ASF$VALREQ|ASF$LSVAL, 0, fnclogfile , 0
+	.LONG	0
+
+	.SBTTL	Start of program
+
+	.PSECT	_OTEXT_p
+
+mainalt::
+	PUSHL	DS			;Change our process name
+	PUSHL	#ourname
+	CALLF	svcSysSetPName##
+	MOVL	ESI, 4.B[ESP]		;Get offset of argument msect
+	MOVL	argmsect, ESI
+	PUSHL	#reqname
+	PUSHL	ESI
+	CALL	getreqname#		;Process requestor name argument
+	ADDL	ESP, #8.B
+	MOVL	EBX, #badpidmsg
+	TESTL	EAX, EAX		;Error?
+	JE	fail1			;Yes
+	MOVL	argpntr, EAX		;No - store argument offset for procarg
+	PUSHL	#0.B			;No default extension for indirect file
+	PUSHL	#0.B			;No next line function
+	PUSHL	#argerr			;Error function
+	PUSHL	#0.B			;Function called for non-keyword args
+	PUSHL	#keyword		;Offset of keyword table
+	PUSHL	#0.B			;Offset of option table
+	PUSHL	#PAF$INDIRECT|PAF$EATQUOTE ;Flag bits
+	PUSHL	#argpntr		;Offset of arg string pointer
+	CALL	procarg#		;Process arguments
+	ADDL	ESP, #32t.B
+	PUSHL	DS			;Give up the argument data
+	PUSHL	argmsect
+	PUSHL	#0.B
+	PUSHL	#0.B
+	CALLF	svcMemChange##
+	MOVL	EBX, #no2domsg
+	CMPL	firsttdd, #0		;Were any TCP devices specified?
+	JE	10$.S			;No - fail!
+	CMPB	logname, #0		;Yes - have a log file specified?
+	JE	cmddone.S		;No - go on
+	PUSHL	#O$TRUNCA|O$CREATE|O$OUT ;Yes - open the log file
+	PUSHL	DS
+	PUSHL	logname
+	PUSHL	#0.B
+	PUSHL	#0.B
+	CALLF	svcIoOpen##
+	MOVL	loghndl, EAX		;Store handle
+	MOVL	EBX, #nologmsg
+	TESTL	EAX, EAX		;Error?
+10$:	JS	fail1			;Yes
+					;No - fall into cmddone on next page
+.PAGE
+;Here with all command line processing done
+
+cmddone:PUSHL	#0			;Give up the argument msect
+	PUSHL	#0
+	PUSHL	argmsect
+	PUSHL	DS
+	CALLF	svcMemChange##
+	PUSHL	#VECT_TCPOPEN.B		;Set the TCP open done vector
+	PUSHL	#84h+{VT_XOSS<8t}
+	PUSHL	CS
+	PUSHL	#tcpopendone
+	CALLF	svcSchSetVector##
+	MOVL	EBX, #sivfmsg
+	TESTL	EAX, EAX
+	JS	2$.S			;If error
+	PUSHL	#VECT_TCPINPUT.B	;Set the TCP input done vector
+	PUSHL	#84h+{VT_XOSS<8t}
+	PUSHL	CS
+	PUSHL	#tcpinputdone
+	CALLF	svcSchSetVector##
+	TESTL	EAX, EAX
+	JS	2$.S			;If error
+	PUSHL	#VECT_TCPOUTPUT.B	;Set the TCP output done vector
+	PUSHL	#84h+{VT_XOSS<8t}
+	PUSHL	CS
+	PUSHL	#tcpoutputdone
+	CALLF	svcSchSetVector##
+	TESTL	EAX, EAX
+2$:	JS	4$.S			;If error
+	PUSHL	#VECT_TCPCLOSE.B	;Set the TCP close done vector
+	PUSHL	#84h+{VT_XOSS<8t}
+	PUSHL	CS
+	PUSHL	#tcpclosedone
+	CALLF	svcSchSetVector##
+	TESTL	EAX, EAX
+	JS	4$.S			;If error
+	PUSHL	#VECT_PCNINPUT.B	;Set the PCN input done vector
+	PUSHL	#84h+{VT_XOSS<8t}
+	PUSHL	CS
+	PUSHL	#pcninputdone
+	CALLF	svcSchSetVector##
+	TESTL	EAX, EAX
+	JS	4$.S			;If error
+	PUSHL	#VECT_PCNOUTPUT.B	;Set the PCN output done vector
+	PUSHL	#84h+{VT_XOSS<8t}
+	PUSHL	CS
+	PUSHL	#pcnoutputdone
+	CALLF	svcSchSetVector##
+	TESTL	EAX, EAX
+	JS	4$.S			;If error
+	PUSHL	#VECT_PCNLVMAP.B	;Set the PCN leave mapped mode vector
+	PUSHL	#83h+{VT_XOSS<8t}
+	PUSHL	CS
+	PUSHL	#pcnleavemap
+	CALLF	svcSchSetVector##
+	TESTL	EAX, EAX
+	JS	4$.S			;If error
+	PUSHL	#VECT_PCNIDLE.B		;Set the PCN idle vector
+	PUSHL	#83h+{VT_XOSS<8t}
+	PUSHL	CS
+	PUSHL	#pcnidle
+	CALLF	svcSchSetVector##
+	TESTL	EAX, EAX
+4$:	JS	fail2.S			;If error
+	MOVL	EDI, #finmsg1		;Send final response message
+	MOVL	ECX, #finsz1
+	CALL	response
+	PUSHL	DS
+	PUSHL	#_ODATABASE		;Give up the once-only data msect
+	PUSHL	#0.B
+	PUSHL	#0.B
+	CALLF	svcMemChange##
+	PUSHL	CS			;Set up arguments to give up the
+	PUSHL	#_CODEBASE		;  once-only code (the actual call
+	PUSHL	#0.B			;  is done at ready since this area
+	PUSHL	#mainalt-_CODEBASE	;  will be given up!)
+	JMP	ready
+.PAGE
+;Here if have fatal error during set up
+;	c{EBX} = Offset of first message string
+;	c{EAX} = Offset of second message string or negative error code
+
+fail1::	CLRL	EAX
+fail2::	SUBL	ESP, #500t		;Allocate a buffer
+	PUSHL	DS
+	POPL	ES
+	MOVL	EDI, ESP
+	PUSHL	EAX			;Save second item
+	MOVL	ESI, #failmsg1
+	MOVL	ECX, #failsz1
+	CLD
+	RMOVSB	[EDI], [ESI]
+	MOVL	ESI, EBX
+2$:	LODSB	[ESI]
+	STOSB	[EDI]
+	TESTB	AL, AL
+	JNE	2$.S
+	DECL	EDI
+	POPL	EAX
+	TESTL	EAX, EAX		;Have a second message line?
+	JE	8$.S			;No
+	MOVL	ESI, #failmsg2		;Yes
+	MOVL	ECX, #failsz2
+	RMOVSB	[EDI], [ESI]
+	TESTL	EAX, EAX		;Is second line a string?
+	JNS	4$.S			;Yes - go on
+	PUSHL	EAX			;No - its an error code - get message
+	PUSHL	#3.B
+	PUSHL	DS
+	PUSHL	EDI
+	CALLF	svcSysErrMsg##
+	ADDL	EDI, EAX
+	JMP	8$.S
+
+;Here if second line specified as a string
+
+4$:	MOVL	ESI, EAX
+6$:	LODSB	[ESI]
+	STOSB	[EDI]
+	TESTB	AL, AL
+	JNE	6$.S
+	DECL	EDI
+8$:	MOVL	ESI, #failmsg3
+	MOVL	ECX, #failsz3
+	RMOVSB	[EDI], [ESI]
+	MOVL	ECX, EDI
+	SUBL	ECX, ESP
+	MOVL	EDI, ESP
+	CALL	response
+	PUSHL	#1.B
+	CALLF	svcSchExit##
+
+;Here if can't get memory during set up
+
+nema:	MOVL	EBX, #nemamsg
+	JMP	fail1.S
+.PAGE
+	.SBTTL	argerr - Function called by procarg on errors
+
+;Function called by procarg on errors
+
+argerr:	POPL	EAX			;Discard return address
+	POPL	EBX			;Get offset of first message string
+	POPL	EAX			;Get offset of second message string
+	JMP	fail2.S
+.PAGE
+	.SBTTL	fncnumopen - Function to process NUMOPEN keyword
+
+;Function to process the NUMOPEN keyword - this specifies the number of
+;  TCP open requests to queue
+
+fncnumopen:
+	MOVL	EBX, 4.B[ESP]		;Get offset of the argument data
+	MOVL	EAX, argdata_value.B[EBX] ;Get value
+	MOVL	numopen, EAX		;Store it
+	JMP	4$.S
+
+	.SBTTL	fncnumcon - Function to process the NUMCON keyword
+
+;Function to process the NUMCON keyword - this specifies the maximum number of
+;  connections allowed
+
+fncnumcon:
+	MOVL	EBX, 4.B[ESP]		;Get offset of the argument data
+	MOVL	EAX, argdata_value.B[EBX] ;Get value
+	MOVL	numcon, EAX		;Store it
+4$:	CLRL	EAX
+	INCL	EAX
+	RET
+
+	.SBTTL	fncpcndev - Function to process the PCNDEV keyword
+
+;Function to process the PCNDEV keyword - this specifies the name of the PCN
+;  device to use
+
+fncpcndev:
+	PUSHL	ESI
+	PUSHL	EDI
+	MOVL	EBX, #pcnname
+	CALL	getdevname
+	POPL	EDI
+	POPL	ESI
+	JMP	4$.S
+.PAGE
+	.SBTTL	fnctlndev - Function to process the TLNDEV keyword
+
+;Function to process the TLNDEV keyword - this specifies the name of a TCP
+;  device to use
+
+fnctlndev:
+	PUSHL	ESI
+	PUSHL	EDI
+	MOVL	EAX, #tdd_SIZE
+	CALL	getimem			;Get memory for the TDD
+	MOVL	EBX, lasttdd		;Link it to our list
+	TESTL	EBX, EBX
+	JE	2$.S
+	MOVL	[EBX], EDI
+	JMP	4$.S
+
+2$:	MOVL	firsttdd, EDI
+4$:	MOVL	lasttdd, EDI
+	MOVL	ESI, EDI
+	CLRL	EAX
+	MOVL	tcpname+0, EAX		;Clear the TCP device name field
+	MOVL	tcpname+2, EAX
+	MOVL	tcpname+4, EAX
+	LEAL	EBX, tdd_tcpname.B[ESI]
+	CALL	getdevname		;Get the device name
+	MOVL	[EBX], #'*::'		;Store *:: followed by null at end
+	PUSHL	#O$RAW|O$IN|O$OUT
+	PUSHL	DS
+	LEAL	EAX, tdd_tcpname.B[ESI]
+	PUSHL	EAX
+	PUSHL	DS
+	PUSHL	#openparms
+	CALLF	svcIoDevParm##		;Check the device (arguments pushed
+	MOVL	EBX, #cnomsg		;  above!)
+	TESTL	EAX, EAX
+	JS	fail2			;If error
+	MOVL	EBX, #nottcpmsg
+	CMPL	devclass+0, #'TCP'	;Is this a TCP class device?
+	JNE	fail1			;No - fail
+	PUSHL	#O$RAW
+	PUSHL	DS
+	PUSHL	#pcnname
+	PUSHL	DS
+	PUSHL	#pcnparms
+	CALLF	svcIoDevParm##
+	MOVL	EBX, #pcnflmsg
+	TESTL	EAX, EAX
+	JS	fail2
+	MOVB	pcnpname+0, #'_'
+	MOVL	EBX, #pcnpname		;Copy the PCN name to the TDD
+	MOVL	EAX, [EBX]
+	MOVL	tdd_pcnname+0t.B[ESI], EAX
+	MOVL	EAX, 4t.B[EBX]
+	MOVL	tdd_pcnname+4t.B[ESI], EAX
+	MOVL	EAX, 8t.B[EBX]
+	MOVL	tdd_pcnname+8t.B[ESI], EAX
+	MOVL	EAX, 12t.B[EBX]
+	MOVL	tdd_pcnname+12t.B[ESI], EAX
+	MOVL	EAX, bufrbase		;Get base of the screen buffer area
+	MOVL	tdd_bufrbase.B[ESI], EAX
+	ADDL	bufrbase, #800000h	;Bump it for next time
+
+;Here with the TCP device verified - now set up the TODs and queue the
+;  initial opens
+
+	MOVL	ECX, numopen		;Get number of opens to queue
+6$:	MOVL	EAX, #tod_SIZE		;Allocate memory for a TOD
+	PUSHL	ECX
+	CALL	getimem
+	POPL	ECX
+	MOVL	EAX, tdd_firsttod.B[ESI] ;Link the TOD to the list
+	MOVL	tdd_firsttod.B[ESI], EDI
+	MOVL	[EDI], EAX	
+	MOVL	tod_tdd.B[EDI], ESI	;Store link back to the TDD
+	MOVW	tod_oqab.B[EDI], #QFNC_OPEN	;Set up the TCP open QAB
+	MOVB	tod_oqab+qab_vector.B[EDI], #VECT_TCPOPEN
+	MOVL	tod_oqab+qab_option.B[EDI], #O$IN|O$OUT|O$PARTIAL
+	LEAL	EAX, tdd_tcpname.B[ESI]
+	MOVL	tod_oqab+qab_buffer1+0.B[EDI], EAX
+	MOVL	tod_oqab+qab_buffer1+4.B[EDI], DS
+	LEAL	EBX, tod_oparm.B[EDI]
+	MOVL	tod_oqab+qab_parm+0.B[EDI], EBX
+	MOVL	tod_oqab+qab_parm+4.B[EDI], DS
+	MOVL	[EBX], #{PAR$SET|REP_HEXV}+{4<8t}+{IOPAR_NETLCLPORT<16t}
+	MOVL	4.B[EBX], #40000000h+TCPP_TELNET
+	MOVL	8.B[EBX], #{PAR$GET|REP_HEXV}+{4<8t}+{IOPAR_NETRMTNETAR<16t}
+	MOVL	16t.B[EBX], #{PAR$GET|REP_HEXV}+{4<8t}+{IOPAR_NETRMTPORTR<16t}
+	CLRL	EAX
+	MOVB	24t.B[EBX], AL
+	PUSHL	DS
+	LEAL	EAX, tod_oqab.B[EDI]
+	PUSHL	EAX
+	CALLF	svcIoQueue##		;Queue the initial open
+	MOVL	EBX, #cnoimsg
+	TESTL	EAX, EAX
+	JS	fail2			;If error
+	LOOP	ECX, 6$			;Continue if more to do
+	MOVL	EDI, #tcpname
+	MOVB	AL, #0
+	DECL	ECX
+	CLD
+	RNSCASB	[EDI]
+	DECL	EDI
+	MOVL	EAX, #' usi'
+	STOSL	[EDI]
+	MOVL	EAX, #'ng '
+	STOSL	[EDI]
+	DECL	EDI
+	MOVL	ESI, #pcnpname
+10$:	LODSB	[ESI]
+	STOSB	[EDI]
+	CMPB	AL, #0
+	JNE	10$.S
+	LEAL	ECX, -1.B[EDI]
+	MOVL	EDI, #initmsg
+	SUBL	ECX, EDI
+	CALL	response
+	CLRL	EAX			;Return TRUE
+	INCL	EAX
+	POPL	EDI
+	POPL	ESI
+	RET
+.PAGE
+;Subroutine to get device name argument
+;	c{EBX} = Offset of device name buffer
+;	CALL	getdevname
+
+getdevname:
+	MOVL	EDX, 16t.B[ESP]		;Get offset of argument data structure
+	MOVL	EDX, argdata_value.B[EDX] ;Get offset of name string
+	MOVL	ECX, #8t
+6$:	MOVB	AL, [EDX]		;Get name character
+	CMPB	AL, #0			;End?
+	JE	14$.S			;Yes
+	INCL	EDX			;No
+	CMPB	AL, #'a'		;Lower case?
+	JB	8$.S			;No
+	ADDB	AL, #'A'-'a'		;Yes - change to upper case
+8$:	MOVB	[EBX], AL		;Store in buffer
+	INCL	EBX
+	CMPB	AL, #':'		;Colon?
+	JE	12$.S			;Yes
+	LOOP	ECX, 6$			;No - loop if can take more
+10$:	MOVL	EBX, #bdspmsg		;Bad name
+	JMP	fail1
+
+;Here with colon in name
+
+12$:	CMPB	[EDX], #0		;Is it the last character?
+	JNE	10$.S			;No - bad name
+	RET				;Yes
+
+;Here with end of name (no colon seen)
+
+14$:	MOVB	[EBX], #':'		;Store colon
+	INCL	EBX
+	RET
+.PAGE
+	.SBTTL	fnctlnport - Function to process the TLNPORT keyword
+
+;Function to process the TLNPORT keyword - this specifies the TCP port to
+;  use
+
+fnctlnport:
+	MOVL	EBX, 4.B[ESP]		;Get offset of the argument data
+	MOVL	EAX, argdata_value.B[EBX] ;Get value
+	MOVL	tcpport, EAX		;Store it
+	JMP	rtnone.S
+.PAGE
+	.SBTTL	fnclogfile - Function to process the LOGFILE keyword
+
+;Function to process the LOGFILE keyword - this specifies the logging file
+
+fnclogfile:
+	PUSHL	EDI
+	MOVL	EDI, #logname
+	PUSHL	ESI
+	MOVL	ESI, 12t.B[ESP]
+	MOVL	EAX, argdata_length.B[ESI]
+	ADDL	EAX, #4t.B		;Allocate enough memory to hold the
+	PUSHL	EAX			;  string plus a little more to hold
+	CALL	sbrk#			;  any characters we append to it
+	POPL	ECX
+	CMPL	EAX, #-1.B
+	JE	nema			;If can't allocate the memory
+	MOVL	[EDI], EAX		;OK - store offset of memory allocated
+	MOVL	EDI, EAX
+strit:	MOVL	ECX, argdata_length.B[ESI] ;Get length of string
+	MOVL	ESI, argdata_value.B[ESI] ;Get offset of string
+	PUSHL	DS
+	POPL	ES
+	CLD
+	INCL	ECX			;Include the final null
+	RMOVSB	[EDI], [ESI]		;Copy the string
+	MOVL	EAX, #1
+10$:	POPL	ESI
+	POPL	EDI
+	RET
+.PAGE
+	.SBTTL	fncloglevel - Function to process the LOGLEVEL keyword
+
+;Function to process the LOGLEVEL keyword - this specifies the number logging
+;  level
+
+fncloglevel:
+	MOVL	EAX, 4.B[ESP]
+	MOVL	EAX, argdata_value.B[EAX]
+	MOVL	loglevel, EAX
+rtnone:	MOVL	EAX, #1
+	RET
+.PAGE
+	.SBTTL	getimem - Subroutine to allocate memory during set up
+
+;Subroutine to allocate memory during set up
+;	c{EAX} = Amount needed
+;	CALL	getimem
+;	c{EDI} = Offset of memory obtained
+
+getimem::
+	PUSHL	EAX
+	CALL	sbrk#
+	POPL	EDI
+	CMPL	EAX, #-1.B
+	JE	4$.S
+	MOVL	EDI, EAX
+	RET
+
+4$:	MOVL	EBX, #nemamsg
+	JMP	fail1
+.PAGE
+	.SBTTL	response - Subroutine to generate response message
+
+;Subroutine to generate response message
+;	c{EDI} = Offset of message
+;	c{ECX} = Length of message
+;	CALL	response
+
+response::
+	CMPB	reqname, #0		;Running from a terminal?
+	JNE	2$.S			;No - go on
+	INCL	EDI			;Yes - output message to the terminal
+	DECL	ECX
+	PUSHL	#DH_STDERR.B
+	PUSHL	DS
+	PUSHL	EDI
+	PUSHL	ECX
+	CALLF	svcIoOutBlock##
+	PUSHL	#DH_STDERR.B
+	PUSHL	DS
+	PUSHL	#crlfmsg
+	PUSHL	#0.B
+	CALLF	svcIoOutString##
+	RET
+
+;Here if not running from a terminal - send response message to requestor
+
+2$:	CMPL	msgqab+qab_handle, #0.B	;Is the message device open?
+	JNE	4$.S			;Yes - us it
+	PUSHL	#O$IN|O$OUT		;No - must open it now
+	PUSHL	DS
+	PUSHL	#msgname
+	PUSHL	#0.B
+	PUSHL	#0.B
+	CALLF	svcIoOpen##
+	TESTL	EAX, EAX
+	JS	ret040.S
+	MOVL	msgqab+qab_handle, EAX
+4$:	MOVL	msgqab+qab_buffer1, EDI	;Store offset of message
+	MOVL	msgqab+qab_count, ECX	;Store length of message
+	PUSHL	DS
+	PUSHL	#msgqab
+	CALLF	svcIoQueue##
+ret040:	RET
+.PAGE
+	.SBTTL	Main program loop
+
+	.PSECT	_TEXT_p
+
+;Here with all initialization complete
+
+ready:	CALLF	svcMemChange##		;Give up the once-only code
+	PUSHL	#0.B			;Set software interrupt level to 0
+	CALLF	svcSchSetLevel##	;  to allow interrupts
+mainloop:
+	PUSHL	#0.B			;Wait for interrupt
+	PUSHL	#0.B
+	PUSHL	#-1.B
+	CALLF	svcSchSuspend##
+	JMP	mainloop.S
+.PAGE
+	.SBTTL	tcpopendone - TCP open done software interrupt routine
+
+;TCP open done software interrupt routine - this code allocates and initializes
+;  a TCD, queues another TCP open, opens a PCN device, queues the initial TCP
+;  and PCN input requests, and starts the initial TCP output.
+
+tcpopendone:
+	PUSHAL				;Save registers
+	MOVL	EDI, 64t.B[ESP]		;Get offset of the TOD
+	SUBL	EDI, #tod_oqab.B
+	PUSHL	#tcd_SIZE+tcd_mSIZE	;Allocate memory for a TCD
+	CALL	malloc#
+	POPL	ECX
+	TESTL	EAX, EAX		;Did it work?
+	JNE	4$.S			;Yes - go on
+	MOVL	EAX, tod_oqab+qab_handle.B[EDI] ;No
+	MOVL	panicqab+qab_handle, EAX ;We can't do much without memory so we
+	PUSHL	DS			;  just close the TCP connection!
+	PUSHL	#panicqab
+	CALLF	svcIoQueue##
+	MOVL	EAX, errno#		;Log the error
+	MOVL	ESI, #nomemmsg
+	CALL	logsyslog
+	CALL	tcpqueopen		;Queue another TCP open
+	JMP	18$
+
+;Here with the TCD allocated
+
+4$:	ADDL	EAX, #tcd_mSIZE.B
+	MOVL	ESI, tod_tdd.B[EDI]	;Get offset of the TDD
+	MOVL	EBX, tdd_lasttcd.B[ESI]	;Link in the new TCD
+	TESTL	EBX, EBX
+	JE	6$.S
+	MOVL	[EBX], EAX
+	JMP	8$.S
+
+6$:	MOVL	tdd_firsttcd.B[ESI], EAX
+8$:	MOVL	tdd_lasttcd.B[ESI], EAX
+	MOVL	tcd_prev.B[EAX], EBX
+	MOVL	tcd_tdd.B[EAX], ESI
+	MOVL	EDX, tod_rmtneta.B[EDI]	;Copy remote IP address to the TCD
+	MOVL	tcd_rmtneta.B[EAX], EDX
+	MOVL	EDX, tod_rmtport.B[EDI]	;Copy remote port number to the TCD
+	MOVL	tcd_rmtport.B[EAX], EDX
+	PUSHL	EAX
+	MOVL	EAX, tod_oqab+qab_handle.B[EDI] ;Store handle were we will
+	MOVL	tcpiqab+qab_handle, EAX		;  copy it to the TCD
+	MOVL	tcpoqab+qab_handle, EAX
+	CALL	tcpqueopen		;Queue another TCP open
+	POPL	EBX			;Restore offset of the TCD
+	PUSHL	ESI			;Copy the skelaton for the 3 QABs
+	LEAL	EDI, tcd_tiqab.B[EBX]	;  in the TCD
+	MOVL	ESI, #tcpiqab
+	MOVL	ECX, #QABSIZE
+	CLD
+	RMOVSL	[EDI], [ESI]
+	POPL	ESI
+	LEAL	EAX, tcd_tibufr[EBX]	;Store buffer offsets in the QABs
+	MOVL	tcd_tiqab+qab_buffer1+0.B[EBX], EAX
+	LEAL	EAX, tcd_tobufr[EBX]
+	MOVL	tcd_toqab+qab_buffer1+0.B[EBX], EAX
+	LEAL	EAX, tcd_pibufr[EBX]
+	MOVL	tcd_piqab+qab_buffer1+0[EBX], EAX
+	LEAL	EAX, tcd_tsbufr[EBX]
+	MOVL	tcd_tsput.B[EBX], EAX
+	MOVL	tcd_tstak.B[EBX], EAX
+	ADDL	EAX, #TCPOBFRSZ
+	MOVL	tcd_tsend.B[EBX], EAX
+	LEAL	EAX, tcd_tobufr[EBX]
+	MOVL	tcd_topnt.B[EBX], EAX
+	CLRL	EAX			;Clear TCP supervisory output count
+	MOVL	tcd_tscnt.B[EBX], EAX
+	MOVL	tcd_tocnt.B[EBX], EAX
+	MOVL	tcd_tohold.B[EBX], EAX	;Also clear held amount
+	MOVL	tcd_status0.B[EBX], EAX	 ;Clear the status bytes and following
+	MOVL	tcd_lclreq+0.B[EBX], EAX ;  stuff
+	MOVL	tcd_lclreq+4.B[EBX], EAX
+	MOVL	tcd_lclopt+0.B[EBX], EAX
+	MOVL	tcd_lclopt+4.B[EBX], EAX
+	MOVL	tcd_rmtreq+0.B[EBX], EAX
+	MOVL	tcd_rmtreq+4.B[EBX], EAX
+	MOVL	tcd_rmtopt+0.B[EBX], EAX
+	MOVL	tcd_rmtopt+4.B[EBX], EAX
+	MOVL	siintdata, EBX
+	PUSHL	#O$OUT|O$IN|O$PARTIAL	;Open a PCN device
+	PUSHL	DS
+	LEAL	EAX, tdd_pcnname.B[ESI]
+	PUSHL	EAX
+	PUSHL	DS
+	PUSHL	#pcnoparms
+	CALLF	svcIoOpen##
+	TESTL	EAX, EAX		;Error?
+	JNS	14$.S			;No - go on
+	MOVL	ESI, #pcnoemsg		;Yes - get message
+	CALL	logsyslog		;Log the error
+	JMP	20$.S			;Go discard the connection
+
+;Here with the PCN device opened
+
+14$:	MOVL	tcd_piqab+qab_handle[EBX], EAX ;Store handle for PCN device
+	MOVL	tcd_poqab+qab_handle[EBX], EAX
+	LEAL	EAX, tcd_pobufr[EBX]
+	MOVL	tcd_poqab+qab_buffer1+0[EBX], EAX
+	MOVB	AL, pcnpunit		;Get primary unit number
+	MOVB	tcd_punit.B[EBX], AL
+	MOVB	AL, pcnsunit		;Get secondary unit number
+	MOVB	tcd_sunit.B[EBX], AL
+	IBTSL	tcd_lclreq, EBX, TNO_XOSMODE ;Request local XOSMODE, remote
+	IBTSL	tcd_rmtreq, EBX, TNO_XOSMODE ;  XOSMODE, local ECHO, and
+	IBTSL	tcd_lclreq, EBX, TNO_ECHO    ;  remote toggle flow control
+;;;;;;;	IBTSL	tcd_rmtreq, EBX, TNO_TFC
+	MOVL	tcd_todsp.B[EBX], #inputdone ;Set initial output done dispatch
+	MOVL	EDI, #newcmsg
+	MOVL	ECX, #NEWCMSGSZ
+	MOVB	AL, #'O'
+	CALL	tcpoutqueue
+	CALL	tcpinpqueue		;Queue the initial TCP input
+	CALL	pcninpqueue		;Queue the initial PCN input
+18$:	POPAL
+	CALLF	svcSchDismiss##
+
+;Here if error opening the PCN device or if can't queue TCP input or output or
+;  PCN input.  This error has already been logged if it should be.  We just
+;  give up the TCD and close the TCP device using the panic QAB.
+
+20$:	MOVL	EAX, tcd_toqab+qab_handle[EBX]
+	MOVL	panicqab+qab_handle, EAX ;Close the TCP device
+	PUSHL	DS
+	PUSHL	#panicqab
+	CALLF	svcIoClose##
+	PUSHL	EBX			;Give up the TCD
+	CALL	free#
+	POPL	EAX
+	JMP	18$.S
+.PAGE
+	.SBTTL	tcpqueopen - Subroutine to queue TCP open
+
+;Subroutine to queue TCP open
+
+tcpqueopen:
+	PUSHL	DS			;Queue another open
+	LEAL	EAX, tod_oqab.B[EDI]
+	PUSHL	EAX
+	CALLF	svcIoQueue##
+	TESTL	EAX, EAX
+	JNS	4$.S			;Go on if OK
+	MOVL	ESI, #tcpoemsg
+	JMP	logsyslog
+
+4$:	RET
+.PAGE
+	.SBTTL	tcpinputdone - TCP input done software interrupt routine
+
+;TCP input done software interrupt routine
+
+tcpinputdone:
+	PUSHAL				;Save registers
+	MOVL	EBX, 64t.B[ESP]		;Get offset of the TCD
+	SUBL	EBX, #tcd_tiqab.B
+	CMPB	loglevel, #3		;Should we log this?
+	JB	2$.S			;No
+	MOVL	ESI, #tiintmsg		;Yes
+	CALL	logstr
+	MOVZBL	EAX, tcd_status1.B[EBX]
+	MOVL	ECX, #2
+	MOVB	DL, #'0'
+	CALL	loghexval
+	CALL	logout
+2$:	TESTB	tcd_tiqab+qab_status+1.B[EBX], #QSTS$DONE>8t ;Really done now?
+	JE	4$.S			;No - forget it for now
+	TESTB	tcd_status0.B[EBX], #TS0$CLOSE ;Yes - closing the connection?
+	JE	6$.S			;No
+	ORB	tcd_status0.B[EBX], #TS0$INPDONE ;Indicate all input is done
+	TESTB	tcd_status0.B[EBX], #TS0$OUTDONE ;Is all output done?
+	JE	4$.S			;No - let the output routine finish
+	CALL	clear2			;Yes
+4$:	POPAL
+	CALLF	svcSchDismiss##		;Finished here
+
+;Here if not closing the connection
+
+6$:	CMPL	tcd_tiqab+qab_error.B[EBX], #0 ;Error?
+	JNS	10$.S			;No - go on
+	CMPL	tcd_tiqab+qab_error.B[EBX], #ER_NCLST ;Yes - network connection
+						      ;  lost?
+	JE	8$.S			;Yes
+	CMPL	tcd_tiqab+qab_error.B[EBX], #ER_NCCLR
+	JE	8$.S
+	CMPB	loglevel, #1		;Should we log this?
+	JB	8$.S			;No
+	MOVL	ESI, #tcpielm		;Yes
+	MOVL	EAX, tcd_tiqab+qab_error.B[EBX]
+	CALL	logerror
+8$:	ORB	tcd_status0.B[EBX], #TS0$INPDONE
+	CALL	tcpclear		;Clear the connection, etc.
+	JMP	4$.S
+
+;Here with input done with no errors
+
+10$:	LEAL	EDI, tcd_tibufr[EBX]	;Initialize TCP input buffer pointer
+	MOVL	tcd_tipnt.B[EBX], EDI
+	CMPB	loglevel, #3		;Need log output?
+	JB	12$.S			;No
+	MOVL	ECX, tcd_tiqab+qab_amount.B[EBX] ;Yes
+	MOVB	AL, #'I'
+	CALL	logmsg
+12$:	LEAL	EAX, tcd_pobufr[EBX]	;Initialize PCN output buffer pointer
+	MOVL	tcd_popnt.B[EBX], EAX
+	CLRL	EAX			;And count
+	MOVL	tcd_poqab+qab_count[EBX], EAX
+tinplp:	DECL	tcd_tiqab+qab_amount.B[EBX]
+	JS	tinpfin.S		;If finished
+	MOVL	EDI, tcd_tipnt.B[EBX]
+	INCL	tcd_tipnt.B[EBX]
+	MOVZBL	EAX, [EDI]		;Get byte from packet
+	MOVZBL	ECX, tcd_rcvstate.B[EBX] ;Get receive state
+	JMPIL	rcvdsp[ECX*4]		;Dispatch on the state
+
+	.PSECT	_DATA_p
+
+rcvdsp:	.LONG	rcvnorm		;RS_NORM     = 0 - Normal character next
+	.LONG	rcvcmd		;RS_CMD      = 1 - Command next
+	.LONG	havesb		;RS_HAVESB   = 2 - Have SB command
+	.LONG	havesbc		;RS_HAVESBC  = 3 - Have SBC command
+	.LONG	havewill	;RS_HAVEWILL = 4 - Have WILL command
+	.LONG	havewont	;RS_HAVEWONT = 5 - Have WONT command
+	.LONG	havedo		;RS_HAVEDO   = 6 - Have DO command
+	.LONG	havedont	;RS_HAVEDONT = 7 - Have DONT command
+
+	.PSECT	_TEXT_p
+.PAGE
+;Here when finished processing TCP input
+
+tinpfin:CMPL	tcd_poqab+qab_count[EBX], #0.B ;Have any PCN output to do?
+	JE	6$.S			;No - go on
+	PUSHL	DS			;Yes - start PNC output
+	LEAL	EAX, tcd_poqab[EBX]
+	PUSHL	EAX
+	CALLF	svcIoQueue##
+	TESTL	EAX, EAX		;Error?
+	JNS	8$.S			;No - finished for now
+	MOVL	ESI, #pcnoqemsg		;Yes - log the fatal error
+	CALL	logsyslog
+	PUSHL	#1.B
+	CALLF	svcSchExit##
+
+;Here if no PCN output to do or when PCN output is finished
+
+6$:	CALL	tcpinpqueue		;Queue TCP input
+	TESTB	tcd_status1.B[EBX], #TS1$OUTACT
+	JE	inputdone		;Go finish up
+8$:	POPAL
+	CALLF	svcSchDismiss##
+
+	.SBTTL	pcnoutputdone - PCN output done software interrupt routine
+
+;PCN output done software interrupt routine
+
+pcnoutputdone:
+	PUSHAL				;Save registers
+	MOVL	EBX, 64t.B[ESP]		;Get offset of the TCD
+	SUBL	EBX, #tcd_poqab
+	CMPB	loglevel, #3		;Should we log this?
+	JB	10$.S			;No
+	MOVL	ESI, #pointmsg		;Yes
+	CALL	logstr
+	MOVZBL	EAX, tcd_status1.B[EBX]
+	MOVL	ECX, #2
+	MOVB	DL, #'0'
+	CALL	loghexval
+	CALL	logout
+10$:	MOVL	EAX, tcd_poqab+qab_error[EBX] ;Error?
+	TESTL	EAX, EAX
+	JNS	6$.S			;No
+	MOVL	ESI, #pcnoxemsg
+	CALL	logsyslog
+	CALL	tcpclear
+	JMP	8$.S
+.PAGE
+;Here for command character to be treated as data
+
+rcvdata:MOVB	tcd_rcvstate.B[EBX], #RS_NORM ;Reset the receive state
+
+;Here for normal received character
+
+rcvnorm:CMPB	AL, #0FFh		;Is this a Telnet escape?
+	JE	6$.S			;Yes
+	TESTB	tcd_status1.B[EBX], #TS1$XOSKB ;No - using XOS mode?
+	JE	8$.S			;No
+rcvinp:	MOVL	EDI, tcd_popnt.B[EBX]	;Yes - get the output pointer
+2$:	MOVB	[EDI], AL		;Store character
+	INCL	tcd_poqab+qab_count[EBX] ;Increment count
+	INCL	tcd_popnt.B[EBX]	;Bump pointer
+4$:	JMP	tinplp			;Continue
+
+;Here with the Telnet escape character (0FFh)
+
+6$:	MOVB	tcd_rcvstate.B[EBX], #RS_CMD ;Update the receive state
+	JMP	tinplp			;Continue
+
+;Here for character when not in XOS mode - in this case we must make it look
+;  like a sequence of keyboard scan codes!
+
+8$:	CMPB	AL, #0			;No - is this a null?
+	JE	4$.S			;Yes - ignore it!
+	MOVL	EDI, tcd_popnt.B[EBX]	;No - get the output pointer
+	TESTB	AL, #80h		;Need ALT?
+	JE	10$.S			;No
+	MOVW	AX, sercode-100h[EAX*2]	;Yes - get scan code and shift bits
+	ORB	AH, #SB$ALT		;Indicate need ALT
+	JMP	12$.S			;Continue
+
+;Here if don't need ALT
+
+10$:	MOVW	AX, sercode[EAX*2]	;Get corresponding scan code and shift
+					;  bits
+12$:	TESTB	AH, #SB$CONTROL		;Need CONTROL?
+	JE	14$.S			;No
+	TESTB	tcd_shiftbts.B[EBX], #SB$CONTROL ;Yes - have it now?
+	JNE	22$.S			;Yes (don't care about SHIFT)
+	ORB	tcd_shiftbts.B[EBX], #SB$CONTROL
+	MOVB	[EDI], #ISC_LFTCTL
+	JMP	20$.S
+
+;Here if don't need CONTROL pressed
+
+14$:	TESTB	tcd_shiftbts.B[EBX], #SB$CONTROL ;Was CONTROL pressed?
+	JE	16$.S			;No
+	ANDB	tcd_shiftbts.B[EBX], #~SB$CONTROL ;Yes
+	MOVB	[EDI], #ISC_LFTCTL+80h
+	INCL	tcd_poqab+qab_count[EBX]
+	INCL	tcd_popnt.B[EBX]
+	INCL	EDI
+16$:	TESTB	AH, #SB$SHIFT		;Need SHIFT?
+	JE	18$.S			;No
+	TESTB	tcd_shiftbts.B[EBX], #SB$SHIFT ;Yes - is it pressed now?
+	JNE	22$.S			;Yes
+	ORB	tcd_shiftbts.B[EBX], #SB$SHIFT ;No
+	MOVB	[EDI], #ISC_LFTSHF
+	JMP	20$.S
+
+;Here if do not need SHIFT
+
+18$:	TESTB	tcd_shiftbts.B[EBX], #SB$SHIFT ;Is SHIFT pressed now?
+	JE	22$.S			;Yes
+	ANDB	tcd_shiftbts.B[EBX], #~SB$SHIFT ;Yes
+	MOVB	[EDI], #ISC_LFTSHF+80h
+20$:	INCL	tcd_poqab+qab_count[EBX]
+	INCL	tcd_popnt.B[EBX]
+	INCL	EDI
+22$:	TESTB	AH, #SB$ALT		;Need ALT?
+	JE	24$.S			;No
+	TESTB	tcd_shiftbts.B[EBX], #SB$ALT ;Yes - is it pressed now?
+	JNE	28$.S			;Yes
+	ORB	tcd_shiftbts.B[EBX], #SB$ALT ;No
+	MOVB	[EDI], #ISC_LFTALT
+	JMP	26$.S
+
+;Here if do not need ALT
+
+24$:	TESTB	tcd_shiftbts.B[EBX], #SB$ALT ;Is ALT pressed now?
+	JE	28$.S			;No
+	ANDB	tcd_shiftbts.B[EBX], #~SB$ALT ;Yes
+	MOVB	[EDI], #ISC_LFTALT+80h
+26$:	INCL	tcd_poqab+qab_count[EBX]
+	INCL	tcd_popnt.B[EBX]
+	INCL	EDI
+28$:	MOVB	[EDI], AL		;Store character
+	INCL	tcd_poqab+qab_count[EBX] ;Increment count
+	INCL	tcd_popnt.B[EBX]	;Bump pointer
+	INCL	EDI
+	ORB	AL, #80h		;Change to break code
+	JMP	2$			;Go store it
+.PAGE
+;Here when expecting byte following an 0FFh byte
+
+rcvcmd:	CMPB	AL, #0F0h		;Valid Telnet command?
+	JB	rcvdata			;No - treat it as data!
+	JMPIL	cmddsp-{0F0h*4}[EAX*4]	;Yes - dispatch on the command
+
+	.PSECT	_DATA_p
+
+cmddsp:	.LONG	rcvdata		;TNC_SE   = F0 - End of subnegotiation
+	.LONG	rcvopdn		;TNC_NOP  = F1 - No operation
+	.LONG	cmddm		;TNC_DM   = F2 - Data mark
+	.LONG	cmdbrk		;TNC_BRK  = F3 - Out-of-band break character
+	.LONG	cmdip		;TNC_IP   = F4 - Interrupt process function
+	.LONG	cmdao		;TNC_AO   = F5 - Abort output function
+	.LONG	cmdayt		;TNC_AYT  = F6 - Are you there function
+	.LONG	cmdec		;TNC_EC   = F7 - Erase character function
+	.LONG	cmdel		;TNC_EL   = F8 - Erase line function
+	.LONG	cmdga		;TNC_GA   = F9 - Go ahead signal
+	.LONG	cmdsb		;TNC_SB   = FA - Start of subnegotiation
+	.LONG	cmdwill		;TNC_WILL = FB - Start of option negotiation
+	.LONG	cmdwont		;TNC_WONT = FC - Start of option negotiation
+	.LONG	cmddo		;TNC_DO   = FD - Start of option negotiation
+	.LONG	cmddont		;TNC_DONT = FE - Start of option negotiation
+	.LONG	rcvdata		;TNC_IAC  = FF - Data byte 0FFh
+
+	.PSECT	_TEXT_p
+.PAGE
+	.SBTTL	cmddm - Here for TNC_DM - Data mark
+
+;Here for TNC_DM command (F2) - Data mark
+
+cmddm:
+	JMP	rcvopdn
+
+	.SBTTL	cmdbrk - Here for TNC_BRK - Out-of-band break character
+
+;Here for TNC_BRK command (F3) - Out-of-band break character
+
+cmdbrk:
+	JMP	rcvopdn
+.PAGE
+	.SBTTL	cmdip - Here for TNC_IP - Interrupt process function
+
+;Here for TNC_IP command (F4) - Interrupt process function
+
+cmdip:
+	JMP	rcvopdn
+
+	.SBTTL	cmdao - Here for TNC_AO - Abort output function
+
+;Here for TNC_AO command (F5) - Abort output function
+
+cmdao:
+	JMP	rcvopdn
+
+	.SBTTL	cmdayt - Here for TNC_AYT - Are you there function
+
+;Here for TNC_AYT command (F6) - Are you there function
+
+cmdayt:
+	JMP	rcvopdn
+
+	.SBTTL	cmdec - Here for TNC_EC - Erase character function
+
+;Here for TNC_EC command (F7) - Erase character function
+
+cmdec:
+	JMP	rcvopdn
+
+	.SBTTL	cmdel - Here for TNC_EL - Erase line function
+
+;Here for TNC_EL command (F8) - Erase line function
+
+cmdel:
+	JMP	rcvopdn
+
+	.SBTTL	cmdga - Here for TNC_GA - Go ahead signal
+
+;Here for TNC_GA command (F9) - Go ahead signal
+
+cmdga:
+	JMP	rcvopdn
+.PAGE
+	.SBTTL	cmdsb - Here for TNC_SB - Start of subnegotiation
+
+;Here for TNC_SB command (FA) - Start of subnegotiation
+
+cmdsb:	MOVB	tcd_rcvstate.B[EBX], #RS_HAVESB ;Reset the receive state
+	MOVB	tcd_sbpntr.B[EBX], #0	;Reset subnegotiation pointer
+	MOVB	tcd_sbdata[EBX], #0FFh
+	JMP	tinplp			;Continue
+
+;Here with first subnegotiation byte
+
+havesb:	CMPB	AL, #TNC_IAC		;Is this the command prefix?
+	JE	4$.S			;Yes
+	MOVZBL	EDX, tcd_sbpntr.B[EBX]	;No - get pointer
+	CMPL	EDX, #TLNSBMAX.B	;Have too much data?
+	JAE	2$.S			;Yes
+	MOVB	tcd_sbdata[EBX+EDX], AL ;No - store this byte
+	INCB	tcd_sbpntr.B[EBX]	;Bump poiner
+2$:	JMP	tinplp
+
+;Here with command prefix character
+
+4$:	MOVB	tcd_rcvstate.B[EBX], #RS_HAVESBC ;Update the receive state
+	JMP	tinplp			;Continue
+
+;Here with character following command prefix character
+
+havesbc:CMPB	AL, #TNC_SE		;End of subnegotiation sequence?
+	JNE	rcvopdn.S		;No - this is illegal - abandon the
+					;  subnegotiation sequence
+	MOVZBL	EAX, tcd_sbdata+0[EBX] ;Get option byte
+	CMPL	EAX, #TNOMAX		;Valid value?
+	JA	rcvopdn.S		;No - forget it!
+	CALLI	sbdsp[EAX*4]		;Yes - dispatch on the option
+rcvopdn:MOVB	tcd_rcvstate.B[EBX], #RS_NORM ;Reset the state to normal
+	JMP	tinplp			;Continue
+
+	.PSECT	_DATA_p
+
+sbdsp:	.LONG	ret020		;TNO_BINARY  = 00 - Binary transmission
+	.LONG	ret020		;TNO_ECHO    = 01 - Echo
+	.LONG	ret020		;TNO_RCP     = 02 - Reconnection
+	.LONG	ret020		;TNO_SUPGA   = 03 - Suppress go ahead
+	.LONG	ret020		;TNO_NAMS    = 04 - Approx message size
+				;		      negotiation
+	.LONG	ret020		;TNO_STATUS  = 05 - Status
+	.LONG	ret020		;TNO_MARK    = 06 - Timing mark
+	.LONG	ret020		;TNO_RCTE    = 07 - Remote controlled trans and
+				;		      echo
+	.LONG	ret020		;TNO_OLW     = 08 - Output line width
+	.LONG	ret020		;TNO_OPS     = 09 - Output page size
+	.LONG	ret020		;TNO_OCRD    = 0A - Output CR disposition
+	.LONG	ret020		;TNO_OHTS    = 0B - Output horiz tab stops
+	.LONG	ret020		;TNO_OHTD    = 0C - Output horiz tab disposition
+	.LONG	ret020		;TNO_OFFD    = 0D - Output formfeed disposition
+	.LONG	ret020		;TNO_OVTS    = 0E - Output vert tab stops
+	.LONG	ret020		;TNO_OVTD    = 0F - Output vert tab disposition
+	.LONG	ret020		;TNO_OLFD    = 10 - Output linefeed disposition
+	.LONG	ret020		;TNO_XASCII  = 11 - Extended ASCI
+	.LONG	ret020		;TNO_LOGOUT  = 12 - Logout
+	.LONG	ret020		;TNO_BM      = 13 - Byte macro
+	.LONG	ret020		;TNO_DET     = 14 - Data entry terminal
+	.LONG	ret020		;	     = 15 - Reserved
+	.LONG	ret020		;TNO_SUPDUP  = 16 - SUPDUP
+	.LONG	ret020		;TNO_SDOUT   = 17 - SUPDUP output
+	.LONG	ret020		;TNO_TERM    = 18 - Terminal type
+	.LONG	ret020		;TNO_EOR     = 19 - End of record
+	.LONG	ret020		;TNO_TACACS  = 1A - TACACS user identification
+	.LONG	ret020		;TNO_OM      = 1B - Output marking
+	.LONG	ret020		;TNO_TLN     = 1C - Terminal location number
+	.LONG	ret020		;TNO_3270    = 1D - 3270 terminal mode
+	.LONG	ret020		;TNO_X3PAD   = 1E - X.3 Pad mode
+	.LONG	ret020		;TNO_NAWS    = 1F - Negotiate about window size
+	.LONG	ret020		;TNO_SPEED   = 20 - Terminal speed option
+	.LONG	ret020		;TNO_TFC     = 21 - Toggle flow control
+	.LONG	ret020		;TNO_LM      = 22 - Line mode
+	.LONG	ret020		;TNO_XLOC    = 23 - X-display location
+	.LONG	ret020		;	     = 24 - Reserved
+	.LONG	ret020		;	     = 25 - Reserved
+	.LONG	ret020		;	     = 26 - Reserved
+	.LONG	ret020		;	     = 27 - Reserved
+	.LONG	ret020		;	     = 28 - Reserved
+	.LONG	ret020		;	     = 29 - Reserved
+	.LONG	ret020		;	     = 2A - Reserved
+	.LONG	ret020		;	     = 2B - Reserved
+	.LONG	ret020		;	     = 2C - Reserved
+	.LONG	ret020		;	     = 2D - Reserved
+	.LONG	ret020		;	     = 2E - Reserved
+	.LONG	ret020		;	     = 2F - Reserved
+	.LONG	sbxosmode	;TNO_XOSMODE = 30 - XOS mode
+
+	.PSECT	_TEXT_p
+.PAGE
+	.SBTTL	sbxosmode - Here for subnegotiation for TNO_XOSMODE
+
+;Here for subnegotiation for TNO_XOSMODE - this is used to inform the host
+;  of actual mode changes once permission has been obtained to use XOS mode.
+;  The sequences always contain 1 data byte, encoded as follows:
+;	XOS_BGNKB   = 1 - Begin XOS mode keyboard encoding (always sent to
+;			    host)
+;	XOS_ENDKB   = 2 - End XOS mode keyboard encoding (always sent to
+;			    host)
+;	XOS_BGNDSP  = 3 - Begin XOS mode display encoding (always sent to
+;			    client)
+;	XOS_ENDDSP  = 4 - End XOS mode display encoding (always sent to
+;			    client)
+;	XOS_VIDMODE = 5 - Report display mode set complete (always sent to
+;			    client - followed by 12 data bytes)
+;	XOS_VIDFINT = 6 - Report display font set complete (always sent to
+;			    client - followed by 8 data bytes)
+;  Note that in this version, the client always sends an XOS_BGNKB as soon as
+;  it receives permission to use XOS mode.  It never sends an XOS_ENDKB.
+;  The host always sends an XOS_BGNDSP as soon as it receives permission to use
+;  XOS mode.  It never sends an XOS_ENDDSP.  The "END" values may be used
+;  in a future version to allow mode switches during a connection.
+
+sbxosmode:
+	CMPB	tcd_sbpntr.B[EBX], #2	;Have at least one data byte?
+	JB	8$.S			;No - ignore this!
+	MOVZBL	EAX, tcd_sbdata+1[EBX]	;Yes - get the data byte
+	CMPB	AL, #XOSMODEMAX		;Legal value?
+	JA	8$.S			;No - ignore this
+	JMPIL	xosmodedsp[EAX*4]	;Yes - dispatch on the value
+
+	.PSECT	_DATA_p
+
+xosmodedsp:
+	.LONG	ret020		;	     = 0 - Illegal
+	.LONG	xosmbgnkb	;XOS_BGNKB   = 1 - Begin XOS mode keyboard
+				;		     encoding
+	.LONG	xosmendkb	;XOS_ENDKB   = 2 - End XOS mode keyboard
+				;		     encoding
+	.LONG	ret020		;XOS_BGNDSP  = 3 - Begin XOS mode display
+				;		     encoding
+	.LONG	ret020		;XOS_ENDDSP  = 4 - End XOS mode display
+				;		     encoding
+	.LONG	xosmvidmd	;XOS_VIDMODE = 5 - Mode set complete
+	.LONG	xosmvidft	;XOS_VIDFONT = 6 - Font set complete
+XOSMODEMAX=!{$-xosmodedsp}/4-1
+
+	.PSECT	_TEXT_p
+
+;Here for XOS_BGNKB - This indicates that the sender will begin doing XOS
+;  mode keyboard handling.  It also the display type for the actual display
+;  used by the client which we need so mode set functions will return the
+;  correct display type.  Data consists of the function byte followed by the
+;  4 byte display type value (high order byte first).
+
+xosmbgnkb:
+	CMPB	tcd_sbpntr.B[EBX], #6	;Have exactly 5 data bytes?
+	JNE	8$.S			;No - ignore this!
+	ORB	tcd_xosmode.B[EBX], #04h ;Yes
+	ORB	tcd_status1.B[EBX], #TS1$XOSKB
+	MOVL	EAX, tcd_sbdata+2[EBX]	;Store display type value
+	XCHGB	AL, AH
+	RORL	EAX, #16t
+	XCHGB	AL, AH
+	MOVL	tcd_disptype.B[EBX], EAX
+	PUSHL	tcd_piqab+qab_handle[EBX] ;Tell the device about the display
+	PUSHL	#PCSF_DISPTYPE.B	  ;  type
+	PUSHL	#0.B
+	PUSHL	#0.B
+	PUSHL	EAX
+	PUSHL	DS
+	PUSHL	#sdfparms
+	CALLF	svcIoSpecial##
+	TESTL	EAX, EAX		;Error?
+	JNS	chkxosmode		;No
+	MOVL	ESI, #pcndtemsg		;Yes - get message
+	CALL	logsyslog		;Log the error
+	PUSHL	#1.B			;This error should not be possible so
+	CALLF	svcSchExit##		;  we terminate if it happens!
+
+;Here for XOS_ENDKB
+
+xosmendkb:
+	CMPB	tcd_sbpntr.B[EBX], #2	;Have exactly one data byte?
+	JNE	8$.S			;No - ignore this!
+	ANDB	tcd_status1.B[EBX], #~TS1$XOSKB ;Yes
+8$:	RET
+.PAGE
+;Here for XOS_VIDMODE - this is sent by the client to indicate that a display
+;  mode set function is complete.  It is followed by 13 data bytes which has
+;  the following format (all multi-byte values are sent high order byte first)
+;	Offset   Size     Use
+;	  0	1	Function
+;	  1	4	Mode bits
+;	  5	1	Primary font
+;	  6	1	Secondary font
+;	  7	1	Number of columns
+;	  8	1	Number of rows
+;	  9	2	Number of horizontal pixels
+;	 11	2	Number of vertical pixels
+
+xosmvidmd:
+	CMPB	tcd_sbpntr.B[EBX], #14t	;Have exactly 13 data bytes?
+	JNE	4$.S			;No - ignore this!
+	MOVL	EDI, #viddata-4
+
+;;;;	MOVB	AL, tcd_sbdata+6t[EBX]	;Yes - set up the data block for the
+;;;;	MOVB	4+dm_prifont.B[EDI], AL	;  svcTrmDspMode call from the
+;;;;	MOVB	AL, tcd_sbdata+7t[EBX]	;  argument data
+;;;;	MOVB	4+dm_secfont.B[EDI], AL
+
+;;;;; NEED TO FIX THIS !!!!!
+
+	MOVZBL	EAX, tcd_sbdata+8t[EBX]
+	MOVL	4+dm_columns.B[EDI], EAX
+	MOVB	AL, tcd_sbdata+9t[EBX]
+	MOVL	4+dm_rows.B[EDI], EAX
+	MOVZWL	EAX, tcd_sbdata+10t[EBX]
+	XCHGB	AL, AH
+	MOVL	4+dm_horiz.B[EDI], EAX
+	MOVZWL	EAX, tcd_sbdata+12t[EBX]
+	XCHGB	AL, AH
+	MOVL	4+dm_vert.B[EDI], EAX
+	MOVL	EAX, tcd_sbdata+2[EBX]
+	XCHGB	AL, AH
+	RORL	EAX, #16t
+	XCHGB	AL, AH
+	MOVL	[EDI], EAX		;Store return value
+	PUSHL	tcd_piqab+qab_handle[EBX] ;Tell the PCN client what happened
+	PUSHL	#PCSF_MODESET.B
+	PUSHL	DS
+	PUSHL	EDI
+	PUSHL	#0.B
+	PUSHL	DS
+	PUSHL	#sdfparms
+	CALLF	svcIoSpecial##
+4$:	RET
+.PAGE
+;Here for XOS_VIDFONT - this is sent by the client to indicate that a display
+;  font set function is complete.  It is followed by 9 data bytes which has
+;  the following format (all multi-byte values are sent high order byte first)
+;	Offset   Size     Use
+;	  0	1	Function
+;	  1	1	Primary font
+;	  2	1	Secondary font
+;	  3	1	Number of columns
+;	  4	1	Number of rows
+;	  5	2	Number of horizontal pixels
+;	  7	2	Number of vertical pixels
+
+xosmvidft:
+	CMPB	tcd_sbpntr.B[EBX], #10t	;Have exactly 9 data bytes?
+	JNE	4$.S			;No - ignore this!
+	MOVL	EDI, #viddata
+
+;;;;	MOVB	AL, tcd_sbdata+2t[EBX]	;Yes - set up the data block for the
+;;;;	MOVB	dm_prifont.B[EDI], AL	;  PCSF_FONTSET call from the
+;;;;	MOVB	AL, tcd_sbdata+3t[EBX]	;  argument data
+;;;;	MOVB	dm_secfont.B[EDI], AL
+
+;;;;; NEED TO FIX THIS !!!!!
+
+	MOVZBL	EAX, tcd_sbdata+4t[EBX]
+	MOVL	dm_columns.B[EDI], EAX
+	MOVB	AL, tcd_sbdata+5t[EBX]
+	MOVL	dm_rows.B[EDI], EAX
+	MOVZWL	EAX, tcd_sbdata+6t[EBX]
+	XCHGB	AL, AH
+	MOVL	dm_horiz.B[EDI], EAX
+	MOVZWL	EAX, tcd_sbdata+8t[EBX]
+	XCHGB	AL, AH
+	MOVL	dm_vert.B[EDI], EAX
+	PUSHL	tcd_piqab+qab_handle[EBX] ;Tell the PCN client what happened
+	PUSHL	#PCSF_FONTSET.B
+	PUSHL	DS
+	PUSHL	EDI
+	PUSHL	#0.B
+	PUSHL	DS
+	PUSHL	#sdfparms
+	CALLF	svcIoSpecial##
+4$:	RET
+.PAGE
+	.SBTTL	cmdwill - Here for TNC_WILL - Start of option negotiation
+
+;Here for TNC_WILL command (FB) - Start of option negotiation - this is a
+;  request that the other side use an option (we can refuse if we want)
+
+cmdwill:MOVB	tcd_rcvstate.B[EBX], #RS_HAVEWILL ;Update the receive state
+	JMP	tinplp			;Continue
+
+havewill:
+	CMPB	AL, #TNOMAX		;Valid option?
+	JA	4$.S			;No
+	BTL	avlrmtopt, EAX		;Yes - do we support it?
+	JNC	4$.S			;No
+	BTSL	tcd_rmtopt.B[EBX], EAX	;Yes - is it enabled now?
+	JC	6$.S			;Yes - nothing more needed here
+	PUSHL	rmtchng[EAX*4]		;No - get offset of routine to call
+	BTZL	tcd_rmtreq.B[EBX], EAX	;Are we requesting it now?
+	JC	2$.S			;Yes - don't send response but do call
+	PUSHL	EAX			;  our function
+	MOVB	AL, #TNC_IAC
+	CALL	putspvrbyte
+	MOVB	AL, #TNC_DO		;Send back DO
+	CALL	putspvrbyte
+	POPL	EAX
+	CALL	putspvrbyte
+2$:	POPL	ECX
+	CALLI	ECX
+	JMP	6$.S
+
+;Here if he is asking to use an option we cannot handle
+
+4$:	PUSHL	EAX
+	MOVB	AL, #TNC_IAC
+	CALL	putspvrbyte
+	MOVB	AL, #TNC_DONT
+	CALL	putspvrbyte
+	POPL	EAX
+	CALL	putspvrbyte
+6$:	MOVB	tcd_rcvstate.B[EBX], #RS_NORM ;Reset the state to normal
+	JMP	tinplp			;Continue
+.PAGE
+	.SBTTL	cmddo - Here for TNC_DO - Start of option negotiation
+
+;Here for TNC_DO command (FD) - Start of option negotiation - this is a request
+;  for us to use the indicated option (we can refuse if we want)
+
+cmddo:	MOVB	tcd_rcvstate.B[EBX], #RS_HAVEDO ;Update the receive state
+	JMP	tinplp			;Continue
+
+;Here with option value for TNC_DO
+
+havedo:	CMPB	AL, #TNOMAX		;Valid option?
+	JA	4$.S			;No
+	BTL	avllclopt, EAX		;Yes - do we support it?
+	JNC	4$.S			;No
+	BTSL	tcd_lclopt.B[EBX], EAX	;Yes - is it enabled now?
+	JC	8$.S			;Yes - nothing more needed here
+	PUSHL	lclchng[EAX*4]		;No - get offset of routine to call
+	BTZL	tcd_lclreq.B[EBX], EAX	;Are we requesting it now?
+	JC	2$.S			;Yes - don't send response but do call
+	PUSHL	EAX			;  our function
+	MOVB	AL, #TNC_IAC
+	CALL	putspvrbyte
+	MOVB	AL, #TNC_WILL		;Send back WILL
+	CALL	putspvrbyte
+	POPL	EAX
+	CALL	putspvrbyte		;This will return to offset we pushed
+2$:	POPL	ECX
+	CALLI	ECX
+	JMP	8$.S
+
+;Here if we cannot enable the requested option
+
+4$:	PUSHL	EAX
+	MOVB	AL, #TNC_IAC
+	CALL	putspvrbyte
+	MOVB	AL, #TNC_WONT
+	CALL	putspvrbyte
+	POPL	EAX
+	CALL	putspvrbyte
+8$:	MOVB	tcd_rcvstate.B[EBX], #RS_NORM ;Reset the state to normal
+	JMP	tinplp			;Continue
+.PAGE
+	.SBTTL	cmdwont - Here for TNC_WONT - Start of option negotiation
+
+;Here for TNC_WONT command (FC) - Start of option negotiation - this is an
+;  indication that the other side will not use an option (we cannot refuse!)
+
+cmdwont:MOVB	tcd_rcvstate.B[EBX], #RS_HAVEWONT ;Update the receive state
+	JMP	tinplp			;Continue
+
+havewont:
+	CMPB	AL, #TNOMAX		;Valid option?
+	JA	10$.S			;No - ignore it
+	BTZL	tcd_rmtreq.B[EBX], EAX	;Yes - are we requesting it now?
+	JNC	4$.S			;No
+	MOVL	ECX, rmtchng[EAX*4]	;Yes - get offset of routine
+	JMP	8$.S
+
+4$:	BTZL	tcd_rmtopt.B[EBX], EAX	;Is it enabled now?
+	JNC	10$.S			;No - ignore this
+	PUSHL	rmtchng[EAX*4]		;Yes - get offset of routine to call
+	PUSHL	EAX
+	MOVB	AL, #TNC_IAC
+	CALL	putspvrbyte
+	MOVB	AL, #TNC_DONT		;Send back DONT
+	CALL	putspvrbyte
+	POPL	EAX
+	CALL	putspvrbyte		;This will return to offset we pushed
+	POPL	ECX
+8$:	CALLI	ECX
+10$:	MOVB	tcd_rcvstate.B[EBX], #RS_NORM ;Reset the state to normal
+	JMP	tinplp			;Continue
+.PAGE
+	.SBTTL	cmddont - Here for TNC_DONT - Start of option negotiation
+
+;Here for TNC_DONT command (FE) - Start of option negotiation - this is a
+;  demand that we not use an option (we cannot refuse!)
+
+cmddont:MOVB	tcd_rcvstate.B[EBX], #RS_HAVEDONT ;Update the receive state
+	JMP	tinplp			;Continue
+
+havedont:
+	CMPB	AL, #TNOMAX		;Valid option?
+	JA	10$.S			;No - ignore it (this is the right thing
+					;  to do since it cannot have a
+					;  different state since we don't know
+					;  anything about it
+	BTZL	tcd_lclreq.B[EBX], EAX	;Yes - are we requesting it now?
+	JNC	4$.S			;No
+	MOVL	ECX, lclchng[EAX*4]	;Yes - get offset of routine
+	JMP	6$.S
+
+4$:	BTZL	tcd_lclopt.B[EBX], EAX	;Is it enabled now?
+	JNC	10$.S			;No - ignore this
+	PUSHL	lclchng[EAX*4]		;Yes - get offset of routine to call
+	PUSHL	EAX
+	MOVB	AL, #TNC_IAC
+	CALL	putspvrbyte
+	MOVB	AL, #TNC_WONT		;Send back WONT
+	CALL	putspvrbyte
+	POPL	EAX
+	CALL	putspvrbyte		;This will return to offset we pushed
+	POPL	ECX
+6$:	CALLI	ECX
+10$:	MOVB	tcd_rcvstate.B[EBX], #RS_NORM ;Reset the state to normal
+	JMP	tinplp			;Continue
+.PAGE
+	.SBTTL	Routines to handle remote options
+
+	.PSECT	_DATA_p
+
+;Dispatch table for change of state of remote options
+
+rmtchng:.LONG	ret020		;TNO_BINARY  = 00 - Binary transmission
+	.LONG	ret020		;TNO_ECHO    = 01 - Echo
+	.LONG	ret020		;TNO_RCP     = 02 - Reconnection
+	.LONG	ret020		;TNO_SUPGA   = 03 - Suppress go ahead
+	.LONG	ret020		;TNO_NAMS    = 04 - Approx message size
+				;		      negotiation
+	.LONG	ret020		;TNO_STATUS  = 05 - Status
+	.LONG	ret020		;TNO_MARK    = 06 - Timing mark
+	.LONG	ret020		;TNO_RCTE    = 07 - Remote controlled trans and
+				;		      echo
+	.LONG	ret020		;TNO_OLW     = 08 - Output line width
+	.LONG	ret020		;TNO_OPS     = 09 - Output page size
+	.LONG	ret020		;TNO_OCRD    = 0A - Output CR disposition
+	.LONG	ret020		;TNO_OHTS    = 0B - Output horiz tab stops
+	.LONG	ret020		;TNO_OHTD    = 0C - Output horiz tab disposition
+	.LONG	ret020		;TNO_OFFD    = 0D - Output formfeed disposition
+	.LONG	ret020		;TNO_OVTS    = 0E - Output vert tab stops
+	.LONG	ret020		;TNO_OVTD    = 0F - Output vert tab disposition
+	.LONG	ret020		;TNO_OLFD    = 10 - Output linefeed disposition
+	.LONG	ret020		;TNO_XASCII  = 11 - Extended ASCI
+	.LONG	ret020		;TNO_LOGOUT  = 12 - Logout
+	.LONG	ret020		;TNO_BM      = 13 - Byte macro
+	.LONG	ret020		;TNO_DET     = 14 - Data entry terminal
+	.LONG	ret020		;	     = 15 - Reserved
+	.LONG	ret020		;TNO_SUPDUP  = 16 - SUPDUP
+	.LONG	ret020		;TNO_SDOUT   = 17 - SUPDUP output
+	.LONG	ret020		;TNO_TERM    = 18 - Terminal type
+	.LONG	ret020		;TNO_EOR     = 19 - End of record
+	.LONG	ret020		;TNO_TACACS  = 1A - TACACS user identification
+	.LONG	ret020		;TNO_OM      = 1B - Output marking
+	.LONG	ret020		;TNO_TLN     = 1C - Terminal location number
+	.LONG	ret020		;TNO_3270    = 1D - 3270 terminal mode
+	.LONG	ret020		;TNO_X3PAD   = 1E - X.3 Pad mode
+	.LONG	ret020		;TNO_NAWS    = 1F - Negotiate about window size
+	.LONG	ret020		;TNO_SPEED   = 20 - Terminal speed option
+	.LONG	ret020		;TNO_TFC     = 21 - Toggle flow control
+	.LONG	ret020		;TNO_LM      = 22 - Line mode
+	.LONG	ret020		;TNO_XLOC    = 23 - X-display location
+	.LONG	ret020		;	     = 24 - Reserved
+	.LONG	ret020		;	     = 25 - Reserved
+	.LONG	ret020		;	     = 26 - Reserved
+	.LONG	ret020		;	     = 27 - Reserved
+	.LONG	ret020		;	     = 28 - Reserved
+	.LONG	ret020		;	     = 29 - Reserved
+	.LONG	ret020		;	     = 2A - Reserved
+	.LONG	ret020		;	     = 2B - Reserved
+	.LONG	ret020		;	     = 2C - Reserved
+	.LONG	ret020		;	     = 2D - Reserved
+	.LONG	ret020		;	     = 2E - Reserved
+	.LONG	ret020		;	     = 2F - Reserved
+	.LONG	rmtxosmode	;TNO_XOSMODE = 30 - XOS mode
+
+	.PSECT	_TEXT_p
+.PAGE
+	.SBTTL	rmtxosmode - Change remote XOS mode option
+
+;Here when changing the remote XOS mode option value
+
+rmtxosmode:
+	ORB	tcd_xosmode.B[EBX], #02h ;Indicate have this response
+	IBTL	tcd_rmtopt, EBX, TNO_XOSMODE ;Is he using XOS mode?
+	JC	chkxosmode.S		;Yes
+	ORB	tcd_xosmode.B[EBX], #04h ;No - won't be getting sub-nego.
+	JMP	chkxosmode.S
+.PAGE
+	.SBTTL	Routines to handle local options
+
+	.PSECT	_DATA_p
+
+;Dispatch table for change of state of local options
+
+lclchng:.LONG	ret020		;TNO_BINARY  = 00 - Binary transmission
+	.LONG	lclecho		;TNO_ECHO    = 01 - Echo
+	.LONG	ret020		;TNO_RCP     = 02 - Reconnection
+	.LONG	ret020		;TNO_SUPGA   = 03 - Suppress go ahead
+	.LONG	ret020		;TNO_NAMS    = 04 - Approx message size
+				;		      negotiation
+	.LONG	ret020		;TNO_STATUS  = 05 - Status
+	.LONG	ret020		;TNO_MARK    = 06 - Timing mark
+	.LONG	ret020		;TNO_RCTE    = 07 - Remote controlled trans and
+				;		      echo
+	.LONG	ret020		;TNO_OLW     = 08 - Output line width
+	.LONG	ret020		;TNO_OPS     = 09 - Output page size
+	.LONG	ret020		;TNO_OCRD    = 0A - Output CR disposition
+	.LONG	ret020		;TNO_OHTS    = 0B - Output horiz tab stops
+	.LONG	ret020		;TNO_OHTD    = 0C - Output horiz tab disposition
+	.LONG	ret020		;TNO_OFFD    = 0D - Output formfeed disposition
+	.LONG	ret020		;TNO_OVTS    = 0E - Output vert tab stops
+	.LONG	ret020		;TNO_OVTD    = 0F - Output vert tab disposition
+	.LONG	ret020		;TNO_OLFD    = 10 - Output linefeed disposition
+	.LONG	ret020		;TNO_XASCII  = 11 - Extended ASCI
+	.LONG	ret020		;TNO_LOGOUT  = 12 - Logout
+	.LONG	ret020		;TNO_BM      = 13 - Byte macro
+	.LONG	ret020		;TNO_DET     = 14 - Data entry terminal
+	.LONG	ret020		;	     = 15 - Reserved
+	.LONG	ret020		;TNO_SUPDUP  = 16 - SUPDUP
+	.LONG	ret020		;TNO_SDOUT   = 17 - SUPDUP output
+	.LONG	ret020		;TNO_TERM    = 18 - Terminal type
+	.LONG	ret020		;TNO_EOR     = 19 - End of record
+	.LONG	ret020		;TNO_TACACS  = 1A - TACACS user identification
+	.LONG	ret020		;TNO_OM      = 1B - Output marking
+	.LONG	ret020		;TNO_TLN     = 1C - Terminal location number
+	.LONG	ret020		;TNO_3270    = 1D - 3270 terminal mode
+	.LONG	ret020		;TNO_X3PAD   = 1E - X.3 Pad mode
+	.LONG	ret020		;TNO_NAWS    = 1F - Negotiate about window size
+	.LONG	ret020		;TNO_SPEED   = 20 - Terminal speed option
+	.LONG	ret020		;TNO_TFC     = 21 - Toggle flow control
+	.LONG	ret020		;TNO_LM      = 22 - Line mode
+	.LONG	ret020		;TNO_XLOC    = 23 - X-display location
+	.LONG	ret020		;	     = 24 - Reserved
+	.LONG	ret020		;	     = 25 - Reserved
+	.LONG	ret020		;	     = 26 - Reserved
+	.LONG	ret020		;	     = 27 - Reserved
+	.LONG	ret020		;	     = 28 - Reserved
+	.LONG	ret020		;	     = 29 - Reserved
+	.LONG	ret020		;	     = 2A - Reserved
+	.LONG	ret020		;	     = 2B - Reserved
+	.LONG	ret020		;	     = 2C - Reserved
+	.LONG	ret020		;	     = 2D - Reserved
+	.LONG	ret020		;	     = 2E - Reserved
+	.LONG	ret020		;	     = 2F - Reserved
+	.LONG	lclxosmode	;TNO_XOSMODE = 30 - XOS mode
+
+	.PSECT	_TEXT_p
+.PAGE
+	.SBTTL	lclecho - Change local echo option
+
+;Here when changing the local echo option value
+
+lclecho:
+;;;;;;;	BTZL	tcd_tlntdb+tdb_imodec[EBX], #TIM%HALFDUP ;Assume setting option
+	BTL	tcd_lclopt.B[EBX], #TNO_ECHO ;Right?
+	JC	ret020.S		;Yes
+;;;;;;;	BTSL	dcb_tlntdb+tdb_imodec[EBX], #TIM%HALFDUP ;No - clearing it
+ret020:	RET				;Finished here
+.PAGE
+	.SBTTL	lclxosmode - Change local XOS mode option
+
+;Here when changing the local XOS mode option value
+
+lclxosmode:
+	ORB	tcd_xosmode.B[EBX], #01h ;Indicate have this response
+	IBTL	tcd_lclopt, EBX, TNO_XOSMODE ;Is it set now?
+	JNC	chkxosmode.S		;No - go on
+	MOVL	ESI, #dsphmsg		;Yes - send the sub-nego.
+	CALL	putstr
+chkxosmode:
+	CMPB	tcd_xosmode.B[EBX], #07h ;Do we have all the XOS mode
+					 ;  responses?
+	JNE	ret030.S		;No
+	MOVB	tcd_xosmode.B[EBX], #0FFh ;Yes - only do this once!
+	IBTL	tcd_lclopt, EBX, TNO_XOSMODE ;Are we using XOS mode?
+	JNC	8$.S			;No
+	MOVZBL	EDX, tcd_sunit.B[EBX]	;Yes - get sub-unit number
+	SHLL	EDX, #16t		;Times 64K
+	MOVL	EAX, tcd_tdd.B[EBX]
+	ADDL	EDX, tdd_bufrbase.B[EAX] ;Plus base gives offset of screen
+	MOVL	tcd_scrnbufr.B[EBX], EDX ;  buffer
+	PUSHL	DS			;Create the buffer msect
+	PUSHL	EDX
+	PUSHL	#PG$READ|PG$WRITE.B
+	PUSHL	#4096t*SCNBUFSIZE*2
+	CALLF	svcMemChange##
+	TESTL	EAX, EAX
+	JS	4$.S
+	PUSHL	tcd_piqab+qab_handle[EBX] ;Tell the device about the buffer
+	PUSHL	#PCSF_SETBUF.B
+	PUSHL	DS
+	PUSHL	EDX
+	PUSHL	#SCNBUFSIZE.B
+	PUSHL	DS
+	PUSHL	#sdfparms
+	CALLF	svcIoSpecial##
+	TESTL	EAX, EAX
+4$:	JS	tcpclear
+8$:	PUSHL	tcd_piqab+qab_handle[EBX] ;Output ENTER to start session
+	PUSHL	#38h.B
+	CALLF	svcIoOutSingle##
+ret030:	RET
+.PAGE
+	.SBTTL	tcpinpqueue - Subroutine to queue TCP input
+
+;Subroutine to queue TCP input
+;	c{EBX} = Offset of TCD
+;	CALL	tcpinpqueue
+;	C:set = Error
+;	C:clr = Normal
+
+tcpinpqueue:
+	PUSHL	DS
+	LEAL	EAX, tcd_tiqab.B[EBX]
+	PUSHL	EAX
+	CALLF	svcIoQueue##
+	TESTL	EAX, EAX		;Error?
+	JNS	4$.S			;No - return
+	MOVL	ESI, #tcpiqemsg		;Yes - get message
+	JMP	8$.S			;Continue
+
+	.SBTTL	tcpoutqueue - Subroutine to queue TCP output
+
+;Subroutine to queue TCP output
+;	c(AL)  = Log flag character
+;	c{EDI} = Offset of buffer
+;	c{ECX} = Amount to output
+;	c{EBX} = Offset of TCD
+;	CALL	tcpoutqueue
+
+tcpoutqueue:
+	MOVL	tcd_toqab+qab_buffer1.B[EBX], EDI ;Store buffer offset
+	MOVL	tcd_toqab+qab_count.B[EBX], ECX ;Store count
+	CMPB	loglevel, #3		;Need log output?
+	JB	2$.S			;No
+	CALL	logmsg			;Yes
+2$:	PUSHL	DS			;Queue the output request
+	LEAL	EAX, tcd_toqab.B[EBX]
+	PUSHL	EAX
+	CALLF	svcIoQueue##
+	TESTL	EAX, EAX		;Error?
+	JS	6$.S			;Yes
+	ORB	tcd_status1.B[EBX], #TS1$OUTACT ;No - indicate output is active
+4$:	RET				;Finished
+
+;Here if have an error queueing the output request.  This is a fatal error
+;  since it should always be possible to queue a request.  If we can't do this
+;  something is seriously wrong!
+
+6$:	MOVL	ESI, #tcpoqemsg		;Get error message
+8$:	CALL	logsyslog		;Yes
+	PUSHL	#1.B
+	CALLF	svcSchExit##
+.PAGE
+	.SBTTL	tcpoutputdone - TCP outdone software interrupt routine
+
+;TCP output done software interrupt routine
+
+tcpoutputdone:
+	PUSHAL				;Save registers
+	MOVL	EBX, 64t.B[ESP]		;Get offset of the TCD
+	SUBL	EBX, #tcd_toqab.B
+	CMPB	loglevel, #3		;Should we log this?
+	JB	2$.S			;No
+	MOVL	ESI, #tointmsg		;Yes
+	CALL	logstr
+	MOVZBL	EAX, tcd_status1.B[EBX]
+	MOVL	ECX, #2
+	MOVB	DL, #'0'
+	CALL	loghexval
+	CALL	logout
+2$:	TESTB	tcd_toqab+qab_status+1.B[EBX], #QSTS$DONE>8t ;Really done?
+	JE	4$.S			;No
+	ANDB	tcd_status1.B[EBX], #~TS1$OUTACT ;Yes - output not active now
+	TESTB	tcd_status0.B[EBX], #TS0$CLOSE ;Closing?
+	JE	6$.S			;No
+	ORB	tcd_status0.B[EBX], #TS0$OUTDONE ;Yes
+	TESTB	tcd_status0.B[EBX], #TS0$INPDONE ;Has input finished yet?
+	JE	4$.S			;No - wait until it does
+	CALL	clear2			;Yes - start to actually close things
+4$:	POPAL
+	CALLF	svcSchDismiss##
+
+;Here if not closing the connection
+
+6$:	CMPL	tcd_toqab+qab_error.B[EBX], #0.B ;Error?
+	JS	14$.S			;Yes
+
+;Here with good output - first see if have anything in the supervisory output
+;  ring and copy it to the output buffer if so - note that this cannot cause
+;  output since the output buffer is empty here and the supervisory ring is
+;  smaller than the output buffer
+
+	MOVL	ECX, tcd_tscnt.B[EBX]
+	JREGZ	ECX, 12$
+8$:	MOVL	ESI, tcd_tstak.B[EBX]
+	LODSB	[ESI]
+	CMPL	ESI, tcd_tsend.B[EBX]
+	JB	10$.S
+	LEAL	ESI, tcd_tsbufr[EBX]
+10$:	MOVL	tcd_tstak.B[EBX], ESI
+	CALL	putdatabyte
+	DECL	tcd_tscnt.B[EBX]
+	JNE	8$.S
+12$:	MOVL	EAX, tcd_todsp.B[EBX]	;Get output done dispatch
+	MOVL	tcd_todsp.B[EBX], #inputdone ;Reset dispatch
+	JMPIL	EAX
+
+;Here if have error on output
+
+14$:	CMPL	tcd_toqab+qab_error.B[EBX], #ER_NCLST ;Network connection lost?
+	JE	16$.S			;Yes
+	CMPL	tcd_toqab+qab_error.B[EBX], #ER_NCCLR
+	JE	16$.S
+	CMPB	loglevel, #1		;Should we log this?
+	JB	16$.S			;No
+	MOVL	ESI, #tcpoelm		;Yes
+	MOVL	EAX, tcd_toqab+qab_error.B[EBX]
+	CALL	logerror
+16$:	ORB	tcd_status0.B[EBX], #TS0$OUTDONE
+	CALL	tcpclear		;Clear the connection, etc.
+	JMP	4$.S
+.PAGE
+	.SBTTL	pcninputdone - PCN input done software interrupt routine
+
+;PCN input done software interrupt routine
+
+pcninputdone:
+	PUSHAL				;Save registers
+	MOVL	EBX, 64t.B[ESP]		;Get offset of the TCD
+	SUBL	EBX, #tcd_piqab
+	CMPB	loglevel, #3		;Should we log this?
+	JB	2$.S			;No
+	MOVL	ESI, #piintmsg		;Yes
+	CALL	logstr
+	MOVZBL	EAX, tcd_status1.B[EBX]
+	MOVL	ECX, #2
+	MOVB	DL, #'0'
+	CALL	loghexval
+	CALL	logout
+2$:	TESTB	tcd_status1.B[EBX], #TS1$OUTACT ;Is output active?
+	JE	doinputdone.S		;No - go on
+	ORB	tcd_status1.B[EBX], #TS1$INPHLD ;Yes - do this later
+	POPAL
+	CALLF	svcSchDismiss##
+
+;Here when ready to process the PCN input done interrupt - get here when
+;  output is not active and not processing input
+
+doinputdone:
+	TESTB	tcd_piqab+qab_status+1[EBX], #QSTS$DONE>8t ;Really done now?
+	JE	4$.S			;No - forget it for now
+	TESTB	tcd_status0.B[EBX], #TS0$CLOSE ;Yes - closing now?
+	JE	6$.S			;No
+	ORB	tcd_status0.B[EBX], #TS0$OUTDONE ;Yes - indicate TCP output done
+	TESTB	tcd_status0.B[EBX], #TS0$INPDONE ;Is TCP input done now?
+	JE	4$.S			;No
+	CALL	clear2			;Yes - finish up with this
+4$:	POPAL
+	CALLF	svcSchDismiss##
+
+;Here with input done when not closing
+
+6$:	CMPL	tcd_piqab+qab_error[EBX], #0 ;Any errors?
+	JL	inperr			;Yes
+	ORB	tcd_status1.B[EBX], #TS1$INPPROC ;No - indicate processing input
+	LEAL	EAX, tcd_pibufr[EBX]	;Initialize PCN input buffer pointer
+	MOVL	tcd_pipnt.B[EBX], EAX
+pinplp:	DECL	tcd_piqab+qab_amount[EBX] ;More to do?
+	JS	inputdone.s		;No
+	MOVL	EDI, tcd_pipnt.B[EBX]	;Yes
+	INCL	tcd_pipnt.B[EBX]
+	MOVB	AL, [EDI]		;Get character
+	CMPB	AL, #0FFh
+	JNE	8$.S
+	CALL	putdatabyte
+	MOVB	AL, #0FFh
+8$:	CALL	putdatabyte		;Output it
+	JMP	pinplp.S
+.PAGE
+;Here when the PCN input buffer is empty or when finished processing TCP input
+;  done interrupt
+
+inputdone:
+	CMPL	tcd_tscnt.B[EBX], #0.B	;Have any supervisory output?
+	JE	6$.S			;No
+2$:	MOVL	ESI, tcd_tstak.B[EBX]	;Yes
+	LODSB	[ESI]
+	CMPL	ESI, tcd_tsend.B[EBX]
+	JB	4$.S
+	LEAL	ESI, tcd_tsbufr[EBX]
+4$:	MOVL	tcd_tstak.B[EBX], ESI
+	DECL	tcd_tscnt.B[EBX]
+	CALL	putdatabyte
+	CMPL	tcd_tscnt.B[EBX], #0.B
+	JNE	2$.S
+6$:	MOVL	ECX, tcd_tocnt.B[EBX]	;Need to start output now?
+	JREGZ	ECX, 10$		;No
+	LEAL	EDI, tcd_tobufr[EBX]	;Yes - do so
+	MOVL	tcd_topnt.B[EBX], EDI
+	MOVL	tcd_tocnt.B[EBX], #0
+	MOVL	tcd_todsp.B[EBX], #inputdone
+	MOVB	AL, #'O'
+	CALL	tcpoutqueue
+	POPAL
+	CALLF	svcSchDismiss##
+
+;Here with output finished
+
+8$:	CMPL	tcd_tscnt.B[EBX], #0.B	;Did more supervisory output sneak in?
+	JNE	2$.S			;Yes - go handle it
+10$:	TESTB	tcd_status1.B[EBX], #TS1$INPHLD ;No - need to handle input now?
+	JNE	16$.S			;Yes
+	TESTB	tcd_status1.B[EBX], #TS1$LVMHLD ;No - need to service leave
+						;  mapped mode interrupt now?
+	JNE	20$.S			;Yes
+	TESTB	tcd_status1.B[EBX], #TS1$INPPROC ;Processing PCN input now?
+	JE	14$.S			;No
+	ANDB	tcd_status1.B[EBX], #~TS1$INPPROC ;Yes
+	CALL	pcninpqueue		;Queue another PCN input request
+14$:	POPAL				;Finished
+	CALLF	svcSchDismiss##		;Dismiss interrupt
+
+;Here if have an input done interrupt pending
+
+16$:	ANDB	tcd_status1.B[EBX], #~TS1$INPHLD
+	JMP	doinputdone
+
+;Here if have a leave map mode interrupt pending
+
+20$:	ANDB	tcd_status1.B[EBX], #~TS1$LVMHLD ;Yes
+	JMP	doleavemap
+
+;Here if error on PCN input
+
+inperr:	CMPB	loglevel, #1		;Should we log this?
+	JB	22$.S			;No
+	MOVL	ESI, #pcnielm		;Yes
+	MOVL	EAX, tcd_piqab+qab_error[EBX]
+	CALL	logerror
+22$:	ORB	tcd_status0.B[EBX], #TS0$OUTDONE
+	CALL	tcpclear
+	JMP	14$.S
+.PAGE
+	.SBTTL	pcnleavemap - PCN leave mapped mode software interrupt routine
+
+;PCN leave mapped mode software interrupt routine - note that this interrupt
+;  occures at interrupt level 3 (instead of level 4) to make sure that we get
+;  this interrupt after we have processed all pending stream data.  We
+;  immediately raise to level 4 so this routine will not be interurpted.
+;  This routine compares the screen and shadow buffers and generates DDSP
+;  image write commands for any changed data.  It also updates the shadow
+;  buffer to match the screen buffer.
+
+pcnleavemap:
+	PUSHAL				;Save registers
+	PUSHL	#4.B			;Ensure can not be interrupted
+	CALLF	svcSchSetLevel##
+	MOVL	EBX, 64t.B[ESP]		;Get offset of the TCD
+	CMPB	loglevel, #3		;Should we log this?
+	JB	2$.S			;No
+	MOVL	ESI, #lmmintmsg		;Yes
+	CALL	logstr
+	MOVZBL	EAX, tcd_status1.B[EBX]
+	MOVL	ECX, #2
+	MOVB	DL, #'0'
+	CALL	loghexval
+	CALL	logout
+2$:	MOVL	EAX, 68t.B[ESP]		;Copy the display page bits
+	MOVL	tcd_dpgbits.B[EBX], EAX
+	TESTB	tcd_status1.B[EBX], #TS1$OUTACT ;Is output active?
+	JE	doleavemap.S		;No - go on
+	ORB	tcd_status1.B[EBX], #TS1$LVMHLD ;Yes - do this later
+	POPAL
+	CALLF	svcSchDismiss##
+
+;Here when ready to process the leave mapped mode interrupt - get here when
+;  output is not active and not processing input
+
+doleavemap:
+	MOVL	EAX, tcd_scrnbufr.B[EBX] ;Get offset of the screen buffer
+	MOVL	tcd_scrnpage.B[EBX], EAX
+	ADDL	EAX, #SCNBUFSIZE*1000h	;Get offset of the shadow buffer
+	MOVL	tcd_shdwpage.B[EBX], EAX
+imglp0:	CLC
+	RCRL	tcd_dpgbits.B[EBX], #1	;Has this page been changed?
+	JNC	imgnxt			;No
+	MOVL	EAX, tcd_scrnpage.B[EBX] ;Yes - point to start of page
+	MOVL	tcd_scrnpnt.B[EBX], EAX
+	MOVL	EAX, tcd_shdwpage.B[EBX]
+	MOVL	tcd_shdwpnt.B[EBX], EAX
+	MOVL	tcd_left.B[EBX], #400h	;Initialize number of longs left in page
+	CLD
+
+;Here to find difference in page
+
+imglp2:	MOVL	ESI, tcd_scrnpnt.B[EBX]	;Get current screen buffer offset
+	MOVL	EDI, tcd_shdwpnt.B[EBX]	;Get current shadow buffer offset
+	MOVL	ECX, tcd_left.B[EBX]	;Get number of longs left in page
+	TESTL	ESI, #03h		;Have odd word at beginning?
+	JE	4$.S			;No
+	CMPSW	[EDI], [ESI]		;Yes - is it different
+	JNE	6$.S			;Yes
+4$:	RECMPSL	[EDI], [ESI]		;No - check the rest of the page
+	JE	imgnxt			;If no more differences found, advance
+					;  to next page
+
+;Here with a difference found
+
+	SUBL	EDI, #4t.B		;Point to the difference
+	SUBL	ESI, #4t.B
+	INCL	ECX
+	CMPSW	[EDI], [ESI]		;Was the first word different?
+	JE	8$.S			;No
+6$:	SUBL	EDI, #2t.B		;Yes
+	SUBL	ESI, #2t.B
+8$:	MOVL	tcd_scrndiff.B[EBX], ESI ;Remember where the difference starts
+	MOVL	tcd_shdwdiff.B[EBX], EDI
+
+;Now see how long the difference is
+
+	TESTL	ESI, #03h		;Long alligned?
+	JE	10$.S			;Yes
+	ADDL	EDI, #2t.B		;No - fix it up (this skips the first
+	ADDL	ESI, #2t.B		;  difference word, which is OK since
+	DECL	ECX			;  we know it is different)
+	JE	12$.S			;If at end of page now
+10$:	RNCMPSL	[EDI], [ESI]		;See how much is different
+	JNE	12$.S			;If ran off the end
+	SUBL	EDI, #4t.B
+	SUBL	ESI, #4t.B
+	INCL	ECX
+	MOVZWL	EAX, -2.B[ESI]		;Was last word different?
+	CMPW	-2.B[EDI], AX
+	JNE	12$.S			;Yes
+	SUBL	EDI, #2t.B		;No - fix up the offsets
+	SUBL	ESI, #2t.B
+12$:	MOVL	tcd_scrnpnt.B[EBX], ESI ;Store current offsets
+	MOVL	tcd_shdwpnt.B[EBX], EDI
+	MOVL	tcd_left.B[EBX], ECX	;Store number of whole longs remaining
+
+;Here with length of difference area determined
+
+	MOVB	AL, #0			;Send prefix byte
+	CALL	putdatabyte
+	MOVL	EAX, ESI		 ;Get number of different character
+	SUBL	EAX, tcd_scrndiff.B[EBX] ;  attribute pairs
+	SHRL	EAX, #1
+	MOVL	tcd_count.B[EBX], EAX
+	MOVB	AL, #DDSF_IMG1CA	;Assume only need 1 byte for the count
+	CMPB	AH, #0			;Right?
+	JE	14$.S			;Yes
+	MOVB	AL, #DDSF_IMG2CA	;No - need two bytes
+14$:	CALL	putdatabyte
+	MOVL	EAX, tcd_scrndiff.B[EBX] ;Get character offset
+	SUBL	EAX, tcd_scrnbufr.B[EBX]
+	SHRL	EAX, #1
+	MOVB	tcd_temp.B[EBX], AL
+	MOVB	AL, AH			;Send it
+	CMPB	AL, #0FFh
+	JNE	16$.S
+	CALL	putdatabyte
+	MOVB	AL, #0FFh
+16$:	CALL	putdatabyte
+	MOVB	AL, tcd_temp.B[EBX]
+	CMPB	AL, #0FFh
+	JNE	18$.S
+	CALL	putdatabyte
+	MOVB	AL, #0FFh
+18$:	CALL	putdatabyte
+	MOVB	AL, tcd_count+1.B[EBX]	;Get high order count byte
+	CMPB	AL, #0			;Do we need to send it?
+	JE	22$.S			;No
+	CMPB	AL, #0FFh		;Yes
+	JNE	20$.S
+	CALL	putdatabyte
+	MOVB	AL, #0FFh
+20$:	CALL	putdatabyte
+22$:	MOVB	AL, tcd_count+0.B[EBX]	;Send low order count byte
+	CMPB	AL, #0FFh
+	JNE	24$.S
+	CALL	putdatabyte
+	MOVB	AL, #0FFh
+24$:	CALL	putdatabyte
+	MOVL	ESI, tcd_scrndiff.B[EBX] ;Point to start of difference area
+	MOVL	EDI, tcd_shdwdiff.B[EBX]
+26$:	LODSB	[ESI]			;Get character byte
+	STOSB	[EDI]			;Store in shadow buffer
+	CMPB	AL, #0FFh
+	JNE	28$.S
+	CALL	putdatabyte
+	MOVB	AL, #0FFh
+28$:	CALL	putdatabyte		;Send it
+	LODSB	[ESI]			;Get attribute byte
+	STOSB	[EDI]			;Store in shadow buffer
+	CMPB	AL, #0FFh
+	JNE	30$.S
+	CALL	putdatabyte
+	MOVB	AL, #0FFh
+30$:	CALL	putdatabyte		;Send it
+	DECL	tcd_count.B[EBX]	;Reduce count
+	JNE	26$.S			;Continue if more to send
+	CMPL	tcd_left.B[EBX], #0.B	;Anything left on this page?
+	JNE	imglp2			;Yes
+imgnxt:	ADDL	tcd_scrnpage.B[EBX], #1000h ;No - advance to next page
+	ADDL	tcd_shdwpage.B[EBX], #1000h
+	CMPL	tcd_dpgbits.B[EBX], #0.B ;Any more changed pages to check?
+	JNE	imglp0			;Yes
+	PUSHL	tcd_piqab+qab_handle[EBX] ;No - switch to stream mode
+	PUSHL	#PCSF_STREAMMD.B
+	PUSHL	#0.B
+	PUSHL	#0.B
+	PUSHL	#0.B
+	PUSHL	DS
+	PUSHL	#sdfparms
+	CALLF	svcIoSpecial##
+	TESTL	EAX, EAX		;Any new changes?
+	JLE	inputdone		;No - finished here
+	MOVL	tcd_dpgbits.B[EBX], EAX	;Yes - store change bits
+	JMP	doleavemap		;And do this again!
+.PAGE
+	.SBTTL	pcnidle - PCN idle software interrupt routine
+
+;PCN idle software interrupt routine - note that this interrupt occures at
+;  interrupt level 3 (instead of level 4) to make sure that we get this
+;  interrupt after we have processed all data for the connection.  We
+;  immediately raise to level 4 so this routine will not be interurpted.
+
+pcnidle:PUSHAL				;Save registers
+	PUSHL	#4.B			;Ensure can not be interrupted
+	CALLF	svcSchSetLevel##
+	MOVL	EBX, 64t.B[ESP]		;Get offset of the TCD
+	CMPB	loglevel, #3		;Should we log this?
+	JB	2$.S			;No
+	MOVL	ESI, #idlintmsg		;Yes
+	CALL	logstr
+	MOVZBL	EAX, tcd_status1.B[EBX]
+	MOVL	ECX, #2
+	MOVB	DL, #'0'
+	CALL	loghexval
+	CALL	logout
+2$:	CALL	tcpclear		;Clear the connection
+	POPAL
+	CALLF	svcSchDismiss##
+.PAGE
+	.SBTTL	pcninpqueue - Subroutine to queue PCN input
+
+;Subroutine to queue PCN input
+;	c{EBX} = Offset of TCD
+;	CALL	pcninpqueue
+;	C:set = Error
+;	C:clr = Normal
+
+pcninpqueue:
+	PUSHL	DS
+	LEAL	EAX, tcd_piqab[EBX]
+	PUSHL	EAX
+	CALLF	svcIoQueue##
+	TESTL	EAX, EAX		;Error?
+	JS	4$.S			;Yes
+	RET				;No
+
+;Here if error
+
+4$:	MOVL	ESI, #pcniqemsg		;Get message
+	CALL	logsyslog		;Log the error
+	PUSHL	#1.B
+	CALLF	svcSchExit##
+.PAGE
+	.SBTTL	tcpclear - Subroutine to clear network connection
+
+;Subroutine to clear network connection - also gives up the associated PCN
+;  device - note that all we do here is cancel the current IO operations
+;  - they will check the TS0$CLOSE bit and finish this
+;	c{EBX} = Offset of TCD
+;	CALL	tcpclear
+
+tcpclear:
+	ORB	tcd_status0.B[EBX], #TS0$CLOSE ;Indicate closing
+	PUSHL	DS			;Cancel TCP input and output
+	LEAL	EAX, tcd_toqab.B[EBX]
+	PUSHL	EAX
+	PUSHL	#CAN$ALL|CAN$INPUT|CAN$OUTPUT.B
+	CALLF	svcIoCancel##
+	PUSHL	DS
+	LEAL	EAX, tcd_piqab[EBX]	;Cancel PCN input
+	PUSHL	EAX
+	PUSHL	#CAN$ALL|CAN$INPUT|CAN$OUTPUT.B
+	CALLF	svcIoCancel##
+	RET
+
+;Here with all input and output terminated
+
+clear2:	TESTB	tcd_status0.B[EBX], #TS0$TCPCLSD ;Have we already done this?
+	JNE	4$.S			;Yes - don't do it again
+	ORB	tcd_status0.B[EBX], #TS0$TCPCLSD
+	MOVB	tcd_toqab+qab_func.B[EBX], #QFNC_CLOSE ;Close TCP IO
+	MOVB	tcd_toqab+qab_vector.B[EBX], #VECT_TCPCLOSE
+	PUSHL	DS
+	LEAL	EAX, tcd_toqab.B[EBX]
+	PUSHL	EAX
+	CALLF	svcIoQueue##		;Do the rest in the close done routine
+4$:	RET
+.PAGE
+	.SBTTL	tcpclosedone - TCP close done software interrupt routine
+
+;TCP close done software interrupt routine
+
+tcpclosedone:
+	PUSHAL				;Save registers
+	MOVL	EBX, 64t.B[ESP]		;Get offset of the TCD
+	SUBL	EBX, #tcd_toqab.B
+	PUSHL	tcd_piqab+qab_handle[EBX] ;Close the PCN device (note that
+	PUSHL	#0.B			  ;  this cannot block)
+	CALLF	svcIoClose##
+	PUSHL	DS			;Give up the screen buffer memory
+	PUSHL	tcd_scrnbufr.B[EBX]
+	PUSHL	#0.B
+	PUSHL	#0.B
+	CALLF	svcMemChange##
+	MOVL	ESI, tcd_tdd.B[EBX]
+	MOVL	EDX, [EBX]		;Unlink the TCD
+	MOVL	EAX, tcd_prev.B[EBX]
+	TESTL	EAX, EAX
+	JNE	4$.S
+	MOVL	tdd_firsttcd.B[ESI], EDX
+	JMP	6$.S
+
+4$:	MOVL	[EAX], EDX
+6$:	TESTL	EDX, EDX
+	JNE	8$.S
+	MOVL	tdd_lasttcd.B[ESI], EAX
+	JMP	10$.S
+
+8$:	MOVL	tcd_prev.B[EDX], EAX
+10$:	SUBL	EBX, #tcd_mSIZE.B	;Give up the TCD
+	PUSHL	EBX
+	CALL	free#
+	POPL	ECX
+	POPAL
+	CALLF	svcSchDismiss##
+.PAGE
+	.SBTTL	putdatabyte - Subroutine to output TCP data byte
+
+;Subroutine to output TCP data byte
+;	c(AL) = Data
+;	CALL	putdatabyte
+;  EBX, EDI, and ESI are preserved, other registers may be changed
+
+putdatabyte:
+	MOVL	EDX, tcd_topnt.B[EBX]
+	INCL	tcd_topnt.B[EBX]
+	MOVB	[EDX], AL
+	INCL	tcd_tocnt.B[EBX]	;Room for more in the buffer?
+	CMPL	tcd_tocnt.B[EBX], #TCPOBFRSZ
+	JAE	2$.S			;No
+	RET				;Yes - finished
+
+;Here if buffer is full now
+
+2$:	MOVL	tcd_saveEDI.B[EBX], EDI
+	MOVL	tcd_saveESI.B[EBX], ESI
+	LEAL	EDI, tcd_tobufr[EBX]
+	MOVL	ECX, tcd_tocnt.B[EBX]
+	MOVL	tcd_topnt.B[EBX], EDI
+	MOVL	tcd_tocnt.B[EBX], #0
+	MOVB	AL, #'o'
+	CALL	tcpoutqueue
+	POPL	tcd_putrtn.B[EBX]	;Save return offset in a safe place
+	MOVL	tcd_todsp.B[EBX], #12$
+	POPAL
+	CALLF	svcSchDismiss##
+
+;Here when TCP output is done
+
+12$:	MOVL	EDI, tcd_saveEDI.B[EBX]
+	MOVL	ESI, tcd_saveESI.B[EBX]
+	JMPIL	tcd_putrtn.B[EBX]
+.PAGE
+	.SBTTL	putstr - Subroutine to store string for TCP supervisory output
+
+;Subroutine to store string for TCP supervisory output
+;	c{ESI} = Offset of string
+;	CALL	putstr
+
+putstr:	LODSB	[ESI]			;Get byte
+	CMPB	AL, #0			;End?
+	JE	4$.S			;Yes
+	CALL	putspvrbyte		;No - store the byte
+	JMP	putstr			;Continue
+
+4$:	RET
+
+	.SBTTL	putspvrbyte - Subroutine to store byte for TCP supervisory output
+
+;Subroutine to store byte for TCP supervisory output
+;	c(AL) = Value
+;	CALL	putspvrbyte
+
+putspvrbyte:
+	CMPL	tcd_tscnt.B[EBX], #TCPSBFRSZ ;Can we take more?
+	JAE	10$.S			;No!
+	MOVL	EDI, tcd_tsput.B[EBX]	;Yes - get putter pointer
+	STOSB	[EDI]			;Store byte
+	CMPL	EDI, tcd_tsend.B[EBX]
+	JB	6$.S
+	LEAL	EDI, tcd_tsbufr[EBX]
+6$:	MOVL	tcd_tsput.B[EBX], EDI
+	INCL	tcd_tscnt.B[EBX]	;Increment count
+8$:	RET
+
+;Here if supervisory buffer is full
+
+10$:	TESTB	tcd_status0.B[EBX], #TS0$CLOSE ;Closing now?
+	JNE	8$.S			;Yes - don't log it
+	MOVL	ESI, #tsoutmsg		;No - log the error
+	CALL	logsyslog
+	JMP	tcpclear
+.PAGE
+	.SBTTL	getmem - Subroutine to allocate memory
+
+;Subroutine to allocate memory
+;	c{EAX} = Amount to allocate
+;	CALL	getmem
+;	C:set = Error
+;	  c:{EAX} = XOS error code
+;	  c:{EBX} = Offset of message string
+;	C:clr = Normal
+;	  c{EAX} = Offset of area allocated
+
+getmem::PUSHL	EAX
+	CALL	malloc#
+	POPL	ECX
+	TESTL	EAX, EAX
+	JNE	4$.S
+	MOVL	EBX, #camdmsg
+	MOVL	EAX, errno#
+	STC
+4$:	RET
+.PAGE
+;Subroutine to log error
+;	c{EAX} = Error code
+;	c{ESI} = Offset of message string
+;	CALL	logerror
+
+logerror::
+	PUSHL	EAX
+	CALL	logstr
+	POPL	EAX
+	CALL	loghexvalv
+	JMP	logout
+
+;Subroutine to log input or output data
+;	c(AL)  = Flag character
+;	c{EDI} = Offset of data buffer
+;	c{ECX} = Number of data bytes
+;	CALL	logmsg
+
+logmsg::PUSHL	ECX			;Save byte count
+	PUSHL	EAX			;Save flag letter
+	MOVZBL	EAX, tcd_punit.B[EBX]	;Display primary unit number
+	MOVB	DL, #'0'
+	MOVL	ECX, #2
+	CALL	logdecval
+	MOVB	AL, #'P'
+	CALL	logchr
+	MOVZBL	EAX, tcd_sunit.B[EBX]	;Display secondary unit number
+	MOVB	DL, #'0'
+	MOVL	ECX, #2
+	CALL	logdecval
+	MOVB	AL, #':'
+	CALL	logchr			;Restore flag character
+	POPL	EAX
+	CALL	logchr			;display it
+	MOVL	EAX, [ESP]		;Get count
+	MOVL	ECX, #4t		;Display it
+	MOVB	DL, #' '
+	CALL	logdecval
+	MOVB	AL, #'>'
+	CALL	logchr
+	POPL	ECX
+	JREGZ	ECX, logout
+	MOVL	EDX, #20t
+4$:	MOVB	AL, #' '
+	CALL	logchr
+	MOVZBL	EAX, [EDI]
+	INCL	EDI
+	PUSHL	ECX
+	PUSHL	EDX
+	MOVL	ECX, #2
+	MOVB	DL, #'0'
+	CALL	loghexval
+	POPL	EDX
+	DECL	EDX
+	JNE	10$.S
+	CMPL	[ESP], #1.B
+	JE	10$.S
+	CALL	logout			;Output this line
+	MOVL	ESI, #lognl2		;Start the next line
+	CALL	logstr
+	MOVL	EDX, #20t
+10$:	POPL	ECX
+	LOOP	ECX, 4$
+					;Fall into logout on next page
+.PAGE
+	.SBTTL	logout - Subroutine to output a log record
+
+;Subroutine to output a log record
+;	CALL	logout
+
+logout::MOVL	EAX, logpnt
+	MOVB	[EAX], #CR
+	MOVB	1.B[EAX], #LF
+	SUBL	EAX, #msgbfr-2
+	PUSHL	loghndl
+	PUSHL	DS
+	PUSHL	#msgbfr
+	PUSHL	EAX
+	CALLF	svcIoOutBlock##
+	MOVL	logpnt, #msgbfr
+	RET
+.PAGE
+	.SBTTL	logstr - Subroutine to put string in a log record
+
+;Subroutine to put string in a log record
+;	c{ESI} = Offset of string
+;	CALL	logstr
+
+logstr::PUSHL	EDI			;Save register we need
+	MOVL	EDI, logpnt		;Get log message pointer
+2$:	LODSB	[ESI]			;Get character
+	CMPB	AL, #0			;End?
+	JE	4$.S			;Yes
+	STOSB	[EDI]			;No - store character
+	JMP	2$.S			;Continue
+
+;Here at end of string
+
+4$:	MOVL	logpnt, EDI		;Save log message pointer
+	POPL	EDI			;Restore register
+	RET				;Finished
+
+;Subroutine to store single character into a log message
+;	c(AL) = Character
+;	CALL	logchr
+
+logchr::PUSHL	EDI			;Save register we need
+	MOVL	EDI, logpnt		;Get log message pointer
+	STOSB	[EDI]			;Store character
+	MOVL	logpnt, EDI		;Update pointer
+	POPL	EDI
+	RET
+.PAGE
+	.SBTTL	loghexval - Subroutine to put hex value in a log record
+
+;Subroutine to put hex value in a log record
+;	c{EAX} = Value
+;	c{ECX} = Field width
+;	c(DL)  = Fill character
+;	CALL	loghexval		;Enter at loghexvalv for minimum field
+;					;  width
+
+loghexvalv::
+	CLRL	ECX
+loghexval::
+	MOVL	radix, #16t
+	JMP	2$.S
+
+	.SBTTL	logdecval - Subroutine to put decimal value in a log record
+
+;Subroutine to put decimal value in a log record
+;	c{EAX} = Value
+;	c{ECX} = Field width
+;	c(DL)  = Fill character
+;	CALL	logdecval		;Enter at logdecvalv for minimum field
+;					;  width
+
+logdecvalv::
+	CLRL	ECX
+logdecval::
+	MOVL	radix, #10t
+2$:	PUSHL	EDI			;Save register we need
+	PUSHL	ESI
+	MOVL	ESI, EDX		;Save fill character
+	MOVL	EDI, logpnt		;Get log message pointer
+	MOVL	digits, #0		;Clear digit counter
+4$:	CLRL	EDX			;Get next digit
+	IDIVL	radix
+	PUSHL	EDX			;Save it
+	INCL	digits			;Count it
+	TESTL	EAX, EAX		;More?
+	JNE	4$.S			;Yes - continue
+	MOVL	EAX, ESI		;Get fill character
+	SUBL	ECX, digits		;Calculate number of leading characters
+	JLE	6$.S			;If none
+	RSTOSB	[EDI]
+6$:	POPL	EAX			;Get digit value
+	CMPB	AL, #9
+	JBE	8$.S
+	ADDB	AL, #'A'-'0'-10t
+8$:	ADDB	AL, #'0'		;Change to digit
+	STOSB	[EDI]			;Store it
+	DECL	digits			;Continue if more
+	JNE	6$.S
+	MOVL	logpnt, EDI		;Restore log message pointer
+	POPL	ESI			;Restore registers
+	POPL	EDI
+	RET				;Finished
+.PAGE
+	.SBTTL	logsyslog - Subroutine to put message in the system log
+
+;Subroutine to put message in the system log
+;	c{EAX} = Error code
+;	c{ESI} = Message
+;	CALL	logsyslog
+
+logsyslog::
+	PUSHL	EDI
+	MOVL	EDI, #msgbfr
+	TESTL	EAX, EAX
+	JE	2$.S
+	PUSHL	EAX
+	PUSHL	#2.B
+	PUSHL	DS
+	PUSHL	EDI
+	CALLF	svcSysErrMsg##
+	ADDL	EDI, EAX
+2$:	PUSHL	DS
+	POPL	ES
+	CLD
+4$:	LODSB	[ESI]
+	STOSB	[EDI]
+	CMPB	AL, #0
+	JNE	4$.S
+	PUSHL	DS
+	PUSHL	#logmsgbfr
+	SUBL	EDI, #logmsgbfr
+	DECL	EDI
+	PUSHL	EDI
+	CALLF	svcSysLog##
+	POPL	EDI
+	RET
+.PAGE
+	.SBTTL	Data
+
+	.PSECT	_DATA_p
+
+	   .MOD   4
+numcon:    .LONG  20t		;Maximum of TCP connections to allow
+numopen:   .LONG  4t		;Number of TCP opens to queue
+tcpport:   .LONG  23t		;TCP port number
+firsttdd:  .LONG  0		;Offset of first TDD
+lasttdd:   .LONG  0		;Offset of last TDD
+logpnt:    .LONG  msgbfr	;Log routine pointer
+radix:	   .LONG  10t
+digits:	   .LONG  0
+loghndl:   .LONG  DH_STDERR
+logname:   .LONG  0		;Log file specification
+loglevel:: .BYTE  0		;Logging level
+
+nomemmsg:  .ASCIZ "Cannot allocate memory for TCP connection data"
+tcpoemsg:  .ASCIZ "FATAL: Error queueing TCP open"
+tcpiqemsg: .ASCIZ "FATAL: Error queueing TCP input"
+tcpoqemsg: .ASCIZ "FATAL: Error queueing TCP output"
+tsoutmsg:  .ASCIZ "TCP supervisory output overflow"
+pcnoemsg:  .ASCIZ "Error opening PCN device"
+pcniqemsg: .ASCIZ "FATAL: Error queueing PCN input"
+pcnoqemsg: .ASCIZ "FATAL: Error queueing PCN output"
+pcnoxemsg: .ASCIZ "PCN output error"
+pcndtemsg: .ASCIZ "FATAL: Error setting PCN display type"
+
+openstr:   .ASCIZ "r"
+camdmsg:   .ASCIZ "Not enough memory available"
+lognl2:    .ASCIZ "            "
+tcpielm:   .ASCIZ "TCP input error: "
+tcpoelm:   .ASCIZ "TCP output error: "
+pcnielm:   .ASCIZ "PCN input error: "
+
+tiintmsg: .ASCIZ "*** TCP IN:  "
+tointmsg: .ASCIZ "*** TCP OUT: "
+piintmsg: .ASCIZ "*** PCN IN:  "
+pointmsg: .ASCIZ "*** PCN OUT: "
+lmmintmsg:.ASCIZ "*** PCN LLM: "
+idlintmsg:.ASCIZ "*** PCN IDL: "
+
+prgname::  .ASCIZ "TLNSRV"
+dsphmsg:   .BYTE  TNC_IAC, TNC_SB, TNO_XOSMODE, XOS_BGNDSP, TNC_IAC, TNC_SE, 0
+newcmsg:   .BYTE  TNC_IAC, TNC_WILL, TNO_ECHO
+	   .BYTE  TNC_IAC, TNC_DO  , TNO_XOSMODE
+	   .BYTE  TNC_IAC, TNC_WILL, TNO_XOSMODE
+;;;;;;;	   .BYTE  TNC_IAC, TNC_DO  , TNO_TFC
+NEWCMSGSZ=!$-newcmsg
+
+	  .MOD	4
+avllclopt:.LONG	0000000Ah	;Supported local options (bits 0 - 31, 1 means
+	  .LONG	00010000h	;  yes)
+avlrmtopt:.LONG	00000008h	;Supported remote options
+	  .LONG	00010002h	;       Option     Local Remote
+				;  0 = TNO_BINARY  = No  No
+				;  1 = TNO_ECHO    = Yes No
+				;  2 = TNO_RCP     = No  No
+				;  3 = TNO_SUPGA   = Yes Yes
+				;  4 = TNO_NAMS    = No  No
+				;  5 = TNO_STATUS  = No  No
+				;  6 = TNO_MARK    = No  No
+				;  7 = TNO_RCTE    = No  No
+				;  8 = TNO_OLW     = No  No
+				;  9 = TNO_OPS     = No  No
+				; 0A = TNO_OCRD    = No  No
+				; 0B = TNO_OHTS    = No  No
+				; 0C = TNO_OHTD    = No  No
+				; 0D = TNO_OFFD    = No  No
+				; 0E = TNO_OVTS    = No  No
+				; 0F = TNO_OVTD    = No  No
+				; 10 = TNO_OLFD    = No  No
+				; 11 = TNO_XASCII  = No  No
+				; 12 = TNO_LOGOUT  = No  No
+				; 13 = TNO_BM      = No  No
+				; 14 = TNO_DET     = No  No
+				; 15 = Reserved
+				; 16 = TNO_SUPDUP  = No  No
+				; 17 = TNO_SDOUT   = No  No
+				; 18 = TNO_TERM    = No  No
+				; 19 = TNO_EOR     = No  No
+				; 1A = TNO_TACACS  = No  No
+				; 1B = TNO_OM      = Yes Yes
+				; 1C = TNO_TLN     = No  No
+				; 1D = TNO_3270    = No  No
+				; 1E = TNO_X3PAD   = No  No
+				; 1F = TNO_NAWS    = No  No
+				; 20 = TNO_SPEED   = No  No
+				; 21 = TNO_TFC     = No  Yes
+				; 22 = TNO_LM      = No  No
+				; 23 = TNO_XLOC    = No  No
+				; 24 = Reserved
+				; 25 = Reserved
+				; 26 - Reserved
+				; 27 - Reserved
+				; 28 - Reserved
+				; 29 - Reserved
+				; 2A - Reserved
+				; 2B - Reserved
+				; 2C - Reserved
+				; 2D - Reserved
+				; 2E - Reserved
+				; 2F - Reserved
+				; 30 = TNO_XOSMODE = Yes Yes
+
+
+	   .MOD   4
+msgparms:  .BYTE  PAR$SET|REP_STR, 0FFh
+	   .WORD  IOPAR_MSGRMTADDRS
+	   .LONG  reqname, !reqname
+	   .WORD  64t, 64t
+	   .BYTE  0
+
+	   .MOD   4
+msgqab:	   .WORD  QFNC_OUTBLOCK	;qab_func    = 0.  - Function
+	   .WORD  0		;qab_status  = 2.  - Returned status
+	   .LONG  0		;qab_error   = 4.  - Error code
+	   .LONG  0		;qab_amount  = 8.  - Amount transfered
+	   .LONG  0		;qab_handle  = 12. - Device handle
+	   .BYTE  0		;qab_vector  = 16. - Vector for interrupt
+	   .BYTE  0, 0, 0	;Reserved
+	   .LONG  0		;qab_option  = 20. - Option bits
+	   .LONG  MSGBFRSIZE	;qab_count   = 24. - Amount to transfer
+	   .LONG  msgbfr	;qab_buffer1 = 28. - Pointer to data buffer
+	   .LONG  !msgbfr
+	   .LONG  0, 0		;qab_buffer2 = 36. - Not used
+	   .LONG  msgparms	;qab_parm    = 44. - Pointer to parameter list
+	   .LONG  !msgparms
+
+logmsgbfr: .BYTE  0, 0, '#', 0
+	   .ASCII "TLNSRV  "
+msgbfr::   .BLKB  150t
+MSGBFRSIZE=!$-msgbfr
+
+	   .MOD   4
+pcnoparms: .BYTE  PAR$GET|REP_HEXV, 4
+	   .WORD  IOPAR_UNITNUM
+pcnpunit:  .WORD  0
+pcnsunit:  .WORD  0
+	   .BYTE  PAR$SET|REP_HEXV, 4
+	   .WORD  IOPAR_SIGDATA
+siintdata: .LONG  0
+	   .BYTE  PAR$SET|REP_HEXV, 1
+	   .WORD  IOPAR_SIGVECT1
+	   .BYTE  VECT_PCNIDLE
+	   .BYTE  PAR$SET|REP_HEXV, 1
+	   .WORD  IOPAR_SIGVECT2
+	   .BYTE  VECT_PCNLVMAP
+	   .BYTE  0
+
+	   .MOD   4
+sdfparms:  .BYTE  PAR$SET|REP_TEXT, 4
+	   .WORD  IOPAR_CLASS
+	   .LONG  'PCN'
+	   .BYTE  0
+
+	   .MOD   4
+	   .LONG  0
+viddata:   .BLKB  dm_SIZE
+
+	   .MOD   4
+notoparms: .BYTE  PAR$SET|REP_HEXV, 4
+	   .WORD  IOPAR_TIMEOUT
+	   .LONG  -1
+	   .BYTE  0
+
+;The following are prototype QABs which are copied to a TCD when it is
+;  initialized
+
+	   .MOD   4
+tcpiqab:   .WORD  QFNC_INBLOCK	;qab_func    = 0.  - Function
+	   .WORD  0		;qab_status  = 2.  - Returned status
+	   .LONG  0		;qab_error   = 4.  - Error code
+	   .LONG  0		;qab_amount  = 8.  - Amount transfered
+	   .LONG  0		;qab_handle  = 12. - Device handle
+	   .BYTE  VECT_TCPINPUT	;qab_vector  = 16. - Vector for interrupt
+	   .BYTE  0, 0, 0	;Reserved
+	   .LONG  0		;qab_option  = 20. - Option bits
+	   .LONG  TCPIBFRSZ	;qab_count   = 24. - Amount to transfer
+	   .LONG  0, !_DATA_p	;qab_buffer1 = 28. - Pointer to data buffer
+	   .LONG  0, 0		;qab_buffer2 = 36. - Not used
+	   .LONG  notoparms	;qab_parm    = 44. - Pointer to parameter list
+	   .LONG  !notoparms
+
+tcpoqab:   .WORD  QFNC_OUTBLOCK	;qab_func    = 0.  - Function
+	   .WORD  0		;qab_status  = 2.  - Returned status
+	   .LONG  0		;qab_error   = 4.  - Error code
+	   .LONG  0		;qab_amount  = 8.  - Amount transfered
+	   .LONG  0		;qab_handle  = 12. - Device handle
+	   .BYTE  VECT_TCPOUTPUT;qab_vector  = 16. - Vector for interrupt
+	   .BYTE  0, 0, 0	;Reserved
+	   .LONG  0		;qab_option  = 20. - Option bits
+	   .LONG  TCPOBFRSZ	;qab_count   = 24. - Amount to transfer
+	   .LONG  0, !_DATA_p	;qab_buffer1 = 28. - Pointer to data buffer
+	   .LONG  0, 0		;qab_buffer2 = 36. - Not used
+	   .LONG  notoparms	;qab_parm    = 44. - Pointer to parameter list
+	   .LONG  !notoparms
+
+pcniqab:   .WORD  QFNC_INBLOCK	;qab_func    = 0.  - Function
+	   .WORD  0		;qab_status  = 2.  - Returned status
+	   .LONG  0		;qab_error   = 4.  - Error code
+	   .LONG  0		;qab_amount  = 8.  - Amount transfered
+	   .LONG  0		;qab_handle  = 12. - Device handle
+	   .BYTE  VECT_PCNINPUT	;qab_vector  = 16. - Vector for interrupt
+	   .BYTE  0, 0, 0	;Reserved
+	   .LONG  0		;qab_option  = 20. - Option bits
+	   .LONG  PCNIBFRSZ	;qab_count   = 24. - Amount to transfer
+	   .LONG  0, !_DATA_p	;qab_buffer1 = 28. - Pointer to data buffer
+	   .LONG  0, 0		;qab_buffer2 = 36. - Not used
+	   .LONG  notoparms	;qab_parm    = 44. - Pointer to parameter list
+	   .LONG  !notoparms
+
+pcnoqab:   .WORD  QFNC_OUTBLOCK	;qab_func    = 0.  - Function
+	   .WORD  0		;qab_status  = 2.  - Returned status
+	   .LONG  0		;qab_error   = 4.  - Error code
+	   .LONG  0		;qab_amount  = 8.  - Amount transfered
+	   .LONG  0		;qab_handle  = 12. - Device handle
+	   .BYTE  VECT_PCNOUTPUT;qab_vector  = 16. - Vector for interrupt
+	   .BYTE  0, 0, 0	;Reserved
+	   .LONG  0		;qab_option  = 20. - Option bits
+	   .LONG  0		;qab_count   = 24. - Amount to transfer
+	   .LONG  0, !_DATA_p	;qab_buffer1 = 28. - Pointer to data buffer
+	   .LONG  0, 0		;qab_buffer2 = 36. - Not used
+	   .LONG  notoparms	;qab_parm    = 44. - Pointer to parameter list
+	   .LONG  !notoparms
+QABSIZE=!$-tcpiqab
+
+;The following QAB is used for closes when cannot allocate any memory for a TCD
+
+panicqab:  .WORD  QFNC_CLOSE	;qab_func    = 0.  - Function
+	   .WORD  0		;qab_status  = 2.  - Returned status
+	   .LONG  0		;qab_error   = 4.  - Error code
+	   .LONG  0		;qab_amount  = 8.  - Amount transfered
+	   .LONG  0		;qab_handle  = 12. - Device handle
+	   .BYTE  0		;qab_vector  = 16. - Vector for interrupt
+	   .BYTE  0, 0, 0	;Reserved
+	   .LONG  0		;qab_option  = 20. - Option bits
+	   .LONG  0		;qab_count   = 24. - Amount to transfer
+	   .LONG  0, 0		;qab_buffer1 = 28. - Pointer to data buffer
+	   .LONG  0, 0		;qab_buffer2 = 36. - Not used
+	   .LONG  0, 0		;qab_parm    = 44. - Pointer to parameter list
+
+;Table which translates from ASCII character (7 bits) to internal code
+
+	.MOD	4
+sercode:.BYTE	0  , 0			;00 - ^@ - NULL
+	.BYTE	5Ah, 2			;01 - ^A
+	.BYTE	69h, 2			;02 - ^B
+	.BYTE	67h, 2			;03 - ^C
+	.BYTE	5Ch, 2			;04 - ^D
+	.BYTE	4Fh, 2			;05 - ^E
+	.BYTE	5Dh, 2			;06 - ^F
+	.BYTE	5Eh, 2			;07 - ^G
+	.BYTE	3Ah, 0			;08 - ^H - Backspace
+	.BYTE	3Bh, 0			;09 - ^I - Tab
+	.BYTE	39h, 0			;0A - ^J - Line feed
+	.BYTE	61h, 2			;0B - ^K
+	.BYTE	62h, 2			;0C - ^L
+	.BYTE	38h, 0			;0D - ^M - Return
+	.BYTE	6Ah, 2			;0E - ^N
+	.BYTE	55h, 2			;0F - ^O
+	.BYTE	56h, 2			;10 - ^P
+	.BYTE	4Dh, 2			;11 - ^Q
+	.BYTE	50h, 2			;12 - ^R
+	.BYTE	5Bh, 2			;13 - ^S
+	.BYTE	51h, 2			;14 - ^T
+	.BYTE	53h, 2			;16 - ^U
+	.BYTE	68h, 2			;15 - ^V
+	.BYTE	4Eh, 2			;17 - ^W
+	.BYTE	66h, 2			;18 - ^X
+	.BYTE	52h, 2			;19 - ^Y
+	.BYTE	65h, 2			;1A - ^Z
+	.BYTE	10h, 0			;1B - ^[ - Escape
+	.BYTE	59h, 2			;1C - ^\
+	.BYTE	58h, 2			;1D - ^]
+	.BYTE	47h, 2			;1E - ^^
+	.BYTE	4Bh, 2			;1F - ^_
+	.BYTE	6Fh, 0			;20 - Space
+	.BYTE	41h, 1			;21 - !
+	.BYTE	64h, 1			;22 - "
+	.BYTE	43h, 1			;23 - #
+	.BYTE	44h, 1			;24 - $
+	.BYTE	45h, 1			;25 - %
+	.BYTE	47h, 1			;26 - &
+	.BYTE	64h, 0			;27 - '
+	.BYTE	49h, 1			;28 - (
+	.BYTE	4Ah, 1			;29 - )
+	.BYTE	48h, 1			;2A - *
+	.BYTE	4Ch, 1			;2B - +
+	.BYTE	6Ch, 0			;2C - ,
+	.BYTE	4Bh, 0			;2D - - (!!)
+	.BYTE	6Dh, 0			;2E - .
+	.BYTE	6Eh, 0			;2F - /
+	.BYTE	4Ah, 0			;30 - 0
+	.BYTE	41h, 0			;31 - 1
+	.BYTE	42h, 0			;32 - 2
+	.BYTE	43h, 0			;33 - 3
+	.BYTE	44h, 0			;34 - 4
+	.BYTE	45h, 0			;35 - 5
+	.BYTE	46h, 0			;36 - 6
+	.BYTE	47h, 0			;37 - 7
+	.BYTE	48h, 0			;38 - 8
+	.BYTE	49h, 0			;39 - 9
+	.BYTE	63h, 1			;3A - :
+	.BYTE	63h, 0			;3B - ;
+	.BYTE	6Ch, 1			;3C - <
+	.BYTE	4Ch, 0			;3D - =
+	.BYTE	6Dh, 1			;3E - >
+	.BYTE	6Eh, 1			;3F - ?
+	.BYTE	42h, 1			;40 - @
+	.BYTE	5Ah, 1			;41 - A
+	.BYTE	69h, 1			;42 - B
+	.BYTE	67h, 1			;43 - C
+	.BYTE	5Ch, 1			;44 - D
+	.BYTE	4Fh, 1			;45 - E
+	.BYTE	5Dh, 1			;46 - F
+	.BYTE	5Eh, 1			;47 - G
+	.BYTE	5Fh, 1			;48 - H
+	.BYTE	54h, 1			;49 - I
+	.BYTE	60h, 1			;4A - J
+	.BYTE	61h, 1			;4B - K
+	.BYTE	62h, 1			;4C - L
+	.BYTE	6Bh, 1			;4D - M
+	.BYTE	6Ah, 1			;4E - N
+	.BYTE	55h, 1			;4F - O
+	.BYTE	56h, 1			;50 - P
+	.BYTE	4Dh, 1			;51 - Q
+	.BYTE	50h, 1			;52 - R
+	.BYTE	5Bh, 1			;53 - S
+	.BYTE	51h, 1			;54 - T
+	.BYTE	53h, 1			;56 - U
+	.BYTE	68h, 1			;55 - V
+	.BYTE	4Eh, 1			;57 - W
+	.BYTE	66h, 1			;58 - X
+	.BYTE	52h, 1			;59 - Y
+	.BYTE	65h, 1			;5A - Z
+	.BYTE	57h, 0			;5B - [
+	.BYTE	59h, 0			;5C - \
+	.BYTE	58h, 0			;5D - ]
+	.BYTE	46h, 1			;5E - ^
+	.BYTE	4Bh, 1			;5F - _
+	.BYTE	40h, 0			;60 - Grave
+	.BYTE	5Ah, 0			;61 - a
+	.BYTE	69h, 0			;62 - b
+	.BYTE	67h, 0			;63 - c
+	.BYTE	5Ch, 0			;64 - d
+	.BYTE	4Fh, 0			;65 - e
+	.BYTE	5Dh, 0			;66 - f
+	.BYTE	5Eh, 0			;67 - g
+	.BYTE	5Fh, 0			;68 - h
+	.BYTE	54h, 0			;69 - i
+	.BYTE	60h, 0			;6A - j
+	.BYTE	61h, 0			;6B - k
+	.BYTE	62h, 0			;6C - l
+	.BYTE	6Bh, 0			;6D - m
+	.BYTE	6Ah, 0			;6E - n
+	.BYTE	55h, 0			;6F - o
+	.BYTE	56h, 0			;70 - p
+	.BYTE	4Dh, 0			;71 - q
+	.BYTE	50h, 0			;72 - r
+	.BYTE	5Bh, 0			;73 - s
+	.BYTE	51h, 0			;74 - t
+	.BYTE	53h, 0			;76 - u
+	.BYTE	68h, 0			;75 - v
+	.BYTE	4Eh, 0			;77 - w
+	.BYTE	66h, 0			;78 - x
+	.BYTE	52h, 0			;79 - Y
+	.BYTE	65h, 0			;7A - z
+	.BYTE	57h, 1			;7B - {
+	.BYTE	59h, 1			;7C - |
+	.BYTE	58h, 1			;7D - {
+	.BYTE	40h, 1			;7E - ~
+	.BYTE	3Ah, 2			;7F - DEL
+.PAGE
+	.PSECT	_ODATA_p
+
+	 .MOD	4
+membegin:
+
+;Following data is used during initialization only
+
+ourname:  .ASCIZ "TelnetServer"
+failmsg1: .ASCII {MT_FINALERR}"? TLNSRV: "
+failsz1=!$-failmsg1
+failmsg2: .ASCII {CR,LF}"          "
+failsz2=!$-failmsg2
+failmsg3: .ASCIZ {CR,LF}"? TLNSRV: Terminating"
+crlfmsg:  .BYTE  CR, LF, 0
+failsz3=!$-failmsg3
+badpidmsg:.ASCIZ "Bad requestor PID"
+nemamsg:  .ASCIZ "Not enough memory available"
+pcnflmsg: .ASCIZ "Cannot set up PCN device"
+cnomsg:   .ASCIZ "Cannot open IT (TCP) device"
+cnoimsg:  .ASCIZ "Cannot queue initial IT (TCP) open"
+nottcpmsg:.ASCIZ "Device is not an IP (TCP) class device"
+no2domsg: .ASCIZ "No TCP devices specified"
+bdspmsg:  .ASCIZ "Bad format device name specified"
+opnemsg:  .ASCII "Error opening device "
+devname:  .BLKB  16t
+nologmsg: .ASCIZ "Cannot open local log file"
+sivfmsg:: .ASCIZ "Cannot initialize interrupt vector"
+initmsg:  .ASCII {MT_INTRMDMSG}"% TLNSRV: Telnet server initialized for _"
+tcpname:  .BLKB  40t
+INITMSGSIZE=!$-initmsg
+pcnpname: .BLKB  16t
+pcnname:  .ASCIZ "PCN1:"
+$=pcnname+16t
+	.IRP	ver, >VERSION
+	.IRP	edit, >EDITNO
+finmsg1:  .ASCII {MT_FINALMSG}"% TLNSRV: v'ver'.''edit - Initialization complete"
+	.ENDR
+	.ENDR
+finsz1=!$-finmsg1
+msgname:  .ASCIZ "IPM:"
+
+reqname:  .BLKB  64t
+
+	.MOD	4
+argpntr:  .LONG  0, 0
+bufrbase: .LONG  800000h	;Offset of base of screen buffer area
+openparms:.BYTE	 PAR$GET|REP_TEXT, 8 ;Parameters for initial open of devices
+	  .WORD	 IOPAR_CLASS
+devclass: .BLKB  8t
+	  .BYTE  PAR$SET|REP_HEXV, 4
+	  .WORD	 IOPAR_FILOPTN
+	  .LONG  FO$XOSNAME|FO$NOPREFIX
+	  .BYTE  PAR$GET|REP_STR, 0
+	  .WORD  IOPAR_FILSPEC
+	  .LONG  tcpname, !tcpname
+	  .WORD  12t
+	  .WORD  0
+	  .BYTE  0
+
+	.MOD	4
+pcnparms: .BYTE  PAR$SET|REP_HEXV, 4
+	  .WORD	 IOPAR_FILOPTN
+	  .LONG  FO$XOSNAME|FO$NOPREFIX
+	  .BYTE  PAR$GET|REP_STR, 0
+	  .WORD  IOPAR_FILSPEC
+	  .LONG  pcnpname+1, !pcnpname
+	  .WORD  12t
+	  .WORD  0
+	  .BYTE  0
+
+	.END

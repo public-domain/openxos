@@ -1,0 +1,2684 @@
+	.TITLE	DFSCLS2 - DOS file service routines for XOS  - part 2
+
+;++++
+; This software is in the public domain.  It may be freely copied and used
+; for whatever purpose you see fit, including commerical uses.  Anyone
+; modifying this software may claim ownership of the modifications, but not
+; the complete derived code.  It would be appreciated if the authors were
+; told what this software is being used for, but this is not a requirement.
+
+;   THIS SOFTWARE IS PROVIDED BY THE AUTHORS "AS IS" AND ANY EXPRESS OR
+;   IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
+;   OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+;   IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+;   INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+;   BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS
+;   OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+;   ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR
+;   TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
+;   USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+;----
+
+	.PROC	80486
+	.INCLUD	XOSINC:\XMAC\XOS.PAR
+	.INCLUD	XOSINC:\XMAC\XOSX.PAR
+	.INCLUD	XOSINC:\XMAC\XOSTIME.PAR
+	.INCLUD	XOSINC:\XMAC\XOSERR.PAR
+	.INCLUD	XOSINC:\XMAC\XOSDISK.PAR
+	.INCLUD	XOSINC:\XMAC\XOSXDISK.PAR
+	.INCLUD	XOSINC:\XMAC\XOSXDFS.PAR
+	.INCLUD	XOSINC:\XMAC\XOSDOS.PAR
+	.INCLUD	XOSINC:\XMAC\XOSLKE.PAR
+	.INCLUD	XOSINC:\XMAC\XOSXLKE.PAR
+
+	LKECONT
+
+$$CHKCHAIN=!0
+
+	CODE
+
+	.SBTTL	dfsopena - Open device additional
+
+;Here for the open device additional entry - this is called whenever an
+;  additional DCB is opened for a file - called by movedevproc and duphandle
+;	c{EDI} = Offset of disk DCB
+;	CALL	dfsopena
+
+dfsopena::
+	MOVL	EBX, dcb_dkfilepnt.B[EDI] ;Point to base FIB for file
+	TESTB	ff_attrib.B[EBX], #A$DIRECT|A$LABEL ;Directory or label?
+	JE	2$.S			;No
+	ANDB	SS:xffCmd##, #~O$OUT	;Yes - don't allow output
+	TESTL	SS:xffCmd##, #O$TRUNCA|O$TRUNCW ;Trying to truncate file?
+	JNE	knlIllOut##		;Yes - fail
+2$:	TESTL	SS:xffCmd##, #O$OUT|O$CREATE|O$TRUNCA|O$TRUNCW
+					;Does he want to do output?
+	JE	4$.S			;No - go on
+	INCW	cb_writecnt.B[EBX]	;Yes - bump write count
+4$:	RET				;All done
+.PAGE
+	.SBTTL	dfsopen - Open device
+
+;Here for the open device entry
+;	c{EDI}    = Offset of disk DCB
+;	c{SS:EDX} = Address of expanded file path and name
+;	CALL	dfsopen
+
+dfsopen::
+	TESTL	SS:xffCmd##, #O$PHYS|O$RAW ;Want non-file IO?
+	JNE	2$.S			;Yes
+	CMPB	SS:[EDX], #0		;Maybe - have completely null name?
+	JNE	4$.S			;No - go on
+	ANDB	SS:xffCmd##, #~{O$IN|O$OUT};Yes - do non-file IO but don't
+2$:	JMP	xosdskForceDsk##	   ;  allow any input or output
+
+;Here for file IO
+
+4$:	ENTER	of_SIZE, 2		;Yes - create our level 2 stack frame
+	CALL	dfsopen2
+	JC	8$.S			;If error
+	JNE	filfnd.S
+	JMP	create			;If file not found
+
+;Here if error (C set)
+
+8$:	LEAVE
+	RET
+.PAGE
+;Here with final file or directory found - file is open and locked, directory
+;  is closed
+
+filfnd:
+.IF NE $$CHKCHAIN
+	CALL	checkchain#
+.ENDC
+	MOVL	EBX, dcb_dkfilepnt.B[EDI] ;Point to base FIB for file
+	MOVL	EAX, SS:xffCmd##
+	BTL	EAX, #O%COMPAT		;Does he want DOS compatability mode?
+	JNC	2$.S			;No - go on
+	CMPW	cb_nocomcnt.B[EBX], #0.B ;Yes - is file now open in other than
+					 ;  DOS compatability mode?
+	JNE	8$.S			;Yes - fail
+2$:	CMPW	cb_xrcnt.B[EBX], #0.B	;No - is file open for exclusive read
+					;  access?
+	JE	6$.S			;No - go on
+	TESTB	AL, #O$IN		;Yes - does it matter?
+	JNE	8$.S			;Yes - fail
+
+;Here if file not currently open for exclusive read or if this doesn't matter
+
+6$:	CMPW	cb_xwcnt.B[EBX], #0.B	;Is file open for exclusive write?
+	JE	10$.S			;No
+	TESTL	EAX, #O$OUT|O$TRUNCA|O$TRUNCW ;Yes - does it matter?
+8$:	JNE	errfbsy			;Yes
+
+;Here if file not currently open for exclusive write or if this doesn't matter
+
+10$:	BTL	EAX, #O%XWRITE		;Want exclusive write?
+	JNC	12$.S			;No
+	CMPW	cb_writecnt.B[EBX], #0.B ;Yes - can we have it?
+	JNE	8$.S			;No
+12$:	BTL	EAX, #O%XREAD		;Want exclusive read?
+	JNC	14$.S			;No
+	CMPW	cb_readcnt.B[EBX], #0.B	;Yes - can we have it?
+	JNE	8$.S			;No
+14$:	TESTB	ff_attrib.B[EBX], #A$DIRECT ;Are we opening a directory?
+	JE	16$.S			;No
+	ANDB	SS:xffCmd##, #~O$OUT	;Yes - make sure not trying to do output
+	ANDB	AL, #~O$OUT
+	TESTL	EAX, #O$TRUNCA|O$TRUNCW	;Want to truncate file?
+	JNE	errex			;Yes - can't do that!
+16$:	TESTB	ff_attrib.B[EBX], #A$LABEL ;No - is it a label?
+	JE	18$.S			;No
+	ANDL	SS:xffCmd##, #~{O$IN|O$TRUNCA|O$TRUNCW}
+	MOVL	EAX, SS:xffCmd##	;Yes
+18$:	TESTB	ff_attrib.B[EBX], #A$RDONLY ;Is it a read-only file?
+	JE	20$.S			;No - go on
+	TESTL	EAX, #O$TRUNCA|O$TRUNCW|O$OUT ;Want to change file?
+	JNE	errro			;Yes - fail
+20$:	TESTL	EAX, #O$TRUNCA|O$TRUNCW	;Want to truncate file?
+	JE	filfn2.S		;No
+	MOVL	ESI, [EDI]		;Yes - is the disk write protected?
+	TESTL	ESI, ESI
+	JE	errnu
+	TESTB	ucb_sts1.B[ESI], #U1$WPROT
+	JNE	filwpe.S		;Yes - fail
+	TESTB	of_wild.B[EBP], #02h	;Yes - have any wild-card characters?
+	JE	filfn2.S		;No - OK
+	MOVL	EAX, #ER_BDSPC		;Yes - fail
+	JMP	errcf
+
+filwpe:	MOVL	EAX, #ER_WPRER
+	JMP	errcf
+.PAGE
+;Here if requested access is OK
+
+filfn2:	MOVL	ESI, opn_frame1.B[EBP]
+	TESTB	ff_attrib.B[EBX], #A$ARCH ;Is the archive bit already set?
+	JNE	2$.S			;Yes - go on
+	TESTL	EAX, #O$OUT|O$TRUNCA|O$TRUNCW ;No - are we writing to this file?
+	JE	2$.S			;No
+	ORB	ff_attrib.B[EBX], #A$ARCH ;Yes - set the archive bit now
+	ORB	SS:opn_curattr.B[ESI], #A$ARCH
+	ORB	cb_sts.B[EBX], #CB$CHNGD ;Indicate FIB has been changed
+2$:	BTL	SS:xffHvValue1##, #IOV1%FILATTR ;Attribute byte given?
+	JNC	10$.S			;No
+	MOVB	DL, SS:opn_filattr.B[ESI] ;Yes - get it
+	TESTB	DL, #A$LABEL		;Is this a label?
+	JE	4$.S			;No
+	MOVB	DL, #A$LABEL		;Yes - make sure no other bits
+	ANDB	SS:xffCmd##, #~{O$IN|O$OUT} ;Cannot read or write it
+4$:	TESTB	DL, DL			;Any bits set?
+	JNE	6$.S			;Yes
+	MOVB	DL, #A$NORMAL		;No - its a normal file
+6$:	MOVB	DH, DL			;Trying to change DIR or LABEL bits?
+	XORB	DH, ff_attrib.B[EBX]
+	ANDB	DH, #A$DIRECT|A$LABEL
+	JE	8$.S			;No
+	ANDB	DH, DL			;Yes - trying to set one?
+	JNE	errifa			;Yes - fail
+	MOVB	DH, ff_attrib.B[EBX]	;No - don't clear it (but don't fail!)
+	ANDB	DH, #A$DIRECT|A$LABEL
+	ORB	DL, DH
+8$:	CMPB	ff_attrib.B[EBX], DL	;Are we changing it at all?
+	JE	10$.S			;No
+	MOVB	ff_attrib.B[EBX], DL	;Yes
+	MOVL	ECX, of_frame1.B[EBP]	;Get pointer to the level 1 stack frame
+	MOVB	SS:opn_curattr.B[ECX], DL
+	ORB	cb_sts.B[EBX], #CB$CHNGD ;Indicate FIB has been changed
+10$:	MOVL	EDX, of_frame1.B[EBP]	;Get pointer to the level 1 stack frame
+	BTL	SS:xffHvValue1##, #IOV1%GRPSIZE ;Was the group size specified?
+	JNC	filfn4.S		;No
+	MOVL	EAX, SS:opn_grpsize.B[EDX] ;Yes - get its value
+	TESTL	EAX, EAX		;Is it 0?
+	JE	filfn4.S		;Yes
+	MOVL	ff_grpsize.B[EBX], EAX	;No - store it
+.PAGE
+filfn4:	BTL	SS:xffCmd##, #O%ODF	;Are we opening a directory?
+	JC	filfn6			;Yes - don't fiddle with the date/time
+	TESTL	SS:xffHvValue1#, #IOV1$CDATE|IOV1$MDATE ;Date/time specified?
+	JE	10$.S			;No - just use default
+	MOVL	EDX, [EDI]		;Yes - is the disk write protected?
+	TESTL	EDX, EDX
+	JE	errnu
+	TESTB	ucb_sts1.B[EDX], #U1$WPROT
+	JNE	filwpe			;Yes - fail
+	ORB	ff_status.B[EBX], #FS$DATESET ;No - indicate date/time set
+	MOVL	EDX, opn_frame1.B[EBP]
+	BTL	SS:xffHvValue1##, #IOV1%MDATE ;Have modify date/time value?
+	JNC	2$.S			;No
+	MOVL	EAX, SS:opn_mdate+0.B[EDX] ;Yes - use it
+	TESTB	SS:opn_datefmt.B[EDX], #DF$DOSMDATE
+	MOVL	EDX, SS:opn_mdate+4.B[EDX]
+	JMP	4$.S
+
+;Here to use specified creation date and time
+
+2$:	MOVL	EAX, SS:opn_cdate+0.B[EDX]
+	TESTB	SS:opn_datefmt.B[EDX], #DF$DOSCDATE ;Already in DOS format?
+	MOVL	EDX, SS:opn_cdate+4.B[EDX]
+4$:	JNE	14$.S			;If already in DOS format
+	ADDL	EAX, #XT_SECOND		;System format - round to 2-second value
+	ADCL	EDX, #0.B
+	CALL	knlSys2DosTime##	;Convert to DOS time format
+	XCHGL	EAX, EDX
+	CALL	knlSys2DosDate##	;Convert to DOS date format
+	JNC	6$.S
+	MOVL	EAX, #21h		;Before 1980 - make it 1-Jan-80
+6$:	SHLL	EAX, #16t
+	JMP	12$.S
+
+;Here to use default date and time
+
+10$:	TESTL	SS:xffCmd##, #O$TRUNCA|O$TRUNCW ;Are we truncating the file?
+	JE	filfn6.S		;No - leave date and time unchanged
+	CLI				;Yes
+	MOVL	EAX, knlTickCnt##	;Use current time
+	PUSHL	knlDosDate##
+	STI
+	CALL	knlTick2DosTime##
+	POPL	EDX
+	SHLL	EDX, #16t
+12$:	ORL	EAX, EDX
+14$:	MOVL	ff_time.B[EBX], EAX
+	ORB	cb_sts.B[EBX], #CB$CHNGD ;Indicate FIB has been changed
+	BTL	SS:xffCmd##, #O%TRUNCA	;Want to truncate file allocation?
+	JNC	18$.S			;No
+	MOVL	EBX, dcb_dkfilepnt.B[EDI] ;Yes - point to buffer containing file
+	CLRL	ECX			  ;  FIB
+	CALL	dfsreduce#		;Reduce file to 0 length
+	JC	16$.S			;If error
+	CALL	dfswritefats#		;;;;;;;;;;Write changed FATs to disk
+	JNC	filfn6.S		;Thats all
+16$:	JMP	errcf
+
+;Here if do not want to truncate allocated length of file
+
+18$:	BTL	SS:xffCmd##, #O%TRUNCW	;Want to truncate written file length?
+	JNC	filfn6.S		;No - finished here
+	MOVL	EBX, dcb_dkfilepnt.B[EDI] ;Yes - point to base file FIB
+	CLRL	EAX			;Set length of file to 0
+	CMPL	ff_size.B[EBX], EAX	;Is the file length already 0?
+	JE	filfn6.S		;Yes - nothing needed here
+	MOVL	ff_size.B[EBX], EAX	;No - set it to 0 now
+	ORB	cb_sts.B[EBX], #CB$CHNGD ;Indicate FIB has been changed
+filfn6:	MOVL	EBX, dcb_dkfilepnt.B[EDI] ;Make sure have FIB offset
+	BTL	SS:xffCmd##, #O%OUT	 ;Increment write count for file if
+	ADCW	cb_writecnt.B[EBX], #0.B ;  doing output to file
+	BTL	SS:xffCmd##, #O%IN	;Increment read count for file if
+	ADCW	cb_readcnt.B[EBX], #0.B	;  doing input from file
+	BTL	SS:xffCmd##, #O%COMPAT	;Increment no compatability count if
+	CMC				;  not DOS compatability mode?
+	ADCW	cb_nocomcnt.B[EBX], #0.B
+	BTL	SS:xffCmd##, #O%XWRITE	;Increment exclusive write count if
+	ADCW	cb_xwcnt.B[EBX], #0.B	;  want exclusive write access
+	BTL	SS:xffCmd##, #O%XREAD	;Increment exclusive read count if
+	ADCW	cb_xrcnt.B[EBX], #0.B	;  want exclusive read access
+	JMP	opendone
+
+;Here if trying to change a read-only file
+
+errro:	MOVL	EAX, #ER_FILAD
+	JMP	errcf.S
+
+;Here if should give "Illegal attribute change" error
+
+errifa:	MOVL	EAX, #ER_IATTR
+	JMP	errcf.S
+
+;Here if should give "file busy" error
+
+errfbsy:MOVL	EAX, #ER_BUSY
+	JMP	errcf.S
+
+;Here if should give "disk changed" error
+
+errnu:	MOVL	EAX, #ER_MDCHG
+	JMP	errcf.S
+
+;Here if should give "file exists" error
+
+errex:	MOVL	EAX, #ER_ISDIR		;Error = file IS a DIRectory
+errcf:	PUSHL	EAX			;Save error code
+	CALL	dfscfil2#		;Close the file
+	POPL	EAX
+	STC
+lv002:	LEAVE
+	RET
+.PAGE
+;Here if file not found and want to create a file - when get here the
+;  directory is open and locked
+;	c{EDX} = Offset of first open slot found in directory
+
+create:	
+.IF NE $$CHKCHAIN
+	CALL	checkchain#
+.ENDC
+	MOVW	AX, of_namlong[EBP]	;Have a null file name?
+	CMPW	AX, #0.B
+	JE	6$.S			;Yes - fail
+	TESTB	of_wild.B[EBP], #02h	;No - any wild-card or illegal
+					;  characters in name?
+	JNE	6$.S			;Yes - fail
+	MOVL	EAX, [EDI]		;No - is the disk write protected?
+	TESTL	EAX, EAX
+	JE	2$.S
+	TESTB	ucb_sts1.B[EAX], #U1$WPROT
+	JNE	4$.S			;Yes - fail
+	BTL	SS:xffCmd##, #O%ODF	;No - creating directory?
+	JNC	newfile.S		;No
+	ANDL	SS:xffCmd##, #~{O$XWRITE|O$XREAD}
+	MOVB	AL, #A$DIRECT		;Get attribute byte
+	JMP	12$.S			;Continue
+
+;Here if disk has been changed
+
+2$:	MOVL	EAX, #ER_MDCHG
+	JMP	8$.S
+
+;Here if disk is write protected
+
+4$:	MOVL	EAX, #ER_WPRER
+	JMP	8$.S
+
+;Here if have wild-card character in name of file to create - fail
+
+6$:	MOVL	EAX, #ER_BDSPC		;Get error code
+8$:	MOVL	EBX, of_frame1.B[EBP]
+	JMP	14$.S			;Go close directory and exit
+
+;Here if should create new file
+
+newfile:MOVB	AL, #A$NORMAL|A$ARCH	;Assume want default attributes
+	BTL	SS:xffHvValue1##, #IOV1%FILATTR ;Attribute byte given?
+	JNC	10$.S			;No
+	MOVL	ESI, opn_frame1.B[EBP]
+	MOVB	AL, SS:opn_filattr.B[ESI] ;Yes - get it
+	TESTB	AL, #A$LABEL		;Is this a label?
+	JE	10$.S			;No
+	MOVB	AL, #A$LABEL		;Yes - make sure no other bits
+	ANDB	SS:xffCmd##, #~{O$IN|O$OUT} ;Cannot read or write it
+10$:	ANDB	AL, #~A$DIRECT		;Make sure directory bit not set
+	MOVL	ESI, [EDI]		;Get offset of UCB
+	TESTL	ESI, ESI
+	JE	2$.S
+12$:	CALL	dfsmkfib#		;Create a FIB for the new file
+	JNC	16$.S			;OK - go on
+14$:	MOVL	EDX, of_frame1.B[EBP]
+	MOVB	SS:opn_curattr.B[EDX], #0 ;Error - clear current attribute bits
+15$:	PUSHL	EAX
+	CALL	dfscfil2#		;Close the directory
+	POPL	EAX			;Restore error code
+	LEAVE
+	STC
+	RET
+
+;Here with a new FIB created
+
+16$:	TESTB	ff_attrib.B[EBX], #A$DIRECT ;Did we just create a directory?
+	JE	opendone		;No
+
+;Here if we have just created a directory - we must create the . and .. entires
+
+	INCW	cb_xrcnt.B[EBX]		;Make the directory exclusive read and
+	INCW	cb_xwcnt.B[EBX]		;  write so no one else can access it
+					;  while we play with the interlocks!
+	CALL	xosdskUnlkBufr##	;Unlock the new directory
+	CALL	xosdskGetDiskRes##	;Get the disk resource
+	JC	15$.S			;If error (must have lost the disk!)
+	CALL	xosdskLockBufrW##	;Lock the file again
+	DECW	cb_xrcnt.B[EBX]
+	DECW	cb_xwcnt.B[EBX]
+	PUSHL	ECX			;Save directory cluster
+	CLRL	EAX			;Allocate 1 cluster to the directory
+	INCL	EAX
+	CALL	dfsextend#
+	JC	34$			;If error
+	PUSHL	ESI
+	PUSHL	EDX
+	PUSHL	ECX
+	PUSHL	EBX
+	PUSHL	EAX
+	MOVL	ESI, [EDI]		;Get block on disk
+	TESTL	ESI, ESI
+	JE	2$
+	MOVB	CL, ucb_clusx.B[ESI]
+	SHLL	EAX, CL
+	ADDL	EAX, ucb_fcblk.B[ESI]
+	MOVL	dcb_dkdblk.B[EDI], EAX
+	CALL	xosdskNewSBufr##	;Get a zeroed buffer for the first
+	JC	34$			;  directory block
+	MOVL	ECX, dcb_dkfilepnt.B[EDI]
+	MOVL	EAX, #'    '		;Setup . and .. file names
+	MOVL	[EBX], EAX
+	MOVB	[EBX], #'.'
+	MOVL	4.B[EBX], EAX
+	MOVL	32t+0.B[EBX], EAX
+	MOVW	32t+0.B[EBX], #'..'
+	MOVL	32t+4.B[EBX], EAX
+	MOVL	EAX, #'   '+A$DIRECT*1000000h
+	MOVL	8.B[EBX], EAX
+	MOVL	32t+8.B[EBX], EAX
+	MOVL	EAX, ff_time.B[ECX]	;Get date and time for directory
+	MOVL	de_time.B[EBX], EAX	;Store it for both . and ..
+	MOVL	32t+de_time.B[EBX], EAX
+	MOVL	EAX, [ESP]		;Get directory cluster
+	MOVW	de_pntr.B[EBX], AX	;Store as cluster for .
+	TESTB	ucb_sts3.B[ESI], #U3$FAT32 ;Have 32 bit FATs?
+	JE	20$.S			;No
+	SHRL	EAX, #16t		;Yes - store high 16 bits of cluster
+	MOVW	de_pntrhi.B[EBX], AX	;  number
+20$:	MOVL	EAX, 20t.B[ESP]		;Get parent directory cluster
+	CMPL	EAX, ucb_rootcls.B[ESI]	;Is this the root directory?
+	JNE	22$.S			;No
+	CLRL	EAX			;Yes
+22$:	MOVW	32t+de_pntr.B[EBX], AX	;Store as cluster for ..
+	TESTB	ucb_sts3.B[ESI], #U3$FAT32 ;Have 32 bit FATs?
+	JE	24$.S			;No
+	SHRL	EAX, #16t		 ;Yes - store high 16 bits of cluster
+	MOVW	32t+de_pntrhi.B[EBX], AX ;  number
+24$:	CALL	xosdskWriteBufr##	;Write out the buffer
+	JC	32$.S			;If error
+	CALL	xosdskRelsLkBufr##	;Release buffer
+	MOVB	CL, ucb_clussize.B[ESI]	;Get cluster size
+28$:	DECB	CL			;Need to zero another cluster?
+	JE	36$.S			;No
+	INCL	dcb_dkdblk.B[EDI]	;Yes - bump block number
+	PUSHL	ECX
+	CALL	xosdskNewSBufr##	;Get a zeroed buffer
+	JC	34$.S			;If error
+	CALL	xosdskWriteBufr##	;Write it out
+	POPL	ECX
+	JC	32$.S			;If error
+	CALL	xosdskRelsLkBufr##	;Release the buffer
+	JMP	28$.S			;Continue
+
+;Here if error while creating "empty" directory
+
+32$:	PUSHL	EAX
+	CALL	xosdskGiveLkBufr##
+	POPL	EAX
+34$:	CALL	xosdskGiveDiskRes##	;Give up the disk resource
+	PUSHL	EAX
+	CALL	dfscfil2#
+	POPL	EAX
+	STC
+	LEAVE
+	RET
+
+;Here with entire new directory zeroed
+
+36$:	POPL	EAX			;Finish extending the new directory
+	POPL	EBX
+	POPL	ECX
+	POPL	EDX
+	POPL	ESI
+	CALL	dfsextfin#
+	JC	34$.S			;If error
+	CALL	xosdskGiveDiskRes##
+	MOVL	ESI, [EDI]		;OK
+	MOVL	EAX, ucb_clussize.B[ESI] ;Get cluster size
+	SHLL	EAX, #9			;Change to bytes
+	MOVL	ff_size.B[EBX], EAX	;Store initial file size
+					;Fall into opendone on next page
+.PAGE
+;Here when open is finished
+
+opendone:
+	MOVL	EBX, dcb_dkfilepnt.B[EDI] ;Make sure have offset of file FIB
+	CALL	xosdskUnlkBufr##	;Unlock the FIB
+	CMPL	of_direbfr.B[EBP], #0.B	;Do we have a directory buffer now?
+	JE	4$.S			;No
+	MOVL	EBX, of_direbfr.B[EBP]	;Yes
+	TESTB	cb_sts.B[EBX], #CB$CHNGD ;Have we changed the directory?
+	JE	2$.S			;No - go on
+	CALL	xosdskLockBufrW##	;Yes
+	CALL	dfswritedir#		;Write out the directory block
+	CALL	xosdskUnlkBufr##
+2$:	CALL	xosdskRelsBufr##	;Give up the directory buffer
+4$:	MOVL	EBX, dcb_dkfilepnt.B[EDI] ;Restore offset of file FIB
+	CLRL	EAX			;Set to beginning of file
+	TESTL	SS:xffCmd##, #O$APPEND|O$FAPPEND ;Want to append to the file?
+	JE	8$.S			;No
+	MOVL	EAX, ff_size.B[EBX]	;Yes - set to end of file
+8$:	MOVL	dcb_dkfpos.B[EDI], EAX
+	TESTB	ff_attrib.B[EBX], #A$DIRECT|A$LABEL ;Directory or label?
+	JE	10$.S			;No
+	ANDB	SS:xffCmd##, #~O$OUT	;Yes - don't allow output
+	TESTB	ff_attrib.B[EBX], #A$DIRECT ;Is it a directory?
+	JE	10$.S			;No
+	ORB	dcb_sts2.B[EDI], #D2$DIRECT ;Yes - remember this
+10$:	CALL	dfsgivefilespec		;Give him the file specification
+	LEAVE				;Give up our stack frame
+ret004:	RET				;All done
+.PAGE
+;Subroutine to give user complete file specification after the file has been
+;  opened.
+
+dfsgivefilespec::
+	BTL	SS:xffPVFilOpt##, #FO%PATHNAME ;Does he want the path using
+					       ;  long names?
+	JNC	2$.S			;No
+	MOVB	AL, #FS_PATHNAME	;Yes
+	BTL	SS:xffHvValue1##, #IOV1%RENAME ;2nd name for rename?
+	JNC	1$.S			;No
+	MOVB	AL, #FS_NPATHNAME	;Yes
+1$:	CALL	givepath
+	JC	ret004.S
+	BTL	SS:xffCmd##, #O%ODF
+	JC	6$.S
+	JMP	4$.S
+
+2$:	BTL	SS:xffCmd##, #O%ODF
+	JC	8$.S
+4$:	BTL	SS:xffPVFilOpt##, #FO%FILENAME ;Does he want the long file name?
+	JNC	8$.S			;No
+6$:	MOVB	AL, #FS_FILENAME
+	BTL	SS:xffHvValue1##, #IOV1%RENAME ;2nd name for rename?
+	JNC	7$.S			;No
+	MOVB	AL, #FS_NFILENAME
+7$:	CALL	givename
+	JC	ret004.S
+8$:	BTL	SS:xffPVFilOpt##, #FO%PATHDOS ;Does he want the path using
+					      ;  short names?
+	JNC	12$.S			;No
+	MOVB	AL, #FS_PATHDOS		;Yes
+	BTL	SS:xffHvValue1##, #IOV1%RENAME ;2nd name for rename?
+	JNC	10$.S			;No
+	MOVB	AL, #FS_NPATHDOS
+10$:	CALL	givepath
+	JC	22$.S
+	BTL	SS:xffCmd##, #O%ODF
+	JC	16$.S
+	JMP	14$.S
+
+12$:	BTL	SS:xffCmd##, #O%ODF
+	JC	18$.S
+14$:	BTL	SS:xffPVFilOpt##, #FO%FILEDOS ;Does he want the short file name?
+	JNC	18$.S			;No
+16$:	MOVB	AL, #FS_FILEDOS		;Yes
+	BTL	SS:xffHvValue1##, #IOV1%RENAME ;2nd name for rename?
+	JNC	17$.S			;No
+	MOVB	AL, #FS_NFILEDOS	;Yes
+17$:	CALL	givename
+18$:	BTL	SS:xffPVFilOpt##, #FO%ATTR ;Does he want attributes?
+	JNC	22$.S			;No
+	BTL	SS:xffPVFilOpt##, #FO%NOPREFIX ;Yes - also want prefix bytes?
+	JC	20$.S			;No - can't give him attributes!
+	MOVB	AL, #FS_ATTR		;Yes - give him the prefix character
+	CALL	knlGivUChr##
+	MOVL	EBX, dcb_dkfilepnt.B[EDI]
+	MOVB	AL, ff_attrib.B[EBX]	;Get attribute byte for file
+	CALL	knlGivUChr##		;Give him the attribute byte
+	MOVB	AL, #0h			;Second attribute byte is always 0
+	JMP	knlGivUChr##		;  for DOS
+
+20$:	CLC
+22$:	RET
+.PAGE
+;Subroutine to give user a file path
+;	c(AL) = Prefix character
+;	CALL	givepath
+
+givepath:
+	MOVL	EBX, dcb_dkfilepnt.B[EDI]
+	BTL	SS:xffPVFilOpt##, #FO%NOPREFIX ;Want a prefix character?
+	JC	2$.S			;No
+	PUSHL	EAX			;Yes
+	CALL	knlGivUChr##
+	POPL	EAX
+2$:	CMPL	cb_dirfib.B[EBX], #0.B	;Do we have a parent?
+	JE	6$.S			;No
+	MOVL	EBX, cb_dirfib.B[EBX]	;Yes
+givepath2:
+	CMPL	cb_dirfib.B[EBX], #0.B	;Do we have a parent?
+	JE	4$.S			;No - finished recuring
+	PUSHL	EBX			;Yes
+	MOVL	EBX, cb_dirfib.B[EBX]	;Get parent FIB
+	CALL	givepath2		;Yes - recur!
+	POPL	EBX
+4$:	CALL	givename2		;Give him this name
+6$:	PUSHL	EAX
+	MOVB	AL, #'\'		;Give him a back-slash
+	CALL	knlGivUChr##
+8$:	POPL	EAX
+	RET
+
+;Subroutine to give user a file name
+;	c(AL) = Prefix character
+;	CALL	givename
+
+;NOTE:	This code counts on the fact that FS_PATHNAME and FS_FILENAME are
+;	even values and FS_PATHDOS and FS_FILEDOS are odd values!
+
+givename:
+	MOVL	EBX, dcb_dkfilepnt.B[EDI]
+	BTL	SS:xffPVFilOpt##, #FO%NOPREFIX ;Want a prefix character?
+	JC	10$.S			;No
+	BTL	SS:xffCmd##, #O%ODF	;Really?
+	JC	10$.S			;No
+	PUSHL	EAX			;Yes
+	CALL	knlGivUChr##
+	POPL	EAX
+10$:	CALL	givename2
+	BTL	SS:xffCmd##, #O%ODF	;Need a final back-slash?
+	JNC	12$.S			;No
+	TESTL	ECX, ECX		;Maybe
+	JNE	6$.S			;Yes
+12$:	RET				;No
+
+givename2:
+	PUSHL	EAX			;Save prefix byte value
+	TESTB	AL, #01h		;Want the long name?
+	JNE	16$.S			;No
+	CLRL	ECX			;Yes
+	CMPL	ff_filename+0.B[EBX], #0.B ;Have a short long name?
+	JE	14$.S			;No
+	LEAL	EDX, ff_filename.B[EBX]	;Yes
+	JMP	18$.S
+
+14$:	MOVL	EDX, ff_filename+4.B[EBX] ;Have a long long name?
+	TESTL	EDX, EDX
+	JE	16$.S			;No
+	ADDL	EDX, #3t.B		;Yes
+	JMP	18$.S
+
+;Here to give him the short name - either because he asked for it or because
+;  we don't have a long name
+
+16$:	LEAL	EDX, ff_filedos.B[EBX]
+18$:	MOVB	AL, [EDX]
+	CMPB	AL, #0
+	JE	8$.S
+	INCL	EDX
+	INCL	ECX
+	CMPB	AL, #FS_MIN		;Need an escape character?
+	JB	20$.S			;No
+	PUSHL	EAX			;Yes
+	MOVB	AL, #FS_ESC
+	CALL	knlGivUChr##
+	POPL	EAX
+20$:	CALL	knlGivUChr##
+	JMP	18$.S
+.PAGE
+	.SBTTL	dfsopen2 - Subroutine to do first part of open
+
+;Subroutine to do first part of open (also called for new name by rename)
+;	c(AL)     = Prefix character for returned path string
+;	c{SS:EDX} = Address of expanded file path and name
+;	c{EDI}    = Offset of DCB
+;	CALL	dfsopen2
+;	C:set = Error, all directories closed unless searching open directory
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  Z:set = File not found
+;	    Directory is open and locked
+;	  Z:clr = File found
+;	    File is open and locked
+
+dfsopen2::
+	PUSHL	EAX
+	PUSHL	EDI
+	PUSHL	SS			;Clear the stack frame
+	POPL	ES
+	LEAL	EDI, -12t.B[EBP]	;(this allows for a 2 item display)
+	CLRL	EAX
+	MOVL	ECX, #of_SIZE/4
+	STD
+	RSTOSL	[EDI]
+	POPL	EDI
+	MOVL	of_namepnt.B[EBP], EDX	;Store offset of file name buffer
+	MOVB	of_lgcnt.B[EBP], #0FFh
+	POPL	EAX
+	CALL	xosdskSetupSpec##	;Set up the file specification
+	JC	7$.S			;If error
+	BTL	SS:xffHvValue1##, #IOV1%DIRHNDL ;Want to search open directory?
+	JC	dfssodir		;Yes
+	CALL	dfsnchar		;No - get first character
+	CMPB	AL, #0			;Is the sting null?
+	JE	8$.S			;Yes - must want to open the root
+	CMPB	AL, #'\'		;No - does path start at root?
+	JE	rtpath			;Yes
+	PUSHL	EAX			;No
+2$:	CALL	knlFindPath##		;Find default path for device
+	JC	6$.S			;If error (should only happen if disk
+					;  has been changed since path was set!)
+	JE	rtpath2			;If no path, start at root
+	MOVL	EDX, ESI		;Save offset of path block
+	JMP	pathrd2
+
+;Here if error getting the path for the device
+
+6$:	POPL	EBX
+7$:	RET
+
+;Here to open root or current directory as a file
+
+8$:	CMPB	of_respath.B[EBP], #0	;Have we resolved the path?
+	JNE	opnroot.S		;Yes - go open the root
+	PUSHL	#0.B			;No - use current path
+	BTL	SS:xffHvValue1##, #IOV1%SRCATTR ;Did he specify attributes?
+	JNC	10$.S			;No - fail
+	MOVL	EDX, opn_frame1.B[EBP]	;Yes
+	TESTB	SS:opn_srcattr.B[EDX], #A$DIRECT ;Want a directory?
+	JNE	2$.S			;Yes - OK
+10$:	POPL	EAX
+opnfnf:	MOVL	EAX, #ER_FILNF		;No - fail
+	BTL	SS:xffCmd##, #O%ODF
+	JNC	opnerr.S
+	MOVB	AL, #ER_DIRNF
+opnerr:	STC
+	RET
+.PAGE
+;Here to really open the root if null name given
+
+opnroot:MOVL	ESI, [EDI]		;Get offset of UCB
+	TESTL	ESI, ESI
+	JE	opndc			;Fail if none
+	BTL	SS:xffHvValue1##, #IOV1%SRCATTR ;Did he specify attributes?
+	JNC	opnfnf.S		;No - fail
+	MOVL	EDX, opn_frame1.B[EBP]	;Yes
+	TESTB	SS:opn_srcattr.B[EDX], #A$DIRECT ;Want a directory?
+	JE	opnfnf.S		;No - fail
+	MOVL	EBX, ucb_rootpnt.B[ESI]	;Yes - get root FIB
+	MOVXWL	EAX, cb_errcode.B[EBX]	;Any error on this buffer?
+	TESTL	EAX, EAX
+	JNE	opnerr.S		;Yes
+	CALL	xosdskLockBufrW##	;No - lock the directory FIB
+	CMPW	cb_usecnt.B[EBX], #0FFFFFFFEh.B
+	JAE	2$.S
+	INCW	cb_usecnt.B[EBX]
+	INCW	cb_opencnt.B[EBX]
+	MOVL	dcb_dkfilepnt.B[EDI], EBX
+	MOVL	dcb_dkcfib.B[EDI], EBX
+	CLRL	EAX
+	MOVL	dcb_dkfpos.B[EDI], EAX
+	JMP	filst2			;Continue
+
+;Here if use count for the root FIB is too large
+
+2$:	CALL	xosdskUnlkBufr##	;Unlock the root FIB
+	MOVL	EAX, #ER_TMRQB
+	STC
+	RET
+
+
+pathrd2:CMPL	FS:pn_fpnt1.B[EDX], #0.B ;Do we have a directory FIB?
+	JNE	10$			;Yes - go on
+
+;Here if do not have a FIB for the default path directory - this will happen
+;  if a device is dismounted after a path is set or if there is an error on
+;  the directory - in this case we try to open the directory again - if this
+;  works, we just re-establish the directory FIB for the path and continue
+;  as if all is normal - if it fails, we return the error, leaving the path
+;  without a FIB (he may put the disk back next time!)
+
+	PUSHL	SS:xffCmd##
+	MOVL	SS:xffCmd##, #O$ODF
+	PUSHL	SS:xffHvValue1##
+	PUSHL	SS:xffNdValue1##
+	PUSHL	SS:xffPVFilOpt##
+	CLRL	EAX
+	MOVL	SS:xffHvValue1##, EAX
+	MOVL	SS:xffNdValue1##, EAX
+	MOVL	SS:xffPVFilOpt##, EAX
+	PUSHL	FS
+	PUSHL	EDX
+	MOVL	ECX, FS:[EDX]		;Get length of the path string
+	SUBL	ECX, #pn_string.B
+	SUBL	ESP, ECX		;Allocate stack space for the name
+	PUSHL	ECX
+	PUSHL	EDI
+	PUSHL	ESI
+	PUSHL	SS
+	POPL	ES
+	LEAL	EDI, 12t.B[ESP]
+	LEAL	ESI, pn_string.B[EDX]
+	SHRL	ECX, #2
+	CLD
+	RMOVSL	[EDI], FS:[ESI]		;Copy name to our stack
+	POPL	ESI
+	POPL	EDI
+	LEAL	EDX, 4.B[ESP]
+	MOVL	EBX, dcb_sdisp.B[EDI]	;Open the last directory
+	CALL	dfsopen
+	POPL	ECX
+	JC	24$
+	ADDL	ESP, ECX
+	POPL	EDX
+	POPL	FS
+	MOVL	EBX, dcb_dkfilepnt.B[EDI]
+	MOVL	FS:pn_fpnt1.B[EDX], EBX
+4$:	CMPW	cb_usecnt.B[EBX], #0FFFFFFFEh.B
+	JB	6$.S			;See if we can increase the use counts
+	CALL	clspathdir		;  on the FIB and all of its parents
+	POPL	SS:xffPVFilOpt##
+	POPL	SS:xffNdValue1##
+	POPL	SS:xffHvValue1##
+	POPL	SS:xffCmd##
+	JMP	14$.S
+
+6$:	MOVL	EBX, cb_dirfib.B[EBX]
+	TESTL	EBX, EBX
+	JNE	4$.S
+	MOVL	EBX, dcb_dkfilepnt.B[EDI]
+8$:	INCW	cb_usecnt.B[EBX]	;Bump use count and open counts on the
+	INCW	cb_opencnt.B[EBX]	;  FIB buffer and on all of its
+	MOVL	EBX, cb_dirfib.B[EBX]	;  parent directory FIB buffers
+	TESTL	EBX, EBX
+	JNE	8$.S
+	CALL	clspathdir
+	POPL	SS:xffPVFilOpt##
+	POPL	SS:xffNdValue1##
+	POPL	SS:xffHvValue1##
+	POPL	SS:xffCmd##
+
+;Here with FIB for the default directory
+
+10$:	MOVL	EBX, FS:pn_fpnt1.B[EDX]
+12$:	MOVL	EBX, cb_dirfib.B[EBX]
+	TESTL	EBX, EBX
+	JE	16$.S
+	CMPW	cb_usecnt.B[EBX], #0FFFFFFFEh.B
+	JB	12$.S
+14$:	POPL	EAX
+	MOVL	EAX, #ER_TMRQB
+	STC
+	RET
+
+16$:	MOVL	EBX, FS:pn_fpnt1.B[EDX]
+18$:	MOVL	EBX, cb_dirfib.B[EBX]
+	TESTL	EBX, EBX
+	JE	20$.S
+	INCW	cb_usecnt.B[EBX]
+	INCW	cb_opencnt.B[EBX]
+	JMP	18$.S
+
+20$:	MOVL	EBX, FS:pn_fpnt1.B[EDX]
+	MOVL	ESI, [EDI]		;Get offset of UCB
+	TESTL	ESI, ESI
+	JNE	rtpath4
+opndc:	POPL	EAX
+	MOVL	EAX, #ER_MDCHG
+	STC
+	RET
+
+;Here if have error opening the directory
+
+24$:	ADDL	ESP, ECX		;Fix up the stack
+	POPL	EDX
+	POPL	FS
+	POPL	SS:xffPVFilOpt##
+	POPL	SS:xffNdValue1##
+	POPL	SS:xffHvValue1##
+	POPL	SS:xffCmd##
+	POPL	EBX			;Discard first character
+retsc6:	STC				;Indicate error
+	RET
+
+clspathdir:
+	PUSHL	SS:xffOption##
+	CLRL	EAX
+	MOVL	SS:xffOption##, EAX
+	PUSHL	EDX
+	PUSHL	FS
+	CALL	dfsclose2#
+	POPL	FS
+	POPL	EDX
+	POPL	SS:xffOption##
+	RET
+.PAGE
+;Here if use count on the root directory FIB is too large
+
+2$:	CALL	xosdskUnlkBufr##	;Unlock the root directory FIB
+	MOVL	EAX, #ER_TMRQB
+	STC
+	RET
+
+;Here if path should start at the root
+
+rtpath:	CALL	dfsnchar		;Get first character of name of first
+	PUSHL	EAX			;  directory and save it
+rtpath2:MOVL	ESI, [EDI]		;Get offset of UCB
+	TESTL	ESI, ESI
+	JE	opndc
+	MOVL	EBX, ucb_rootpnt.B[ESI]	;Get buffer which contains root FIB
+rtpath4:MOVXWL	EAX, cb_errcode.B[EBX]	;Any error on this buffer?
+	TESTL	EAX, EAX
+	JNE	retsc6.S		;Yes
+	CALL	xosdskLockBufrW##	;Lock the root directory FIB
+	CMPW	cb_usecnt.B[EBX], #0FFFFFFFEh.B
+	JAE	2$.S
+	INCW	cb_usecnt.B[EBX]
+	INCW	cb_opencnt.B[EBX]
+	MOVL	dcb_dkfilepnt.B[EDI], EBX
+	MOVL	dcb_dkcfib.B[EDI], EBX
+	CLRL	EAX
+	MOVL	dcb_dkfpos.B[EDI], EAX
+	POPL	EAX			;Fall into diropn on next page
+.PAGE
+;Here with next directory to search open
+;	c(AL) = First character in next name
+
+diropn:	TESTB	AL, AL			;Have another name to search for?
+	JE	nulname			;No
+	CALL	copyname		;Yes
+	JC	12$.S
+	TESTB	AL, AL			;Stopped by end of name?
+	JE	filset			;Yes
+	TESTB	of_wild.B[EBP], #02h	;Have wild-card character in name?
+	JNE	12$.S			;Yes - fail
+	MOVB	SS:[EBX], #0		;Put null at end
+	CALL	dfsfinddir		;Search for next directory
+	JC	10$.S			;If error
+	JNE	dirfnd.S		;If found it
+	BTL	SS:xffCmd##, #O%ODF	;Not found - trying to create directory?
+	JNC	8$.S			;No
+	BTL	SS:xffCmd##, #O%CREATE	;Maybe
+	JNC	8$.S			;No
+6$:	CALL	dfsnchar		;Yes - is this the last directory?
+	JE	22$.S			;Yes - not found
+	CMPB	AL, #'\'
+	JNE	6$.S
+8$:	MOVL	EAX, #ER_DIRNF		;Error = "DIRectory Not Found"
+10$:	PUSHL	EAX
+	CALL	dfscfil2#		;Close the directory
+	POPL	EAX			;Restore error code
+	STC
+	RET
+
+;Here if bad name
+
+12$:	CALL	dfscfil2#		;Too long - close the directory
+dbdspc:	MOVL	EAX, #ER_BDSPC		;Error = BaD file SPeCification
+	STC
+	RET
+
+;Here if trying to create directory and it does not exist
+
+22$:	CLRL	EAX			;Indicate not found
+	RET				;And return
+.PAGE
+;Here if directory found
+
+dirfnd:	CALL	dfsnchar
+	JMP	diropn			;Continue
+
+;Here if file name is null
+
+nulname:BTL	SS:xffCmd##, #O%ODF	;Want to open last directory?
+	JC	filst2.S		;Yes
+	CALL	dfscfil2#		;No - close the directory
+	JMP	dbdspc.S
+
+;Here with name of file to find setup
+
+filset:	TESTB	AH, AH			;Have period in name?
+	JE	6$.S			;No
+	CMPB	SS:-1.B[EBX], #'.'	;Yes - was the period at the end?
+	JNE	6$.S			;No
+	DECL	EBX			;Yes - discard it
+6$:	MOVB	SS:[EBX], #0		;Put null at end
+	BTL	SS:xffCmd##, #O%ODF	;Really want to open last directory?
+	JNC	opnfil.S		;No
+filst2:	BTL	SS:xffCmd##, #O%CREATE	;Yes - trying to create directory?
+	JNC	14$.S			;No - go on
+10$:	CALL	dfscfil2#		;Yes - close the directory
+	MOVL	EAX, #ER_FILEX		;Error = File Exists
+	STC
+	RET
+
+;Here if not opening final directory
+
+opnfil:	CALL	dfsfindfile		;Search for the file
+	JC	18$.S			;If error
+	JE	notfnd			;If file not found
+	CALL	storedirpos
+	BTL	SS:xffCmd##, #O%FAILEX	;Should we fail if the file exists?
+	JC	10$.S			;Yes
+14$:	TESTL	EDI, EDI		;No - clear Z and C
+	RET				;Return
+
+;Here if error return from dfsfindfile or dfschngowner
+
+18$:	PUSHL	EAX			;Save error code
+	CALL	dfscfil2#		;Close the directory
+	POPL	EAX
+	STC
+ret008:	RET
+.PAGE
+;Here if want to search open directory
+
+dfssodir::
+	BTZL	SS:xffPVFilOpt##, #FO%PATHNAME
+	MOVL	ECX, of_namepnt.B[EBP]	;Initialize pointer to name part
+2$:	CALL	dfsnchar		;Get name character
+	JE	6$.S			;If end of name
+	CMPB	AL, #':'		;No - end of device part?
+	JE	4$.S			;Yes
+	CMPB	AL, #'\'		;No - end of directory name?
+	JNE	2$.S			;No - continue
+4$:	MOVL	ECX, of_namepnt.B[EBP]	;Yes - remember where name may start
+	JMP	2$.S			;Continue
+
+;Here with beginning of actual name part of file specification found
+
+6$:	MOVL	of_namepnt.B[EBP], ECX	;Point to start of name
+	CALL	dfsnchar		;Get first character
+	JE	dbdspc			;Error if null name here!
+	CALL	copyname
+	JC	dbdspc			;If bad name
+	TESTB	AH, AH			;Have period in name?
+	JE	10$.S			;No
+	CMPB	SS:-1.B[EBX], #'.'	;Yes - was the period at the end?
+	JNE	10$.S			;No
+	DECL	EBX			;Yes - discard it
+10$:	MOVB	SS:[EBX], #0		;Put null at end of name
+	BTL	SS:xffHvValue1##, #IOV1%RENAME ;Is this 2nd name for rename?
+	JNC	18$.S			;No
+	MOVL	EBX, dcb_dkfilepnt.B[EDI] ;Yes - lock the directory
+	CALL	xosdskLockBufrW##
+	PUSHL	#0.B
+	JMP	26$			;Continue
+
+;Here if disk has been changed
+
+12$:	MOVL	EAX, #ER_MDCHG
+	STC
+	RET
+
+;Here if use count on a buffer is too big
+
+14$:	CALL	xosdskCDcb##		;Give up the DCB we just got
+	MOVL	EAX, #ER_TMRQB
+	STC
+
+;Here if cannot allocate another disk DCB
+
+16$:	ADDL	ESP, #16t.B		;Fix up the stack
+	MOVL	EDI, EDX		;Restore directory DCB
+	STC
+	RET				;Return the error
+
+;When we get here, we have done as much as we can without actually opening
+;  the file.  Inorder to open the file, we must clone the directory DCB so
+;  that we don't destroy its current state - we keep track of it so we can
+;  update dcb_dkfpos when we are finished
+
+18$:	MOVL	ESI, [EDI]
+	TESTL	ESI, ESI
+	JE	12$.S
+	PUSHL	dcb_name+12t.B[EDI]
+	PUSHL	dcb_name+8.B[EDI]
+	PUSHL	dcb_name+4.B[EDI]
+	PUSHL	dcb_name+0.B[EDI]
+	MOVL	EDX, #xosdskCcb##
+	PUSHL	EDI			;Save offset of directory DCB
+	CALL	xosdskGetDcb##		;Get another disk DCB
+	POPL	EDX
+	JC	16$.S			;If error
+	ADDL	ESP, #16t.B
+	MOVL	dcb_sdisp.B[EDI], #dfsdsp#
+	MOVL	EBX, dcb_dkfilepnt.B[EDX] ;Make directory open on the new DCB
+	MOVL	dcb_dkfilepnt.B[EDI], EBX
+	MOVL	dcb_dkcfib.B[EDI], EBX
+	MOVW	AX, dcb_sesproc.B[EDX]	;Store owner process number in the new
+	MOVW	dcb_sesproc.B[EDI], AX	;  DCB
+	MOVL	EAX, EBX		;Fix up the use and open counts
+20$:	CMPW	cb_usecnt.B[EAX], #0FFFFFFFEh.B
+	JAE	14$.S			;First scan the FIBs and make sure
+	MOVL	EAX, cb_dirfib.B[EAX]	;  the counts are not too big
+	TESTL	EAX, EAX
+	JNE	20$.S
+	MOVL	EAX, EBX		;Counts are all OK - now increment the
+22$:	INCW	cb_usecnt.B[EAX]	;  counts
+	INCW	cb_opencnt.B[EAX]
+	MOVL	EAX, cb_dirfib.B[EAX]
+	TESTL	EAX, EAX
+	JNE	22$.S
+	MOVL	EAX, dcb_outframe.B[EDX]
+	MOVW	dcb_outframe.B[EDI], AX
+	MOVW	dcb_outframe.B[EDX], #0
+	MOVL	EAX, dcb_dkfpos.B[EDX]
+	MOVL	dcb_dkfpos.B[EDI], EAX
+	PUSHL	EDX			;Store new DCB offset in the handle
+	CALL	knlStoreHnd2##		;  table, replacing directory DCB offset
+	CALL	xosdskLockBufrW##	;Lock the directory
+26$:	CALL	dfsfindfile		;Search for the file
+	POPL	EDX
+	JC	28$.S			;If error
+	JE	32$.S			;If file not found
+	CALL	storedirpos
+	CALL	sodfix
+	TESTL	EDI, EDI		;Clear Z
+	RET				;And return
+
+;Here if error
+
+28$:	PUSHL	EAX
+	CALL	sodfix
+	MOVL	EBX, dcb_dkfilepnt.B[EDI]
+	CALL	xosdskUnlkBufr##
+	POPL	EAX
+	STC
+	RET
+
+;Here if file not found
+
+32$:	CALL	sodfix
+	JMP	notfnd.S
+.PAGE
+;Subroutine to fix up directory pointers after searching open directory
+;	c{EDX} = Offset of directory DCB or 0 if new name for rename
+;	c{EDI} = Offset of file DCB or of directory DCB if new name for
+;		   rename
+;	CALL	sodfix
+
+sodfix:	TESTL	EDX, EDX		;Do we have a directory DCB?
+	JE	2$.S			;No (must be rename call)
+	CMPL	dcb_opencnt.B[EDX], #1.B ;Yes - is directory DCB still in use?
+	JNE	4$.S			;Yes
+	PUSHL	EDI			;No - close the directory
+	MOVL	EDI, EDX
+	CALL	dfscfile#
+	DECL	dcb_opencnt.B[EDI]	;Reduce use count on directory DCB
+	CALL	xosdskCDcb##		;Give up the DCB
+	POPL	EDI
+2$:	RET
+
+;Here if directory DCB use count is not 1
+
+4$:	JB	10$.S			;Serious error if use count is 0!
+	DECL	dcb_opencnt.B[EDX]	;OK - reduce the use count
+	MOVL	EAX, opn_frame1.B[EBP]	;Update position
+	MOVL	EAX, SS:opn_dirofs.B[EAX]
+	SHLL	EAX, #5
+	MOVL	dcb_dkfpos.B[EDX], EAX	;Store as position for next search
+	RET
+
+10$:	CRASH	BDUC			;[Bad Device Use Count]
+.PAGE
+;Here if file not found
+
+notfnd:	BTL	SS:xffCmd##, #O%CREATE	;Not found - want to create new file?
+	JC	10$.S			;Yes
+	MOVL	EAX, #ER_FILNF		;No - Assume file not found
+	BTL	SS:xffCmd##, #O%ODF	;Trying to open directory?
+	JNC	2$.S			;No
+	MOVL	EAX, #ER_DIRNF		;Yes - return right error
+2$:	PUSHL	EAX
+clsdir:	CALL	dfscfil2#		;Close the directory
+	POPL	EAX			;Restore error code
+	STC
+	RET
+
+;Here if want to create new file
+
+10$:	CLRL	EAX			;Set Z
+	RET				;And return
+.PAGE
+	.SBTTL	dfsfinddir - Subroutine to find directory in directory
+
+;Subroutine to find directory in directory
+;	c{EDI}    = Offset of DCB
+;	c{ESI}    = Offset of UCB
+;	C:set     = Should give name to user
+;	Directory is open and locked
+;	CALL	dfsfinddir
+;	C:set = Error
+;	  Directories is still open and locked
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  Z:set = Directory not found
+;	    Directory is open and locked
+;	  Z:clr = Directory found
+;	    Next directory is open and locked
+
+dfsfinddir:
+	LEAL	EBX, of_namshort[EBP]	;Point to start of name string
+2$:	MOVB	AL, SS:[EBX]		;Get name character
+	TESTB	AL, AL			;End?
+	JE	10$.S			;Yes - done here
+	INCL	EBX			;No - bump pointer
+	CMPB	AL, #'*'		;No - other wild character?
+	JE	6$.S
+	CMPB	AL, #'?'
+	JNE	2$.S			;No - continue
+6$:	MOVL	EAX, #ER_BDSPC		;Yes - say bad file specification
+	STC
+ret010:	RET
+
+;Here if name to search for does not contain any wild characters
+
+10$:
+
+;;;;;;	BTL	SS:xffPVFilOpt##, #FO%PATHNAME ;See if user wants file path
+;;;;;;	SETC	of_gtname.B[EBP]
+
+	MOVB	AL, #A$DIRECT		;Get value for attribute byte
+	JMP	dfsffil2.S
+.PAGE
+	.SBTTL	dfsfindfile - Subroutine to find file in directory
+
+;Subroutine to find file in directory
+;	c{EDI}    = Offset of DCB
+;	c{ESI}    = Offset of UCB
+;	Directory is open and locked
+;	CALL	dfsfindfile
+;	C:set = Error
+;	  Directory is open and locked
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  Z:set = File not found
+;	    Directory is open and locked
+;	  Z:clr = File found
+;	    File is open and locked
+
+dfsfindfile:
+
+;;;;;;	BTL	SS:xffPVFilOpt##, #FO%FILENAME ;See if user wants file name
+;;;;;;	SETC	of_gtname.B[EBP]
+
+	INCB	of_isname.B[EBP]	;Indicate this is the name part
+	MOVL	EDX, opn_frame1.B[EBP]
+	BTL	SS:xffHvValue1##, #IOV1%DIROFS ;Was directory offset specified?
+	JNC	4$.S			;No
+	MOVL	EAX, SS:opn_dirofs.B[EDX] ;Yes - get the value
+	SHLL	EAX, #5			;Change to byte offset in directory
+	MOVL	dcb_dkfpos.B[EDI], EAX	;Store in directory DCB
+4$:	BTL	SS:xffHvValue1##, #IOV1%SRCATTR ;Did he specify attributes?
+	JNC	6$.S			;No
+	MOVB	AL, SS:opn_srcattr.B[EDX] ;Yes - get value
+	CMPB	AL, #0			;Anything really specified?
+	JNE	dfsffil2.S		;Yes
+6$:	MOVB	AL, #A$NORMAL|A$HIDDEN|A$SYSTEM ;No - get default
+dfsffil2:
+	BTL	SS:xffCmd##, #O%CREATE	;Trying to create a file?
+	JNC	10$.S			;No
+	TESTB	AL, #A$LABEL		;Yes - trying to create a label?
+	JE	dfsffil4.S		;No
+	MOVB	AL, #A$LABEL		;Yes - make sure only the label bit
+					;  is set
+	ANDB	SS:xffCmd##, #~{O$IN|O$OUT} ;Cannot read or write it
+	JMP	8$.S
+
+;Here if creating file (other than volume label)
+
+dfsffil4::
+	MOVB	AL, #A$NORMAL|A$HIDDEN|A$SYSTEM|A$DIRECT ;Find any file
+8$:	MOVL	dcb_dkfpos.B[EDI], #0	;Always search entire directory if
+					;  creating a file
+10$:	MOVB	of_attrib.B[EBP], AL	;Save attributes for search
+	MOVB	of_retry.B[EBP], #5	;Initialize retry count
+	MOVL	EAX, dcb_dkfpos.B[EDI]	;Get position in directory
+	ANDB	AL, #0E0h		;Make sure really points to start of
+	MOVL	dcb_dkfpos.B[EDI], EAX	;  entry
+	MOVL	EBX, dcb_dkfilepnt.B[EDI] ;Point to base FIB for directory
+	TESTB	ff_attrib.B[EBX], #A$DIRECT ;Is this a directory?
+	JNE	14$.S			;Yes
+	MOVL	EAX, #ER_NTDIR		;No - fail!
+	STC
+	RET
+
+;Here if directory read error (from below)
+
+12$:	CMPL	EAX, #ER_MDCHG
+	JE	13$.S
+	MOVL	EAX, #ER_DRRER		;Get right error code
+13$:	STC
+	RET
+
+;Here if really have a directory
+
+14$:	MOVL	ESI, [EDI]
+	TESTL	ESI, ESI
+	JE	knlNoUnit##
+	MOVL	of_holepos.B[EBP], #-1	;Yes - initialize empty entry data
+	MOVL	EAX, of_namllen.B[EBP]	;Calculate number of slots needed
+	MOVL	EDX, EAX
+	TESTL	EDX, EDX
+	JE	15$.S
+	CMPW	of_namlong-2[EBP+EDX*2], #'.'.B
+	JNE	15$.S
+	DECL	EAX
+15$:	ADDL	EAX, #25t.B		;  (including the base 8x3 name slot)
+	CLRL	EDX
+	IDIVL	lit13#
+	MOVL	of_dentneed.B[EBP], EAX
+	MOVL	of_dentsize.B[EBP], #0
+nxdblk:	CALL	dfsrdpos#		;Get position for read
+	JC	12$.S
+	JE	20$.S			;If at end of directory
+	MOVL	EDX, ECX		;Get amount available here in right
+					;  register
+	CALL	xosdskFindSBufr##	;Get block into a buffer
+	JC	12$.S
+	CALL	xosdskUnlkBufr##	;Unlock the block
+	MOVL	ECX, dcb_dkfpos.B[EDI]	;Get current offset in block
+	ANDL	ECX, #1E0h
+	LEAL	EDX, [EBX+ECX]
+	SHRL	ECX, #5			;Get number of entries left
+	NEGL	ECX
+	ADDL	ECX, #16t.B
+nxdent:	CMPB	[EDX], #0		;Is this entry in use?
+	JE	16$.S			;No
+	CMPB	[EDX], #0E5h		;Maybe
+	JNE	ckdent.S		;Yes
+16$:	INCL	of_dentsize.B[EBP]
+	CMPL	of_holepos.B[EBP], #0	;Start of hole?
+	JGE	18$.S			;No
+	MOVL	EAX, dcb_dkfpos.B[EDI]	;Yes - remember where the hole is	ANDL	EAX, #~1FFh
+	ADDL	EAX, EDX
+	SUBL	EAX, EBX
+	MOVL	of_holepos.B[EBP], EAX
+18$:	CMPB	[EDX], #0		;End of directory?
+	JNE	advent0			;No - continue searching
+	CALL	xosdskRelsBufr##	;Yes - give up the buffer
+20$:	CLRL	EAX			;Set Z
+	RET				;And return with directory still open
+					;  and locked
+.PAGE
+;Here with directory entry to check
+
+ckdent:	CMPL	of_holepos.B[EBP], #0.B	;Have a hole now?
+	JS	2$.S			;No
+	MOVL	EAX, of_dentsize.B[EBP]	;Yes - is it big enough?
+	CMPL	EAX, of_dentneed.B[EBP]
+	JAE	2$.S			;Yes
+	MOVL	of_holepos.B[EBP], #-1	;No - forget about it
+	MOVL	of_dentsize.B[EBP], #0
+2$:	MOVB	AL, de_attrib.B[EDX]	;Get attribute for entry
+	CMPB	AL, #0Fh		;Is this an extended name entry?
+	JNE	10$			;No
+	TESTB	[EDX], #40h		;Yes - is this the first chunk?
+	JE	4$.S			;No
+	MOVB	AL, 13t.B[EDX]		;Yes - save the checksum byte
+	MOVB	of_lgchksum.B[EBP], AL
+	MOVB	AL, [EDX]		;Get entry number
+	ANDL	EAX, #1Fh.B
+	CMPB	AL, #20t		;Is it valid
+	JA	8$			;No
+	CMPB	AL, #0			;Maybe
+	JE	8$.S			;No
+	MOVB	of_lgnum.B[EBP], AL	;Yes - store it
+	MOVB	of_lgcnt.B[EBP], AL
+	JMP	6$.S			;Go collect this name part
+
+;Here if not the first long name chunk
+
+4$:	MOVB	AL, 13t.B[EDX]		;Get the checksum byte
+	CMPB	of_lgchksum.B[EBP], AL	;Is it right?
+	JNE	8$.S			;No
+	MOVB	AL, [EDX]		;Get entry number
+	ANDL	EAX, #1Fh.B
+	TESTL	EAX, EAX		;Cannot be 0
+	JE	8$.S
+	CMPB	of_lgcnt.B[EBP], AL	;Is it right?
+	JNE	8$.S			;No
+6$:	PUSHL	EBP
+	DECL	EAX
+	IMULL	EAX, #26t.B
+	ADDL	EBP, EAX
+	MOVL	EAX, 1.B[EDX]		;Copy the extended name characters
+	MOVL	of_dirlong[EBP], EAX	;  to the long name buffer
+	MOVL	EAX, 5.B[EDX]
+	MOVL	of_dirlong+4[EBP], EAX
+	MOVW	AX, 9.B[EDX]
+	MOVW	of_dirlong+8[EBP], AX
+	MOVL	EAX, 14t.B[EDX]
+	MOVL	of_dirlong+10t[EBP], EAX
+	MOVL	EAX, 18t.B[EDX]
+	MOVL	of_dirlong+14t[EBP], EAX
+	MOVL	EAX, 22t.B[EDX]
+	MOVL	of_dirlong+18t[EBP], EAX
+	MOVL	EAX, 28t.B[EDX]
+	MOVL	of_dirlong+22t[EBP], EAX
+	TESTB	[EDX], #40h		;First slot (last part of name)?
+	JE	7$.S			;No
+	MOVW	of_dirlong+26t[EBP], #0	;Yes - make sure have final null
+7$:	POPL	EBP
+	DECB	of_lgcnt.B[EBP]
+	JMP	advent2			;Continue
+
+;Here if the long name chunk is invalid
+
+8$:	JMP	advent0			;And ignore the entry
+
+;Here if not a long name entry
+
+10$:	TESTB	AL, #A$DIRECT|A$HIDDEN|A$SYSTEM|A$LABEL ;Normal file?
+	JNE	12$.S			;No
+	ORB	AL, #A$NORMAL		;Yes - set that bit
+12$:	ANDB	AL, of_attrib.B[EBP]	;Is this one we need to check?
+	JE	advent0			;No - go on
+	CMPB	[EDX], #'.'		;Might this be . or ..?
+	JNE	14$.S			;No
+	CMPL	2.B[EDX], #'    '	;Maybe
+	JNE	14$.S			;No
+	CMPL	6.B[EDX], #'    '	;Maybe
+	JNE	14$.S			;No
+	CMPB	10t.B[EDX], #' '	;Maybe
+	JNE	14$.S			;No
+	CMPB	1.B[EDX], #' '		;Maybe - is it .?
+	JE	advent0			;Yes - always ignore it
+	CMPB	1.B[EDX], #'.'		;No - is it ..?
+	JE	advent0			;Yes - always ignore it
+14$:	CMPB	of_lgcnt.B[EBP], #0FFh	;Do we have a long name?
+	JE	22$.S			;No
+	CMPB	of_lgcnt.B[EBP], #0	;Yes - valid sequence?
+	JNE	20$.S			;No - ignore the long name
+	PUSHL	ECX			;Yes - calculate checksum from short
+	PUSHL	EDX			;  name
+	CLRL	EAX
+	MOVL	ECX, #11t
+16$:	RORB	AL, #1t
+	ADDB	AL, [EDX]
+	INCL	EDX
+	LOOP	ECX, 16$
+	POPL	EDX
+	POPL	ECX
+	CMPB	of_lgchksum.B[EBP], AL	;Is the checksum right?
+	JE	24$.S			;Yes
+20$:	MOVB	of_lgcnt.B[EBP], #0FFh	;No - ignore the long name
+22$:	MOVB	of_lgnum.B[EBP], #0
+24$:	PUSHL	ECX			;Check name
+	PUSHL	EDX
+	PUSHL	EBX
+	PUSHL	ESI
+	PUSHL	EDI
+	LEAL	EDI, of_dirshort.B[EBP]
+	MOVL	ESI, EDI		;Initialize end pointer
+	PUSHL	SS
+	POPL	ES
+	CMPB	[EDX], #'.'		;Does entry begin with a period?
+	JNE	26$.S			;No
+	MOVL	ECX, #11t		;Yes - this is a special name
+	JMP	36$.S
+
+;Here if entry does not begin with a period - normal file name
+
+26$:	MOVL	ECX, #8
+28$:	MOVB	AL, [EDX]		;Get character from entry
+	INCL	EDX
+	STOSB	[EDI]			;Store in string
+	CMPB	AL, #' '		;Space?
+	JE	30$.S			;Yes
+	MOVL	ESI, EDI		;No - update end pointer
+30$:	LOOP	ECX, 28$		;Continue if may have more
+	MOVL	EDI, ESI		;Point to end (this discards any
+					;  trailing spaces but keeps other
+					;  spaces)
+	MOVB	AL, #'.'		;Put period after name
+	STOSB	[EDI]
+	MOVL	ESI, EDI
+	MOVB	CL, #3
+36$:	MOVB	AL, [EDX]		;Get character from entry
+	INCL	EDX
+	STOSB	[EDI]			;Store in string
+	CMPB	AL, #' '		;Space?
+	JE	38$.S			;Yes
+	MOVL	ESI, EDI		;No - update end pointer
+38$:	LOOP	ECX, 36$		;Continue if may have more
+	MOVL	EDI, ESI		;Point to actual end
+40$:	MOVB	SS:[EDI], #0		;Put null at end
+	PUSHL	SS
+	POPL	ES
+	CMPB	of_lgcnt.B[EBP], #0	;Do we have a long name?
+	JNE	44$.S			;No
+	LEAL	EDI, of_dirlong[EBP]	;Yes - see if there is a period in
+					;  the name
+42$:	MOVW	AX, SS:[EDI]
+	ADDL	EDI, #2t.B
+	CMPW	AX, #'.'.B
+	JE	48$.S
+	CMPW	AX, #0.B
+	JNE	42$.S
+	MOVL	SS:-2.B[EDI], #'.'	;No period - add a final period
+	JMP	48$.S
+
+;Here if don't have a long name - construct one which is an exact copy of the
+;  short name - (must do this in case have a short name which contains a
+;  character which we don't allow, mainly ~)
+
+44$:	LEAL	ESI, of_dirshort[EBP]
+	LEAL	EDI, of_dirlong[EBP]
+	PUSHL	SS
+	POPL	ES
+	CLD
+	MOVB	AH, #0
+46$:	LODSB	SS:[ESI]
+	STOSW	[EDI]
+	CMPB	AL, #0
+	JNE	46$.S
+48$:	BTL	SS:xffCmd##, #O%NOLONG	;Should we check the long name?
+	JC	52$.S			;No
+	LEAL	ESI, of_namlong[EBP]	;Yes
+	LEAL	EDI, of_dirlong[EBP]
+	LEAL	EBX, of_wmask[EBP]
+	CLRL	EAX			;Do mixed case compare
+	CALL	knlWildCmp16##		;Do wild-card compare
+	JE	found.S			;If match
+
+;Here if not checking the long name or it did not match
+
+52$:	BTL	SS:xffCmd##, #O%USEDOS	;Should we check the DOS name?
+	JNC	54$.S			;No
+	LEAL	ESI, of_namshort[EBP]	;Yes
+	LEAL	EDI, of_dirshort.B[EBP]
+	LEAL	EBX, of_wmask[EBP]
+	CLRL	EAX			;Do mixed case compare
+	CALL	knlWildCmp8##		;Do wild-card compare
+	JE	found.S
+54$:	POPL	EDI			;If not found
+	POPL	ESI
+	POPL	EBX
+	POPL	EDX
+	POPL	ECX
+advent0:MOVB	of_lgcnt.B[EBP], #0FFh	;Indicate not collecting long name
+advent2:ADDL	EDX, #32t.B		;Bump to next entry
+	DECL	ECX			;More to check?
+	JNE	nxdent			;Yes - continue
+	ADDL	dcb_dkfpos.B[EDI], #512t ;Bump to beginning of next block
+	ANDW	dcb_dkfpos.B[EDI], #0FE00h
+	CALL	xosdskRelsBufr##	;Give up buffer for this block
+	MOVL	EBX, dcb_dkfilepnt.B[EDI] ;Restore offset of the fake FIB
+	JMP	nxdblk			;Continue
+.PAGE
+;Here with file found
+
+found:	POPL	EDI
+	POPL	ESI
+	POPL	EBX
+	POPL	EDX
+	POPL	ECX
+	CMPB	of_isname.B[EBP], #0	;Is this a directory to search?
+	JE	8$.S			;Yes
+	BTL	SS:xffCmd##, #O%FAILEX	;No - should we fail if it exists?
+	JNC	8$.S			;No - go on
+	MOVL	EAX, #ER_FILEX		;Yes - get error code
+	TESTB	de_attrib.B[EDX], #A$DIRECT ;Is this a directory?
+	JE	6$.S			;No
+	ADDL	EAX, #ER_ISDIR-ER_FILEX.B ;Yes - use right error code
+6$:	PUSHL	EAX
+	CALL	xosdskRelsBufr##	;Give up the directory block
+	POPL	EAX
+	STC				;Indicate error
+	RET
+
+;Here if its OK that the file exists
+
+8$:	MOVL	EAX, dcb_dkfpos.B[EDI]	;Save position in directory of start of
+	ANDL	EAX, #0FFFFFE00h	;  this block
+	MOVL	of_direblk.B[EBP], EAX
+	MOVL	of_direbfr.B[EBP], EBX	;Save offset of directory block buffer
+	SUBL	EDX, EBX		;Save offset in block
+	MOVL	of_direofs.B[EBP], EDX
+	CALL	dfsrdfib#		;Set up the fake FIB for the file
+	JC	10$.S			;If error
+	PUSHL	EBX
+	MOVL	EBX, of_direbfr.B[EBP]	;Give up the directory block
+	CLRL	EAX
+	MOVL	of_direbfr.B[EBP], EAX
+	CALL	xosdskRelsBufr##
+	POPL	EBX
+	MOVL	EDX, of_frame1.B[EBP]	;Save current attribute bits
+	MOVB	AL, ff_attrib.B[EBX]
+	MOVB	SS:opn_curattr.B[EDX], AL
+	TESTL	EDI, EDI		;Clear Z
+	RET				;And return with directory closed and
+					;  file open and locked
+
+;Here if error opening the file
+
+10$:	PUSHL	EAX			;Save error code
+	MOVL	EAX, of_frame1.B[EBP]	;Clear current attribute bits
+	MOVB	SS:opn_curattr.B[EAX], #0
+	MOVL	EBX, of_direbfr.B[EBP]	;Give up the directory block
+	CLRL	EAX
+	MOVL	of_direbfr.B[EBP], EAX
+	CALL	xosdskRelsBufr##
+	POPL	EAX			;Restore error code
+	STC				;Indicate error
+	RET				;And return
+.PAGE
+	.SBTTL	dfsputindir - Subroutine to put file into a directory
+
+;Subroutine to put file into a directory - directory must be open and locked
+;  and file may or may not be locked. Support for long file names makes this
+;  much more complex. If the name is not a valid short name, it must first
+;  search the directory and determine the corresponding short name. It must
+;  also find a slot big enough to hold the long and short names.
+;	c(AL)  = 1 if rename, 0 if not rename 
+;	c{EBX} = Offset of file FIB
+;	c{EDI} = Offset of DCB
+;	CALL	dfsputindir
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	In all cases, directory is still open
+
+$$$=!0
+FRM pi_frame1 , 4t	;Pointer to level 1 stack frame
+FRM pi_frame2 , 4t	;Pointer to level 2 stack frame
+FRM pi_frame3 , 4t	;Pointer to level 3 stack frame
+FRM pi_ffib   , 4t	;Offset of file FIB
+FRM           , 3t
+FRM pi_rename , 1t	;Non-zero if rename operation
+FRM pi_xESI   , 4t	;ESI value returned by dfsextend
+FRM pi_xEAX   , 4t	;EAX value returned by dfsextend
+FRM pi_xEBX   , 4t	;EBX value returned by dfsextend
+FRM pi_xECX   , 4t	;ECX value returned by dfsextend
+FRM pi_xEDX   , 4t	;EDX value returned by dfsextend
+FRM pi_xleft  , 4t
+FRM pi_xcnt   , 4t
+FRM pi_extpnt , 4t
+FRM pi_curval , 4t
+FRM pi_numinx , 4t
+FRM pi_numbfr , 4t
+FRM pi_nummax , 4t
+FRM pi_digpnt , 4t
+FRM pi_slotcnt, 4t
+FRM pi_slotnum, 1t
+FRM pi_chksum , 1t
+FRM pi_idbyte , 1t
+FRM           , 1t
+FRM pi_dirbufr, 4t
+pi_SIZE=!$$$
+
+2$:	MOVL	EAX, #ER_BDSPC
+	STC
+3$:	LEAVE
+	RET
+
+dfsputindir::
+	ENTER	pi_SIZE, 3
+	MOVB	pi_rename.B[EBP], AL	;Save rename indicator
+	MOVL	pi_ffib.B[EBP], EBX	;Save file FIB offset
+
+	MOVW	AX, SS
+	MOVL	EDX, cb_dirfib.B[EBX]
+	CMPW	AX, cb_lockxff.B[EDX]
+	JE	104$.S
+	CRASH	BNLK
+104$:
+
+	MOVL	EDX, pi_frame2.B[EBP]
+	MOVL	EAX, SS:of_dentneed.B[EDX] ;Get number of slots to write
+	MOVL	pi_slotcnt.B[EBP], EAX
+	MOVB	pi_slotnum.B[EBP], AL
+	CMPB	SS:of_namshort[EDX], #0	;Do we have a valid short name now?
+	JNE	haveshort		;Yes - go on
+
+;Here if we do not have a valid short name - We must first determine the
+;  maximum number of characters we have to use for the short name (between
+;  0 and 6).  We discard all non-valid characters (which includes all periods
+;  except the last, which begins the extension).  We then take between 0 and
+;  3 extension characters the same way.
+
+;We first find the last period in the long name
+
+	MOVL	EBX, pi_frame2.B[EBP]
+	ADDL	EBX, #of_namlong
+	MOVL	pi_extpnt.B[EBP], #0
+4$:	MOVZWL	EAX, SS:[EBX]
+	ADDL	EBX, #2t.B
+	TESTL	EAX, EAX
+	JE	6$.S
+	CMPW	AX, #'.'
+	JNE	4$.S
+	MOVL	pi_extpnt.B[EBP], EBX
+	JMP	4$.S
+
+;Now collect up to 6 valid short name characters for the name
+
+6$:	MOVL	ECX, #6t
+	MOVL	EBX, pi_frame2.B[EBP]
+	MOVL	EDX, EBX
+	ADDL	EBX, #of_namlong
+	ADDL	EDX, #of_namshort
+8$:	MOVZWL	EAX, SS:[EBX]
+	ADDL	EBX, #2t.B
+	TESTL	EAX, EAX
+	JE	10$.S
+	CMPL	EBX, pi_extpnt.B[EBP]
+	JE	10$.S
+	CALL	convchr
+	JC	8$.S
+	MOVB	SS:[EDX], AL
+	INCL	EDX
+	LOOP	ECX, 8$
+
+;Now collect up to 3 valid short name characters for the extension
+
+10$:	MOVL	SS:[EDX], #'~+.'
+	MOVL	pi_digpnt.B[EBP], EDX
+	ADDL	EDX, #3t.B
+	MOVB	CL, #3t
+	MOVL	EBX, pi_extpnt.B[EBP]
+12$:	MOVZWL	EAX, SS:[EBX]
+	ADDL	EBX, #2t.B
+	TESTL	EAX, EAX
+	JE	14$.S
+	CALL	convchr
+	JC	12$.S
+	MOVB	SS:[EDX], AL
+	INCL	EDX
+	LOOP	ECX, 12$
+14$:	MOVB	SS:[EDX], #0		;Put a null at the end
+
+;Here with the initial short name constructed. It contains a + in place of
+;  the single digit. Now search the directory and see if there is a value
+;  we can use for the digit.
+
+	CALL	knlGetQel##
+	JC	18$.S
+	MOVL	pi_numbfr.B[EBP], ESI
+	MOVL	pi_numinx.B[EBP], #0
+	MOVL	ECX, #9t
+	CALL	scandir
+	JC	20$.S
+	JE	22$.S
+	CALL	extenddig
+	MOVL	ECX, #99t
+	CALL	scandir
+18$:	JC	20$.S
+	JE	22$.S
+	MOVL	ESI, pi_numbfr.B[EBP]
+	CALL	knlGiveQel##
+	CALL	extenddig
+	MOVL	ECX, #1
+	CALL	knlGetXmb##
+	JC	20$.S
+	MOVL	pi_numbfr.B[EBP], ESI
+	INCL	pi_numinx.B[EBP]
+	MOVL	ECX, #999t
+	CALL	scandir
+	JC	20$.S
+	JE	22$.S
+	MOVL	ESI, pi_numbfr.B[EBP]
+	MOVL	ECX, #1
+	CALL	knlGiveXmb##
+	CALL	extenddig
+	MOVL	ECX, #4t
+	CALL	knlGetXmb##
+	JC	20$.S
+	MOVL	pi_numbfr.B[EBP], ESI
+	MOVL	pi_numinx.B[EBP], #4t
+	MOVL	ECX, #9999t
+	CALL	scandir
+	JC	20$.S
+	JE	22$.S
+	MOVL	EAX, #ER_BDSPC
+	STC
+20$:	RET
+
+;Here with the number to use
+
+22$:	MOVL	EBX, pi_frame2.B[EBP]
+	ADDL	EBX, #of_namshort
+24$:	CMPB	SS:[EBX], #'+'
+	JE	26$.S
+	INCL	EBX
+	JMP	24$.S
+
+26$:	MOVL	ECX, EBX
+28$:	INCL	ECX
+	CMPB	SS:[ECX], #'+'
+	JE	28$.S
+	SUBL	ECX, EBX		;This gives number of digits needed
+	CALL	putdigits
+					;Fall into haveshort on next page
+.PAGE
+;Here with a valid short name
+
+haveshort:
+	MOVL	EDX, pi_frame2.B[EBP]	;Calculate checksum for short name
+	ADDL	EDX, #of_namshort
+	CLRL	EAX
+	MOVL	ECX, #9t
+2$:	MOVB	AH, SS:[EDX]		;Calculate for name part (up to
+	CMPB	AH, #0			;  8 characters)
+	JE	4$.S
+	INCL	EDX
+	CMPB	AH, #'.'
+	JE	4$.S
+	RORB	AL, #1t
+	ADDB	AL, AH
+	LOOP	ECX, 2$
+	JMP	8$.S
+
+;Here at end of name
+
+4$:	DECL	ECX			;Shorter than 8 characters?
+	JE	8$.S			;No
+6$:	RORB	AL, #1t			;Yes - fill it out
+	ADDB	AL, #' '
+	LOOP	ECX, 6$
+8$:	MOVB	CL, #4t
+10$:	MOVB	AH, SS:[EDX]		;Calculate for extension part (up
+	CMPB	AH, #0			;  to 3 characters)
+	JE	12$.S
+	INCL	EDX
+	RORB	AL, #1t
+	ADDB	AL, AH
+	LOOP	ECX, 10$
+	JMP	16$.S
+
+;Here at end of extension
+
+12$:	DECL	ECX			;Shorter than 3 charactesr?
+	JE	16$.S			;No
+14$:	RORB	AL, #1t			;Yes - fill it out
+	ADDB	AL, #' '
+	LOOP	ECX, 14$
+16$:	MOVB	pi_chksum.B[EBP], AL
+	MOVB	pi_idbyte.B[EBP], #40h
+	MOVL	pi_xEAX.B[EBP], #0	;Set to 0 to indicate no expansion
+	MOVL	EDX, dcb_dkfilepnt.B[EDI]
+	MOVL	EAX, pi_frame2.B[EBP]
+	MOVL	EAX, SS:of_holepos.B[EAX] ;Get position of slot to use
+	TESTL	EAX, EAX		;Do we have a slot to use?
+	JNS	18$.S			;Yes
+	MOVL	EAX, ff_alloc.B[EDX]	;No - put this entry at the end of
+	IMULL	EAX, ucb_bpclus.B[ESI]
+18$:	MOVL	dcb_dkfpos.B[EDI], EAX	;  the directory
+	IMULL	ECX, pi_slotcnt.B[EBP], #32t.B ;Do we need to extend the
+	ADDL	ECX, EAX		       ;  directory?
+	MOVL	EAX, ff_alloc.B[EDX]
+	MOVL	ESI, [EDI]
+	TESTL	ESI, ESI
+	JE	intochg
+	IMULL	EAX, ucb_bpclus.B[ESI]
+	SUBL	ECX, EAX
+	JBE	dirloop			;No
+	MOVL	EBX, dcb_dkfilepnt.B[EDI] ;Yes - get base FIB for directory
+	CMPL	ff_f1pnt+1.B[EBX], #1.B	;Is it the fixed root directory?
+	JNE	20$.S			;No - go on
+	MOVL	EAX, #ER_DIRFL		;Error = DIRectory FuLl
+	STC
+	MOVL	EBX, pi_ffib.B[EBP]	;Error - restore offset of file FIB
+	LEAVE
+	RET
+
+;Here if have a directory we can expand
+;	c{ECX} = Additional bytes needed
+
+20$:	PUSHL	ECX
+	CALL	xosdskUnlkBufr##	;Unlock the directory FIB (must do this
+					;  so can safely get the disk resource
+					;  to extend the file - since we have
+					;  the directory open, no one can delete
+					;  it out from under us while it is
+					;  unlocked!)
+	MOVL	EBX, pi_ffib.B[EBP]	;Also unlock the file FIB if necessary
+	MOVW	AX, SS			;  to keep knlGetDiskRes happy
+	CMPW	AX, cb_lockxff.B[EBX]
+	JNE	22$.S
+	CALL	xosdskUnlkBufr##
+	CALL	xosdskGetDiskRes##	;Get the disk resource
+	POPL	ECX
+	JNC	21$.S			;Go on if OK
+	MOVL	EBX, dcb_dkfilepnt.B[EDI] ;Error - lock the directory again
+	CALL	xosdskLockBufrW##
+	MOVL	EBX, pi_ffib.B[EBP]	;And lock the file FIB
+	CALL	xosdskLockBufrW##
+	STC
+	LEAVE
+	RET
+
+;Here with the disk resource
+
+21$:	MOVL	EBX, dcb_dkfilepnt.B[EDI] ;Lock the directory again
+	CALL	xosdskLockBufrW##
+	MOVL	EBX, pi_ffib.B[EBP]	;And lock the file FIB
+	CALL	xosdskLockBufrW##
+	JMP	235$.S
+
+22$:	CALL	xosdskGetDiskRes##	;Get the disk resource
+	POPL	ECX
+	JNC	23$.S			;Go on if OK
+	MOVL	EBX, dcb_dkfilepnt.B[EDI] ;Error - lock the directory again
+	CALL	xosdskLockBufrW##
+	STC
+	LEAVE
+	RET
+
+;Here with the disk resource
+
+23$:	MOVL	EBX, dcb_dkfilepnt.B[EDI] ;Lock the directory again
+	CALL	xosdskLockBufrW##
+235$:	MOVL	EBX, dcb_dkfilepnt.B[EDI]
+	LEAL	EAX, -1.B[ECX]		;Determine number of clusters needed
+	ADDL	EAX, ucb_bpclus.B[ESI]
+	CLRL	EDX
+	DIVL	ucb_bpclus.B[ESI]
+	MOVL	pi_xcnt.B[EBP], EAX
+24$:	CALL	dfsextend#		;Start extending the directory
+	JC	34$			;If error!
+	MOVL	pi_xEAX.B[EBP], EAX	;Save data needed to finish extending
+	MOVL	pi_xEBX.B[EBP], EBX	;  the directory
+	MOVL	pi_xECX.B[EBP], ECX
+	MOVL	pi_xEDX.B[EBP], EDX
+	MOVL	pi_xESI.B[EBP], ESI
+	SUBL	pi_xcnt.B[EBP], ECX	;Reduce amount we need
+	MOVL	ESI, [EDI]		;Restore offset of the UCB
+	TESTL	ESI, ESI
+	JE	intochg
+	MOVL	EDX, ucb_clussize.B[ESI] ;Get blocks per cluster
+	MOVL	pi_xleft.B[EBP], EDX
+	IMULL	EAX, EDX		;Get first block allocated
+	ADDL	EAX, ucb_fcblk.B[ESI]
+	MOVL	dcb_dkdblk.B[EDI], EAX
+26$:	CALL	xosdskNewSBufr##	;Get zeroed buffer
+	JC	32$.S
+	CALL	xosdskWriteBufr##	;Write out the buffer
+	JC	30$.S
+	CALL	xosdskRelsLkBufr##	;Give up the buffer
+	INCL	dcb_dkdblk.B[EDI]	;Bump block number
+	DECL	pi_xleft.B[EBP]		;More to initialize here?
+	JNE	26$.S			;Yes - continue
+	MOVL	EAX, pi_xEAX.B[EBP]	;No - restore allocation data
+	MOVL	EBX, pi_xEBX.B[EBP]
+	MOVL	ECX, pi_xECX.B[EBP]
+	MOVL	EDX, pi_xEDX.B[EBP]
+	MOVL	ESI, pi_xESI.B[EBP]
+	CALL	dfsextfin#		;Finish extending the directory
+	JC	34$.S
+	MOVL	EAX, pi_xcnt.B[EBP]	;Still more to do?
+	TESTL	EAX, EAX
+	JNE	24$.S			;Yes - continue
+	CALL	xosdskGiveDiskRes##	;No - give up the disk resource
+	MOVL	EBX, dcb_dkfilepnt.B[EDI]
+	MOVL	EAX, ff_alloc.B[EBX]	;Update written size to be same as
+	MOVL	ESI, [EDI]		;  allocated size
+	TESTL	ESI, ESI
+	JE	knlNoUnitLv##
+	MOVB	CL, ucb_clusx.B[ESI]
+	ADDB	CL, #9
+	SHLL	EAX, CL
+	MOVL	ff_size.B[EBX], EAX
+	JMP	dirloop.S
+
+;Here if error writing the newly allocated blocks
+
+30$:	CALL	xosdskRelsLkBufr##	;Give up the buffer
+32$:	MOVL	ECX, pi_xECX.B[EBP]	;Yes - restore amount allocated
+	MOVL	EDX, pi_xEAX.B[EBP]	;Restore first cluster allocated
+	PUSHL	EAX
+	CALL	dfsdeall#		;Give up the clusters we have
+	POPL	EAX
+34$:	PUSHL	EAX
+	CALL	xosdskGiveDiskRes##	;Give up the disk resource
+	POPL	EAX
+	STC				;Indicate error
+	LEAVE
+	RET
+.PAGE
+dirloop:CALL	dfsrdpos#		;Get physical position on disk
+	JC	intoerr
+	JE	4$.S			;Serious problem If at end of file
+	CALL	xosdskFindSBufr##	;Read the directory block
+	JNC	6$.S
+	JMP	intoerr			;If error
+
+4$:	CRASH	DXLE			;[Directory expansion length error]
+
+;Here with directory block read
+
+6$:	MOVL	pi_dirbufr.B[EBP], EBX	;OK
+	MOVL	EDX, dcb_dkfpos.B[EDI]
+	ANDL	EDX, #1FFh
+	ADDL	EDX, EBX
+	ANDL	dcb_dkfpos.B[EDI], #~1FFh
+8$:	DECL	pi_slotcnt.B[EBP]	;Is this the final slot?
+	JE	intobase		;Yes
+	IMULL	ESI, pi_slotcnt.B[EBP], #26t.B ;No
+	MOVB	AL, pi_slotcnt.B[EBP]	;Store the ID byte
+	ADDB	AL, pi_idbyte.B[EBP]
+	MOVB	pi_idbyte.B[EBP], #0
+	MOVB	[EDX], AL
+	MOVB	xe_attrib.B[EDX], #0Fh	;Store the attribute byte
+	MOVB	AL, pi_chksum.B[EBP]	;Store the checksum byte
+	MOVB	xe_chksum.B[EDX], AL
+	MOVB	xe_resrvd.B[EDX], #0	;Clear the reserved bytes
+	MOVW	xe_pntr.B[EDX], #0
+	PUSHL	EDI
+	LEAL	EDI, 1.B[EDX]
+	PUSHL	DS
+	POPL	ES
+	CLD
+	ADDL	ESI, pi_frame2.B[EBP]	;Store the part of the long name
+	ADDL	ESI, #of_namlong-26t	;  that goes in this slot
+	MOVL	ECX, #5
+	MOVL	EAX, ECX
+	CALL	putlongchrs		;Store first 5 characters
+	ADDL	EDI, #3t.B
+	MOVB	CL, #6
+	CALL	putlongchrs		;Store next 6 characters
+	ADDL	EDI, #2t.B
+	MOVB	CL, #2
+	CALL	putlongchrs		;Store next 2 characters
+	POPL	EDI
+	ADDL	EDX, #32t		;Bump to next slot
+	MOVL	EAX, EDX		;At end of block?
+	SUBL	EAX, pi_dirbufr.B[EBP]
+	TESTL	EAX, #1FFh
+	JNE	8$.S		;No - continue with this block
+	MOVL	EBX, pi_dirbufr.B[EBP]	;Yes
+	CALL	xosdskWriteBufr##	;Write out the block
+	JC	intoerr
+	CALL	xosdskRelsLkBufr##	;Give up the buffer
+	ADDL	dcb_dkfpos.B[EDI], #512t ;Bump position in directory
+	JMP	dirloop			;Continue
+.PAGE
+;Here to fill the final (base) directory slot - this is the standard DOS
+;  8x3 directory entry
+
+intobase:
+	CMPB	pi_rename.B[EBP], #0	;Is this a rename?
+	JNE	2$.S			;Yes - don't check for available slot
+	CMPB	[EDX], #0E5h		;No - is this an available slot?
+	JE	2$.S			;Yes
+	CMPB	[EDX], #0		;Maybe
+	JNE	6$.S			;No!
+2$:	MOVL	ESI, pi_frame2.B[EBP]
+	ADDL	ESI, #of_namshort
+	PUSHL	EDI
+	MOVL	EDI, EDX
+	PUSHL	DS
+	POPL	ES
+	MOVL	EAX, #'    '		;Initialize name and extension to spaces
+	CLD
+	STOSL	[EDI]
+	STOSL	[EDI]
+	STOSL	[EDI]
+	SUBL	EDI, #12t.B
+4$:	LODSB	SS:[ESI]		;Get character
+	TESTB	AL, AL			;End of string?
+	JE	12$.S			;Yes
+	CMPB	AL, #'.'		;No - end of name?
+	JE	8$.S			;Yes
+	STOSB	[EDI]			;No - store character
+	JMP	4$.S			;Continue
+
+6$:	CRASH	DSNA			;[Directory Slot Not Available]
+
+;Here with period in the short name
+
+8$:	LEAL	EDI, de_ext.B[EDX]
+10$:	LODSB	SS:[ESI]		;Get character
+	TESTB	AL, AL			;End of string?
+	JE	12$.S			;Yes
+	STOSB	[EDI]			;No - store character
+	JMP	10$.S			;Continue
+
+;Here with the short name stored
+
+12$:	LEAL	EDI, 12t.B[EDX]
+	CLRL	EAX			;Zero the 10 or 12 reserved bytes
+	STOSL	[EDI]
+	STOSL	[EDI]
+	STOSL	[EDI]
+	POPL	EDI
+	MOVL	ECX, pi_ffib.B[EBP]	;Get offset of file FIB
+	MOVL	EAX, dcb_dkfpos.B[EDI]	;Get offset in directory of directory
+	ANDL	EAX, #~1FFh		;  entry
+	ADDL	EAX, EDX
+	SUBL	EAX, EBX
+	MOVL	ff_dirpos.B[ECX], EAX	;Store in file FIB
+	MOVB	AL, pi_slotnum.B[EBP]	;Also store size of directory (number
+	DECL	EAX			;  of slots - 1)
+	MOVB	ff_dirsize.B[ECX], AL
+	MOVL	EAX, dcb_dkfilepnt.B[EDI] ;Get offset of directory FIB
+	MOVL	cb_dirfib.B[ECX], EAX	;Store in FIB
+	MOVL	ESI, [EDI]		;Get offset of UCB
+	TESTL	ESI, ESI
+	JE	intochg.S
+	CMPL	cb_block.B[ECX], #0.B	;Does this FIB have a "block number"?
+	JNE	14$.S			;Yes - go on
+	MOVL	EAX, EDX		;No - build a "block number" for the
+	SUBL	EAX, EBX
+	ORB	AH, #02h		;  fake FIB as follows:
+	SHLL	EAX, #22t		;    1 (1) Entry # in block (4)
+	ORL	EAX, cb_block.B[EBX]	;    Directory block # (27)
+	MOVL	cb_block.B[ECX], EAX
+	PUSHL	EBX
+	MOVL	EBX, ECX
+	PUSHL	EDX
+	CALL	xosdskIntoHash##	;Put file FIB into a hash list
+	POPL	EDX
+	POPL	EBX
+14$:	MOVB	AL, ff_attrib.B[ECX] 	;Copy attribute bits
+	ANDB	AL, #{~A$NORMAL}&0FFh
+	MOVB	de_attrib.B[EDX], AL
+	MOVL	EAX, ff_time.B[ECX]	;Copy time and date
+	MOVL	de_time.B[EDX], EAX
+	MOVL	EAX, ff_size.B[ECX]	;Copy size
+	MOVL	de_size.B[EDX], EAX
+	MOVL	EAX, ff_f1pnt+1.B[ECX]	;Get first cluster in file
+	MOVW	de_pntr.B[EDX], AX	;Store first cluster in directory
+	TESTB	ucb_sts3.B[ESI], #U3$FAT32 ;Have 32 bit FATs?
+	JE	intodone.S		;No
+	SHRL	EAX, #16t		;Yes - store high 16 bits of cluster
+	MOVW	de_pntrhi.B[EDX], AX	;  number
+	JMP	intodone.S
+.PAGE
+;Here if disk has been changed
+
+intochg:MOVL	EAX, #ER_MDCHG.B
+	JMP	6$.S
+
+;Here with the final slot stored in the directory
+
+intodone:
+	MOVL	EBX, pi_dirbufr.B[EBP]
+	CALL	xosdskWriteBufr##	;Write out the last buffer
+	JC	intoerr.S
+	CALL	xosdskRelsLkBufr##	;Give up the buffer
+4$:	MOVL	EBX, pi_ffib.B[EBP]	;Restore file FIB offset
+	LEAVE
+	RET				;Finished
+
+;Here if error writing the directory buffer
+
+intoerr:PUSHL	EAX
+	CALL	xosdskRelsLkBufr##	;Give up the buffer
+	POPL	EAX
+6$:	STC
+	JMP	4$.S
+.PAGE
+;Subroutine to store digits into the short name
+;	c{EAX} = Value
+;	c{EBX} = Offset for first digit
+;	c{ECX} = Number of digits to store
+;	CALL	putdigits
+;	C:clr always
+
+putdigits:
+	CLRL	EDX
+	IDIVL	knlLit10##
+	PUSHL	EDX
+	DECL	ECX
+	JE	4$.S
+	CALL	putdigits
+4$:	POPL	EAX
+	ADDB	AL, #'0'
+	MOVB	SS:[EBX], AL
+	INCL	EBX
+	RET
+.PAGE
+extenddig:
+	MOVL	EDX, pi_digpnt.B[EBP]	;Point to the ~ character
+2$:	INCL	EDX
+	CMPB	SS:[EDX], #'.'
+	JNE	2$.S
+	MOVL	EAX, pi_frame2.B[EBP]
+	ADDL	EAX, #of_namshort
+	SUBL	EAX, EDX
+	CMPL	EAX, #-8t.B		;Have eight characters?
+	JNE	6$.S			;No
+	DECL	pi_digpnt.B[EBP]	;Yes - overwrite the last name character
+	MOVL	EDX, pi_digpnt.B[EBP]
+	MOVW	SS:[EDX], #'~+'
+	RET
+
+;Here if have fewer than 8 name characters - extend the name by one character
+
+6$:	MOVL	EAX, SS:[EDX]
+	MOVL	SS:1.B[EDX], EAX
+	MOVB	SS:[EDX], #'+'
+	RET
+.PAGE
+;Subroutine to scan directory when checking for duplicate short names
+;	c{ECX} = Maximum value
+;	CALL	scandir
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  Z:set = Have an available number
+;	    c{EAX} = First available number
+;	  Z:clr = No number available
+
+;Here if directory read error (from below)
+
+2$:	CMPL	EAX, #ER_MDCHG
+	JE	3$.S
+	MOVL	EAX, #ER_DRRER		;Get right error code
+3$:	STC
+4$:	RET
+
+scandir:MOVL	ESI, [EDI]
+	TESTL	ESI, ESI
+	JE	knlNoUnit##
+	PUSHL	EDI
+	MOVL	EDI, pi_numbfr.B[EBP]
+	MOVL	pi_nummax.B[EBP], ECX
+	ADDL	ECX, #1Fh
+	SHRL	ECX, #5t
+	MOVL	EAX, #-1
+	CLD
+	PUSHL	DS
+	POPL	ES
+	RSTOSL	[EDI]
+	POPL	EDI
+	MOVL	dcb_dkfpos.B[EDI], #0
+snxdblk:CALL	dfsrdpos#		;Get position for read
+	JC	2$.S
+	JE	scanend			;If at end of directory
+	MOVL	EDX, ECX		;Get amount available here in right
+					;  register
+	CALL	xosdskFindSBufr##	;Get block into a buffer
+	JC	12$.S
+	CALL	xosdskUnlkBufr##	;Unlock the block
+	MOVL	EDX, EBX		;Point to first slot in block
+	MOVL	ECX, #16t		;There are 16 slots per block
+snxdent:CMPB	[EDX], #0		;Is this entry in use?
+	JNE	6$.S			;Maybe
+	CALL	xosdskRelsBufr##	;No - end of directory - give up buffer
+	JMP	scanend
+
+6$:	CMPB	[EDX], #0E5h		;Maybe
+	JE	sadvent			;No - go on
+	MOVB	AL, de_attrib.B[EDX]	;Yes - get attribute for entry
+	CMPB	AL, #0Fh		;Is this an extended name entry?
+	JE	sadvent			;Yes - ignore it
+	MOVL	pi_curval.B[EBP], #0
+	PUSHL	EBX
+	PUSHL	ECX
+	PUSHL	EDX
+	MOVL	EBX, pi_frame2.B[EBP]
+	ADDL	EBX, #of_namshort
+	MOVL	ECX, #8t
+10$:	MOVB	AL, SS:[EBX]
+	INCL	EBX
+	CMPB	AL, #'+'		;Need a digit here?
+	JE	12$.S			;Yes
+	CMPB	AL, #'.'		;No - start of extension?
+	JE	14$.S			;Yes
+	CMPB	AL, [EDX]		;No - does it match the entry?
+	JNE	22$.S			;No - not this one
+	INCL	EDX
+	JMP	10$.S
+
+;Here if need a digit
+
+12$:	MOVB	AL, [EDX]
+	INCL	EDX
+	CMPB	AL, #'0'
+	JB	22$.S
+	CMPB	AL, #'9'
+	JA	22$.S
+	ANDL	EAX, #0Fh.B
+	MOVL	ECX, pi_curval.B[EBP]
+	IMULL	ECX, #10t.B
+	ADDL	ECX, EAX
+	MOVL	pi_curval.B[EBP], ECX
+	JMP	10$.S
+
+;Here with start of extension
+
+14$:	MOVL	EAX, EDX
+	SUBL	EAX, [ESP]		;Calculate current position in entry
+	CMPL	EAX, #8t.B
+	JAE	16$.S			;If at start of extension
+	CMPB	[EDX], #' '		;Not at extension - more name?
+	JNE	22$.S			;Yes - no match
+	MOVL	EDX, [ESP]		;No - check extension next
+16$:	MOVB	AL, SS:[EBX]
+	CMPB	AL, #0			;End of extension?
+	JE	18$.S			;Yes
+	INCL	EBX
+	CMPB	AL, [EDX]
+	JNE	22$.S
+	INCL	EDX
+	JMP	16$.S
+
+;Here at end of extension
+
+18$:	MOVL	EAX, EDX
+	SUBL	EAX, [ESP]
+	CMPL	EAX, #11t.B
+	JAE	20$.S
+	CMPB	[EDX], #' '
+	JNE	22$.S
+20$:	MOVL	EAX, pi_curval.B[EBP]
+	ADDL	EAX, #8t.B		;Add 8 to insure we leave the first
+					;  byte of the exec buffer alone to
+					;  avoid a very unlikely problem with
+					;  the contents matching the magic
+					;  number for an empty buffer!
+	MOVL	EDX, pi_numbfr.B[EBP]
+	BTZL	[EDX], EAX
+22$:	POPL	EDX
+	POPL	ECX
+	POPL	EBX
+sadvent:ADDL	EDX, #32t.B		;Bump to next entry
+	DECL	ECX			;More to check?
+	JNE	snxdent			;Yes - continue
+	ADDL	dcb_dkfpos.B[EDI], #512t ;Bump to beginning of next block
+	CALL	xosdskRelsBufr##	;Give up buffer for this block
+	MOVL	EBX, dcb_dkfilepnt.B[EDI] ;Restore offset of the fake FIB
+	JMP	snxdblk			;Continue
+.PAGE
+;Here when we have scanned the entire directory - now we search the bit array
+;  we have been building and find the first available number
+
+scanend:MOVL	EBX, pi_numbfr.B[EBP]
+	ANDW	[EBX], #0FE00h		;Don't use 0
+2$:	BSFL	EAX, [EBX]
+	JNE	4$.S
+	ADDL	EBX, #4t.B
+	JMP	2$.S
+
+;Here with a set bit which indicates an available number
+
+4$:	SUBL	EBX, pi_numbfr.B[EBP]
+	LEAL	EAX, -8.B[EAX+EBX*8]	;Get the bit number
+	CMPL	EAX, pi_nummax.B[EBP]	;Is it in range?
+	JG	6$.S			;No - return with Z clear
+	CLRL	EDX			;Yes - set Z
+	RET
+
+6$:	CLC
+	RET
+.PAGE
+;Subroutine to convert to valid character
+;	c[AX] = Uniconde character
+;	CALL	convchr
+;	C:clr = Have valid character
+;	  c(AL) = ASCII character
+;	C:set = Should ignore this character
+
+convchr:CMPB	AH, #0
+	JNE	4$.S
+	CMPB	AL, #'.'
+	JE	10$.S
+	CMPB	AL, #20h
+	JBE	10$.S
+	CMPB	AL, #7Fh
+	JAE	10$.S
+	CMPB	AL, #'~'
+	JE	4$.S
+	CMPB	AL, #'+'
+	JE	4$.S
+	CMPB	AL, #';'
+	JE	4$.S
+	CMPB	AL, #'['
+	JE	4$.S
+	CMPB	AL, #']'
+	JE	4$.S
+	CMPB	AL, #','
+	JNE	6$.S
+4$:	MOVB	AL, #'_'
+	CLC
+	RET
+
+6$:	CMPB	AL, #'a'
+	JB	8$.S
+	CMPB	AL, #'z'
+	JA	8$.S
+	ADDB	AL, #'A'-'a'
+8$:	CLC
+	RET
+
+10$:	STC
+	RET
+.PAGE
+;Subroutine to store Unicode characters into an extended directory entry
+;	c[AX]  = Previous character
+;	c{ECX} = Maximum number of characters to store
+;	c{EDI} = Destination offset
+;	c{ESI} = Source offset
+;	CALL	putlongchrs
+;	Z:set = End of long name encountered
+;	Z:clr = Not end
+
+putlongchrs:
+	TESTW	AX, AX			;At end?
+	JE	6$.S			;Yes
+2$:	LODSW	SS:[ESI]		;No - store a character
+	CMPW	AX, #'.'.B		;Period?
+	JNE	4$.S			;No
+	CMPW	SS:[ESI], #0.B		;Yes - last characater?
+	JE	2$.S			;Yes
+4$:	STOSW	[EDI]
+	LOOP	ECX, putlongchrs	;Continue if more needed
+	RET
+
+;Here if past end of long name
+
+6$:	MOVW	[EDI], #0FFFF
+	ADDL	EDI, #2t.B
+	LOOP	ECX, 6$
+	RET
+.PAGE
+	.SBTTL	dfsfrmdir - Subroutine to remove entry from a directory
+
+;Subroutine to remove entry from a directory.  File to be removed must be open
+;  for exclusive write access and locked.  The directory must be open but not
+;  locked.
+;	c{EDI} = Offset of DCB
+;	CALL	dfsfrmdir
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+
+dfsfrmdir::
+	MOVL	EBX, dcb_dkfilepnt.B[EDI]
+	CMPL	cb_dirfib.B[EBX], #0.B	;Is this file in a directory?
+	JE	ret020.S		;No - nothing to do here!
+	MOVZBL	EAX, ff_dirsize.B[EBX]	;Get offset to first entry
+	IMULL	EAX, #-32t.B
+	PUSHL	EAX
+4$:	CALL	dfsgetdirent#		;Yes - get directory entry
+	JC	8$.S			;If error
+	POPL	EAX
+6$:	MOVB	[EBX+EDX], #0E5		;OK - mark entry as removed
+	ADDL	EDX, #32t.B
+	ADDL	EAX, #32t.B		;More entries to remove?
+	JG	16$.S			;No - go on
+	TESTL	EDX, #1FFh		;Yes - in same block?
+	JNE	6$.S			;Yes
+	PUSHL	EAX
+	CALL	dfswritedir#		;No - write out this directory block
+	JC	10$.S
+	CALL	xosdskRelsLkBufr##	;Give up the directory buffer
+	MOVL	EBX, dcb_dkfilepnt.B[EDI]
+	MOVL	EAX, [ESP]
+	JMP	4$.S
+
+;Here if error reading a directory buffer
+
+8$:	POPL	EDX
+	RET
+
+;Here if error writing a directory buffer
+
+10$:	POPL	EDX			;Fix up the stack
+12$:	PUSHL	EAX			;Save error code
+	CALL	xosdskGiveLkBufr##	;Give up the directory block
+	POPL	EAX			;Restore error code
+	STC				;Indicate error
+ret020:	RET
+
+;Here with all directory entries for the file removed
+
+16$:	CALL	dfswritedir#		;Write out the final directory block
+	JC	12$.S			;If error
+	JMP	xosdskRelsLkBufr##	;Give up the directory buffer
+.PAGE
+	.SBTTL	dfsfinfrm - Subroutine to finish removing a file from a directory
+
+;Subroutine to finish removing a file from a directory
+;	CALL	dfsfinfrm
+
+dfsfinfrm::
+	MOVL	EBX, dcb_dkfilepnt.B[EDI] ;Get offset of file FIB
+	MOVL	EDX, cb_dirfib.B[EBX]	;Get offset of directory FIB
+	TESTL	EDX, EDX		;Is file in a directory?
+	JE	4$.S			;No - go on
+	MOVZWL	EAX, cb_opencnt.B[EBX]	;Yes - get number of times file is open
+	MOVL	cb_dirfib.B[EBX], #0	;Give up all of the directory FIBs
+	MOVL	EBX, EDX
+	CALL	dfsgivefibn#
+	MOVL	EBX, dcb_dkfilepnt.B[EDI] ;Get offset of the file's FIB again
+4$:	CMPL	cb_block.B[EBX], #0.B	;Does FIB still have a "block number"?
+	JE	6$.S			;No
+	CALL	xosdskRmvHash##		;Yes - remove FIB from its hash list
+6$:	CLRL	EAX
+	MOVL	cb_block.B[EBX], EAX	;FIB no longer has a "block number"
+	MOVL	cb_dirfib.B[EBX], EAX	;Clear links back to the directory
+	DECL	EAX
+	MOVL	ff_dirpos.B[EBX], EAX
+	RET
+.PAGE
+	.SBTTL	copyname - Subroutine to copy name element
+
+;Subroutine to copy name element - This routine always constructs a long name
+;  and also constructs a short name if it could be valid.  If the name is not
+;  a valid short name (too long, contains illegal character(s), or contains
+;  more than 1 period), no short name is constructed.
+;	c(AL) = First character of name
+;	CALL	copyname
+;	C:set = Error, always ER_BDSPC but not returned in EAX!
+;	C:clr = Normal
+;	  c(AL)  = Stopper character
+;	  c(AH)  = Non-zero if had period
+;	  c{EBX} = Offset of byte following last character in short name
+
+;Note that while the long name is constructed as Unicode, the specified name
+;  is currently only ASCII.  Thus the high byte of all Unicode characters is
+;  0.
+
+;While the maximum length of a long name stored on the disk is 255 characters,
+;  our buffer actually allows up to 399 characters to allow some extra room
+;  for wild-card characters.
+
+copyname:
+	PUSHL	#0.B
+	PUSHL	EAX			;Save first character
+	PUSHL	of_namepnt.B[EBP]	;Save pointer to start of name
+	LEAL	EBX, of_namlong[EBP]	;Point to place to put the long name
+	MOVL	ECX, #399t
+	MOVB	AH, #0			;High byte is always 0 for now!
+	MOVB	of_wild.B[EBP], AH	;Assume no wild-card characters
+	MOVL	of_percnt.B[EBP], #0	;Initialize the period count
+	JMP	4$.S
+
+2$:	CALL	dfsnchar
+4$:	CMPB	AL, #0			;End of name?
+	JE	12$.S			;Yes
+	CMPB	AL, #'\'		;Maybe
+	JE	12$.S			;Yes
+	MOVW	SS:[EBX], AX		;Store character
+	ADDL	EBX, #2t.B
+	CMPB	AL, #'.'		;Period?
+	JNE	6$.S			;No
+	INCL	of_percnt.B[EBP]	;Yes - count it
+	JMP	10$.S
+
+6$:	CMPB	AL, #'*'		;Wild-card character?
+	JE	8$.S			;Yes
+	CMPB	AL, #'?'		;Maybe
+	JNE	10$.S
+8$:	ORB	of_wild.B[EBP], #02h	;Yes - indicate have wild card character
+10$:	LOOPNE	ECX, 2$			;No - continue if have room for more
+	ADDL	ESP, #8t.B		;Name is too long - fail
+	STC
+	RET
+
+;Here with the long name stored
+
+12$:	MOVB	8.B[ESP], AL		;Save stopper character
+	CMPL	of_percnt.B[EBP], #1t.B	;Have exactly one period?
+	JE	14$.S			;Yes - no additional checks needed
+	JB	13$.S			;No - if no periods at all
+
+;Here if have more than 1 period in the name - make sure no final period
+
+	CMPW	SS:-2.B[EBX], #'.'.B	;Have final period?
+	JNE	14$.S			;No
+	SUBL	EBX, #2t.B		;Yes - remove it
+	JMP	14$.S
+
+;Here if have no periods - add a final period
+
+13$:	MOVW	SS:[EBX], #'.'		;No - add a final period
+	ADDL	EBX, #2t.B
+14$:	MOVW	SS:[EBX], #0		;Store null at end of long name
+	LEAL	EAX, of_namlong[EBP]	;Get length of the long name
+	SUBL	EAX, EBX
+	NEGL	EAX
+	SHRL	EAX, #1t
+	MOVL	of_namllen.B[EBP], EAX
+	MOVL	EBX, of_namepnt.B[EBP]
+	POPL	of_namepnt.B[EBP]	;Restore name pointer
+	POPL	EAX			;Restore first character
+	PUSHL	EBX			;Save pointer to end of name
+
+;Now store the short name if it is valid
+
+	CMPL	of_percnt.B[EBP], #1t.B	;Have more than 1 period in name?
+	JA	32$.S			;Yes - not a valid short name
+	LEAL	EBX, of_namshort[EBP]	;Point to place to put string
+	MOVL	ECX, #8			;No - allow 8 characters in name
+	TESTB	of_wild.B[EBP], #02h	;Have any wildcard characters?
+	JE	20$.S			;No
+	MOVB	CL, #40t		;Yes - allow more characters
+	JMP	20$.S
+
+18$:	CALL	dfsnchar		;Get character
+	JE	28$.S			;If end of name
+20$:	CMPB	AL, #'.'		;Period?
+	JNE	22$.S			;No
+	MOVB	CL, #3			;Yes - assume no wild card characters
+	TESTB	of_wild.B[EBP], #02h	;Have wild card characters yet?
+	JE	26$.S			;No
+	MOVB	CL, #10t		;Yes - allow more characters
+	JMP	26$.S
+
+;Here if not start of extension
+
+22$:	CMPB	AL, #'\'		;No - end of directory name?
+	JE	28$.S			;Yes
+	CMPB	AL, #20h		;No - valid short name character?
+	JBE	32$.S
+	CMPB	AL, #7Fh
+	JAE	32$.S
+	CMPB	AL, #'+'
+	JE	32$.S
+	CMPB	AL, #';'
+	JE	32$.S
+	CMPB	AL, #'['
+	JE	32$.S
+	CMPB	AL, #']'
+	JE	32$.S
+	CMPB	AL, #','
+	JE	32$.S
+	CMPB	AL, #'a'		;Yes - lower case letter?
+	JB	24$.S			;No
+	CMPB	AL, #'z'		;Maybe
+	JA	24$.S			;No
+	SUBB	AL, #20h		;Yes - convert to upper case
+24$:	DECL	ECX
+	JS	32$.S
+26$:	MOVB	SS:[EBX], AL		;Store character
+	INCL	EBX			;Bump pointer
+	JMP	18$.S			;Continue
+
+;Here at end of a valid short name
+
+28$:	CMPL	of_percnt.B[EBP], #0.B	;Have a period in name?
+	JNE	30$.S			;Yes
+	MOVB	SS:[EBX], #'.'		;No - add a final period
+	INCL	EBX
+30$:	MOVB	SS:[EBX], #0		;Store final null
+	JMP	34$.S
+
+;Here if not valid as a short name
+
+32$:	MOVB	of_namshort[EBP], #0	;Indicate no short name
+34$:	POPL	of_namepnt.B[EBP]	;Restore pointer to end of name
+	POPL	EAX			;Restore stopper character
+	CLC				;Make sure C is clear
+	RET				;Return
+.PAGE
+	.SBTTL	dfsnchar - Subroutine to get next file name character
+
+;Subroutine to get next file name character
+;	CALL	dfsnchar
+;	Z:clr = Character available
+;	  c(AL) = ASCII character
+;	Z:set = End of name
+;  All registers are preserved
+
+dfsnchar::
+	PUSHL	EBX
+2$:	MOVL	EBX, of_namepnt.B[EBP]	;Get pointer
+	MOVB	AL, SS:[EBX]		;Get character
+	INCL	of_namepnt.B[EBP]	;Bump pointer
+	CMPB	AL, #'\'		;No - directory seperator character?
+	JNE	4$.S			;No
+	CMPB	SS:1.B[EBX], #'\'	;Yes - have two in a row?
+	JE	2$.S			;Yes - ignore one of them
+4$:	POPL	EBX			;Finished
+	TESTB	AL, AL			;Set Z if end of string
+	RET
+.PAGE
+storedirpos:
+	TESTL	SS:xffPVFilOpt#, #FO$PHYNAME|FO$DOSNAME|FO$VOLNAME|FO$XOSNAME|FO$PATHNAME|FO$PATHDOS|FO$FILENAME|FO$FILEDOS|FO$ATTR
+					;Returning name?
+	JE	4$.S			;No - continue
+	MOVL	EAX, SS:xffPCFilSpc##	;Yes - has it overflowed?
+	CMPL	EAX, SS:xffPSFilSpc##
+	JAE	6$.S			;Yes
+4$:	MOVL	EAX, of_direofs.B[EBP]	;Calculate relative position in
+	ADDL	EAX, of_direblk.B[EBP]	;  directory
+	SHRL	EAX, #5			;Change to entry number
+	INCL	EAX
+	PUSHL	EAX
+	MOVL	EAX, opn_frame1.B[EBP]
+	POPL	SS:opn_dirofs.B[EAX]	;Save it in case user wants it
+6$:	RET
+
+	LKEEND

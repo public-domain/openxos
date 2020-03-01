@@ -1,0 +1,441 @@
+	.TITLE	ONCEDISK - XOS once-only RAM-disk routines
+
+;++++
+; This software is in the public domain.  It may be freely copied and used
+; for whatever purpose you see fit, including commerical uses.  Anyone
+; modifying this software may claim ownership of the modifications, but not
+; the complete derived code.  It would be appreciated if the authors were
+; told what this software is being used for, but this is not a requirement.
+
+;   THIS SOFTWARE IS PROVIDED BY THE AUTHORS "AS IS" AND ANY EXPRESS OR
+;   IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
+;   OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+;   IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+;   INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+;   BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS
+;   OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+;   ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR
+;   TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
+;   USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+;----
+
+	.PROC	80486
+	.INCLUD	XOSINC:\XMAC\XOS.PAR
+	.INCLUD	XOSINC:\XMAC\XOSX.PAR
+	.INCLUD	XOSINC:\XMAC\XOSERR.PAR
+
+	ONCE
+
+;This module contains the code which implements the once-only RAM-disk which
+;  is used to load the initial LKEs.  The RAM-disk is created by the real-mode
+;  once-only routine using the file system routines left over from the
+;  bootstrap to read the boot disk.  These initial LKEs will generally be
+;  those needed to access files on the boot device.  Generally, all other LKEs
+;  should be loaded using the normal startup routines.
+
+;The RAM-disk is located in contiguous physical memory starting at physical
+;  address 100000h (beginning of extended memory).  It is mapped to contiguous
+;  logical pages starting at offset 401000 in the exec data segment
+;  (GS_DATA:oordfile.  The first long in this area specifies the total size
+;  of the RAM-disk in bytes, including this first long.  Following this are
+;  one or more files.  Each file consists of a file header followed immediately
+;  byte the file data.  The file header is 36 bytes long and starts with a long
+;  which specifies the length of the file in bytes, NOT including the header.
+;  The remaining 32 bytes contain the name of the file.  If the name is less
+;  than 32 bytes, it is null filled to 32 bytes.  Files are tightly packed
+;  without regard to allignment.
+
+;Once all LKEs contained in the RAM-disk have been loaded, the RAM-disk (and
+;  all other once-only code) is deallocated.
+
+;Define offsets in the device dependent part of the RAM-disk DCB
+
+$$$=!4
+BLK dcb_oordiopos  , 4t		;Position in file for IO
+BLK dcb_oordfilepnt, 4t		;Pointer to beginning of file data
+BLK dcb_oordfilelen, 4t		;Length of the file
+dcb_oordSIZE=!$$$
+
+;Define offsets in our data area - this is a 4K page which is allocated at
+;  offset 400000h (ooramdisk).  Note that the RAM-disk contents is mapped
+;  starting at 401000h
+
+$$$=!oorddata
+BLK        , dcb_cSIZE
+BLK oorddcb, dcb_oordSIZE	;DCB
+BLK oordccb, ccb_SIZE		;CCB
+BLK dirofs , 4t			;Directory offset for open
+
+	ONCE
+
+;SVC dispatch table for RAMDISK class devices
+
+	.MOD	4
+oorddsp:.LONG	knlRtnZero#	;sd_mount      = 0.   - Mount
+	.LONG	knlRtnZero#	;sd_cleardev   = 4.   - Clear device
+	.LONG	oordclear	;sd_cleardcb   = 8.   - Clear DCB
+	.LONG	knlRtnZero#	;sd_commit     = 12.  - Commit data to disk
+	.LONG	knlRtnZero#	;sd_transold   = 16.  - Transfer device/old
+	.LONG	knlRtnZero#	;sd_transnew   = 20.  - Transfer device/new
+	.LONG	knlRtnZero#	;sd_opena      = 24.  - Open additional
+	.LONG	oordopen	;sd_open1      = 28.  - Open device/file
+	.LONG	oordopen	;sd_devparm    = 32.  - Device parameters
+	.LONG	knlIFnDev#	;sd_delete     = 36.  - Delete file
+	.LONG	knlIFnDev#	;sd_rename     = 40.  - Rename file
+	.LONG	oordinpblk	;sd_inblock    = 44.  - Input block
+	.LONG	knlIllOutGQ#	;sd_outblock   = 48.  - Output block
+	.LONG	knlIllOutGQ#	;sd_outblockq  = 52.  - Output block (XFF)
+	.LONG	knlIllOutGQ#	;sd_outstring  = 56.  - Output string
+	.LONG	knlRtnMOne#	;sd_getiosts   = 60.  - Get input/output status
+	.LONG	knlIFnDevGQ#	;sd_special    = 64.  - Special device function
+	.LONG	oordclose	;sd_close      = 68.  - Close file
+	.LONG	knlNullLabel#	;sd_label      = 72.  - Get device label
+	.LONG	knlRtnZero#	;sd_commitfunc = 76.  - Commit data to disk
+	.LONG	knlInfoNone#	;sd_devinfo    = 80.  - Return device info
+.PAGE
+;IO parameter table for RAMDISK open operations - note that the RAMDISK device
+;  supports only a limited number of IO parameters.  Only those parameters
+;  needed by the startup code and by LKELOAD are supported.  This is NOT a
+;  general purpose device!
+
+	.LONG	OPARMMAX
+oordopenparms:
+	.LONG	opnpgenparms	 ;IOPAR_xxxxxx = 00xx - Generic IO parameters
+	.LONG	opnpfilparms	 ;IOPAR_FILxxx = 01xx - File IO parameters
+OPARMMAX=!{$-oordopenparms}/4
+
+	.LONG	OPARMGENMAX
+opnpgenparms:
+	.LONG	0		;		   = 0000h
+	.LONG	knlIopDummyN#	;IOPAR_FILOPTN     = 0001h
+	.LONG	knlIopDummyS#	;IOPAR_FILSPEC     = 0002h
+OPARMGENMAX=!{$-opnpgenparms}/4
+
+	.LONG	OPARMFILMAX
+opnpfilparms:
+	.LONG	0		;		   = 0000h
+	.LONG	0		;IOPAR_DIRHNDL     = 0101h
+	.LONG	0		;IOPAR_SRCATTR     = 0102h
+	.LONG	0		;IOPAR_FILATTR     = 0103h
+	.LONG	opnpdirofs	;IOPAR_DIROFS      = 0104h
+	.LONG	0		;IOPAR_ABSPOS	   = 0105h
+	.LONG	0		;IOPAR_RELPOS	   = 0106h
+	.LONG	0		;IOPAR_EOFPOS	   = 0107h
+	.LONG	0		;IOPAR_VBOF	   = 0108h
+	.LONG	opnplength	;IOPAR_LENGTH      = 0109h
+OPARMFILMAX=!{$-opnpfilparms}/4
+
+;IO parameter table for RAMDISK IO operations
+
+	.LONG	PARMMAX
+oordioparms:
+	.LONG	0		 ;IOPAR_xxxxxx = 00xx - Generic IO parameters
+	.LONG	filparms	 ;IOPAR_FILxxx = 01xx - File IO parameters
+PARMMAX=!{$-oordioparms}/4
+
+	.LONG	PARMFILMAX
+filparms:
+	.LONG	0		;		   = 0000h
+	.LONG	0		;IOPAR_DIRHNDL     = 0101h
+	.LONG	0		;IOPAR_SRCATTR     = 0102h
+	.LONG	0		;IOPAR_FILATTR     = 0103h
+	.LONG	0		;IOPAR_DIROFS      = 0104h
+	.LONG	oordabspos	;IOPAR_ABSPOS	   = 0105h
+PARMFILMAX=!{$-filparms}/4
+.PAGE
+	.SBTTL	Initialization routine
+
+;This Outine assumes that the memory initialization code has already set up
+;  our local data area and the RAM-disk contents area.
+
+	INITSUB	oordinit
+
+oordinit:
+	MOVL	EDI, #oordchk		;Install our class
+	CLRL	EBX
+	MOVL	EAX, #'OORD'
+	CLRL	EDX
+	CLRL	ECX
+	MOVL	ESI, #oordccb
+	CALL	knlNewClass#
+	JC	4$.S
+	MOVL	EDI, #oorddcb		;Set up our single DCB
+	MOVL	dcb_name+0.B[EDI], #'OORD'
+	MOVL	dcb_name+4.B[EDI], #'SK'
+	MOVL	dcb_dsp.B[EDI],#DS$FILE|DS$DIN
+	MOVL	dcb_sdisp.B[EDI], #oorddsp
+	DECL	dcb_fnext.B[EDI]
+	CALL	knlGetDcbId#
+	MOVL	ESI, #oordccb
+	CALL	knlLinkDcb#
+	JC	4$.S
+	CLRL	EAX
+	RET
+
+4$:	CRASH	CIRD
+.PAGE
+	.SBTTL	oordchk - Device check routine for OORD devices
+
+;Device check routine for OORD class devices
+;	c{SS:EBX} = Address of device name (16 bytes)
+;	CALL	oordchk
+;	C:set = Error (match found)
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  Z:set = Match found
+;	    c{EDI} = Offset of DCB
+;	  Z:clr = Not found
+;  EBX and ESI are preserved
+
+oordchk:CMPL	SS:[EBX], #'OORD'	;Is this OORD0?
+	JNE	2$.S			;No
+	CMPL	SS:4.B[EBX], #'SK'	;Maybe
+	JNE	2$.S			;No
+	MOVL	EDI, #oorddcb		;Yes - point to our DCB
+	CMPL	dcb_opencnt.B[EDI], #0.B ;Is it in use now?
+	JNE	4$.S			;Yes - fail
+	RET				;No - return with Z set
+
+;Here if not OORDSK, return with Z and C clear
+
+2$:	CLC
+	RET
+
+;Here if OORDSK and it is in use
+
+4$:	MOVL	EAX, #ER_BUSY
+	STC
+	RET
+.PAGE
+	.SBTTL	sd_open - Open device
+
+;Here for the open device entry - get here in extended fork context
+;	c{ECX}    = Device command bits
+;	c{SS:EDX] = Address of file specification
+;	c{EDI}    = Offset of DCB
+;	CALL	oordopen
+;	C:set = Error
+;	  c{EAX} = Error code
+;	  c{ECX} = 0
+;	C:clr = Normal
+;	  c{ECX} = 1
+
+oordopen:
+	CLRL	EAX
+	MOVL	dirofs, EAX
+	BTL	SS:xffHvValue1#, #IOV1%DIROFS ;Was a directory offset specified?
+	JNC	4$.S			;No
+	MOVL	EAX, opn_dirofs.B[EBP]	;Yes - get the value
+	MOVL	dirofs, EAX
+4$:	MOVL	opn_dirofs.B[EBP], #0
+	MOVL	ESI, #oordfile+4	;Point to first file
+	MOVL	ECX, -4.B[ESI]		;Get size of the disk
+	CLD
+8$:	TESTL	ECX, ECX		;Anything left to check?
+	JLE	18$.S			;No - fail
+	DECL	dirofs			;Should we skip this one?
+	JNS	10$.S			;Yes
+	PUSHL	EDX
+	PUSHL	ESI
+	PUSHL	EDI
+	PUSHL	ECX
+	LEAL	EDI, 4.B[ESI]
+	PUSHL	DS
+	POPL	ES
+	MOVL	ESI, EDX
+	LEAL	EBX, opn_namebfr+FILESPCSIZE/2[EBP]
+	MOVB	AL, #0
+	CALL	knlWildCmp8#
+	POPL	ECX
+	POPL	EDI
+	POPL	ESI
+	POPL	EDX	
+	JE	12$.S			;If found it
+10$:	INCL	opn_dirofs.B[EBP]	;Not this one
+	MOVL	EAX, [ESI]		;Get length of this file
+	ADDL	EAX, #36t		;Plus length of the header
+	SUBL	ECX, EAX		;Reduce amount left
+	ADDL	ESI, EAX		;Bump pointer
+	JMP	8$.S			;Continue
+
+;Here if file found
+
+12$:	MOVL	EAX, [ESI]		;Store length of file
+	MOVL	dcb_oordfilelen.B[EDI], EAX
+	ADDL	ESI, #36t.B		;Point to start of data
+	MOVL	dcb_oordfilepnt.B[EDI], ESI ;Store it
+	CMPL	SS:xffParm#, #0.B	;Have any parameters?
+	JE	14$.S			;No
+	MOVL	EBX, #oordopenparms	;Yes - process the parameters
+	MOVL	ECX, #knlComDPParms#
+	LFSL	EDX, SS:xffParm#
+	CALL	knlProcDevParm#
+	JC	20$.S
+14$:	CLRL	EAX
+	MOVL	dcb_oordiopos.B[EDI], EAX
+	MOVL	ECX, #1
+	RET
+
+;Here if file not found
+
+18$:	MOVL	EAX, #ER_FILNF
+20$:	CLRL	ECX
+	STC
+ret008:	RET
+.PAGE
+	.SBTTL	sd_close - Close
+
+;Here for the close entry
+;	c{EDI} = Offset of DCB
+;	c{ESI} = Offset of IORB
+;	CALL	oordclose
+;	c{EAX} = Error code
+;	c{EBX} = Status bits
+;	c{ECX} = Amount transfered
+
+;WARNING: Closing this device with C$ONCEONLY set completely removes the
+;	  OORDSK: disk from and system and removes ALL of the once-only code
+;	  and data from the system!  (Not just the code and data associated
+;	  with OORDSK:)  The OOCD0: once-only device MUST have been opened
+;	  and closed (which will remove it from the system) before this is
+;	  done!
+
+oordclose:
+	CLRL	EAX
+	BTL	iorb_option.B[ESI], #C%ONCEONLY ;Final once-only close?
+	JNC	4$.S			;No
+	MOVL	dcb_name.B[EDI], EAX	;Yes - clear out the name in the DCB
+4$:	TOFORK				;  (the sd_clear routine will check for
+	JMP	knlCloseFin#		;  this)
+
+	.SBTTL	sd_cleardcb - Clear DCB
+
+;Here for the clear DCB entry
+;	c{EDI} = Offset of DCB
+;	CALL	oordclear
+
+oordclear:
+	CMPL	dcb_name.B[EDI], #0.B	;Final close?
+	JNE	ret008.S		;No - nothing needed here
+	MOVZWL	EAX, dcb_id.B[EDI]	;Give up the DCB's global ID
+	CALL	knlGiveDcbId#
+	MOVL	ESI, #oordccb		;Remove the device class
+	CALL	knlRmvClass#
+	MOVL	EBX, #la_oorddata	;Get linear address for the once-only
+	MOVL	ECX, oordfile+0		;  data
+	ADDL	ECX, #oordfile-oorddata+0FFFh
+	CALL	6$			;Give up the once-only data pages		;Get number of once-only data pages
+	MOVL	EBX, #la_oocode
+	MOVL	ECX, #oocodetop#-oocode+0FFFh
+6$:	SHRL	ECX, #12t		;Give up the once-only code (Note that
+	CLRL	EAX			;  this gives up this code!  The call
+	JMP	knlGivePages#		;  to knlGivePages here MUST NOT RETURN
+					;  HERE!)
+.PAGE
+	.SBTTL	sd_qinpblk - Queued input block
+
+;Here for the queued input block entry
+;	c{EDI} = Offset of DCB
+;	c{ESI} = Offset of IORB
+;	CALL	oordinpblk
+;	c{EAX} = Error code
+;	c{EBX} = Status bits
+;	c{ECX} = Amount transfered
+
+oordinpblk:
+	CMPL	iorb_parm.B[ESI], #0.B	;Do we have a parameter list?
+	JE	2$.S			;No
+	IFFAULT	18$
+	LFSL	EDX, iorb_parm.B[ESI]	;Yes - get address of parameter list
+	MOVL	EBX, #oordioparms	;Process parameters
+	MOVL	ECX, #knlComDPParms#
+	CALL	knlProcDevParm#
+	JC	10$.S			;If error
+2$:	MOVL	ECX, iorb_count.B[ESI]	;OK - get amount wanted
+	JREGZ	ECX, 6$
+	MOVL	EAX, dcb_oordfilelen.B[EDI] ;Get amount of data available
+	SUBL	EAX, dcb_oordiopos.B[EDI]
+	JS	12$.S			;If beyond EOF
+	CMPL	ECX, EAX		;Asking for more than this?
+	JBE	4$.S			;No
+	MOVL	ECX, EAX		;Yes - just give him what we have
+4$:	MOVL	EAX, dcb_oordfilepnt.B[EDI] ;Point to the file data
+	ADDL	EAX, dcb_oordiopos.B[EDI]
+	PUSHL	ECX
+	PUSHL	EDI
+	IFFAULT	16$
+	LESL	EDI, iorb_buffer1.B[ESI] ;Get buffer address
+	PUSHL	ESI
+	MOVL	ESI, EAX
+	CLD
+	IFFAULT	14$
+	RMOVSB	[EDI], [ESI]
+	POPL	ESI
+	POPL	EDI
+	CALL	knlGiveQel#
+	POPL	ECX
+	ADDL	dcb_oordiopos.B[EDI], ECX ;Bump position in file
+6$:	CLRL	EAX
+8$:	MOVL	EBX, #QSTS$DONE
+10$:	TOFORK
+	RET
+
+;Here if beyond EOF
+
+12$:	MOVL	EAX, #ER_EOF
+	CLRL	ECX
+	JMP	8$.S
+
+;Here if have address error
+
+	FAULTHDR
+14$:	POPL	ESI
+	FAULTHDR
+16$:	POPL	EDI
+	POPL	ECX
+	FAULTHDR
+18$:	TOFORK
+	JMP	knlQAdrErr0#
+.PAGE
+	.SBTTL	opnpdirofs - Here for the IOPAR_DIROFS IO parameter for open
+
+;Here for the IOPAR_DIROFS IO parameter - Directory offset
+
+	DPARMHDR  BOTH, HEXV
+opnpdirofs:
+	TESTB	AH, #PAR$GET
+	JE	6$.S
+	MOVL	EAX, opn_dirofs.B[EBP]
+	JMP	knlStrParm4#
+
+	.SBTTL	opnplength - Here for the IOPAR_LENGTH IO parameter for open
+
+;Here for the IOPAR_LENGTH IO parameter - File length
+
+	DPARMHDR  GET, HEXV
+opnplength:
+	MOVL	EAX, dcb_oordfilelen.B[EDI]
+	JMP	knlStrParm4#
+
+	.SBTTL	oordabspos - Here for the IOPAR_ABSPOS IO parameter
+
+;Here for the IOPAR_ABSPOS IO parameter - Set absolute position for IO
+
+	DPARMHDR  BOTH, HEXV
+oordabspos:
+	TESTB	AH, #PAR$SET		;Want to set value?
+	JE	2$.S			;No
+	PUSHL	EAX
+	CALL	knlGetParm#
+	JC	4$.S
+	MOVL	dcb_oordiopos.B[EDI], EAX
+	POPL	EAX
+2$:	TESTB	AH, #PAR$GET
+	JE	6$.S
+	MOVL	EAX, dcb_oordiopos.B[EDI]
+	JMP	knlStrParm4#
+
+4$:	POPL	EDX
+6$:	RET
+
+	END

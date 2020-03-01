@@ -1,0 +1,1684 @@
+	.TITLE	SNAPCLS - SNAP class driver for XOS
+
+;++++
+; This software is in the public domain.  It may be freely copied and used
+; for whatever purpose you see fit, including commerical uses.  Anyone
+; modifying this software may claim ownership of the modifications, but not
+; the complete derived code.  It would be appreciated if the authors were
+; told what this software is being used for, but this is not a requirement.
+
+;   THIS SOFTWARE IS PROVIDED BY THE AUTHORS "AS IS" AND ANY EXPRESS OR
+;   IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
+;   OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+;   IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+;   INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+;   BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS
+;   OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+;   ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR
+;   TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
+;   USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+;----
+
+	.PROC	80486
+	.INCLUD	XOSINC:\XMAC\XOS.PAR
+	.INCLUD	XOSINC:\XMAC\XOSX.PAR
+	.INCLUD	XOSINC:\XMAC\XOSTIME.PAR
+	.INCLUD	XOSINC:\XMAC\XOSERR.PAR
+	.INCLUD	XOSINC:\XMAC\XOSNET.PAR
+	.INCLUD	XOSINC:\XMAC\XOSXNET.PAR
+	.INCLUD	XOSINC:\XMAC\XOSXSNAP.PAR
+	.INCLUD	XOSINC:\XMAC\XOSLKE.PAR
+	.INCLUD	XOSINC:\XMAC\XOSXLKE.PAR
+
+;This device class implements the link-level SNAP protocol.  It is
+;  intended primarily for Ethernet devices, but also provides a bypass which
+;  allows its use with other devices (such as SLIP) which do not use a link
+;  level protocol.  This allows a consistant protocol stack for all devices.
+
+MAJV   =!2t
+MINV   =!0t
+EDITNUM=!0t
+
+	LKEHEAD	SNAPCLS, MAJV, MINV, EDITNUM, LKETYPE_CLASS
+
+	.EXPORT	xossnpClrEType
+	.EXPORT	xossnpClrSap
+	.EXPORT	xossnpGetPdbData
+	.EXPORT	xossnpMakeDcb
+	.EXPORT	xossnpNetClose1
+	.EXPORT	xossnpNetIopSapAddr
+	.EXPORT	xossnpRcv
+	.EXPORT	xossnpSdbHead
+	.EXPORT	xossnpSdbTail
+	.EXPORT	xossnpSendPkt
+	.EXPORT	xossnpSendPktHw
+	.EXPORT	xossnpSetEcho
+	.EXPORT	xossnpSetEType
+	.EXPORT	xossnpSetPdbData
+	.EXPORT	xossnpSetPkt
+	.EXPORT	xossnpSetSap
+
+	CODE
+.PAGE
+	.SBTTL	Service access point function dispatch table for SNAP
+
+;Serive access point function dispatch for SNAP
+
+snapdisp:
+	.LONG	snapabort		;nsf_abort    = 00 - Abort output
+	.LONG	dixrcv			;nsf_receive  = 04 - Packet receive
+
+	.SBTTL	SVC dispatch table for SNAP class devices
+
+;SVC dispatch table for SNAP class devices
+
+snapsvcdsp:
+	.LONG	knlRtnZero##	;sd_mount	=  0. - Mount
+	.LONG	knlRtnZero##	;sd_cleardev	=  4. - Clear device
+	.LONG	xosnetGiveDcb##	;sd_cleardcb	=  8. - Clear DCB
+	.LONG	knlRtnZero##	;sd_commit	= 12. - Commit data to disk
+	.LONG	knlRtnZero##	;sd_transold    = 16. - Transfer device/old
+	.LONG	knlRtnZero##	;sd_transnew    = 20. - Transfer device/new
+	.LONG	knlNullQio##	;sd_opena	= 24. - Open additional
+	.LONG	snapopen	;sd_open1	= 28. - Open device/file
+	.LONG	snapopen	;sd_devparm     = 32. - Device parameters
+	.LONG	knlIFnDev##	;sd_delete	= 36. - Delete file
+	.LONG	knlIFnDev##	;sd_rename	= 40. - Rename file
+	.LONG	snapinpblk	;sd_inblock	= 44. - Input block
+	.LONG	snapoutblk	;sd_outblock	= 48. - Output block
+	.LONG	snapoutblk1	;sd_outblockq	= 52. - Output block (XFF)
+	.LONG	knlIFnDevGQ##	;sd_outstring	= 56. - Output string
+	.LONG	knlRtnMOne##	;sd_getiosts	= 60. - Get input/output status
+	.LONG	knlIFnDevGQ##	;sd_special     = 64. - Special device function
+	.LONG	snapclose	;sd_close	= 68. - Close file
+	.LONG	knlNullLabel##	;sd_label       = 72. - Get device label
+	.LONG	knlNullQioGQ##	;sd_commitfunc	= 76. - Commit data to disk
+	.LONG	snapdevinfo	;sd_devinfo     = 80. - Get device info
+SNAPSVCDSPSZ=!{$-snapsvcdsp}/4
+
+;Class function dispatch table for SNAP class devices
+
+	.LONG	CLSFMX
+snapcls:.LONG	snapaddunit	;CF_ADDUNIT =  8. - Add unit
+	.LONG	snapunitinfo	;CF_PUNITS  =  9. - Get information about
+				;		      physical units
+	.LONG	knlIFnDevGQ##	;CF_AUNITS  = 10. - Get information about active
+				;		      units
+CLSFMX=!{$-snapcls}/4
+.PAGE
+;Device characteristics tables for SNAP devices
+
+	DATA
+
+	.MOD	4
+snapdctbl:
+ DCHARBGN  1, knlDCharValCom##
+ DCHARENT  CLASS   , TEXT ,  ,  8, knlDcMsgClass##   , knlDcGetClass##   , knlDcSetClass##   , 0
+ DCHARENT  NETDEV  , TEXT ,  , 16, xosnetMsgDev##    , snapgetnetdev     , 0                 , 0
+ DCHARENT  SAP     , HEXB ,  ,  2, msgsap            , snapgetsap        , snapsetsap        , 0
+ DCHARENT  PKTIN   , DECV ,  ,  4, xosnetMsgPktIn##  , xosnetGetSdbData##, xosnetSetSdbData##, sdb_cntpktin
+ DCHARENT  BYTEIN  , DECV ,  ,  4, knlDcMsgByteIn##  , xosnetGetSdbData##, xosnetSetSdbData##, sdb_cntbytein
+ DCHARENT  PKTOUT  , DECV ,  ,  4, xosnetMsgPktOut## , xosnetGetSdbData##, xosnetSetSdbData##, sdb_cntpktout
+ DCHARENT  BYTEOUT , DECV ,  ,  4, knlDcMsgByteOut## , xosnetGetSdbData##, xosnetSetSdbData##, sdb_cntbyteout
+ DCHARENT  BADPDU  , DECV ,  ,  4, msgbadpdu         , xosnetGetSdbData##, xosnetSetSdbData##, sdb_cntbadpdu
+ DCHARENT  NODST   , DECV ,  ,  4, msgnodst          , xosnetGetSdbData##, xosnetSetSdbData##, sdb_cntnodst
+ DCHARENT  ETYPETHS, DATAB, H,  4, msgetypethis      , snapgetetthis     , snapsetetthis     , 0
+ DCHARENT  ETYPENXT, DATAB, H,  4, msgetypenext      , snapgetetnext     , snapsetetthis     , 0
+ DCHARENT  ETYPEDEV, DATAB, H, 16, msgetypedev       , snapgetetdev      , 0                 , 0
+
+;Class characteristics tables for the SNAP device class
+
+	.MOD	4
+snapcctbl:
+ DCHARBGN  2, knlDCharValCom##
+ DCHARENT  NUMBER , DECV, , 4, msgnumber , knlGetSysVal##, 0             , snapdcbnum
+ DCHARENT  MAXIMUM, DECV, , 4, msgmaximum, knlGetSysVal##, knlSetSysVal##, snapdcbmax
+ DCHARENT  LIMIT  , DECV, , 4, msglimit  , knlGetSysVal##, knlSetSysVal##, snapdcblmt
+
+	CODE
+
+msgsap:      DCHARINFO  {Service access point address}
+msgbadpdu:   DCHARINFO  {Illegal format in network data unit}
+msgnodst:    DCHARINFO  {No destination for Ethertype}
+msgetypethis:DCHARINFO  {Next Ethertype}
+msgetypenext:DCHARINFO  {This Ethertype}
+msgetypedev: DCHARINFO  {Device for Ethertype}
+
+msgnumber:   DCHARINFO  {Number of in use SNAP devices}
+msgmaximum:  DCHARINFO  {Maximum number of in use SNAP devices}
+msglimit:    DCHARINFO  {Maximum number of SNAP devices allowed}
+.PAGE
+;Device parameter table for SNAP: opens
+
+	CODE
+
+	.MOD	4
+	.LONG	OPARMMAX
+snapopnparms:
+	.LONG	snapopngenparms	 ;IOPAR_xxxxxx = 00xx - Generic IO parameters
+	.LONG	knlNullFilParms##;IOPAR_FILxxx = 01xx - File system IO parameters
+	.LONG	knlNullTrmParms##;IOPAR_TRMxxx = 02xx - Terminal IO parameters
+	.LONG	0		 ;IOPAR_DSKxxx = 03xx - Disk IO parameters
+	.LONG	0		 ;IOPAR_TAPxxx = 04xx - Tape IO parameters
+	.LONG	snapopnnetparms	 ;IOPAR_NETxxx = 05xx - Network IO parameters
+OPARMMAX=!{$-snapopnparms}/4
+
+	.LONG	OPARMGENMAX	;Size of table
+snapopngenparms:
+	.LONG	0		;		   = 0000h
+	.LONG	knlIopDummyN##	;IOPAR_FILOPTN     = 0001h
+	.LONG	knlIopDummyS##	;IOPAR_FILSPEC     = 0002h
+	.LONG	knlIopDevSts##	;IOPAR_DEVSTS      = 0003h
+	.LONG	knlIopUnitNum##	;IOPAR_UNITNUM     = 0004h
+	.LONG	knlIopGlbId##	;IOPAR_GLBID       = 0005h
+	.LONG	knlIopDelay##	;IOPAR_DELAY       = 0006h
+	.LONG	knlIopTimeOut##	;IOPAR_TIMEOUT     = 0007h
+	.LONG	0		;IOPAR_INPSTS      = 0008h
+	.LONG	0		;IOPAR_OUTSTS      = 0009h
+	.LONG	knlIopInpQLmt##	;IOPAR_INPQLMT     = 000Ah
+	.LONG	knlIopOutQLmt##	;IOPAR_OUTQLMT     = 000Bh
+	.LONG	0		;IOPAR_SIVECT1     = 000Ch
+	.LONG	0		;IOPAR_SIVECT2     = 000Dh
+	.LONG	0		;IOPAR_SIDATA      = 000Eh
+	.LONG	knlIopNumOpen##	;IOPAR_NUMOPEN     = 000Fh
+	.LONG	knlIopBufrLmt##	;IOPAR_BUFRLMT	   = 0010h
+OPARMGENMAX=!{$-snapopngenparms}/4
+
+	.LONG	OPARMNETMAX
+snapopnnetparms:
+	.LONG	0		;		   = 0500h
+	.LONG	0		;IOPAR_NETSUBUMASK = 0501h
+	.LONG	snapiopetype	;IOPAR_NETPROTOCOL = 0502h
+	.LONG	0		;IOPAR_NETLCLPORT  = 0503h
+	.LONG	snapioprmthwas	;IOPAR_NETRMTHWAS  = 0504h
+OPARMNETMAX=!{$-snapopnnetparms}/4
+
+;Device parameter table for SNAP: IO operations
+
+	.LONG	PARMMAX
+snapioparms:
+	.LONG	snapiogenparms	 ;IOPAR_xxxxxx = 00xx - Generic IO parameters
+	.LONG	knlNullFilParms##;IOPAR_FILxxx = 01xx - File system IO parameters
+	.LONG	knlNullTrmParms##;IOPAR_TRMxxx = 02xx - Terminal IO parameters
+	.LONG	0		 ;IOPAR_DSKxxx = 03xx - Disk IO parameters
+	.LONG	0		 ;IOPAR_TAPxxx = 04xx - Tape IO parameters
+	.LONG	snapionetparms	 ;IOPAR_NETxxx = 05xx - Network IO parameters
+PARMMAX=!{$-snapioparms}/4
+
+	.LONG	PARMGENMAX	;Size of table
+snapiogenparms:
+	.LONG	0		;		   = 0000h
+	.LONG	knlIopFilOptn##	;IOPAR_FILOPTN     = 0001h
+	.LONG	knlIopFilSpec##	;IOPAR_FILSPEC     = 0002h
+	.LONG	knlIopDevSts##	;IOPAR_DEVSTS      = 0003h
+	.LONG	knlIopUnitNum##	;IOPAR_UNITNUM     = 0004h
+	.LONG	knlIopGlbId##	;IOPAR_GLBID       = 0005h
+	.LONG	knlIopDelay##	;IOPAR_DELAY       = 0006h
+	.LONG	knlIopTimeOut##	;IOPAR_TIMEOUT     = 0007h
+	.LONG	0		;IOPAR_INPSTS      = 0008h
+	.LONG	0		;IOPAR_OUTSTS      = 0009h
+	.LONG	knlIopInpQLmt##	;IOPAR_INPQLMT     = 000Ah
+	.LONG	knlIopOutQLmt##	;IOPAR_OUTQLMT     = 000Bh
+	.LONG	0		;IOPAR_SIVECT1     = 000Ch
+	.LONG	0		;IOPAR_SIVECT2     = 000Dh
+	.LONG	0		;IOPAR_SIDATA      = 000Eh
+	.LONG	knlIopNumOpen##	;IOPAR_NUMOPEN     = 000Fh
+	.LONG	knlIopBufrLmt##	;IOPAR_BUFRLMT	   = 0010h
+PARMGENMAX=!{$-snapiogenparms}/4
+
+	.LONG	PARMNETMAX
+snapionetparms:
+	.LONG	0		;		   = 0500h
+	.LONG	0		;IOPAR_NETSUBUMASK = 0501h
+	.LONG	snapiopetype	;IOPAR_NETPROTOCOL = 0502h
+	.LONG	0		;IOPAR_NETLCLPORT  = 0503h
+	.LONG	snapioprmthwas	;IOPAR_NETRMTHWAS  = 0504h
+	.LONG	snapioprmthwar	;IOPAR_NETRMTHWAR  = 0505h
+PARMNETMAX=!{$-snapionetparms}/4
+.PAGE
+	.SBTTL	Initialization routine
+
+	INITSUB	initsnap
+
+;The command for installing SNAPCLS is:
+;	LKELOAD SNAPCLS
+
+initsnap:
+	MOVL	EDI, #snapchk		;Install our class
+	MOVL	EBX, #snapcls		;Offset of class function dispatch table
+	MOVL	EAX, #'SNAP'
+	CLRL	EDX
+	MOVL	ECX, #snapcctbl
+	MOVL	ESI, #snapccb
+	CALL	knlNewClass##
+4$:	JC	10$.S			;This should not fail!
+	MOVL	ECX, #codetop
+	CLRL	EDX
+	CLRL	EAX
+10$:	MOVL	EBX, #QSTS$DONE
+	RET
+
+	CODE
+.PAGE
+	.SBTTL	snapaddunit - Class function to add unit
+
+;Here for the CL_ADDUNIT function
+;	c{ES:EDI} = Address of parameter block
+;	CALL	snapaddunit
+;	c{EAX} = Error code
+;	c{EBX} = Status bits
+;	c{ECX} = Item count
+
+;Description block for addunitchar
+
+	DATA
+
+	.MOD	4
+snapaublk:
+ DCHARBGN  3, knlDCharValCom##
+ DCHARENT  UNIT  , DECV, ,  1, 0, 0, lauunit  , 0
+ DCHARENT  NETDEV, TEXT, , 16, 0, 0, launetdev, 0
+
+	CODE
+
+$$$=!0
+FRM sau_unit, 4t		;Unit number
+FRM sau_idb , 4t		;Offset of IDB
+FRM sau_char, 8t		;Address of chracteristics list
+sau_SIZE=!$$$
+
+snapaddunit:
+	ENTER	sau_SIZE, 0		;Set up and initialize our stack frame
+	CLRL	EAX
+	DECL	EAX
+	MOVL	sau_unit.B[EBP], EAX
+	MOVL	sau_idb.B[EBP], EAX
+	IFFAULT	6$
+	LFSL	EDX, iorb_buffer2.B[ESI]
+	MOVL	sau_char+0.B[EBP], EDX
+	MOVL	sau_char+4.B[EBP], FS
+	CALL	knlGiveQel##		;Give up the IORB
+	MOVL	EBX, #snapaublk		;Process the characteristics
+	MOVB	AL, #1			;Ignore bad names here
+	CALL	knlAddUnitChar##
+	JNC	8$.S			;If no error
+4$:	CLRL	ECX
+	MOVL	EBX, #QSTS$DONE
+	LEAVE				;Fail
+	TOFORK
+	STC
+	RET
+
+;Here if address error with IORB
+
+	FAULTHDR
+6$:	CALL	knlGiveQel##
+7$:	MOVL	EAX, #ER_ADRER
+	JMP	4$.S
+
+;Here with all parameters processed - make sure we got everything we need
+
+8$:	MOVL	EAX, sau_unit.B[EBP]
+	ORL	EAX, sau_idb.B[EBP]
+	INCL	EAX
+	JNE	16$.S
+	MOVL	EAX, #ER_CHARM
+	JMP	4$.S
+
+;Here if SNAP unit is already defined
+
+12$:	MOVL	EAX, #ER_DUADF
+	JMP	4$.S
+
+;Here with all needed parameters found
+
+16$:	MOVB	AL, sau_unit.B[EBP]
+	MOVL	ESI, xossnpSdbHead	;Point to first SNAP SDB
+18$:	TESTL	ESI, ESI
+	JE	22$.S			;If no more SDBs
+	CMPB	sdb_unit.B[ESI], AL	;Same unit?
+	JE	12$.S			;Yes - fail
+20$:	MOVL	ESI, sdb_nextd.B[ESI]	;Not this one - try next
+	JMP	18$.S			;Continue
+
+;Here if this unit not defined now
+
+22$:	CALL	knlGetXRes##		;Get exec memory resource
+	MOVL	ECX, #sdb_mSIZE+sdb_snapSIZE
+	CALL	knlGetXMem##		;Allocate exec memory for the SDB
+	JC	30$.S			;If error
+	LEAL	ESI, sdb_mSIZE[EDI]
+	MOVL	sdb_magic.B[ESI], #'SDB*'
+	MOVL	EDX, sau_idb.B[EBP]	;Store offset of associated IDB
+	MOVL	sdb_idb.B[ESI], EDX
+	MOVB	AL, idb_hlen.B[EDX]	;Store hardware address length
+	MOVB	sdb_snaphlen.B[ESI], AL
+	MOVL	EAX, idb_hwhdrsz.B[EDX]	;Store hardware header size
+	MOVL	sdb_snaphwhdrsz.B[ESI], EAX
+	ADDL	EAX, #8.B		;Store total SNAP header size
+	MOVL	sdb_snaphdrsz.B[ESI], EAX
+	MOVB	AL, idb_cntoffset.B[EDX] ;Store offset in packet of count field
+	MOVB	sdb_snapcntoffset.B[ESI], AL
+	MOVL	EAX, idb_hwpktsz.B[EDX]	;Store maximum packet size
+	SUBL	EAX, #8.B
+	MOVL	sdb_maxpktsz.B[ESI], EAX
+	MOVB	sdb_snaphwtype+1.B[ESI], #06h ;Store ARP hardware type (assume
+					      ;  using 802.2 format - it will
+					      ;  be changed if we set for DIX)
+	MOVL	sdb_disp.B[ESI], #snapdisp
+	MOVL	EAX, xossnpSdbTail	;Link into our chain of SDBs
+	TESTL	EAX, EAX
+	JE	24$.S
+	MOVL	sdb_nextd.B[EAX], ESI
+	JMP	26$.S
+
+24$:	MOVL	xossnpSdbHead, ESI
+26$:	MOVL	xossnpSdbTail, ESI
+	MOVL	EAX, sau_unit.B[EBP]
+	MOVB	sdb_unit.B[ESI], AL
+	LEAL	EBX, sdb_name+4.B[ESI]	;Construct unit name
+	MOVL	-4.B[EBX], #'SNAP'
+	CALL	knlPutDecNmbr##
+	DECL	sdb_sapnext.B[ESI]	;Indicate not in a SAP list
+	DECL	sdb_sapprev.B[ESI]
+	CLRL	EAX
+30$:	CALL	knlGiveXRes##
+	JMP	4$
+.PAGE
+;Subroutine called by adduchars when "NETDEV" characteristic found
+
+launetdev:
+	MOVL	ESI, xosnetIdbHead##	;Get offset of first IDB
+	TESTL	ESI, ESI
+	JE	8$.S			;If none
+4$:	MOVL	EAX, knlDcValue##+0	;Check name
+	CMPL	idb_name+0.B[ESI], EAX
+	JNE	6$.S			;If different
+	MOVL	EAX, knlDcValue##+4
+	CMPL	idb_name+4.B[ESI], EAX
+	JNE	6$.S			;If different
+	MOVL	EAX, knlDcValue##+8
+	CMPL	idb_name+8.B[ESI], EAX
+	JNE	6$.S			;If different
+	MOVL	EAX, knlDcValue##+12t
+	CMPL	idb_name+12t.B[ESI], EAX
+	JE	10$.S			;If match
+6$:	MOVL	ESI, idb_nextd.B[ESI]	;Different - advance to next IDB
+	TESTL	ESI, ESI
+	JNE	4$.S			;Continue if have another
+8$:	MOVL	EAX, #ER_CHARV		;No match found - fail
+	STC
+	RET
+
+;Here with IDB for interface
+
+10$:	MOVL	sau_idb.B[EBP], ESI
+	RET
+
+;Subroutine called by adduchars when "UNIT" characteristic found
+
+lauunit:MOVL	sau_unit.B[EBP], EAX
+	CLC
+	RET
+.PAGE
+;Here to set the value of the SAP characteristic
+
+snapsetsap:
+	TESTL	EDX, EDX
+	JNE	badcharv.S
+	MOVL	ESI, dcb_netidb.B[EDI]	;Get offset of the IDB
+	MOVL	EBX, dcb_netsdb.B[EDI]	;Get offset of the SDB
+	CMPW	sdb_sapvalue.B[EBX], #0.B ;Do we already have a SAP address
+	JE	4$.S			;No - go on
+	PUSHL	EAX			;Yes - get rid of it
+	CALL	xossnpClrSap
+	CLRL	EAX			;Clear the SAP value
+	MOVL	sdb_sapvalue.B[EBX], EAX
+	POPL	EAX
+4$:	TESTL	EAX, EAX		;0 means no SAP address
+	JE	10$.S
+	MOVW	sdb_snaphwtype.B[EBX], #0600h ;Assume 802.2 format
+	MOVB	CL, idb_cntoffset.B[ESI]
+	MOVB	sdb_snapcntoffset.B[EBX], CL
+	MOVW	DX, idb_hwtype.B[ESI]	;Use the right ARP hardware type value
+	MOVW	sdb_snaphwtype.B[EBX], DX
+	MOVB	sdb_snapcntoffset.B[EBX], #0 ;No count field
+6$:	JMP	xossnpSetSap		;Go change SAP address
+
+badcharv:
+	MOVL	EAX, #ER_CHARV
+	STC
+10$:	RET
+
+;Here to get the value of the NETDEV characteristic
+
+snapgetnetdev:
+	MOVL	EBX, dcb_netidb.B[EDI]	;Get offset of the IDB
+	LEAL	EAX, idb_name.B[EBX]	;Get offset of NET device name
+	RET
+
+;Here to get the value of the SAP characteristic
+
+snapgetsap:
+	MOVL	ESI, dcb_netsdb.B[EDI]	;Get offset of the SDB
+	MOVL	EAX, sdb_sapvalue.B[ESI] ;Get the SAP address
+	RET
+.PAGE
+;Here to set the value of the ETYPETHS or ETYPENXT characteristic
+
+snapsetetthis:
+	TESTL	EAX, EAX		;Want first one?
+	JNE	2$.s			;No
+	TESTL	EDX, EDX		;Maybe
+	JNE	2$.S			;No
+	MOVL	thisetpdb, EAX		;Yes
+	RET
+
+2$:	MOVL	ESI, dcb_netsdb.B[EDI]	;Get offset of the SDB
+	MOVL	EBX, sdb_pdbhead.B[ESI] ;Get first PDB
+	TESTL	EBX, EBX
+	JE	6$.S
+4$:	CMPL	pdb_etypevalue.B[EBX], EAX ;This one?
+	JE	6$.S			;Yes
+	MOVL	EBX, [EBX]		;No - advance to next
+	TESTL	EBX, EBX
+	JNE	4$.S
+6$:	MOVL	thisetpdb, EBX		;Save the PDB we found
+	RET
+
+;Here to get the value of the ETYPENXT characteristic
+
+snapgetetnext:
+	MOVL	EAX, thisetpdb		;Get last PDB
+	TESTL	EAX, EAX		;Want first next?
+	JNE	7$.S			;No
+	MOVL	ESI, dcb_netsdb.B[EDI]	;Yes - get first PDB
+	MOVL	EAX, sdb_pdbhead.B[ESI]
+	JMP	75$.S
+
+7$:	MOVL	EAX, [EAX]		;Get next PDB
+75$:	MOVL	thisetpdb, EAX
+	JMP	8$.S
+
+;Here to get the value of the ETYPETHS characteristic
+
+snapgetetthis:
+	MOVL	EAX, thisetpdb
+8$:	TESTL	EAX, EAX
+	JE	10$.S
+	MOVL	EAX, pdb_etypevalue.B[EAX]
+10$:	RET
+
+;Here to get the value of the ETYPEDEV characteristic
+
+snapgetetdev:
+	CLRL	EAX
+	CLRL	EDX
+	MOVL	ESI, thisetpdb
+	TESTL	ESI, ESI
+	JE	12$.S
+	LEAL	EAX, pdb_name.B[ESI]	;Get offset of name
+12$:	RET
+
+20$:	MOVL	EAX, #ER_CHARV
+	STC
+	RET
+.PAGE
+	.SBTTL	xossnpGetPdbData - Subroutine to get data item from a PDB
+
+;Subroutine to get data item from a PDB for QFNC_DEVCHAR
+;	c{EBX} = Offset of item
+;	c{EDI} = Offset of DCB
+;	CALL	xossnpGetPdbData
+;	C:clr always
+;	c{EAX} = Data value
+
+xossnpGetPdbData:
+	ADDL	EBX, dcb_netpdb.B[EDI]	;Point to the data item
+	MOVL	EAX, [EBX]		;Get value
+	CLC
+	RET				;Thats all
+
+	.SBTTL	xossnpSetPdbData - Subroutine to set data item in a PDB
+
+;Subroutine to set data item in a PDB for QFNC_DEVCHAR
+;	c{EAX} = Data value
+;	c{EBX} = Offset of item
+;	c{EDI} = Offset of DCB
+;	CALL	xossnpSetPdbData
+;	C:clr always
+
+xossnpSetPdbData:
+	ADDL	EBX, dcb_netpdb.B[EDI]	;Point to the data item
+	MOVL	[EBX], EAX		;Store value
+	CLC
+	RET				;Thats all
+.PAGE
+	.SBTTL	snapunitinfo - SNAP class get phyical unit information function
+
+;Here for the get physical unit information class function (CL_PUNITS) for the
+;  SNAP class
+;	c{EBX} = Offset of CCB
+;	c{ESI} = Offset of IORB
+;	CALL	snapunitinfo
+;	c{EAX} = Error code
+;	c{EBX} = Status bits
+;	c{ECX} = Item count
+;  A zero count (iorb_count) requests that the number of units only be returned
+;    in qab_amount.  A non-zero count indicates that a buffer is available for
+;    that many unit names (8 characters each, null padded).
+
+snapunitinfo:
+	MOVL	EAX, #ER_NIYT
+	STC
+	RET
+.PAGE
+	.SBTTL	snapabort - Subroutine to abort all SNAP output
+
+;Subroutine to abort all SNAP output
+;	c{ESI} = Offset of SDB
+;	CALL	snapabort
+
+snapabort:
+	MOVL	EDI, sdb_pdbhead.B[ESI]	;Get first PDB
+2$:	TESTL	EDI, EDI
+	JE	ret008.S
+	MOVL	EAX, pdb_disp.B[EDI]
+	CALLI	CS:npf_abort.B[EAX]
+	MOVL	EDI, [EDI]
+	JMP	2$.S
+.PAGE
+	.SBTTL	snapchk - Device check routine for SNAP devices
+
+;Device check routine for SNAP devices
+;	c{EBX:EAX} = Device name (8 bytes)
+;	CALL	snapchk
+;	C:set = Error (match found)
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  Z:set = Match found
+;	    c{EDI} = Offset of DCB
+;	  Z:clr = Not found
+;  ESI is preserved
+
+snapchk:CMPL	SS:[EBX], #'SNAP'	;Is this for SNAP*?
+	JNE	8$.S			;No
+	MOVL	EDI, xossnpSdbHead	;Yes - point to first SDB
+	TESTL	EDI, EDI
+	JE	8$.S			;If none at all
+4$:	MOVL	EAX, SS:[EBX]
+	CMPL	sdb_name+0.B[EDI], EAX
+	JNE	6$.S
+	MOVL	EAX, SS:4.B[EBX]
+	CMPL	sdb_name+4.B[EDI], EAX
+	JNE	6$.S
+	MOVL	EAX, SS:8.B[EBX]
+	CMPL	sdb_name+8.B[EDI], EAX
+	JNE	6$.S
+	MOVL	EAX, SS:12t.B[EBX]
+	CMPL	sdb_name+12t.B[EDI], EAX
+	JE	10$.S			;Yes - this is it!
+6$:	MOVL	EDI, sdb_nextd.B[EDI]	;Not this one - try next
+	TESTL	EDI, EDI
+	JNE	4$.S			;Continue if another
+8$:	TESTL	ESP, ESP		;No more - clear Z
+ret008:	RET
+
+;Here with match on name
+
+10$:	PUSHL	ESI
+	PUSHL	EDI			;Save offset of the SDB
+	PUSHL	SS:12t.B[EBX]		;Device name
+	PUSHL	SS:8.B[EBX]
+	PUSHL	SS:4.B[EBX]
+	PUSHL	SS:[EBX]
+	MOVZBL	EAX, sdb_unit.B[EDI]	;Primary unit number
+	PUSHL	EAX
+	PUSHL	#0.B			;Secondary unit number
+	PUSHL	#dcb_snapINDEX.B	;Size index
+	PUSHL	#snapccb		;Offset of CCB
+	PUSHL	sdb_idb.B[EDI]		;Offset of IDB
+	PUSHL	#DS$DUPLEX		;Description bits
+	CALL	xosnetMakeDcb##		;Get a network DCB
+	POPL	EBX			;Restore offset of the SDB
+	POPL	ESI
+	JC	12$.S			;If error
+	MOVL	dcb_sdisp.B[EDI], #snapsvcdsp ;Store offset of SVC dispatch
+					      ;  table
+	MOVL	dcb_devchar.B[EDI], #snapdctbl ;Store offset of devchar table
+	MOVB	dcb_bufrlmt.B[EDI], #4	;Default buffer limit is 4
+	MOVL	dcb_netsdb.B[EDI], EBX	;Store offset of the SDB in the DCB
+	LEAL	EBX, dcb_snappdb.B[EDI]	;Set up our PDB
+	MOVL	dcb_netpdb.B[EDI], EBX
+	MOVL	pdb_sdb.B[EBX], EBX
+	MOVL	EAX, dcb_netidb.B[EDI]
+	MOVL	pdb_idb.B[EBX], EAX
+	MOVL	EAX, dcb_name+0.B[EDI]
+	MOVL	pdb_name+0.B[EBX], EAX
+	MOVL	EAX, dcb_name+4.B[EDI]
+	MOVL	pdb_name+4.B[EBX], EAX
+	DECL	[EBX]
+	CLRL	EAX			;Set Z
+12$:	RET				;And return
+.PAGE
+	.SBTTL	xossnpNetIopSapAddr - Process IOPAR_NETPROTOCOL device parameter for network devices
+
+;Here to process the IOPAR_NETPROTOCOL device parameter for network
+;  devices - SAP address
+
+xossnpNetIopSapAddr:
+	TESTB	AH, #PAR$SET		;Want to set value?
+	JE	8$.S			;No
+	PUSHL	EAX
+	CALL	knlGetParm##		;Yes - get value
+	JC	12$.S
+	LEAL	EBX, dcb_ndvsdb.B[EDI]
+	CMPL	sdb_sapvalue.B[EBX], #0.B ;Already have a SAP address?
+	JE	4$.S			;No
+	PUSHL	EAX
+	CALL	xossnpClrSap		;Yes - clear it out
+	POPL	EAX
+4$:	TESTL	EAX, EAX		;Just clearing the protocol?
+	JE	6$.S			;Yes
+	MOVL	ECX, #xosnetRcvPkt##	;No
+	MOVL	ESI, dcb_netidb.B[EDI]
+	CALL	xossnpSetSap		;Set the new protocol
+	JC	12$.S			;If error
+6$:	POPL	EAX
+8$:	TESTB	AH, #PAR$GET		;Want value returned?
+	JE	14$.S			;No
+10$:	MOVZWL	EAX, dcb_ndvsdb+sdb_sapvalue.B[EDI] ;Yes - give him the current
+	JMP	knlStrParm4##			    ;  value
+
+12$:	POPL	EDX
+14$:	RET
+
+16$:	POPL	EAX
+	MOVL	EAX, #ER_PARMV
+	STC
+	RET
+.PAGE
+	.SBTTL	xossnpMakeDcb - Make DCB for network device using SNAP
+
+;Subroutine to make DCB for network device using SNAP
+;	c{SS:EBX} = Address of device name
+;	c{EDX}    = Offset of net CCB
+;	c{EDI}    = Offset of IDB
+;	CALL	xossnpMakeDcb
+
+xossnpMakeDcb:
+	PUSHL	ESI
+	PUSHL	SS:12t.B[EBX]		;Device name
+	PUSHL	SS:8.B[EBX]
+	PUSHL	SS:4.B[EBX]
+	PUSHL	SS:[EBX]
+	MOVZBL	EAX, idb_unit.B[EDI]	;Primary unit number
+	PUSHL	EAX
+	PUSHL	#0.B			;Secondary unit number
+	PUSHL	#dcb_ndvINDEX.B		;Size index
+	PUSHL	EDX			;Offset of CCB
+	PUSHL	EDI			;Offset of IDB
+	PUSHL	#DS$DUPLEX		;Description bits
+	CALL	xosnetMakeDcb##		;Get a network DCB
+	POPL	ESI
+	JC	4$.S			;If error
+	LEAL	EBX, dcb_ndvsdb.B[EDI]	;Set up our SDB
+	MOVL	dcb_netsdb.B[EDI], EBX
+	MOVL	sdb_idb.B[EBX], ESI
+	MOVL	EAX, dcb_name+0.B[EDI]
+	MOVL	sdb_name+0.B[EBX], EAX
+	MOVL	EAX, dcb_name+4.B[EDI]
+	MOVL	sdb_name+4.B[EBX], EAX
+	DECL	sdb_sapnext.B[EBX]
+	DECL	sdb_sapprev.B[EBX]
+	CLRL	EAX			;Set Z
+4$:	RET				;And return
+.PAGE
+	.SBTTL	snapiopetype - Process IOPAR_PROTOCOL device parameter
+
+;Here to process the IOPAR_PROTOCOL device parameter - Ethertype value
+
+	DPARMHDR  BOTH, DECV, 8
+snapiopetype:
+	TESTB	AH, #PAR$SET		;Want to set value?
+	JE	8$.S			;No
+	PUSHL	EAX
+	CALL	knlGetParm##		;Yes - get value
+	JC	retp1.S
+	LEAL	EBX, dcb_snappdb.B[EDI]
+	CMPL	pdb_etypevalue.B[EBX], #0.B ;Already have an Ethertype?
+	JE	4$.S			;No
+	PUSHL	EAX
+	CALL	xossnpClrEType		;Yes - clear it out
+	POPL	EAX
+4$:	TESTL	EAX, EAX		;Just clearing the Ethertype?
+	JE	6$.S			;Yes
+	MOVL	ECX, #snaprcvpkt	;No
+	MOVL	ESI, dcb_netsdb.B[EDI]
+	CALL	xossnpSetEType		;Set the new Ethertype
+	JC	retp1.S			;If error
+6$:	POPL	EAX
+8$:	TESTB	AH, #PAR$GET		;Want value returned?
+	JE	14$.S			;No
+10$:	MOVL	EAX, dcb_snappdb+pdb_etypevalue.B[EDI]
+	JMP	knlStrParm4##		;Yes - give him the current value
+
+retp1:	POPL	EDX
+14$:	RET
+
+16$:	POPL	EAX
+	MOVL	EAX, #ER_PARMV
+	STC
+ret010:	RET
+.PAGE
+	.SBTTL	snapioprmthwas - Process IOPAR_RMTHWAS device parameter
+
+;Here to process the IOPAR_RMTHWAS device parameter - Remote hardware address
+;  for output
+
+	DPARMHDR  BOTH, DECV, 8
+snapioprmthwas:
+	TESTB	AH, #PAR$SET		;Want to set value?
+	JE	4$.S			;No
+	PUSHL	EAX			;Yes
+	CALL	knlGetParm		;Get value
+	JC	retp1.S			;If error
+	MOVL	dcb_snaphwaddr+0.B[EDI], EAX ;Store value
+	MOVL	dcb_snaphwaddr+4.B[EDI], EDX
+	POPL	EAX
+4$:	TESTB	AH, #PAR$GET		;Want to get value?
+	JE	ret010.S		;No
+	MOVL	EAX, dcb_snaphwaddr+0.B[EDI] ;Store value
+	MOVL	EDX, dcb_snaphwaddr+4.B[EDI]
+	JMP	knlStrParm8##
+.PAGE
+	.SBTTL	snapioprmthwar - Process IOPAR_RMTHWAR device parameter
+
+;Here to process the IOPAR_RMTHWAR device parameter - Remote hardware address
+;  for input
+
+	DPARMHDR  GET, DECV, 8
+snapioprmthwar:
+	CMPB	SS:xffFunc##, #QFNC_INBLOCK ;Input?
+	JNE	2$.S			;No - this parameter is illegal!
+	CMPL	ECX, #8.B		;Yes - is the value long enough?
+	JB	4$.S			;No - fail
+	MOVL	iox_rmthwa+0.B[EBP], EBX ;Yes - store address for value
+	MOVL	iox_rmthwa+4.B[EBP], ES
+	CLRL	EAX			;Clear his value for now
+	JMP	knlStrParm4##
+
+2$:	MOVL	EAX, #ER_PARMF
+	STC
+	RET
+
+4$:	MOVL	EAX, #ER_PARMS
+	STC
+	RET
+.PAGE
+;Here for the get device information entry
+;	c{ECX}    = Length of user buffer
+;	c{ES:EDI} = Address of user buffer
+;	c{ESI}    = Offset of DCB
+;	CALL	snapdevinfo
+
+$$$=!0
+FRM info_left  , 4t
+FRM info_amount, 4t
+info_SIZE=!$$$
+
+snapdevinfo:
+	ENTER	info_SIZE, 0
+	MOVL	info_left.B[EBP], ECX
+	CLRL	EAX
+	MOVL	info_amount.B[EBP], EAX
+	CMPL	dcb_snappdb+pdb_etypevalue.B[ESI], #0.B ;Have an Ethertype?
+	JE	2$.S			;No
+	MOVL	EBX, #etlbl		;Yes
+	CLRL	ECX
+	CALL	knlInfoStr##
+	MOVZBL	EAX, dcb_snappdb+pdb_etypevalue+0.B[ESI]
+	CALL	knlInfoHex##
+	MOVB	AL, #'-'
+	CALL	knlInfoChr##
+	MOVZBL	EAX, dcb_snappdb+pdb_etypevalue+1.B[ESI]
+	CALL	knlInfoHex##
+2$:	DECL	info_left.B[EBP]	;Have room for a null?
+	JS	4$.S			;No
+	IFFAULT	knlRtnAdrErLv##		;Yes - store one
+	MOVB	ES:[EDI], #0
+4$:	MOVL	EAX, info_amount.B[EBP]
+	LEAVE
+	RET
+.PAGE
+	.SBTTL	sd_open - Open device
+
+;Here for the open device entry (sd_open) - also used for the device parameters
+;  entry (sd_parm)
+;	c{EDI} = Offset of DCB
+
+snapopen:
+	CMPL	SS:xffParm##, #0.B
+	JE	4$.S
+	MOVL	EBX, #snapopnparms	;Process device parameters
+	MOVL	ECX, #knlComDPParms##
+	LFSL	EDX, SS:xffParm##
+	JMP	knlProcDevParm##
+
+4$:	CLRL	EAX
+	RET
+.PAGE
+	.SBTTL	sd_close - Close device
+
+;Here for the close device entry
+;	c{ECX} = Close option bits
+;	c{EDI} = Offset of DCB
+;	c{ESI} = Offset of device table entry
+;	CALL	snapclose
+;	C:set = Error or not ready
+;	  c{EAX} = Error code (0 means not ready)
+;	C:clr = Normal
+
+snapclose:
+	CALL	knlIoClsLock##		;Lock the QAB
+	MOVB	iorb_queue.B[ESI], #dcb_outframe
+	MOVL	iorb_routine.B[ESI], #snapclose1
+	JMP	knlXfQueue##		;Switch to extended fork context
+
+	FAULTHDR
+2$:	MOVL	[ESP], #ER_ADRER
+	JMP	4$.S
+
+;Here in extended fork context
+
+snapclose1:
+	PUSHL	#0.B
+	CMPL	SS:xffParm##, #0.B	;Have any device parameters?
+	JE	4$.S			;No
+	MOVL	EBX, #snapioparms	;Yes - process parameters
+	MOVL	ECX, #knlComDPParms##
+	IFFAULT	2$
+	LFSL	EDX, SS:xffParm##
+	CALL	knlProcDevParm##
+	JNC	4$.S
+	MOVL	[ESP], EAX
+4$:	MOVL	ESI, dcb_netsdb.B[EDI]	;Get offset of our SDB
+	LEAL	EBX, dcb_snappdb.B[EDI]	;And of our PDB
+	CALL	xossnpClrEType		;Clear any Ethertype we have setup
+	MOVL	EBX, dcb_snaprcvpkth.B[EDI] ;Have any input packets buffered?
+	TESTL	EBX, EBX
+	JE	6$.S			;No
+	CALL	xosnetGiveList##	;Yes - give them up
+6$:	CLRL	EAX
+	MOVL	dcb_snaprcvpkth.B[EDI], EAX
+	POPL	EAX			;Restore error code
+	JMP	knlXfCloseFin##		;Go finish up
+.PAGE
+;Extended fork context routine for closing network level devices which use SNAP
+
+xossnpNetClose1:
+	PUSHL	SS:xffCount##		;Stack the error code
+	MOVL	ESI, dcb_netidb.B[EDI]	;Get offset of our IDB
+	CMPL	idb_lnkctldcb.B[ESI], EDI ;Are we in link control mode?
+	JNE	4$.S			;No
+	CLRL	EDX			;Yes - clear link control mode
+	MOVL	ECX, idb_disp.B[ESI]
+	CALLI	CS:ndf_linkctl.B[ECX]
+4$:	LEAL	EBX, dcb_ndvsdb.B[EDI]	;Get offset of our SDB
+	CALL	xossnpClrSap		;Clear any SAP we have setup
+	POPL	EAX			;Restore error code
+	JMP	knlXfCloseFin##		;Go finish up
+.PAGE
+	.SBTTL	sd_inpblock - Input block
+
+;Here for the sd_inpblock entry - input block
+;	c{ESI} = Offset of IORB
+;	c{EDI} = Offset of DCB
+;	CALL	snapinpblock
+;	c{EAX} = Error code
+;	c{ECX} = Amount output
+;	c{EBX} = Status bits
+
+$$$=!0
+FRM iox_rmthwa, 8t		;Address to receive the remote hardware address
+iox_SIZE=!$$$
+
+snapinpblk:
+	CALL	knlIoQabLock##		;Lock the QAB
+	JC	2$.S			;If error
+	CALL	knlIoReadLock##		;Lock all buffer pages
+	JC	2$.S			;If error
+	MOVB	iorb_queue.B[ESI], #dcb_inpframe
+	MOVL	iorb_routine.B[ESI], #snapinpblk1
+	JMP	knlXfQueue##		;Switch to extended fork context
+
+2$:	TOFORK
+	RET
+
+;Here in extended fork context
+
+snapinpblk1:
+	ENTER	iox_SIZE, 0
+	MOVL	SS:xffTimeOut##, #-1
+	CLRL	EAX
+	MOVL	iox_rmthwa+0.B[EBP], EAX
+	CMPL	SS:xffParm##+0, EAX
+	JE	4$.S
+	MOVL	EBX, #snapioparms	;Process parameters
+	MOVL	ECX, #knlComDPParms##
+	LFSL	EDX, SS:xffParm##
+	CALL	knlProcDevParm##
+	JC	6$.S			;If error
+4$:	CMPL	SS:xffCount##, #0.B	;Really want to do input?
+	JNE	10$.S			;Yes
+	CLRL	EAX			;No - finished now
+6$:	CLRL	EAX
+	MOVL	EBX, #QSTS$DONE
+	LEAVE
+	RET
+
+;Here to really do input
+
+10$:	CMPL	dcb_snaprcvpkth.B[EDI], #0.B ;Yes - have a packet now?
+	JNE	12$.S			;Yes
+	MOVL	EAX, SS:xffTimeOut##	;No - wait for input to appear
+	CALL	knlXfWait##
+	JC	6$.S			;If error
+12$:	MOVL	EBX, dcb_snaprcvpkth.B[EDI] ;OK - get offset of the packet
+	MOVL	EAX, npb_next.B[EBX]	;Unlink it
+	MOVL	dcb_snaprcvpkth.B[EDI], EAX
+	TESTL	EAX, EAX
+	JNE	14$.S
+	MOVL	dcb_snaprcvpktt.B[EDI], EAX
+14$:	DECB	dcb_snaprcvpktc.B[EDI]	;Reduce number of packets buffered
+	MOVZBL	ESI, npb_npofs.B[EBX]	;Point to the data
+	ADDL	ESI, EBX
+	PUSHL	#QSTS$DONE		;Get final status bits
+	MOVL	ECX, npb_count.B[EBX]
+	CMPL	ECX, SS:xffCount##	;Will it all fit in his buffer?
+	JBE	16$.S			;Yes
+	MOVL	ECX, SS:xffCount##	;No - just give him what will fit
+	BTSL	[ESP], #QSTS%TRUNC	;Indicate truncation
+16$:	PUSHL	ECX
+	PUSHL	EDI
+	LESL	EDI, SS:xffBuffer1##	;Get address of buffer
+	CMPL	ECX, #4.B		;4 bytes or fewer?
+	JBE	18$.S			;Yes
+	MOVL	EAX, ECX		;No
+	CLRL	ECX			;Get destination long aligned
+	SUBL	ECX, EDI
+	ANDL	ECX, #03.B
+	SUBL	EAX, ECX
+	RMOVSB	[EDI], [ESI]
+	MOVL	ECX, EAX
+	SHRL	ECX, #2
+	RMOVSL	[EDI], [ESI]		;Copy most of the data 4 bytes at a time
+	MOVL	ECX, EAX
+	ANDL	ECX, #03.B
+18$:	RMOVSB	[EDI], [ESI]		;Copy anything left over
+	POPL	EDI
+	CMPL	iox_rmthwa+0.B[EBP], #0.B ;Does he want the remote address?
+	JE	20$.S			;No
+	MOVL	ESI, dcb_netidb.B[EDI]	;Yes - get remote address
+	MOVL	EAX, idb_disp.B[ESI]
+	CALLI	CS:ndf_gethwa.B[EAX]
+	LESL	ECX, iox_rmthwa.B[EBP]	;Get address where he wants the value
+	MOVL	ES:[ECX], EAX		;Give him the remote address value
+	MOVL	ES:4.B[ECX], EDX
+20$:	PUSHL	#0.B
+22$:	CALL	xosnetGiveBufr##	;Give up the buffer
+	POPL	EAX
+	POPL	ECX
+	POPL	EBX
+	LEAVE
+	RET
+.PAGE
+	.SBTTL	snaprcvpkt - Subroutine called when packet has been input for SNAP device
+
+;Subroutine called when packet has been input for a SNAP device
+;	c{EBX} = Offset of start of packet
+;	c{ECX} = Length of packet
+;	c{EDI} = Offset of PDB
+;	c{ESI} = Offset of IDB
+;	CALL	snaprcvpkt
+
+snaprcvpkt:
+	SUBL	EDI, #dcb_snappdb.B	;Point to our DCB
+	MOVB	AL, dcb_snaprcvpktc.B[EDI] ;Can we take another packet?
+	CMPB	AL, dcb_bufrlmt.B[EDI]
+	JAE	10$.S			;No
+	MOVL	EAX, dcb_snaprcvpktt.B[EDI] ;Yes - link to end of list
+	TESTL	EAX, EAX
+	JNE	2$.S
+	MOVL	dcb_snaprcvpkth.B[EDI], EBX
+	JMP	4$.S
+
+2$:	MOVL	npb_next.B[EAX], EBX
+4$:	MOVL	dcb_snaprcvpktt.B[EDI], EBX
+	MOVL	npb_next.B[EBX], #0
+	INCB	dcb_snaprcvpktc.B[EDI]	;Count the packet
+	MOVL	npb_count.B[EBX], ECX	;Store data size in packet
+	CLRL	EAX
+	JMP	knlResumeInput##	;Continue with input
+
+;Here if can not take the received packet
+
+10$:	INCL	sdb_cntnodst.B[ESI]	;Count this
+	CALL	xosnetGiveBufr#
+	RET
+.PAGE
+	.SBTTL	sd_outblock - Output block
+
+;Here for the sd_outblock entry - output block
+;	c{ESI} = Offset of IORB
+;	c{EDI} = Offset of DCB
+;	CALL	snapoutblk
+;	c{EAX} = Error code
+;	c{ECX} = Amount output
+;	c{EBX} = Status bits
+
+snapoutblk:
+	CALL	knlIoQabLock##		;Lock the QAB
+	JC	2$.S			;If error
+	CALL	knlIoWriteLock##	;Lock the buffer pages
+	JC	2$.S
+	MOVB	iorb_queue.B[ESI], #dcb_outframe
+	MOVL	iorb_routine.B[ESI], #snapoutblk1
+	JMP	knlXfQueue##		;Switch to extended fork context
+
+2$:	TOFORK
+	RET
+
+;Here in extended fork context
+
+snapoutblk1:
+	CMPL	SS:xffParm##, #0.B	;Have any parameters?
+	JE	4$.S			;No
+	MOVL	EBX, #snapioparms	;Yes - process parameters
+	MOVL	ECX, #knlComDPParms##
+	LFSL	EDX, SS:xffParm##
+	CALL	knlProcDevParm##
+	JC	6$.S			;If error
+4$:	CLRL	EAX
+	MOVL	ECX, SS:xffCount##
+	TESTL	ECX, ECX
+	JE	8$			;If nothing to output
+	CMPL	dcb_snappdb+pdb_etypevalue.B[EDI], #0.B ;Have an Ethertype?
+	JE	10$			;No - fail
+	MOVL	EAX, dcb_snaphwaddr+0.B[EDI] ;Yes - was an address specified?
+	ORL	EAX, dcb_snaphwaddr+4.B[EDI]
+	JE	12$			;No - fail
+	MOVL	ESI, dcb_netsdb.B[EDI]	;Yes - get offset of our SDB
+	ADDL	ECX, sdb_snaphdrsz.B[ESI] ;Add in length of the headers
+	CALL	xosnetGetBufr##		;Allocate a buffer
+6$:	JC	18$			;If error
+	MOVL	EAX, dcb_snappdb+pdb_etypevalue.B[EDI]
+	CALL	xossnpSetPkt		;Set up the packet header
+	JC	7$.S
+	MOVL	ECX, SS:xffCount##
+	ADDL	npb_count.B[EBX], ECX
+	CLRL	EAX
+	MOVL	npb_next.B[EBX], EAX
+	PUSHL	EDI
+	PUSHL	ESI
+	MOVL	EDI, EDX
+	PUSHL	DS
+	POPL	ES
+	LFSL	ESI, SS:xffBuffer1##	;Get address of buffer
+	MOVL	EAX, ECX		;Copy user's data to our buffer
+	SHRL	ECX, #2t
+	CLD
+	RMOVSL	[EDI], FS:[ESI]
+	MOVL	ECX, EAX
+	ANDL	ECX, #03.B
+	RMOVSB	[EDI], FS:[ESI]
+	POPL	ESI
+	POPL	EDI
+	PUSHL	EDI
+	MOVL	EAX, dcb_snaphwaddr+0.B[EDI] ;Get destination hardware address
+	MOVL	EDX, dcb_snaphwaddr+4.B[EDI]
+	MOVL	EDI, dcb_netpdb.B[EDI]
+	PUSHL	ESI
+	MOVL	ESI, sdb_idb.B[ESI]	;Store destination hardware address
+	MOVL	ECX, idb_disp.B[ESI]	;  in the packet
+	CALLI	CS:ndf_sethwa.B[ECX]
+	POPL	ESI
+	MOVL	npb_outdone.B[EBX], #xosnetOutDone##
+	CALL	snapsendpk2		;Output the packet
+	POPL	EDI
+7$:	JC	16$.S			;If error
+	PUSHL	ESI
+	MOVL	ESI, dcb_netidb.B[EDI]
+	MOVL	EAX, SS:xffTimeOut##	;Get time-out value
+	CALL	xosnetWaitPkt##		;Wait until output is done
+	POPL	ESI
+	JC	16$.S			;If error
+	CALL	xosnetGiveBufr##	;Give up the buffer
+	MOVL	ECX, SS:xffCount##	;Get amount we output
+8$:	MOVL	EBX, #QSTS$DONE
+	RET
+
+;Here if no Ethertype defined for the device
+
+10$:	MOVL	EAX, #ER_NNOPC
+	JMP	8$.S
+
+;Here if no network address was specified
+
+12$:	MOVL	EAX, #ER_NILAD
+	JMP	8$.S
+
+;Here if address error
+
+16$:	CALL	xosnetGiveBufr#
+18$:	CLRL	ECX
+	JMP	8$.S
+.PAGE
+	.SBTTL	xossnpSetEType - Subroutine to set Ethertype value
+
+;Subroutine to set Ethertype value
+;	c{EDX,EAX} = Protocol value
+;	c{EBX}     = Offset of PDB
+;	c{ESI}     = Offset of SDB
+;	CALL	snapsetprot
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  c{EAX} = 0
+
+xossnpSetEType:
+	PUSHL	EBX
+	MOVL	EBX, sdb_idb.B[ESI]
+	MOVL	EBX, idb_disp.B[EBX]
+	CALLI	CS:ndf_getetype.B[EBX]	;Call driver to convert to device
+	POPL	EBX			;  Ethertype value
+	JC	2$.S
+	MOVL	pdb_etypevalue.B[EBX], EAX ;Store Ethertype value
+	CMPL	EAX, #-1.B		;Want to set the default Ethertype?
+	JNE	8$.S			;No - go on
+	CMPL	sdb_dftpdb.B[ESI], #0.B	;Yes - already have a default?
+	JNE	18$.S			;Yes - fail
+	CLRL	EAX			;No - make this the default
+	MOVL	[EBX], EAX
+	MOVL	sdb_dftpdb.B[ESI], EBX
+2$:	RET				;Thats all
+
+;Here if not setting default Ethertype
+
+8$:	LEAL	EDX, sdb_pdbhead.B[ESI] ;Get offset of head pointer
+10$:	MOVL	ECX, [EDX]		;Get next PDB
+	JREGZ	ECX, 14$		;If no more
+	CMPL	EAX, pdb_etypevalue.B[ECX] ;Does it go here?
+	JBE	12$.S			;Yes
+	MOVL	EDX, ECX 		;No - advance to next PDB
+	JMP	10$.S			;Continue
+
+;Here with position for new entry
+
+12$:	JE	18$.S			;If duplicate
+14$:	MOVL	[EBX], ECX		;Insert into list
+	MOVL	[EDX], EBX
+	CLRL	EAX
+	RET
+
+;Here if requested Ethertype value is already in use
+
+18$:	MOVL	EAX, #ER_NPCIU
+	STC
+	RET
+.PAGE
+	.SBTTL	xossnpClrEType - Subroutine to clear Ethertype value
+
+;Subroutine to clear Ethertype value
+;	c{EBX} = Offset of PDB
+;	c{ESI} = Offset of SDB
+;	CALL	xossnpClrEType
+
+xossnpClrEType:
+	CLRL	EAX
+	CMPL	[EBX], #-1.B 		;Really in use?
+	JE	12$.S			;No
+	MOVL	pdb_etypevalue.B[EBX], EAX ;Yes - clear the value
+	CMPL	sdb_dftpdb.B[ESI], EBX	;Is this the default Ethertype?
+	JNE	4$.S			;No
+	MOVL	sdb_dftpdb.B[ESI], EAX	;Yes - but not any more
+	JMP	10$.S			;Finished
+
+;Here if this is not the default Ethertype
+
+4$:	LEAL	ECX, sdb_pdbhead.B[ESI]
+6$:	CMPL	[ECX], EBX
+	JE	8$.S
+	MOVL	ECX, [ECX]
+	TESTL	ECX, ECX
+	JNE	6$.S
+	CRASH	BETL			;[Bad EtherType List]
+
+8$:	MOVL	EDX, [EBX]		;Remove this PDB from the list
+	MOVL	[ECX], EDX
+10$:	MOVL	[EBX], #-1		;Indicate not in use
+12$:	RET
+.PAGE
+	.SBTTL	xossnpSetSap - Subroutine to set receive service access point address
+
+;Subroutine to set receive service access point address
+;	c(AL)  = DSAP value
+;	c(AH)  = SSAP value
+;	c{EBX} = Offset of SDB
+;	c{ESI} = Offset of IDB
+;	CALL	xossnpSetSap
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  c{EAX} = 0
+
+xossnpSetSap:
+	MOVL	sdb_sapvalue.B[EBX], EAX ;Store value in the SDB
+	CMPL	EAX, #-1.B		;Want to set the default address?
+	JNE	8$.S			;No - go on
+	CMPL	idb_dftsdb.B[ESI], #0.B	;Yes - already have a default?
+	JNE	18$.S			;Yes - fail
+	CLRL	EAX			;No - make this the default
+	MOVL	sdb_sapnext.B[EBX], EAX
+	MOVL	sdb_sapprev.B[EBX], EAX
+	MOVL	idb_dftsdb.B[ESI], EBX
+2$:	RET				;Thats all
+
+;Here if not setting default address
+
+8$:	MOVL	ECX, idb_sdbhead.B[ESI] ;Get first SDB
+10$:	TESTL	ECX, ECX
+	JE	20$.S			;No more - go put it at the end
+	CMPL	EAX, sdb_sapvalue.B[ECX] ;Does it go here?
+	JBE	12$.S			;Yes
+	MOVL	ECX, sdb_sapnext.B[ECX]	;No - get next SDB
+	JMP	10$.S			;Continue
+
+;Here with position for new entry
+
+12$:	JE	18$.S			;If duplicate
+	MOVL	EAX, sdb_sapprev.B[ECX]	;Get previous
+	MOVL	sdb_sapprev.B[EBX], EAX
+	MOVL	sdb_sapprev.B[ECX], EBX
+	TESTL	EAX, EAX		;Will this be the first?
+	JE	14$.S			;Yes
+	MOVL	sdb_sapnext.B[EAX], EBX	;No
+	JMP	16$.S
+
+14$:	MOVL	idb_sdbhead.B[ESI], EBX
+16$:	MOVL	sdb_sapnext.B[EBX], ECX
+	CLRL	EAX
+	RET
+
+;Here if requested service access point address is already in use
+
+18$:	MOVL	EAX, #ER_NPCIU
+	STC
+	RET
+
+;Here to place new entry at end of the SDB list
+
+20$:	MOVL	EAX, idb_sdbtail.B[ESI] ;Get current tail
+	MOVL	sdb_sapprev.B[EBX], EAX
+	TESTL	EAX, EAX		;Anything there at all?
+	JE	22$.S			;No
+	MOVL	sdb_sapnext.B[EAX], EBX	;Yes
+	JMP	24$.S
+
+22$:	MOVL	idb_sdbhead.B[ESI], EBX
+24$:	MOVL	idb_sdbtail.B[ESI], EBX
+	CLRL	EAX
+	MOVL	sdb_sapnext.B[EBX], EAX
+	RET
+.PAGE
+	.SBTTL	xossnpClrSap - Subroutine to clear receive service access point address
+
+;Subroutine to clear receive service access point address
+;	c{EBX} = Offset of SDB
+;	c{ESI} = Offset of IDB
+;	CALL	xossnpClrSap
+
+xossnpClrSap:
+	CLRL	EAX
+	CMPL	sdb_sapnext.B[EBX], #-1.B ;Really have a SAP address?
+	JE	14$.S			;No
+	MOVL	sdb_sapvalue.B[EBX], EAX ;Yes - clear the value
+	CMPL	idb_dftsdb.B[ESI], EBX	;Default SAP?
+	JNE	4$.S			;No
+	MOVL	idb_dftsdb.B[ESI], EAX	;Yes - but not any more
+	JMP	12$.S			;Finished
+
+;Here if this is not the default SAP address
+
+4$:	MOVL	ECX, sdb_sapnext.B[EBX]	;Get next SDB
+	MOVL	EDX, sdb_sapprev.B[EBX]	;Get previous SDB
+	TESTL	ECX, ECX		;Is this the last one?
+	JE	6$.S			;Yes
+	MOVL	sdb_sapprev.B[ECX], EDX	;No
+	JMP	8$.S
+
+6$:	MOVL	idb_sdbtail.B[ESI], EDX
+8$:	TESTL	EDX, EDX		;Is this the first one?
+	JE	10$.S			;Yes
+	MOVL	sdb_sapnext.B[EDX], ECX	;No
+	JMP	12$.S
+
+10$:	MOVL	idb_sdbhead.B[ESI], ECX
+12$:	DECL	EAX			;Indicate no SAP address
+	MOVL	sdb_sapnext.B[EBX], EAX
+	MOVL	sdb_sapprev.B[EBX], EAX
+14$:	RET
+.PAGE
+	.SBTTL	xossnpRcv - Subroutine to process received packet
+
+;Subroutine to process received packet at the network interface (NET) level
+;	c{EAX} = Ethertype value from hardware level header
+;	c{EBX} = Offset of packet buffer
+;	c{ECX} = Length of packet
+;	c{EDX} = Offset of data in packet
+;	c{ESI} = Offset of IDB
+;	CALL	xossnpRcv
+
+xossnpRcv:
+	CMPW	npb_magic.B[EBX], #NPB_MAGIC ;Is this really a network buffer?
+	JE	1$.S			;Yes
+	CRASH	NANB			[Not A Network Buffer]
+
+1$:	PUSHL	ESI			;Save offset of the IDB
+	XCHGB	AL, AH
+	CMPL	EAX, #1500t		;Is this an 802.2 format packet?
+	JBE	2$.S			;Yes
+	XCHGB	AL, AH			;No
+	MOVL	EDI, #0FFFFh		;Use dummy SAP value
+	JMP	4$.S
+
+;Here if have 802.2 format packet
+
+2$:	CMPL	ECX, EAX		;Is the count valid?
+	JB	18$.S			;No - discard the packet
+	MOVL	ECX, EAX		;Yes - use value from count field
+	MOVZWL	EDI, [EDX]		;Get 802.2 SAP addresses
+
+4$:	MOVL	ESI, idb_sdbhead.B[ESI]	;Point to first SDB for interface
+	TESTL	ESI, ESI
+	JE	8$.S			;If none
+6$:	CMPL	sdb_magic.B[ESI], #'SDB*'
+	JNE	20$.S
+	CMPL	sdb_sapvalue.B[ESI], EDI ;This one?
+	JE	12$.S			;Yes
+	MOVL	ESI, sdb_sapnext.B[ESI]	;No - advance to next SDB
+	TESTL	ESI, ESI
+	JNE	6$.S			;Continue if have another
+8$:	POPL	ESI			;Not found - restore offset of IDB
+	INCL	idb_cntnosap.B[ESI]	;Count the error
+10$:	CALL	xosnetGiveBufr		;And discard the packet
+	RET
+
+;Here with a match on the service access point (SAP) addresses
+
+12$:	PUSHL	#16$			;This is a funny way to do a CALLI
+	PUSHL	EAX			;  through the dispatch table when
+	MOVL	EAX, sdb_disp.B[ESI]	;  no registers are available!
+	MOVL	EAX, CS:nsf_receive.B[EAX]
+	XCHGL	EAX, [ESP]
+	RET
+
+;	CALLI	CS:nsf_receive.B[EAX]	;Dispatch to the service routine
+
+16$:	POPL	ESI
+	RET
+
+;Here if the count is illegal
+
+18$:	POPL	ESI
+	INCL	idb_cntbadsize.B[ESI]
+	JMP	10$.S
+
+20$:	CRASH	NSDB			;[Not an SDB]
+.PAGE
+	.SBTTL	xossnpSetEcho - Subroutine to set up a SNAP echo packet
+
+;Subroutine to set up a SNAP echo packet - the source and destination hardware
+;  addresses are exchanged but the LLC part is not changed
+;	c{EBX} = Offset of packet buffer
+;	c{ESI} = Offset of SDB
+;	CALL	xossnpSetEcho
+;	c{EDX} = Offset of start of SNAP data
+
+xossnpSetEcho:
+	PUSHL	ESI
+	MOVL	ESI, sdb_idb.B[ESI]
+	MOVL	EAX, idb_disp.B[ESI]
+	CALLI	CS:ndf_setecho.B[EAX]
+	POPL	ESI
+	CMPL	sdb_sapvalue.B[ESI], #0FFFFh ;Dummy SAP?
+	JNE	2$.S			;No
+	JMP	4$.S			;Yes
+
+	.SBTTL	xossnpSetPkt - Subroutine to set up the SNAP packet header
+
+;Subroutine to set up the SNAP packet header
+;	c{EAX} = Ethertype value
+;	c{EBX} = Offset of packet buffer
+;	c{ESI} = Offset of SDB
+;	CALL	xossnpSetPkt
+;	c{EDX} = Offset of start of SNAP data
+
+xossnpSetPkt:
+	PUSHL	EAX
+	PUSHL	ESI
+	MOVL	ESI, sdb_idb.B[ESI]
+	MOVL	ECX, idb_disp.B[ESI]
+	CALLI	CS:ndf_setpkt.B[ECX]
+	POPL	ESI
+	POPL	EAX
+	CMPL	sdb_sapvalue.B[ESI], #0FFFFh ;Dummy SAP?
+	JE	4$.S			;Yes - nothing more needed here
+	RORL	EAX, #16t		;No
+	MOVL	4.B[EDX], EAX		 ;Store Ethertype value and two low
+	MOVL	EAX, sdb_sapvalue.B[ESI] ;  bytes of the protocol ID
+	MOVW	[EDX], AX		;Store DSAP and SSAP values
+	MOVW	2.B[EDX], #0003h	;Store control byte and high byte of
+2$:	ADDL	EDX, #8.B
+	ADDL	npb_count.B[EBX], #8.B
+4$:	MOVL	EAX, EDX		;Calculate offset of the next level
+	SUBL	EAX, EBX		;  header
+	MOVB	npb_npofs.B[EBX], AL	;Store it
+	RET
+.PAGE
+	.SBTTL	xossnpSendPktHw - Subroutine to send packet when hardware address is known
+
+;Subroutine to send packet when hardware address is known
+;	c{EDX,EAX} = Hardware address
+;	c{EBX}     = Offset of packet buffer
+;	c{ESI}     = Offset of SDB
+;	CALL	xossnpSendPktHw
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+
+xossnpSendPktHw:
+	CMPL	sdb_magic.B[ESI], #'SDB*'
+	JNE	10$.S
+	PUSHL	EDI
+	MOVL	EDI, npb_dcb.B[EBX]	;Get offset of PDB or DCB associated
+	PUSHL	ESI			;  with the packet
+	MOVL	ESI, sdb_idb.B[ESI]
+	MOVL	ESI, idb_disp.B[ESI]
+	CALLI	CS:ndf_sethwa.B[ESI]	;Store hardware address in the packet
+	POPL	ESI
+	CALL	snapsendpk2
+	POPL	EDI
+	RET
+
+	.SBTTL	xossnpSendPkt - Subroutne to send a SNAP packet
+
+;Subroutine to send a SNAP packet
+;	c{EAX} = Offset of output done routine for xosnetSendPkt
+;	c{EBX} = Offset of packet buffer
+;	c{EDI} = Offset of DCB or PDB
+;	c{ESI} = Offset of SDB
+;	CALL	xossnpSendPkt
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+
+;Note that the output done routine will ALWAYS be called, even if an error
+;  occures
+
+xossnpSendPkt:
+	CMPL	sdb_magic.B[ESI], #'SDB*'
+	JNE	14$.S
+	MOVL	npb_outdone.B[EBX], EAX	;Store offset of output done routine
+	PUSHL	EBX			;Save packet pointer in case we change
+					;  it when doing routing
+	PUSHL	EDI
+	CMPL	pdb_magic.B[EDI], #'PDB*' ;Does EDI point to the PDB?
+	JE	2$.S			;Yes
+	MOVL	EDI, dcb_netpdb.B[EDI]	;No - it must point to the DCB
+2$:	MOVL	ECX, pdb_disp.B[EDI]	;Get hardware address for packet (This
+	CALLI	CS:npf_getaddr.B[ECX]	;  may change EBX so that we are sending
+					;  a different packet (for ARP) or none
+					;  at all.  In this case, the actual
+					;  packet will be output later by the
+					;  routing routine.)
+	JC	8$.S			;If error
+	TESTL	EBX, EBX		;Really have output to do now?
+	JE	16$.S			;No - finished for now (routing routine
+4$:	PUSHL	ESI			;  will do the actual output later)
+	MOVL	ESI, sdb_idb.B[ESI]
+	MOVL	ESI, idb_disp.B[ESI]
+	CALLI	CS:ndf_sethwa.B[ESI]	;Store hardware address in the packet
+	POPL	ESI
+	POPL	EDI
+	JC	10$.S			;If error
+	CALL	snapsendpk2
+	JC	10$.S
+	POPL	EBX
+	RET
+
+;Here if error getting address for the packet
+
+8$:
+	TESTL	EAX, EAX
+	JS	9$.S
+	INT3
+9$:
+
+	POPL	EDI
+	ORL	EBX, EBX		;Still have the packet?
+	JE	12$.S			;No
+10$:	PUSHL	EAX
+	CALLI	npb_outdone.B[EBX]
+	POPL	EAX
+12$:	STC
+	POPL	EBX
+	RET
+
+14$:	CRASH	NSDB			;[Not an SDB]
+
+;Here if we no longer have a packet (it has been held by the routine routines
+;  because routiing is pending for the destination
+
+16$:	POPL	EDI
+	POPL	EBX
+	RET
+
+snapsendpk2:
+	MOVL	ECX, npb_count.B[EBX]	;Get size of the packet
+	SUBL	ECX, sdb_snaphwhdrsz.B[ESI] ;Minus size of the hardware header
+	ADDL	sdb_cntbyteout.B[ESI], ECX ;Count the output packet
+	INCL	sdb_cntpktout.B[ESI]
+	MOVZBL	EDX, sdb_snapcntoffset.B[ESI] ;Get offset of count field
+	TESTL	EDX, EDX
+	JE	18$.S			;If no count field
+	XCHGB	CL, CH			;Fix the byte order for the count value
+	MOVW	[EBX+EDX], CX		;Store count in packet
+18$:	PUSHL	ESI
+	MOVL	ESI, sdb_idb.B[ESI]	;Get offset of IDB
+	CALL	xosnetSendPkt##		;Send the packet
+
+	JNC	19$.S
+	TESTL	EAX, EAX
+	JS	17$.S
+	INT3
+
+17$:	STC
+19$:
+
+	POPL	ESI
+	RET
+.PAGE
+;Here if have illegal PDU type
+
+2$:	INCL	sdb_cntbadpdu.B[ESI]
+	CALL	xosnetGiveBufr##
+	RET
+
+;Subroutine to process 802.2 SNAP packets
+;	c{EBX} = Offset of packet buffer
+;	c{ECX} = Length of packet
+;	c{EDX} = Offset of data in packet
+;	c{EDI} = Offset of IDB
+;	c{ESI} = Offset of SDB
+;	CALL	snaprcv
+
+snaprcv:CMPB	2.B[EDX], #03h		;Is this a type 1 frame?
+	JNE	2$.S			;No - discard it
+	SUBL	ECX, #8t.B		;Yes - adjust size
+	JLE	2$.S			;Discard it if too small
+	ADDL	sdb_cntbytein.B[ESI], #8t.B
+	ADDB	npb_npofs.B[EBX], #8t	;Adjust network header offset
+	MOVZWL	EAX, 6.B[EDX]		;Get Ethertype value
+	ADDL	EDX, #8.B		;Point to first data byte
+					;Fall into dixrcv
+
+;Subroutine to process received packets which use an Ethertype-like value for
+;  protocol multiplexing - this includes "Bluebook" ethernet packets, Arcnet
+;  packets, and 802.2 SNAP packets
+;	c{EAX} = Protocol value from packet
+;	c{EBX} = Offset of packet buffer
+;	c{ECX} = Length of packet
+;	c[EDX} = Offset of data in packet
+;	c{EDI} = Offset of IDB
+;	c{ESI} = Offset of SDB
+;	CALL	dixrcv
+
+dixrcv:	INCL	sdb_cntpktin.B[ESI]	;Count the received packet
+	ADDL	sdb_cntbytein.B[ESI], ECX
+	MOVL	EDI, sdb_pdbhead.B[ESI] ;Point to first PDB
+	TESTL	EDI, EDI
+	JE	6$.S			;If list is empty!
+4$:	CMPL	pdb_etypevalue.B[EDI], EAX ;This Ethertype?
+	JAE	8$.S			;Maybe
+	MOVL	EDI, [EDI]		 ;No - advance to next
+	TESTL	EDI, EDI		;Have another one?
+	JNE	4$.S			;Yes - continue
+6$:	MOVL	EDI, sdb_dftpdb.B[ESI]	;No more - have a default Ethertype?
+	TESTL	EDI, EDI
+	JNE	10$.S			;Yes - use that Ethertype
+nodst:	INCL	sdb_cntnodst.B[ESI]	;No - count the discarded packet
+	CALL	xosnetGiveBufr#		;Give up the buffer and return
+	RET
+
+;Here if this might be an exact match
+
+8$:	JNE	6$.S			;If not a match, this can't match
+10$:	MOVL	npb_dcb.B[EBX], EDI	;Store PDB offset in the packet buffer
+	MOVL	EAX, pdb_disp.B[EDI]
+	JMPIL	CS:npf_receive.B[EAX]	;Call protocol level routine and return
+.PAGE
+	.SBTTL	SNAP class driver data
+
+	DATA
+
+xossnpSdbHead:.LONG  0		;Offset of first SAP data block
+xossnpSdbTail:.LONG  0		;Offset of last SAP data block
+snapdcbnum:   .LONG  0		;Number of in use network DCBs
+snapdcbmax:   .LONG  0		;Maximum in use network DCBs
+snapdcblmt:   .LONG  10000t	;Maximum number of network DCBs allowed
+snapccb:      .BLKB  ccb_SIZE	;SNAP CCB
+thisetpdb:    .LONG  0
+etlbl:        .ASCIZ "ET="
+
+	LKEEND

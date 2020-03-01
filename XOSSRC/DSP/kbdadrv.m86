@@ -1,0 +1,715 @@
+        .TITLE  KBDADRV - Device driver for console keyboard - hardware routines
+
+;++++
+; This software is in the public domain.  It may be freely copied and used
+; for whatever purpose you see fit, including commerical uses.  Anyone
+; modifying this software may claim ownership of the modifications, but not
+; the complete derived code.  It would be appreciated if the authors were
+; told what this software is being used for, but this is not a requirement.
+
+;   THIS SOFTWARE IS PROVIDED BY THE AUTHORS "AS IS" AND ANY EXPRESS OR
+;   IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
+;   OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+;   IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+;   INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+;   BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS
+;   OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+;   ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR
+;   TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
+;   USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+;----
+
+	.PROC	80486
+	.INCLUD	XOSINC:\XMAC\XOS.PAR
+	.INCLUD	XOSINC:\XMAC\XOSX.PAR
+	.INCLUD	XOSINC:\XMAC\XOSERR.PAR
+	.INCLUD	XOSINC:\XMAC\XOSDOS.PAR
+	.INCLUD	XOSINC:\XMAC\XOSTRM.PAR
+	.INCLUD	XOSINC:\XMAC\XOSXTRM.PAR
+	.INCLUD	XOSINC:\XMAC\PCAT.PAR
+	.INCLUD	XOSINC:\XMAC\XOSLKE.PAR
+	.INCLUD	XOSINC:\XMAC\XOSXLKE.PAR
+
+MAJV   =!1t
+MINV   =!0t
+EDITNUM=!0t
+
+;@@@@@@@ IOPAUSE
+; Relacement for IOPAUSE macro using knlSDelay.
+;
+; Notes:
+;  1) IOPAUSE uses old ISA 'trick' to delay 0.5 to 1.0 uS.
+;     This is not sufficient (nor works properly) with many new
+;     busses / architectures.
+;  2) The Keyboard controller is especially sensitive to back to back
+;     I/O operations. (uController based...)
+;  3) knlSDelay is overkill - delay granularity is approximately 10 uS
+;  4) Could implement the delay based on knlDelFactor inline. Since
+;     most modern Pentimum+ machines have factor 500+, 1 uS granularity
+;     could be 'safely' implemented by dividing the SDelay loop count
+;     by 10. This could even be determined run-time to support slow
+;     machines...
+;
+.IF EQ 1
+	;
+	; Use original definition
+	;
+	.MACRO IOPAUSEKBD
+	 IOPAUSE
+	.ENDM
+.IFF
+	.MACRO IOPAUSEKBD
+
+	pushl	ecx
+	movl	ecx, #1
+	call	knlSDelay##
+	popl	ecx
+
+	.ENDM
+.ENDC
+
+	LKEHEAD	KBDADRV, MAJV, MINV, EDITNUM, LKETYPE_DEVICE
+
+	CODE
+
+kbdadsp:.LONG	knlRtnZero##	;kf_open    =  0.
+	.LONG	xosconKeyVInB##	;kf_vkinb   =  4. - INB instruction for
+				;		      keyboard in real mode
+	.LONG	xosconKeyVOutB##;kf_vkoutb  =  8. - OUTB instruction for
+				;		      keyboard in real mode
+	.LONG	xosconKeyVInt##	;kf_keyint  = 12. - Attempt to execute keyboard
+				;		      interrupt routine in real
+				;		      mode
+	.LONG	xosconClrKeyI##	;kf_clrkeyi = 16. - Clear keyboard interrupt
+	.LONG	tolites		;kf_tolites = 20. - Update keyboard lites
+	.LONG	kbdready	;kf_process = 24. - Process held scan codes
+	.LONG	keybeep		;kf_beep    = 28. - Beep
+	.LONG	xosconKeyEn2##	;kf_enable  = 32. - Enable keyboard
+.PAGE
+	.SBTTL	kbdainit - Console keyboard initialization routine
+
+	INITSUB	kbdainit
+
+kbdainit:
+	MOVL	EAX, #'KBDA'		;Register this keyboard driver
+	MOVL	EBX, #kbdaaddunit
+	CALL	xosconNewKeyDriver##
+	JC	6$.S			;If error
+	CLRL	EAX			;OK
+	CLRL	EDX
+	MOVL	ECX, #codetop
+6$:	RET
+
+	CODE
+.PAGE
+	.SBTTL	kbdaaddunit - Console keyboard addunit routine
+
+;Console keyboard addunit routine
+;	c{EBX} = Interrupt number for keyboard
+;	c{EDI} = Offset of console DHDB
+;	CALL	kbdaaddunit
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+
+kbdaaddunit:
+	MOVL	ECX, EBX
+	CALL	knlChkIRqAvl##
+	JC	2$.S
+	MOVL	EDX, dhdb_kbioreg.B[EDI]
+	LEAL	ECX, 4.B[EDX]
+	CALL	knlChkIORegs##
+2$:	JC	6$
+	MOVB	dhdb_keysta.B[EDI], #KS_CHR
+	MOVL	dhdb_fdisp.B[EDI], #kbdafork ;Store offset of keyboard fork
+	MOVL	dhdb_kdisp.B[EDI], #kbdadsp ;Store offset of keyboard function
+	MOVL	ECX, #KBDAINTSZ		    ;  dispatch table
+	PUSHL	EDI			;Get memory for interrupt code
+	CALL	knlGetXCode##
+	JC	4$.S			;If error
+	PUSHL	EDI			;Remember where code is going
+	MOVL	ESI, #kbdaint		;Copy prototype interrupt routine
+	MOVL	EAX, EDI
+	SUBL	EAX, ESI
+	SHRL	ECX, #2
+	MOVB	gdtable+GS_CODEALS+5, #DT_RWDATA+PL_0 ;Enable alaised code space
+	PUSHL	#GS_CODEALS.B
+	POPL	ES
+	CLD
+	RMOVSL	[EDI], CS:[ESI]
+	POPL	ESI
+	POPL	EDI
+	MOVL	ES:kbdaifx1.B[ESI], EDI	;Fix up the interrupt code
+	SUBL	ES:kbdaifx2.B[ESI], EAX
+	CLRL	EAX
+	MOVL	ES, EAX
+	MOVB	gdtable+GS_CODEALS+5, AL
+	PUSHL	EBX
+	MOVL	EBX, #irqname+3
+	MOVB	AL, dhdb_unit.B[EDI]
+	CALL	knlPutDecNmbr##
+	MOVL	EBX, #irqname
+	MOVL	EDX, dhdb_kbioreg.B[EDI]
+	LEAL	ECX, 4.B[EDX]
+	CALL	knlRegIORegs##
+	POPL	ECX
+	JC	6$.S
+	MOVB	CH, #DT_INT+PL_0
+	MOVL	EDX, #irqname
+	MOVL	EBX, ESI		;Set up the keyboard vector
+	CALL	knlSetIRq##
+	INB	P_INC1P1		;Enable keyboard interrupt
+	IOPAUSE
+	ANDB	AL, #~02h
+	OUTB	P_INC1P1
+	IOPAUSE
+	CLC
+	RET
+
+;Here if error getting memory for interrupt entry code
+
+4$:	POPL	EDI
+6$:	RET
+.PAGE
+	.SBTTL	kbdint - Console keyboard interrupt service routine
+
+	CODE
+
+;Prototype console interrpt entry routine
+
+kbdaint:PUSHAL				;Save general registers
+kbdaifx1=!{$-kbdaint}+1
+	MOVL	EDI, #0			;Get offset of the DHDB
+kbdaifx2=!{$-kbdaint}+1
+	JMP	kbdaintcom		;Continue in common code
+KBDAINTSZ=$-kbdaint
+
+;Console interrupt common routine
+;	c{EDI} = Offset of DHDB
+
+kbdaintcom:
+	PUSHL	DS			;Save segment regsiters
+	PUSHL	ES
+	PUSHL	FS
+	PUSHL	GS
+	PUSHL	#GS_DATA.B		;Make normal data addressable
+	POPL	DS
+	MOVL	EDX, dhdb_kbioreg.B[EDI]
+	A2IOP	P_KEYSTS-P_KEYDATA
+	MOVL	ECX, #10000h
+2$:	INB	[DX]			;Have anything from the keyboard?
+	 IOPAUSEKBD			;@@@ CEY 00Aug04
+	ANDB	AL, #1
+	LOOPE	ECX, 2$
+	JE	10$.S			;No - false alarm!
+	A2IOP	P_KEYDATA-P_KEYSTS
+	INB	[DX]			;Get keyboard code
+	 IOPAUSEKBD			;@@@ CEY 00Aug04
+	CMPB	AL, #54h		;Is this the GECKO escape key?
+	JE	12$.S			;Yes
+	CMPB	AL, #0FAh		;No - ACK?
+
+;;;	JE	14$.S			;Yes
+	JE	14$			;Yes
+
+
+4$:	CMPB	dhdb_ircnt.B[EDI], #IKSIZE ;No - room for more in the keyboard
+					   ;  interrupt ring buffer?
+	JA	8$.S			;No - forget it!
+	MOVZBL	EBX, dhdb_irput.B[EDI]	;Yes - get putter pointer
+	MOVB	dhdb_irng.B[EDI+EBX], AL ;Store code in ring
+	INCL	EBX			;Bump pointer
+	CMPB	BL, #IKSIZE		;Past end of ring?
+	JB	6$.S			;No
+	CLRL	EBX			;Yes - reset pointer
+6$:	MOVB	dhdb_irput.B[EDI], BL	;Update pointer
+	INCB	dhdb_ircnt.B[EDI]	;Bump count
+	CALL	knlReqFork##		;Request fork
+8$:	CLI
+	MOVB	AL, #INT_EOI		;Release interrupt controller
+	OUTB	P_INC1P0
+	 IOPAUSEKBD			;@@@ CEY 00Aug04
+	JMP	knlDismissInt2##	;Check for scheduling and dismiss
+
+;Here if have interrupt without an input character - This sometimes happens on
+;  some machines after startup.  We read the input register anyway to make sure
+;  the state of the keyboard interface is OK and just discard what we get!
+
+10$:	A2IOP	P_KEYDATA-P_KEYSTS
+	INB	[DX]
+	 IOPAUSEKBD			;@@@@@@ CEY 00Aug14
+	JMP	8$.S
+
+;Here if have GECKO escape key
+
+12$:	CMPL	knlGeckoSig##+0, #'GECK' ;Is GECKO loaded?
+	JNE	4$.S			;No - this is not special
+	CMPL	knlGeckoSig##+4, #'O$'	;Maybe
+	JNE	4$.S			;No
+	MOVL	ESI, dhdb_curtdb.B[EDI]	;Yes
+	MOVB	tdb_keysts0.B[ESI], #0	;Clear shift, control, and ALT
+	MOVB	tdb_keysts1.B[ESI], #0	;  keys status
+sysint_key::
+	INT3				;Invoke GECKO
+	CMPL	knlCpsPda##, #0.B	;Does he want to interrupt a process?
+	JE	8$.S			;No - dismiss this interrupt
+	MOVB	knlSchedReq##, #1	;Yes - make sure we schedule now
+	JMP	8$.S			;Dismiss this interrupt
+
+;Here if have ACK from keyboard
+
+14$:	MOVB	AL, dhdb_keydata.B[EDI]	;Get possible data to send
+	TESTB	AL, AL			;Anything to send?
+	JE	8$.S			;No - just dismiss interrupt
+	MOVB	dhdb_keydata.B[EDI], #0	;Yes - only do it once
+	ANDB	AL, #7Fh		;Only 7 bits
+	MOVL	EDX, dhdb_kbioreg.B[EDI]
+	OUTB	[DX]			;Output the data byte
+	 IOPAUSEKBD			;@@@ CEY 00Aug04
+
+;;;	JMP	8$.S			;Thats all
+
+	JMP	8$			;Thats all
+
+.PAGE
+	.SBTTL	kbdafork - Keyboard fork routine
+
+;Here at fork level
+;	c{EDI} = Offset of DHDB for keyboard
+
+kbdafork:
+	MOVL	ESI, dhdb_curtdb.B[EDI]	;Get offset of the active TDB
+	TESTL	ESI, ESI
+	JE	ret002.S
+	CMPB	dhdb_ircnt.B[EDI], #0	;Anything in the keyboard ring?
+	JNE	2$.S			;Yes
+	TESTB	tdb_keysts2.B[ESI], #KS2$KEYDIS ;No - is keyboard enabled now?
+	JE	kbdready		;Yes - go on
+ret002:	RET				;No - just dismiss fork for now
+
+;Here with input scan code from keyboard
+
+2$:	MOVL	EAX, dhdb_scsvtime.B[EDI] ;Reset screen saver counter
+	MOVL	dhdb_scsvcnt.B[EDI], EAX
+	TESTB	dhdb_keysts.B[EDI], #KS$VOFF ;Has the display been disabled?
+	JE	3$.S			;No
+	ANDB	dhdb_keysts.B[EDI], #~KS$VOFF ;Yes - but not any more
+	MOVL	EAX, tdb_ddisp.B[ESI]	;Enable the screen
+	CALLI	CS:tf_enable.B[EAX]
+3$:	MOVZBL	EBX, dhdb_irtak.B[EDI]	;Get taker pointer
+	MOVZBL	EAX, dhdb_irng.B[EDI+EBX] ;Get character
+	INCL	EBX			;Bump pointer
+	CMPB	BL, #IKSIZE		;Past end of ring?
+	JB	4$.S			;No
+	CLRL	EBX			;Yes
+4$:	MOVB	dhdb_irtak.B[EDI], BL
+	DECB	dhdb_ircnt.B[EDI]	;Reduce ring count
+	CMPB	AL, #0E0h		;Is this a special prefix?
+	JE	8$.S			;Yes
+	CMPB	AL, #0E1h
+	JE	10$.S
+kbdfk2:	MOVL	EBX, dhdb_keysta.B[EDI]	;No - get keyboard state
+	JMPIL	keysdsp[EBX]		;Dispatch on the state
+
+	DATA
+
+keysdsp:.LONG	kbdnchr		;KS_CHR  = 0t  - Normal character
+	.LONG	kbdE0chr	;KS_E0   = 4t  - Character after E0
+	.LONG	kbdE1chr	;KS_E1   = 8t  - Character after E1
+	.LONG	kbdE11D		;KS_E11D = 12t - Character after E1-1D
+	.LONG	kbdE19D		;KS_E19D = 16t - Character after E1-9D
+
+	CODE
+
+;Here if have E0 from keyboard
+
+8$:	MOVB	dhdb_enhanced.B[EDI], #1 ;Indicate have enchanced keyboard
+	MOVB	dhdb_keysta.B[EDI], #KS_E0 ;Advance state
+	JMP	kbdafork.S
+
+;Here if have E1 from keyboard
+
+10$:	MOVB	dhdb_keysta.B[EDI], #KS_E1 ;Advance state
+	JMP	kbdafork.S
+.PAGE
+;Here for normal character from keyboard
+
+kbdnchr:MOVL	EBX, #xosconKeyTbl##
+2$:	TESTB	AL, AL			;Key-release code?
+	JNS	nrmchr.S		;No
+	ANDB	AL, #7Fh		;Yes - remove high bit
+	MOVB	dhdb_keysta.B[EDI], #KS_CHR ;Reset keyboard state
+	CMPB	AL, #58h
+4$:	JA	kbdafork.S
+	MOVB	AL, [EBX+EAX]		;Get internal code
+	CMPB	AL, #80h		;Is this a special key?
+	JE	kbdafork
+	JB	6$.S			;No
+	MOVB	AL, spckeytbl-80h[EAX]	;Yes - get actual internal scan code
+6$:	MOVB	AH, #KB$RELEASE>8t	;Indicate key-release code
+	JMP	havcode.S		;Continue
+
+	DATA
+
+spckeytbl:
+	.BYTE	0		;SX_IGNORE = 80 - Character to be ignored
+	.BYTE	7Fh		;SX_PRTSCN = 81 - Print screen
+	.BYTE	2Ch		;SX_KEYSTR = 82 - Keypad *
+	.BYTE	14h		;SX_DELETE = 83 - DEL
+	.BYTE	2Ah		;SX_KEYDEL = 84 - Keypad DEL
+
+	CODE
+
+;Here for normal make code
+
+nrmchr:	CMPB	AL, #58h		;Is this a valid code?
+	JA	4$.S			;No - ignore it
+	MOVB	AL, [EBX+EAX]		;Yes - get internal scan code
+	CMPB	AL, #80h		;Is this a special code?
+	JAE	10$.S			;Yes - go handle it
+havcode:TESTB	dhdb_keysts.B[EDI], #KS$SYSSHFT ;No - system-shift state?
+	JNE	almact			;Yes - go handle that case
+	CMPB	dhdb_frcnt.B[EDI], #FKSIZE ;No - room for more in the keyboard
+					   ;  ring buffer?
+	JA	4$.S			;No - forget it!
+	MOVZBL	EBX, dhdb_frput.B[EDI]	;Yes - get putter pointer
+	MOVW	dhdb_frng.B[EDI+EBX*2], AX ;Store code in ring
+	INCL	EBX			;Bump pointer
+	CMPB	BL, #FKSIZE		;Past end of ring?
+	JB	8$.S			;No
+	CLRL	EBX			;Yes - reset pointer
+8$:	MOVB	dhdb_frput.B[EDI], BL	;Update pointer
+	INCB	dhdb_frcnt.B[EDI]	;Bump count
+	JMP	kbdafork		;Continue
+
+;Here for special key
+
+10$:	JMPIL	CS:spckeydsp-80h*4[EAX*4] ;Dispatch on the special key code
+
+	.MOD	4
+spckeydsp:
+	.LONG	kbdafork	;SX_IGNORE = 80 - Character to be ignored
+	.LONG	sysshf		;SX_PRTSCN = 81 - Print screen
+	.LONG	havekpa		;SX_KEYSTR = 82 - Keypad *
+	.LONG	havedel		;SX_DELETE = 83 - DEL
+	.LONG	havekpd		;SX_KEYDEL = 84 - Keypad DEL
+
+;Here for character following E0 from keyboard
+
+kbdE0chr:
+	MOVL	EBX, #xosconKeyTblE0##	;Get offset of table to use
+	MOVB	dhdb_keysta.B[EDI], #KS_CHR ;Reset keyboard state
+	JMP	2$			;Continue
+
+;Here for character following E1 from keyboard
+
+kbdE1chr:
+	CMPB	AL, #1Dh		;Make of control key?
+	JE	18$.S			;Yes
+	CMPB	AL, #45h		;No - is it the pause key code?
+	JE	20$.S			;Yes
+	CMPB	AL, #9Dh		;Release of control key?
+	JNE	ignore.S		;No - just reset back to normal
+	MOVB	dhdb_keysta.B[EDI], #KS_E19D ;Yes - eat one more character
+	JMP	22$.S			     ;  after this
+
+;Here with make of control key following E1 from mode 1 keyboard
+
+18$:	MOVB	dhdb_keysta.B[EDI], #KS_E11D ;Advance state
+	JMP	22$.S			;Continue
+
+;Here with character following E1-1D from keyboard
+
+kbdE11D:CMPB	AL, #45h		;Is this the right code?
+	JNE	ignore.S		;No - ignore this!
+20$:	MOVB	AL, #7Eh		;Yes - get index for pause key
+	MOVB	dhdb_keysta.B[EDI], #KS_CHR ;Reset the input state
+	JMP	havcode.S
+
+;Here with character following E1-9D from keyboard
+
+kbdE19D:CMPB	AL, #0C5		;Is this the right code?
+	JNE	ignore.S		;No - ignore this
+	MOVB	AH, #80h		;Yes - indicate key-release
+	JMP	20$.S
+
+ignore:	MOVB	dhdb_keysta.B[EDI], #KS_CHR
+22$:	JMP	kbdafork
+.PAGE
+;Here with make of keypad DEL key
+
+havekpd:MOVB	AL, #2Ah
+	JMP	2$.S
+
+;Here with make of DELETE key
+
+havedel:MOVB	AL, #14h
+2$:	BTL	knlSysDescp##, #SYSD%KBRESET ;Is ctl-alt-DEL reboot enabled?
+	JNC	havcode			;No - not special
+	MOVL	ESI, dhdb_curtdb.B[EDI]	;Yes
+	MOVB	BL, tdb_keysts0.B[ESI]	;Get state bits
+	MOVB	BH, BL			;Merge left and right bits
+	SHLB	BH, #4
+	ORB	BL, BH
+	NOTB	BL
+	TESTB	BL, #KS0$LCTRL|KS0$LALT	;Both CTRL and ALT pressed?
+	JNE	havcode			;No - not special
+	JMP	knlReboot##		;Yes - reboot the system
+
+;Here with make of the keypad * key (used for system shift on AT keyboards)
+
+havekpa:CMPB	dhdb_enhanced.B[EDI], #0 ;Is this an enhanced keyboard?
+	JNE	4$.S			;Yes - this is never special
+	MOVL	EDI, dhdb_curtdb.B[EDI]
+	TESTB	tdb_keysts0.B[ESI], #KS0$LSHFT|KS0$RSHFT ;No - shift pressed?
+	JE	sysshf.S		;No - make this system-shift
+4$:	MOVB	AL, #2Ch		;Yes - make it *
+	JMP	havcode
+
+;Here with make of the PRINT SCREEN key
+
+sysshf:	MOVB	AL, #7Fh
+	CLI
+	MOVB	dhdb_frcnt.B[EDI], #0	;Clear the fork level input ring
+	MOVB	dhdb_frput.B[EDI], #0
+	MOVB	dhdb_frtak.B[EDI], #0
+	STI
+	ORB	dhdb_keysts.B[EDI], #KS$SYSSHFT
+	JMP	almproc.S		;Process this character
+
+;Here with any character when an alarm window is active
+
+almact:	MOVL	ESI, dhdb_curtdb.B[EDI]
+	MOVB	BL, tdb_keysts0.B[ESI]	;Get shift and control state
+	MOVB	BH, BL			;Merge left and right bits
+	SHRB	BL, #4t
+	ORB	BL, BH
+	ANDL	EBX, #07h.B
+	MOVL	EBX, knlScnTblX##[EBX*4] ;Get offset of table for this state
+	MOVZBL	EDX, AL
+	MOVZBL	ECX, [EBX+EDX]		;Get translation for character
+	TESTB	AH, AH			;Is this a key-release code?
+	JS	almhvbrk.S		;Yes - go handle it
+	TESTB	CL, CL			;Special dispatch needed?
+	JNS	almproc.S		;No
+	CALLI	xosconKbdMKyTbl##-80h[ECX] ;Yes - dispatch on the special code
+	JMP	kbdafork
+
+;Here for key-release code from keyboard
+
+almhvbrk:
+	TESTB	CL, CL			;Special dispatch needed?
+	JNS	kbdafork		;No - ignore it
+	CALLI	xosconKbdBKyTbl##-80h[ECX] ;Yes - do special dispatch
+	JMP	kbdafork
+
+$$$=!0
+FRM alm_msg, sss_cSIZE		;Message buffer
+FRM alm_dst, 12t		;Destination string buffer
+alm_SIZE=!$$$
+
+almproc:ENTER	alm_SIZE, 0		;Allocate a stack frame
+	PUSHL	ESI
+	MOVW	alm_msg+sss_char.B[EBP], AX ;Store character code
+	MOVB	alm_msg+sss_func.B[EBP], #MT_SSALMCHAR ;Store function
+	MOVL	EAX, tdb_keysts0.B[ESI]	;Store keyboard state bits
+	MOVW	alm_msg+sss_bits.B[EBP], AX
+	MOVZBL	EAX, tdb_mode[ESI]	;Store display mode
+	MOVL	alm_msg+sss_dspmode.B[EBP], EAX
+	MOVW	AX, tdb_pnum.B[ESI]	    ;Store primary unit and secondary
+	MOVW	alm_msg+sss_pnum.B[EBP], AX ;  unit numbers
+	MOVL	alm_msg+sss_xtdb.B[EBP], ESI ;Store offset of the TDB
+	MOVL	alm_dst+0.B[EBP], #'SYS^' ;Build destination string
+	MOVL	alm_dst+4.B[EBP], #'TRM'
+	MOVZBL	EAX, tdb_pnum.B[ESI]
+	PUSHL	DS
+	PUSHL	SS
+	POPL	DS
+	LEAL	EBX, alm_dst+7.B[EBP]
+	CALL	knlPutDecNmbr##
+	MOVB	[EBX], #0
+	POPL	DS
+	PUSHL	SS
+	POPL	ES
+	LEAL	EBX, alm_dst.B[EBP]
+	PUSHL	DS			;Get source string for message
+	POPL	GS
+	MOVL	EDX, #knlTrmMsgSrc##
+	PUSHL	SS			;Get address of the message buffer in
+	POPL	FS			;  the right registers
+	LEAL	ESI, alm_msg.B[EBP]
+	MOVL	ECX, #sss_cSIZE
+	CALL	knlIpmSendMsg##		;Send the message
+	POPL	ESI			;Restore offset of the TDB
+	LEAVE				;Remove the stack frame
+	MOVL	EDI, tdb_dhdb.B[ESI]	;Restore offset of the DHDB
+	JNC	kbdafork		;If OK
+
+;Here if error sending message to the screen symbiont - this should not
+;  happen, but if it does, it probably means the screen symbiont is not
+;  running - in this case we just forget about it after clearing the
+;  the KS$SYSSHFT bit.
+
+	ANDB	dhdb_keysts.B[EDI], #~KS$SYSSHFT
+	CALL	knlTrmOutDone##		;Just to be sure, see if need to wake
+					;  up anyone
+	MOVL	EDI, tdb_dhdb.B[ESI]	;Restore offset of the DHDB
+	JMP	kbdafork		;And continue
+.PAGE
+	.SBTTL	kbdready - Subroutine to process buffered scan codes
+
+ret004:	RET
+
+;Subroutine to process buffered scan codes - must be called at fork level only
+;	c{ESI} = Offset of TDB
+;	CALL	kbdready
+
+kbdready:
+	BTL	tdb_imode.B[ESI], #TIM%DEBUG ;In debug input mode?
+	JC	2$.S			;Yes - don't check for interrupts
+	TESTB	tdb_keysts2.B[ESI], #KS2$KEYINT ;No - processing interrupt?
+	JNE	ret004.S		;Yes - forget this for now!
+2$:	MOVL	EDI, tdb_dhdb.B[ESI]	;Make sure have offset of DHDB
+	CMPB	dhdb_frcnt.B[EDI], #0	;No - anything in the keyboard ring?
+
+;;;;;;;	JE	ret004.S
+
+	JNE	4$.S			;Yes
+	CMPB	dhdb_ircnt.B[EDI], #0	;No - anything in the interrupt ring?
+	JNE	kbdafork		;Yes - go handle it now
+	RET				;No - all done here
+
+4$:	MOVZBL	EBX, dhdb_frtak.B[EDI]	;Get taker pointer
+	MOVZWL	EAX, dhdb_frng.B[EDI+EBX*2] ;Get character
+	INCL	EBX			;Bump pointer
+	CMPB	BL, #FKSIZE		;Past end of ring?
+	JB	6$.S			;No
+	CLRL	EBX			;Yes
+6$:	MOVB	dhdb_frtak.B[EDI], BL
+	DECB	dhdb_frcnt.B[EDI]	;Reduce ring count
+	INCL	dhdb_kbtchar[EDI]	;Count the character
+	CALL	xosconKbdInp##		;Process the character
+	JMP	kbdready.S
+.PAGE
+	.SBTTL	tolites - Function to update keyboard lites
+
+;Function to update keyboard lites
+
+tolites:PUSHL	EAX
+	MOVB	AL, #80			;Assume no lites wanted
+	BTL	tdb_keysts0.B[ESI], #KS0%SCLLK ;Want scroll lock lite on?
+	JNC	2$.S			;No
+	INCB	AL			;Yes
+2$:	BTL	tdb_keysts0.B[ESI], #KS0%NUMLK ;Want NUM lock lite on?
+	JNC	4$.S			;No
+	ORB	AL, #02h		;Yes
+4$:	BTL	tdb_keysts0.B[ESI], #KS0%CAPLK ;Want CAP lock lite on?
+	JNC	6$.S			;No
+	ORB	AL, #04h		;Yes
+6$:	MOVL	EDI, tdb_dhdb.B[ESI]
+	MOVB	dhdb_keydata.B[EDI], AL	;Store data byte for later
+	ANDB	AL, #0Fh
+	CALL	xosconKbdChkRM##	;Need to update real mode segment?
+	JE	8$.S			;No
+	MOVB	ES:pdaRMPage0##+bda_vkeysts3, AL ;Yes
+8$:	MOVL	EDX, dhdb_kbioreg.B[EDI]
+	MOVB	AL, #0EDh		;Send command to keyboard
+	OUTB	[DX]
+	 IOPAUSEKBD			;@@@ CEY 00Aug04
+	POPL	EAX
+	RET
+.PAGE
+	.SBTTL	keybeep - Subroutine to generate timed tone
+
+;Subroutine to generate a timed tone
+;  NOTE:  This version only supports a single tone generator, which is the
+;	  PC's built in speaker - all calls to this routine use this speaker
+;	c{EAX} = Duration (milliseconds)
+;	c{EDX} = Frequency (Hertz)
+;	c{ESI} = Offset of TDB
+;	CALL	keybeep
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal			;Normal return
+
+2$:	STC
+4$:	POPL	EDI
+	RET
+
+keybeep:PUSHL	EDI
+	MOVL	EDI,tdb_dhdb.B[ESI]	;Get offset of our DHDB
+	TESTL	EDI, EDI
+	JE	2$.S			;If none
+	TESTB	dhdb_spkstate.B[EDI], #02h ;Is a tone being generated now?
+	JNE	4$.S			;Yes - forget it!
+	TESTL	EAX, EAX		;Do we want a tone?
+	JE	4$.S			;No
+	PUSHL	EDX			;Yes - save frequency
+	ADDL	EAX, #19t.B		;Change to ticks (round up)
+	CLRL	EDX
+	DIVL	lit20
+	MOVL	EBX, #endbeep
+	PUSHL	ESI
+	CALL	knlWakeRequest##	;Enter timer request
+	POPL	ESI
+	POPL	EBX
+	JC	4$.S			;If error
+	CMPL	EBX, #19t		;Make sure not too small
+	JA	6$.S
+	MOVB	AL, #19t
+6$:	MOVL	EAX, #1193167t		;Calculate counter factor
+	CLRL	EDX
+	DIVL	EBX
+	MOVL	EBX, EAX
+	MOVB	AL, #0B6		;Set the counter
+	OUTB	P_TMRCWR
+	IOPAUSE
+	MOVB	AL, BL
+	OUTB	P_TMRCNT2
+	IOPAUSE
+	MOVB	AL, BH
+	OUTB	P_TMRCNT2
+	IOPAUSE
+	ORB	knlPort61##, #03	;Connect the counter to the speaker
+	MOVB	AL, knlPort61##
+	OUTB	P_SYSCONB
+	IOPAUSE
+	ORB	dhdb_spkstate.B[EDI], #02h ;Indicate generating tone
+	POPL	EDI
+	RET
+
+;Here at the end of the tone to end it
+;	c{EDI} = Offset of DHDB
+;	CALL	endbeep
+
+endbeep:ANDB	knlPort61##, #0FCh	;Disconnect the speaker
+	MOVB	AL, knlPort61##
+	OUTB	P_SYSCONB
+	IOPAUSE
+	MOVB	AL, #0B6		;Set the counter
+	OUTB	P_TMRCWR
+	IOPAUSE
+	MOVB	AL, dhdb_spkcnt+0.B[EDI]
+	OUTB	P_TMRCNT2
+	IOPAUSE
+	MOVB	AL, dhdb_spkcnt+1.B[EDI]
+	OUTB	P_TMRCNT2
+	IOPAUSE
+	ANDB	dhdb_spkstate.B[EDI], #~02h
+	TESTB	dhdb_spkstate.B[EDI], #01h
+	JE	10$.S
+	ORB	knlPort61##, #03h	;Restore idle speaker state
+	MOVB	AL, knlPort61##
+	OUTB	P_SYSCONB
+	IOPAUSE
+10$:	CLC
+	RET				;Thats all
+.PAGE
+	.SBTTL	Data
+
+	DATA
+
+lit20:	.LONG	20t
+irqname:.LONG	'TRM', 0, 0, 0
+
+	LKEEND

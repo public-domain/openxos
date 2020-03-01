@@ -1,0 +1,143 @@
+	.TITLE	DPMI - DOS Protected Mode Interface (DPMI) routines
+
+;++++
+; This software is in the public domain.  It may be freely copied and used
+; for whatever purpose you see fit, including commerical uses.  Anyone
+; modifying this software may claim ownership of the modifications, but not
+; the complete derived code.  It would be appreciated if the authors were
+; told what this software is being used for, but this is not a requirement.
+
+;   THIS SOFTWARE IS PROVIDED BY THE AUTHORS "AS IS" AND ANY EXPRESS OR
+;   IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
+;   OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+;   IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+;   INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+;   BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS
+;   OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+;   ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR
+;   TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
+;   USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+;----
+
+	.PROC	80486
+	.INCLUD	XOSINC:\XMAC\XOS.PAR
+	.INCLUD	XOSINC:\XMAC\XOSX.PAR
+	.INCLUD	XOSINC:\XMAC\XOSXTRM.PAR
+	.INCLUD	XOSINC:\XMAC\XOSERR.PAR
+	.INCLUD	XOSINC:\XMAC\XOSDOS.PAR
+	.INCLUD	XOSINC:\XMAC\XOSDPMI.PAR
+
+	.SBTTL	initdos - Initialize DPMI routines
+
+;Once-only routine to initialize the DPMI routines
+
+	ONCE
+
+initdpmi::
+	MOVL	EAX, #1680h		;Install blocks for our INT 2F functions
+	MOVL	EDX, #0FFFFh		;  for real mode mode
+	MOVL	EBX, #int2Frelts
+	CALL	newdosint2F#
+	MOVL	EAX, #1686h
+	MOVL	EBX, #int2Fgetmode
+	CALL	newdosint2F#
+	MOVL	EAX, #1687h
+	MOVL	EBX, #int2Fgetentry
+	JMP	newdosint2F#
+
+	CODE
+.PAGE
+	.SBTTL	int2Frelts - INT 2F function to release current time slice
+
+;Here for INT 2F function 1680h - Release current virtual machine's time slice
+;	c[AX] = 1680h
+;	INT	2Fh
+;	c(AL) = 0 (always)
+
+int2Frelts:
+	MOVB	SS:pdaURegEAX#+0, #0	;Indicate supported
+	RET				;But otherwise do nothing for now
+.PAGE
+	.SBTTL	int2Fgetmode - INT 2F function to get current CPU mode
+
+;Here for INT 2F function 1686h - Get current CPU mode
+;	c[AX] = 1686h
+;	INT	2Fh
+;	c(AL) = 0 if in protected mode, 1 if in real mode
+
+int2Fgetmode:
+	TESTB	SS:pdaURegEFR#+3, #02h	;Check for protected mode
+	SETNE	SS:pdaURegEAX#+0
+	RET
+.PAGE
+	.SBTTL	int2Fgetentry - INT 2F function to get real-to-protected mode entry point
+
+;Here for INT 2F function 1687h - Get real-to-protected mode switch entry point
+;	c[AX] = 1687h
+;	INT	2FH
+;	c[AX]    = 0
+;	c[BX]    = Flag bits:
+;		     Bit 0     - set if 32 bit programs supported
+;		     Bits 1-15 - Not used
+;	c(CL)    = Processor type:
+;		     03h = 80386
+;		     04h = 80486
+;	c(DL)    = DPMI minor version number
+;	c(DH)    = DPMI major version number
+;	c[SI]    = Number of paragraphs required for DPMI host private data
+;	c[ES:DI] = Address of routine to call to enter protected mode
+
+int2Fgetentry:
+	MOVW	SS:pdaURegEAX#, #0
+	MOVW	SS:pdaURegEBX#, #1
+	MOVB	AL, #3			;Assume 80386
+	CMPB	proctype#, #PROC_486SX	;Right?
+	JB	2$.S			;Yes
+	INCL	EAX			;No - its a 80486
+2$:	MOVB	SS:pdaURegECX#+0, AL
+	MOVW	SS:pdaURegEDX#, #05Ah
+	MOVW	SS:pdaURegESI#, #{hda_SIZE+15t}>4 ;Get size of host data area
+	MOVW	SS:pdaURegEDI#, #dpmisetup# ;Get address of the DPMI set up
+	MOVW	SS:pdaVRegES#, #0ED00h	   ;  routine
+	CLC
+	RET
+.PAGE
+	.SBTTL	vsvcDpmiSetup - Initial DPMI entry
+
+;Here for the svcDpmiSetup SVC in real mode.  This SVC is executed by the real
+;  mode DPMI entry routine.  Since all of the work is done by protected mode
+;  user code, all that is done here is to switch to protected user mode.  This
+;  SVC is intended for initialization of the DPMI emulator only.  It should not
+;  be executed at any other time.  It allocates the selectors required to map
+;  the user's current real mode segments and stores than in the segment register
+;  array.
+;	long   flags;		// Flag bits:
+;				//   Bit     0: Set if 32-bit application
+;				//   Bits 1-15: Not used, should be 0
+;	struct regs *regs;	// Address of segment register array
+;	rtn = svcDpmiSetup(flags, regs);
+;  Value returned is 0 if normal or a negative error code if error
+
+;  Format of the segment register array:
+;	struct regs
+;	{   long userGS;	// GS value
+;	    long userFS;	// FS value
+;	    long userES;	// ES value
+;	    long userDS;	// DS value
+;	    long xxx1;		// Not used
+;	    long userCS;	// CS value
+;	    long xxx2;		// Not used
+;	    long xxx3;		// Not used
+;	    long xxx4;		// Not used
+;	    long userSS;	// SS value
+;	};
+;  Note that this array places the segment register values in the correct
+;  relative positions for an XOS signal stack frame with no signal data.
+;  The unused locations are not modified by this SVC.
+
+rsvcDpmiSetup::
+	MOVL	ECX, #2t		;Copy 2 argument items
+	MOVL	EAX, #usvcdpmisetup#	;Offset of the protected user mode code
+	JMP	rmprotsvc#		;Go switch modes
+
+	END

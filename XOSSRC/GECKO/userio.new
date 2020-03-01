@@ -1,0 +1,1049 @@
+	.SBTTL	USERIO  - Character I/O routines using user mode IO for XOS
+
+;++++
+; This software is in the public domain.  It may be freely copied and used
+; for whatever purpose you see fit, including commerical uses.  Anyone
+; modifying this software may claim ownership of the modifications, but not
+; the complete derived code.  It would be appreciated if the authors were
+; told what this software is being used for, but this is not a requirement.
+
+;   THIS SOFTWARE IS PROVIDED BY THE AUTHORS "AS IS" AND ANY EXPRESS OR
+;   IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
+;   OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+;   IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+;   INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+;   BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS
+;   OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+;   ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR
+;   TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
+;   USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+;----
+
+;This version of the IO module uses the VGA display in XOS text mode (mode 1)
+;  or XOS graphic mode (mode 2)
+
+VRTLIN =!0B3h		;Character to use as vertical line in dump output
+.IF EQ $$DEBUG
+  BRDATR =!06h		;Attribute byte for border
+.IFF
+  BRDATR =!07h
+.ENDC
+INVBRD =!BRDATR*10h
+TXTATR =!02h		;Attribute byte for normal text
+INVATR =!20h		;Attribute byte for inverse text
+ERRATR =!0Ch		;Attribute byte for error message text
+
+textbufr =!3F0000h	;Offset for text mode screen buffer
+graphbufr=!400000h	;Offset for graphic mode screen buffer
+
+tsclladdr=!textbufr+7000h+6*160t ;Offset of text mode scrolling area
+tnscladdr=!textbufr+7000h+160t ;Offset of text mode nonscrolling area
+tscllsize=!18t		;Size of text mode scrolling area (lines)
+
+txscrlbf =!txdispbf+6*160t ;Address of scrolling region in save buffer
+txnsclbf =!txdispbf+160t ;Address of nonscrolling region in save buffer
+
+CCHR =!' '+TXTATR*100h	;Character + attributes to clear screen
+VBCHR=!0BAh+BRDATR*100h	;Character + attributes for vertical border
+HBCHR=!0CDh+BRDATR*100h	;Character + attributes for horizontal border
+
+	.SBTTL	swterm - TRM command - switch to or from a serial port
+
+swterm:	MOVL	EBX, #niytmsg
+	JMP	outstrcca
+.PAGE
+	.SBTTL	setdisp - Subroutine to set up our display routine
+
+;Subroutine to set up our display routine
+;	CALL	setdisp
+
+setdisp:PUSHL	#DH_STDTRM.B		;Get current mode
+	PUSHL	#0.B
+	PUSHL	#0.B
+	PUSHL	#0.B
+	CALLF	svcTrmDspMode##
+	TESTL	EAX, EAX		;Serial terminal?
+	JG	3$.S			;No
+2$:	DECB	serterm			;Yes
+	RET
+
+;Here if not serial terminal
+
+3$:	PUSHL	#DH_STDTRM.B		;Get terminal screen buffer
+	PUSHL	DS
+	PUSHL	#textbufr
+	PUSHL	#8000h
+	PUSHL	#0.B
+	CALLF	svcTrmMapScrn##
+	TESTL	EAX, EAX
+	JS	2$.S			;If error, assume serial terminal
+	MOVL	EAX, #CCHR+CCHR*10000h	;Fill buffer with spaces
+	MOVL	EDI, #txdispbf
+	MOVL	ECX, #400h
+	CLD
+	RSTOSL	[EDI]
+	MOVL	EDI, #txdispbf		;Set up our frame
+	MOVL	ESI, #lblmsg		;Top line
+	MOVL	EDX, #LBLSIZE
+	CALL	mline
+	MOVL	EDI, #txdispbf+160t*5	;Middle line
+	CALL	fline
+	MOVL	EDI, #txdispbf+160t*24t	;Bottom line
+	MOVL	ESI, #cprmsg
+	MOVL	EDX, #CPRSIZE
+	CALL	mline
+	MOVL	EDI, #txdispbf+158t	;Left and right sides
+	MOVL	ECX, #24t
+	MOVL	EAX, #VBCHR+VBCHR*10000h
+8$:	STOSL	[EDI]
+	ADDL	EDI, #156t
+	LOOP	ECX, 8$
+	MOVW	txdispbf+0, #0C9h+BRDATR*100h ;Corners
+	MOVW	txdispbf+158t, #0BBh+BRDATR*100h
+	MOVW	txdispbf+800t, #0CCh+BRDATR*100h
+	MOVW	txdispbf+958t, #0B9h+BRDATR*100h
+	MOVW	txdispbf+3840t, #0C8h+BRDATR*100h
+	MOVW	txdispbf+3998t, #0BCh+BRDATR*100h
+	RET				;Finished
+.PAGE
+	.SBTTL	mline - Subroutine to display message in frame border
+
+;Subroutine to display message in frame border
+;	c[EDX] = Length of message (number of words)
+;	c[EDI] = Offset for place to start border in screen save buffer
+;	c[ESI] = Offset for message string in code segment (includes
+;		   attribute bytes)
+;	CALL	mline
+
+mline:	CALL	fline			;Put border line in buffer
+	SUBL	EDI, #80t		;Calculate address for message
+	SUBL	EDI, EDX
+	ANDL	EDI, #0FFFFFFFEh.B	;Make sure word address
+	MOVL	ECX, EDX
+	RMOVSW	[EDI], CS:[ESI]		;Put message in buffer
+	RET				;Finished
+
+	.SBTTL	fline - Subroutine to store horizontal border line in screen save buffer
+
+;Subroutine to store horizontal border line in screen save buffer
+;	c[DI] = Offset for place to start border in screen save buffer
+;	CALL	fline
+
+fline:	MOVL	ECX, #40t		;Border is 80 characters
+	MOVL	EAX, #HBCHR+HBCHR*10000h ;Get attribute byte and character
+	RSTOSL	[EDI]			;Put border in buffer
+	RET				;Thats all
+.PAGE
+	.SBTTL	setvec - Subroutine to set up GECKO's vectors
+
+;Subroutine to set up GECKO's vectors
+;	CALL	setvec
+
+setvec:
+.IF EQ $$DEBUG				;Don't set up any vectors if debugging!
+	PUSHL	EAX
+	PUSHL	EBX
+	PUSHL	EDI
+	PUSHL	ES
+	PUSHL	#VECT_PDEBUG		;Set debug/trace trap vector
+	PUSHL	#VT_XOSS<8
+	PUSHL	CS
+	PUSHL	#debugtrapu
+	CALLF	svcSchSetVector##
+	PUSHL	#VECT_RDEBUG
+	PUSHL	#VT_XOSS<8
+	PUSHL	CS
+	PUSHL	#debugtrapu
+	CALLF	svcSchSetVector##
+	PUSHL	#VECT_PBRKPNT		;Set INT3 vector
+	PUSHL	#VT_XOSS<8
+	PUSHL	CS
+	PUSHL	#bptent
+	CALLF	svcSchSetVector##
+	PUSHL	#VECT_RBRKPNT
+	PUSHL	#VT_XOSS<8
+	PUSHL	CS
+	PUSHL	#bptent
+	CALLF	svcSchSetVector##
+	PUSHL	#VECT_PPROT		;Set protection error vector
+	PUSHL	#VT_XOSS<8
+	PUSHL	CS
+	PUSHL	#perint
+	CALLF	svcSchSetVector##
+	PUSHL	#VECT_RPROT
+	PUSHL	#VT_XOSS<8
+	PUSHL	CS
+	PUSHL	#perint
+	CALLF	svcSchSetVector##
+	PUSHL	#VECT_PPAGEFLT		;Set page fault error vector
+	PUSHL	#VT_XOSS<8
+	PUSHL	CS
+	PUSHL	#ferint
+	CALLF	svcSchSetVector##
+	PUSHL	#VECT_RPAGEFLT
+	PUSHL	#VT_XOSS<8
+	PUSHL	CS
+	PUSHL	#ferint
+	CALLF	svcSchSetVector##
+	PUSHL	#VECT_PSEGNP		;Set segment not present vector
+	PUSHL	#VT_XOSS<8
+	PUSHL	CS
+	PUSHL	#nerint
+	CALLF	svcSchSetVector##
+	PUSHL	DS			;Set terminal to interrupt on vector
+	PUSHL	#tvqab			;  31 on ^P
+	CALLF	svcIoQueue##
+	PUSHL	#31t.B
+	PUSHL	#7+VT_XOSS<8
+	PUSHL	CS
+	PUSHL	#cpent
+	CALLF	svcSchSetVector##
+	POPL	ES
+	POPL	EDI
+	POPL	EBX
+	POPL	EAX
+.ENDC
+	RET
+
+	.SBTTL	intusr - Subroutine to initialize user environment when GECKO is started
+
+;Subroutine to initialize the user environment when GECKO is started
+;	CALL	intusr
+
+intusr:	RET
+.PAGE
+	.SBTTL	entgecko - Subroutine to set up for entry to GECKO
+
+;Subroutine to set up for entry to GECKO
+;	CALL	entgecko
+
+entgecko:
+	CLD
+	PUSHL	#!data_p
+	POPL	DS
+	POPL	entrtn			;Save our return address
+	POPL	uregGS			;Save segment registers
+	POPL	uregFS
+	POPL	uregES
+	POPL	uregDS
+	POPL	uregEIP	 		;Save user IP
+	POPL	uregCS			;Save user CS
+	POPL	uregEFR			;And save user flags
+	ADDL	ESP, #4.B		;Discard stack count/interrupt number
+	TESTB	uregEFR+2, #02		;Trap from V86 mode?
+	JE	2$.S			;No
+	POPL	uregESP			;Yes - save V86 stack pointer
+	POPL	uregSS
+	MOVL	uESP, ESP
+	MOVL	uSS, SS
+	JMP	4$.S
+
+2$:	MOVL	uregESP, ESP		;Save user stack pointer
+	MOVL	uregSS, SS
+4$:	PUSHL	DS			;Set up the GECKO stack pointer
+	POPL	SS
+	MOVL	ESP, xESP
+	MOVL	xESP, #0
+	CALL	savusr
+	CALL	xscreen			;Set up GECKO's screen
+	CALL	xregdmp			;Update register display
+	MOVL	EDI, #bpttbl		;Point to breakpoint table
+	MOVL	ECX, #BPTNUM
+	CLRL	ESI
+6$:	CMPB	[EDI], #0		;Is this entry in use?
+	JE	12$.S			;No - go on
+	MOVL	EBX, bt_ofs.B[EDI]	;Yes - get address
+	MOVL	EDX, bt_seg.B[EDI]
+	INCL	EBX
+	CMPL	EBX, uregEIP		;Now stopped at this breakpoint?
+	JNE	10$.S			;No
+	MOVL	EAX, uregCS		;Maybe
+	BTL	EAX, #16t
+	JC	8$.S
+	ANDB	AL, #0FCh
+8$:	CMPL	EDX, EAX
+	JNE	10$.S			;No
+	MOVL	ESI, EDI		;Yes - remember it
+10$:	DECL	EBX
+	MOVB	AL, bt_ins.B[EDI]	;Get instruction
+	CALL	putmbyte		;Restore instruction
+12$:	ADDL	EDI, #bt_ENSZ
+	LOOP	ECX, 6$
+	MOVL	EAX, oradix		;Reset temporary output radix
+	MOVL	tradix, EAX
+	MOVB	AL, poutmd		;And reset temporary output mode
+	MOVB	toutmd, AL
+	JMPIL	entrtn			;Return from entgecko
+.PAGE
+savusr:	MOVL	uregEAX, EAX		;Save EAX
+	PUSHL	#8.B			;Disable signals
+	CALLF	svcSchSetLevel##
+	MOVL	uregEBX, EBX		;Save other registers
+	MOVL	uregECX, ECX
+	MOVL	uregEDX, EDX
+	MOVL	uregEDI, EDI
+	MOVL	uregESI, ESI
+	MOVL	uregEBP, EBP
+	CLRL	EAX
+	TESTB	uregEFR+2, #02		;From V86 mode?
+	JE	4$.S			;No
+	INCL	EAX			;Yes
+4$:	MOVW	uregSS+2, AX
+	MOVW	uregES+2, AX
+	MOVW	uregDS+2, AX
+	MOVW	uregFS+2, AX
+	MOVW	uregGS+2, AX
+	MOVW	uregCS+2, AX
+	PUSHL	#80000000h		;Disable watchpoints
+	CALLF	svcMemWPCntl##
+	PUSHL	#DH_STDTRM.B		;Get user's terminal state
+	PUSHL	#0.B
+	PUSHL	#0.B
+	PUSHL	#0.B
+	PUSHL	DS
+	PUSHL	#trmgetparm
+	CALLF	svcIoInBlockP##
+	MOVL	inpbits, #TIM$IMAGE|TIM$DEBUG ;Set up GECKO's terminal state
+	MOVL	outbits, #TOM$IMAGE
+	PUSHL	#DH_STDTRM.B
+	PUSHL	#0.B
+	PUSHL	#0.B
+	PUSHL	#0.B
+	PUSHL	DS
+	PUSHL	#trmsetparm
+	CALLF	svcIoInBlockP##
+	RET
+.PAGE
+	.SBTTL	xscreen - Subroutine to display GECKO's screen
+
+;Subroutine to display GECKO's screen
+;	CALL	xscreen
+
+xscreen:CMPB	serterm, #0		;Using memory mapped display?
+	JNE	4$			;No - nothing needed here
+	PUSHL	#DH_STDTRM.B		;Get current display mode data
+	PUSHL	#DM$RTNDATA
+	PUSHL	DS
+	PUSHL	#userdata
+	CALLF	svcTrmDspMode##
+	MOVL	usermode, EAX
+	PUSHL	#DH_STDTRM.B		;Set GECKO display mode
+	PUSHL	#DM$NOCLEAR|DM$USEDATA|DM_TEXT
+	PUSHL	DS
+	PUSHL	#gecdata
+	CALLF	svcTrmDspMode##
+	PUSHL	#DH_STDTRM.B
+	PUSHL	#7.B
+	CALLF	svcTrmDspPage##
+	MOVL	userpage, EAX
+	MOVL	EDI, DS			;Save user's screen
+	MOVL	ES, EDI
+	MOVL	EDI, #tudispbf
+	MOVL	ESI, #textbufr+7000h
+	MOVL	ECX, #1024t
+	CLD
+	RMOVSL	[EDI], [ESI]
+	PUSHL	#DH_STDTRM.B		;Save user's cursor position
+	PUSHL	userpage
+	PUSHL	#-1.B
+	PUSHL	#-1.B
+	CALLF	svcTrmCurPos##
+	MOVW	ucursor, AX
+	PUSHL	#DH_STDTRM.B		;Set GECKO cursor position
+	PUSHL	#7.B
+	MOVZBL	EAX, xcursor+0
+	PUSHL	EAX
+	MOVZBL	EAX, xcursor+1
+	PUSHL	EAX
+	CALLF	svcTrmCurPos##
+	MOVL	EDI, #textbufr+7000h	;Set up GECKO's screen
+	MOVL	ESI, #txdispbf
+	MOVL	ECX, #1024t
+	RMOVSL	[EDI], [ESI]
+	MOVB	screen, #1		;Remember displaying GECKO's screen
+4$:	RET				;Thats all
+.PAGE
+	.SBTTL	rstusr - Subroutine to restore user state
+
+;Subroutine to restore user state
+;	CALL	rstusr
+
+rstusr:	CMPB	screen, #0		;Need to switch screens?
+	JE	rstus2.S		;No
+	CALL	uscreen			;Yes - restore user screen
+rstus2:	MOVL	EAX, inpbitg		;Restore user's terminal state
+	MOVL	inpbits, EAX
+	MOVL	EAX, outbitg
+	MOVL	outbits, EAX
+	PUSHL	#DH_STDTRM.B
+	PUSHL	#0.B
+	PUSHL	#0.B
+	PUSHL	#0.B
+	PUSHL	DS
+	PUSHL	#trmsetparm
+	CALLF	svcIoInBlockP##
+	PUSHL	#40000000h		;Enable watchpoints
+	CALLF	svcMemWPCntl##
+	MOVL	EDI, uregEDI
+	MOVL	ESI, uregESI
+	MOVL	EBP, uregEBP
+	MOVL	EDX, uregEDX
+	MOVL	ECX, uregECX
+	MOVL	EBX, uregEBX
+	MOVL	EAX, uregEAX
+retio06:RET				;Finished
+.PAGE
+	.SBTTL	uscreen - Subroutine to save GECKO screen and display user screen
+
+;Subroutine to save GECKO screen and display user screen
+;	CALL	uscreen
+
+uscreen:CMPB	serterm, #0		;Using memory mapped display?
+	JNE	retio06.S		;No - nothing needed here
+	MOVL	EDI, DS			;Yes - save GECKO's screen
+	MOVL	ES, EDI
+	MOVL	EDI, #txdispbf
+	MOVL	ESI, #textbufr+7000h
+	MOVL	ECX, #1024t
+	CLD
+	RMOVSL	[EDI], [ESI]
+	PUSHL	#DH_STDTRM.B		;Restore user's display mode
+	MOVL	EAX, usermode
+	ORL	EAX, #DM$NOCLEAR|DM$USEDATA
+	PUSHL	EAX
+	PUSHL	DS
+	PUSHL	#userdata
+	CALLF	svcTrmDspMode##
+	PUSHL	#DH_STDTRM.B
+	PUSHL	userpage
+	CALLF	svcTrmDspPage##
+	PUSHL	#DH_STDTRM.B		;Save GECKO cursor position
+	PUSHL	#7.B
+	PUSHL	#-1.B
+	PUSHL	#-1.B
+	CALLF	svcTrmCurPos##
+	MOVW	xcursor, AX
+	PUSHL	#DH_STDTRM.B		;Restore user's cursor position
+	PUSHL	userpage
+	MOVZBL	EAX, ucursor+0
+	PUSHL	EAX
+	MOVZBL	EAX, ucursor+1
+	PUSHL	EAX
+	CALLF	svcTrmCurPos##
+	MOVL	EDI, #textbufr+7000h	;Set up user's screen
+	MOVL	ESI, #tudispbf
+	MOVL	ECX, #1024t
+	RMOVSL	[EDI], [ESI]
+	MOVB	screen, #0		;Remember displaying user's screen
+	RET				;Thats all
+.PAGE
+;Here for exit command
+
+goexit:	CALL	outcrl
+	CMPB	screen, #0		;Need to switch screens?
+	JE	2$.S			;No
+	CALL	uscreen			;Yes - restore user screen
+2$:	PUSHL	#0.B
+exit2:	CALLF	svcSchExit##
+4$:	JMP	4$.S
+.PAGE
+;Here on terminal ^P interrupt
+
+cpent:	CALL	entgecko   		;Do common entry stuff
+	MOVL	curbpt, #0		;No current breakpoint now
+	MOVL	EBX, #ci0msg		;No
+	JMP	bpten6
+.PAGE
+	.SBTTL	getmtype - Subroutine to get memory segment type
+
+;Subroutine to get memory segment type (this routine assumes that the segment
+;  has already been accessed by calling getmbyte, getmword, or getmlong to
+;  verify that the selector is valid)
+;	c[DX] = Segment selector
+;	CALL	getmtype
+;	c(AL)  = Segment type
+;		    2t = 32 bit data segment
+;		    5t = 32 bit code segment
+;		   10t = 16 bit data segment
+;		   13t = 16 bit code segment
+
+getmtype:
+	MOVB	AL, memtype		;Get memory type from last access
+	RET
+.PAGE
+	.SBTTL	getmbyte - Subroutine to get byte from memory
+
+;Subroutine to get byte from memory
+;	c[DX]  = Segment selector
+;	c{EBX} = Segment offset
+;	CALL	getmbyte
+;	c{EAX} = Value (byte zero extended to 32 bits)
+
+getmbyte:
+	MOVB	AL, #1
+	CALL	memfunc
+	TESTL	EAX, EAX
+	JS	2$.S
+	MOVB	memtype, AL		;Store segment type
+	MOVZBL	EAX, memval
+	RET
+
+	.SBTTL	getmword - Subroutine to get word from memory
+
+;Subroutine to get word from memory
+;	c[DX]  = Segment selector
+;	c{EBX} = Segment offset
+;	CALL	getmword
+;	c{EAX} = Value (word zero extended to 32 bits)
+
+getmword:
+	MOVB	AL, #2			;Read word item
+	CALL	memfunc
+	TESTL	EAX, EAX
+	JS	2$.S
+	MOVB	memtype, AL		;Store segment type
+	MOVZWL	EAX, memval
+	RET
+
+	.SBTTL	getmlong - Subroutine to get long from memory
+
+;Subroutine to get long from memory
+;	c[DX]  = Segment selector
+;	c{EBX} = Segment offset
+;	CALL	getmlong
+;	c{EAX} = Value
+
+getmlong:
+	MOVB	AL, #3			;Read long item
+	CALL	memfunc
+	TESTL	EAX, EAX
+	JS	2$.S
+	MOVB	memtype, AL		;Store segment type
+	MOVL	EAX, memval
+	RET
+
+	.SBTTL	putmbyte - Subroutine to store byte in memory
+
+;Subroutine to store byte in memory
+;	c(AL)  = Value
+;	c[DX]  = Segment selector
+;	c{EBX} = Segment offset
+;	CALL	putmbyte
+
+putmbyte:
+	MOVB	memval, AL		;Store value
+	MOVB	AL, #4			;Write byte item
+	CALL	memfunc
+	TESTL	EAX, EAX
+	JNS	4$.S
+2$:	STC
+4$:	RET
+
+	.SBTTL	memfunc - Subroutine to do memory debug function
+
+;Subroutine to do memory debug function
+;	c(AL) = Function
+;	CALL	memfunc
+;	c{EAX} = Returned value
+
+memfunc:MOVZBL	EAX, AL
+	PUSHL	EAX
+	BTL	EDX, #16t		;V86 mode address?
+	JNC	10$.S			;No
+	MOVZWL	EAX, DX			;Yes
+	SHLL	EAX, #4
+	ADDL	EAX, EBX
+	PUSHL	#GS_REAL16.B
+	PUSHL	EAX
+	JMP	12$.S
+
+10$:	PUSHL	EDX
+	PUSHL	EBX
+12$:	PUSHL	DS
+	PUSHL	#memval
+	CALLF	svcMemDebug##
+	RET
+.PAGE
+	.SBTTL	wptsetclr - Subroutine to set or clear a watchpoint
+
+;Subroutine to set or clear a watchpoint
+;	c(AL)     = Trap number (0 to 3)
+;	c(CL)     = Type type:
+;		      0 = None (clear trap)
+;		      1 = Instruction
+;		      2 = Data write
+;		      3 = Data access
+;	c(CH)     = Trap size:
+;		      1 = Byte
+;		      2 = Word
+;		      3 = Long
+;	c{DX:EBX} = Address
+;	CALL	wptsetclr
+;	C:set = Error
+;	C:clr = Normal
+
+wptsetclr:
+	MOVZBL	EAX, AL
+	PUSHL	EAX
+	MOVB	AL, CL
+	PUSHL	EAX
+	MOVB	AL, CH
+	PUSHL	EAX
+	BTL	EDX, #16t		;V86 mode address?
+	JNC	2$.S			;No
+	MOVZWL	EAX, DX			;Yes
+	SHLL	EAX, #16t
+	MOVW	AX, BX
+	PUSHL	#0.B
+	PUSHL	EAX
+	JMP	4$.S
+
+2$:	PUSHL	EDX
+	PUSHL	EBX
+4$:	CALLF	svcMemWPSet##
+	BTL	EAX, #31t
+	RET
+.PAGE
+	.SBTTL	outchx - Internal subroutine to output character to scrolling region
+
+;Internal subroutine to output character to scrolling region
+;	c(AL) = Character to output
+;	CALL	outchx
+
+outchx:	CMPB	stpflg, #0		;Want to stop output?
+	JNE	outchx.S		;Yes - wait
+	MOVB	nohalt, #1		;No - indicate should not stop now
+	PUSHL	EBX
+	PUSHL	EDX
+	CMPB	AL, #' '		;Printing character?
+	JNC	20$			;Yes
+	CMPB	AL, #CR			;No - return?
+	JNE	2$.S			;No
+	MOVB	horpsn, #0		;Yes - reset position
+	CMPB	serterm, #0		;Using memory mapped display?
+	JNE	5$.S			;No
+	JMP	dspcur			;Yes
+
+2$:	CMPB	AL, #LF			;Line feed?
+	JNE	4$.S			;No
+	CMPB	serterm, #0		;Yes - using memory mapped display?
+	JNE	5$.S			;No - just output character
+	JMP	scrollup		;Yes - go scroll screen
+
+;Here if not line feed
+
+4$:	CMPB	AL, #BS			;Backspace?
+	JNE	8$.S			;No
+	CMPB	horpsn, #0		;Yes - at beginning of line?
+	JE	6$.S			;Yes
+	DECB	horpsn			;No - reduce position
+	CMPB	serterm, #0		;Using memory mapped display?
+5$:	JNE	32$			;No - just output character
+	JMP	dspcur			;Yes - go display updated cursor
+
+6$:	CMPB	serterm, #0		;Using memory mapped display?
+	JNE	disdon			;No - do nothing
+	SUBL	verpsn, #80t		;Yes - backup to end of previous line
+	DECB	curlin
+	MOVB	horpsn, #77t
+	JMP	dspcur
+
+;Here if not backspace
+
+8$:	CMPB	AL, #HT			;Horizontal tab?
+	JNE	12$.S			;No
+10$:	MOVB	AL, #' '		;Yes - output space
+	INCB	horpsn
+	CALL	onscrn
+	TESTB	horpsn, #7		;At tab stop yet?
+	JNE	10$.S			;No - contin;ue
+	JMP	34$			;Yes - finished
+
+;Here if not horizontal tab
+
+12$:	CMPB	serterm, #0
+	JNE	30$.S
+	CMPB	AL, #ERR		;Change color for error text?
+	JNE	14$.S			;No
+	MOVB	attrib, #ERRATR		;Yes
+	JMP	16$.S
+
+14$:	CMPB	AL, #TXT		;Change color for normal text?
+	JNE	18$.S			;No
+	MOVB	attrib, #TXTATR		;Yes
+16$:	JMP	disdon
+
+18$:	CMPB	AL, #INV		;Change to inverse video?
+	JNE	20$.S			;No
+	MOVB	attrib, #INVATR
+	JMP	16$.S
+
+20$:	CMPB	AL, #CLR		;Clear line?
+	JNE	30$.S			;No
+	PUSHL	EDI			;Yes
+	PUSHL	ES
+	MOVB	horpsn, #0		;Reset position
+	MOVL	EDI, verpsn		;Point to beginning of line
+	INCL	EDI
+	ADDL	EDI, EDI
+	CMPB	screen, #0
+	JE	22$.S
+	ADDL	EDI, #tsclladdr
+	JMP	24$.S
+
+22$:	ADDL	EDI, #txscrlbf
+24$:	PUSHL	DS
+	POPL	ES
+	MOVB	AH, #TXTATR
+	MOVB	AL, #' '
+	MOVL	ECX, #78t
+	CLD
+	RSTOSW	[EDI]
+	POPL	ES
+	POPL	EDI
+	JMP	dspcur
+
+;Here with printing character
+
+30$:	INCB	horpsn			;Bump horizontal position
+32$:	CALL	onscrn			;Put character on screen
+34$:	CMPB	serterm, #0
+	JNE	16$.S
+.PAGE
+;Here to update cursor position
+
+dspcur:	CMPB	screen, #0		;Displaying GECKO's screen?
+	JE	4$.S			;No
+	PUSHL	#DH_STDTRM.B		;Yes
+	PUSHL	#7.B
+	MOVZBL	EAX, horpsn		;Get column number
+	INCL	EAX
+	PUSHL	EAX
+	MOVL	EAX, verpsn		;Set GECKO cursor position
+	CLRL	EDX
+	DIVL	CS:lit80		;Calculate row number
+	ADDL	EAX, #6.B
+	PUSHL	EAX
+	CALLF	svcTrmCurPos##
+4$:	JMP	disdon			;Thats all
+.PAGE
+;Here to scroll screen up one line
+
+scrollup:
+	CMPB	nonscrl, #0		;Output to nonscrolling region?
+	JNE	2$.S			;Yes
+	MOVB	AL, curlin		;No - on last line now?
+	INCB	AL
+	CMPB	AL, #tscllsize
+	JA	4$.S			;Yes
+	MOVB	curlin, AL		;No - just move down a line
+2$:	ADDL	verpsn, #80t
+	JMP	dspcur.S		;And go update cursor
+
+;Here if now on last line of scrolling region
+
+4$:	PUSHL	ESI
+	PUSHL	EDI
+	PUSHL	ECX
+	CMPB	screen, #0		;Displaying GECKO's screen?
+	JE	6$.S			;No
+	MOVL	EDI, #tsclladdr		;Yes - scroll the real display
+	JMP	8$.S
+
+6$:	MOVL	EDI, #txscrlbf		;Scroll the saved display
+8$:	PUSHL	ES
+	MOVL	ECX, #tscllsize		;Get size of scrolling area (lines)
+	DECL	ECX			;Minus one
+	IMULL	ECX, #40t		;Change to number of longs
+	MOVL	ESI, DS
+	MOVL	ES, ESI
+	LEAL	ESI, 160t[EDI]
+	CLD
+	RMOVSL	[EDI], [ESI]		;Move screen up one line
+	MOVW	AX, #VBCHR
+	STOSW	[EDI]
+	MOVL	EAX, #CCHR+CCHR*10000h	;Fill last line with spaces
+	MOVL	ECX, #39t
+	RSTOSL	[EDI]
+	MOVW	AX, #VBCHR
+	STOSW	[EDI]
+	POPL	ES
+	POPL	ECX
+	POPL	EDI
+	POPL	ESI
+disdon:	POPL	EDX
+	POPL	EBX
+	MOVB	nohalt, #0		;Allow stopping now
+	CMPB	hltflg, #0		;Should we stop now?
+	JE	10$.S
+	MOVB	hltflg, #0		;Yes - only once!
+
+;NEED TO ADD CODE HERE TO STOP!!
+
+10$:	RET
+.PAGE
+	.SBTTL	onscrn - Subroutine to place character on screen
+
+;Subroutine to place character on screen
+;	c(AL) = Character
+;	CALL	onscrn
+
+onscrn:	CMPB	horpsn, #78t		;Too far right?
+	JBE	2$.S			;No
+	PUSHL	EAX			;Yes - save character
+	CALL	outcrl			;Go to next line
+	POPL	EAX
+	INCB	horpsn
+2$:	CMPB	serterm, #0		;Using memory mapped display?
+	JE	6$.S			;Yes
+	CMPB	nonscrl, #0		;Write to non-scrolling region?
+	JNE	4$.S			;Yes - ignore it!
+	PUSHL	#DH_STDTRM.B		;No - just output character to terminal
+	PUSHL	EAX
+	CALLF	svcIoOutSingle##
+4$:	RET
+
+;Here if using memory mapped display
+
+6$:	CMPB	graphmode, #0		;Graphic mode display?
+	JNE	onsgm.S			;Yes
+	MOVL	EBX, horpsn		;No - text mode
+	ADDL	EBX, verpsn
+	ADDL	EBX, EBX
+	CMPB	nonscrl, #0		;Write to non-scrolling region?
+	JE	10$.S			;No
+	CMPB	screen, #0
+	JE	8$.S
+	ADDL	EBX, tnscladdr
+	JMP	16$.S
+
+8$:	ADDL	EBX, #txnsclbf
+	JMP	16$.S
+
+10$:	CMPB	screen, #0
+	JE	14$.S
+	ADDL	EBX, #tsclladdr
+	JMP	16$.S
+
+14$:	ADDL	EBX, #txscrlbf
+16$:	MOVB	AH, attrib
+	MOVW	[EBX], AX
+	RET
+
+;Here if in graphic mode
+
+onsgm:
+
+
+	RET
+.PAGE
+	.SBTTL	inpchx - Subroutine to get input character from terminal
+
+;Subroutine to get input character from terminal
+;	CALL	inpchx
+;	c(AL) = Character
+
+inpchx:	CALL	inpchxx
+	CMPB	AL, #0			;Special character?
+	JE	4$.S			;Yes
+	ANDB	AL, #7Fh		;Only 7 bits
+	RET
+
+;Here if have special character
+
+4$:	CALL	inpchxx			;Get next byte
+	ORB	AL, #80h
+	PUSHL	EAX
+	CALL	inpchxx			;Get first flag byte
+	TESTB	AL, #11h		;Either shift key pressed?
+	JE	6$.S			;No
+	ORB	[ESP], #10h		;Yes
+6$:	CALL	inpchxx			;Discard second flag byte
+	POPL	EAX			;Get the byte
+	RET				;And return
+
+inpchxx:PUSHL	DS			;Get single input character using
+	PUSHL	#inpqab			;  direct (not queued) IO
+	CALLF	svcIoQueue##
+	TESTL	EAX, EAX		;See if error
+	JS	10$.S
+	ORL	EAX, inpqab+qab_error
+	JS	10$.S
+	MOVB	AL, inpbuf		;OK - get the character
+	RET
+
+;Here if error reading console input - this is a serious problem so just tell
+;  him as best we can and exit quickly!
+
+10$:	SUBL	ESP, #100t
+	MOVL	EDX, ESP
+	PUSHL	EAX
+	PUSHL	#3.B
+	PUSHL	SS
+	PUSHL	EDX
+	MOVL	EBX, #ciemsg
+	CALL	outstrc
+	CALLF	svcSysErrMsg##
+	ADDL	EAX, ESP
+	MOVL	[EAX], #CR+{LF<8}
+	MOVL	EBX, ESP
+	CALL	outstrd
+	PUSHL	#1.B
+	JMP	exit2
+
+ciemsg:	.ASCIZ	{LF,CLR,ERR}"? Error reading console input - fatal"{CR,LF}"  "
+.PAGE
+	.SBTTL	debugtrapu - User mode debug trap signal routine
+
+;Here on a debug trap
+
+debugtrapu:
+	CALL	entgecko		;Do common GECKO entry stuff
+	PUSHL	#400Fh
+	CALLF	svcMemWPCntl##
+	JMP	debugtrap
+.PAGE
+	.MOD	4
+lit80:	.LONG	80t
+
+	.MACRO	& SCNMSG  attr, string
+	.IRPC	&& qq,{string}
+	.BYTE	'qq', attr
+	.ENDR
+	.ENDM
+
+	.RADIX	10t
+	.IRP	maj, >MAJVER
+	.IRP	min, >MINVER
+	.IRP	& edit, >EDITNUM
+lblmsg:	SCNMSG	BRDATR*10h, { GECKO (user mode) v&maj.&min.&edit }
+	.ENDR
+	.ENDR
+	.ENDR
+LBLSIZE=!{$-lblmsg}/2
+	.RADIX	16t
+cprmsg:	SCNMSG	BRDATR, {1}
+	SCNMSG	INVBRD, {Help}
+	SCNMSG	BRDATR, { 2}
+	SCNMSG	INVBRD, {SwScrn}
+	SCNMSG	BRDATR, { 4}
+	SCNMSG	INVBRD, {ExmEIP}
+	SCNMSG	BRDATR, { 5}
+	SCNMSG	INVBRD, {ExmPrev}
+	SCNMSG	BRDATR, { 6}
+	SCNMSG	INVBRD, {ExmSame}
+	SCNMSG	BRDATR, { 7}
+	SCNMSG	INVBRD, {ExmNext}
+	SCNMSG	BRDATR, { 8}
+	SCNMSG	INVBRD, {Step}
+	SCNMSG	BRDATR, { 9}
+	SCNMSG	INVBRD, {Trace}
+	SCNMSG	BRDATR, {10}
+	SCNMSG	INVBRD, {Go}
+CPRSIZE=!{$-cprmsg}/2
+
+ci0msg:	.ASCIZ	{CR,LF}"User interrupt at ES:EIP} "
+
+	DATA
+
+graphmode:
+	.BYTE	0	;Non-zero if have graphic mode display
+nonscrl:.BYTE	0	;Non-zero to output to nonscrolled region
+attrib:	.BYTE	TXTATR	;Current character attributes
+memtype:.BYTE	0	;Type of last segment read
+
+	.MOD	4
+uESP::	.LONG	0	;Actual user stack pointer when called from V86 mode
+uSS::	.LONG	0
+v86img::.LONG	0	;Bit 16 set if V86 program loaded, all 0 otherwise
+memval:	.LONG	0, 0	;Memory value for svcMemDebug SVCs
+inpbuf:	.WORD	0	;Consol character input buffer
+ucursor:.WORD	0	;User cursor location while GECKO screen is displayed
+xcursor:.WORD	0	;GECKO cursor location while user screen is displayed
+curlin:	.WORD	0	;Current line in scrolling region
+horpsn:	.LONG	0	;Horizontal position in current line
+verpsn:	.LONG	0	;Vertical position of start of current line
+screen:	.WORD	0	;Non-zero when GECKO's screen is displayed
+
+hltflg:	.WORD	0	;Non-zero if need to halt GECKO
+nohalt:	.WORD	0	;Non-zero if cannot halt because in critical code
+stpflg:	.WORD	0	;Non-zero to stop output
+
+	.MOD	4
+trmsetparm:				;Parameter list for setting terminal
+	.BYTE	PAR$SET|REP_HEXV, 4	;  parameters
+	.WORD	IOPAR_TRMCINPMODE
+	.LONG	0FFFFFFFFh
+	.BYTE	PAR$SET|REP_HEXV, 4
+	.WORD	IOPAR_TRMSINPMODE
+inpbits:.LONG	0
+	.BYTE	PAR$SET|REP_HEXV, 4
+	.WORD	IOPAR_TRMCOUTMODE
+	.LONG	0FFFFFFFFh
+	.BYTE	PAR$SET|REP_HEXV, 4
+	.WORD	IOPAR_TRMSOUTMODE
+outbits:.LONG	0
+	.BYTE	0
+
+	.MOD	4
+tvparm:	.BYTE	PAR$SET|REP_TEXT, 4
+	.WORD	IOPAR_CLASS
+	.LONG	'TRM'
+	.BYTE	0
+
+	.MOD	4
+tvqab:	.WORD	QFNC$WAIT|QFNC_SPECIAL	;qab_func    - Function
+	.WORD	0			;qab_status  - Returned status
+	.LONG	0			;qab_error   - Error code
+	.LONG	0			;qab_amount  - Amount
+	.LONG	DH_STDTRM		;qab_handle  - Device handle
+	.BYTE	0			;qab_vector  - Vector for interrupt
+	.BYTE	0, 0, 0			;            - Reserved
+	.LONG	TSF_SETCPI		;qab_option  - Options or command
+	.LONG   31t			;qab_count   - Count
+	.LONG	0, 0			;qab_buffer1 - Pointer to file spec
+	.LONG	0, 0			;qab_buffer2 - Unused
+	.LONG	tvparm, !tvparm		;qab_parm    - Pointer to parameter area
+
+inpqab:	.WORD	QFNC$WAIT|QFNC$DIO|QFNC_INBLOCK
+					;qab_func    - Function
+	.WORD	0			;qab_status  - Returned status
+	.LONG	0			;qab_error   - Error code
+	.LONG	0			;qab_amount  - Amount
+	.LONG	DH_STDTRM		;qab_handle  - Device handle
+	.BYTE	0			;qab_vector  - Vector for interrupt
+	.BYTE	0, 0, 0			;            - Reserved
+	.LONG	0			;qab_option  - Options or command
+	.LONG   1t			;qab_count   - Count
+	.LONG	inpbuf, !inpbuf		;qab_buffer1 - Pointer to buffer
+	.LONG	0, 0			;qab_buffer2 - Unused
+	.LONG	0, 0			;qab_parm    - Pointer to parameter area
+
+	.MOD	4
+trmgetparm:				;Parameter list for getting terminal
+	.BYTE	PAR$GET|REP_HEXV, 4	;  parameters
+	.WORD	IOPAR_TRMSINPMODE
+inpbitg:.LONG	0
+	.BYTE	PAR$GET|REP_HEXV, 4
+	.WORD	IOPAR_TRMSOUTMODE
+outbitg:.LONG	0
+	.BYTE	0
+
+	.MOD	4
+userpage:.LONG	0
+usermode:.LONG	0
+userdata:.BLKB	dm_SIZE
+gecdata: .LONG	0
+	 .LONG	80t		;dm_columns
+	 .LONG	25t		;dm_rows
+	 .LONG	0		;dm_horiz
+	 .LONG	0		;dm_vert
+	 .LONG	0		;dm_dsptype
+	 .LONG	0		;dm_curmode
+	 .LONG	0
+
+txdispbf:.BLKW	4*1024t	;GECKO text mode display buffer
+tudispbf:.BLKW	4*1024t	;User text mode display buffer
+
+	CODE
+.PAGE

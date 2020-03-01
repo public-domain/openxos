@@ -1,0 +1,646 @@
+	.TITLE	LCDACLS - LCD display class driver type A
+
+;++++
+; This software is in the public domain.  It may be freely copied and used
+; for whatever purpose you see fit, including commerical uses.  Anyone
+; modifying this software may claim ownership of the modifications, but not
+; the complete derived code.  It would be appreciated if the authors were
+; told what this software is being used for, but this is not a requirement.
+
+;   THIS SOFTWARE IS PROVIDED BY THE AUTHORS "AS IS" AND ANY EXPRESS OR
+;   IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
+;   OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+;   IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+;   INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+;   BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS
+;   OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+;   ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR
+;   TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
+;   USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+;----
+
+;This driver supports a simple register interface to the Toshiba LCD5005
+;   LCD display which uses the xxxx LCD controller chip.  The interface
+;   consists of a data register (read/write), a command register (write
+;   only, and a status register (read only).  There is no interrupt.
+
+	.PROC	80486
+	.INCLUD	XOSINC:\XMAC\XOS.PAR
+	.INCLUD	XOSINC:\XMAC\XOSX.PAR
+	.INCLUD	XOSINC:\XMAC\XOSERR.PAR
+	.INCLUD	XOSINC:\XMAC\XOSTIME.PAR
+	.INCLUD	XOSINC:\XMAC\PCAT.PAR
+	.INCLUD	XOSINC:\XMAC\XOSLKE.PAR
+	.INCLUD	XOSINC:\XMAC\XOSXLKE.PAR
+	.INCLUD	LCDT5005.PAR
+
+MAJV   =!1t
+MINV   =!0t
+EDITNUM=!0t
+
+	LKEHEAD	LCDACLS, MAJV, MINV, EDITNUM, LKETYPE_CLASS
+
+;Define offsets in the LCDA interface DCB
+
+$$$=!4
+BLK dcb_lcdaioreg, 4t		;Base IO register for interface
+dcb_lcdaSIZE=!$$$
+.PAGE
+	.SBTTL	SVC dispatch table for LCDA class devices
+
+	CODE
+
+;SVC dispatch table for LCDA class devices
+
+lcdadsp:.LONG	rtnzero		;sd_mount	=  0. - Mount
+	.LONG	rtnzero		;sd_cleardev	=  4. - Clear device
+	.LONG	rtnzero		;sd_cleardcb	=  8. - Clear DCB
+	.LONG	rtnzero		;sd_commit	= 12. - Commit data to disk
+	.LONG	rtnzero		;sd_transold    = 16. - Transfer device/old
+	.LONG	rtnzero		;sd_transnew    = 20. - Transfer device/new
+	.LONG	knlNullQio##	;sd_opena	= 24. - Open additional
+	.LONG	lcdaopen	;sd_open1	= 28. - Open device/file
+	.LONG	lcdaopen	;sd_devparm     = 32. - Device parameters
+	.LONG	knlIFnDev##	;sd_delete	= 36. - Delete file
+	.LONG	knlIFnDev##	;sd_rename	= 40. - Rename file
+	.LONG	lcdainpblk	;sd_inblock	= 44. - Input block
+	.LONG	lcdaoutblk	;sd_outblock	= 48. - Output block
+	.LONG	knlIllOut##	;sd_outblockq	= 52. - Output block (XFF)
+	.LONG	lcdaoutstr	;sd_outstring	= 56. - Output string
+	.LONG	knlRtnMOne##	;sd_getiosts	= 60. - Get input/output status
+	.LONG	lcdaspecial	;sd_special     = 64. - Special device function
+	.LONG	rtnzero		;sd_close	= 68. - Close file
+	.LONG	knlNullLabel##	;sd_getlabel    = 72. - Get device label
+	.LONG	knlNullQioGQ##	;sd_commitfunc	= 76. - Commit data to disk
+	.LONG	knlInfoNone##	;sd_devinfo     = 80. - Get device info
+LCDADSPSZ=!{$-lcdadsp}/4
+.PAGE
+;Class function dispatch table for LCDA class devices
+
+	.LONG	CLSFMX
+lcdacls:.LONG	lcdaaddunit	;CF_ADDUNIT = 1. - Add unit
+	.LONG	lcdaunitinfo	;CF_PUNITS  = 2. - Get information about
+				;		     physical units
+	.LONG	knlIFnDev##	;CF_AUNITS  = 3. - Get information about active
+				;		     units
+CLSFMX=!{$-lcdacls}/4
+
+;Class characteristics table for the LCDA device class
+
+	DATA
+
+	.MOD	4
+lcdacctbl:
+ DCHARBGN  1, knlDCharValCom##
+ DCHARENT  NUMBER , DECV, , 4, msgnumber , knlGetSysVal##, 0             , lcdadcbnum
+ DCHARENT  MAXIMUM, DECV, , 4, msgmaximum, knlGetSysVal##, knlSetSysVal##, lcdadcbmax
+ DCHARENT  LIMIT  , DECV, , 4, msglimit  , knlGetSysVal##, knlSetSysVal##, lcdadcblmt
+
+	CODE
+
+msgnumber: DCHARINFO  {Number of in use LCDA devices}
+msgmaximum:DCHARINFO  {Maximum number of in use LCDA devices}
+msglimit:  DCHARINFO  {Maximum number of LCDA devices allowed}
+.PAGE
+;Device parameter table for LCDA IO operations
+
+	.LONG	PARMMAX
+lcdaioparms::
+	.LONG	lcdaiogenparms	 ;IOPAR_xxxxxx = 00xx - Generic IO parameters
+	.LONG	knlNullFilParms##;IOPAR_FILxxx = 01xx - File system IO
+				 ;			  parameters
+	.LONG	lcdaiotrmparms	 ;IOPAR_TRMxxx = 02xx - Terminal IO parameters
+PARMMAX=!{$-lcdaioparms}/4
+
+	.LONG	PARMGENMAX	;Size of table
+lcdaiogenparms:
+	.LONG	0		;		   = 0000h
+	.LONG	knlIopFilOptn##	;IOPAR_FILOPTN     = 0001h
+	.LONG	knlIopFilSpec##	;IOPAR_FILSPEC     = 0002h
+	.LONG	knlIopDevSts##	;IOPAR_DEVSTS      = 0003h
+	.LONG	knlIopUnitNum##	;IOPAR_UNITNUM     = 0004h
+	.LONG	knlIopGlbId##	;IOPAR_GLBID       = 0005h
+	.LONG	knlIopDelay##	;IOPAR_DELAY       = 0006h
+	.LONG	knlIopTimeOut##	;IOPAR_TIMEOUT     = 0007h
+	.LONG	knlIopIoSts##	;IOPAR_INPSTS      = 0008h
+	.LONG	knlIopIoSts##	;IOPAR_OUTSTS      = 0009h
+	.LONG	knlIopInpQLmt##	;IOPAR_INPQLMT     = 000Ah
+	.LONG	knlIopOutQLmt##	;IOPAR_OUTQLMT     = 000Bh
+	.LONG	0		;IOPAR_SIVECT1     = 000Ch
+	.LONG	0		;IOPAR_SIVECT2     = 000Dh
+	.LONG	0		;IOPAR_SIDATA      = 000Eh
+	.LONG	knlIopNumOpen##	;IOPAR_NUMOPEN     = 000Fh
+	.LONG	0		;IOPAR_BUFRLMT	   = 0010h
+PARMGENMAX=!{$-lcdaiogenparms}/4
+
+	.LONG	PARMIOTRMMAX
+lcdaiotrmparms:
+	.LONG	0
+	.LONG	0		;IOPAR_TRMSINPMODE = 0201h
+	.LONG	0		;IOPAR_TRMCINPMODE = 0202h
+	.LONG	0		;IOPAR_TRMSOUTMODE = 0203h
+	.LONG	0		;IOPAR_TRMCOUTMODE = 0204h
+	.LONG	0		;IOPAR_TRMBFRLIMIT = 0205h
+	.LONG	0		;IOPAR_TRMCLRBUFR  = 0206h
+	.LONG	lcdaiocurtype	;IOPAR_TRMCURTYPE  = 0207h
+	.LONG	lcdaiocurpos	;IOPAR_TRMCURPOS   = 0208h
+	.LONG	lcdaiodisppage	;IOPAR_TRMDISPAGE  = 0209h
+PARMIOTRMMAX=!{$-lcdaiotrmparms}/4
+
+	.LONG	1
+lcdadvparms:
+	.LONG	lcdadv0parms
+
+	.LONG	LCDAPMAX
+lcdadv0parms:
+	.LONG	knlIoparClass##	; IOPAR_CLASS  =!8000h - Device class
+;;;;	.LONG	ibcaparremadr	;IBCPAR_REMADR =!8001h - Remote address
+;;;;	.LONG	ibcapareoschr	;IBCPAR_EOSCHR =!8002h - EOS character
+;;;;	.LONG	ibcaparinmode	;IBCPAR_INMODE =!8003h - Input mode
+LCDAPMAX=!{$-lcdadv0parms}/4
+.PAGE
+;Device characteristics table for LCDA devices
+
+	DATA
+
+	.MOD	4
+lcdadctbl:
+ DCHARBGN  2, knlDCharValCom##
+ DCHARENT  CLASS   , TEXT, , 8, knlDcMsgClass##, knlDcGetClass##, knlDcSetClass##, 0
+ DCHARENT  IOREG   , HEXV, , 4, knlDcMsgIoReg##, knlDcGet4Byte##, 0              , dcb_lcdaioreg
+
+	CODE
+.PAGE
+	.SBTTL	Initialization routine
+
+	INITSUB	lcdainit
+
+lcdainit:
+;;;;	MOVL	EBX, #lcdaoat		;Set up our once-a-tick routine
+;;;;	CALL	knlSetupOAT##
+
+	MOVL	EDI, #lcdachk		;Install our class
+	MOVL	EBX, #lcdacls		;Offset of class function dispatch table
+	MOVL	EAX, #'LCDA'
+	CLRL	EDX
+	MOVL	ECX, #lcdacctbl
+	MOVL	ESI, #lcdaccb
+	CALL	knlNewClass##
+4$:	JC	10$.S			;This should not fail!
+	MOVL	ECX, #codetop
+	CLRL	EDX
+	CLRL	EAX
+10$:	MOVL	EBX, #QSTS$DONE
+	RET
+
+	CODE
+.PAGE
+	.SBTTL	lcdachk - Device check routine for LCDA interfaces
+
+;Device check routine for LCDA interfaces
+;	c{SS:EBX} = Address of device name (16 bytes)
+;	CALL	lcdachk
+;	C:set = Error (match found)
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  Z:set = Match found
+;	    c{EDI} = Offset of DCB
+;	  Z:clr = Not found
+;  EBX and ESI are preserved
+
+lcdachk:CMPL	SS:[EBX], #'LCDA'	;Is this LCDA?
+	JNE	10$.S			;No
+	MOVL	EDI, lcdaccb+ccb_dcbhead ;Yes - get first LCDA DCB
+	TESTL	EDI, EDI
+	JE	8$.S
+4$:	MOVL	EAX, dcb_name+0.B[EDI]	;Does name match?
+	CMPL	SS:[EBX], EAX
+	JNE	6$.S			;No
+	MOVL	EAX, dcb_name+4.B[EDI]
+	CMPL	SS:4.B[EBX], EAX
+	JNE	6$.S
+	MOVL	EAX, dcb_name+8.B[EDI]
+	CMPL	SS:8.B[EBX], EAX
+	JNE	6$.S
+	MOVL	EAX, dcb_name+12t.B[EDI]
+	CMPL	SS:12t.B[EBX], EAX
+	JE	12$.S			;Yes - this is it!
+6$:	MOVL	EDI, dcb_next.B[EDI]	;Not this one - try next
+	TESTL	EDI, EDI
+	JNE	4$.S			;Continue if another
+8$:	INCL	EDI			;No more - clear Z
+10$:	CLC
+12$:	RET
+.PAGE
+	.SBTTL	lcdaaddunit - Class function to add unit
+
+;Here for the CL_ADDUNIT function
+;	c{ES:EDI} = Address of parameter block
+;	CALL	lcdaaddunit
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  c{EAX}  = 0
+
+$$$=!0
+FRM au_unit , 4		;Unit number
+FRM au_ioreg, 4		;Base IO register number
+FRM au_int  , 4		;Interrupt number
+FRM au_dma  , 4		;DMA channel
+au_SIZE=!$$$
+
+;Description block for addunitchar
+
+	DATA
+
+	.MOD	4
+lcdaaublk:
+ DCHARBGN  3, knlDCharValCom##
+ DCHARENT  UNIT , DECV, , 1, 0, 0, lcdaauunit , 0
+ DCHARENT  IOREG, HEXV, , 4, 0, 0, lcdaauioreg, 0
+
+	CODE
+
+lcdaaddunit:
+	ENTER	au_SIZE, 0		;Set up and initialize our stack frame
+	CLRL	EAX
+	DECL	EAX
+	MOVL	au_unit.B[EBP], EAX
+	MOVL	au_ioreg.B[EBP], EAX
+	IFFAULT	6$
+	LFSL	EDX, iorb_buffer2.B[ESI] ;Get address of add-unit
+					 ;  characteristics
+	CALL	knlGiveQel##		;Give up the IORB
+	MOVL	EBX, #lcdaaublk		;Process the characteristics
+	MOVB	AL, #0			;Fail on bad names here
+	CALL	knlAddUnitChar##
+	JNC	8$.S			;If no error
+4$:	CLRL	ECX			;Fail
+	MOVL	EBX, #QSTS$DONE
+	LEAVE
+	TOFORK
+	STC
+	RET
+
+;Here if address error with IORB
+
+	FAULTHDR
+6$:	CALL	knlGiveQel##
+	MOVL	EAX, #ER_ADRER
+	JMP	4$.S
+
+;Here with all parameters processed - make sure we got everything we need
+
+8$:	MOVL	EAX, au_unit.B[EBP]
+	ORL	EAX, au_ioreg.B[EBP]
+	TESTL	EAX, EAX
+	JNS	16$.S			;If have everything
+	MOVL	EAX, #ER_CHARM
+	JMP	4$.S
+
+;Here if LCDA is already defined
+
+12$:	MOVL	EAX, #ER_DUADF
+	JMP	4$.S
+
+;Here if requested physical device is already in use
+
+14$:	MOVL	EAX, #ER_PDADF
+	JMP	4$.S
+
+;Here with all needed characteristics found
+
+16$:	MOVL	EAX, au_unit.B[EBP]	;Get unit number
+	MOVL	EDX, au_ioreg.B[EBP]	;And get IO register number
+	MOVL	EDI, lcdaccb+ccb_dcbhead ;Point to first IBC DCB
+18$:	TESTL	EDI, EDI
+	JE	22$.S			;If no more DCBs
+	CMPB	dcb_punit.B[EDI], AL	;Same unit?
+	JE	12$.S			;Yes - fail
+	CMPL	dcb_lcdaioreg.B[EDI], EDX ;No - same device?
+	JE	14$.S			;Yes - fail
+20$:	MOVL	EDI, [EDI]		;Not this one - try next
+	JMP	18$.S			;Continue
+
+;Here if unit and device are not defined now
+
+22$:
+
+;;;;; CODE GOES HERE TO SEE IF DEVICE EXISTS
+
+
+	JMP	30$.S			;Yes - device exists
+
+24$:	MOVL	EAX, #ER_PDNAV		;No - device does not exist
+26$:	JMP	4$
+
+;Here if error when have exec memory resource
+
+28$:	CALL	knlGiveXRes##		;Give up the exec memory resource
+	JMP	26$.S
+
+;Here if interface exists
+
+30$:	CALL	knlGetXRes##		;Get exec memory resource
+
+
+	MOVL	ECX, #dcb_lcdaSIZE+dcb_cSIZE ;Create a DCB
+	MOVL	EBX, #DS$PHYS|DS$DOUT|DS$DIN
+	MOVL	EDI, #lcdadsp
+	CALL	knlMakeDcb##
+	JC	28$.S
+	MOVL	ESI, #lcdaccb
+	CALL	knlLinkDcb##
+	MOVL	dcb_name+0.B[EDI], #'LCDA' ;Set up device name
+	MOVL	EAX, au_unit.B[EBP]	;Put in unit number
+	MOVB	dcb_punit.B[EDI], AL
+	LEAL	EBX, dcb_name+4.B[EDI]
+	CALL	knlPutDecNmbr##		       ;Store offset of device
+	MOVL	dcb_devchar.B[EDI], #lcdadctbl ;  characteristics table
+	MOVL	EAX, au_ioreg.B[EBP]
+	MOVL	dcb_lcdaioreg.B[EDI], EAX ;Save base IO port address
+	CALL	knlGiveXRes##		;Give up the exec memory resource
+	LEAVE
+	MOVL	ECX, #1
+	MOVL	EBX, #QSTS$DONE
+	TOFORK
+rtnzero:CLRL	EAX			;Return 0
+	RET
+.PAGE
+;Subroutine called by adduchars when "UNIT" characteristic found
+
+lcdaauunit:
+	CMPL	EAX, #99t
+	JAE	6$.S
+	MOVL	au_unit.B[EBP], EAX
+	CLC
+	RET
+
+;Here if bad characteristic value
+
+6$:	MOVL	EAX, #ER_CHARV		;Get error code
+	STC				;Fail
+	RET
+
+;Subroutine called by adduchars when "IOREG" characteristic found
+
+lcdaauioreg:
+	TESTL	EAX, #0FFFFF807h	;Valid register?
+	JNE	6$.S			;No
+	MOVL	au_ioreg.B[EBP], EAX	;Yes - store it
+	RET
+.PAGE
+	.SBTTL	lcdaunitinfo - LCDA class get physical unit information function
+
+;Here for the get physical unit information class function (CL_PUNITS) for the
+;  LCDA class
+;	c{EBX} = Offset of CCB
+;	c{ESI} = Offset of IORB
+;	CALL	lcdcaunitinfo
+;	c{EAX} = Error code
+;	c{EBX} = Status bits
+;	c{ECX} = Item count
+;  A zero count (iorb_count) requests that the number of units only be returned
+;    in qab_amount.  A non-zero count indicates that a buffer is available for
+;    that many unit names (8 characters each, null padded).
+
+lcdaunitinfo:
+	CLRL	ECX
+	MOVL	EBX, #QSTS$DONE
+	MOVL	EAX, #ER_NIYT
+	RET
+.PAGE
+	.SBTTL	sd_open - Open device
+
+;Here for the open device entry
+;	c{EDI} = Offset of DCB
+
+lcdaopen:
+	TESTL	SS:xffCmd##, #O$ODF
+	JNE	10$.S			;If illegal options
+	CMPL	dcb_opencnt.B[EDI], #1.B ;First open?
+	JNE	4$.S			;No
+	CALL	lcdareset		;Reset the display
+4$:	MOVL	EBX, #lcdaioparms	;Process parameters
+	MOVL	ECX, #lcdadvparms
+	IFFAULT	knlRtnAdrEr##
+	LFSL	EDX, SS:xffParm##
+	CALL	knlProcDevParm##
+	JC	10$.S
+	CLRL	EAX			;Return 0
+8$:	RET
+
+;Here if illegal options specified
+
+10$:	MOVL	EAX, #ER_NTFIL
+	STC
+	RET
+.PAGE
+	.SBTTL	sd_close - Close device
+
+;Here for the close device entry
+;	c{ECX} = Close option bits
+;	c{EDI} = Offset of DCB
+;	c{ESI} = Offset of device table entry
+;	CALL	lcdaclose
+;	C:set = Error or not ready
+;	  c{EAX} = Error code (0 means not ready)
+;	C:clr = Normal
+
+lcdaclose:
+	CMPL	dcb_opencnt.B[EDI], #1.B ;Is this last close?
+	JNE	10$.S			;No
+	CALL	lcdareset		;Yes - reset the device
+10$:	CLRL	EAX
+	RET
+.PAGE
+	.SBTTL	sd_inblock - Input block entry
+
+;Here for the input block entry
+;	c{ESI} = Offset of IORB
+;	c{EDI} = Offset of DCB
+;	CALL	lcdainpblk
+;	c{EAX} = Error code
+;	c{EBX} = Status bits
+;	c{ECX} = Amount transfered
+
+lcdainpblk:
+	CRASH	????
+
+.PAGE
+	.SBTTL	sd_outblock - Output block
+
+;Here for the output block entry
+;	c{ESI} = Offset of IORB
+;	c{EDI} = Offset of DCB
+;	CALL	lcdaoutblk
+;	c{EAX} = Error code
+;	c{EBX} = Status bits
+;	c{ECX} = Amount transfered
+
+lcdaoutblk:
+	BTL	ECX, #O%OUT		;Is output allowed?
+	JC	4$.S			;Yes - go on
+	CMPL	iorb_count.B[ESI], #0.B ;No - really doing output?
+	JNE	knlIllOutGQ##		;Yes - fail
+4$:	TOFORK
+	CMPL	iorb_parm.B[ESI], #0.B	;Do we have a parameter list?
+	JE	6$.S			;No
+	IFFAULT	oute6
+	LFSL	EDX, iorb_parm.B[ESI]	;Yes - get address of parameter list
+	MOVL	EBX, #lcdaioparms	;Process parameters
+	MOVL	ECX, #lcdadvparms
+	CALL	knlProcDevParm#
+	JC	oute4.S		;If error
+6$:	MOVL	ECX, iorb_count.B[ESI]	;Get count
+	JREGZ	ECX, outnul		;Finished if 0
+	IFFAULT	oute6
+	LESL	EBX, iorb_buffer1.B[ESI] ;Get address of string
+	CALL	knlGiveQel#		;Give up the IORB
+	CLRL	ESI
+	MOVL	EBP, ECX
+	MOVL	EDX, dcb_lcdaioreg.B[EDI]
+	IFFAULT	oute2
+8$:	MOVB	AH, ES:[EBX]
+	INCL	EBX
+	INCL	EDX			;Point to the status register
+	MOVL	ECX, #1000t		;Don't do this too much!
+10$:	INB	[DX]			;Get the status byte
+	TESTB	AL, #00h		;Is the display ready?
+	LOOP	ECX, 10$
+	DECL	EDX			;Point to the data register
+	MOVB	AL, AH			;Output the data byte
+	OUTB	[DX]
+	DECL	EBP
+	JNE	8$.S
+	CLRL	EAX
+12$:	MOVL	ECX, ESI
+	SUBL	ECX, EBP
+14$:	MOVL	EBX, #QSTS$DONE
+	RET
+
+;Here if address error after the QEL is given up
+
+	FAULTHDR
+oute2:	MOVL	EAX, #ER_ADRER
+	JMP	12$.S
+
+;Here if nothing to output
+
+outnul:	CLRL	EAX
+oute4:	CALL	knlGiveQel#
+	CLRL	ECX
+	JMP	14$.S
+
+;Here if address error before the QEL is given up
+
+	FAULTHDR
+oute6:	MOVL	EAX, #ER_ADRER
+	JMP	oute4.S
+.PAGE
+	.SBTTL	sd_outstring - Output string
+
+;Here for the output string entry
+;	c{ESI} = Offset of IORB
+;	c{EDI} = Offset of DCB
+;	CALL	lcdaoutstr
+;	c{EAX} = Error code
+;	c{EBX} = Status bits
+;	c{ECX} = Amount transfered
+
+lcdaoutstr:
+	BTL	ECX, #O%OUT		;Is output allowed?
+	JC	4$.S			;Yes - go on
+	CMPL	iorb_count.B[ESI], #0.B ;No - really doing output?
+	JNE	knlIllOutGQ##		;Yes - fail
+4$:	TOFORK
+	CMPL	iorb_parm.B[ESI], #0.B	;Do we have a parameter list?
+	JE	6$.S			;No
+	IFFAULT	oute6
+	LFSL	EDX, iorb_parm.B[ESI]	;Yes - get address of parameter list
+	MOVL	EBX, #lcdaioparms	;Process parameters
+	MOVL	ECX, #lcdadvparms
+	CALL	knlProcDevParm#
+	JC	oute4.S			;If error
+6$:	MOVL	ECX, iorb_count.B[ESI]	;Get count
+	JREGZ	ECX, outnul		;Finished if 0
+	IFFAULT	oute6
+	LESL	EBX, iorb_buffer1.B[ESI] ;Get address of string
+	CALL	knlGiveQel#		;Give up the IORB
+	CLRL	ESI
+	MOVL	EBP, ECX
+	MOVL	EDX, dcb_lcdaioreg.B[EDI]
+	IFFAULT	oute2
+8$:	MOVB	AH, ES:[EBX]		;Get next byte
+	CMPB	AH, #0			;End?
+	JE	12$.S			;Yes
+	INCL	EBX			;No - advance pointer
+	INCL	EDX			;Point to the status register
+	MOVL	ECX, #1000t		;Don't do this too much!
+10$:	INB	[DX]			;Get the status byte
+	TESTB	AL, #00h		;Is the display ready?
+	LOOP	ECX, 10$
+	DECL	EDX			;Point to the data register
+	MOVB	AL, AH			;Output the data byte
+	OUTB	[DX]
+	DECL	EBP
+	JNE	8$.S
+12$:	CLRL	EAX
+	MOVL	ECX, ESI
+	SUBL	ECX, EBP
+	MOVL	EBX, #QSTS$DONE
+	RET
+.PAGE
+	.SBTTL	lcdaspecial - Special device function for LCD display
+
+;Here for the QFNC_SPECIAL queued IO function for LCDA class devices - Do
+;  special device functions
+;  Value returned depends of function if normal or is negative error code
+;    if error
+
+lcdaspecial:
+	CRASH	????
+.PAGE
+	.SBTTL	lcdaiocurtype- Here for the IOPAR_TRMCURTYPE IO parameter
+
+;Here for the IOPAR_TRMCURTYPE IO parameter - Set or get cursor type
+
+	DPARMHDR  BOTH, HEXV
+lcdaiocurtype:
+	CRASH	???
+
+	.SBTTL	lcdaiocurpos - Here for the IOPAR_TRMCURPOS IO parameter
+
+;Here for the IOPAR_TRMCURPOS IO parameter - Set or get cursor position
+
+	DPARMHDR  BOTH, HEXV
+lcdaiocurpos:
+	CRASH	???
+
+	.SBTTL	lcdaiodisppage - Here for the IOPAR_TRMDISPAGE IO parameter
+
+;Here for the IOPAR_TRMDISPAGE IO parameter - Set or get display page
+
+	DPARMHDR  BOTH, DECV
+lcdaiodisppage:
+	CRASH	???
+.PAGE
+	.SBTTL	lcdareset - Subroutine to reset the LCD display
+
+;Subroutine to reset the LCD display
+;	CALL	lcdareset
+
+lcdareset:
+	CRASH	????
+.PAGE
+	.SBTTL	LCDA interface class driver data
+
+	DATA
+
+	.MOD	4
+lcdaccb:   .BLKB  ccb_SIZE	;LCDA CCB
+lcdadcbnum:.LONG  0
+lcdadcbmax:.LONG  0
+lcdadcblmt:.LONG  0
+
+	LKEEND

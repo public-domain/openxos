@@ -1,0 +1,47 @@
+//------------------------------------------------------------------------
+// XOSSYSP.H
+//
+// Written by: John R. Goltz
+//
+// Edit History:
+// 09/07/92(brn) - Add comment Header
+//
+//------------------------------------------------------------------------
+
+// ++++
+// This software is in the public domain.  It may be freely copied and used
+// for whatever purpose you see fit, including commerical uses.  Anyone
+// modifying this software may claim ownership of the modifications, but not
+// the complete derived code.  It would be appreciated if the authors were
+// told what this software is being used for, but this is not a requirement.
+
+//   THIS SOFTWARE IS PROVIDED BY THE AUTHORS "AS IS" AND ANY EXPRESS OR
+//   IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
+//   OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+//   IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+//   INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+//   BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS
+//   OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+//   ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR
+//   TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
+//   USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+//----
+
+#ifndef _XOSSYSP_H
+#define _XOSSYSP_H
+
+#define SPM_NUMPROC  1
+#define SPM_NUMDBUF  2
+#define SPM_NUMSBUF  3
+#define SPM_NUMDDCB  4
+#define SPM_NUMQEL   5
+#define SPM_NUMTERMS 6
+#define SPM_V86SIZE  7
+#define SPM_AHEADMAX 8
+#define SPM_DEFERMAX 9
+#define SPM_DSKWLMT  10
+#define SPM_LIMPROC  11
+#define SPM_SYSSTATE 12
+#define SPM_HIGHDMA  13
+
+#endif	/* _XOSSYSP_H_ */

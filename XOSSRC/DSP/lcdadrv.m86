@@ -1,0 +1,1230 @@
+	.TITLE	LCDADRV - Loadable driver for Optrex LCD display
+
+;++++
+; This software is in the public domain.  It may be freely copied and used
+; for whatever purpose you see fit, including commerical uses.  Anyone
+; modifying this software may claim ownership of the modifications, but not
+; the complete derived code.  It would be appreciated if the authors were
+; told what this software is being used for, but this is not a requirement.
+
+;   THIS SOFTWARE IS PROVIDED BY THE AUTHORS "AS IS" AND ANY EXPRESS OR
+;   IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
+;   OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+;   IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+;   INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+;   BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS
+;   OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+;   ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR
+;   TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
+;   USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+;----
+
+;This driver supports Optrex LCD displays which use the Toshiba T6963 LCD
+;  controller chip.  Almost all of the screen parameters for this display
+;  are fixed.  The number of vertical and horizontal pixels are fixed for
+;  each display type.  The height of a character is fixed at 8 scan lines
+;  for all displays.  The width of a character can be set to either 6 or
+;  8 pixels.  This driver does NOT support character attributes.  It also
+;  does not support simultanous display of text and graphics but DOES support
+;  a pure graphics mode.  This display is not memory mapped.  In graphics
+;  mode, data is required to be formated with 1 pixel per byte and is output
+;  using the standard output functions.  The output data is packed by the
+;  driver.  Input from the display memory is NOT supported.  This device is
+;  supported as a full console device with an associated keyboard.
+
+;The display interface uses three IO registers as follows:
+;	Offset    Read         Write
+;	0000h     Input data    Output data
+;	0001h     Status        Command
+;	1000h     Reserved      configuration
+;  Normally, the display is configured with a base address of 358h
+
+;The data, status, and command regsiters are simply the T6963C registers.  The
+;  configuration register bits are assigned as follows:
+;	Bit    Description
+;	0      Font width selection (0 = 8 pixels, 1 = 6 pixels)
+;	1-6    Reserved, must be set to 0
+;	7      Reset (0 = reset, 1 = normal operation)
+;  To reset the display, bit 7 is set to 0 for at least 10 usec.  It must be
+;  set to 1 by the software for normal operation.  If it is left set to 0
+;  for a signficiant time (several seconds or more), the display may be
+;  damanged!
+
+	.PROC	80486
+	.INCLUD	XOSINC:\XMAC\XOS.PAR
+	.INCLUD	XOSINC:\XMAC\XOSX.PAR
+	.INCLUD	XOSINC:\XMAC\XOSERR.PAR
+	.INCLUD	XOSINC:\XMAC\XOSDOS.PAR
+	.INCLUD	XOSINC:\XMAC\XOSTRM.PAR
+	.INCLUD	XOSINC:\XMAC\XOSXTRM.PAR
+	.INCLUD	XOSINC:\XMAC\PCAT.PAR
+	.INCLUD	XOSINC:\XMAC\XOSLKE.PAR
+	.INCLUD	XOSINC:\XMAC\XOSXLKE.PAR
+	.INCLUD XOSINC:\XMAC\XOSXT6963C.PAR
+
+MAJV   =!1t
+MINV   =!0t
+EDITNUM=!0t
+
+	LKEHEAD	LCDADRV, MAJV, MINV, EDITNUM, LKETYPE_DEVICE
+
+	CODE
+
+	.SBTTL	lcdadsp - LCDA device driver dispatch table
+
+;LCDA device driver dispatch table
+
+lcdadspbgn:
+	.LONG	knlIFnDev##	;tf_ggetcurpos= -68  - Get graphics cursor
+				;			 postion
+	.LONG	knlIFnDev##	;tf_gsetcurpos= -64  - Set graphics cursor
+				;			 positon
+	.LONG	knlIFnDev##	;tf_gsetcurcol= -60  - Set graphics cursor
+				;			 colors
+	.LONG	knlIFnDev##	;tf_gsetcurpat= -56  - Set graphics cursor
+				;			 pattern
+	.LONG	knlRtnZero##	;tf_setgvf    = -52. - Set graphics vert. freq.
+	.LONG	knlRtnZero##	;tf_getgvf    = -48. - Get graphics vert. freq.
+	.LONG	knlIFnDev##	;tf_virtacs   = -44. - Access to virtual page
+	.LONG	knlRtnZero##	;tf_enable    = -40. - Enable video
+	.LONG	knlRtnZero##	;tf_disable   = -36. - Disable video
+	.LONG	lcdacurtype	;tf_curtype   = -32. - Get/set cursor type (INT
+				;			 10, function 01)
+	.LONG	lcdacurpos	;tf_curpos    = -28. - Get/set cursor position
+				;			 (INT 10, function 02)
+	.LONG	lcdadsppage	;tf_dsppage   = -24. - Set display page (INT 10,
+				;			 function 05)
+	.LONG	lcdascroll	;tf_scroll    = -20. - Scroll window (INT 10,
+				;			 functions 06 and 07)
+	.LONG	knlIFnDev##	;tf_getatc    = -16. - Get attribute and char.
+				;			 (INT 10, function 08)
+	.LONG	lcdachr		;tf_setatc    = -12. - Set attribute and char.
+				;			 (INT 10, function 09)
+	.LONG	lcdachr		;tf_setchr    =  -8. - Set character only (INT
+				;			 10, function 0A)
+	.LONG	knlIFnDev##	;tf_attrib    =  -4. - Get or set attributes
+lcdadsp:.LONG	knlRtnZero##	;tf_transfer  =   0. - Transfer device
+	.LONG	knlRtnZero##	;tf_opena     =   4. - Open additional
+	.LONG	xosconOpen1##	;tf_open1     =   8. - Open first time
+	.LONG	ret002		;tf_stop      =  12. - Stop output
+	.LONG	ret002		;tf_clrout    =  16. - Clear output buffer
+	.LONG	xosconEchChr##	;tf_echchr    =  20. - Echo character
+	.LONG	xosconOutChr##	;tf_doutchr   =  24. - Direct output character
+	.LONG	lcdaoutblk	;tf_doutblk   =  28. - Direct output block
+	.LONG	xosconOutStr##	;tf_doutstr   =  32. - Direct output string
+	.LONG	knlIFnDev##	;tf_qoutchr   =  36. - Queued output character
+	.LONG	knlIFnDev##	;tf_qoutblk   =  40. - Queued output block
+	.LONG	knlIFnDev##	;tf_qoutstr   =  44. - Queued output string
+	.LONG	knlRtnZero##	;tf_idle      =  48. - Set to idle state
+	.LONG	knlTrmDoEcho##	;tf_resume    =  52. - Resume output
+	.LONG	knlIFnDev##	;tf_mapscn    =  56. - Map screen buffer
+	.LONG	knlRtnZero##	;tf_dosset    =  60. - Set up terminal for DOS
+	.LONG	knlRtnZero##	;tf_dosupd    =  64. - Update page 0 for DOS
+	.LONG	knlRtnZero##	;tf_dosuse    =  68. - Use data on DOS page 0
+	.LONG	lcdadspmode	;tf_dspmode   =  72. - Get or set display mode
+	.LONG	lcdaaddunit	;tf_addunit   =  76. - Add unit
+	.LONG	knlIFnDev##	;tf_ssread    =  80. - Screen symbiont read
+	.LONG	knlIFnDev##	;tf_sswrite   =  84. - Screen symbiont write
+	.LONG	knlIFnDev##	;tf_ssswitch  =  88. - Screen symbiont switch
+	.LONG	knlIFnDev##	;tf_ssdone    =  92. - Screen symbiont done
+	.LONG	knlIFnDev##	;tf_ssopnalm  =  96. - Open alarm window
+	.LONG	knlIFnDev##	;tf_sswrtalm  = 100. - Write to alarm window
+	.LONG	knlIFnDev##	;tf_ssclsalm  = 104. - Close alarm window
+	.LONG	knlIFnDev##	;tf_ssstatus  = 108. - Report screen status to
+				;			 screen symbiont
+	.LONG	knlIFnDev##	;tf_ssgetmod  = 112. - Get display page modified
+				;			 bits
+	.LONG	lcdadspcur	;tf_dspcur    = 116. - Display cursor on screen
+	.LONG	knlRtnZero##	;tf_updpgb    = 120. - Update page changed bytes
+	.LONG	ret002		;tf_setdtr    = 124. - Set or clear DTR output
+	.LONG	ret002		;tf_setrts    = 128. - Set or clear RTS output
+	.LONG	ret002		;tf_getdsb    = 132. - Get data set bits
+	.LONG	ret002		;tf_finout    = 136. - Ensure output is finished
+	.LONG	ret002		;tf_imodechng = 140. - Input mode change
+	.LONG	ret002		;tf_omodechng = 144. - Output mode change
+LCDADSPSIZE=!{$-lcdadspbgn}/4
+.PAGE
+	.SBTTL	lcdainit - LCDA driver initialization routine
+
+	INITSUB	lcdainit
+
+	DATA
+
+	.MOD	4
+lcdainitblk:					;Characteristics description
+ DCHARBGN  1, knlDCharValCom##			;  block for initialization
+ DCHARENT  BOOT  , DECV, , 4, 0, 0              , initboot, 0
+ DCHARENT  RESULT, STR , , 0, 0, knlGetDcNullS##, 0       , 0
+
+	ONCE
+
+lcdainit:
+	PUSHL	FS
+	PUSHL	EDX
+	MOVL	EBX, #'LCDA'		;Register this as a terminal driver
+	MOVL	EDX, #lcdadsp
+	CALL	knlTrmNewDriver##
+	POPL	EDX
+	POPL	FS
+	JC	6$.S			;If error
+	TESTL	EDX, EDX		;OK - have a characteristics list?
+	JE	2$.S			;No
+	MOVL	EBX, #lcdainitblk	;Yes - point to characteristics table
+	CALL	knlAddUnitChar##	;Process characteristics
+	JC	10$.S			;If error
+2$:	CLRL	EAX			;OK
+	CLRL	EDX
+	MOVL	ECX, #codetop
+6$:	RET
+
+;Here if error after the driver is registered
+
+10$:	CALL	knlTrmUnlinkDriver##	;Unlink the driver
+	STC				;Return failure
+	RET
+.PAGE
+lcdachar:
+	DCHAR	UNIT   , SET, DECV, 1
+	.BYTE	0
+	DCHAR	TYPE   , SET, TEXT, 4
+	.ASCII	'LCDA'
+	DCHAR	IOREG  , SET, HEXV, 2
+	.WORD	358h
+	DCHAR	KBIOREG, SET, HEXV, 2
+	.WORD	4358h
+	.BYTE	0
+LCDACHARSZ=!{{$-lcdachar}+3}&{~3}
+
+;Here for the BOOT characteristic
+
+$$$=!0
+FRM iboot_char, LCDACHARSZ
+iboot_SIZE=!$$$
+
+initboot:
+	ENTER	iboot_SIZE, 0
+	LEAL	EDI, iboot_char.B[EBP]	;Copy the characteristics list to our
+	PUSHL	SS			;  stack frame
+	POPL	ES
+	MOVL	ESI, #lcdachar
+	MOVL	ECX, #LCDACHARSZ/4
+	CLD
+	RMOVSL	[EDI], CS:[ESI]
+	CALL	knlGetQelClr##
+	JC	4$.S
+	LEAL	EAX, iboot_char.B[EBP]
+	MOVL	iorb_buffer2+0.B[ESI], EAX
+	MOVW	iorb_buffer2+4.B[ESI], SS
+	MOVL	EAX, knlTrmCcb##+ccb_fdsp
+	CALLI	CS:CF_ADDUNIT-8.B[EAX]
+	FROMFORK
+	BTL	EAX, #31t
+4$:	LEAVE
+	RET
+
+	CODE
+.PAGE
+	.SBTTL	lcdaaddunit - Subroutine to add LCD display unit
+
+;Subroutine to add LCD display unit
+;	c(AL) = Unit number
+;	CALL	lcdaaddunit
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+
+$$$=!0
+FRM au_xres   , 1t	;Non-zero if allocated exec memory resource here
+FRM au_unit   , 1t	;Unit number
+FRM           , 2t
+FRM au_ioreg  , 4t	;Display base IO register number
+FRM au_vert   , 4t	;Vertical size (pixels)
+FRM au_horiz  , 4t	;Horizontal size (pixels)
+FRM au_kbtype , 4t	;Keyboard driver type name
+FRM au_kbioreg, 4t	;Keyboard base IO register number
+au_SIZE=!$$$
+
+;Description block for addunitchar
+
+	DATA
+
+	.MOD	4
+lcdaaublk:
+ DCHARBGN  2, knlDCharValCom##
+ DCHARENT  UNIT   , DECV, , 4, 0, 0, retclc       , 0
+ DCHARENT  TYPE   , TEXT, , 4, 0, 0, retclc       , 0
+ DCHARENT  HORIZ  , DECV, , 4, 0, 0, lcdaauhoriz  , 0
+ DCHARENT  VERT   , DECV, , 4, 0, 0, lcdaauvert   , 0
+ DCHARENT  KBTYPE , TEXT, , 4, 0, 0, lcdaaukbtype , 0
+ DCHARENT  IOREG  , HEXV, , 4, 0, 0, lcdaauioreg  , 0
+ DCHARENT  KBIOREG, HEXV, , 4, 0, 0, lcdaaukbioreg, 0
+
+stdtype:.ASCIZ	"Generic"
+
+	CODE
+
+lcdaaddunit:
+	ENTER	au_SIZE, 0		;Allocate our stack frame
+	MOVB	au_unit.B[EBP], AL	;Store unit number
+	CLRL	EAX
+	MOVB	au_xres.B[EBP], AL
+	DECL	EAX
+	MOVL	au_ioreg.B[EBP], EAX	;Store illegal value for register number
+	MOVL	au_vert.B[EBP], #64t	;Store default VERT and HORIZ values
+	MOVL	au_horiz.B[EBP], #240t
+	MOVL	au_kbtype.B[EBP], #'KPDA' ;Store default keyboard driver type					  ;  name
+	MOVL	EBX, #lcdaaublk		;Point to our description block
+	MOVB	AL, #0			;Fail if bad name
+	CALL	knlAddUnitChar##
+	JC	6$.S			;If error
+	CMPL	au_ioreg.B[EBP], #-1.B	;Was an IO register specified?
+	JNE	12$.S			;Yes - go on
+	MOVL	EAX, #ER_CHARM		;No - say parameter missing
+6$:	MOVL	EBX, #QSTS$DONE
+	CLRL	ECX
+	LEAVE
+	TOFORK
+	STC
+	RET
+
+;Here if error with the exec memory resource
+
+10$:	CALL	knlGiveXRes##
+	JMP	6$.S
+
+;Here if an IO register was specified (Note that we don't check for the
+;  existance of the device - there really is no way to do this!)
+
+12$:	MOVL	EAX, SS			;Do we have the exec memory resource?
+	CMPW	knlXResPda##, AX
+	JE	14$.S			;Yes
+	CALL	knlGetXRes##		;No - get it resource now
+	MOVB	au_xres.B[EBP], #1	;Remember we need to give it up
+14$:	MOVB	AL, au_unit.B[EBP]	;Get unit number
+	MOVB	AH, #0			;No keyboard interrupt number
+	MOVL	EBX, #'LCDA'		;Get type name for console driver
+	MOVL	ECX, au_kbtype.B[EBP]	;Get type name for keyboard driver
+	MOVL	ESI, au_kbioreg.B[EBP]	;Get keyboard base IO register
+	CALL	xosconMakeDhdb##	;Create the DHDB
+	JC	10$.S			;If error
+	MOVL	dhdb_dispname.B[EDI], #stdtype
+	MOVL	EAX, #{60t<16t}+60t
+	MOVB	DH, #1
+	MOVL	ECX, #tdb_lcdaSIZE	;Get size for a TDB
+	CALL	xosconMakeTdb##		;Make the TDB
+	JC	10$			;If error
+	MOVL	EAX, #DISP_LCD|DISP$FLAT
+	MOVL	dhdb_disptype.B[EDI], EAX
+	MOVL	tdb_disptype.B[ESI], EAX
+	MOVL	dhdb_curtdb.B[EDI], ESI	;This is the "active" TDB
+	MOVL	tdb_ddisp.B[ESI], #lcdadsp ;Store offset of console function
+					   ;  dispatch table
+	MOVL	tdb_dspchr.B[ESI], #lcdachr ;Store offset of character
+	MOVL	EAX, au_horiz.B[EBP]	    ;  output routine
+	MOVL	tdb_horiz[ESI], EAX	;Store the screen parameters
+	MOVL	EAX, au_vert.B[EBP]
+	MOVL	tdb_vert[ESI], EAX
+	SHRL	EAX, #3t
+	MOVL	tdb_rows[ESI], EAX
+	MOVL	EDX, au_ioreg.B[EBP]	;Store base IO register number
+	MOVL	tdb_bioreg[ESI], EDX
+	MOVL	dhdb_bioreg.B[EDI], EDX
+	ADDB	DH, #10h		;Point to the configuration register
+	MOVB	AL, #0			;Reset the display
+	OUTB	[DX]
+	MOVL	ECX, #15t
+	CALL	knlSDelay##
+	MOVB	AL, #80h
+	OUTB	[DX]
+	MOVL	EAX, #DM_TEXT+DM$NOCLEAR
+	TOFORK
+	CALL	lcdadspmode		;Set up parameters for default mode
+	FROMFORK
+	MOVL	EAX, #DM_SETBASE	;Set up the base parameters
+	CALL	xosconChkBiosMd##
+	MOVB	tdb_ifdsp.B[ESI], #0	;Indicate can not do queued output
+	CMPB	au_xres.B[EBP], #0
+	JE	20$.S
+	CALL	knlGiveXRes##		;Give up the exec memory resource
+20$:	POPL	ECX			;Get our return value
+	CLRL	EAX
+	MOVL	EBX, #QSTS$DONE
+	LEAVE
+	TOFORK
+	RET
+.PAGE
+;Subroutine called by addunitchar for the "KBTYPE" characteristic
+
+lcdaaukbtype:
+	MOVL	au_kbtype.B[EBP], EAX
+	CLC
+	RET
+
+;Subroutine called by addunitchar for the "IOREG" characteristic
+
+lcdaauioreg:
+	CMPL	EAX, #100h		;Reasonable value?
+	JB	4$.S			;No
+	TESTL	EAX, #0FFFE007h		;Maybe
+4$:	JNE	knlBadCharV##		;No
+	MOVL	au_ioreg.B[EBP], EAX	;OK - store value
+retclc:	CLC
+	RET
+
+;Subroutine called by addunitchar for the "KBIOREG" characteristic
+
+lcdaaukbioreg:
+	CMPL	EAX, #100h		;Reasonable value?
+	JB	4$.S			;No
+10$:	MOVL	au_kbioreg.B[EBP], EAX	;Store value
+	CLC
+ret002:	RET
+
+;Subroutine called by addunitchar for the "HORIZ" characteristic
+
+lcdaauhoriz:
+	MOVL	au_horiz.B[EBP], EAX	;Store value
+	CLC
+	RET
+
+;Subroutine called by addunitchar for the "VERT" characteristic
+
+lcdaauvert:
+	MOVL	au_vert.B[EBP], EAX	;Store value
+	CLC
+	RET
+.PAGE
+	.SBTTL	lcdadisable - Subroutine to disable the screen
+
+;Subroutine to disable the screen
+;	c{EDI} = Offset of DHDB
+;	c{ESI} = Offset of TDB
+;	CALL	lcdadisable
+
+lcdadisable:
+	RET
+
+	.SBTTL	lcdaenable - Subroutine to enable the screen
+
+;Subroutine to enable the screen
+;	c{EDI} = Offset of DHDB
+;	c{ESI} = Offset of TDB
+;	CALL	lcdaenable
+
+lcdaenable:
+	RET
+.PAGE
+	.SBTTL	lcdadspmode - Function to get and set display mode
+
+;Function to get and set display mode
+;	c{EAX}    = Display mode bits
+;	c{ES:EBX} = Address of data block
+;	CALL	lcdadspmode
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  c{EAX} = Current display mode
+;  Stack frame offsets are defined in XOSXTRM.PAR
+
+;Since our display screen has a fixed size and resolution, we ignore most
+;  of the mode data.  The only display parameter we can change is the number
+;  of character columns, and we are limited to the two values that result
+;  from using a 6 or 8 pixel wide character cell.  The only other thing we
+;  can set is the display mode.  This display works differently from the VGA
+;  in that text and graphics modes can coexist, with the data from the text
+;  and graphics "screens" combined on the actual display screen.
+
+;About the only thing we look at is the basic display  mode (text or graphics).
+
+4$:	LEAVE
+	RET
+
+lcdadspmode:
+	ENTER	dm_SIZE, 0
+	CALL	xosconChkBiosMd##	;Convert BIOS mode requests
+	JC	4$.S			;If error
+	MOVL	adm_bits.B[EBP], EAX
+	MOVL	adm_dataadr+0.B[EBP], EBX ;Store address of caller's data block
+	MOVL	adm_dataadr+4.B[EBP], ES
+	CMPB	AL, #0			;Changing the mode?
+	JE	24$			;No - just return the current values
+	PUSHL	ESI			;Yes - copy new data values
+	PUSHL	EDI
+	MOVL	ESI, EDX
+	LEAL	EDI, adm_dv.B[EBP]
+	PUSHL	SS
+	POPL	ES
+	CLD
+	MOVL	ECX, #5
+	IFFAULT	knlRtnAdrErLv##
+	RMOVSL	[EDI], FS:[ESI]
+	POPL	EDI
+	POPL	ESI
+	CMPB	AL, #DM_TEXT		;Valid mode?
+	JE	6$.S			;Yes
+	CMPB	AL, #DM_MONOG		;Maybe
+	JNE	knlBadValueLv##		;No - fail
+6$:	MOVB	tdb_mode[ESI], AL	;Yes - store new mode
+	MOVL	EDX, tdb_bioreg[ESI]	;Point to the data register
+	MOVB	AH, #CMD_MODE1|MODE1_OR
+	CALL	writecmd
+	JC	10$.S
+	MOVB	AH, #CMD_MODE2|MODE2_TEXT|MODE2_CURSOR|MODE2_BLINK ;Assume text
+	CMPB	adm_bits.B[EBP], #DM_TEXT ;Right?
+	JE	8$.S			;Yes
+	MOVB	AH, #CMD_MODE2|MODE2_GRPH ;No - graphics mode
+8$:	CALL	writecmd
+	JC	10$.S
+	MOVB	AH, #0
+	CALL	writedata
+	JC	10$.S
+	MOVB	AH, #0
+	CALL	writedata
+	JC	10$.S
+	MOVB	AH, #CMD_TEXTADDR
+	CALL	writecmd
+10$:	JC	20$.S
+	MOVB	AH, #0
+	CALL	writedata
+	JC	20$.S
+	MOVB	AH, #0
+	CALL	writedata
+	JC	20$.S
+	MOVB	AH, #CMD_GRPHADDR
+	CALL	writecmd
+	JC	20$.S
+	MOVB	BL, #80h		;Assume want an 8-bit character cell
+	MOVL	EAX, tdb_horiz[ESI]
+	CMPB	adm_bits.B[EBP], #DM_TEXT ;Text mode?
+	JNE	16$.S			;No
+	CMPL	adm_dv+dm_columns.B[EBP], #0.B ;Yes - columns value given?
+	JNE	14$.S			;Yes
+	MOVL	adm_dv+dm_columns.B[EBP], #1000t ;No - make it a large value
+14$:	SHRL	EAX, #3t		;Calculate number of columns with an
+					;  8-bit character cell
+	CMPL	adm_dv+dm_columns.B[EBP], EAX ;Want this many or less?
+	JBE	18$.S			;Yes
+	MOVL	EAX, tdb_horiz[ESI]	;No - calculate number of columns with
+	CLRL	EDX			;  a 6-bit character cell
+	IDIVL	lit6
+	MOVB	BL, #81h		;Get corresponding configuration value
+	PUSHL	tdb_rows[ESI]
+	JMP	18$.S
+
+;Here if graphics mode
+
+16$:	SHRL	EAX, #3t		;Get number of columns with an 8-bit
+					;  character cells
+	PUSHL	tdb_vert[ESI]
+18$:	MOVL	tdb_columns[ESI], EAX	;Store number of columns
+	MOVL	EDX, tdb_bioreg[ESI]	;Point to the configuration register
+	ADDB	DH, #10h
+	MOVB	AL, BL
+	OUTB	[DX]			;Output the configuration value
+	SUBB	DH, #10h
+	MOVB	AH, tdb_columns[ESI]	;Give the display the number of
+	CALL	writedata		;  text columns
+20$:	JC	22$.S
+	MOVB	AH, #0
+	CALL	writedata
+	JC	22$.S
+	MOVB	AH, #CMD_TEXTWID
+	CALL	writecmd
+	JC	22$.S
+	MOVB	AH, tdb_columns[ESI]	;Also give it the number of graphios
+	CALL	writedata		;  columns
+	JC	22$.S
+	MOVB	AH, #0
+	CALL	writedata
+	JC	22$.S
+	MOVB	AH, #CMD_GRPHWID
+	CALL	writecmd
+	JC	22$.S
+	POPL	EAX			;Get number of rows (characters or
+					;  pixels)
+	IMULL	EAX, tdb_columns[ESI]	;Times number of character columns
+	MOVL	tdb_pgsize[ESI], EAX	;  gives page size
+	CLRL	EAX			;Set both the access and display pages
+	MOVB	tdb_dsppage[ESI], AL	;  to 0 (the hardware has already been
+	MOVL	tdb_dstart[ESI], EAX	;  set to match this)
+	BTL	adm_bits.B[EBP], #DM%NOCLEAR ;Want to clear the buffer?
+	JC	24$.S			;No
+	MOVL	tdb_curpos+0.B[ESI], EAX ;Yes - reset all cursor positions
+	MOVL	tdb_curpos+4.B[ESI], EAX
+	MOVL	tdb_curpos+8.B[ESI], EAX
+	MOVL	tdb_curpos+12t.B[ESI], EAX
+	CALL	lcdadspcur		;Update cursor on the display
+	JC	22$.S
+	CALL	lcdaclrbfr		;Clear the display buffer
+22$:	JC	30$
+24$:	MOVB	tdb_scntop.B[ESI], #1	;Initlialize the scrolling region to be
+	MOVB	AL, tdb_rows[ESI]	;  the entire screen
+	MOVB	tdb_scnbtm.B[ESI], AL
+	MOVZBL	EAX, tdb_mode[ESI]
+	BTL	adm_bits.B[EBP], #DM%RTNDATA ;Want data values returned?
+	JNC	26$.S			;No
+	LESL	EBX, adm_dataadr.B[EBP]	;Yes - get address of his data block
+	MOVL	EDX, tdb_disptype.B[ESI]
+	IFFAULT	knlRtnAdrErLv##
+	MOVL	ES:dm_disptype.B[EBX], EDX
+	MOVL	EDX, tdb_pgsize[ESI]
+	IFFAULT	knlRtnAdrErLv##
+	MOVL	ES:dm_pagesize.B[EBX], EDX
+	MOVL	EDX, tdb_columns[ESI]
+	IFFAULT	knlRtnAdrErLv##
+	MOVL	ES:dm_columns.B[EBX], EDX
+	MOVZBL	EDX, tdb_rows[ESI]
+	IFFAULT	knlRtnAdrErLv##
+	MOVL	ES:dm_rows.B[EBX], EDX
+	MOVL	EDX, tdb_horiz[ESI]
+	IFFAULT	knlRtnAdrErLv##
+	MOVL	ES:dm_horiz.B[EBX], EDX
+	IFFAULT	knlRtnAdrErLv##
+;;;;;;	MOVL	ES:dm_span.B[EBX], EDX
+	MOVL	EDX, tdb_vert[ESI]
+	IFFAULT	knlRtnAdrErLv##
+	MOVL	ES:dm_vert.B[EBX], EDX
+26$:	TESTB	AH, #DM$BIOSMODE/100h	;Want BIOS value?
+	JE	28$.S			;No
+	CALL	xosconGetBiosMd##	;Yes - get equivalent BIOS mode
+28$:	ANDL	EAX, #~{DM$BIOSMODE|DM$RTNDATA}
+30$:	LEAVE
+	RET
+.PAGE
+	.SBTTL	lcdaoutblk - Function to output a block of bytes
+
+;Function to output a block of bytes - This functions outputs to the graphics
+;  screen if TOM$GRAPHIC is set, otherwise it outputs to the text screen.
+
+lcdaoutblk:
+	CMPB	tdb_mode[ESI], #DM_TEXT ;Text mode?
+	JE	xosconOutBlk##		;Yes - do normal console output
+
+;Here for graphic mode output - In graphic mode the user's data buffer is
+;  formated as 1 byte per pixel.  It is assumed that each byte has a value
+;  of 0 or 1. (Any other value will produce undefined results.)  Output is
+;  packed 8 bites per byte and stored in the graphics buffer starting at
+;  a location specified by the cursor position.  The column number specifies
+;  a the horizontal pixel position divided by 8. The row number, specifies
+;  the vertical pixel position.  This implies that output must start at the
+;  left edge of an 8-bit wide cell, but can start on any pixel line.  Also,
+;  the number of pixels output MUST be evenly divisible by 8.  If it is not,
+;  the amount output is rounded down.
+
+$$$=!0
+FRM out_cnt   , 4t
+FRM out_amount, 4t
+out_SIZE=!$$$
+
+	ENTER	out_SIZE
+	MOVL	out_cnt.B[EBP], ECX
+	PUSHL	EBX
+	MOVZBL	EDX, tdb_dsppage[ESI]	;Get page number
+	MOVZBL	EBX, tdb_curpos+1.B[ESI+EDX*2] ;Get pixel row number
+	IMULL	EBX, tdb_columns[ESI]	;Times length of a row (in characters)
+	MOVZBL	EAX, tdb_curpos+0.B[ESI+EDX*2] ;Get character number
+	ADDL	EBX, EAX		;Add it in
+	IMULL	EDX, tdb_pgsize[ESI]	;Get offset of start of page
+	ADDL	EBX, EDX
+	MOVL	EDX, tdb_bioreg[ESI]	;Point to the data register
+	MOVB	AH, BL			;Set the display data address
+	CALL	writedata
+	JC	2$.S
+	MOVB	AH, BH
+	CALL	writedata
+	JC	2$.S
+	MOVB	AH, #CMD_ADDRESS
+	CALL	writecmd
+	JC	2$.S
+	MOVB	AH, #CMD_AUTOWRT	;Start auto-write
+	CALL	writecmd
+2$:	JC	8$
+	POPL	EBX
+	CLRL	EAX
+	MOVL	out_amount.B[EBP], EAX
+	SHRL	out_cnt.B[EBP], #4t	;Get number of bytes to output
+	IFFAULT	8$
+4$:	MOVB	AH, ES:[EBX]		;Construct one display byte from 8
+	ADDB	AH, AH			;  buffer pixels
+	ORB	AH, ES:2.B[EBX]
+	ADDB	AH, AH
+	ORB	AH, ES:4.B[EBX]
+	ADDB	AH, AH
+	ORB	AH, ES:6.B[EBX]
+	ADDB	AH, AH
+	ORB	AH, ES:8.B[EBX]
+	ADDB	AH, AH
+	ORB	AH, ES:10t.B[EBX]
+	ADDB	AH, AH
+	ORB	AH, ES:12t.B[EBX]
+	ADDB	AH, AH
+	ORB	AH, ES:14t.B[EBX]
+	ADDL	EBX, #16t.B
+	INCL	EDX			;Point to the status register
+	MOVL	ECX, #1500t
+6$:	INB	[DX]			;Wait until display is ready
+	TESTB	AL, #08h
+	LOOPE	ECX, 6$
+	JE	10$.S
+	DECL	EDX			;Point to the data register
+	MOVB	AL, AH
+	NOTB	AL
+	OUTB	[DX]			;Output the byte
+	ADDL	out_amount.B[EBP], #8t.B
+	DECL	out_cnt.B[EBP]		;More to output
+	JNE	4$.S			;Yes - continue
+	MOVB	AH, #CMD_AUTOEND	;No - terminate auto-write mode
+	CALL	writecmd
+	JC	8$.S
+	CLRL	EAX
+	FAULTHDR
+8$:	MOVL	ECX, out_amount.B[EBP]	;Get amount output
+	MOVL	EBX, #QSTS$DONE
+	LEAVE
+	RET
+
+;Here if display did not come ready in a short time
+
+10$:	MOVL	EAX, #ER_NORSP
+	JMP	8$.S
+.PAGE
+	.SBTTL	lcdacurtype - Function to set cursor type (INT 10, function 1)
+
+;Function to set cursor type (INT 10, function 1)
+;	c(CL) = Ending scan line for cursor (0 - 1Fh)
+;	c(CH) = Starting scan line for cursor (0 - 1Fh), bit 5 set to indicate
+;		  invisible cursor, bit 7 set to indicate no cursor emulation
+;		Both c(CL) and c(CH) = 0FFh means don't change type
+;	CALL	lcdacurtype
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  c(AL) = Previous ending line for cursor
+;	  c(AH) = Previous starting scan line for cursor
+;	  High 16 bits of EAX are 0
+
+;  This device always has an ending scan line at the bottom of the character
+;    cell, so we just ignore the ending scan line value!
+;
+
+lcdacurtype:
+	MOVZWL	EAX, tdb_curmode[ESI]	;Get previous value to return
+	CMPW	CX, #0FFFFFFFFh.B	;Want to change value?
+	JE	12$.S			;No - just return value
+	ANDB	CH, #0BFh		;Remove possible junk
+	MOVB	CL, #1Fh		;Force the ending value
+	MOVW	tdb_curmode[ESI], CX
+	ANDB	CH, #~20h
+	BTZL	ECX, #15t		;Want to do cursor emulation?
+	JC	8$.S			;No
+	SHLB	CH, #2
+	CMPB	CH, #1Ch
+	JNE	6$.S
+	MOVB	CH, #1Fh
+6$:	MOVB	DL, tdb_curmode+1[ESI]
+	ANDB	DL, #20h
+	ORB	CH, DL			;Put back the cursor off bit
+	MOVW	tdb_dcurmode[ESI], CX
+8$:	TOFORK	16$.S			;Yes
+	CALL	16$
+	JC	14$.S
+	FROMFORK
+	CLC
+12$:	RET
+
+14$:	FROMFORK
+	STC
+	RET
+
+16$:	PUSHL	EAX
+	MOVB	AH, CH
+	ADDB	CH, #2			;Get value for the hardware
+	SHRB	CH, #2
+	MOVB	AH, CMD_CURSIZE+7
+	SUBB	AH, CH
+	MOVL	EDX, tdb_bioreg[ESI]
+	CALL	writecmd
+	JC	20$.S
+	POPL	EAX			;Get previous value to return
+	CLC
+	RET
+
+;Here if error setting the hardware
+
+20$:	POPL	EDX			;Restore previous value
+	MOVW	tdb_curmode[ESI], DX
+	RET				;Return the error
+.PAGE
+	.SBTTL	lcdacurpos - Func. to set and get cursor pos. (INT 10, func. 02)
+
+;Function to set and get cursor position (INT 10, function 02)
+;	c{EBX} = Page number
+;	c{ECX} = Character number
+;	c{EDX} = Line number
+;	CALL	lcdacurpos
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  c(AL) = Previous character number
+;	  c(AH) = Previous line number
+
+lcdacurpos:
+	REQUIREFORK
+	MOVW	AX, tdb_curpos.B[ESI+EBX*2]
+	CMPL	ECX, #-1.B		;Want to change character position
+	JE	8$.S			;No
+	TESTL	ECX, ECX		;Yes - relative?
+	JNS	6$.S			;No
+	ADDB	tdb_curpos+0.B[ESI+EBX*2], CL ;Yes
+	JMP	8$.S
+
+6$:	MOVB	tdb_curpos+0.B[ESI+EBX*2], CL
+8$:	CMPL	EDX, #-1.B		;Want to change line position?
+	JE	12$.S			;No
+	TESTL	EDX, EDX		;Yes - relative?
+	JNS	10$.S			;No
+	ADDB	tdb_curpos+1.B[ESI+EBX*2], DL ;Yes
+	JMP	12$.S
+
+10$:	MOVB	tdb_curpos+1.B[ESI+EBX*2], DL
+12$:	CMPB	tdb_dsppage[ESI], BL	;Is this for the current page?
+	JNE	16$.S			;No
+	PUSHL	EAX			;Yes
+	CALL	lcdadspcur		;Set value into the hardware
+	POPL	EAX
+16$:	CLC
+20$:	RET
+.PAGE
+	.SBTTL	lcdadsppage - Function to select display page (INT 10, func. 05)
+
+;Function to select display page (INT 10, function 05)
+;	c(BL) = Display page number
+;	c(BH) = Function:
+;		  0 = Change both display and access pages
+;		  1 = Change display page only
+;		  2 = Change access page only
+;	CALL	lcdadsppage
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  c{EAX} = Previous display page number
+;	  High 16 bits of EAX are 0
+
+lcdadsppage:
+	REQUIREFORK
+	CMPB	BL, #7
+2$:	JA	knlBadValue##
+	CMPB	BH, #2
+	JA	2$.S
+	MOVZBL	EDX, tdb_dsppage[ESI]
+	PUSHL	EDX
+	CMPB	BH, #1			;Want to change the access page?
+	JE	4$.S			;No
+	MOVB	tdb_dsppage[ESI], BL	;Yes
+4$:	CMPB	BH, #2			;Want to change the display page?
+	JE	8$.S			;No
+	ANDL	EBX, #07Fh.B		;Yes - calculate display start address
+	IMULL	EBX, tdb_pgsize[ESI]
+	MOVL	tdb_dstart[ESI], EBX
+	MOVL	EDX, tdb_bioreg[ESI]
+	MOVB	AH, BL			;Give the start address to the hardware
+	CALL	writedata
+	MOVB	AH, BH
+	CALL	writedata
+	MOVB	AH, #CMD_TEXTADDR	;Assume text mode
+	CMPB	tdb_mode[ESI], #DM_TEXT ;Right?
+	JE	6$.S			;Yes
+	MOVB	AH, #CMD_GRPHADDR	;No - its graphics mode
+6$:	CALL	writecmd
+8$:	POPL	EAX			;Restore previous value to return
+	CLC
+	RET
+.PAGE
+	.SBTTL	lcdadspcur - Subroutine to set cursor on screen
+
+;Subroutine to set on screen cursor - must be called at fork level
+;	CALL	lcdadspcur
+
+lcdadspcur:
+	PUSHL	EAX			;Save count
+	MOVZBL	EBX, tdb_dsppage[ESI]	;Get page number
+	MOVL	EDX, tdb_bioreg[ESI]
+	MOVB	AH, tdb_curpos+0.B[ESI+EBX*2]
+	CALL	writedata
+	MOVB	AH, tdb_curpos+1.B[ESI+EBX*2]
+	CALL	writedata
+	MOVB	AH, #CMD_CURPOS
+	CALL	writecmd
+	CLC				;Make sure C is clear
+	POPL	EAX			;Restore count
+	RET				;And return
+.PAGE
+	.SBTTL	lcdachr - Subroutine to display character
+
+;Subroutine to display character at cursor position
+;	c(AL)  = Character
+;	c{EBX} = Page number
+;	c(CL)  = Foreground color
+;	c(CH)  = Background color
+;	c(DL)  = Horizontal position
+;	c(DH)  = Vertical position
+;	c{ESI} = Offset of terminal TDB
+;	CALL	lcdachr
+;  EBX is preserved
+
+lcdachr:PUSHL	EBX			;Save page number
+	PUSHL	EDX			;Save position
+	MOVL	ECX, tdb_pgsize[ESI]	;Get page size
+	IMULL	EBX, ECX		;Times page number
+	MOVZBL	EDX, DH			;Get vertical position in page
+	IMULL	EDX, tdb_columns[ESI]
+	ADDL	EBX, EDX
+	POPL	EDX			;Restore position
+	MOVZBL	EDX, DL			;Add in position in line
+	ADDL	EBX, EDX
+	PUSHL	EAX			;Save character
+	MOVL	EDX, tdb_bioreg[ESI]
+	MOVB	AH, BL			;Set the data pointer
+	CALL	writedata
+	MOVB	AH, BH
+	CALL	writedata
+	MOVB	AH, #CMD_ADDRESS
+	CALL	writecmd
+	POPL	EAX			;Restore character
+	POPL	EBX			;Restore page number
+	SUBB	AL, #20h
+	MOVB	AH, AL			;Give the character to the display
+	CALL	writedata
+	MOVB	AH, #CMD_WRITE
+	JMP	writecmd
+.PAGE
+	.SBTTL	lcdascroll - Function to scroll window (INT 10, func. 06 & 07)
+
+;Function to scroll window (INT 10, functions 06 & 07)
+;	c(AL)  = Function: 0 = up, 1 = down, 2 = right, 3 = left
+;	c(BL)  = Page number
+;	c(BH)  = Number of lines to scroll (positive is down, negative is up)
+;	c(CL)  = X coordinate, upper left corner of window
+;	c(CH)  = Y coordinate, upper left corner of window
+;	c(DL)  = X coordinate, lower right corner of window
+;	c(DH)  = Y coordinate, lower right corner of window
+;	c{ESI} = Offset of TDB
+;	CALL	lcdascroll
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  c{EAX} = 0
+
+;THIS VERSION ONLY SUPPORTS SCROLLING UP IN TEXT MODES!
+
+$$$=!0
+FRM sc_length, 4t	;Length of line to scroll
+FRM sc_fline , 4t	;First line in window
+FRM sc_dist  , 4t	;Distance to scroll in character lines
+FRM sc_incr  , 4t	;Amount to incrment pointer (bytes)
+FRM sc_height, 4t	;Height of window
+FRM sc_fill  , 4t	;Fill colors
+FRM sc_offset, 4t	;Screen offset
+FRM sc_cnt1  , 4t
+FRM sc_cnt2  , 4t
+FRM sc_bufr  , 44t
+sc_SIZE=!$$$
+
+gferr:	MOVL	EAX, #ER_FUNCM
+	STC
+	RET
+
+lcdascroll:
+	CMPB	tdb_mode[ESI], #DM_TEXT ;Text mode?
+	JNE	gferr.S			;No - can't do that!
+2$:	CMPB	DL, tdb_columns[ESI]	;Yes - make sure window coordinates
+	JB	4$.S			;  are valid
+	MOVB	DL, tdb_columns[ESI]
+	DECL	EDX
+4$:	CMPB	DH, tdb_rows[ESI]
+	JB	6$.S
+	MOVB	DH, tdb_rows[ESI]
+	DECB	DH
+6$:	CMPB	CL, DL
+	JBE	8$.S
+	MOVB	CL, DL
+8$:	CMPB	CH, DH
+	JBE	10$.S
+	MOVB	CH, DH
+10$:	CMPB	BH, #0			;Clearing window?
+	JNE	12$.S			;No
+	MOVB	AL, #0			;Yes
+	MOVB	BH, DH
+	SUBB	BH, CH
+12$:	CMPB	AL, #0			;Scrolling up?
+	JNE	gferr.S			;No - fail!
+	PUSHL	EDI
+	ENTER	sc_SIZE, 0
+	MOVXBL	EAX, BH			;Store distance to scroll
+	MOVL	sc_dist.B[EBP], EAX
+	IMULL	EAX, tdb_columns[ESI]	;Get amount to increment pointer
+	MOVL	sc_incr.B[EBP], EAX
+	MOVZBL	EAX, CH			;Store first line in window
+	MOVL	sc_fline.B[EBP], EAX
+	MOVZBL	EDI, DH			;Store height of window
+	SUBL	EDI, EAX
+	INCL	EDI
+	MOVL	sc_height.B[EBP], EDI
+	MOVZBL	EBX, BL			;Get page number
+	CMPB	BL, #8t.B		;Valid page number?
+	JB	14$.S			;Yes
+	MOVB	BL, #0			;No - use page 0!
+14$:	IMULL	EBX, tdb_pgsize[ESI]	;Get offset in display buffer
+	MOVZBL	EAX, CL			;Get distance to left side of window
+	ADDL	EBX, EAX		;Add into offset
+	MOVL	sc_offset.B[EBP], EBX
+	MOVZBL	ECX, DL			;Get distance to right side of window
+	SUBL	ECX, EAX		;Calculate width of window
+	INCL	ECX
+	MOVL	sc_length.B[EBP], ECX
+	MOVL	EAX, sc_height.B[EBP]
+	SUBL	EAX, sc_dist.B[EBP]
+	JLE	40$
+	MOVL	sc_cnt2.B[EBP], EAX
+	MOVL	EDX, tdb_bioreg[ESI]	;Point to the data register
+20$:	MOVL	EAX, sc_offset.B[EBP]
+	ADDL	EAX, sc_incr.B[EBP]
+	PUSHL	EAX
+	MOVB	AH, AL
+	CALL	writedata
+	JC	28$.S
+	POPL	EAX
+	CALL	writedata
+	JC	28$.S
+	MOVB	AH, #CMD_ADDRESS
+	CALL	writecmd
+	JC	28$.S
+	MOVB	AH, #CMD_AUTOREAD	;Start auto-read
+	CALL	writecmd
+	JC	28$.S
+	LEAL	EDI, sc_bufr.B[EBP]
+	MOVL	EAX, sc_length.B[EBP]
+	MOVL	sc_cnt1.B[EBP], EAX
+22$:	INCL	EDX			;Point to the status register
+	MOVL	ECX, #1500t
+24$:	INB	[DX]			;Wait until display is ready
+	TESTB	AL, #04h
+	LOOPE	CX, 24$
+	JE	36$.S
+	DECW	DX			;Point to the data register
+	INB	[DX]
+	MOVB	SS:[EDI], AL
+	INCL	EDI
+	DECL	sc_cnt1.B[EBP]
+	JNE	22$.S
+	INCL	EDX			;Point to the status register
+	MOVL	ECX, #1500t
+26$:	INB	[DX]			;Wait until display is ready
+	TESTB	AL, #04h
+	LOOPE	ECX, 26$
+	JE	36$.S
+	DECL	EDX			;Point to the data register
+	MOVB	AH, #CMD_AUTOEND	;Terminate auto-read mode
+	CALL	writecmd
+28$:	JC	38$.S
+	MOVB	AH, sc_offset+0.B[EBP]
+	CALL	writedata
+	JC	38$.S
+	MOVB	AH, sc_offset+1.B[EBP]
+	CALL	writedata
+	JC	38$.S
+	MOVB	AH, #CMD_ADDRESS
+	CALL	writecmd
+	JC	38$.S
+	MOVB	AH, #CMD_AUTOWRT	;Start auto-write
+	CALL	writecmd
+	JC	38$.S
+	LEAL	EDI, sc_bufr.B[EBP]
+	MOVL	EAX, sc_length.B[EBP]
+	MOVL	sc_cnt1.B[EBP], EAX
+30$:	INCL	EDX			;Point to the status register
+	MOVL	ECX, #1500t
+32$:	INB	[DX]			;Wait until display is ready
+	TESTB	AL, #08h
+	LOOPE	ECX, 32$
+	JE	36$.S
+	DECL	EDX			;Point to the data register
+	MOVB	AL, SS:[EDI]
+	OUTB	[DX]
+	INCL	EDI
+	DECL	sc_cnt1.B[EBP]
+	JNE	30$.S
+	INCL	EDX			;Point to the status register
+	MOVL	ECX, #1500t
+34$:	INB	[DX]			;Wait until display is ready
+	TESTB	AL, #08h
+	LOOPE	ECX, 34$
+36$:	JE	46$.S
+	DECL	EDX			;Point to the data register
+	MOVB	AH, #CMD_AUTOEND	;Terminate auto-write mode
+	CALL	writecmd
+38$:	JC	baddisp.S
+	MOVL	EAX, tdb_columns[ESI]
+	ADDL	sc_offset.B[EBP], EAX
+	DECL	sc_cnt2.B[EBP]		;More to scroll?
+	JNE	20$
+
+;Here with N - M lines moved up M lines - now fill the last M lines with blanks
+
+40$:	MOVB	AH, sc_offset+0.B[EBP]
+	CALL	writedata
+	MOVB	AH, sc_offset+1.B[EBP]
+	CALL	writedata
+	JC	baddisp.S
+	MOVB	AH, #CMD_ADDRESS
+	CALL	writecmd
+	JC	baddisp.S
+	MOVB	AH, #CMD_AUTOWRT	;Start auto-write
+	CALL	writecmd
+	JC	baddisp.S
+	MOVL	EAX, sc_length.B[EBP]
+	MOVL	sc_cnt1.B[EBP], EAX
+42$:	INCL	EDX			;Point to the status register
+	MOVL	ECX, #1500t
+44$:	INB	[DX]			;Wait until display is ready
+	TESTB	AL, #08h
+	LOOPE	ECX, 44$
+46$:	JE	baddisp.S
+	DECL	EDX			;Point to the data register
+	MOVB	AL, #0
+	OUTB	[DX]
+	DECL	sc_cnt1.B[EBP]
+	JNE	42$.S
+	INCL	EDX			;Point to the status register
+	MOVL	ECX, #1500t
+48$:	INB	[DX]			;Wait until display is ready
+	TESTB	AL, #08h
+	LOOPE	ECX, 48$
+	JE	baddisp.S
+	DECL	EDX			;Point to the data register
+	MOVB	AH, #CMD_AUTOEND	;Terminate auto-write mode
+	CALL	writecmd
+	JC	baddisp.S
+	MOVL	EAX, tdb_columns[ESI]
+	ADDL	sc_offset.B[EBP], EAX
+	DECL	sc_dist.B[EBP]		;More to clear?
+	JNE	40$.S
+	LEAVE
+	POPL	EDI
+	RET
+
+;Here if error
+
+baddisp:MOVL	EAX, #ER_NORSP
+	LEAVE
+	POPL	EDI
+	STC
+	RET
+
+
+.PAGE
+	.SBTTL	lcdaclrbfr - Subroutine to clear entire display buffer
+
+;Subroutine to clear entire display buffer
+;	c{EDX} = Data register number
+;	c{ESI} = Offset of TDB for terminal
+;	CALL	lcdaclrbfr
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+
+;Unlike the VGA screen clear routine, this routine does not use a clear list.
+;  It simply clears the entire screen, clearing all but the character generator
+;  area.
+
+lcdaclrbfr:
+	MOVB	AH, #0			;Set the address pointer to 0
+	CALL	writedata
+	MOVB	AH, #0
+	CALL	writedata
+	MOVB	AH, #CMD_ADDRESS
+	CALL	writecmd
+	MOVB	AH, #CMD_AUTOWRT	;Set auto-write mode
+	CALL	writecmd
+	MOVL	EBX, #1800h		;Get number of bytes to clear
+4$:	INCL	EDX
+	MOVL	ECX, #1500t
+6$:	INB	[DX]
+	TESTB	AL, #08h
+	LOOPE	ECX, 6$
+	JE	10$.S
+	DECL	EDX
+	MOVB	AL, #0			;Clear a byte
+	OUTB	[DX]
+	DECL	EBX			;More to clear?
+	JNE	4$.S			;Yes - continue
+	MOVB	AH, #CMD_AUTOEND	;No - terminate auto-write mode
+	JMP	writecmd
+
+;Here if interface did not come ready in a short time
+
+10$:	MOVL	EAX, #ER_NORSP
+	STC
+	RET
+.PAGE
+	.SBTTL	writedata - Subroutine to output data byte to display
+
+;Subrouitne to output a data byte to the display controller
+;	c(AH)  = Value to output
+;	c{EDX} = Data register
+;	CALL	writedata
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	EDX always unchanged
+
+writedata:
+	INCL	EDX			;Point to commmand/status register
+	MOVL	ECX, #1500h		;Don't do this too much
+4$:	INB	[DX]			;Get status
+	NOTB	AL
+	TESTB	AL, #03h
+	LOOPNE	ECX, 4$			;Wait if not ready
+	JNE	6$.S			;If timed out
+	DECL	EDX			;Point to the data register
+	MOVB	AL, AH			;Get the value
+	OUTB	[DX]			;Output it
+	RET
+
+;Here if controller did not come ready in a short time
+
+6$:	MOVL	EAX, #ER_NORSP
+	STC
+	RET
+
+	.SBTTL	writecmd - Subroutine to output command byte to display
+
+;Subrouitne to output a command byte to the display controller
+;	c(AH)  = Value to output
+;	c{EDX} = Data register
+;	CALL	writecmd
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	EDX always unchanged
+
+writecmd:
+	INCL	EDX			;Point to command/status register
+	MOVL	ECX, #1500h		;Dont do this too much
+10$:	INB	[DX]			;Get status
+	NOTB	AL
+	TESTB	AL, #03h
+	LOOPNE	ECX, 10$		;Wait if not ready
+	JNE	6$.S			;If timed out
+	MOVB	AL, AH			;Get the value
+	OUTB	[DX]			;Output it as a command
+	DECL	EDX			;Point to the data register
+	RET
+.PAGE
+	.SBTTL	Data
+
+	DATA
+
+lit6:	.LONG	6t
+
+	LKEEND

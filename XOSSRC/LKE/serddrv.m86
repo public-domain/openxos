@@ -1,0 +1,1992 @@
+  	.TITLE	SERDDRV - RocketPort device driver (terminal class device)
+
+;++++
+; This software is in the public domain.  It may be freely copied and used
+; for whatever purpose you see fit, including commerical uses.  Anyone
+; modifying this software may claim ownership of the modifications, but not
+; the complete derived code.  It would be appreciated if the authors were
+; told what this software is being used for, but this is not a requirement.
+
+;   THIS SOFTWARE IS PROVIDED BY THE AUTHORS "AS IS" AND ANY EXPRESS OR
+;   IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
+;   OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+;   IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+;   INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+;   BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS
+;   OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+;   ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR
+;   TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
+;   USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+;----
+
+	.PROC	80486
+	.INCLUD	XOSINC:\XMAC\XOS.PAR
+	.INCLUD	XOSINC:\XMAC\XOSX.PAR
+	.INCLUD	XOSINC:\XMAC\XOSTIME.PAR
+	.INCLUD	XOSINC:\XMAC\XOSERR.PAR
+	.INCLUD	XOSINC:\XMAC\XOSTRM.PAR
+	.INCLUD	XOSINC:\XMAC\XOSXTRM.PAR
+	.INCLUD	XOSINC:\XMAC\PCAT.PAR
+	.INCLUD	XOSINC:\XMAC\XOSLKE.PAR
+	.INCLUD	XOSINC:\XMAC\XOSXLKE.PAR
+	.INCLUD	SERD.PAR
+
+MAJV   =!1t
+MINV   =!0t
+EDITNUM=!3t
+
+;v1.0.0  22-Mar-95
+;	Original version
+;v1.0.2  17-Oct-95
+;	Added code to clear output active (TSO$OUTA) when clearing output
+;	buffer.
+;v1.0.3  19-May-96
+;	Added code to partially support output timeouts for direct output
+
+	LKEHEAD	SERDDRV, MAJV, MINV, EDITNUM, LKETYPE_DEVICE
+
+;Each board uses 2 or more seperate blocks of IO registers.  All boards use
+;  a block of 4 board registers which an be assigned at any base address which
+;  is evenly divisable by 64 (0x40) and is 0xFC0 or less. 8-port boards also
+;  use a single block of 64 registers which can also be assigned at any base
+;  address which is evenly divisable by 64 and is 0xFC0 or less.  16-port
+;  boards use two blocks of 64 registers.  The first block can be assigned at
+;  any base address which is evenly divisable by 64 and is 0x7C0 or less.  The
+;  second block of 64 registers is located at the address of the first block
+;  plus 0x400.  32-port boards use four blocks of 64 registers each.  The first
+;  block can be assigned at any base address which is evenly divisable by 64
+;  and is 0x3C0 or less.  The second block of 64 registers is located at the
+;  address of first block plus 0x400, the third at the address of the first
+;  plus 0x800 and the fourth at the address of the first plus 0xC00.
+
+;Note that the above address limits are based on the number of ports
+;  initialized on a board, NOT on the physical size of the board.
+
+;All devices on a board must be specified with the same interrupt number,
+;  IO register address and board register address.  The port number must be
+;  different for each port on a board and must be between 1 and 8 inclusive
+;  for an 8-port board, 1 and 16 inclusive for a 16-port board, and 1 and 32
+;  inclusive for a 32 board board.  Not all ports on a board need to be
+;  initialized and they can be initialized in any order.
+
+;Define offsets in the board data block (BDB) - There is one BDB for each
+;  physical interface board.  This data block is used when adding units to
+;  find the board containing the channel and when servicing interrupts to
+;  provide the top level (board level) structure for locating the interrupting
+;  channel.
+
+$$$=!-12t
+BLK bdb_fdisp  , 4t	;Offset of fork routine
+BLK bdb_fnext  , 4t	;Offset of next BDB in fork request list
+BLK bdb_magic  , 4t
+BLK bdb_next   , 4t	;Offset of next BDB
+BLK bdb_brdreg , 4t	;Base IO register for board
+BLK bdb_ioreg  , 4t
+BLK bdb_intlvl , 4t	;Interrupt level
+BLK bdb_numaiop, 4t	;Number of AIOPs (1 to 4)
+BLK bdb_mintctl, 1t	;Value for the SERD_MINTCTL register
+BLK            , 3t
+BLK bdb_adb    , 4t*4t	;ADB table
+bdb_SIZE=!$$$
+
+;Define offsets in the AIOP data block (ADB) - There is one ADB for each
+;  AIOP on an interface (there are between 1 and 4 AIOPs per board)  This
+;  data block is used when servicing interrupts to provide the next level
+;  of access below the board level.  It is not used when accessing the board
+;  since each TDB contains all of the necessary register numbers for accessing
+;  its channel.
+
+$$$=!0
+BLK adb_bdb    , 4t	;Offset of BDB
+BLK adb_num    , 4t	;AIOP number (0 through 3)
+BLK adb_istsreg, 4t	;Interrupt status register for AIOP
+BLK adb_intmsk , 1t	;Value for SERD_INTMSK register for AIOP
+BLK            , 3t
+BLK adb_numchnl, 4t	;Number of channels on AIOP (4 or 8)
+BLK adb_tdb    , 4t*8t	;TDB table
+adb_SIZE=!$$$
+
+;Define offsets for device dependent part of the TDB for SERD ports
+
+$$$=!tdb_SIZE
+BLK tdb_sdbdb    , 4t		;Offset of board data block (BDB)
+BLK tdb_sdadb    , 4t		;Offset of AIP data block (ADB)
+BLK tdb_sdaiopreg, 4t		;Base AIOP IO register
+BLK tdb_sddatareg, 4t		;Data IO register for channel
+BLK tdb_sdiidreg , 4t		;Channel interrupt ID IO register
+BLK tdb_sdsram   , 4t		;Channel base SRAM offset
+BLK tdb_sdport   , 1t		;Port on board
+BLK              , 1t
+BLK tdb_sdxmtctl , 2t		;Value for the X_XMTCTL register
+BLK tdb_sdrcvctl , 2t		;Value for the X_RCVCTL register
+BLK tdb_sdouttov , 1t		;Output time-out value (seconds)
+BLK tdb_sdouttoc , 1t		;Output time-out counter
+BLK tdb_sdhungcnt, 4t		;Hung output count
+tdb_sdSIZE=!$$$
+
+	CODE
+
+	.LONG	knlIFnDev##	;tf_virtacs   = -44.
+	.LONG	knlIFnDev##	;tf_enable    = -40.
+	.LONG	knlIFnDev##	;tf_disable   = -36.
+	.LONG	knlIFnDev##	;tf_curtyp    = -32. - Get/set cursor type
+	.LONG	knlIFnDev##	;tf_curpos    = -28. - Get/set cursor position
+	.LONG	knlIFnDev##	;tf_dsppag    = -24. - Set display page
+	.LONG	knlIFnDev##	;tf_scroll    = -20. - Scroll window
+	.LONG	knlIFnDev##	;tf_getatc    = -16. - Get attribute and char.
+	.LONG	knlIFnDev##	;tf_setatc    = -12. - Set attribute and char.
+	.LONG	knlIFnDev##	;tf_setchr    =  -8. - Set character only
+	.LONG	knlIFnDev##	;tf_attrib    =  -4. - Get or set attributes
+serdsp:	.LONG	knlRtnZero##	;tf_trans     =   0. - Transfer device
+	.LONG	knlRtnZero##	;tf_opena     =   4. - Open additional
+	.LONG	serdopen	;tf_open1     =   8. - Open first time
+	.LONG	knlRtnZero##	;tf_stop      =  12. - Stop output
+	.LONG	serdclrout	;tf_clrout    =  16. - Clear output buffer
+	.LONG	serdechchr	;tf_echchr    =  20. - Echo character
+	.LONG	serddoutchr	;tf_doutchr   =  24. - Direct output character
+	.LONG	serddoutblk	;tf_doutblk   =  28. - Direct output block
+	.LONG	serddoutstr	;tf_doutstr   =  32. - Direct output string
+	.LONG	knlIFnDev##	;tf_qoutchr   =  36. - Queued output character
+	.LONG	serdqoutblk	;tf_qoutblk   =  40. - Queued output block
+	.LONG	knlIFnDev##	;tf_qoutstr   =  44. - Queued output string
+	.LONG	serdidle	;tf_idle      =  48. - Set to idle state
+	.LONG	serdresume	;tf_resume    =  52. - Resume output
+	.LONG	knlIFnDev##	;tf_mapscn    =  56. - Map screen buffer
+	.LONG	notmapped	;tf_rmset     =  60. - Setup terminal for real
+				;			 mode
+	.LONG	knlRtnZero##	;tf_rmupd     =  64. - Update page 0 for real
+				;			 mode
+	.LONG	ret006		;tf_rmuse     =  68. - Use real mode page 0 data
+	.LONG	serddspmode	;tf_d86mode   =  72. - Get or set display mode
+	.LONG	serdaddunit	;tf_addunit   =  76. - Add unit
+	.LONG	knlIFnDev##	;tf_ssread    =  80. - Screen symbiont read
+	.LONG	knlIFnDev##	;tf_sswrite   =  84. - Screen symbiont write
+	.LONG	knlIFnDev##	;tf_sswitch   =  88. - Screen symbiont switch
+	.LONG	knlIFnDev##	;tf_ssdone    =  92. - Screen symbiont done
+	.LONG	knlIFnDev##	;tf_ssopnal   =  96. - Open alarm window
+	.LONG	knlIFnDev##	;tf_sswrtalm  = 100. - Write to alarm window
+	.LONG	knlIFnDev##	;tf_ssclsalm  = 104. - Close alarm window
+	.LONG	knlRtnZero##	;tf_ssstatus  = 108. - Report screen status to
+				;			 screen symbiont
+	.LONG	knlIFnDev##	;tf_ssgetmod  = 112. - Get display page modified
+				;			 bits
+	.LONG	knlIFnDev##	;tf_dspcur    = 116. - Low level display cursor
+				;			 routine
+	.LONG	knlRtnZero##	;tf_updpbms   = 120. - Update page changed bits
+				;			 for single msect
+	.LONG	serdsetdtr	;tf_setdtr    = 124. - Set or clear DTR output
+	.LONG	serdsetrts	;tf_setrts    = 128. - Set or clear RTS output
+	.LONG	serdgetdsb	;tf_getdsb    = 132. - Get data set bits
+	.LONG	serdfinout	;tf_finout    = 136. - Ensure output is finished
+	.LONG	ret006		;tf_imodechng = 140. - Input mode change
+	.LONG	ret006		;tf_omodechng = 144. - Output mode change
+	.LONG	knlIFnDev##	;tf_mapphys   = 148. - Map physical display
+
+
+skeydsp:.LONG	knlIFnDev##	;kf_vdinb    =  0. - INB instruction for
+				;		       keyboad in real mode
+	.LONG	knlIFnDev##	;kf_vdoutb   =  4. - OUTB instruction for
+				;		       keyboard in real mode
+	.LONG	knlIFnDev##	;kf_keyint   =  8. - Attempt to execut keyboard
+				;		       interrupt routine in real
+				;		       mode
+	.LONG	knlIFnDev##	;kf_clrkeyi  = 12. - Clear keyboard interrupt
+	.LONG	ret006		;kf_tolites  = 16. - Update keyboard lites
+
+;Device characteristics for SERA devices
+
+	DATA
+
+	.MOD	4
+serddctbl:
+ DCHARBGN  1, knlDCharValCom##
+ DCHARENT  CLASS   , TEXT, ,  8, knlDcMsgClass##    , knlDcGetClass##   , knlDcSetClass##   , 0
+ DCHARENT  TYPE    , TEXT, ,  4, knlDcMsgType##     , knlDcGet4Byte##   , 0                 , dcb_type
+ DCHARENT  SESSION , TEXT, ,  8, knlTrmMsgSession## , knlTrmGetSession##, knlTrmSetSession##, 0
+ DCHARENT  MSGDST  , STR , , 16, knlTrmMsgMsgDst##  , knlTrmGetText##   , knlTrmSetText##   , tdb_msgdst
+ DCHARENT  PROGRAM , STR , , 16, knlTrmMsgProgram## , knlTrmGetText##   , knlTrmSetText##   , tdb_program
+ DCHARENT  ACCESS  , TEXT, ,  4, knlDcMsgAccess##   , knlTrmGet4Byte##  , knlTrmSetAccess## , tdb_access
+ DCHARENT  PASSWORD, STR , ,  8, knlTrmMsgPWrd##    , knlTrmGetText##   , knlTrmSetText##   , tdb_password
+ DCHARENT  IOUTFLOW, TEXT, ,  8, knlTrmMsgIOFlow##  , knlTrmGetOFlow##  , setoflow          , tdb_iflow
+ DCHARENT  IINFLOW , TEXT, ,  8, knlTrmMsgIIFlow##  , knlTrmGetIFlow##  , setiiflow         , tdb_iflow
+ DCHARENT  IRATE   , DECV, ,  4, msgirate           , knlTrmGet4Byte##  , setirate          , tdb_ioutr
+ DCHARENT  IOUTRATE, DECV, ,  4, msgioutrate        , knlTrmGet4Byte##  , setirate          , tdb_ioutr
+ DCHARENT  IINRATE , DECV, ,  4, msgiinrate         , knlTrmGet4Byte##  , knlRtnZero##      , tdb_ioutr
+ DCHARENT  IDBITS  , DECV, ,  1, msgidbits          , getdbits          , setdbits          , tdb_icsize
+ DCHARENT  ISBITS  , DECV, ,  1, msgisbits          , getsbits          , setsbits          , tdb_icsize
+ DCHARENT  IPARITY , TEXT, ,  8, msgiparity         , getparity         , setparity         , tdb_ipar
+ DCHARENT  IMODEM  , TEXT, ,  8, knlTrmMsgIModem##  , knlTrmGetModem##  , knlTrmSetModem##  , tdb_imodem
+ DCHARENT  OUTFLOW , TEXT, ,  8, knlTrmMsgOFlow##   , knlTrmGetOFlow##  , setoflow          , tdb_flow
+ DCHARENT  INFLOW  , TEXT, ,  8, knlTrmMsgIFlow##   , knlTrmGetIFlow##  , setiflow          , tdb_flow
+ DCHARENT  RATE    , DECV, ,  4, msgrate            , knlTrmGet4Byte##  , setrate           , tdb_outr
+ DCHARENT  OUTRATE , DECV, ,  4, msgoutrate         , knlTrmGet4Byte##  , setrate           , tdb_outr
+ DCHARENT  INRATE  , DECV, ,  4, msginrate          , knlTrmGet4Byte##  , knlRtnZero##      , tdb_outr
+ DCHARENT  DBITS   , DECV, ,  1, msgdbits           , getdbits          , setdbits          , tdb_csize
+ DCHARENT  SBITS   , DECV, ,  1, msgsbits           , getsbits          , setsbits          , tdb_csize
+ DCHARENT  PARITY  , TEXT, ,  8, msgparity          , getparity         , setparity         , tdb_par
+ DCHARENT  MODEM   , TEXT, ,  8, knlTrmMsgModem##   , knlTrmGetModem##  , knlTrmSetModem##  , tdb_modem
+ DCHARENT  IOREG   , HEXV, ,  4, knlDcMsgIoReg##    , knlTrmGet4Byte##  , 0                 , tdb_bioreg
+ DCHARENT  INT     , DECV, ,  1, knlDcMsgInt##      , knlTrmGet1Byte##  , 0                 , tdb_intlvl
+ DCHARENT  BRDREG  , HEXV, ,  4, msgbrdreg          , getbrdreg         , 0                 , 0
+ DCHARENT  PORT    , DECV, ,  1, msgport            , knlTrmGet1Byte##  , 0                 , tdb_sdport
+ DCHARENT  INRBS   , DECV, ,  2, knlTrmMsgInRBS##   , knlTrmGet4Byte##  , 0                 , tdb_irsize
+ DCHARENT  INRBSL  , DECV, ,  2, knlTrmMsgInRBSL##  , knlTrmGet4Byte##  , knlTrmSet4Byte##  , tdb_irbsl
+ DCHARENT  INRBPL  , DECV, ,  2, knlTrmMsgInRBPL##  , knlTrmGet4Byte##  , knlTrmSet4Byte##  , tdb_irbpl
+ DCHARENT  INRBHELD, DECV, ,  4, knlTrmMsgInRBHeld##, knlTrmGet4Byte##  , knlTrmSet4Byte##  , tdb_irheld
+ DCHARENT  INRBLOST, DECV, ,  4, knlTrmMsgInRBLost##, knlTrmGet4Byte##  , knlTrmSet4Byte##  , tdb_irlost
+ DCHARENT  INLBS   , DECV, ,  2, knlTrmMsgInLBS##   , knlTrmGet4Byte##  , 0                 , tdb_ibsize
+ DCHARENT  HUNGOUT , DECV, ,  4, msghungout         , knlTrmGet4Byte##  , knlTrmSet4Byte##  , tdb_sdhungcnt
+ DCHARENT  CHAROUT , DECV, ,  4, knlTrmMsgCharOut## , knlTrmGet4Byte##  , knlTrmSet4Byte##  , tdb_charout
+ DCHARENT  CHARIN  , DECV, ,  4, knlTrmMsgCharIn##  , knlTrmGet4Byte##  , knlTrmSet4Byte##  , tdb_charin
+ DCHARENT  KBCHAR  , DECV, ,  4, knlTrmMsgKbChar##  , knlTrmGet4Byte##  , knlTrmSet4Byte##  , tdb_kbchar
+
+	CODE
+
+msgbrdreg:  DCHARINFO  {Board IO register number}
+msgport:    DCHARINFO  {Port number on board}
+msgirate:   DCHARINFO  {Initial baud rate}
+msgioutrate:DCHARINFO  {Initial output baud rate}
+msgiinrate: DCHARINFO  {Initial input baud rate (not used)}
+msgidbits:  DCHARINFO  {Initial number of data bits}
+msgisbits:  DCHARINFO  {Initial number of stop bits}
+msgiparity: DCHARINFO  {Initial parity handling}
+msgrate:    DCHARINFO  {Current baud rate}
+msgoutrate: DCHARINFO  {Current output baud rate}
+msginrate:  DCHARINFO  {Current input baud rate (not used)}
+msgdbits:   DCHARINFO  {Current number of data bits}
+msgsbits:   DCHARINFO  {Current number of stop bits}
+msgparity:  DCHARINFO  {Current parity handling}
+msghungout: DCHARINFO  {Number of output hangs}
+
+intxlate:.BYTE	00, 00, 00, 10, 20, 30, 00, 00	; 0  1  2  3  4  5  6  7
+	 .BYTE	00, 40, 50, 60, 70, 00, 00, 80	; 8  9 10 11 12 13 14 15
+
+mcode:	.WORD	0900, 082F6, 0902, 0FB86
+	.WORD	0904, 00A00, 0906, 00A01
+	.WORD	0908, 0138A, 090A, 011C5
+	.WORD	090C, 08586, 090E, 00A20
+	.WORD	0910, 00A21, 0912, 0FF41
+	.WORD	0914, 00082, 0916, 07B82
+	.WORD	0918, 07D8A, 091A, 08188
+	.WORD	091C, 07A86, 091E, 08184
+	.WORD	0920, 07C82, 0922, 00A0A
+MCODESZ=!{$-mcode}/4
+.PAGE
+	.SBTTL	initser - Serial port driver initialization routine
+
+	INITSUB	serdinit
+
+serdinit:
+	MOVL	EBX, #'SERD'		;Get terminal driver name
+	MOVL	EDX, #serdsp		;Get offset of dispatch table
+	CALL	knlTrmNewDriver##	;Register this terminal driver
+	JC	4$.S
+	CLRL	EAX
+	CLRL	EDX
+	MOVL	ECX, #codetop
+4$:	RET
+
+	CODE
+.PAGE
+	.SBTTL	serdaddunit - Subroutine to add serial port unit
+
+;Subroutine to add serial port unit
+;	c(AL) = Major unit number
+;	c(AH) = Minor unit number
+;	CALL	serdaddunit
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+
+$$$=!0
+FRM sau_unit   , 4t	;Unit number
+FRM sau_bdb    , 4t	;Offset of BDB
+FRM sau_adb    , 4t	;Offset of ADB
+FRM sau_introut, 4t	;Interrupt routine offset
+FRM sau_ioreg  , 4t	;Base AIOP IO register number
+FRM sau_brdreg , 4t	;Board IO register number
+FRM sau_port   , 4t	;Port number on board
+FRM sau_intlvl , 4t	;Interrupt level
+FRM sau_numchnl, 4t	;Number of channels on each AIOP (4 X 1 byte)
+FRM sau_numaiop, 4t	;Number of AIOPs on board
+FRM sau_inrbs  , 4t	;Input ring buffer size
+FRM sau_inlbs  , 4t	;Input line buffer size
+FRM sau_menable, 1t	;Value for SERD_MENABLE register
+FRM sau_intval , 1t
+FRM            , 2t
+sau_SIZE=!$$$
+
+;Description block for addunitchar
+
+	DATA
+
+	.MOD	4
+seraublk:
+ DCHARBGN  2, knlDCharValCom##
+ DCHARENT  UNIT  , DECV, , 4, 0, 0, retclc      , 0
+ DCHARENT  TYPE  , TEXT, , 4, 0, 0, retclc      , 0
+ DCHARENT  IOREG , HEXV, , 4, 0, 0, serdauioreg , 0
+ DCHARENT  BRDREG, HEXV, , 4, 0, 0, serdaubrdreg, 0
+ DCHARENT  PORT  , DECV, , 1, 0, 0, serdauport  , 0
+ DCHARENT  INT   , DECV, , 1, 0, 0, serdauint   , 0
+ DCHARENT  INRBS , DECV, , 2, 0, 0, serdauinrbs , 0
+ DCHARENT  INLBS , DECV, , 2, 0, 0, serdauinlbs , 0
+
+	CODE
+
+serdaddunit::
+	ENTER	sau_SIZE, 0		;Allocate our stack frame
+	MOVB	sau_unit.B[EBP], AL	;Store unit number
+	CLRL	EAX
+	MOVB	sau_menable.B[EBP], AL
+	DECL	EAX
+	MOVL	sau_ioreg.B[EBP], EAX	;Store illegal values for register,
+	MOVL	sau_intlvl.B[EBP], EAX	;  interrupt level, and port on board
+	MOVL	sau_port.B[EBP], EAX
+	MOVL	sau_inrbs.B[EBP], #IRSIZE ;Store default buffer sizes
+	MOVL	sau_inlbs.B[EBP], #IBSIZE
+	MOVL	EBX, #seraublk		;Point to our description block
+	MOVB	AL, #0			;Fail if bad name
+	CALL	knlAddUnitChar##
+	JC	audone.S		;If error
+	MOVL	EDX, sau_ioreg.B[EBP]	;Get base IO port
+	MOVL	EAX, EDX		;Was the IO port, interrupt level and
+	ORL	EAX, sau_intlvl.B[EBP]	;  port on board specified?
+	ORL	EAX, sau_port.B[EBP]
+	JNS	4$.S			;Yes - go on
+	MOVL	EAX, #ER_CHARM		;No - fail
+audone:	MOVL	EBX, #QSTS$DONE
+	CLRL	ECX
+	LEAVE
+	TOFORK
+	STC
+ret006:	RET
+
+;Here with all required parameters
+
+4$:	MOVL	EAX, sau_brdreg.B[EBP]	;Search all SERD BDBs to see if we
+	MOVL	EDI, serdfbdb		;  have already set up this board
+	TESTL	EDI, EDI
+	JE	newbrd.S
+6$:	CMPL	bdb_brdreg.B[EDI], EAX	;This one?
+	JE	havbrd			;Yes
+	MOVL	EDI, [EDI]		;No - advance to next BDB
+	TESTL	EDI, EDI		;Any more?
+	JNE	6$.S			;Yes - continue
+					;No - fall into newbrd on next page
+.PAGE
+;Here if do not have a matching BDB
+
+newbrd:	MOVB	CL, sau_intlvl.B[EBP]	;Get interrupt number
+	CALL	knlChkIRqAvl##		;See if the vector is available
+	JC	audone.S		;If not available
+	MOVL	EDX, sau_brdreg.B[EBP]	;Point to the MUDBAC registers
+	A2IOP	SERD_MBASE
+	MOVB	AL, #0			;First write 0 to the base register and
+	OUTB	[DX]			;  read it back
+	IOPAUSE
+	INB	[DX]
+	CMPB	AL, #0			;Right?
+	JNE	2$.S			;No - say no board!
+	MOVB	AL, #55h		;Now try a non-zero value
+	OUTB	[DX]
+	IOPAUSE
+	INB	[DX]
+	CMPB	AL, #55h		;Right?
+	JNE	2$.S			;No!
+	A2IOP	SERD_MINTCTL-SERD_MBASE	;OK, now make sure other stuff is
+	MOVB	AL, #0			;  reset
+	OUTB	[DX]
+	A2IOP	SERD_MENABLE-SERD_MINTCTL
+	OUTB	[DX]
+	A2IOP	SERD_MBASE-SERD_MENABLE
+	CLRL	EBX			;See if the first AIOP exists
+	CALL	chkaiop
+	JNC	4$.S			;OK
+2$:	MOVL	EAX, #ER_PDNAV		;No - fail
+	JMP	audone.S
+
+;Here if we are convinced that we really have a RocketPort board at the
+;  specified board address!  Now we will attempt to access each of the
+;  additional AIOPs to see what size board we have.  When doing this, we
+;  map each in turn to the lowest AIOP address so as not to mess with
+;  IO registers which may be used by something else!
+
+4$:	INCL	EBX
+	CALL	chkaiop
+	JC	6$.S
+	CMPL	EBX, #3.B
+	JB	4$.S
+	INCL	EBX
+6$:	MOVL	sau_numaiop.B[EBP], EBX	;Store number of AIOPs
+	MOVL	EDX, sau_brdreg.B[EBP]	;Disable registers for all of the AIOPs
+	A2IOP	SERD_MENABLE
+	MOVB	AL, #0
+	OUTB	[DX]
+
+;Here with the number of AIOPs determined.  Next we allocate and set up our
+;  data blocks.  We allocate one BDB for the board and one ADB for each AIOP
+;  on the board.
+
+	CALL	knlGetXRes##		;Get exec memory resource
+	MOVL	ECX, #SERDINTSZ		;Get space for interrupt code
+	CALL	knlGetXCode##
+	JC	12$.S			;If error
+	MOVL	sau_introut.B[EBP], EDI	;Remember where code is going
+	MOVL	ESI, #serdint		;Copy prototype interrupt routine
+	SHRL	ECX, #2
+	MOVB	gdtable+GS_CODEALS+5, #DT_RWDATA+PL_0 ;Enable alaised code space
+	PUSHL	#GS_CODEALS.B
+	POPL	ES
+	CLD
+	RMOVSL	[EDI], ES:[ESI]
+	IMULL	ECX, sau_numaiop.B[EBP], #adb_SIZE.B
+	ADDL	ECX, #bdb_SIZE+8.B
+	CALL	knlGetXMem##
+	JC	12$.S			;If error
+	ADDL	EDI, #8t.B		;OK - point to base of BDB
+	MOVL	sau_bdb.B[EBP], EDI
+	MOVL	EAX, serdfbdb		;Link in the BDB
+	TESTL	EAX, EAX
+	JNE	14$.S
+	MOVL	serdfbdb, EDI
+	MOVL	EBX, #serdoas		;Setup our once-a-second routine
+	PUSHL	EDI
+	CALL	knlSetupOAS##
+	POPL	EDI
+	JNC	16$.S
+12$:	JMP	auerrgxr
+
+14$:	MOVL	bdb_next.B[EAX], EDI
+16$:	MOVL	bdb_fdisp.B[EDI], #serdfork
+	DECL	bdb_fnext.B[EDI]
+	MOVL	EAX, sau_brdreg.B[EBP]	;Store board base IO register in BDB
+	MOVL	bdb_brdreg.B[EDI], EAX
+	MOVL	EAX, sau_ioreg.B[EBP]
+	MOVL	bdb_ioreg.B[EDI], EAX
+	MOVB	AL, sau_intval.B[EBP]	;Store interrupt select value for board
+	MOVB	bdb_mintctl.B[EDI], AL
+	MOVL	ECX, sau_numaiop.B[EBP]	;Get number of AIOPs
+	MOVL	bdb_numaiop.B[EDI], ECX
+	LEAL	EBX, bdb_SIZE.B[EDI]
+	LEAL	EDX, bdb_adb.B[EDI]
+	CLRL	ESI
+18$:	MOVL	[EDX], EBX		;Set up the ADB table in the BDB
+	MOVL	[EBX], EDI		;Also initialize the ADB contents
+	MOVL	EAX, ESI
+	SHLL	EAX, #10t
+	ADDL	EAX, sau_ioreg.B[EBP]
+	ADDL	EAX, #SERD_INTSTS.B
+	MOVL	adb_istsreg.B[EBX], EAX
+	MOVL	adb_num.B[EBX], ESI
+	ADDL	EDX, #4.B
+	ADDL	EBX, #adb_SIZE.B
+	INCL	ESI
+	LOOP	ECX, 18$
+	MOVL	EBX, sau_introut.B[EBP]	;Fix up the interrupt code
+	PUSHL	#GS_CODEALS.B
+	POPL	ES
+	MOVL	ES:{fix1-serdint}+1.B[EBX], EDI
+	MOVL	EAX, EBX
+	SUBL	EAX, #serdint
+	SUBL	ES:{fix2-serdint}+1.B[EBX], EAX
+	CLRL	EAX
+	MOVL	ES, EAX
+	MOVB	gdtable+GS_CODEALS+5, AL ;Disable the allaised code space
+	MOVL	EAX, sau_intlvl.B[EBP]	;Get the interrupt number
+	MOVL	EBX, #irqname+7
+	MOVL	EAX, sau_brdreg.B[EBP]
+	CALL	knlPutHex4Nmbr##
+	MOVL	EDX, #irqname
+	MOVL	EBX, sau_introut.B[EBP]	;Get address of interrupt routine
+	MOVB	CL, sau_intlvl.B[EBP]	;Get interrupt number
+	MOVB	bdb_intlvl.B[EDI], CL
+	MOVB	CH, #DT_INT+PL_0	;Set up our interrupt vector
+	CALL	knlSetIRq##
+	JC	auerrgxr		;If error
+
+;Here with everything allocated and the interrupt routine set up - now we
+;  have to finish setting up the board and enable it
+
+	MOVL	ECX, bdb_numaiop.B[EDI]	;Get number of AIOPs
+	LEAL	EBX, bdb_adb.B[EDI]	;Point to start of AIOP table
+20$:	PUSHL	EBX
+	PUSHL	ECX
+	MOVL	EBX, [EBX]		;Get offset of next ADB
+	MOVL	EDX, bdb_brdreg.B[EDI]	;Set AIOP register address
+	A2IOP	SERD_MINTCTL
+	MOVL	EAX, adb_num.B[EBX]
+	BTSL	sau_menable.B[EBP], EAX	;Set enable bit for the AIOP
+	OUTB	[DX]
+	A2IOP	SERD_MBASE-SERD_MINTCTL
+	MOVL	EAX, adb_istsreg.B[EBX]
+	SHRL	EAX, #6t
+	OUTB	[DX]
+	A2IOP	SERD_MENABLE-SERD_MBASE	;Enable the AIOP's registers
+	MOVB	AL, sau_menable.B[EBP]
+	OUTB	[DX]
+
+;Now check to see if this is a 4 port or an 8 port AIOP.  We do this by
+;  checking to see if the SRAM for the top 4 ports is different from the
+;  SRAM for the bottom 4 ports.
+
+	MOVL	EDX, adb_istsreg.B[EBX]
+	A2IOP	SERD_XADDR-SERD_INTSTS	;Write to channel 4 SRAM
+	MOVL	EAX, #0F0F4000h
+	OUTL	[DX]
+	MOVL	EAX, #12340000h		;Write something different to channel
+	OUTL	[DX]			;  0 SRAM
+	IOPAUSE
+	A2IOP	SERD_XDATA-SERD_XADDR	;Read value from channel 4
+	INW	[DX]
+	MOVL	ECX, EAX
+	A2IOP	SERD_XADDR-SERD_XDATA
+	MOVW	AX, #4000h		;Now read from channel 4 SRAM
+	OUTW	[DX]
+	IOPAUSE
+	A2IOP	SERD_XDATA-SERD_XADDR
+	INW	[DX]
+	CMPW	AX, #1234h		;Is it what we write to channel 0?
+	MOVB	AL, #8			;Assume not (8 channels)
+	JNE	22$.S			;Right
+	MOVB	AL, #4			;Wrong, its 4 channels
+22$:	MOVB	adb_numchnl[EBX], AL
+	A2IOP	SERD_XADDR-SERD_XDATA	;Set up clock prescaller
+	MOVW	AX, #X_CLKPRE
+	OUTW	[DX]
+	A2IOP	SERD_XDATA-SERD_XADDR
+	MOVB	AL, #CLKPRE_10
+	OUTB	[DX]
+	POPL	ECX
+	POPL	EBX
+	ADDL	EBX, #4t.B
+	LOOP	ECX, 20$
+
+;Here with all AIOPs on the board set up.  Now all that is left is to enable
+;  interrupts on the board and to enable the board's interrupt.
+
+	MOVL	EDX, bdb_brdreg.B[EDI]	;Set interrupt level and strobe EOI
+	A2IOP	SERD_MINTCTL
+	MOVB	AL, sau_intval.B[EBP]
+	ORB	AL, #MINTCTL$EOI
+	OUTB	[DX]
+	IOPAUSE
+	IOPAUSE
+	XORB	AL, #MINTCTL$ENBINT|MINTCTL$EOI ;Enable interrupts on board
+	OUTB	[DX]
+	MOVL	ECX, sau_intlvl.B[EBP]	;Enable our interrupt
+	CALL	knlEnableInt##
+	JMP	brdok
+.PAGE
+;Here with match on an existing BDB - all we have to do is verify that the
+;  configuration data is consistant and then set up the TDB
+
+havbrd:	MOVL	sau_bdb.B[EBP], EDI
+	MOVL	EAX, sau_intlvl.B[EBP]
+	CMPL	bdb_intlvl.B[EDI], EAX
+	JNE	2$.S
+	MOVL	EAX, sau_brdreg.B[EBP]
+	CMPL	bdb_brdreg.B[EDI], EAX
+	JNE	2$.S
+	MOVL	EAX, sau_ioreg.B[EBP]
+	CMPL	bdb_ioreg.B[EDI], EAX
+	JE	4$.S
+2$:	MOVL	EAX, #ER_CHARV
+	JMP	6$.S
+
+;Here if configuration data matches current values
+
+4$:	CALL	knlGetXRes##		;Get exec memory resource
+brdok:	MOVL	EAX, sau_port.B[EBP]	;Get AIOP number and channel on AIOP
+	DECL	EAX
+	MOVL	ECX, EAX
+	ANDL	ECX, #07h.B
+	SHRL	EAX, #3t
+	MOVL	EBX, bdb_adb[EDI+EAX*4]	;Get offset of corresponding ADB
+	TESTL	EBX, EBX		;Do we have one?
+	JE	8$.S			;No - fail!
+	CMPL	ECX, adb_numchnl.B[EBX]	;Yes - valid channel for the AIOP?
+	JAE	8$.S			;No - fail!
+	MOVL	sau_adb.B[EBP], EBX	;Yes - remember offset of the ADB
+	MOVL	ECX, #tdb_sdSIZE	;Get size for our TDB
+	MOVB	DH, #0FFh		;No secondary unit number
+	MOVB	DL, sau_unit.B[EBP]	;Get primary unit number
+	MOVL	EAX, sau_inlbs.B[EBP]	;Get input line buffer and ring sizes
+	SHLL	EAX, #16t
+	MOVW	AX, sau_inrbs.B[EBP]
+	PUSHL	EBX
+	MOVL	EBX, #'SERD'		;Get type name
+	CALL	knlTrmMakeTdb##		;Make our TDB
+	POPL	EBX
+	JNC	10$.S			;OK
+auerrgxr:
+	CALL	knlGiveXRes##		;Give up the exec memory resource
+6$:	JMP	audone
+
+;Here with invalid channel
+
+8$:	MOVL	EAX, #ER_CHARV
+	JMP	auerrgxr.S
+
+;Here with TDB allocated
+
+10$:	CALL	knlGiveXRes##		;Give up the exec memory resource
+	MOVB	tdb_ifdsp.B[ESI], #TID$QOUT ;Indicate can do queued output
+	MOVL	tdb_ddisp.B[ESI], #serdsp ;Store offset of our dispatch table
+	MOVL	tdb_fdisp.B[ESI], #serdfork ;Store offset of fork routine
+	MOVL	tdb_devchar.B[ESI], #serddctbl ;Store offset of device
+	MOVL	EAX, serdltdb		       ;  characteristics table
+	MOVL	serdltdb, ESI		;Link into our list of TDBs
+	TESTL	EAX, EAX
+	JE	12$.S
+	MOVL	tdb_nexts.B[EAX], ESI
+	JMP	14$.S
+
+12$:	MOVL	serdftdb, ESI
+14$:	MOVL	EAX, sau_bdb.B[EBP]	;Store BDB offset in the TDB
+	MOVL	tdb_sdbdb.B[ESI], EAX
+	MOVL	EAX, sau_adb.B[EBP]	;Store ADB offset in the TDB
+	MOVL	tdb_sdadb.B[ESI], EAX
+	MOVL	EAX, bdb_intlvl.B[EAX]	;Store interrupt level in the TDB
+	MOVB	tdb_intlvl.B[ESI], AL
+	MOVL	ECX, sau_ioreg.B[EBP]	;Store base IO register for board (which
+	MOVL	tdb_bioreg[ESI], ECX	;  is really just the base register for
+	MOVL	EAX, sau_port.B[EBP]	;  the first AIOP on the board and is
+	MOVB	tdb_sdport.B[ESI], AL	;  only used to identify the board)
+	DECL	EAX
+	MOVL	EDX, EAX		;Store base IO register for the
+	ANDL	EDX, #18h.B		;  channel's AIOP
+	SHLL	EDX, #7t
+	ADDL	EDX, ECX
+	MOVL	tdb_sdaiopreg.B[ESI], EDX
+	ANDL	EAX, #07h.B		;Get channel number on AIOP
+	LEAL	ECX, [EDX+EAX*2]	;Store data IO register for channel
+	MOVL	tdb_sddatareg[ESI], ECX
+	LEAL	ECX, SERD_INTID0.B[EDX+EAX] ;Store interrupt ID IO register for
+	MOVL	tdb_sdiidreg.B[ESI], ECX    ;  channel
+	MOVL	adb_tdb[EBX+EAX*4], ESI	;Store TDB offset in the ADB
+	SHLL	EAX, #12t		;Store SRAM index for channel
+	MOVL	tdb_sdsram.B[ESI], EAX
+
+	MOVW	tdb_sdxmtctl.B[ESI], #XMTCTL$ENABLE|XMTCTL$ENBINT|-
+			XMTCTL$8BITDATA
+	MOVL	EAX, tdb_irsize[ESI]	;Calculate input buffer stop level
+	CMPL	EAX, #1024t
+	JBE	16$.S
+	MOVL	EAX, #512t
+16$:	SHRL	EAX, #2
+	MOVL	tdb_irbsl[ESI], EAX
+	SHRL	EAX, #2			;Calculate input buffer panic level
+	MOVL	tdb_irbpl[ESI], EAX	;Fall into setupchnl on next page
+.PAGE
+;Here with the TDB set up - now initialize the hardware for the channel
+
+setupchnl:
+	MOVL	EDX, tdb_sdaiopreg.B[ESI]
+	A2IOP	SERD_XADDR
+	MOVL	ECX, #MCODESZ		;Load the channel's "microcode"
+	MOVL	EBX, #mcode
+4$:	MOVL	EAX, CS:[EBX]
+	ADDL	EBX, #4t.B
+	ADDL	EAX, tdb_sdsram.B[ESI]
+	OUTL	[DX]
+	LOOP	ECX, 4$
+	MOVL	EAX, tdb_sdsram.B[ESI]	;Clear the receive and transmit enables
+	ADDL	EAX, #X_RCVCTL
+	OUTL	[DX]
+	ADDL	EAX, #X_XMTCTL-X_RCVCTL.B
+	OUTL	[DX]
+	MOVL	EAX, #TRMR_init		;Get baud rates
+	MOVL	tdb_iinpr[ESI], EAX	;Store idle baud rate
+	MOVL	tdb_ioutr.B[ESI], EAX
+	CALL	setbaudrate		;Set baud rate in the hardware
+	MOVB	tdb_icsize.B[ESI], #{TRMS_init<4}|TRMD_init
+	MOVB	tdb_csize.B[ESI], #{TRMS_init<4}|TRMD_init
+	MOVB	tdb_ipar.B[ESI], #TRMP_init
+	MOVB	tdb_par.B[ESI], #TRMP_init
+	CALL	setlhw			;Set line bits for the hardware
+	MOVL	EDX, tdb_sdaiopreg.B[ESI] ;Clear out the transmit editing stuff
+	A2IOP	SERD_XADDR
+	MOVL	EAX, tdb_sdsram.B[ESI]
+	ADDL	EAX, #X_XMTENB
+	OUTL	[DX]			;(0980)
+	ADDL	EAX, #X_XMTCMP1-X_XMTENB.B
+	OUTL	[DX]			;(0988)
+	ADDL	EAX, #X_XMTREP1B1-X_XMTCMP1.B
+	OUTL	[DX]			;(098A)
+	ADDL	EAX, #X_XMTREP2-X_XMTREP1B1.B
+	OUTL	[DX]			;(098C)
+	A2IOP	SERD_CMDREG-SERD_XADDR
+	MOVB	AL, tdb_sdport.B[ESI]
+	DECL	EAX
+	ANDB	AL, #07h
+	ORB	AL, #CMDREG$RSTXMTFCR	;Reset the xmit count
+	OUTB	[DX]
+	MOVL	ECX, #4t
+	CALL	knlSDelay##
+	ANDB	AL, #07
+	OUTB	[DX]			;Remove the reset
+	ORB	AL, #CMDREG$RSTRCVFCR	;Reset the receive count
+	OUTB	[DX]
+	MOVL	ECX, #4t
+	CALL	knlSDelay##
+	ANDB	AL, #07
+	OUTB	[DX]			;Remove the reset
+	A2IOP	SERD_XADDR-SERD_CMDREG
+	MOVL	EAX, tdb_sdsram.B[ESI]	;Clear receive and transmit FIFO
+	ADDL	EAX, #X_XMTFOPNT	;  pointers
+	OUTL	[DX]
+	ADDL	EAX, #X_RCVFOPNT-X_XMTFOPNT.B
+	OUTL	[DX]
+	ADDL	EAX, #X_RCVFIPNT-X_RCVFOPNT.B
+	OUTL	[DX]
+	ADDL	EAX, #X_XMTPCNT-X_RCVFIPNT.B ;Clear the transmit priority
+	OUTW	[DX]			     ;  pointer and count
+	A2IOP	SERD_XDATA-SERD_XADDR
+	MOVB	AL, #0
+	OUTB	[DX]
+	A2IOP	SERD_XADDR-SERD_XDATA
+	MOVL	EAX, tdb_sdsram.B[ESI]
+	ADDL	EAX, #X_XMTPPNT
+	OUTW	[DX]
+	A2IOP	SERD_XDATA-SERD_XADDR
+	MOVB	AL, #0
+	OUTB	[DX]
+	A2IOP	SERD_INTMSK-SERD_XDATA
+	MOVL	EBX, tdb_sdadb.B[ESI]	;Set the interrupt mask bit for the
+	MOVB	CL, tdb_sdport.B[ESI]	;  AIOP (this bit unmasks the interrupt
+	DECL	ECX			;  bit in the MUDBAC register 1 but
+	ANDL	ECX, #07h.B		;  does not seem to effect the actual
+	BTSL	adb_intmsk.B[EBX], ECX	;  interrupt request!)
+	MOVB	AL, adb_intmsk.B[EBX]
+	OUTB	[DX]
+	A2IOP	SERD_XADDR-SERD_INTMSK	;Start the receive processor and enable
+	MOVL	EAX, tdb_sdsram.B[ESI]	;  the receive interrupts
+	ADDL	EAX, #X_RCVCTL
+	ORL	EAX, #{RCVCTL$ENBRCVPR|RCVCTL$ENBSCINT|RCVCTL$ENBDRINT|-
+			RCVCTL$ENBMCINT|FTLVL_1}<16t
+	OUTL	[DX]
+	MOVW	tdb_sdrcvctl.B[ESI], #RCVCTL$ENBRCVPR|RCVCTL$ENBSCINT|-
+			RCVCTL$ENBDRINT|RCVCTL$ENBMCINT|FTLVL_1
+	MOVL	EAX, tdb_sdsram.B[ESI]
+	ADDL	EAX, #X_ENBRCVF+{{0A08}<16t}
+	OUTL	[DX]
+	MOVL	EDX, tdb_sddatareg.B[ESI] ;Clear read status mode
+	A2IOP	SERD_CHNSTS0-SERD_DATA0
+	CLRL	EAX
+	OUTW	[DX]
+	POPL	ECX			;Get our return value
+	CLRL	EAX
+	MOVL	EBX, #QSTS$DONE
+	LEAVE
+	TOFORK
+	RET
+.PAGE
+;Subroutine to check for existance of an AIOP
+;	c{EBX} = AIOP number (0 to 3)
+;	CALL	chkaiop
+;	C:set = AIOP does not exist
+;	C:clr = AIOP exists
+
+chkaiop:MOVL	EDX, sau_brdreg.B[EBP]
+	A2IOP	SERD_MINTCTL
+	MOVB	AL, BL			;Set index to AIOP
+	OUTB	[DX]
+	A2IOP	SERD_MBASE-SERD_MINTCTL	;Set AIOP register address
+	MOVL	EAX, sau_ioreg.B[EBP]
+	SHRL	EAX, #6t
+	OUTB	[DX]
+	A2IOP	SERD_MENABLE-SERD_MBASE	;Enable this AIOP
+	CLRL	EAX
+	BTSL	EAX, EBX
+	OUTB	[DX]
+	MOVL	EDX, sau_ioreg.B[EBP]	;Reset the AIOP
+	A2IOP	SERD_CMDREG
+	MOVB	AL, #CMDREG$RESETALL
+	OUTB	[DX]
+	IOPAUSE
+	MOVB	AL, #0
+	OUTB	[DX]
+	IOPAUSE
+	A2IOP	SERD_CHNSTS0-SERD_CMDREG ;Read status byte for channel 0
+	INB	[DX]
+	ANDB	AL, #0C7h
+	CMPB	AL, #CHNSTS$XMTFIFOEM|CHNSTS$XMTSHRGEM ;Right?
+	JE	4$.S			;Yes - say the AIOP exists
+	STC
+4$:	RET
+.PAGE
+;Subroutine called by addunitchar for the "IOREG" characteristic
+
+serdauioreg:
+	MOVL	sau_ioreg.B[EBP], EAX	;Store value
+	JMP	2$.S
+
+;Subroutine called by addunitchar for the "BRDREG" characteristic
+
+serdaubrdreg:
+	MOVL	sau_brdreg.B[EBP], EAX	;Store value
+2$:	TESTB	AL, #3Fh
+	JNE	4$.S
+	CMPL	EAX, #100h		;Valid value?
+	JB	4$.S			;No
+	CMPL	EAX, #0FFFh
+	JBE	retclc.S		;Yes
+4$:	JMP	knlBadCharV##		;No - fail
+
+;Subroutine called by addunitchar for the "INT" characteristic
+
+serdauint:
+	CMPL	EAX, #2.B		;See if valid interrupt level
+	JB	4$.S			;If too small
+	JNE	6$.S			;Not level 2
+	MOVB	AL, #9			;Level 2 - change it to level 9
+6$:	MOVL	sau_intlvl.B[EBP], EAX	;Store interrupt level
+	CMPL	EAX, #15t.B		;Too large?
+	JA	4$.S			;Yes
+	MOVB	AL, CS:intxlate[EAX]	;No - Get interrupt bits
+	CMPB	AL, #0			;Valid?
+	JE	4$.S			;No - fail
+	MOVB	sau_intval.B[EBP], AL	;Yes - remember value
+	RET
+
+;Subroutine called by addunitchar for the "PORT" characteristic
+
+serdauport:
+	CMPL	EAX, #32t
+	JA	4$.S
+	TESTL	EAX, EAX
+	JE	4$.S
+	MOVL	sau_port.B[EBP], EAX
+	RET
+
+;Subroutine called by addunitchar for the "INRBS" characteristic
+
+serdauinrbs:
+	ANDB	AL, #0FCh		;Make sure even number of longs
+	CMPL	EAX, #40t.B		;Is it too small?
+	JA	8$.S			;No
+	MOVB	AL, #40t		;Yes - use minimum
+8$:	MOVL	sau_inrbs.B[EBP], EAX
+10$:	CMPL	EAX, #1000h		;Is this a reasonable value?
+	JAE	4$.S			;No - fail
+retclc:	CLC
+	RET
+
+;Subroutine called by addunitchar for the "INLBS" characteristic
+
+serdauinlbs:
+	ANDB	AL, #0FCh		;Make sure even number of longs
+	CMPL	EAX, #40t.B		;Is it too small?
+	JA	12$.S			;No
+	MOVB	AL, #40t		;Yes - use minimum
+12$:	MOVL	sau_inlbs.B[EBP], EAX
+	JMP	10$.S
+.PAGE
+;Here to get the value of the RATE characteristic
+
+getrate:CALL	knlGetTdb##
+	JC	4$.S
+	MOVL	EAX, tdb_ioutr.B[ESI]
+	CLRL	EDX
+4$:	RET
+
+;Here to get the value of the DBITS characteristic
+
+getdbits:
+	CALL	knlGetTdb##
+	JC	4$.S
+	MOVZBL	EAX, [ESI+EBX]
+	ANDB	AL, #0Fh
+	CLRL	EDX
+	RET
+
+;Here to get the value of the SBITS characteristic
+
+getsbits:
+	CALL	knlGetTdb##
+	JC	8$.S
+	MOVZBL	EAX, [ESI+EBX]
+	SHRB	AL, #4
+	CLRL	EDX
+	RET
+
+;Here to get the value of the PARITY characteristic
+
+getparity:
+	CALL	knlGetTdb##
+	JC	8$.S
+	MOVZBL	EBX, [ESI+EBX]
+	ANDB	BL, #0Fh
+	MOVL	EAX, CS:parname+0-8[EBX*8]
+	MOVL	EDX, CS:parname+4-8[EBX*8]
+8$:	RET
+
+	.MOD	4
+parname:.LONG	'NONE', 0	;TRMP_NONE  = 1 - No parity bit
+	.LONG	'MARK', 0	;TRMP_MARK  = 2 - Mark parity
+	.LONG	'SPAC', 'E'	;TRMP_SPACE = 3 - Space parity
+	.LONG	'ODD' , 0	;TRMP_ODD   = 4 - Odd parity
+	.LONG	'EVEN', 0	;TRMP_EVEN  = 5 - Even parity
+PARNAMESZ=!{$-parname}/8
+
+;Here to get the value of the MODEM characteristic
+
+getmodem:
+	CALL	knlGetTdb##
+	JC	12$.S
+	ADDL	EBX, ESI
+	MOVL	EAX, #'YES'		;Assume YES
+	TESTB	[EBX], #TMC$MODEM
+	JNE	10$.S
+	MOVL	EAX, #'NO'
+10$:	CLRL	EDX
+12$:	RET
+
+;Here to get the value of the BRDREG characteristic
+
+getbrdreg:
+	CALL	knlGetTdb##
+	JC	12$.S
+	MOVL	EBX, tdb_sdbdb.B[ESI]
+	MOVL	EAX, bdb_brdreg.B[EBX]
+ret020:	RET
+.PAGE
+
+	.MOD	4
+oflowtbl:
+	.LONG	'CTS' , 0    , TFC$OCTS
+	.LONG	'NONE', 0    , 0
+	.LONG	'XONX', 'OFF', TFC$OXONXOFF
+	.LONG	'XON' , 0    , TFC$OXONXOFF
+	.LONG	'PAUS', 'E'  , TFC$OXONXOFF|TFC$OREV
+	.LONG	'PAU' , 0    , TFC$OXONXOFF|TFC$OREV
+OFLOWTBLSZ ==!{$-oflowtbl}/12t
+
+;Here to set the value of the IOUTFLOW or OUTFLOW characteristic
+
+setoflow:
+	CALL	knlGetTdb##
+	JC	ret020.S
+	PUSHL	EBX
+	MOVL	ECX, #OFLOWTBLSZ
+	MOVL	EBX, #oflowtbl
+	CALL	knlGetDcVal2##
+	POPL	EBX
+	JC	4$.S
+	ANDB	[ESI+EBX], #0Fh
+	ORB	[ESI+EBX], AL		;Store new value
+	CMPL	EBX, #tdb_iflow.B	;Setting initial value?
+	JE	4$.S			;Yes - finished now
+	JMP	setinte			;No - make sure interrupt enables are
+					;  right
+
+	.MOD	4
+iflowtbl:
+	.LONG	'RTS' , 0    , TFC$IRTS
+	.LONG	'NONE', 0    , 0
+	.LONG	'XONX', 'OFF', TFC$IXONXOFF
+	.LONG	'XON' , 0    , TFC$IXONXOFF
+	.LONG	'PAUS', 'E'  , TFC$IXONXOFF|TFC$IREV
+	.LONG	'PAU' , 0    , TFC$IXONXOFF|TFC$IREV
+IFLOWTBLSZ ==!{$-iflowtbl}/12t
+
+;Here to set the value of the IINFLOW characteristic
+
+setiiflow::
+	CALL	knlGetTdb##
+	JC	4$.S
+	PUSHL	EBX
+	MOVL	ECX, #IFLOWTBLSZ
+	MOVL	EBX, #iflowtbl
+	CALL	knlGetDcVal2##
+	POPL	EBX
+	JC	4$.S
+	ANDB	[ESI+EBX], #0F0h
+	ORB	[ESI+EBX], AL		;Store new value
+4$:	RET
+
+;Here to set the value of the IINFLOW or INFLOW characteristic
+
+setiflow::
+	CALL	setiiflow
+	JC	4$.S
+	MOVL	EDX, tdb_sdaiopreg.B[ESI] ;Disable it in the hardware
+	A2IOP	SERD_XADDR
+	TESTB	AL, #TFC$IRTS		;Have RTS flow control now?
+	JE	6$.S			;No
+	ORB	tdb_sdrcvctl.B[ESI], #RCVCTL$ENBRTSFC ;Yes
+	MOVZWL	EAX, tdb_sdrcvctl.B[ESI]
+	SHLL	EAX, #16t
+	ADDL	EAX, tdb_sdsram.B[ESI]
+	ADDL	EAX, #X_RCVCTL
+	OUTL	[DX]
+	ANDB	tdb_sdxmtctl+1.B[ESI], #~{XMTCTL$SETRTS>8t}
+	MOVZWL	EAX, tdb_sdxmtctl.B[ESI]
+	SHLL	EAX, #16t
+	ADDL	EAX, tdb_sdsram.B[ESI]
+	ADDL	EAX, #X_XMTCTL
+	OUTL	[DX]
+	JMP	8$.S
+
+;Here if RTS flow control is disabled now
+
+6$:	ORB	tdb_sdxmtctl+1.B[ESI], #XMTCTL$SETRTS>8t
+	MOVZWL	EAX, tdb_sdxmtctl.B[ESI]
+	SHLL	EAX, #16t
+	ADDL	EAX, tdb_sdsram.B[ESI]
+	ADDL	EAX, #X_XMTCTL
+	OUTL	[DX]
+	ANDB	tdb_sdrcvctl.B[ESI], #~RCVCTL$ENBRTSFC
+	MOVZWL	EAX, tdb_sdrcvctl.B[ESI]
+	SHLL	EAX, #16t
+	ADDL	EAX, tdb_sdsram.B[ESI]
+	ADDL	EAX, #X_RCVCTL
+	OUTL	[DX]
+
+;;;;; DO WE NEED TO POKE THE TRANSMITTER HERE?????
+
+8$:	CLC
+ret030:	RET
+.PAGE
+;Here to set the value of the RATE or OUTRATE characteristic
+
+setrate:CALL	knlGetTdb##
+	JC	ret030.S
+	CALL	actrate			;Calculate actual rate
+setbaudrate:
+	MOVL	tdb_outr.B[ESI], EAX	;Store this as the current rate
+	MOVL	tdb_inpr.B[ESI], EAX
+	MOVL	ECX, EAX		;Calculate the output time-out value
+	MOVL	EAX, #3600t		;  (number of seconds needed to output
+	CLRL	EDX			;  255 characters plus safety factor)
+	DIVL	ECX
+	MOVB	tdb_sdouttov.B[ESI], AL
+	MOVL	EAX, ECX
+	CMPL	EAX, #134t		;Did he say 134 baud?
+	JNE	4$.S			;No
+	MOVL	EAX, #1713t		;Yes - make it 134.5!
+	JMP	6$.S
+
+4$:	SHRL	EAX, #1			;Calculate rate divisor
+	ADDL	EAX, #230400t
+	CLRL	EDX
+	DIVL	ECX
+6$:	SHLL	EAX, #16t
+	ADDL	EAX, #0FFFF0000+X_BAUDRATE
+	ADDL	EAX, tdb_sdsram.B[ESI]
+	MOVL	EDX, tdb_sdaiopreg.B[ESI]
+	A2IOP	SERD_XADDR
+	OUTL	[DX]
+	CLC
+	RET
+
+;Here to set the value of the IRATE or IOUTRATE characteristic
+
+setirate:
+	CALL	knlGetTdb##
+	JC	8$.S
+	CALL	actrate			;Calculate actual rate
+	MOVL	tdb_ioutr.B[ESI], EAX	;And store this as the initial rate
+	MOVL	tdb_iinpr[ESI], EAX
+	CLC
+8$:	RET
+.PAGE
+;Subroutine to calculate actual baud rate
+;	c{EAX} = Desired baud rate
+;	CALL	actrate
+;	c{EAX} = Actual baud rate
+
+actrate:CMPL	EAX, #50t.B		;Must be at least 50!
+	JA	4$.S
+	MOVB	AL, #50
+4$:	CMPL	EAX, #134t		;Did he say 134 baud?
+	JE	8$.S			;Yes - leave it at that
+	MOVL	ECX, EAX		;No - calculate rate divisor
+	SHRL	EAX, #1
+	ADDL	EAX, #230400t
+	CLRL	EDX
+	DIVL	ECX
+	TESTL	EAX, EAX		;Make sure not zero
+	JNE	6$.S
+	INCL	EAX
+6$:	MOVL	ECX, EAX		;Now calculate actual baud rate that
+	MOVL	EAX, #230400t		;  this divisor will generate
+	CLRL	EDX
+	DIVL	ECX
+8$:	RET
+.PAGE
+;Here to set the value of the DBITS characteristic
+
+setdbits:
+	CALL	knlGetTdb##
+	JC	12$.S
+	CMPL	EAX, #8.B	;Make sure legal value (must be 5, 6, 7, or 8)
+	JA	knlBadCharV##
+	CMPL	EAX, #5.B
+	JB	knlBadCharV##
+	ANDB	[ESI+EBX], #0F0h
+	ORB	[ESI+EBX], AL	;Store new value
+	JMP	10$.S		;Continue
+
+;Here to set the value of the SBITS characteristic
+
+setsbits:
+	CALL	knlGetTdb##
+	JC	12$.S
+	CMPL	EAX, #2.B	;Make sure legal value (must be 1 or 2)
+	JA	knlBadCharV##
+	TESTL	EAX, EAX
+	JE	knlBadCharV##
+	SHLB	AL, #4
+	ANDB	[ESI+EBX], #0Fh
+	ORB	[ESI+EBX], AL	;Store new value
+10$:	CMPL	EBX, #tdb_icsize.B ;Changing current value?
+	JNE	setlhw.S	;Yes - go do that
+12$:	RET
+
+;Here to set the value of the PARITY characteristic
+
+setparity:
+	CALL	knlGetTdb##
+	JC	12$.S
+	PUSHL	EBX
+	MOVL	ECX, #PARNAMESZ
+	MOVL	EBX, #parname
+	CALL	knlGetDcVal1##		;Search the keyword table
+	POPL	EBX
+	JC	12$.S			;If error
+	INCL	EAX
+	ANDB	[ESI+EBX], #0F0h
+	ORB	[ESI+EBX], AL		;Store new value
+	CMPL	EBX, #tdb_ipar.B 	;Changing current value?
+	JE	12$.S			;No - finished
+
+;Here to set the data bits, stop bits, and parity values into the hardware
+
+setlhw:	MOVW	AX, tdb_sdxmtctl.B[ESI]
+	MOVZBL	EDX, tdb_ipar.B[ESI]
+	MOVB	DL, CS:parvalue-1[EDX]
+	ANDB	AL, #0F9h
+	ORB	AL, DL
+	ORB	AL, #XMTCTL$8BITDATA	;Assume 8 bit data
+	MOVB	DL, tdb_csize.B[ESI]
+	ANDB	DL, #0Fh
+	CMPB	DL, #7			;Right?
+	JA	14$.S			;Yes
+	ANDB	AL, #~XMTCTL$8BITDATA	;No - use 7 bit data
+14$:	ANDB	AL, #~XMTCTL$2BITSTOP	;Assume 1 stop bit
+	TESTB	tdb_csize.B[ESI], #10h	;Right?
+	JNE	16$.S			;Yes
+	ORB	AL, #XMTCTL$2BITSTOP	;No - use 2 stop bits
+16$:	ANDW	tdb_sdxmtctl.B[ESI], #XMTCTL$SETDTR|XMTCTL$SETRTS
+	ORW	tdb_sdxmtctl.B[ESI], AX
+setxmtctl:
+	MOVW	AX, tdb_sdxmtctl.B[ESI]
+	SHLL	EAX, #16t
+	MOVW	AX, #X_XMTCTL
+	ADDL	EAX, tdb_sdsram.B[ESI]
+	MOVL	EDX, tdb_sdaiopreg.B[ESI]
+	A2IOP	SERD_XADDR
+	OUTL	[DX]
+	RET
+
+parvalue:
+	.BYTE	00h		;TRMP_NONE  = 1 - No parity bit
+	.BYTE	04h		;TRMP_MARK  = 2 - Mark parit
+	.BYTE	06h		;TRMP_SPACE = 3 - Space parity
+	.BYTE	04h		;TRMP_ODD   = 4 - Odd parity
+	.BYTE	06h		;TRMP_EVEN  = 5 - Even parity
+
+notmapped:
+	CLRL	EAX			;Return 0 as mapped size
+	CLRL	EDX			;And 0 as offset
+	RET
+.PAGE
+	.SBTTL	Serial port interrupt routines
+
+;The following is a prototype for the interrupt service routine entry code
+;  - this code is copied for each board by seraddunit
+
+serdint:PUSHAL				;Save all registers
+	PUSHL	DS
+	PUSHL	ES
+	PUSHL	FS
+	PUSHL	GS
+	MOVW	AX, #GS_DATA		;Make our data addressable
+	MOVL	DS, EAX
+fix1:	MOVL	EDI, #0			;Get offset of BDB for this board
+fix2:	JMP	serdintcom		;Go to common routine
+
+SERDINTSZ=!$-serdint
+
+;Common interrupt routine
+
+serdintcom:
+	MOVL	EDX, bdb_brdreg.B[EDI]	;Get base IO address for board
+	A2IOP	SERD_MINTCTL		;Disable interrupts for board
+	ANDB	bdb_mintctl.B[EDI], #~MINTCTL$ENBINT
+	MOVB	AL, bdb_mintctl.B[EDI]
+	OUTB	[DX]
+	CALL	knlReqFork##		;Request fork for board
+	MOVB	AL, #INT_EOI		;Release interrupt controller
+	CLI
+	CMPB	bdb_intlvl.B[EDI], #7	;High interrupt?
+	JBE	4$.S			;No
+	OUTB	P_INC2P0		;Yes - release 2nd interrupt controller
+4$:	OUTB	P_INC1P0		;Always release 1st interrupt controller
+	JMP	knlDismissInt2##	;Check for scheduling and dismiss
+.PAGE
+	.SBTTL	serdfork - Device fork routine
+
+;Get here as a result of any interrupt for the board.  Since the board has as
+;  much buffering as it does, we don't bother doing anything at interrupt
+;  level!  Everything is deferred to fork level.  When get here, all interrupts
+;  for the board have been disabled.
+;	c{EDI} = Offset of BDB for board
+
+2$:	MOVL	EDI, adb_bdb.B[EBX]
+serdfork:
+	MOVL	EDX, bdb_brdreg.B[EDI]	;Get base IO address for board
+	A2IOP	SERD_MINTID
+	INB	[DX]			;Get the board's interrupt bits
+	ANDL	EAX, #0Fh.B
+	JE	6$.S			;If no more interrupts
+	MOVB	AL, CS:adbpri-1[EAX]
+	MOVL	EBX, bdb_adb.B[EDI+EAX]	;Get offset of ADB for AIOP with an
+	TESTL	EBX, EBX		;  interrupt request
+	JE	6$.S
+forknxt1:
+	MOVL	EDX, adb_istsreg.B[EBX]
+	INB	[DX]			;Get AIOP's interrupt status
+	BSFL	ECX, EAX
+	JE	2$.S			;If no more interrupts here
+	MOVL	ESI, adb_tdb[EBX+ECX*4]	;Get offset of TDB for channel with an
+	TESTL	ESI, ESI		;  interrupt request
+	JE	6$.S
+forknxt2:
+	MOVL	EDX, tdb_sdiidreg.B[ESI] ;Get interrupt bits for channel
+	INB	[DX]
+	ANDL	EAX, #3Fh
+	MOVB	AL, CS:intpri[EAX]	;Get highest priority interrupt
+	JMPIL	CS:forkdsp[EAX]		;Dispatch on the interrupt
+
+;Here when have no more interrupt conditions to service
+
+6$:	A2IOP	SERD_MINTCTL-SERD_MINTID ;Enable interrupts for board
+	ORB	bdb_mintctl.B[EDI], #MINTCTL$ENBINT
+	MOVB	AL, bdb_mintctl.B[EDI]
+	OUTB	[DX]
+	RET				;Thats all
+
+;ADB selection priority table - index is by 4-bit value read from the interface
+
+adbpri:	.BYTE	     0t, 4t, 0t, 8t, 0t, 4t, 0t
+	.BYTE	12t, 0t, 4t, 0t, 8t, 0t, 4t, 0t
+
+;Interrupt priority table - index is by 6-bit interrupt status value read
+;  from the interface
+
+RCV=!4t
+CD =!8t
+CTS=!12t
+DSR=!16t
+SRC=!20t
+XMT=!24t
+
+	.MOD	4
+intpri:	.BYTE	0  , DSR, CTS, CTS, CD , CD , CD , CD
+	.BYTE	SRC, DSR, CTS, CTS, CD , CD , CD , CD
+	.BYTE	XMT, DSR, CTS, CTS, CD , CD , CD , CD
+	.BYTE	SRC, DSR, CTS, CTS, CD , CD , CD , CD
+	.BYTE	RCV, RCV, RCV, RCV, RCV, RCV, RCV, RCV
+	.BYTE	RCV, RCV, RCV, RCV, RCV, RCV, RCV, RCV
+	.BYTE	RCV, RCV, RCV, RCV, RCV, RCV, RCV, RCV
+	.BYTE	RCV, RCV, RCV, RCV, RCV, RCV, RCV, RCV
+
+;Fork (interrupt request) dispatch table - index is by value from priority
+;  table
+
+forkdsp:.LONG	forknone	;No interrupts
+	.LONG	forkrcv		;Receive ready interrupt
+	.LONG	forkcd		;CD change interrupt
+	.LONG	forkcts		;CTS change interrupt
+	.LONG	forkdsr		;DSR change interrupt
+	.LONG	forksrc		;Special receive condition interrupt
+	.LONG	forkxmt		;Output done interrupt
+.PAGE
+;Here if there are no interrupts pending for the channel
+
+forknone:
+	MOVL	EBX, tdb_sdadb.B[ESI]	;Restore offset of the ADB
+	JMP	forknxt1		;Go check for other requests
+
+;Here for receive ready interrupt
+
+forkrcv:MOVL	EDX, tdb_sddatareg.B[ESI]
+	A2IOP	SERD_FIFOCNT0-SERD_DATA0
+	CLRL	EAX
+	INW	[DX]			;Get number of characters available now
+	TESTL	EAX, EAX
+	JE	forknxt2		;If none (just to be safe!)
+	PUSHL	EBX			;Have some - save ADB offset
+	PUSHL	EDI			;Save BDB offset
+	PUSHL	EAX			;Stack the count
+	A2IOP	SERD_CHNSTS0-SERD_FIFOCNT0 ;Point to the line status register
+	INB	[DX]			;Get line status
+	MOVL	EDX, #KB$IMAGE
+	ANDB	tdb_stsinp+1.B[ESI], #~{TSI$CARDET>8}
+	TESTB	AL, #CHNSTS$CDACT	;Have carrier now?
+	JE	2$.S			;No
+	ORB	tdb_stsinp+1.B[ESI], #TSI$CARDET>8 ;Yes
+	ORL	EDX, #KB$CARDET
+2$:	PUSHL	EDX
+4$:	MOVL	EDX, tdb_sddatareg.B[ESI] ;Restore register number
+	MOVL	EAX, [ESP]		;Get bits
+	INB	[DX]			;Get character
+	CALL	knlTrmInp##		;Process the character
+	DECL	4.B[ESP]		;Have more to get?
+	JNE	4$.S			;Yes - continue
+	ADDL	ESP, #8t.B		;No - fix up the stack
+	POPL	EDI			;Restore BDB offset
+	POPL	EBX			;Restore ADB ofsset
+	JMP	forknxt2		;Continue
+
+;Here for special receive condition interrupt
+
+forksrc:MOVL	EDX, tdb_sddatareg.B[ESI] ;Get the channel status bits
+	A2IOP	SERD_CHNSTS0-SERD_DATA0
+	INW	[DX]
+	TESTB	AH, #CHNSTS$RCVBREAK>8t	;Do we have a break?
+	JE	forknxt2		;No - ignore the rest for now!
+	CALL	knlTrmBreak##		;Yes
+	JMP	forknxt2
+
+;Here for xmit done interrupt
+
+forkxmt:CALL	serdresume
+	JMP	forknxt2
+
+;Here for CTS change interrupt
+
+forkcts:MOVL	EDX, tdb_sddatareg.B[ESI] ;Get the channel status bits
+	A2IOP	SERD_CHNSTS0-SERD_DATA0
+	INB	[DX]
+	TESTB	AL, #CHNSTS$CTSACT	;Is CTS active now?
+	JE	6$.S			;No
+	CALL	knlTrmCtsOn##		;Yes
+	JMP	forknxt2
+
+6$:	CALL	knlTrmCtsOff##
+	JMP	forknxt2
+
+;Here for DSR change interrupt
+
+forkdsr:MOVL	EDX, tdb_sddatareg.B[ESI] ;Get the channel status bits
+	A2IOP	SERD_CHNSTS0-SERD_DATA0
+	INB	[DX]
+	TESTB	AL, #CHNSTS$DSRACT	;Is DSR active now?
+	JE	8$.S			;No
+	CALL	knlTrmDsrOn##		;Yes
+	JMP	forknxt2
+
+8$:	CALL	knlTrmDsrOff##
+	JMP	forknxt2
+
+;Here for CD change interrupt
+
+forkcd:	MOVL	EDX, tdb_sddatareg.B[ESI] ;Get the channel status bits
+	A2IOP	SERD_CHNSTS0-SERD_DATA0
+	INB	[DX]
+	TESTB	AL, #CHNSTS$DSRACT	;Is carrier detect active now?
+	JE	10$.S			;No
+	CALL	knlTrmCarDet##		;Yes
+	JMP	forknxt2
+
+10$:	CALL	knlTrmCarLoss##
+	JMP	forknxt2
+.PAGE
+	.SBTTL	tf_open - serdopen - Open device
+
+;Here for the tf_open dispatch - Open device - this routine sets the baud rate
+;  to the initial value and sets up the DTR and RTS modem control outputs as
+;  follows:
+;    RTS: reverse RTS flow control: CLEAR
+;         otherwise:                SET
+;    DTR: reverse DTR flow control: CLEAR
+;         full modem control:       CLEAR
+;         otherwise:                SET
+;	c{ESI} = Offset of TDB
+;	CALL	serdopen
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+
+serdopen:
+	CALL	serdidle		;Make sure set to idle state
+	CALL	serdclrout		;Clear the output buffer
+	BTL	SS:xffCmd##, #O%PHYS	;Are we open for physical I/O?
+	JC	setinte.S		;Yes - skip control lines
+	MOVB	AL, #0FFh		;Assume should set RTS
+	TESTB	tdb_flow.B[ESI], #TFC$IRTS ;RTS flow control?
+	JE	2$.S			;No - always set RTS
+	MOVB	AL, #0
+2$:	CALL	serdsetrts
+	MOVB	AL, #0FFh		;Always set DTR
+	CALL	serdsetdtr
+setinte:ANDB	tdb_stsinp+1.B[ESI], #~{TSI$CARDET>8} ;Assume don't have
+	MOVL	EDX, tdb_sddatareg.B[ESI]	      ;  carrier
+	A2IOP	SERD_CHNSTS0-SERD_DATA0	;Get the channel status bits
+	INB	[DX]
+	TESTB	AL, #CHNSTS$DSRACT	;Is carrier detect active now?
+	JE	6$.S			;No
+	ORB	tdb_stsinp+1.B[ESI], #TSI$CARDET>8 ;Yes - indicate that
+6$:	RET
+.PAGE
+	.SBTTL	tf_idle - serdidle - Set to idle state
+
+;Here for the tf_idle dispatch - Set to idle state
+;	c{ESI} = Offset of TDB
+;	CALL	serdidle
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+
+serdidle:
+	MOVB	AL, tdb_icsize.B[ESI]	;Set parameters to their idle values
+	MOVB	tdb_csize.B[ESI], AL
+	MOVB	AL, tdb_ipar.B[ESI]
+	MOVB	tdb_par.B[ESI], AL
+	MOVL	EAX, tdb_ioutr.B[ESI]
+	MOVL	tdb_outr.B[ESI], EAX
+	CALL	setbaudrate		;Set the hardware to match
+	MOVL	EAX, tdb_iinpr[ESI]
+	MOVL	tdb_inpr.B[ESI], EAX
+	CLRL	EAX
+	TESTB	tdb_stsmisc.B[ESI], #TSM$SESSION ;Are sessions enabled?
+	JE	4$.S			;No - take ctl lines down
+	MOVB	AL, #0FFh		;Yes - put ctl lines up
+4$:	PUSHL	EAX
+	CALL	serdsetrts
+	POPL	EAX
+	TESTB	tdb_modem.B[ESI], #TMC$MODEM ;Is this a modem line?
+	JE	6$.S			;No
+	CLRL	EAX			;Yes - force DTR low!
+6$:	CALL	serdsetdtr
+	JMP	setlhw			;And return
+.PAGE
+	.SBTTL	tf_resume - serdresume - Resume output
+
+;Here for the tf_resume dispatch - Resume output
+;	c{ESI} = Offset of TDB
+;	CALL	serdresume
+
+serdresume:
+	MOVB	tdb_sdouttoc.B[ESI], #0	;Stop the output timer
+	CALL	knlTrmDoEcho##		;See if need to echo now
+	JMP	knlTrmOutDone##		;Go wake up someone
+.PAGE
+	.SBTTL	tf_doutchr - serddoutchr - Output character at main program level
+
+;Here for the tf_doutchr dispatch - Output character at main program level
+;	c(AL)  = Character to output
+;	c{ESI} = Offset of TDB
+;	CALL	serddoutchr
+;	c{EAX} = Error code
+;	c{ECX} = Number of bytes output
+;	c{EBX} = Status bits
+
+serddoutchr:
+	PUSHL	EAX
+	MOVL	EBX, ESP
+	PUSHL	SS
+	POPL	ES
+	MOVL	ECX, #1
+	CALL	serddoutblk
+	POPL	EDX
+	RET
+.PAGE
+	.SBTTL	tf_doutstr - serddoutstr - Output string at main program level
+
+;Here for the tf_doutstr dispatch - Output string at main program level
+;	c{ES:EBX} = Address of string
+;	c{EDX}    = Time-out value
+;	c{ESI}    = Offset of TDB
+;	CALL	serddoutstr
+;	c{EAX} = Error code
+;	c{ECX} = Number of bytes output
+;	c{EBX} = Status bits
+
+	FAULTHDR
+2$:	POPL	EDI
+	JMP	knlQAdrErr0##
+
+serddoutstr:
+	TESTL	ECX, ECX		;Did he specify a length limit?
+	JNE	4$.S			;Yes
+	DECL	ECX			;No - get a very large value
+4$:	PUSHL	EDI
+	MOVL	EDI, EBX		;Determine actual string length
+	MOVB	AL, #0
+	CLD
+	IFFAULT	2$
+	RNSCASB	[EDI]
+	JNE	6$.S
+	DECL	EDI
+6$:	MOVL	ECX, EDI
+	SUBL	ECX, EBX
+	POPL	EDI
+
+	.SBTTL	tf_doutblk - serddoutblk - Output block at main program level
+
+;Here for the tf_doutblk dispatch - Output block at main program level - must
+;  be called at main program level raised to fork level
+;	c{ECX}    = Number of characters to output
+;	c{ES:EBX} = Address of block
+;	c{EDX}    = Time-out value
+;	c{ESI}    = Offset of TDB
+;	CALL	serddoutblk
+;	c{EAX} = Error code
+;	c{ECX} = Number of bytes output
+;	c{EBX} = Status bits
+
+$$$=!0
+FRM ob_left   , 4t
+FRM ob_done   , 4t
+FRM ob_timeout, 4t
+ob_SIZE=!$$$
+
+serddoutblk:
+	ENTER	ob_SIZE, 0
+	MOVL	ob_left.B[EBP], ECX
+	MOVL	ob_timeout.B[EBP], EDX
+	CLRL	EAX
+	MOVL	ob_done.B[EBP], EAX
+	JREGZ	ECX, outrtn
+	TESTB	tdb_stsout.B[ESI], #TSO$JUNK|TSO$JUNKX ;Are we junking output?
+	JNE	20$.S			;Yes
+	TESTB	tdb_stsout.B[ESI], #TSO$OUTA ;Is output active now?
+	JNE	22$.S			;Yes - must wait
+	MOVL	EDX, tdb_sddatareg.B[ESI] ;See how much the board can take now
+	A2IOP	SERD_FIFOCNT0-SERD_DATA0
+	CLRL	EAX
+	INB	[DX]
+	MOVL	ECX, #255t
+	SUBL	ECX, EAX
+	JE	outwt.S
+	A2IOP	SERD_DATA0-SERD_FIFOCNT0 ;Point to the data register
+	CMPL	ECX, ob_left.B[EBP]	;Can we take more than we have?
+	JBE	10$.S			;No
+	MOVL	ECX, ob_left.B[EBP]	;Yes - only output what we have
+10$:	SUBL	ob_left.B[EBP], ECX	;Reduce amount to do
+	PUSHL	ESI
+	MOVL	ESI, EBX		;Set up pointer for output
+	ADDL	EBX, ECX		;Bump buffer offset
+	ADDL	ob_done.B[EBP], ECX
+	CLD
+	TESTL	ESI, #01
+	JE	12$.S
+	IFFAULT	outae
+	OUTSB	ES:[ESI]
+	DECL	ECX
+	JE	16$.S
+12$:	MOVL	EAX, ECX
+	SHRL	ECX, #1
+	JE	14$.S
+	IFFAULT	outae
+	ROUTSW	ES:[ESI]
+14$:	TESTB	AL, #01h
+	JE	16$.S
+	IFFAULT	outae
+	OUTSB	ES:[ESI]
+16$:	POPL	ESI
+	CMPL	ob_left.B[EBP], #0.B	;Did we output everything?
+	JNE	outwt.S			;No
+outdn:	MOVL	EBX, #QSTS$DONE		;Yes
+outrtn:	MOVL	ECX, ob_done.B[EBP]	;Get amount output
+	LEAVE
+	CLRL	EAX
+	RET				;Finished
+
+;Here if junking output
+
+20$:	MOVL	EAX, ob_left.B[EBP]	;Report that everything was ouput
+	ADDL	ob_done.B[EBP], EAX
+	JMP	outdn.S
+
+;Here if need to wait
+
+outwt:	ORB	tdb_stsout.B[ESI], #TSO$OUTA ;Indicate output is active
+	MOVB	AL, tdb_sdouttov.B[ESI]	;Start the output time-out
+	MOVB	tdb_sdouttoc.B[ESI], AL
+22$:	CMPL	ob_timeout.B[EBP], #0.B	;Really want to wait?
+	JE	24$.S			;No - fail
+	MOVL	EBX, #QSTS$WAIT		;Yes - indicate should wait
+	JMP	outrtn.S
+
+;Here if should not wait at all
+
+24$:	MOVL	EAX, #ER_NORSP
+	JMP	26$.S
+
+;Here if address error
+
+	FAULTHDR
+outae:	MOVL	EAX, #ER_ADRER
+26$:	MOVL	ECX, ob_done.B[EBP]
+	LEAVE
+	MOVL	EBX, #QSTS$DONE
+	RET
+.PAGE
+	.SBTTL	tf_qoutblk - serdqoutblk - Output block at fork level
+
+;Here for the tf_qoutblk dispatch - Output block at fork level
+;	c{ECX}    = Number of characters to output
+;	c{ES:EBX} = Address of block
+;	c{ESI}    = Offset of TDB
+;	CALL	serdqoutblk
+;	c{EAX} = Error code
+;	c{ECX} = Amount output
+;	c{ESI} = Status bits
+
+serdqoutblk:
+	ENTER	ob_SIZE, 0
+	MOVL	ob_left.B[EBP], ECX
+	CLRL	EAX
+	MOVL	ob_done.B[EBP], EAX
+	TESTL	ECX, ECX
+	JE	22$
+	ORB	tdb_stsout+1.B[ESI], #TSO$QOWAIT>8
+2$:	TESTB	tdb_stsout.B[ESI], #TSO$OUTA ;Is output active now?
+	JE	4$.S			;No - go on
+	CALL	knlXfWaitNTO##		;Yes - must wait
+	JNC	2$.S			;If OK
+	JMP	20$.S			;If error
+
+4$:	TESTB	tdb_omode+3.B[ESI], #{TOM$PLP1|TOM$PLP2}>24t
+					;Want PLP packet output?
+	JNE	plpoutblk		;Yes
+6$:	TESTB	tdb_stsout.B[ESI], #TSO$JUNK|TSO$JUNKX ;Are we junking output?
+	JNE	26$.S			;Yes
+	MOVL	EDX, tdb_sddatareg.B[ESI] ;See how much the board can take now
+	A2IOP	SERD_FIFOCNT0-SERD_DATA0
+	CLRL	EAX
+	INB	[DX]
+	MOVL	ECX, #255t
+	SUBL	ECX, EAX
+	JE	16$.S
+	A2IOP	SERD_DATA0-SERD_FIFOCNT0 ;Point to the data register
+	CMPL	ECX, ob_left.B[EBP]	;Can we take more than we have?
+	JBE	8$.S			;No
+	MOVL	ECX, ob_left.B[EBP]	;Yes - only output what we have
+8$:	SUBL	ob_left.B[EBP], ECX	;Reduce amount to do
+	PUSHL	ESI
+	MOVL	ESI, EBX		;Set up pointer for output
+	ADDL	EBX, ECX		;Bump buffer offset
+	ADDL	ob_done.B[EBP], ECX
+	CLD
+	TESTL	ESI, #01
+	JE	10$.S
+	OUTSB	ES:[ESI]
+	DECL	ECX
+	JE	14$.S
+10$:	MOVL	EAX, ECX
+	SHRL	ECX, #1
+	JE	12$.S
+	ROUTSW	ES:[ESI]
+12$:	TESTB	AL, #01h
+	JE	14$.S
+	OUTSB	ES:[ESI]
+14$:	POPL	ESI
+	CMPL	ob_left.B[EBP], #0.B	;Did we output everything?
+	JE	26$.S			;Yes - all finished now
+16$:	ORB	tdb_stsout.B[ESI], #TSO$OUTA ;No - indicate output is active
+;;;;;;	BTL	dcb_cmd.B[EDI], #O%FNR	;Should we wait?
+;;;;;;	JC	28$.S			;No
+	MOVB	AL, tdb_sdouttov.B[ESI]	;Yes - start the output time-out
+	MOVB	tdb_sdouttoc.B[ESI], AL
+	CALL	knlXfWaitNTO##		;Wait until have more space
+	JNC	6$.S			;Go on if OK
+20$:	ANDB	tdb_stsout+1.B[ESI], #~{TSO$QOWAIT>8}
+22$:	CLRL	EAX
+24$:	MOVL	EBX, #QSTS$DONE		;Finished
+	MOVL	ECX, ob_done.B[EBP]	;Get amount output
+	LEAVE
+	RET				;Finished
+
+;Here if junking output
+
+26$:	MOVL	EAX, ob_left.B[EBP]	;Report that everything was ouput
+	ADDL	ob_done.B[EBP], EAX
+	JMP	20$.S
+
+;Here if should fail if busy
+
+28$:	MOVL	EAX, #ER_NTRDY
+	JMP	24$.S
+.PAGE
+;Here for Parley mode output - This is the same as normal mode except that we
+;  must insert the beginning of packet and end of packet characters and insert
+;  escapes before the reserved characters.
+
+plpoutblk:
+	MOVL	EDX, tdb_sddatareg.B[ESI] ;See how much the board can take now
+	A2IOP	SERD_FIFOCNT0-SERD_DATA0
+	CLRL	EAX			;Note that we only allow 252 characters
+	INB	[DX]			;  so we don't have to check for space
+	MOVL	ECX, #252t		;  when inserting prefixes and we will
+	SUBL	ECX, EAX		;  always have room for an end of packet
+	JG	2$.S			;  character!
+	ORB	tdb_stsout.B[ESI], #TSO$OUTA ;No - indicate output is active
+	MOVB	AL, tdb_sdouttov.B[ESI]	;Start the output time-out
+	MOVB	tdb_sdouttoc.B[ESI], AL
+	CALL	knlXfWaitNTO##		;Wait until have more space
+	JC	18$.S
+2$:	A2IOP	SERD_DATA0-SERD_FIFOCNT0 ;Point to the data register
+	MOVB	AL, #0F0h		;Output beginning of packet character
+	OUTB	[DX]
+4$:	MOVB	AL, ES:[EBX]		;Get next character
+	INCL	EBX
+	CMPB	AL, #'S'-40h		;Might this be XON or XOFF?
+	JA	8$.S			;No
+	JE	6$.S			;If XOFF
+	CMPB	AL, #'Q'-40h		;XON?
+	JNE	12$.S
+6$:	TESTB	tdb_omode+3.B[ESI], #TOM$PLP2>24t ;Yes - need prefix for it?
+	JE	12$.S			;No
+	SUBB	AL, #13t
+	JMP	10$.S
+
+8$:	CMPB	AL, #0F0h		;Need prefix?
+	JB	12$.S			;No
+	CMPB	AL, #0F2h		;Maybe
+	JA	12$.S			;No
+	SUBB	AL, #0EFh
+10$:	MOVB	AH, AL
+	MOVB	AL, #0F2h		;Get prefix code
+	OUTB	[DX]
+	DECL	ECX
+	MOVB	AL, AH
+12$:	OUTB	[DX]
+	DECL	SS:xffCount##		;Have more to output?
+	JLE	16$.S			;No - finished here
+	DECL	ECX			;Yes - can we take more now?
+	JNS	4$.S			;Yes - continue
+14$:	ORB	tdb_stsout.B[ESI], #TSO$OUTA ;No - indicate output is active
+	MOVB	AL, tdb_sdouttov.B[ESI]	;Start the output time-out
+	MOVB	tdb_sdouttoc.B[ESI], AL
+	CALL	knlXfWaitNTO##		;Wait until have more space
+	JC	18$.S			;If error
+	MOVL	EDX, tdb_sddatareg.B[ESI] ;See how much the board can take now
+	A2IOP	SERD_FIFOCNT0-SERD_DATA0
+	CLRL	EAX
+	INB	[DX]
+	A2IOP	SERD_DATA0-SERD_FIFOCNT0
+	MOVL	ECX, #253t
+	SUBL	ECX, EAX
+	JG	4$.S
+	JMP	14$.S
+
+;Here when finished
+
+16$:	MOVB	AL, #0F1h
+	OUTB	[DX]
+	CLRL	EAX
+18$:	ANDB	tdb_stsout+1.B[ESI], #~{TSO$QOWAIT>8}
+	MOVL	EBX, #QSTS$DONE		;Finished
+	MOVL	ECX, ob_done.B[EBP]	;Get amount output
+	LEAVE
+	RET				;Finished
+.PAGE
+	.SBTTL	tf_clrout - serdclrout - Clear output ring buffer
+
+;Here for the tf_clrout dispatch - Clear output ring buffer
+
+serdclrout:
+	MOVW	AX, tdb_sdxmtctl.B[ESI]	;Disable the transmitter
+	ANDB	AH, #~{XMTCTL$ENABLE>8t}
+	SHLL	EAX, #16t
+	MOVW	AX, #X_XMTCTL
+	ADDL	EAX, tdb_sdsram.B[ESI]
+	MOVL	EDX, tdb_sdaiopreg.B[ESI]
+	A2IOP	SERD_XADDR
+	OUTL	[DX]
+	MOVL	ECX, #2			;Wait for a short time
+	CALL	knlSDelay##
+	A2IOP	SERD_CMDREG-SERD_XADDR
+	MOVB	AL, tdb_sdport.B[ESI]
+	DECL	EAX
+	ANDB	AL, #07h
+	ORB	AL, #CMDREG$RSTXMTFCR
+	OUTB	[DX]
+	MOVL	ECX, #4t
+	CALL	knlSDelay##
+	ANDB	AL, #07h
+	OUTB	[DX]
+	A2IOP	SERD_XADDR-SERD_CMDREG
+	MOVL	EAX, #X_XMTFOPNT	;Clear transmit FIFO in and out
+	ADDL	EAX, tdb_sdsram.B[ESI]	;  pointers
+	OUTL	[DX]			;This stores index and writes 0 as data
+	A2IOP	SERD_XDATA-SERD_XADDR
+	MOVW	AX, tdb_sdxmtctl.B[ESI]	;Enable the transmitter
+	SHLL	EAX, #16t
+	MOVW	AX, #X_XMTCTL
+	ADDL	EAX, tdb_sdsram.B[ESI]
+	MOVL	EDX, tdb_sdaiopreg.B[ESI]
+	A2IOP	SERD_XADDR
+	OUTL	[DX]
+	ANDB	tdb_stsout.B[ESI], #{~TSO$OUTA}&0FFh ;Make sure output active
+	RET					     ;  is not set
+.PAGE
+	.SBTTL	sechchr - Subroutine to echo character
+
+;Subroutine to echo character - may only be called at fork level
+;	c(AL) = Character
+;	c{ESI} = Offset of TDB
+;	CALL	serechchr
+;	C:set = Should stop echoing
+;	C:clr = Can continue echoing if need to
+
+serdechchr:
+	MOVL	ECX, EAX
+	MOVL	EDX, tdb_sddatareg.B[ESI] ;See how much the board can take now
+	A2IOP	SERD_FIFOCNT0-SERD_DATA0
+	CLRL	EAX
+	INB	[DX]
+	SUBL	EAX, #255t		;Can it take more now?
+	JE	4$.S			;No
+	A2IOP	SERD_DATA0-SERD_FIFOCNT0 ;Yes - point to the data register
+	MOVL	EAX, ECX
+	OUTB	[DX]			;Output the character
+	CLC
+	RET				;Finished
+
+;Here if cannot echo the character now
+
+4$:	STC
+	RET
+.PAGE
+	.SBTTL	tf_dspmode - serddspmode - Get or set display mode
+
+;Here for the tf_dspmode dispatch - Get or set display mode
+;	c{EAX}    = Display mode bits
+;	c{ES:EBX} = Address of data block
+;	CALL	serddspmode
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  c{EAX} = Current display mode
+
+serddspmode:
+	CMPB	AL, #0FFh		;Setting to "serial port" mode?
+	JE	4$.S			;Yes - thats OK
+	TESTB	AL, AL			;No - just want current mode?
+	JNE	knlBadValue##		;No - fail
+4$:	BTL	EAX, #DM%RTNDATA	;Want values returned?
+	JNC	6$.S			;No
+	CLRL	EAX			;Yes - zero stuff we don't support
+	IFFAULT	knlRtnAdrEr##		;Clear dm_textres, dm_prifont, and
+	MOVL	ES:[EBX], EAX		;  dm_secfont
+	IFFAULT	knlRtnAdrEr##
+	MOVL	ES:dm_disptype.B[EBX], EAX
+	MOVL	ES:dm_horiz.B[EBX], EAX
+	MOVL	ES:dm_vert.B[EBX], EAX
+	MOVL	ES:dm_columns.B[EBX], #80t ;THESE SHOULD BE DYNAMIC!!!!!
+	MOVL	ES:dm_rows.B[EBX], #24t
+6$:	MOVL	EAX, #0FFh		;Yes - indicate "serial port" mode
+	RET				;Thats all
+.PAGE
+	.SBTTL	tf_setdtr - serdsetdtr - Set or clear the DTR output
+
+;Here for the tf_setdtr dispatch - Set or clear the DTR modem control output
+;	c(AL)  = New state for bit
+;	c{ESI} = Offset of TDB
+;	CALL	serdsetdtr
+
+serdsetdtr:
+	ANDB	tdb_sdxmtctl+1.B[ESI], #~{XMTCTL$SETDTR>8t} ;Assume clearing DTR
+	CMPB	AL, #0			;Right?
+	JE	2$.S			;Yes
+	ORB	tdb_sdxmtctl+1.B[ESI], #XMTCTL$SETDTR>8t ;No
+2$:	JMP	setxmtctl
+
+	.SBTTL	tf_setrts - serdsetrts - Set or clear the RTS output
+
+;Here for the tf_setrts dispatch - Set or clear the RTS modem control output
+;	c(AL)  = New state for bit
+;	c{ESI} = Offset of TDB
+;	CALL	serdsetrts
+
+serdsetrts:
+	ANDB	tdb_sdxmtctl+1.B[ESI], #~{XMTCTL$SETRTS>8t} ;Assume clearing RTS
+	CMPB	AL, #0			;Right?
+	JE	4$.S			;Yes
+	ORB	tdb_sdxmtctl+1.B[ESI], #XMTCTL$SETRTS>8t ;No
+4$:	JMP	setxmtctl
+.PAGE
+	.SBTTL	tf_getdsb - serdgetdsb - Get data set bits
+
+;Here for the tf_getdsb dispatch - Get data set bits
+;	c{ESI} = Offset of TDB
+;	CALL	serdgetdsb
+;	c{EAX} = Current data set bits:
+;		  Bit 4 = CTS
+;		  Bit 5 = DSR
+;		  Bit 7 = CD
+
+serdgetdsb:
+	MOVL	EDX, tdb_sddatareg.B[ESI] ;Get the channel status bits
+	A2IOP	SERD_CHNSTS0-SERD_DATA0
+	INB	[DX]
+	CLRL	ECX			;Assume no bits set
+	TESTB	AL, #CHNSTS$CTSACT	;Is CTS active now?
+	JE	2$.S			;No
+	ORB	CL, #10h
+2$:	TESTB	AL, #CHNSTS$DSRACT	;Is DSR active now?
+	JE	4$.S			;No
+	ORB	CL, #20h
+4$:	TESTB	AL, #CHNSTS$CDACT	;Is CD active now?
+	JE	6$.S			;No
+	ORB	CL, #80h
+6$:	MOVL	EAX, ECX
+	RET
+.PAGE
+	.SBTTL	tf_finout - serdfinout - Ensure that output is complete
+
+;Here for the tf_finout dispatch - Ensure that output is complete
+;	c{ESI} = Offset of TDB
+;	CALL	serdfinout
+
+serdfinout:
+	MOVL	EAX, #300t*XT_MILLISEC	;Wait for about 1/3 second while the
+	JMP	knlXfTimeWait##		;  UART empties out!
+.PAGE
+	.SBTTL	serdoas - Once-a-second routine
+
+;Once-a-second routine
+
+serdoas:MOVL	ESI, serdftdb		;Point to our first TDB
+2$:	CMPB	tdb_sdouttoc.B[ESI], #0	;Are we timing output?
+	JE	6$.S			;No
+	DECB	tdb_sdouttoc.B[ESI]	;Yes - count it down
+	JNE	6$.S			;If not timed-out
+	INCL	tdb_sdhungcnt.B[ESI]	;Timed-out - count it
+	TOFORK				;Fake up an output done interrupt
+	CALL	forkxmt
+	FROMFORK
+6$:	MOVL	ESI, tdb_nexts.B[ESI]	;Advance to next TDB
+	TESTL	ESI, ESI		;Any more?
+	JNE	2$			;Yes - continue
+	RET				;No - finished
+.PAGE
+	.SBTTL	Data
+
+	DATA
+
+	 .MOD	4
+serdfbdb:.LONG	0		;Offset of first BDB
+serdftdb:.LONG	0		;Offset of first SERD TDB
+serdltdb:.LONG	0		;Offset of last SERD TDB
+irqname: .LONG	'TRMs', 'era', 0, 0
+
+	LKEEND

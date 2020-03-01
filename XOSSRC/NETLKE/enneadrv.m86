@@ -1,0 +1,1459 @@
+	.TITLE	ENNEADRV - Network device driver for NE-2000 & NS EN-16ATX for XOS
+
+;++++
+; This software is in the public domain.  It may be freely copied and used
+; for whatever purpose you see fit, including commerical uses.  Anyone
+; modifying this software may claim ownership of the modifications, but not
+; the complete derived code.  It would be appreciated if the authors were
+; told what this software is being used for, but this is not a requirement.
+
+;   THIS SOFTWARE IS PROVIDED BY THE AUTHORS "AS IS" AND ANY EXPRESS OR
+;   IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
+;   OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+;   IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+;   INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+;   BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS
+;   OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+;   ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR
+;   TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
+;   USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+;----
+
+	.PROC	80486
+	.INCLUD	XOSINC:\XMAC\XOS.PAR
+	.INCLUD	XOSINC:\XMAC\XOSX.PAR
+	.INCLUD	XOSINC:\XMAC\XOSERR.PAR
+	.INCLUD	XOSINC:\XMAC\XOSTIME.PAR
+	.INCLUD	XOSINC:\XMAC\XOSXNET.PAR
+	.INCLUD XOSINC:\XMAC\XOSXEN.PAR
+	.INCLUD XOSINC:\XMAC\PCAT.PAR
+	.INCLUD	XOSINC:\XMAC\XOSLKE.PAR
+	.INCLUD	XOSINC:\XMAC\XOSXLKE.PAR
+
+;This device driver supports the Novell NE1000 and NE2000 and the National
+;  Semiconductor EN-16ATX Ethernet Interfaces.  The NE2000 and EN-16ATX are
+;  supported in both 8 and 16 bit modes.  It also supports PCI network cards
+;  which are NE2000 register compatable.
+
+;Define IO ports on the interface (relative to the base port)
+
+P_8390   =!00h		;        First 8390 register
+P_DATA   =!10h		;(both)  Data register
+P_RESET  =!1Fh		;(both)  Reset register
+
+;Include NS8390 parameter definitions (must follow definition of P_8390)
+
+	.INCLUD	NS8390.PAR
+
+RAM1000=!2000h		;Beginning of RAM memory for NE1000
+RAM2000=!4000h		;Beginning of RAM memory for NE2000
+RINGBGN=!6t		;Beginning of receive ring (page relative to start of
+			;  RAM)
+RINGE8 =!32t		;End of receive ring for 8 bit mode (page relative to
+			;  start of RAM)
+RINGE16=!64t		;End of receive ring for 16 bit mode (page relative to
+			;  start of RAM)
+.PAGE
+MAJV   =!1t
+MINV   =!2t
+EDITNUM=!0t
+
+;1.0.0 - 24-Mar-92
+;	Initial version, created from ENWDADRV 1.0.6
+;1.0.1 - 8-Apr-92
+;	Moved part of sendpkt and all of finxmit to NETCLS, used A2IOP macro
+;1.0.2 - 23-Mar-93
+;	Added support for fragmented output buffers
+;1.2.0 - 27-Mar-01
+;	Added support for PCI NE2000 compatable cards
+
+	LKEHEAD	ENNEADRV, MAJV, MINV, EDITNUM, LKETYPE_DEVICE
+
+;Define offsets in the device dependent part of the IDB for the ennea interface
+;  (Novell NE-1000 and NE-2000 and National Semiconductor EN-16ATX Enthernet
+;  interfaces)
+
+$$$=!idb_SIZE
+BLK idb_enneaboard , 12t	;Board type
+BLK idb_enneaisr   , 1t		;Bits from P_ISR device register
+BLK idb_enneapktsts, 1t		;Receive status bits for current receive packet
+BLK idb_ennearngtak, 1t		;Receive ring taker pointer
+BLK idb_enneamemsz , 1t		;Memory size (in 256 byte blocks)
+BLK idb_enneaoutpkt, 4t		;Offset of current output packet
+BLK idb_enneasndbfr, 4t		;Offset of send buffer
+BLK idb_ennearngbgn, 4t		;Offset of beginning of receive ring buffer
+BLK idb_ennearngend, 4t		;Offset of end of receive ring buffer
+BLK idb_enneaintreq, 1t
+BLK                , 3t
+
+idb_enneaSIZE=!$$$
+.PAGE
+;Device characteristics for ENNEA NET devices
+
+	DATA
+
+	.MOD	4
+enneadctbl:
+ DCHARBGN  1, knlDCharValCom##
+ DCHARENT  CLASS   , TEXT, ,  8, knlDcMsgClass##    , knlDcGetClass##, knlDcSetClass##, 0
+ DCHARENT  TYPE    , TEXT, ,  4, knlDcMsgType##     , knlDcGet4Byte##, 0              , dcb_type
+ DCHARENT  BOARD   , TEXT, , 12, msgboard           , dcgetboard     , 0              , 0
+ DCHARENT  IOREG   , HEXV, ,  4, knlDcMsgIoReg##    , dcgetioreg     , 0              , 0
+ DCHARENT  INT     , DECV, ,  1, knlDcMsgInt##      , dcgetint       , 0              , 0
+ DCHARENT  MEMSIZE , DECV, ,  4, msgmemsize         , dcgetmemsize   , 0              , 0
+ DCHARENT  NETADDR , HEXB, ,  6, msgnetaddr         , dcgetnetaddr   , 0              , 0
+ DCHARENT  PRM     , TEXT, ,  4, msgprm             , dcgetprm       , dcsetprm       , 0
+ DCHARENT  PKTIN   , DECV, ,  4, xosnetMsgPktIn##   , dcgeterror     , dcseterror     , idb_cntpktin
+ DCHARENT  BYTEIN  , DECV, ,  4, knlDcMsgByteIn##   , dcgeterror     , dcseterror     , idb_cntbytein
+ DCHARENT  PKTOUT  , DECV, ,  4, xosnetMsgPktOut##  , dcgeterror     , dcseterror     , idb_cntpktout
+ DCHARENT  BYTEOUT , DECV, ,  4, knlDcMsgByteOut##  , dcgeterror     , dcseterror     , idb_cntbyteout
+ DCHARENT  BCPKTIN , DECV, ,  4, xosnetMsgBcPktIn## , dcgeterror     , dcseterror     , idb_cntbcpktin
+ DCHARENT  NOSAP   , DECV, ,  4, xosnetMsgNoSap##   , dcgeterror     , dcseterror     , idb_cntnosap
+ DCHARENT  BADSIZE , DECV, ,  4, xosnetMsgBadSize## , dcgeterror     , dcseterror     , idb_cntbadsize
+ DCHARENT  BADPNT  , DECV, ,  4, msgbadpnt          , dcgeterror     , dcseterror     , idb_cntbadpnt
+ DCHARENT  FIXEDCNT, DECV, ,  4, xosnetMsgFixedCnt##, dcgeterror     , dcseterror     , idb_cntfixedcnt
+ DCHARENT  NOSBFR  , DECV, ,  4, xosnetMsgNoSBfr##  , dcgeterror     , dcseterror     , idb_cntnosbfr
+ DCHARENT  NOIBFR  , DECV, ,  4, msgnoibfr          , dcgetnoibfr    , dcseterror     , idb_cntnoibfr
+ DCHARENT  IFRAME  , DECV, ,  4, msgfrmerr          , dcgetfrmerr    , dcseterror     , idb_cntfa
+ DCHARENT  ICRC    , DECV, ,  4, xosnetMsgCrcErr##  , dcgetcrcerr    , dcseterror     , idb_cntcrc
+ DCHARENT  IOVRRN  , DECV, ,  4, xosnetMsgOvrErr##  , dcgeterror     , dcseterror     , idb_cntrover
+ DCHARENT  OCSEN   , DECV, ,  4, msgxcsenerr        , dcgeterror     , dcseterror     , idb_cntcsense
+ DCHARENT  OUNDRN  , DECV, ,  4, msgxunderr         , dcgeterror     , dcseterror     , idb_cntxunder
+ DCHARENT  OHUNG   , DECV, ,  4, xosnetMsgXHung##   , dcgeterror     , dcseterror     , idb_cntxhung
+ DCHARENT  OHTBT   , DECV, ,  4, msgxhtbterr        , dcgeterror     , dcseterror     , idb_cnthrtbt
+ DCHARENT  OOWC    , DECV, ,  4, msgxowcerr         , dcgeterror     , dcseterror     , idb_cntowcol
+ DCHARENT  OCOL    , DECV, ,  4, msgxcolerr         , dcgeterror     , dcseterror     , idb_cntnumcol
+ DCHARENT  OXCOL   , DECV, ,  4, msgxxcolerr        , dcgeterror     , dcseterror     , idb_cntabort
+
+	CODE
+
+msgboard:   DCHARINFO  {Board type}
+msgnetaddr: DCHARINFO  {Physical network address}
+msgmemsize: DCHARINFO  {Buffer memory size (KB)}
+msgprm:     DCHARINFO  {Promiscuous receive mode}
+msgbadpnt:  DCHARINFO  {Discarded - bad ring pointer}
+msgnoibfr:  DCHARINFO  {Discarded - no interface buffer available}
+msgfrmerr:  DCHARINFO  {Number of input framing errors}
+msgxcsenerr:DCHARINFO  {Number of output carrier lost errors}
+msgxunderr: DCHARINFO  {Number of output underrun errors}
+msgxhtbterr:DCHARINFO  {Number of output heartbeat errors}
+msgxowcerr: DCHARINFO  {Number of output out of window collisions}
+msgxcolerr: DCHARINFO  {Number of output collisions}
+msgxxcolerr:DCHARINFO  {Number of excessive output collisions}
+.PAGE
+;Protocol translation table which converts from standard internal protocol
+;  values to device protocol values
+
+	.MOD	4
+etypetbl:
+	.LONG	-1		;	  =80000000 - Illegal
+	.BYTE	81, 0BA, 0, 0	;PROT_SSL1=80000001 - SSL 1st Ethernet protocol
+	.BYTE	81, 0BB, 0, 0	;PROT_SSL2=80000002 - SSL 2nd Ethernet protocol
+	.BYTE	81, 0BC, 0, 0	;PROT_SSL3=80000003 - SSL 3rd Ethernet protocol
+	.BYTE	81, 0BD, 0, 0	;PROT_SSL4=80000004 - SSL 4th Ethernet protocol
+	.BYTE	81, 0BE, 0, 0	;PROT_SSL5=80000005 - SSL 5th Ethernet protocol
+	.BYTE	81, 0BF, 0, 0	;PROT_SSL6=80000006 - SSL 6th Ethernet protocol
+	.BYTE	81, 0C0, 0, 0	;PROT_SSL7=80000007 - SSL 7th Ethernet protocol
+	.BYTE	81, 0C1, 0, 0	;PROT_SSL8=80000008 - SSL 8th Ethernet protocol
+	.LONG	-1		;	  =80000009 - Illegal
+	.LONG	-1		;	  =8000000A - Illegal
+	.LONG	-1		;	  =8000000B - Illegal
+	.LONG	-1		;	  =8000000C - Illegal
+	.LONG	-1		;	  =8000000D - Illegal
+	.LONG	-1		;	  =8000000E - Illegal
+	.LONG	-1		;	  =8000000F - Illegal
+	.BYTE	8 , 0  , 0, 0	;0PROT_IP =80000010 - Internet IP protocol
+	.BYTE	8 , 6  , 0, 0	;PROT_ARP =80000011 - Internet ARP protocol
+	.BYTE	80, 35 , 0, 0	;PROT_RARP=80000012 - Internet RARP protocol
+ETYPEMAX=!{$-etypetbl}/4-1
+.PAGE
+	.MOD	4
+enneadisp:
+	.LONG	xossnpMakeDcb##		;ndf_makedcb  = 00
+	.LONG	xossnpNetIopSapAddr##	;ndf_protocol = 04
+	.LONG	xossnpNetClose1##	;ndf_close1   = 08
+	.LONG	setpkt			;ndb_setpkt   = 0C
+	.LONG	setecho			;ndb_setecho  = 10
+	.LONG	sendpkt			;ndb_sendpkt  = 14
+	.LONG	rcvpkt			;ndb_rcvpkt   = 18
+	.LONG	getetype		;ndb_getetype = 1C
+	.LONG	sethwa			;ndb_sethwa   = 20
+	.LONG	gethwa			;ndb_gethwa   = 24
+	.LONG	knlIFnDev##		;ndb_lnkctl   = 28
+	.LONG	ret002			;ndb_icmpecho = 2C
+.PAGE
+	.SBTTL	Initialization routine
+
+	INITSUB	initennea
+
+initennea:
+	MOVL	EBX, #'ENEA'		;Get network driver name
+	MOVL	EDX, #enneaaddunit	;Get offset of dispatch table
+	CALL	xosnetNewDrive##		;Register this network driver
+	JC	4$.S
+	MOVL	ECX, #codetop
+	CLRL	EDX
+	CLRL	EAX
+4$:	MOVL	EBX, #QSTS$DONE
+	RET
+
+	CODE
+.PAGE
+	.SBTTL	enneaaddunit - Subroutine to add Ethernet interface unit
+
+;Subroutine to add Ethernet interface unit
+;	c(AL) = Unit number
+;	CALL	enneaaddunit
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+
+$$$=!0
+FRM eau_unit   , 4t	;Unit number
+FRM eau_irout  , 4t	;Interrupt routine offset
+FRM eau_ioreg  , 4t	;Base IO register number
+FRM eau_int    , 4t	;Interrupt level
+FRM eau_prm    , 4t	;Promiscuous receive mode request
+FRM eau_config , 1t	;Value for idb_config
+FRM eau_slot   , 1t	;PCI slot number
+FRM eau_bus    , 1t	;PCI bus number
+FRM            , 1t
+FRM eau_rambase, 4t	;Base address for card RAM
+FRM eau_rom    , 16t	;Buffer for reading ROM data
+eau_SIZE=!$$$
+
+	DATA
+
+	.MOD	4
+enneaaublk:				;Parameter block for addunitchar
+ DCHARBGN  2, knlDCharValCom##
+ DCHARENT  UNIT , DECV, , 1, knlDcMsgUnit## , 0, retclc      , 0
+ DCHARENT  TYPE , TEXT, , 4, knlDcMsgType## , 0, retclc      , 0
+ DCHARENT  IOREG, HEXV, , 4, knlDcMsgIoReg##, 0, enneaauioreg, 0
+ DCHARENT  INT  , DECV, , 1, knlDcMsgInt##  , 0, enneaauint  , 0
+ DCHARENT  PRM  , TEXT, , 4, msgprm         , 0, enneaauprm  , 0
+ DCHARENT  BUS  , DECV, , 1, 0              , 0, enneaaubus  , 0
+ DCHARENT  SLOT , DECV, , 1, 0              , 0, enneaauslot , 0
+
+	CODE
+
+enneaaddunit::
+	ENTER	eau_SIZE, 0		;Allocate our stack frame
+	MOVL	eau_unit.B[EBP], EAX	;Store unit number
+	CLRL	EAX
+	MOVL	eau_prm.B[EBP], EAX
+	MOVB	eau_config.B[EBP], AL
+	MOVB	eau_bus.B[EBP], AL
+	DECL	EAX
+	MOVL	eau_ioreg.B[EBP], EAX	;Store illegal values for port and
+	MOVL	eau_int.B[EBP], EAX	;  interrupt level
+	MOVB	eau_slot.B[EBP], AL
+	MOVL	EBX, #enneaaublk	;Process the characteristics
+	MOVB	AL, #0			;Fail if have a bad name
+	CALL	knlAddUnitChar##
+	JC	4$.S			;If error
+	MOVL	EAX, eau_ioreg.B[EBP]	;Did we get all of the values we need?
+	ORL	EAX, eau_int.B[EBP]
+	JNS	2$.S			;Yes
+	CMPB	eau_slot.B[EBP], #0FFh	;Maybe, did we get a PCI slot number?
+	JE	6$.S			;No - fail
+	MOVZBL	EBX, eau_bus.B[EBP]	;Yes - get the card type (class code)
+	SHLL	EBX, #5t
+	ORB	BL, eau_slot.B[EBP]
+	SHLL	EBX, #11t
+	MOVB	BL, #08h
+	CALLI	knxPciReadConfig##
+	JC	4$.S
+	SHRL	EAX, #16t
+	CMPB	AH, #2			;Is it a network card?
+	JNE	10$.S			;No - fail
+	MOVB	BL, #10h		;Yes - get the IO address
+	CALLI	knxPciReadConfig##
+	JC	4$.S
+	TESTB	AL, #01			;Is bit 0 set?
+	JE	10$.S			;No - fail
+	ANDB	AL, #0FCh		;Yes - clear extra bits
+	MOVL	eau_ioreg.B[EBP], EAX	;Store IO address
+	MOVB	BL, #3Ch		;Get the interrupt number
+	CALLI	knxPciReadConfig##
+	JC	4$.S
+	MOVZBL	EAX, AL
+	TESTL	EAX, EAX
+	JE	10$.S
+	MOVL	eau_int.B[EBP], EAX
+
+;Now check to see if the physical interface exists
+
+2$:	CALL	initial			;Reset the board if its there
+	INB	[DX]			;See if we can read command register
+	IOPAUSE				;  back
+	CMPB	AL, #CMD$STOP|CMD$NODMA
+	JE	12$.S			;OK - assume we have an interface
+	MOVL	EAX, #ER_PDNAV		;Interface is not there
+4$:	LEAVE
+	CLRL	ECX
+	MOVL	EBX, #QSTS$DONE
+	TOFORK
+	STC
+ret002:	RET
+
+;Here if a required characteristic is missing
+
+6$:	MOVL	EAX, #ER_CHARM
+	JMP	4$.S
+
+;Here if error while have the exec memory resource
+
+8$:	CALL	knlGiveXRes##
+	JMP	4$.S
+
+;Here if device does not respond correctly
+
+10$:	MOVL	EAX, #ER_PDTYP
+	JMP	4$.S
+
+;Here if the interface exists
+
+12$:	MOVL	eau_rambase.B[EBP], #RAM1000 ;Assume NE1000
+	MOVB	AL, #DCR$FT8|DCR$LBD	;First set up for 8 bit operation
+	CALL	getconfig		;Get configuration data
+	CMPW	eau_rom+14t.B[EBP], #'WW' ;Is this an NE1000?
+	JE	14$.S			;Yes - go on
+	MOVL	eau_rambase.B[EBP], #RAM2000 ;No - must be NE2000
+	CALL	initial			;Initialize it again (board does not
+					;  like to change mode otherwise!)
+	MOVB	AL, #DCR$FT8|DCR$WTS|DCR$LBD ;Set up for 16 bit operation
+	CALL	getconfig		;Get configuration data again
+	CMPW	eau_rom+14t.B[EBP], #'BB' ;NE2000 in eight bit mode?
+	JE	14$.S			;Yes
+	CMPW	eau_rom+14t.B[EBP], #'WW' ;No - NE2000 in sixteen bit mode?
+	JNE	10$.S			;No - fail!
+	ORB	eau_config.B[EBP], #IC$16BITBUS ;Yes - remember that
+14$:	CALL	knlGetXRes##		;Get exec memory resource
+	MOVL	EDX, eau_ioreg.B[EBP]	;Get base IO register
+	LEAL	ECX, 31t[EDX]
+	CALL	knlChkIORegs##		;Are the registers available?
+15$:	JC	8$			;No - fail
+	MOVB	CL, eau_int.B[EBP]	;Yes - get interrupt number
+	CALL	knlChkIRqAvl##		;Is it available?
+	JC	15$.S			;No - fail
+	MOVL	ECX, #ENNEAINTSZ	;Yes - get space for interrupt code
+	CALL	knlGetXCode##
+	JC	16$.S
+	MOVL	eau_irout.B[EBP], EDI	;Remember where code is going
+	MOVL	ESI, #enneaint		;Copy prototype
+	SHRL	ECX, #2
+	MOVB	gdtable+GS_CODEALS+5, #DT_RWDATA+PL_0 ;Enable aliased code space
+	PUSHL	#GS_CODEALS.B
+	POPL	ES
+	CLD
+	RMOVSL	[EDI], ES:[ESI]
+	MOVL	ECX, #idb_mSIZE+idb_enneaSIZE ;Get size for our IDB
+	MOVL	EDX, #enneadctbl	;Get offset of device characteristics
+	MOVL	EAX, eau_unit.B[EBP]	;Get unit number
+	CALL	xosnetMakeIdb##		;Make our IDB
+	JNC	18$.S			;OK
+	CLRL	EBX			;Error
+	MOVL	ES, EBX
+	MOVB	gdtable+GS_CODEALS+5, BL ;Disable the aliased code space
+16$:	JMP	8$
+
+;Here with IDB allocated
+
+18$:	MOVL	idb_typname.B[ESI], #'ENEA';Store type name
+	MOVB	idb_iftype.B[ESI], #IFT_MULTI ;Store interface type
+	MOVB	idb_hwhdrsz.B[ESI], #14t ;Store hardware header size
+	MOVL	idb_hwpktsz.B[ESI], #1500t ;Store maximum packet size
+	MOVB	idb_hlen.B[ESI], #6t	;Store hardware address size
+	MOVB	idb_hwtype+1.B[ESI], #01h ;Store hardware type value for APR
+	MOVB	idb_cntoffset.B[ESI], #en_count ;Store offset of count field
+
+;;;	MOVL	idb_iopprotocol.B[ESI], #xossnpNetIopSapAddr##
+;;;	MOVL	idb_makedcb.B[ESI], #xossnpMakeDcb##
+;;;	MOVL	idb_netclose1.B[ESI], #xossnpNetClose1##
+;;;	MOVL	idb_setpkt.B[ESI], #setpkt
+;;;	MOVL	idb_setecho.B[ESI], #setecho
+;;;	MOVL	idb_sendpkt.B[ESI], #sendpkt
+;;;	MOVL	idb_rcvpkt.B[ESI], #rcvpkt
+;;;	MOVL	idb_getetype.B[ESI], #getetype
+;;;	MOVL	idb_sethwa.B[ESI], #sethwa
+;;;	MOVL	idb_gethwa.B[ESI], #gethwa
+;;;	MOVL	idb_lnkctl.B[ESI], #knlIFnDev##
+;;;	MOVL	idb_icmpecho.B[ESI], #ret002
+
+	MOVL	idb_disp.B[ESI], #enneadisp
+
+	MOVB	idb_state.B[ESI], #LNKS_ESTAB
+	MOVL	idb_xmtavail.B[ESI], #1
+	MOVL	idb_fdisp.B[ESI], #enneafork ;Store offset of fork routine
+	MOVL	EAX, ennealidb		;Link into our list of IDBs
+	MOVL	ennealidb, ESI
+	TESTL	EAX, EAX
+	JE	20$.S
+	MOVL	idb_nextd.B[EAX], ESI
+	JMP	22$.S
+
+20$:	MOVL	enneafidb, ESI
+	MOVL	EBX, #enneaoas		;Set up our once-a-second routine the
+	CALL	knlSetupOAS##		;  first time though here
+22$:	MOVL	EDI, eau_irout.B[EBP]	;Fix up the interrupt code
+	PUSHL	#GS_CODEALS
+	POPL	ES
+	MOVL	ES:{fix1-enneaint}+1.B[EDI], ESI
+	MOVL	EAX, EDI
+	SUBL	EAX, #enneaint
+	SUBL	ES:{fix2-enneaint}+1.B[EDI], EAX
+	CLRL	EAX
+	MOVL	ES, EAX
+	MOVB	gdtable+GS_CODEALS+5, AL ;Disable the aliased code space
+	MOVB	CL, eau_config.B[EBP]	;Get configuration bits
+	CMPL	eau_prm.B[EBP], #0.B	;Want promiscuous receive mode?
+	JE	24$.S			;No
+	ORB	CL, #IC$PRM		;Yes
+24$:	MOVB	idb_config.B[ESI], CL	;Store configuration bits
+	MOVL	idb_enneaboard+0[ESI], #'NE10' ;Assume NE1000
+	MOVL	idb_enneaboard+4[ESI], #'00'
+	MOVL	EAX, eau_rambase.B[EBP]
+	CMPB	AH, #RAM1000>8		;Right?
+	JE	26$.S			;Yes
+	MOVB	idb_enneaboard+2[ESI], #'2' ;No - its an NE2000
+	MOVL	idb_enneaboard+4[ESI], #'00-8' ;Assume 8 bit mode
+26$:	MOVL	idb_enneasndbfr[ESI], EAX
+	ADDL	EAX, #RINGBGN<8
+	MOVL	idb_ennearngbgn[ESI], EAX
+	ADDL	EAX, #{RINGE8-RINGBGN}<8 ;Assume 8 bit mode
+	MOVB	idb_enneamemsz[ESI], #RINGE8
+	TESTB	CL, #IC$16BITBUS	;Right?
+	JE	28$.S			;Yes
+	ADDL	EAX, #{RINGE16-RINGE8}<8 ;No - its 16 bit mode
+	MOVB	idb_enneamemsz[ESI], #RINGE16
+	MOVW	idb_enneaboard+7[ESI], #'16'
+28$:	MOVL	idb_ennearngend[ESI], EAX
+	MOVL	EAX, eau_rom+0.B[EBP]	;Store hardware address in the IDB
+	MOVL	idb_hwaddr+0[ESI], EAX
+	MOVZWL	EAX, eau_rom+4.B[EBP]
+	MOVL	idb_hwaddr+4[ESI], EAX
+	MOVL	EDX, eau_ioreg.B[EBP]
+	MOVL	idb_bioreg.B[ESI], EDX	;Store base IO register number
+	MOVL	EBX, #temp+3		;Build name for interrupt table
+	CLRL	EAX
+	MOVL	1.B[EBX], EAX
+	MOVL	EAX, eau_unit.B[EBP]
+	CALL	knlPutDecNmbr##
+	MOVL	EBX, #temp		;Register our IO registers (this cannot
+	MOVL	EDX, eau_ioreg.B[EBP]	;  fail since we already verified that
+	LEAL	ECX, 31t.B[EDX]		;  they are available!)
+	CALL	knlRegIORegs##
+	MOVL	EDX, #temp
+	MOVL	EBX, eau_irout.B[EBP]	;Get address of interrupt routine
+	MOVB	CL, eau_int.B[EBP]	;Get interrupt number
+	MOVB	idb_intlvl.B[ESI], CL	;Remember it
+	MOVB	CH, #DT_TRAP+PL_0	;Set up our interrupt vector
+	CALL	knlSetIRq##
+	CALL	knlGiveXRes##		;Give up the exec memory resource
+	CALL	enneareset		;Now reset the interface
+	MOVL	ECX, eau_int.B[EBP]	;Enable our interrupt
+	CALL	knlEnableInt##
+	CLRL	EAX			;Get our return value
+	MOVL	ECX, #1
+	MOVL	EBX, #QSTS$DONE
+	LEAVE
+	TOFORK
+	RET
+.PAGE
+;Subroutine to inialize board for addunit
+
+initial:MOVL	EDX, eau_ioreg.B[EBP]	;Reset the board
+	A2IOP	P_RESET
+	INB	[DX]
+	MOVL	ECX, #2
+	CALL	knlSDelay##
+	OUTB	[DX]			;Remove reset request
+	MOVL	ECX, #5
+	CALL	knlSDelay##
+	A2IOP	P_CMDREG-P_RESET	;Point to the 8390 command register
+	MOVB	AL, #CMD$STOP+CMD$NODMA
+	OUTB	[DX]
+	RET
+
+;Subroutine to get board configuration - this routine reads the 6 byte
+;  Ethernet address and the 2 byte configuration code
+;	c(AL) = Bits for P_DCR
+;	CALL	getconfig
+
+getconfig:
+	MOVL	EDX, eau_ioreg.B[EBP]
+	A2IOP	P_DCR
+	OUTB	[DX]
+	IOPAUSE
+	CLRL	EAX
+	A2IOP	P_RSAR0-P_DCR		;Set remote DMA start address
+	OUTB	[DX]
+	IOPAUSE
+	INCL	EDX
+	OUTB	[DX]
+	IOPAUSE
+	MOVB	AL, #32t		;Set remote DMA byte count
+	INCL	EDX
+	OUTB	[DX]
+	IOPAUSE
+	MOVB	AL, #0
+	INCL	EDX
+	OUTB	[DX]
+	IOPAUSE
+	MOVB	AL, #CMD$READ		;Start remote DMA read
+	A2IOP	P_CMDREG-P_RBCR1
+	OUTB	[DX]
+	IOPAUSE
+	A2IOP	P_DATA-P_CMDREG
+	MOVL	ECX, #16t		;Read 16 ROM bytes which contain the
+	LEAL	EDI, eau_rom.B[EBP]	;  boards Ethernet address and the
+	PUSHL	SS			;  bus width indicator
+	POPL	ES
+	CLD
+	RINSB	[EDI]
+	IOPAUSE
+	A2IOP	P_CMDREG-P_DATA		;Disable remote DMA
+	MOVB	AL, #CMD$NODMA
+	OUTB	[DX]
+	RET
+.PAGE
+;Subroutine called by addunitchar for the "IOREG" characteristic
+
+enneaauioreg:
+	CMPL	EAX, #0FFFFh		;Valid port address?
+	JA	4$.S			;No - fail
+	CMPL	EAX, #100h		;Maybe
+	JB	4$.S			;No - fail
+	MOVL	eau_ioreg.B[EBP], EAX	;Yes - store it
+	CLC
+	RET
+
+;Subroutine called by addunitchar for the "INT" characteristic
+
+enneaauint:
+	CMPL	EAX, #15t.B		;Valid interrupt level?
+	JA	4$.S			;No - fail
+	CMPB	AL, #2			;Maybe
+	JB	4$.S			;No - fail
+	JNE	2$.S
+	MOVB	AL, #9
+2$:	MOVL	eau_int.B[EBP], EAX	;Yes - store it
+	RET
+
+;Here if bad characteristic value
+
+4$:	MOVL	EAX, #ER_CHARV		;Get error code
+	STC				;Fail
+	RET
+
+;Subroutine called by addunitchar for the "PRM" parameter
+
+enneaauprm:
+	CMPL	EAX, #'YES'		;Valid value?
+	JE	6$.S			;Yes
+	CMPL	EAX, #'NO'		;Maybe
+	JNE	4$.S			;No - fail
+	CLRL	EAX
+6$:	MOVL	eau_prm.B[EBP], EAX
+	RET
+
+;Subroutine called by addunitchar for the "BUS" parameter
+
+enneaaubus:
+	TESTL	EAX, #0FFFF00h
+	JNE	4$.S
+	MOVB	eau_bus.B[EBP], AL
+	RET
+
+;Subroutine called by addunitchar for the "SLOT" parameter
+
+enneaauslot:
+	TESTL	EAX, #0FFFFE0h
+	JNE	4$.S
+	MOVB	eau_slot.B[EBP], AL
+	RET
+.PAGE
+;Here to get the value of the BOARD characteristic
+
+dcgetboard:
+	MOVL	ESI, dcb_netidb.B[EDI]
+	LEAL	EAX, idb_enneaboard[ESI]
+	RET
+
+;Here to get the value of the IOREG characteristic
+
+dcgetioreg:
+	MOVL	ESI, dcb_netidb.B[EDI]
+	MOVL	EAX, idb_bioreg.B[ESI]
+	CLRL	EDX
+	RET
+
+;Here to get the value of the INT characteristic
+
+dcgetint:
+	MOVL	ESI, dcb_netidb.B[EDI]
+	MOVZBL	EAX, idb_intlvl.B[ESI]
+	CLRL	EDX
+	RET
+
+;Here to get the value of the NETADDR characteristic
+
+dcgetnetaddr:
+	MOVL	ESI, dcb_netidb.B[EDI]
+	MOVL	EAX, idb_hwaddr+0[ESI]
+	MOVL	EDX, idb_hwaddr+4[ESI]
+	RET
+
+;Here to get the value of the MEMSIZE characteristic
+
+dcgetmemsize:
+	MOVL	ESI, dcb_netidb.B[EDI]
+	MOVZBL	EAX, idb_enneamemsz[ESI] ;Get number of memory blocks
+	SHRL	EAX, #2t		;Change to KB
+	CLC
+	RET
+
+;Here to get the value of the PRM characteristic
+
+dcgetprm:
+	MOVL	ESI, dcb_netidb.B[EDI]
+	MOVL	EAX, #'YES'		;Assume YES
+	TESTB	idb_config.B[ESI], #IC$PRM
+	JNE	10$.S
+	MOVL	EAX, #'NO'
+10$:	CLRL	EDX
+	RET
+.PAGE
+;Here to get the value of the IFRAME characteristic
+
+dcgetfrmerr:
+	MOVL	EDX, #P_CNTR0
+	JMP	4$.S
+
+;Here to get the value of the ICRC characteristic
+
+dcgetcrcerr:
+	MOVL	EDX, #P_CNTR1
+	JMP	4$.S
+
+;Here to get the value of the NOIBFR characteristic
+
+dcgetnoibfr:
+	MOVL	EDX, #P_CNTR2
+4$:	MOVL	ESI, dcb_netidb.B[EDI]
+	CLRL	EAX
+	ADDL	EDX, idb_bioreg.B[ESI]	;Point to the counter register
+	INB	[DX]			;Get error count from the interface
+	ADDL	[ESI+EBX], EAX		;Add it in to our count
+	MOVL	EAX, [ESI+EBX]		;Get the updated count value
+	CLRL	EDX			;Only 32 bits
+	RET
+
+;Here to get the value of an error counter which does not require special
+;  handling
+
+dcgeterror:
+	ADDL	EBX, dcb_netidb.B[EDI]	;Point to the count value
+	MOVL	EAX, [EBX]		;Get it
+	CLRL	EDX			;Only 32 bits
+	RET
+
+;Here to set the value of an error counter
+
+dcseterror:
+	ADDL	EBX, dcb_netidb.B[EDI]	;Point to the count value
+	MOVL	[EBX], EAX		;Set it
+	RET				;Thats all
+.PAGE
+;Here to set the value of the PRM characteristic
+
+dcsetprm:
+	MOVL	ESI, dcb_netidb.B[EDI]
+	CALL	knlGetYesNo##
+	JC	10$.S
+	JE	2$.S			;If he said YES
+	ANDB	idb_config.B[ESI], #{~IC$PRM}&0FFh ;He said NO
+	JMP	4$.S
+
+2$:	ORB	idb_config.B[ESI], #IC$PRM
+4$:
+
+;NEED CODE HERE TO CHANGE BIT IN INTERFACE (MAYBE)
+
+10$:	RET
+.PAGE
+	.SBTTL	getetype - Subroutine to get Ethertype value for device
+
+;Subroutine to get Ethertype value for device
+;	c{EAX} = Standard Ethertype value
+;	CALL	getetype
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  c{EAX} = Device Ethertype value
+
+getetype:
+	CMPL	EAX, #-1.B		;Is this the default Ethertype?
+	JE	6$.S			;Yes - pass it through
+	BTZL	EAX, #31t		;No - is this an internal Ethertype ID?
+	JNC	2$.S			;No
+	CMPL	EAX, #ETYPEMAX.B	;Yes - legal Ethertype value?
+	JA	4$.S			;No - fail
+	MOVL	EAX, CS:etypetbl[EAX*4]	;Yes - get corresponding Ethertype value
+	CMPL	EAX, #-1.B		;Valid value?
+	JE	4$.S			;No - fail
+2$:	XCHGB	AL, AH			;Must be above 1500 so as not to
+	CMPL	EAX, #1500t		;  conflict with 802.3 format packets
+	JBE	4$.S
+	XCHGB	AL, AH
+	TESTL	EAX, #0FFFF0000h	;Must be a 16 bit value
+	JE	6$.S			;OK
+4$:	MOVL	EAX, #ER_NILPC		;If bad protocol value
+	STC
+6$:	RET
+.PAGE
+	.SBTTL	sethwa - Subroutine to store remote hardware address in packet
+
+;Subroutine to store remote hardware address in packet
+;	c{EDX,EAX} = Remote hardware address
+;	c{EBX}     = Offset of packet buffer
+;	CALL	sethwa
+
+sethwa:	MOVL	[EBX], EAX
+	MOVW	4.B[EBX], DX
+	RET
+
+	.SBTTL	gethwa - Subroutine to get source hardware address from packet
+
+;Subroutine to get remote hardware address from packet
+;	c{EBX} = Offset of packet buffer
+;	CALL	sethwa
+;	c{EDX,EAX} = Source hardware address
+
+gethwa:	MOVL	EAX, 6.B[EBX]
+	MOVZWL	EDX, 10t.B[EBX]
+	RET
+.PAGE
+	.SBTTL	enneareset - Subroutine to reset Ethernet interface
+
+;Subroutine to reset Ethernet interface
+;	c{ESI} = Offset of IDB
+;	CALL	enneareset
+
+enneareset:
+	MOVL	EDX, idb_bioreg.B[ESI]	;Reset the board
+	A2IOP	P_RESET
+	INB	[DX]
+	MOVL	ECX, #2
+	CALL	knlSDelay##
+	OUTB	[DX]			;Remove reset request
+	MOVL	ECX, #2
+	CALL	knlSDelay##
+	MOVB	AL, #DCR$FT8|DCR$LBD|DCR$ARM ;Set the data configuration reg.
+	TESTB	idb_config.B[ESI], #IC$16BITBUS ;16 bit configuration?
+	JE	2$.S			;No
+	ORB	AL, #DCR$WTS		;Yes - enable word mode
+2$:	A2IOP	P_DCR-P_RESET		;Fifo threshhold = 8 bytes, loopback
+	OUTB	[DX]			;  disabled
+	IOPAUSE
+	CLRL	EAX			;Clear the remote byte count registers
+	A2IOP	P_RBCR0-P_DCR
+	OUTB	[DX]
+	IOPAUSE
+	INCL	EDX
+	OUTB	[DX]
+	IOPAUSE
+	MOVB	AL, #RCR$MON		;Initially disable receiver
+	A2IOP	P_RCR-P_RBCR1
+	OUTB	[DX]
+	IOPAUSE
+	MOVB	AL, #TCR$LBM1		;Set transmitter for loopback
+	A2IOP	P_TCR-P_RCR
+	OUTB	[DX]
+	IOPAUSE
+	MOVB	AL, idb_ennearngend+1[ESI] ;Set receive page stop register
+	A2IOP	P_PSTOP-P_TCR
+	OUTB	[DX]
+	IOPAUSE
+	MOVB	AL, idb_ennearngbgn+1[ESI] ;Set receive page start register
+	A2IOP	P_PSTART-P_PSTOP
+	OUTB	[DX]
+	IOPAUSE
+	A2IOP	P_BNRY-P_PSTART		;Set receive page boundry register
+	OUTB	[DX]
+	IOPAUSE
+	MOVB	AL, idb_enneasndbfr+1[ESI] ;Set the transmit page start
+	A2IOP	P_TPSR-P_BNRY		   ;  register
+	OUTB	[DX]
+	IOPAUSE
+	MOVB	AL, #0FFh		;Clear the interrupt status register
+	A2IOP	P_ISR-P_TPSR
+	OUTB	[DX]
+	IOPAUSE
+	MOVB	AL, #INT$PRX+INT$PTX+INT$TXE+INT$OVW+INT$CNT
+	A2IOP	P_IMR-P_ISR		;Enable the interrupts we want
+	OUTB	[DX]
+	IOPAUSE
+	MOVB	AL, #CMD$STOP+CMD$PG1+CMD$NODMA ;Enable register page 1
+	A2IOP	P_CMDREG-P_IMR
+	OUTB	[DX]
+	IOPAUSE
+	A2IOP	P_NETADR-P_CMDREG	;Set the board's network address
+	LEAL	EBX, idb_hwaddr[ESI]
+	MOVL	ECX, #6
+4$:	MOVB	AL, [EBX]
+	OUTB	[DX]
+	INCL	EDX
+	INCL	EBX
+	LOOP	ECX, 4$
+	IOPAUSE
+	MOVB	AL, idb_ennearngbgn+1[ESI] ;Initialize receive ring putter
+	INCL	EAX			     ;  poitner
+	MOVB	idb_ennearngtak[ESI], AL
+	OUTB	[DX]
+	INCL	EDX
+	IOPAUSE
+	MOVL	ECX, #8			;Clear the multicast address registers
+6$:	OUTB	[DX]
+	INCL	EDX
+	LOOP	ECX, 6$
+	IOPAUSE
+	MOVL	EDX, idb_bioreg.B[ESI]
+	MOVB	AL, #CMD$STOP+CMD$NODMA	;Enable register page 0 again
+	A2IOP	P_CMDREG
+	OUTB	[DX]
+	IOPAUSE
+	MOVB	AL, #CMD$START+CMD$NODMA ;Activate the 8390
+	OUTB	[DX]
+	IOPAUSE
+	MOVB	AL, #0			;Set transmitter for normal operation
+	A2IOP	P_TCR-P_CMDREG
+	OUTB	[DX]
+	IOPAUSE
+	MOVB	AL, #RCR$AB		;Assume not PRM
+	TESTB	idb_config.B[ESI], #IC$PRM ;Right?
+	JE	8$.S			;Yes
+	MOVB	AL, #RCR$AB+RCR$PRO	;No - set the right bit for this
+8$:	A2IOP	P_RCR-P_TCR		;Set receiver for normal operation
+	OUTB	[DX]
+	RET				;Finished
+.PAGE
+	.SBTTL	setecho - Subroutine to set up echo packet header
+
+;Subroutine to set up hardware level packet header for echoed packet - the
+;  packet is set up to be an echo for the current receive packet
+;	c{EBX} = Offset of packet buffer
+;	CALL	setecho
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  c{ECX} = Offset of start of software part of received packet
+;	  c{EDX} = Offset of start of software part of echo packet
+
+setecho:MOVL	EAX, en_srchwadr+0.B[EBX] ;Copy source to destination
+	MOVL	en_dsthwadr+0.B[EBX], EAX
+	MOVW	DX, en_srchwadr+4.B[EBX]
+	MOVW	en_dsthwadr+4.B[EBX], DX
+	JMP	4$.S
+
+	.SBTTL	setpkt - Subroutine to set up packet header
+
+;Subroutine to set up hardware level packet header
+;	c[AX]  = Ethertype value
+;	c{EBX} = Offset of packet buffer
+;	CALL	setpkt
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  c{EDX} = Offset of start of software part of packet
+
+setpkt:	MOVW	en_ethertype.B[EBX], AX	;Store Ethertype value
+4$:	MOVL	EAX, idb_hwaddr+0[ESI]  ;Store our address in the packet
+	MOVL	en_srchwadr+0.B[EBX], EAX ;  as the source address
+	MOVL	EAX, idb_hwaddr+4[ESI]
+	MOVW	en_srchwadr+4.B[EBX], AX
+	MOVB	npb_lpofs.B[EBX], #en_data ;Store offset of next level
+	MOVL	npb_count.B[EBX], #en_data ;Store initial total size
+	LEAL	EDX, en_data.B[EBX]	;Get pointer to next header
+	CLC
+	RET
+.PAGE
+	.SBTTL	sendpkt - Subroutine to send a packet over the network
+
+;Subroutine to send a packet over the network - must be called from fork level,
+;  does not wait for completion
+;	c{EAX} = Ethertype or count value
+;	c{EBX} = Offset of packet to send
+;	c{ESI} = Offset of IDB
+;	CALL	sendpkt
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;  EBX is preserved
+
+sendpkt:CLD
+	PUSHL	EDI
+	MOVL	ECX, npb_count.B[EBX]	;Get amount to output
+	CMPL	ECX, #1514t		;Is the packet too big?
+	JB	2$.S			;No
+	MOVL	ECX, #1514t		;Yes - just use as much as we can!
+2$:	CMPL	ECX, #60t.B		;Is it too short?
+	JAE	4$.S			;No - go on
+	LEAL	EDI, [EBX+ECX]		;Yes - pad it with zeros (this code
+	PUSHL	DS			;  counts on the fact that we never
+	POPL	ES			;  allocate a packet buffer of less
+	SUBL	ECX, #60t.B		;  than 128 bytes, which always has
+	NEGL	ECX			;  room for a 60 byte packet
+	CLRL	EAX
+	RSTOSB	[EDI]
+	MOVL	ECX, #60t
+4$:	MOVL	idb_enneaoutpkt[ESI], EBX ;Save packet offset
+	MOVL	EDX, idb_bioreg.B[ESI]
+	MOVB	AL, #0
+	A2IOP	P_RSAR0			;Set remote DMA start address
+	OUTB	[DX]
+	IOPAUSE
+	MOVB	AL, idb_enneasndbfr+1[ESI]
+	INCL	EDX
+	OUTB	[DX]
+	IOPAUSE
+	INCL	EDX
+	PUSHL	ECX
+	PUSHL	ESI
+	INCL	ECX			;Make sure transfer an even number of
+	ANDB	CL, #0FEh		;  words
+	MOVB	AL, CL			;Set remote DMA byte count
+	OUTB	[DX]
+	IOPAUSE
+	INCL	EDX
+	MOVB	AL, CH
+	OUTB	[DX]
+	IOPAUSE
+	MOVB	AL, #CMD$WRITE		;Start packet write
+	A2IOP	P_CMDREG-P_RBCR1
+	OUTB	[DX]
+	IOPAUSE
+	A2IOP	P_DATA-P_CMDREG
+	MOVL	ESI, EBX
+	SHRL	ECX, #1			;Get number of words
+	ROUTSW	[ESI]			;Copy data to the interface
+	MOVL	ECX, #2
+	CALL	knlSDelay##
+	POPL	ESI
+	POPL	ECX
+	POPL	EDI
+	A2IOP	P_CMDREG-P_DATA		;Disable remote DMA
+	MOVB	AL, #CMD$NODMA
+	OUTB	[DX]
+	MOVL	EDX, idb_bioreg.B[ESI]
+	MOVB	AL, idb_enneasndbfr+1[ESI]
+	A2IOP	P_TPSR
+	OUTB	[DX]
+	IOPAUSE
+	INCL	EDX
+	MOVB	AL, CL			;Give the count to the interface
+	OUTB	[DX]
+	IOPAUSE
+	INCL	EDX
+	MOVB	AL, CH
+	OUTB	[DX]
+	IOPAUSE
+	A2IOP	P_CMDREG-P_TBCR1
+	MOVB	AL, #CMD$TXP+CMD$NODMA	;Start packet transmission
+	OUTB	[DX]
+	MOVB	idb_outtimer.B[ESI], #2	;Start 2 second time-out
+retclc:	CLC				;Clear C
+	RET				;And return
+.PAGE
+	.SBTTL	Network interface interrupt routines
+
+;The following is a prototype for the interrupt service routine entry code
+;  - this code is copied for each unit by enneaaddunit
+
+enneaint:
+	PUSHAL				;Save registers
+	PUSHL	DS
+	PUSHL	ES
+	PUSHL	FS
+	PUSHL	GS
+	PUSHL	#GS_DATA.B		;Make our data addressable
+	POPL	DS
+fix1:	MOVL	EDI, #0			;Get offset of IDB for this interface
+fix2:	JMP	enneaintcom		;Go to the common interrupt routine
+
+ENNEAINTSZ=!$-enneaint
+
+;Common interrupt routine
+
+enneaintcom:
+	MOVL	EDX, idb_bioreg.B[EDI]
+	A2IOP	P_IMR			;Disable interrupts
+	MOVB	AL, #0
+	OUTB	[DX]
+	A2IOP	P_ISR-P_IMR		;Get interrupt bits
+	INB	[DX]
+	ANDL	EAX, #3Bh.B		;Remove junk
+	ORL	idb_enneaintreq[EDI], EAX
+	OUTB	[DX]			;Clear the interrupt bits
+	CALL	knlReqFork##		;Request fork
+	MOVB	AL, #INT_EOI
+	CLI
+	CMPB	idb_intlvl.B[EDI], #7	;High interrupt?
+	JBE	4$.S			;No
+	OUTB	P_INC2P0		;Yes - release 2nd interrupt controller
+4$:	OUTB	P_INC1P0		;Release first interrupt controller
+	JMP	knlDismissInt2##	;Check for scheduling and dismiss
+.PAGE
+	.SBTTL	enneafork - Fork routine
+
+;Get here at fork level after interrupt from the Ethernet interface card
+
+enneafork:
+	MOVL	ESI, EDI		;Get offset of the IDB in right register
+	INCL	idb_cntint.B[ESI]	;Count the interrupt
+fkloop:
+
+;;;	MOVL	EDX, idb_bioreg.B[ESI]	;Get interrupt bits
+;;;	A2IOP	P_ISR
+;;;	INB	[DX]
+;;;	ANDL	EAX, #3Bh.B		;Remove junk
+
+	MOVL	EAX, idb_enneaintreq[ESI]
+	MOVB	AL, intpri[EAX]		;Get interrupt priority value
+	JMPIL	intdsp[EAX]		;Dispatch to routine
+
+	DATA
+
+NONE=!0t
+RECV=!4t
+CNTR=!8t
+OVRF=!12t
+XMIT=!16t
+XERR=!20t
+
+;Interrupt priority table - interrupts are processed with the following
+;  priority (highest to lowest):  RECV, OVRF, CNTR, XERR, XMIT
+
+intpri:	.BYTE	NONE, RECV, XMIT, RECV	;000000 000001 000010 000011
+	.BYTE	0   , 0   , 0   , 0   	;000100 000101 000110 000111
+	.BYTE	XERR, RECV, XERR, RECV	;001000 001001 001010 001011
+	.BYTE	0   , 0   , 0   , 0   	;001100 001101 001110 001111
+	.BYTE	OVRF, RECV, OVRF, RECV	;010000 010001 010010 010011
+	.BYTE	0   , 0   , 0   , 0   	;010100 010101 010110 010111
+	.BYTE	OVRF, RECV, OVRF, RECV	;011000 011001 011010 011011
+	.BYTE	0   , 0   , 0   , 0   	;011100 011101 011110 011111
+	.BYTE	CNTR, RECV, CNTR, RECV	;100000 100001 100010 100011
+	.BYTE	0   , 0   , 0   , 0   	;100100 100101 100110 100111
+	.BYTE	CNTR, RECV, CNTR, RECV	;101000 101001 101010 101011
+	.BYTE	0   , 0   , 0   , 0   	;101100 101101 101110 101111
+	.BYTE	OVRF, RECV, OVRF, RECV	;110000 110001 110010 110011
+	.BYTE	0   , 0   , 0   , 0   	;110100 110101 110110 110111
+	.BYTE	OVRF, RECV, OVRF, RECV	;111000 111001 111010 111011
+	.BYTE	0   , 0   , 0   , 0   	;111100 111101 111110 111111
+
+;Interrupt dispatch table
+
+intdsp:	.LONG	fkdone		;IX_NONE =  0 - Nothing to do
+	.LONG	fkrecv		;IX_RECV =  4 - Received packet available
+	.LONG	fkcntr		;IX_CNTR =  8 - Error counter half full
+	.LONG	fkovrf		;IX_OVRF = 12 - Receive overflow
+	.LONG	fkxmit		;IX_XMIT = 16 - Packet transmission done
+	.LONG	fkxerr		;IX_XERR = 20 - Packet transmission error
+
+	CODE
+.PAGE
+;Here if there is nothing to do
+
+fkdone:	MOVL	EDX, idb_bioreg.B[ESI]
+	MOVB	AL, #INT$PRX+INT$PTX+INT$TXE+INT$OVW+INT$CNT
+	A2IOP	P_IMR			;Enable the interrupts we want
+	OUTB	[DX]
+	RET
+
+;Here if have a received packet available
+
+fkrecv:	ANDB	idb_enneaintreq[ESI], #~INT$PRX ;Clear the interrupt bit
+	CALL	fkrec0			;Receive packets
+	JMP	fkloop.S		;Continue
+.PAGE
+;Subroutine to remove receive packets from the input ring buffer
+;	CALL	fkrec0
+
+fkrec0:	MOVL	EDX, idb_bioreg.B[ESI]
+	MOVB	AL, #CMD$PG1+CMD$NODMA	;Set up to read CURR (packet putter
+	A2IOP	P_CMDREG		;  pointer)
+	OUTB	[DX]
+	IOPAUSE
+	A2IOP	P_CURR-P_CMDREG		;Get value of CURR
+	INB	[DX]
+	IOPAUSE
+	MOVB	AH, AL
+	MOVB	AL, #CMD$NODMA		;Set register addressing back to page 0
+	A2IOP	P_CMDREG-P_CURR
+	OUTB	[DX]
+	CMPB	idb_ennearngtak[ESI], AH ;Does it match the taker pointer?
+	JE	4$.S			;Yes - nothing there now
+	MOVB	AL, #0			;No
+	A2IOP	P_RSAR0-P_CMDREG	;Set remote DMA start address
+	OUTB	[DX]
+	IOPAUSE
+	MOVB	AL, idb_ennearngtak[ESI]
+	INCL	EDX
+	OUTB	[DX]
+	IOPAUSE
+	MOVB	AL, #4t			;Set remote DMA byte count
+	INCL	EDX
+	OUTB	[DX]
+	IOPAUSE
+	MOVB	AL, #0
+	INCL	EDX
+	OUTB	[DX]
+	IOPAUSE
+	MOVB	AL, #CMD$READ		;Start remote DMA read
+	A2IOP	P_CMDREG-P_RBCR1
+	OUTB	[DX]
+	IOPAUSE
+	A2IOP	P_DATA-P_CMDREG
+	INW	[DX]			;Get receive status and forward pointer
+	MOVB	idb_enneapktsts[ESI], AL ;Save receive status bits
+	CMPB	AH, idb_ennearngbgn+1[ESI] ;Make sure valid
+	JB	2$.S
+	CMPB	AH, idb_ennearngend+1[ESI]
+	JB	12$.S
+2$:	INCL	idb_cntbadpnt.B[ESI]	;Pointer is bad - count this
+	CALL	enneareset		;Reset the interface!
+	JMP	fkrec0.S		;Continue
+
+4$:	RET
+
+;Here if packet is too small (should not happen since interface should have
+;  already discarded small packets!)
+
+6$:	INCL	idb_cntfa[ESI]		;Count the error
+	JMP	10$.S			;Continue
+
+;Here if can't get a buffer for the input packet
+
+8$:	INCL	idb_cntnosbfr.B[ESI]	;Count the error
+10$:	POPL	EAX			;Restore new taker value
+	CALL	advinp
+	JMP	fkrec0			;Continue
+
+;Here with good value for the taker pointer
+
+12$:	PUSHL	EAX			;Save new taker pointer value
+	CLRL	EAX
+	INW	[DX]			;Get receive byte count
+	IOPAUSE
+	CLRL	ECX
+	MOVB	CH, 1.B[ESP]		;Get new pointer value
+	SUBB	CH, idb_ennearngtak[ESI]
+	JNS	14$.S
+	MOVB	DL, idb_ennearngend+1[ESI]
+	SUBB	DL, idb_ennearngbgn+1[ESI]
+	ADDB	CH, DL
+14$:	DECB	CH
+	ADDL	EAX, #3t.B
+	CMPB	AH, CH			;Do the high bytes agree?
+	JE	16$.S			;Yes
+	INCL	idb_cntfixedcnt.B[ESI]	;No - count this
+	MOVB	AH, CH			;Use the right value
+16$:	LEAL	ECX, -7t.B[EAX]		;Adjust count
+	A2IOP	P_CMDREG-P_DATA		;Disable remote DMA
+	MOVB	AL, #CMD$NODMA
+	OUTB	[DX]
+	CMPL	ECX, #60t.B		;Is the packet big enough?
+	JL	6$.S			;No - ignore the packet!
+	INCL	idb_cntpktin.B[ESI]	;Count the receive packet
+	ADDL	idb_cntbytein.B[ESI], ECX
+	TESTB	idb_enneapktsts[ESI], #RSR$PHY ;Physical address?
+	JE	20$.S			;Yes
+	INCL	idb_cntbcpktin.B[ESI]	;No - count it
+20$:	CLRL	EDI
+	CALL	xosnetGetBufr##		;Get a network buffer
+	JC	8$.S			;Can't get a buffer - junk the packet!
+	PUSHL	ECX
+	PUSHL	EBX
+	MOVL	EAX, #4
+	MOVB	AH, idb_ennearngtak[ESI]
+22$:	PUSHL	#0.B			;Store 0 as amount left
+	MOVL	EDX, idb_bioreg.B[ESI]
+	A2IOP	P_RSAR0			;Set remote DMA start address
+	OUTB	[DX]
+	IOPAUSE
+	MOVB	AL, AH
+	INCL	EDX
+	OUTB	[DX]
+	IOPAUSE				;Calculate amount past end of ring (this
+	INCL	EDX			;  is off by 4 if 2nd time here, but it
+	MOVB	AL, #4			;  does not matter since it can only
+	ADDL	EAX, ECX		;  overflow once!)
+	SUBL	EAX, idb_ennearngend[ESI] ;Is it past end of the ring?
+	JLE	24$.S			;If not past end
+	SUBL	ECX, EAX		;Past end - transfer to end of ring now
+	MOVL	[ESP], EAX		;Remember amount to do next time
+24$:	PUSHL	EDI
+	MOVL	EDI, EBX		;Get address for data
+	PUSHL	DS
+	POPL	ES
+	ADDL	EBX, ECX		;Bump offset in case will need more
+	INCL	ECX			;Make sure transfer an even number of
+	ANDB	CL, #0FEh		;  words
+	MOVB	AL, CL
+	OUTB	[DX]
+	IOPAUSE
+	INCL	EDX
+	MOVB	AL, CH
+	OUTB	[DX]
+	IOPAUSE
+	MOVB	AL, #CMD$READ		;Start packet read
+	A2IOP	P_CMDREG-P_RBCR1
+	OUTB	[DX]
+	IOPAUSE
+	A2IOP	P_DATA-P_CMDREG
+	SHRL	ECX, #1			;Get number of words to read
+	CLD
+	RINSW	[EDI]			;Copy data to our buffer
+	MOVL	ECX, #2
+	CALL	knlSDelay##
+	POPL	EDI
+	POPL	ECX			;Get amount left to do
+	JREGZ	ECX, 26$		;If finished now
+	MOVL	EAX, idb_ennearngbgn[ESI] ;Do the rest now
+	JMP	22$.S
+
+;Here with transfer complete
+
+26$:	POPL	EBX			;Restore buffer address
+	POPL	ECX			;Restore amount transfered
+	A2IOP	P_CMDREG-P_DATA		;Disable remote DMA
+	MOVB	AL, #CMD$NODMA
+	OUTB	[DX]
+	POPL	EAX			;Restore new taker value
+	CALL	advinp
+	CALL	rcvpkt			;Process the received packet
+	JMP	fkrec0			;See if have any more packets to get
+.PAGE
+	.SBTTL	rcvpkt - Subroutine to process received packet
+
+;Subroutine to process received packet
+;	c{EBX} = Offset of packet
+;	c{ECX} = Size of packet
+;	c{ESI} = Offset of IDB
+;	CALL	rcvpkt
+
+rcvpkt:	MOVL	npb_count.B[EBX], ECX	;Store total count in packet
+	MOVB	npb_lpofs.B[EBX], #en_data ;Store header offsets
+	MOVB	npb_npofs.B[EBX], #en_data
+	SUBL	ECX, #en_data.B		;Adjust count
+	LEAL	EDX, en_data.B[EBX]	;Point to start of data
+	MOVZWL	EAX, en_ethertype.B[EBX] ;Get protocol value from the packet
+	PUSHL	ESI
+	CALL	xossnpRcv##		;Process the received packet
+	POPL	ESI
+	RET
+.PAGE
+;Subroutine to advance hardware input pointer
+;	c(AH)  = New taker value
+;	c{ESI} = Offset of IDB
+;	CALL	advinp
+
+advinp:	MOVB	AL, AH			;Get packet ring taker pointer
+	MOVB	idb_ennearngtak[ESI], AL ;Update our taker pointer
+	DECL	EAX			;Minus 1
+	CMPB	AL, idb_ennearngbgn+1[ESI] ;Before beginning of ring?
+	JAE	8$.S			;No
+	MOVB	AL, idb_ennearngend+1[ESI] ;Yes - fix it up
+	DECL	EAX
+8$:	MOVL	EDX, idb_bioreg.B[ESI]
+	A2IOP	P_BNRY			;Update boundry pointer
+	OUTB	[DX]
+	RET
+.PAGE
+;Here if have error during packet transmission
+
+fkxerr:	ANDB	idb_enneaintreq[ESI], #~INT$TXE ;Clear the interrupt request
+	CALL	xmitchk			;Check for transmit conditions
+	MOVL	EDX, idb_bioreg.B[ESI]
+	A2IOP	P_TSR			;Get transmit status bits
+	INB	[DX]
+	TESTB	AL, #TSR$FU		;Was error a FIFO underrun?
+	MOVL	EAX, #ER_NCONG		;Assume not (error = NeTwork CONgestion)
+	JE	2$.S			;No
+	MOVL	EAX, #ER_LSTER		;Yes (error = LoST data ERror)
+	JMP	2$.S
+
+;Here if packet transmission is complete
+
+fkxmit:	ANDB	idb_enneaintreq[ESI], #~INT$PTX ;Clear the interrupt request
+	CALL	xmitchk			;Check for xmit conditions
+	CLRL	EAX			;Indicate no errors
+2$:	MOVL	EBX, idb_enneaoutpkt[ESI]
+	MOVL	idb_enneaoutpkt[ESI], #0
+	CALL	xosnetFinXmit##		;Do output done processing
+	CMPL	idb_xmtavail.B[ESI], #0.B ;Can we send more now?
+	JLE	fkloop			;No
+	MOVL	EBX, idb_outhead.B[ESI]	;Yes
+	TESTL	EBX, EBX
+	JE	fkloop
+	MOVL	EAX, npb_nextsnd.B[EBX]
+	MOVL	idb_outhead.B[ESI], EAX
+	TESTL	EAX, EAX
+	JNE	4$.S
+	MOVL	idb_outtail.B[ESI], EAX
+4$:	DECL	idb_xmtavail.B[ESI]	;Reduce output availability
+	CLRL	EAX			;Set link to 0 to indicate packet is
+	MOVL	npb_nextsnd.B[EBX], EAX	;  being output
+	MOVL	npb_holdrt.B[EBX], EAX	;Also make sure hold list back pointer
+	CALL	sendpkt			;  is clear
+	JMP	fkloop			;Don't need to loop here since this
+					;  interface only outputs 1 packet at
+					;  a time!
+.PAGE
+;Subroutine to check for transmit conditions
+;	c{EDX} = P_ISR
+;	CALL	xmitchk
+
+xmitchk:MOVL	EDX, idb_bioreg.B[ESI]
+	A2IOP	P_TSR			;Point to transmit status register
+	INB	[DX]			;Get it
+	TESTB	AL, #TSR$ABT|TSR$CRS|TSR$FU|TSR$CDH|TSR$OWC|TSR$COL
+	JE	12$.S			;If nothing to do here (usual case)
+	TESTB	AL, #TSR$ABT		;Transmit aborted?
+	JE	2$.S			;No
+	INCL	idb_cntabort[ESI]	;Yes
+2$:	TESTB	AL, #TSR$CRS		;Carrier sense lost?
+	JE	4$.S			;No
+	INCL	idb_cntcsense[ESI]	;Yes
+4$:	TESTB	AL, #TSR$FU		;FIFO underrun?
+	JE	6$.S			;No
+	INCL	idb_cntxunder[ESI]	;Yes
+6$:	TESTB	AL, #TSR$CDH		;Collision detect heartbeat?
+	JE	8$.S			;No
+	INCL	idb_cnthrtbt[ESI]	;Yes
+8$:	TESTB	AL, #TSR$OWC		;Out of window collision
+	JE	10$.S			;No
+	INCL	idb_cntowcol[ESI]	;Yes
+10$:	TESTB	AL, #TSR$COL		;Transmit collided?
+	JE	12$.S			;No
+	ADDL	EBX, #P_NCR-P_TSR	;Yes - get number of collisions
+	INB	[DX]
+	ANDL	EAX, #0Fh.B
+	ADDL	idb_cntnumcol[ESI], EAX	;Add it in
+12$:	RET
+.PAGE
+;Here if have input buffer overflow
+
+fkovrf:	MOVL	EDX, idb_bioreg.B[ESI]
+	A2IOP	P_IMR			;Disable all interrupts
+	MOVB	AL, #0
+	OUTB	[DX]
+	IOPAUSE
+	A2IOP	P_ISR-P_IMR		;Clear all pending interrupts
+	MOVB	AL, #0FFh
+	OUTB	[DX]
+	IOPAUSE
+	MOVB	idb_enneaintreq[ESI], #0
+	INCL	idb_cntrover.B[ESI]	;Count the error
+	A2IOP	P_CMDREG-P_ISR		;Point to the 8390 command register
+	MOVB	AL, #CMD$STOP+CMD$NODMA	;Stop the interface
+	OUTB	[DX]
+	ORB	idb_sts.B[ESI], #IS$RESET ;Indicate interface being reset
+	CLRL	EAX			;Clear the remote byte count registers
+	A2IOP	P_RBCR0-P_CMDREG
+	OUTB	[DX]
+	IOPAUSE
+	INCL	EDX
+	OUTB	[DX]
+	IOPAUSE
+	MOVL	ECX, #400t
+2$:	MOVL	EDX, idb_bioreg.B[ESI]	;Get status
+	A2IOP	P_ISR
+	INB	[DX]
+	TESTB	AL, #INT$RST		;Is it reset yet?
+	JNE	4$.S			;Yes - go on
+	MOVL	EAX, #2			;No - wait for a short time
+	MOVL	EBX, #fkovrf2
+	MOVL	EDI, ESI
+	PUSHL	ECX
+	CALL	knlWakeRequest##
+	POPL	ECX
+	MOVL	ESI, EDI
+	JNC	10$.S			;Finished if wait request worked
+	LOOP	ECX, 2$			;Opps - wait by looping!!!
+
+;Here after delay when waiting for interface to be reset
+
+fkovrf2:MOVL	ESI, EDI
+4$:	MOVL	EDX, idb_bioreg.B[ESI]
+	A2IOP	P_TCR
+	MOVB	AL, #TCR$LBM1		;Put it in loop-back mode
+	OUTB	[DX]
+	IOPAUSE
+	A2IOP	P_CMDREG-P_TCR		 ;Start the interface so can do remote
+	MOVB	AL, #CMD$NODMA|CMD$START ;  DMA
+	OUTB	[DX]
+;;;;;	CALL	fkrec0			;Process any complete received packets
+	ANDB	idb_sts.B[ESI], #~IS$RESET ;Indicate reset is complete
+	CALL	enneareset		;Reset and restart the board
+	CLRL	EAX			;Fake up a transmit interrupt
+	MOVL	EBX, idb_enneaoutpkt[ESI]
+	TESTL	EBX, EBX
+	JE	10$.S
+	MOVL	idb_enneaoutpkt[ESI], EAX
+	CALL	xosnetFinXmit##
+	CLC
+10$:	RET
+.PAGE
+;Here if one of the error counters is half full (this code assumes the high
+;  24 bits of EAX are 0)
+
+fkcntr:	ANDB	idb_enneaintreq[ESI], #~INT$CNT ;Clear the interrupt request
+	MOVL	EDX, idb_bioreg.B[ESI]
+	A2IOP	P_CNTR0
+	INB	[DX]			;Get frame alignment error count
+	IOPAUSE
+	ADDL	idb_cntfa[ESI], EAX	;Add it in to our count
+	INCL	EDX
+	INB	[DX]			;Get CRC error count
+	IOPAUSE
+	ADDL	idb_cntcrc[ESI], EAX	;Add it in to our count
+	INCL	EDX
+	INB	[DX]			;Get lost frame error count
+	IOPAUSE
+	ADDL	idb_cntnoibfr.B[ESI], EAX ;Add it in to our count
+	JMP	fkloop			;Continue
+.PAGE
+	.SBTTL	enneaoas - Once-a-second routine
+
+enneaoas:
+	MOVL	ESI, enneafidb		;Get offset of first IDB
+4$:	TESTL	ESI, ESI		;More to check?
+	JE	10$.S			;No
+	CMPB	idb_outtimer.B[ESI], #0	;Yes - need to time output?
+	JE	6$.S			;No
+	DECB	idb_outtimer.B[ESI]	;Yes - has it timed out?
+	JNE	6$.S			;No
+	INCL	idb_cntxhung[ESI]	;Yes - count it
+	TOFORK				;Raise to fork level
+	MOVL	EBX, idb_enneaoutpkt[ESI]
+	MOVL	idb_enneaoutpkt[ESI], #0
+	MOVL	EAX, #ER_DEVER		;Report this as a device error
+	STC
+	CALL	xosnetFinXmit##		;Do output done processing
+	FROMFORK			;Back to main program level
+6$:	MOVL	ESI, idb_nextd.B[ESI]	;Advance to next IDB
+	JMP	4$.S			;Continue
+
+10$:	RET
+.PAGE
+	.SBTTL	Data
+
+	DATA
+
+enneafidb:.LONG	0		;Offset of first IDB for this type of interface
+ennealidb:.LONG	0		;Offset of last IDB for this type of interface
+temp:	  .LONG 'NET', 0
+
+	LKEEND

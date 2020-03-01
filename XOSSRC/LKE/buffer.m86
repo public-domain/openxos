@@ -1,0 +1,1843 @@
+	.TITLE	BUFFER - Disk cache buffer management routines for XOS
+
+;++++
+; This software is in the public domain.  It may be freely copied and used
+; for whatever purpose you see fit, including commerical uses.  Anyone
+; modifying this software may claim ownership of the modifications, but not
+; the complete derived code.  It would be appreciated if the authors were
+; told what this software is being used for, but this is not a requirement.
+
+;   THIS SOFTWARE IS PROVIDED BY THE AUTHORS "AS IS" AND ANY EXPRESS OR
+;   IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
+;   OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+;   IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+;   INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+;   BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS
+;   OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+;   ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR
+;   TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
+;   USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+;----
+
+	.PROC	80486
+	.INCLUD	XOSINC:\XMAC\XOS.PAR
+	.INCLUD	XOSINC:\XMAC\XOSX.PAR
+	.INCLUD	XOSINC:\XMAC\XOSERR.PAR
+	.INCLUD	XOSINC:\XMAC\XOSDISK.PAR
+	.INCLUD	XOSINC:\XMAC\XOSXDISK.PAR
+	.INCLUD	XOSINC:\XMAC\XOSSINFO.PAR
+	.INCLUD	XOSINC:\XMAC\XOSLKE.PAR
+	.INCLUD	XOSINC:\XMAC\XOSXLKE.PAR
+
+	LKECONT
+
+	.EXPORT	xosdskClrBufr
+	.EXPORT	xosdskDBufCnt
+	.EXPORT	xosdskFindSBufr
+	.EXPORT	xosdskFindDBufr
+	.EXPORT	xosdskFlush
+	.EXPORT	xosdskGetDBufr
+	.EXPORT	xosdskGetSBufr
+	.EXPORT	xosdskGiveLkBufr
+	.EXPORT	xosdskGiveBufr
+	.EXPORT	xosdskIntoHash
+	.EXPORT	xosdskLockBufrF
+	.EXPORT	xosdskLockBufrW
+	.EXPORT	xosdskNewDBufr
+	.EXPORT	xosdskNewSBufr
+	.EXPORT	xosdskReadBufr
+	.EXPORT	xosdskRelsLkBufr
+	.EXPORT	xosdskRelsBufr
+	.EXPORT	xosdskRmvAlloc
+	.EXPORT	xosdskRmvHash
+	.EXPORT	xosdskSBufCnt
+	.EXPORT	xosdskSenseChange
+	.EXPORT	xosdskSrchDBufr
+	.EXPORT	xosdskSrchDisk
+	.EXPORT	xosdskSrchSBufr
+	.EXPORT	xosdskUnlkBufr
+	.EXPORT	xosdskWriteBufr
+
+$$CHKALLOC=!0		;Set non-zero to include debug disk cache checking
+			;  (WARNING: This REALLY slows down the system and will
+			;  significantly change disk timing! Use with care.)
+
+;The following rules apply to blocking requests to lock a buffer (knlLockBufrW):
+;	If any FIBs are locked, only FIBs for files in a locked directory can
+;	  be locked.
+;	Only one FIB of a file contained in any directory can be locked at a
+;	  time. (This and the preceeding rule implies that if more than one
+;	  FIB is locked, the locked FIBs must from a single chain through the
+;	  directory tree.  It does not have to start at the root, but if it
+;	  does not, it cannot be extended backwards.);
+;	If any FIBs or data blocks are locked, NO data blocks can be locked.
+;	If any data block is locked, NO FIB can be locked. (This and the
+;	  preceeding rule imply that only one data block can be locked at a
+;	  time.)
+;	The disk resource cannot be obtained if any FIBs or data blocks are
+;	  locked.
+;	Having the disk resource has no effect on the ability to lock FIBs
+;	  or data blocks.
+;	The disk resource is required for any operation which changes a FAT
+;	  block or which searches for empty space in the FAT blocks.
+;  The above rules only apply when the knlLockBufrW call is used.  It is OK to
+;    lock any combination of FIBs and blocks using the knlLockBufrF call.  The
+;    usual proceedure is to attempt to lock the additional block with a
+;    knlLockBufrF call.  If it does not succeed, enough blocks must be unlocked
+;    to allow locking all necessary blocks in a legal order with the
+;    knlLockBufrW call.  Once the blocks are locked, a check must be made to
+;    ensure that no one else snuck in and changed something critical while
+;    blocks were unlocked.  If it is necessary to lock two data blocks, this
+;    can only be done using knlLockBufrF calls with a delay and retry (after
+;    unlocking all data blocks) if any knlLockBufrF call fails.  This is true
+;    because there is no valid sequence of knlLockBufrW calls for locking
+;    multiple data blocks.  There is no garentee that this sequence will work
+;    any given time and it should be avoided if at all possible!  Any other
+;    scheme which guarantees that no deadlocks can occur is allowed.  It should
+;    be noted that when a buffer is initially allocated for a block that buffer
+;    cannot be locked, so it can be safely locked, regardless of what other
+;    blocks are locked.  Locking a FIB is equivilent to locking the file.  Any
+;    operation that changes the allocation or directory entry for a file
+;    requires that the file's FIB be locked.  Also, any operation which changes
+;    the contents of a directory requires that the directory be locked.
+
+	.SBTTL	Buffer initialization routine
+
+	ONCE
+
+;Buffer initialization routine
+
+initbufr::
+	MOVL	EBX, #sbuffirst
+	MOVL	ECX, numsbuf#		;Get number of system buffers wanted
+	MOVL	EDX, #CB_SYSMAGIC	;Get magic number for the buffers
+	CALL	addbufrs		;Create the system buffers
+	JC	4$.S
+	MOVL	numsbuf#, EAX
+	MOVL	xosdskSBufCnt, EAX
+	MOVL	EBX, #dbuffirst
+	MOVL	ECX, numdbuf#		;Get number of data buffers wanted
+	MOVL	EDX, #CB_DATAMAGIC	;Get magic number for the buffers
+	CALL	addbufrs		;Create the data buffer
+	JC	4$.S
+	MOVL	numdbuf#, EAX
+	MOVL	xosdskDBufCnt, EAX
+4$:	RET
+
+	CODE
+.PAGE
+	.SBTTL	addbufrs - Subroutine to create and initialize buffers
+
+;Subroutine to create and initialize buffers
+;	c{EBX} = Offset of pointer to first buffer (must be immediately
+;		   followed by free list pointer)
+;	c{ECX} = Number of buffers to create
+;	c{EDX} = Value for cb_magic
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  c{EAX} = Number of buffers actually set up
+
+$$$=!0
+FRM ab_magic, 4t	;Value for cb_magic
+FRM ab_pcnt , 4t	;Page count
+FRM ab_pnum , 4t	;Number of pages
+FRM ab_bcnt , 4t	;Buffer count
+FRM ab_pntr , 4t	;Offset of buffer pointers
+ab_SIZE=!$$$
+
+addbufrs::
+	ENTER	ab_SIZE, 0		;Set up our stack frame
+	MOVL	ab_pntr.B[EBP], EBX	;Save offset of pointer
+	MOVL	ab_magic.B[EBP], EDX	;Save magic number value
+	MOVL	EBX, bufferla		;Get linear address
+	CLRL	EDX			;Get number of pages needed
+	LEAL	EAX, 6.B[ECX]		;Round up to a multiple of 7 (since
+	DIVL	lit7			;  we get 7 buffers/page)
+	MOVL	ab_pcnt.B[EBP], EAX
+	MOVL	ab_pnum.B[EBP], EAX
+	MOVL	ECX, EAX
+	CLRL	EDX
+	MOVL	EAX, #63h		;Allocate pages
+	CALL	knlGetPages##
+	JC	10$			;If can't get the pages
+	SUBL	knlMemUser##, ECX
+	MOVL	EAX, ECX
+	SHLL	EAX, #12t		;Bump linear address
+	ADDL	bufferla, EAX
+	SUBL	EBX, #la_data		;Change linear address to data segment
+	PUSHL	DS			;  offset
+	POPL	ES
+	CLD
+4$:	MOVL	ab_bcnt.B[EBP], #7	;Get number of buffers per page
+	ADDL	EBX, #CB_HDRSIZE	;Point to start of first buffer
+6$:	LEAL	EDI, -{CB_HDRSIZE-8}.B[EBX]
+	MOVL	ECX, #{CB_HDRSIZE-8+CB_DATASIZE}/4 ;Clear the buffer
+	CLRL	EAX
+	CLD
+	RSTOSL	[EDI]
+	DECW	cb_usecnt.B[EBX]	;Set use count to 0FFFFh to indicate
+	DECL	cb_hnext.B[EBX]		;  buffer is in the free list
+	DECL	cb_hprev.B[EBX]		;Indicate not in hash list
+	DECL	cb_anext.B[EBX]		;Indicate not in allocation list
+	DECL	cb_aprev.B[EBX]
+	MOVL	EAX, ab_magic.B[EBP]	;Store magic number
+	MOVL	cb_magic.B[EBX], EAX
+	MOVL	ECX, #512t
+	PUSHL	EBX
+	CALL	knlGetPhyAddr##		;Get physical address of buffer
+	JC	8$.S
+	CALL	knlForceLowMem##
+	POPL	EBX
+8$:	JC	12$.S
+	MOVL	cb_paddr.B[EBX], EAX	;Store physical address
+	TOFORK
+	MOVL	EDI, ab_pntr.B[EBP]	;Get offset of list pointer
+	MOVL	EAX, 4.B[EDI]		;Link buffer into free list
+	MOVL	[EBX], EAX
+	MOVL	4.B[EDI], EBX
+	MOVL	EAX, [EDI]		;Link into main buffer list too
+	MOVL	cb_next.B[EBX], EAX
+	MOVL	[EDI], EBX
+	FROMFORK
+	ADDL	EBX, #CB_HDRSIZE+CB_DATASIZE ;Bump offset
+	DECL	ab_bcnt.B[EBP]		;More buffers in this page?
+	JNE	6$.S			;Yes - continue
+	ANDL	EBX, #0FFFFF000h	;No - advance to start of next page
+	DECL	ab_pcnt.B[EBP]		;More pages to do?
+	JNE	4$			;Yes - continue
+	MOVL	EAX, ab_pnum.B[EBP]	;No - restore number of pages
+	IMULL	EAX, #7.B		;Change to number of buffers
+	CLC
+10$:	LEAVE
+	RET
+
+12$:	CRASH	CGPA			;[Can't Get Physical Address]
+.PAGE
+	.SBTTL	xosdskFindSBufr - Subroutine to find system buffer containing block
+
+;Subroutine to find system buffer containing disk block - if block is not in a
+;  buffer, a system buffer is allocated and the block is read - must be called
+;  in extended fork context
+;	c{dcb_dkdblk{EDI}} = Block number on physical disk
+;	c{EDX}             = Amount available on disk at this position
+;	c{EDI}             = Offset of DCB
+;	CALL	xosdskFindSBufr
+;	C:clr = Normal
+;	  c{EBX} = Offset of buffer (buffer is locked)
+;	C:set = Error, no buffer returned
+;	  c{EAX} = Error code
+
+xosdskFindSBufr::
+	PUSHL	EDX
+	CALL	xosdskSrchSBufr		;Try to find block in memory
+	JMP	2$.S			;Continue
+
+	.SBTTL	xosdskFindDBufr - Subroutine to find data buffer containing block
+
+;Subroutine to find data buffer containing disk block - if block is not in a
+;  buffer, a data buffer is allocated and the block is read - must be called
+;  in extended fork context
+;	c{dcb_dkdblk{EDI}} = Block number on physical disk
+;	c{EDX}             = Amount available on disk at this position
+;	c{EDI}             = Offset of DCB
+;	CALL	xosdskFindDBufr
+;	C:clr = Normal
+;	  c{EBX} = Offset of buffer (buffer is locked)
+;	C:set = Error, no buffer returned
+;	  c{EAX} = Error code
+
+$$$=!0
+FRM ra_reqblock, 4t
+FRM ra_1stblock, 4t	;Block number
+FRM ra_count   , 4t	;Read-ahead count
+FRM ra_cntr    , 4t
+FRM ra_bytes   , 4t	;Total read-ahead bytes
+FRM ra_prevbufr, 4t	;Offset of previous buffer
+
+FRM ra_error   , 4t
+FRM ra_lasterr , 4t
+FRM ra_reqbufr , 4t	;Offset of the requested buffer
+FRM ra_reqnum  , 4t	;Relative number of the requested buffer
+FRM ra_1stbufr , 4t	;Offset of first buffer in list
+FRM ra_blkcnt  , 4t
+FRM            , 3t
+FRM ra_type    , 1t	;Buffer type
+ra_SIZE=!$$$
+
+xosdskFindDBufr::
+	REQUIREXFF
+	PUSHL	EDX
+	CALL	xosdskSrchDBufr		;Try to find block in memory
+2$:	POPL	EDX
+	JC	ret004.S		;If error
+	JE	mustread.S		;If not found
+	CALL	xosdskLockBufrW		;Found it - lock the buffer
+	TESTB	cb_sts.B[EBX], #CB$FULL	;Is the buffer full now?
+	JE	mustrd2.S		;No - must have had a write error - try
+					;  to read it again
+	CALL	xosdskSenseChange	;Yes - check for changed disk if need to
+	JNC	ret004.S		;If OK
+	PUSHL	EAX			;Error
+	CALL	xosdskGiveLkBufr	;Give up the buffer
+	POPL	EAX
+	STC
+ret004:	RET
+.PAGE
+;Here if did not find the buffer in memory - srchdbufr has already allocated
+;  an empty buffer for us
+
+mustread:
+	CALL	xosdskLockBufrW		;Lock the empty buffer
+	JC	ret004.S
+mustrd2:MOVL	ESI, [EDI]		;Get offset of UCB
+	TESTL	ESI, ESI
+	JE	knlNoUnit##
+	ENTER	ra_SIZE, 0
+	MOVL	ra_reqbufr.B[EBP], EBX	;Store offset of requested buffer
+	MOVL	EAX, dcb_dkdblk.B[EDI]
+	MOVL	ra_reqblock.B[EBP], EAX
+	MOVB	CL, cb_magic.B[EBX]
+	MOVB	ra_type.B[EBP], CL
+	CMPB	ucb_pblksz[ESI], #1	;Have large physical block?
+	JE	6$.S			;No - go on
+
+;Here if have large physcial blocks - First we adjust the read-ahead amount
+;  so we always read enough logical blocks to make an even number of physical
+;  blocks.  If the block we want is not the first logical block in a phsyical
+;  block we give up the buffer we have and get the buffer for the first
+;  logical block in the physical block.  If this block is in the cache, we
+;  ignore it.  Since CD-ROMs are the only large block devices we support, we
+;  can always safely re-read a block any time. We then call the normal
+;  read-ahead routine and fix up which buffer we return when done.
+
+	PUSHL	EDX			;Get the number of the first logical
+	CLRL	EDX			;  block in the physical block and
+					;  get the offset to the desired
+	IDIVL	ucb_pblksz[ESI]		;  block
+	MOVL	ra_reqnum.B[EBP], EDX	;Store buffer to return
+	POPL	EDX
+	IMULL	EAX, ucb_pblksz[ESI]
+	MOVL	dcb_dkdblk.B[EDI], EAX
+					;Now have c{EDX} = original read-ahead
+					;  amount (in bytes)
+	SHLL	EAX, #9t		;Get offset in bytes
+	ADDL	EAX, EDX		;Add to the buffer offset
+	ADDL	EAX, #511t		;Plus one block (for the first block
+					;  which is not included in the
+					;  read-ahead value) minus 1 (for
+					;  rounding calculation below)
+	MOVL	EBX, ucb_pblksz[ESI]	;Get physical block size in bytes
+	SHLL	EBX, #9t
+	ADDL	EAX, EBX		;Round up (we already subtracted 1)
+	CLRL	EDX
+	IDIVL	EBX
+	IMULL	EAX, EBX		;Get number of bytes to read
+	JMP	7$.S
+
+;Here if don't have large physical blocks
+
+6$:	BTL	SS:xffCmd##, #O%NORDAH	;Should we do read-ahead?
+	JC	readbufr		;No
+	TESTL	EDX, EDX		;Yes - have any more data available?
+	JBE	readbufr		;No
+	ADDL	EDX, #512t
+	MOVL	ra_reqnum.B[EBP], #0	;Always return the first block
+7$:	MOVL	EBX, ra_reqbufr.B[EBP]
+	CMPL	cb_magic.B[EBX], #CB_SYSMAGIC ;System buffer?
+	JNE	10$.S			;No
+	MOVL	EAX, xosdskSBufCnt	;Yes
+	JMP	12$.S
+
+8$:	CRASH	BCBH			;[Bad Cache Buffer Header]
+
+10$:	CMPL	cb_magic.B[EBX], #CB_DATAMAGIC ;Data buffer?
+	JNE	8$.S			;No
+	MOVL	EAX, xosdskDBufCnt
+12$:	SHRL	EAX, #1			;Get 1/2 of available buffers
+	INCL	EAX			;Plus one
+	CMPL	EAX, ucb_ramax[ESI]	;Is this more than we can use?
+	JBE	14$.S			;No
+	MOVL	EAX, ucb_ramax[ESI]	;Yes - just use maximum
+14$:	SHLL	EAX, #9			;Change to bytes
+	CMPL	EAX, EDX		;More than he can get here?
+	JBE	16$.S			;No
+	MOVL	EAX, EDX		;Yes
+16$:	ADDL	EAX, #511t		;Get maximum number of read-ahead blocks
+	SHRL	EAX, #9
+	CMPL	EAX, ucb_pblksz[ESI]	;Is this enough for 1 physical block?
+	JGE	17$.S			;Yes
+	MOVL	EAX, ucb_pblksz[ESI]	;No - use at least that much
+17$:	CMPL	EAX, #1.B
+	JLE	readbufr		;If no read-ahead wanted
+	MOVL	ra_count.B[EBP], EAX	;Store number of read blocks
+
+;The following code sets up a list of buffers for read-ahead - the first buffer
+;  is the one requested, or in the case of a device with large blocks, the
+;  first buffer in the physical block containing the requested buffer, followed
+;  by as many sequential blocks as we can read ahead - read ahead is stopped
+;  when we encounter a buffer which is already in memory - these buffers are
+;  all locked, but since none of them were found in memory, there is no chance
+;  of a deadlock, even though we are locking multiple buffers!
+
+;Having to handle CRROMs with large physical blocks makes this somewhat more
+;  complex.  In this case we cannot simply stop when we find a block in memory.
+;  This will not happen very often, if at all, but it is possible!  Some of the
+;  logical blocks in a physical block could have aged out of the cache, leaving
+;  a partial physical block in the cache.  As long as the cached blocks are
+;  not locked, we can just re-read them, since they can never be modified.  If
+;  one is locked we have more of a problem.  In this case, we just wait for
+;  it to be unlocked.  As long as the logical blocks within a physical block
+;  are accessed in order of increasing logical block number, there should not
+;  be any deadlocks!
+
+	CLRL	EAX
+	MOVL	ra_bytes.B[EBP], EAX	;Initialize total read-ahead bytes
+	MOVL	ra_blkcnt.B[EBP], EAX
+	MOVL	ra_1stbufr.B[EBP], EAX
+	MOVL	ra_prevbufr.B[EBP], EAX
+	MOVL	EAX, dcb_dkdblk.B[EDI]	;Save first block to read
+	MOVL	ra_1stblock.B[EBP], EAX
+	MOVL	EAX, ra_reqnum.B[EBP]
+	INCL	EAX
+	MOVL	ra_cntr.B[EBP], EAX
+18$:	DECL	ra_cntr.B[EBP]		;Is this the requested block?
+	JE	23$.S			;Yes
+	MOVL	EAX, dcb_dkdblk.B[EDI]
+	CALL	xosdskSrchDisk		;No - is next block in a buffer now?
+	JE	20$.S			;No
+	CMPL	ucb_pblksz[ESI], #1.B	;Yes - is this a large block device?
+	JE	24$.S			;No - just stop read-ahead here
+	CMPW	cb_usecnt.B[EBX], #0.B	;Yes - is the buffer in use now?
+	JNE	19$.S			;Yes
+	CMPL	cb_anext.B[EBX], #-1.B	;No - is it in the allocation list?
+	JE	19$.S			;No (possible if this is a FAT block)
+	CALL	xosdskRmvAlloc		;Yes - remove it from the allocation
+.IF NE $$CHKALLOC			;  list
+	CALL	chkalloc
+.ENDC
+19$:	CMPW	cb_usecnt.B[EBX], #0FFFFFFFEh.B
+	JAE	24$.S
+	INCW	cb_usecnt.B[EBX]	;Bump use count
+	JMP	22$.S			;Must wait for the buffer
+
+;Here if next block is not now in a buffer
+
+20$:	MOVB	CL, ra_type.B[EBP]
+	CALL	setbufr			;Set up a buffer for it
+	JC	24$.S			;Stop if not available
+22$:	CALL	xosdskLockBufrW		;OK - lock the empty buffer
+	JMP	235$.S
+
+;Here if the requested buffer is the next buffer for the list
+
+23$:	MOVL	EBX, ra_reqbufr.B[EBP]
+
+;Here with the next buffer for our list
+
+235$:	INCL	ra_blkcnt.B[EBP]	;Count the buffer
+	MOVL	EAX, ra_prevbufr.B[EBP]	;Link it to the list
+	TESTL	EAX, EAX
+	JNE	237$.S
+	MOVL	ra_1stbufr.B[EBP], EBX
+	JMP	239$.S
+
+237$:	MOVL	cb_xnext.B[EAX], EBX
+239$:	MOVL	ra_prevbufr.B[EBP], EBX
+
+	ADDL	ra_bytes.B[EBP], #512t	;Increase total bytes to read
+	INCL	dcb_dkdblk.B[EDI]	;Bump disk block
+	DECL	ra_count.B[EBP]		;Need more buffers?
+	JG	18$.S			;Yes - continue
+
+24$:	MOVL	EAX, ra_prevbufr.B[EBP]	;Clear last link pointer
+	MOVL	cb_xnext.B[EAX], #0
+
+	MOVL	EAX, ra_1stblock.B[EBP]	;Restore first disk block number
+	MOVL	dcb_dkdblk.B[EDI], EAX
+
+	MOVL	EBX, ra_1stbufr.B[EBP]	;Restore offset of first buffer
+
+	MOVL	EAX, ra_blkcnt.B[EBP]	;Did we get enough buffers to do
+	CMPL	EAX, ucb_pblksz[ESI]	;  anything?
+	JB	34$.S			;No
+	CMPL	ucb_pblksz[ESI], #1.B	;Yes - is this a large block device?
+	JE	readbf4			;No
+	CLRL	EDX			;Yes - make sure no extra buffers
+	IDIVL	ucb_pblksz[ESI]
+	TESTL	EDX, EDX
+	JE	readbf4
+	IMULL	EAX, ucb_pblksz[ESI]
+26$:	MOVL	EDX, cb_xnext.B[EBX]
+	DECL	EAX
+	JE	28$.S
+	MOVL	EBX, EDX
+	JMP	26$.S
+
+28$:	MOVL	cb_xnext.B[EBX], #0
+	MOVL	EBX, EDX
+	PUSHL	cb_xnext.B[EBX]
+	MOVW	cb_errcode.B[EBX], #ER_DTINT
+	CALL	xosdskGiveLkBufr
+	POPL	EBX
+	TESTL	EBX, EBX
+	JNE	28$.S
+	MOVL	EBX, ra_1stbufr.B[EBP]
+	JMP	readbf4.S		;Continue
+
+;Here if could not get have enough buffers to read anything
+
+34$:	PUSHL	cb_xnext.B[EBX]
+	MOVW	cb_errcode.B[EBX], #ER_DTINT
+	CALL	xosdskGiveLkBufr
+	POPL	EBX
+	TESTL	EBX, EBX
+	JNE	34$.S
+	LEAVE
+	MOVL	EAX, #ER_NODCB
+	STC
+	RET
+.PAGE
+;Here if no read-ahead is possible - can enter here to read a single block into
+;  a buffer independent of the disk cache
+
+xosdskReadBufr::
+	REQUIREXFF
+	ENTER	ra_SIZE, 0
+	MOVL	ra_reqbufr.B[EBP], EBX
+readbufr:
+	MOVL	EBX, ra_reqbufr.B[EBP]
+	MOVL	ra_1stbufr.B[EBP], EBX
+	MOVL	ra_bytes.B[EBP], #512t
+	CLRL	EAX
+	MOVL	ra_reqnum.B[EBP], EAX
+	MOVL	cb_xnext.B[EBX], EAX	;Clear link
+
+;Here with the buffer list set up - do the transfer
+
+readbf4:PUSHL	DS
+	POPL	ES
+	MOVL	EBX, ra_1stbufr.B[EBP]
+	MOVL	ECX, ra_bytes.B[EBP]
+	MOVL	EAX, #kf_readlist	;Get function
+	CALL	xosdskXfer#		;Do the transfer
+	JC	2$.S
+	MOVL	EAX, #ER_DVDER
+2$:	MOVL	ra_lasterr.B[EBP], EAX
+
+;Here with the transfer complete - Process the list of buffers.  We give up
+;  all buffers with errors.  We keep and return the requested buffer and
+;  release all others.
+
+	MOVL	EBX, ra_1stbufr.B[EBP]
+	CLRL	EAX
+	MOVL	ra_error.B[EBP], EAX
+
+4$:	PUSHL	cb_xnext.B[EBX]
+	CMPL	EBX, ra_reqbufr.B[EBP]	;Is this the buffer we want?
+	JNE	10$.S			;No
+	MOVXWL	EAX, cb_errcode.B[EBX]	;Yes - error on the buffer?
+	TESTL	EAX, EAX
+	JS	6$.S			;Yes
+	TESTB	cb_sts.B[EBX], #CB$FULL	;No - did we fill this buffer?
+	JNE	20$.S			;Yes
+	MOVL	EAX, ra_lasterr.B[EBP]	;No - report last error we saw (this
+					;  can only happen if the transfer
+					;  fails completely or if we are
+					;  reading a CDROM with large blocks)
+6$:	MOVL	ra_error.B[EBP], EAX
+	MOVL	ra_reqbufr.B[EBP], #0	;We will give up the buffer
+	JMP	18$.S
+
+;Here if this is not the buffer we want
+
+10$:	MOVXWL	EAX, cb_errcode.B[EBX]
+	TESTL	EAX, EAX
+	JS	16$.S
+	TESTB	cb_sts.B[EBX], #CB$FULL	;Did we fill the buffer?
+	JE	14$.S			;No
+12$:	CALL	xosdskRelsLkBufr	;Release the buffer
+	JMP	20$.S
+
+;Here if have a buffer without an error which we did not fill - This will
+;  happen if the transfer is interrupted because of an error.  We just mark
+;  this block with a ER_DTINT error so anyone waiting for it will try to read
+;  it again.
+
+14$:	MOVW	cb_errcode.B[EBX], #ER_DTINT
+	JMP	18$.S
+
+;Here if error on a buffer we don't want now
+
+16$:	MOVL	ra_lasterr.B[EBP], EAX
+18$:	CALL	xosdskGiveLkBufr	;Give up the buffer (this clears EBX)
+20$:	POPL	EBX			;Get offset of next buffer in list
+	TESTL	EBX, EBX
+	JNE	4$.S			;Continue if another buffer
+	MOVL	EAX, ra_reqblock.B[EBP]	;Restore his block number (only has
+	MOVL	dcb_dkdblk.B[EDI], EAX	;  any effect for large block devices)
+	MOVL	EBX, ra_reqbufr.B[EBP]
+	MOVL	EAX, ra_error.B[EBP]
+	LEAVE
+	BTL	EAX, #31t		;Set C if error
+	RET				;All done
+.PAGE
+	.SBTTL	xosdskNewSBufr - Subroutine to create zeroed system buffer for block
+
+;Subroutine to create zeroed system buffer for a disk block - must be called
+;  at in extended fork context
+;	c{dcb_dkdblk{EDI}} = Block number on physical disk
+;	c{EDI}             = Offset of DCB
+;	c{ESI}             = Offset of UCB
+;	CALL	xosdskNewSBufr
+;	C:clr = Normal
+;	  c{EBX} = Offset of buffer
+;	  Buffer is locked
+;	C:set = Error, no buffer returned
+
+xosdskNewSBufr::
+	CALL	xosdskSrchSBufr		;Find the buffer
+	JMP	2$.S			;Go zero it
+
+	.SBTTL	xosdskNewDBufr - Subroutine to create zeroed data buffer for block
+
+;Subroutine to create zeroed data buffer for a disk block
+;	c{dcb_dkdblk{EDI}} = Block number on physical disk
+;	c{EDI}             = Offset of DCB
+;	c{ESI}             = Offset of UCB
+;	CALL	xosdskNewDBufr
+;	C:clr = Normal
+;	  c{EBX} = Offset of buffer
+;	  Buffer is locked
+;	C:set = Error, no buffer returned
+
+xosdskNewDBufr::
+	CALL	xosdskSrchDBufr		;Find the buffer
+2$:	JC	ret006.S		;If error
+	CALL	xosdskLockBufrW		;Found it - lock the buffer
+xosdskClrBufr::
+	CMPL	cb_dev.B[EBX], #0.B
+	JE	10$.S
+	ORB	cb_sts.B[EBX], #CB$FULL	;Indicate buffer is full
+	PUSHL	EDI			;Clear the buffer
+	MOVL	EDI, EBX
+	PUSHL	DS
+	POPL	ES
+	MOVL	ECX, #128t
+	CLRL	EAX
+	CLD
+	RSTOSL	[EDI]
+	POPL	EDI
+ret006:	RET
+
+10$:	CRASH	NUCB
+.PAGE
+	.SBTTL	xosdskSrchSBufr - Subroutine to search for disk in a system buffer
+
+;Subroutine to search for disk block in a system buffer - if not found, a
+;  system buffer is allocated and set up to receive the block - if the
+;  requested block is already in a data buffer, it will be returned - must be
+;  called in extended fork context
+;	c{dcb_dkdblk{EDI}} = Block number on physical disk
+;	c{EDI}             = Offset of DCB
+;	CALL	xosdskSrchSBufr
+;	C:clr = Normal
+;	  c{EBX} = Offset of buffer (buffer is in-use but not locked)
+;	  Z:set  = Block not in buffer
+;	  Z:clr  = Block in buffer
+;	C:set = Error, no buffer returned
+;	  c{EAX} = Error code
+
+xosdskSrchSBufr::
+	REQUIREXFF
+	MOVL	ESI, [EDI]		;Get offset of UCB
+	TESTL	ESI, ESI
+	JE	knlNoUnit##
+	MOVB	CL, #CB_SYSMAGIC&0FFh	;Indicate want system buffer
+	TESTB	dcb_sts2.B[EDI], #D2$DCHG ;Has disk been changed?
+	JE	6$.S			;No
+2$:	CLRL	EBX			;Yes - return 0 offset
+	MOVL	EAX, #ER_MDCHG		;Get error code
+	STC
+	RET
+
+	.SBTTL	xosdskSrchDBufr - Subroutine to search for disk block in a data buffer
+
+;Subroutine to search for disk block in a data buffer.  If not found, a
+;  data buffer is allocated and set up to receive the block.  If the
+;  requested block is already in a system buffer, it will be returned.  Must
+;  be called in extended fork context.  IMPORTANT: This subroutine does not
+;  lock the buffer - the buffer MUST be locked before the contents can be
+;  considered valid since some one else may be in the process of filling the
+;  buffer.
+;	c{dcb_dkdblk{EDI}} = Block number on physical disk
+;	c{EDI}             = Offset of DCB
+;	CALL	xosdskSrchDBufr
+;	C:clr = Normal
+;	  c{EBX} = Offset of buffer (buffer is in-use but not locked)
+;	  Z:set  = Block not in buffer
+;	  Z:clr  = Block in buffer
+;	C:set = Error, no buffer returned
+;	  c{EAX} = Error code
+
+xosdskSrchDBufr::
+	REQUIREXFF
+	MOVL	ESI, [EDI]		;Get offset of UCB
+	TESTL	ESI, ESI
+	JE	knlNoUnit##
+	TESTB	dcb_sts2.B[EDI], #D2$DCHG
+	JNE	2$.S
+	MOVB	CL, #CB_DATAMAGIC&0FFh	;Indicate would like data buffer
+6$:	MOVL	EAX, dcb_dkdblk.B[EDI]
+	CALL	xosdskSrchDisk
+	JNE	20$.S			;If found it
+setbufr:CMPB	CL, #CB_SYSMAGIC&0FFh	;Not there - need system buffer?
+	JNE	12$.S			;No
+	CALL	xosdskGetSBufr		;Yes - get system buffer
+	JMP	14$.S
+
+12$:	CALL	xosdskGetDBufr		;No - get data buffer
+14$:	JC	16$.S			;If no buffer is available
+.IF NE $$CHKALLOC
+	CALL	chkalloc
+.ENDC
+	MOVL	cb_block.B[EBX], EAX	;Store position of block
+	MOVL	cb_dev.B[EBX], ESI	;Store offset of UCB
+	CALL	xosdskIntoHash		;Place block into a hash chain
+	CLRL	EAX			;Set Z and clear error code
+	MOVW	cb_errcode.B[EBX], AX
+	RET
+
+;Here if no buffers are available
+
+16$:
+.IF NE $$CHKALLOC
+	CALL	chkalloc
+.ENDC
+	STC
+	RET
+
+;Here with buffer we are looking for
+
+20$:	CMPW	cb_usecnt.B[EBX], #0.B	;Found it - is it in use now?
+	JNE	22$.S			;Yes
+	CMPL	cb_anext.B[EBX], #-1.B	;No - is it in the allocation list?
+	JE	22$.S			;No (possible if this is a FAT block)
+	CALL	xosdskRmvAlloc		;Yes - remove it from the allocation
+.IF NE $$CHKALLOC			;  list
+	CALL	chkalloc
+.ENDC
+22$:	CMPW	cb_usecnt.B[EBX], #0FFFFFFFEh.B
+	JAE	26$.S
+	INCW	cb_usecnt.B[EBX]	;Bump use count
+	MOVXWL	EAX, cb_errcode.B[EBX]	;Any error on the buffer?
+	TESTL	EAX, EAX
+	JS	24$.S			;Yes
+	TESTL	EDI, EDI		;No - clear Z
+	RET				;And return
+
+;Here if error on buffer
+	
+24$:	CMPL	EAX, #ER_DTINT		;Is it an interrupted tranfer?
+	JNE	28$.S			;No - just return the error
+	PUSHL	cb_magic.B[EBX]		;Yes
+	CALL	xosdskGiveBufr		;Give up the buffer
+	POPL	EAX
+	CMPB	AL, #CB_SYSMAGIC&0FFh	;And go try again
+	JE	xosdskSrchSBufr
+	JMP	xosdskSrchDBufr
+
+26$:	MOVL	EAX, #ER_TMRQB
+28$:	CALL	xosdskGiveBufr
+	CLRL	EBX
+	STC
+	RET
+.PAGE
+	.SBTTL	xosdskSrchDisk - Subroutine to search for disk block in memory
+
+;Subroutine to search for disk block in memory
+;	c{EAX} = Block number
+;	c{EDI} = Offset of DCB
+;	c{ESI} = Offset of UCB
+;	CALL	xosdskSrchDisk
+;	Z:set = Block not in memory
+;	Z:clr = Block found
+;	  c{EBX} = Offset of buffer
+
+xosdskSrchDisk::
+	REQUIREXFF
+	MOVL	EBX, EAX		;Index into the hash table
+	ANDL	EBX, #1FFh
+	SHLL	EBX, #2t
+	ADDL	EBX, ucb_hash.B[ESI]
+	MOVL	EBX, [EBX]
+	TESTL	EBX, EBX
+	JE	10$.S
+8$:	CMPL	cb_dev.B[EBX], #0.B	;Have UCB pointer in buffer?
+	JE	14$.S			;No - fail big!
+	CMPL	cb_block.B[EBX], EAX	;This one?
+	JE	12$.S			;Yes
+	MOVL	EBX, cb_hnext.B[EBX]	;No - advance to next buffer
+	TESTL	EBX, EBX
+	JNE	8$.S
+10$:	RET
+
+;Here if block found
+
+12$:	TESTL	ESP, ESP		;Clear Z
+	RET
+
+;Here if buffer does not point back to a UCB
+
+14$:	CRASH	NUCB			;[No UCB]
+.PAGE
+;Subroutine to check for a changed disk if need to
+;	CALL	xosdskSenseChange
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;  EBX is respected
+
+xosdskSenseChange::
+	MOVL	EAX, ucb_disp.B[ESI]	;Yes - check for possible changed disk
+	CALLI	CS:ks_senchg.B[EAX]
+	JMPIL	sendsp[EDX*4]		;Dispatch on the changed disk state
+
+	DATA
+
+sendsp:	.LONG	12$		;0 - Error
+	.LONG	6$		;1 - Disk not changed
+	.LONG	10$		;2 - Might be changed (no MS)
+	.LONG	10$		;3 - Probably changed (try to assume changed)
+	.LONG	10$		;4 - Probably changed (always verify)
+
+	CODE
+
+;Here if disk was not changed
+
+4$:	ANDB	dcb_sts2.B[EDI], #~D2$CHKCHG
+6$:	CLC
+8$:	RET
+
+;Here if disk may have been changed
+
+10$:	TESTB	dcb_sts2.B[EDI], #D2$CHKCHG ;Already doing disk change check?
+	JNE	8$.S			;Yes - don't be recursive!
+	ORB	dcb_sts2.B[EDI], #D2$CHKCHG ;No - but we are now
+	PUSHL	EBX			;Read and compare disk data to see if
+	MOVL	EBX, dcb_sdisp.B[EDI]	;  we still have the same disk
+	CALLI	CS:dd_vfychg.B[EBX]
+	POPL	EBX
+	JNC	4$.S			;If same
+	ANDB	dcb_sts2.B[EDI], #~D2$CHKCHG ;If error
+12$:	STC
+	RET
+.PAGE
+	.SBTTL	xosdskFlush - Subroutine to remove all blocks for disk from cache
+
+;Subroutine to remove all blocks from a disk unit from the disk cache - must
+;  be called in extended fork context
+;	c{EAX} = Error code
+;	c{ESI} = Offset of UDB
+;	CALL	xosdskFlush
+
+xosdskFlush::
+	REQUIREXFF
+	PUSHL	EDI
+	PUSHL	EAX
+	MOVL	EDX, ucb_hash.B[ESI]	;Point to start of hash list
+	MOVL	ECX, #512t
+4$:	MOVL	EBX, [EDX]		;Get first buffer in hash chain
+	TESTL	EBX, EBX
+	JE	12$.S			;If bucket is empty
+	MOVL	[EDX], #0		;Not empty - clear it
+6$:	PUSHL	cb_hnext.B[EBX]		;Get next buffer in hash list
+	MOVL	cb_hnext.B[EBX], #-1	;Clear links in this buffer
+	MOVL	cb_hprev.B[EBX], #-1
+	CMPW	cb_usecnt.B[EBX], #0.B	;Anyone using this buffer now?
+	JNE	8$.S			;Yes
+	CALL	xosdskRmvAlloc		;No - remove from allocation list
+.IF NE $$CHKALLOC
+	CALL	chkalloc
+.ENDC
+	CALL	givebuf6		;And put buffer on its free list
+	JMP	10$.S			;Continue
+
+;Here if someone is using this buffer
+
+8$:	MOVL	EAX, 4.B[ESP]		;Store error code in buffer
+	MOVW	cb_errcode.B[EBX], AX
+10$:	POPL	EBX			;Another buffer in this hash list?
+	TESTL	EBX, EBX
+	JNE	6$.S			;Yes - continue
+12$:	ADDL	EDX, #4t.B		;No - bump hash table pointer
+	LOOP	ECX, 4$			;Continue if more buckets to check
+	POPL	EAX
+	POPL	EDI
+	RET				;Finished
+.PAGE
+	.SBTTL	xosdskGetSBufr - Subroutine to allocate disk system buffer
+
+;Subroutine to allocate disk system buffer - must be called in extended fork
+;  context
+;	CALL	xosdskGetSBufr
+;	C:set = Error
+;	  c{EAX} = Error code
+;	  c{EBX} = 0
+;	C:clr = Normal
+;	  c{EBX} = Offset of buffer obtained
+
+xosdskGetSBufr::
+	REQUIREXFF
+	PUSHL	EAX
+	PUSHL	ECX
+2$:	MOVL	EBX, sbuffree		;Get buffer from free list
+	TESTL	EBX, EBX		;Is there one?
+	JE	4$.S			;No
+	MOVL	EAX, [EBX]		;Remove from list
+	MOVL	sbuffree, EAX
+	DECL	xosdskSBufCnt
+	CMPL	cb_magic.B[EBX], #CB_SYSMAGIC ;Is the magic number right?
+	JE	26$			;Yes - go finish up
+	CRASH	BSCB			;[Bad System Cache Buffer]
+
+;Here if system free list is empty
+
+4$:	MOVL	EBX, sbuftail		;Get buffer from tail of allocation list
+	TESTL	EBX, EBX
+	JNE	8$.S
+6$:	POPL	ECX
+	POPL	EAX			;Return 0 so will fail if anyone tries
+	CLRL	EBX			;  to use the offset
+	MOVL	EAX, #ER_NODCB		;Get error code
+	STC
+	RET
+
+8$:	DECL	xosdskSBufCnt
+	MOVL	EAX, cb_aprev.B[EBX]	;Remove from allocation list
+	MOVL	sbuftail, EAX
+	TESTL	EAX, EAX
+	JNE	20$
+	MOVL	sbufhead, EAX
+	JMP	22$
+
+	.SBTTL	xosdskGetDBufr - Subroutine to allocate disk data buffer
+
+;Subroutine to allocate disk data buffer - must be called in extended fork
+;  context
+;	CALL	xosdskGetDBufr
+;	  c{EAX} = Error code
+;	  c{EBX} = 0
+;	C:clr = Normal
+;	  c{EBX} = Offset of buffer obtained
+
+xosdskGetDBufr::
+	REQUIREXFF
+	PUSHL	EAX
+	PUSHL	ECX
+10$:	MOVL	EBX, dbuffree		;Get buffer from free list
+	TESTL	EBX, EBX
+	JE	12$.S
+	MOVL	EAX, [EBX]		;Remove from list
+	MOVL	dbuffree, EAX
+	DECL	xosdskDBufCnt
+	CMPL	cb_magic.B[EBX], #CB_DATAMAGIC ;Is the magic number right?
+	JE	26$			;Yes - go finish up
+	CRASH	BDCB			;[Bad Data Cache Buffer]
+
+11$:	CRASH	UCN0			;[cache buffer Use Count Not 0]
+
+;Here if data free list is empty
+
+12$:	MOVL	EBX, dbuftail		;Get buffer from tail of allocation list
+	TESTL	EBX, EBX
+	JE	6$			;If no buffer available!
+	DECL	xosdskDBufCnt
+	CMPW	cb_usecnt.B[EBX], #0.B
+	JNE	11$.S
+	MOVL	EAX, cb_aprev.B[EBX]	;Remove from allocation list
+	MOVL	dbuftail, EAX
+	TESTL	EAX, EAX
+	JNE	20$.S
+	MOVL	dbufhead, EAX
+	JMP	22$.S
+
+20$:	MOVL	cb_anext.B[EAX], #0
+22$:	MOVL	cb_anext.B[EBX], #-1	;Indicate not in allocation list now
+	MOVL	cb_aprev.B[EBX], #-1
+	TESTB	cb_sts.B[EBX], #CB$FAT	;Is this a FAT block?
+	JE	2212$.S			;No
+	CMPL	cb_nextfat.B[EBX], #-1.B ;Yes - is it in the write list?
+	JE	2210$.S			;No
+	TESTB	cb_sts.B[EBX], #CB$CHNGD ;Yes - has it been changed (DEBUG)?
+	JNE	2202$.S			;Yes
+	CRASH	FBNC			;[FAT Block Not Changed]
+
+;Here with a FAT block which has not been changed
+
+2202$:	PUSHL	EBX			;Save offset of buffer
+	PUSHL	dcb_dkdblk.B[EDI]	;Save current disk block
+	PUSHL	[EDI]			;Save current UCB offset
+	MOVL	ESI, cb_dev.B[EBX]	;Use the block's UCB
+	LEAL	ECX, ucb_fatwrite[ESI]	;Find the previous block in the FAT
+2204$:	CMPL	[ECX], EBX		;  write list
+	JE	2208$.S
+	MOVL	ECX, [ECX]
+	TESTL	ECX, ECX
+	JE	2206$.S
+	ADDL	ECX, #cb_nextfat.B
+	JMP	2204$.S
+
+2206$:	CRASH	FNWL			;[FAT block Not in Write List]
+
+;Here with previous block in the FAT write list - now remove this block from
+;  the FAT write list
+
+2208$:	MOVL	EAX, cb_nextfat.B[EBX]
+	MOVL	[ECX], EAX
+	JMP	2214$.S
+
+;Here with FAT block which is not in the FAT list
+
+2210$:	TESTB	cb_sts.B[EBX], #CB$CHNGD ;Has it been changed (DEBUG)?
+	JE	24$.S			;No
+	CRASH	FNWL			;[FAT block Not in Write List]
+
+;Here if this block is not a FAT block
+
+2212$:	TESTB	cb_sts.B[EBX], #CB$CHNGD ;Has the buffer been changed?
+	JE	24$.S			;No
+	PUSHL	EBX			;Yes - save offset of buffer
+	PUSHL	dcb_dkdblk.B[EDI]	;Save current disk block
+	PUSHL	[EDI]			;Save current UCB offset
+	MOVL	ESI, cb_dev.B[EBX]	;Use the block's UCB
+2214$:	MOVL	[EDI], ESI
+	INCW	cb_usecnt.B[EBX]	;Yes - bump use count
+	CALL	xosdskLockBufrW		;Lock the buffer (since the buffer was
+	CALL	xosdskWriteBufr		;Write it out now (ignore errors!!!)
+	POPL	ESI			;Restore UCB offset
+	MOVL	[EDI], ESI
+	POPL	dcb_dkdblk.B[EDI]	;Restore disk block
+	POPL	EBX			;Restore offset of buffer
+	CALL	xosdskUnlkBufr		;Unlock the buffer
+	CMPW	cb_usecnt.B[EBX], #1.B	;Anyone else want it now? (This is
+					;  possible if someone tried to
+					;  access this buffer while we were
+					;  writing it!)
+	JBE	24$.S			;No - go on
+	DECW	cb_usecnt.B[EBX]	;Yes - give it up (this allows anyone
+					;  waiting for it to get it)
+					;Since this buffer is now in use, we
+					;  will have to start over and find
+					;  another one to use!
+	CMPB	cb_magic.B[EBX], #CB_SYSMAGIC&0FFh ;Is it a system buffer?
+	JE	10$			;Yes
+	JMP	2$			;No - its a data buffer
+
+;Here with buffer which matchs the disk which we can use now
+
+24$:	CALL	xosdskRmvHash		;Remove buffer from hash list
+26$:	PUSHL	EDI
+	LEAL	EDI, -{CB_HDRSIZE-8}.B[EBX]
+	PUSHL	DS			 ;Clear the buffer header (except for
+	POPL	ES			 ;  the first two items which are
+	MOVL	ECX, #{CB_HDRSIZE-12t}/4 ;  cb_magic and cb_next) and the last
+	CLRL	EAX			 ;  (which is cb_paddr)
+	CLD
+	RSTOSL	[EDI]
+	POPL	EDI			;Restore registers
+	POPL	ECX
+	POPL	EAX
+	INCW	cb_usecnt.B[EBX]	;Initialize use count
+	DECL	cb_anext.B[EBX]		;Indicate not in allocation list
+	DECL	cb_aprev.B[EBX]
+	DECL	cb_hnext.B[EBX]		;Indicate not in hash list
+	DECL	cb_hprev.B[EBX]
+	MOVL	ESI, [EDI]
+	MOVL	cb_dev.B[EBX], ESI
+ret008:	RET				;And return
+.PAGE
+	.SBTTL	xosdskRelsLkBufr - Subroutine to release locked disk buffer
+
+;Here if buffer is locked when it should not be
+
+relsbilk:
+	CRASH	BILK			;[Buffer Is LocKed]
+
+;Here if buffer is not in use
+
+relsbniu:
+	CRASH	BNIU			;[Buffer Not In Use]
+
+;Here if buffer is on an allocation list when it shouldn't be
+
+relsboal:
+	CRASH	BOAL			;[Buffer is On Allocation List]
+
+;Subroutine to release locked disk buffer - current user is finished with the
+;  buffer but it will be left around for future use - buffer is left on its
+;  hash list and is also placed on the head of either the system or data
+;  buffer allocation list - must be called in extended fork context
+;	c{EBX} = Offset of buffer
+;	Buffer must be locked
+;	CALL	xosdskRelsLkBufr
+
+xosdskRelsLkBufr::
+	REQUIREXFF
+	TESTL	EBX, EBX		;Really have a buffer here?
+	JE	ret008.S		;No - nothing to do!
+	CMPL	cb_magic.B[EBX], #CB_SYSMAGIC
+	JE	2$.S
+	CMPL	cb_magic.B[EBX], #CB_DATAMAGIC
+	JNE	8$
+2$:	CALL	xosdskUnlkBufr		;Yes - its no longer locked
+	JMP	4$.S			;Continue
+
+	.SBTTL	xosdskRelsBufr - Subroutine to release disk buffer
+
+;Subroutine to release disk buffer - same as relslkbufr except buffer is not
+;  now locked
+;	c{EBX} = Offset of buffer
+;	CALL	xosdskRelsBufr
+;	C:clr always
+
+xosdskRelsBufr::
+	REQUIREXFF
+	TESTL	EBX, EBX		;Really have a buffer here?
+	JE	ret008.S		;No - nothing to do!
+	CMPL	cb_magic.B[EBX], #CB_SYSMAGIC
+	JE	4$.S
+	CMPL	cb_magic.B[EBX], #CB_DATAMAGIC
+	JNE	8$.S
+4$:	REQUIREFORK
+	DECW	cb_usecnt.B[EBX]	;No - any active users of this buffer
+	JS	relsbniu		;  left?
+	JNE	14$.S			;Yes - just reduce the count this time
+	TESTB	cb_sts.B[EBX], #CB$FAT	;No - is this a FAT block?
+	JE	6$.S			;No
+	CMPL	cb_nextfat.B[EBX], #-1.B ;Yes - is it in the FAT write list?
+	JNE	14$.S			;Yes - don't put it on the allocation
+					;  list
+6$:	CMPW	cb_errcode.B[EBX], #0.B	;Any errors on this buffer?
+	JNE	givebuf4		;Yes - don't keep it around!
+	MOVL	EAX, SS
+	CMPW	cb_lockxff.B[EBX], AX	;No - is it locked now by us?
+	JE	relsbilk		;Yes - fail!
+	CMPL	cb_anext.B[EBX], #-1.B	;No - is buffer on an allocation list?
+	JNE	relsboal		;Yes - fail!
+	CMPL	cb_magic.B[EBX], #CB_SYSMAGIC ;No - system buffer?
+	JNE	10$.S			;No
+	MOVL	EAX, sbufhead		;Yes - put on head of system buffer
+	MOVL	sbufhead, EBX		;  allocation list
+	INCL	xosdskSBufCnt
+	JMP	12$.S
+
+8$:	CRASH	BCBH			;[Bad Cache Buffer Header]
+
+10$:	CMPL	cb_magic.B[EBX], #CB_DATAMAGIC ;Data buffer?
+	JNE	8$.S			;No
+	MOVL	EAX, dbufhead		;Put on head of data buffer allocation
+	MOVL	dbufhead, EBX		;  list
+	INCL	xosdskDBufCnt
+12$:	MOVL	cb_anext.B[EBX], EAX
+	MOVL	cb_aprev.B[EBX], #0	;Clear back pointer
+	TESTL	EAX, EAX		;Is this the only buffer in the list?
+	JE	18$.S			;Yes
+	MOVL	cb_aprev.B[EAX], EBX	;No - link next block back to this one
+14$:	CLRL	EBX			;Return 0
+ret010:	RET
+
+;Here if this is now only buffer on allocation list - set up the tail pointer
+
+18$:	CMPB	cb_magic.B[EBX], #CB_SYSMAGIC&0FFh
+	JNE	20$.S
+	MOVL	sbuftail, EBX
+	JMP	14$.S
+
+20$:	MOVL	dbuftail, EBX
+	JMP	14$.S
+.PAGE
+	.SBTTL	xosdskGiveLkBufr - Subroutine to give up locked disk buffer
+
+;Here if we are trying to give up a buffer which we have locked
+
+givebilk:
+	CRASH	BILK			;[Buffer Is LocKed]
+
+;Here if we are trying to give up a buffer which is not in use
+
+givebniu:
+	CRASH	BNIU			;[Buffer Not In Use]
+
+;Subroutine to give up locked disk buffer - buffer is removed from its hash
+;  list and placed on either the system or data buffer free list
+;	c{EBX} = Offset of buffer
+;	Buffer must be locked
+;	CALL	xosdskGiveLkBufr
+
+xosdskGiveLkBufr::
+	REQUIREFORK
+	TESTL	EBX, EBX		;Really have a buffer now?
+	JE	ret010.S		;No - nothing needed here
+	CMPL	cb_magic.B[EBX], #CB_SYSMAGIC
+	JE	1$.S
+	CMPL	cb_magic.B[EBX], #CB_DATAMAGIC
+	JNE	4$
+1$:	CALL	xosdskUnlkBufr		;Yes - no longer locked
+	JMP	2$.S			;Continue
+
+	.SBTTL	xosdskGiveBufr - Subroutine to give up disk buffer
+
+;Subroutine to give up disk buffer - just like xosdskGiveLkBufr except buffer
+;  is not locked
+;	c{EBX} = Offset of buffer
+;	CALL	xosdskGiveBufr
+
+xosdskGiveBufr::
+	REQUIREFORK
+	TESTL	EBX, EBX		;Really have a buffer now?
+	JE	ret010.S		;No - nothing needed here
+	CMPL	cb_magic.B[EBX], #CB_SYSMAGIC
+	JE	2$.S
+	CMPL	cb_magic.B[EBX], #CB_DATAMAGIC
+	JNE	4$.S
+2$:	DECW	cb_usecnt.B[EBX]	;Yes - reduce use count
+	JS	givebniu		;If it was not in use!
+	JNE	10$			;Can't give it up if someone is still
+givebuf4:				;  using it
+	MOVL	EAX, SS			;Do we have this buffer locked?
+	CMPW	cb_lockxff.B[EBX], AX
+	JE	givebilk		;Yes - fail big!
+	CMPL	cb_hnext.B[EBX], #-1.B	;No - is buffer on a hash list now?
+	JE	givebuf6.S		;No
+	CALL	xosdskRmvHash		;Yes - remove from hash list
+givebuf6:
+	CMPL	cb_anext.B[EBX], #-1.B	;Is buffer on an allocation list now?
+	JNE	giveboal.S		;Yes - fail!
+	DECW	cb_usecnt.B[EBX]	;No - set use count to 0FFFFh to
+					;  indicate buffer is on the free list
+	CMPL	cb_magic.B[EBX], #CB_SYSMAGIC ;System buffer?
+	JNE	6$.S			;No - data buffer
+	MOVL	EAX, sbuffree		;Yes - put on system buffer free list
+	MOVL	sbuffree, EBX
+	INCL	xosdskSBufCnt
+	JMP	8$.S
+
+4$:	CRASH	BCBH			;[Bad Cache Buffer Header]
+
+;Here if data buffer
+
+6$:	CMPL	cb_magic.B[EBX], #CB_DATAMAGIC ;Data buffer?
+	JNE	4$.S			;No!
+	MOVL	EAX, dbuffree
+	MOVL	dbuffree, EBX
+	INCL	xosdskDBufCnt
+8$:	MOVL	[EBX], EAX
+10$:	CLRL	EBX
+	RET
+
+;Here if we are trying to give up a buffer which is already on an allocation
+;  list
+
+giveboal:
+	CRASH	BOAL			;[Buffer is On Allocation List]
+.PAGE
+	.SBTTL	xosdskIntoHash - Subroutine to place buffer into a hash list
+
+;Subroutine to place buffer into a hash list - must be called at fork level
+;	c{EAX} = Block number
+;	c{EBX} = Offset of buffer
+;	CALL	xosdskIntoHash
+
+xosdskIntoHash::
+	REQUIREXFF
+	CMPL	cb_magic.B[EBX], #CB_SYSMAGIC ;Make sure magic number is right
+	JE	2$.S
+	CMPL	cb_magic.B[EBX], #CB_DATAMAGIC
+	JNE	8$.S
+2$:	CMPL	cb_hnext.B[EBX], #-1.B	;Is this block in a hash list now?
+	JNE	10$.S			;Yes!
+	MOVL	EDX, EAX		;No - index into the hash table
+	ANDL	EDX, #1FFh
+	SHLL	EDX, #2t
+	ADDL	EDX, ucb_hash.B[ESI]
+	MOVL	EAX, [EDX]		;Link into hash chain for block
+	MOVL	cb_hnext.B[EBX], EAX
+	MOVL	cb_hprev.B[EBX], #0
+	MOVL	[EDX], EBX
+	TESTL	EAX, EAX		;Was the list empty to start with?
+	JE	4$.S			;Yes
+	MOVL	cb_hprev.B[EAX], EBX	;No - update back link in previous first
+4$:	RET				;  packet
+
+8$:	CRASH	BCBH			;[Bad Cache Buffer Header]
+
+10$:	CRASH	BIHL			;[Buffer In Hash List]
+.PAGE
+	.SBTTL	xosdskRmvHash - Subroutine to remove disk buffer from its hash list
+
+;Subroutine to remove disk buffer from its hash list - must be called at fork
+;  level
+;	c{EBX} = Offset of disk buffer
+;	CALL	xosdskRmvHash
+
+1$:	CRASH	BCBH			;[Bad Cache Buffer Header]
+
+2$:	CRASH	BNHL			;[Buffer Not in Hash List]
+
+xosdskRmvHash::
+	REQUIREFORK
+	CMPL	cb_magic.B[EBX], #CB_SYSMAGIC
+	JE	3$.S
+	CMPL	cb_magic.B[EBX], #CB_DATAMAGIC
+	JNE	1$.S
+3$:	CMPL	cb_hnext.B[EBX], #-1.B	;Really in a hash list?
+	JE	2$.S			;No - fail
+	PUSHL	EAX
+	PUSHL	EDX
+	MOVL	EAX, cb_hprev.B[EBX]	;Remove from hash list
+	MOVL	EDX, cb_hnext.B[EBX]
+	TESTL	EAX, EAX
+	JE	4$.S			;If first in hash list
+	MOVL	cb_hnext.B[EAX], EDX	;Not first
+	JMP	6$.S
+
+;Here if this buffer is first in hash list
+
+4$:	PUSHL	ECX			;Calculate hash index
+	PUSHL	ESI			;Point to UCB for this buffer
+	MOVL	ESI, cb_dev.B[EBX]
+	TESTL	ESI, ESI
+	JE	10$.S
+	MOVL	ECX, cb_block.B[EBX]	;Get hash table index
+	ANDL	ECX, #1FFh
+	SHLL	ECX, #2t
+	ADDL	ECX, ucb_hash.B[ESI]
+	CMPL	[ECX], EBX		;Is the head pointer right?
+	JNE	12$.S			;No - fail
+	MOVL	[ECX], EDX		;Yes - update pointer in hash table
+	POPL	ESI
+	POPL	ECX
+6$:	TESTL	EDX, EDX
+	JE	8$.S			;If last in hash list
+	MOVL	cb_hprev.B[EDX], EAX	;Not last
+8$:	MOVL	cb_hprev.B[EBX], #-1
+	MOVL	cb_hnext.B[EBX], #-1
+	POPL	EDX
+	POPL	EAX
+	RET				;Return
+
+10$:	CRASH	NUCB			;[No UCB]
+
+12$:	CRASH	BDHL			;[Bad Disk Hash List]
+.PAGE
+	.SBTTL	xosdskRmvAlloc - Subroutine to remove disk buffer from allocation list
+
+;Subroutine to remove disk buffer from allocation list - must be called at
+;  fork level
+;	c{EBX} = Offset of buffer
+;	CALL	xosdskRmvAlloc
+
+1$:	CRASH	BCBH			;[Bad Cache Buffer Header]
+
+2$:	CRASH	BALC
+
+xosdskRmvAlloc:
+	REQUIREFORK
+	CMPL	cb_magic.B[EBX], #CB_SYSMAGIC
+	JE	3$.S
+	CMPL	cb_magic.B[EBX], #CB_DATAMAGIC
+	JNE	1$.S
+3$:	CMPL	cb_anext.B[EBX], #-1.B	;Really on an allocation list?
+	JE	2$.S			;No - fail
+	PUSHL	EAX
+	PUSHL	EDX
+	MOVL	EAX, cb_aprev.B[EBX]	;Remove it from the allocation list
+	MOVL	EDX, cb_anext.B[EBX]
+	TESTL	EAX, EAX		;First in list?
+	JNE	6$.S			;No
+	CMPB	cb_magic.B[EBX], #CB_SYSMAGIC&0FFh ;Yes - which list?
+	JNE	4$.S			;Data buffer
+	MOVL	sbufhead, EDX		;System buffer
+	JMP	8$.S
+
+4$:	MOVL	dbufhead, EDX
+	JMP	8$.S
+
+;Here if not first in allocation list
+
+6$:	MOVL	cb_anext.B[EAX], EDX
+8$:	TESTL	EDX, EDX		;Last in allocation list?
+	JNE	12$.S			;No
+	CMPB	cb_magic.B[EBX], #CB_SYSMAGIC&0FFh ;Yes - which list?
+	JNE	10$.S			;Data buffer
+	MOVL	sbuftail, EAX		;System buffer
+	JMP	14$.S
+
+10$:	MOVL	dbuftail, EAX
+	JMP	16$.S
+
+;Here if not last in allocation list
+
+12$:	MOVL	cb_aprev.B[EDX], EAX
+	CMPB	cb_magic.B[EBX], #CB_SYSMAGIC&0FFh ;Which kind of buffer?
+	JNE	16$.S			;Data buffer
+14$:	DECL	xosdskSBufCnt		;System buffer
+	JMP	18$.S
+
+16$:	DECL	xosdskDBufCnt
+18$:	MOVL	cb_anext.B[EBX], #-1	;Indicate buffer not in allocation
+	MOVL	cb_aprev.B[EBX], #-1	;  list
+	POPL	EDX
+	POPL	EAX			;Restore registers we used
+	RET				;Return
+.PAGE
+	.SBTTL	chkalloc
+
+.IF NE $$CHKALLOC
+
+chkalloc::
+	PUSHL	EAX
+	PUSHL	ECX
+	PUSHL	EDX
+	PUSHL	EBX
+	MOVL	EAX, sbufhead		;Check the system buffer allocation
+	MOVL	EBX, sbuftail		;  list
+	CALL	chkalloc2
+	MOVL	EAX, dbufhead		;Check the data buffer allocation
+	MOVL	EBX, dbuftail		;  list
+	CALL	chkalloc2
+	MOVL	EAX, sbuffree		;Check the system buffer free list
+	CALL	chkfree
+	MOVL	EAX, dbuffree		;Check the data buffer free list
+	CALL	chkfree
+	POPL	EBX
+	POPL	EDX
+	POPL	ECX
+	POPL	EAX
+	RET
+
+;Subroutine to check an allocation list
+;	c{EAX} = First buffer in list
+;	c{EBX} = Last buffer in list
+;	CALL	chkalloc2
+
+chkalloc2::
+	CLRL	ECX
+2$:	TESTL	EAX, EAX		;End of list?
+	JE	6$.S			;Yes
+	CMPL	cb_magic.B[EAX], #CB_SYSMAGIC ;No - check the magic number
+	JE	4$.S
+	CMPL	cb_magic.B[EAX], #CB_DATAMAGIC
+	JNE	14$.S
+4$:	CMPL	cb_aprev.B[EAX], ECX	;Is back pointer OK?
+	JNE	16$.S
+	MOVL	ECX, EAX		;Yes - advance to next in list
+	MOVL	EAX, cb_anext.B[EAX]
+	JMP	2$.S
+
+;Here at end of list
+
+6$:	CMPL	ECX, EBX		;Is tail pointer right?
+	JNE	18$.S			;No
+10$:	RET				;Yes
+
+14$:	CRASH	XXMN
+
+16$:	CRASH	XXBP
+
+18$:	CRASH	XXTP
+
+;Subroutine to check a free list
+;	c{EAX} = First buffer in list
+;	CALL	chkfree
+
+chkfree::
+	TESTL	EAX, EAX
+	JE	10$.S
+	CMPL	cb_magic.B[EAX], #CB_SYSMAGIC ;No - check the magic number
+	JE	22$.S
+	CMPL	cb_magic.B[EAX], #CB_DATAMAGIC
+	JNE	24$.S
+22$:	CMPW	cb_usecnt.B[EAX], #-1.B	;Use count must be -1
+	JNE	26$.S
+	MOVL	EDX, cb_hnext.B[EAX]	;Make sure not in hash list
+	ANDL	EDX, cb_hprev.B[EAX]
+	INCL	EDX
+	JNE	28$.S
+	MOVL	EDX, cb_anext.B[EAX]	;Make sure not in allocation list
+	ANDL	EDX, cb_aprev.B[EAX]
+	INCL	EDX
+	JNE	30$.S
+	MOVL	EAX, [EAX]		;Advance to next buffer
+	JMP	chkfree.S
+
+24$:	CRASH	XXMN
+
+26$:	CRASH	XXUC
+
+28$:	CRASH	XXHL
+
+30$:	CRASH	XXAL
+.ENDC
+.PAGE
+	.SBTTL	xosdskWriteBufr - Subroutine to write contents of buffer to disk
+
+;Subroutine to write contents of a buffer to disk - must be called in extended
+;  fork context
+;	c{EBX} = Offset of buffer
+;	c{EDI} = Offset of DCB
+;	CALL	xosdskWriteBufr
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+
+xosdskWriteBufr::
+	REQUIREXFF
+	CMPL	cb_magic.B[EBX], #CB_SYSMAGIC ;Check the magic number
+	JE	2$.S
+	CMPL	cb_magic.B[EBX], #CB_DATAMAGIC
+	JNE	12$.S
+2$:	MOVL	ESI, [EDI]		;Get offset of UCB
+	TESTL	ESI, ESI
+	JE	knlNoUnit##
+	CLRL	EAX
+	MOVL	cb_xnext.B[EBX], EAX	;Clear the buffer list pointer
+	CMPL	dcb_dkpbfr.B[EDI], EBX	;Is this the pending write buffer?
+	JNE	4$.S			;No
+	MOVL	dcb_dkpbfr.B[EDI], EAX	;Yes, but not any more
+	DECW	cb_usecnt.B[EBX]
+	JE	14$.S
+4$:	ANDB	cb_sts.B[EBX], #~CB$CHNGD ;Indicate buffer matches disk
+	MOVL	EAX, cb_block.B[EBX]	;Get block number
+	MOVL	dcb_dkdblk.B[EDI], EAX
+	MOVL	ECX, #512t		;Get amount to transfer (1 block)
+	PUSHL	DS
+	POPL	ES
+	MOVL	EAX, #kf_writlist	;Get function
+	PUSHL	EBX
+	CALL	xosdskXfer#		;Do the transfer
+	POPL	EBX
+	JNC	10$.S			;If OK
+	ORB	cb_sts.B[EBX], #CB$CHNGD ;Error
+	STC
+10$:	RET
+
+12$:	CRASH	BCBH			;[Bad Cache Buffer Header]
+
+14$:	CRASH	BBUC			;[Bad Buffer Use Count]
+.PAGE
+	.SBTTL	xosdskLockBufrF - Subroutine to lock buffer for single access
+
+;Subroutine to lock buffer for single access - fails if buffer not immediately
+;  available - must be called in extended fork context
+;	c{EBX} = Offset of buffer for disk block
+;	c{EDI} = Offset of DCB
+;	CALL	xosdskLockBufrF
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  Z:clr = Buffer already locked
+;	  Z:set = Buffer available, now locked
+;  All registers are preserved unless error (EAX only is changed on error)
+
+xosdskLockBufrF::
+	REQUIREXFF
+	CMPL	cb_magic.B[EBX], #CB_SYSMAGIC ;No - check the magic number
+	JE	2$.S
+	CMPL	cb_magic.B[EBX], #CB_DATAMAGIC
+	JNE	4$.S
+2$:	TESTL	EDI, EDI		;Make sure have DCB
+	JE	6$.S
+	CMPL	SS:xffDcb##, #0.B
+	JE	6$.S
+	CMPW	cb_usecnt.B[EBX], #0.B	;Make sure buffer is in use
+	JE	8$.S
+	CMPL	cb_anext.B[EBX], #-1.B	;Make sure not in allocation list
+	JNE	10$.S
+	CMPW	cb_lockxff.B[EBX], #0.B	;Does anyone have this buffer now?
+	JE	grabbfr.S		;No
+	CLC				;Yes - clear C (Z is already clear
+	RET				;  from above)
+
+4$:	CRASH	BCBH			;[Bad Cache Buffer Header]
+
+6$:	CRASH	NDCB			;[No DCB associated with buffer]
+
+8$:	CRASH	BNIU			;[Buffer Not In Use]
+
+10$:	CRASH	BOAL			;[Buffer is On Allocation List]
+.PAGE
+	.SBTTL	xosdskLockBufrW - Subroutine to lock buffer for single access
+
+;Subroutine to lock buffer for single access - waits until buffer is available
+;  if currently locked - must be called in extended fork
+;  context
+;	c{EBX} = Offset of buffer for disk block
+;	c{EDI} = Offset of DCB
+;	CALL	xosdskLockBufrW
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;  All registers are preserved unless error (EAX only is changed on error)
+
+xosdskLockBufrW::
+	REQUIREXFF
+	CMPL	cb_magic.B[EBX], #CB_SYSMAGIC ;Check the magic number
+	JE	2$.S
+	CMPL	cb_magic.B[EBX], #CB_DATAMAGIC
+	JNE	4$.S
+2$:	TESTL	EDI, EDI		;Make sure have a DCB
+	JE	6$.S
+	CMPL	SS:xffDcb##, #0.B
+	JE	6$.S
+	CMPW	cb_usecnt.B[EBX], #0.B	;Make sure buffer is in use
+	JE	8$.S
+	CMPL	cb_anext.B[EBX], #-1.B	;Make sure not in allocation list
+	JNE	10$.S
+	CMPW	cb_lockxff.B[EBX], #0.B	;Does anyone have this buffer now?
+	JNE	12$.S			;Yes
+grabbfr:MOVW	cb_lockxff.B[EBX], SS	;No - grab the resource
+	INCL	SS:xffLockCnt#		;Count this locked buffer
+	CMPL	EAX, EAX		;Set Z, clear C
+	RET
+
+4$:	CRASH	BCBH			;[Bad Cache Buffer Header]
+
+6$:	CRASH	NDCB			;[No DCB associated with buffer]
+
+8$:	CRASH	BNIU			;[Buffer Not In Use]
+
+10$:	CRASH	BOAL			;[Buffer is On Allocation List]
+
+;Here if must wait for this buffer
+
+12$:	PUSHL	EAX
+	MOVL	EAX, SS			;Do we have it now?
+	CMPW	cb_lockxff.B[EBX], AX
+	JE	lockhvlk.S		;Yes - fail big!
+	MOVZWL	EAX, cb_wtail.B[EBX]	;No - link us to the wait list
+	TESTL	EAX, EAX
+	JE	14$.S
+	PUSHL	ES
+	MOVL	ES, EAX
+	MOVW	ES:xffWaitList##, SS
+	POPL	ES
+	JMP	16$.S
+
+14$:	MOVW	cb_whead.B[EBX], SS
+16$:	MOVW	cb_wtail.B[EBX], SS
+	MOVW	SS:xffWaitList##, #0
+	MOVL	SS:xffWaitBufr##, EBX	;Remember buffer for debugging
+18$:	CALL	knlXfWaitNTO##		;Wait for the buffer
+	JC	18$.S			;If error, just wait some more!
+	MOVL	EAX, SS
+	CMPW	cb_lockxff.B[EBX], AX	;Make sure we really have it!
+	JNE	20$.S
+	POPL	EAX
+	RET
+
+;Here if do not have the buffer after waiting
+
+20$:	CRASH	DNHB			;[Do Not Have Buffer]
+
+;Here if trying to lock buffer which we already have locked
+
+lockhvlk:
+	CRASH	HVLK			;[HaVe buffer LocKed]
+.PAGE
+	.SBTTL	xosdskUnlkBufr - Subroutine to unlock buffer
+
+;Subroutine to unlock buffer
+;	c{EBX} = Offset of buffer for disk block
+;	c{EDI} = Offset of disk DCB
+;	CALL	xosdskUnlkBufr
+;	C:clr always
+;  All registers are preserved
+
+xosdskUnlkBufr::
+	REQUIREXFF
+	CMPL	cb_magic.B[EBX], #CB_SYSMAGIC
+	JE	2$.S
+	CMPL	cb_magic.B[EBX], #CB_DATAMAGIC
+	JNE	8$.S
+2$:	PUSHL	EAX
+	MOVL	EAX, SS
+	CMPW	cb_lockxff.B[EBX], AX	;Is the buffer really locked by us?
+	JNE	unlkbnlk.S		;No
+	DECL	SS:xffLockCnt##		;Yes - reduce our lock count
+	JS	4$.S
+	CMPL	cb_whead.B[EBX], #0.B	;Anyone waiting for this buffer?
+	JNE	10$.S			;Yes
+	MOVW	cb_lockxff.B[EBX], #0	;No - indicate not locked now
+	POPL	EAX
+	RET				;Finished
+
+4$:	CRASH	BBLC			;[Bad Buffer Lock Count]
+
+;Here if not a valid buffer
+
+8$:	CRASH	BCBH			;[Bad Cache Buffer Header]
+
+;Here if buffer is not locked by this process
+
+unlkbnlk:
+	CRASH	BNLK			;[Buffer Not LocKed]
+
+;Here if someone is waiting for this buffer
+
+10$:	PUSHL	ES			;Remove extended fork frame from wait
+	MOVW	ES, cb_whead.B[EBX]	;  list for buffer
+	MOVZWL	EAX, ES:xffWaitList##
+	MOVW	cb_whead.B[EBX], AX
+	TESTL	EAX, EAX
+	JNE	12$.S
+	MOVW	cb_wtail.B[EBX], AX
+12$:	MOVW	ES:xffWaitList##, #0FFFFh
+	CMPL	ES:xffWaitBufr##, EBX	;Really waiting for this buffer?
+	JNE	14$.S			;No!
+	MOVL	ES:xffWaitBufr##, #0	;Yes - but not any more
+	MOVW	cb_lockxff.B[EBX], ES
+	INCL	ES:xffLockCnt##
+	PUSHL	EBX
+	PUSHL	EDI
+	MOVL	EDI, ES:xffDcb##	;Get DCB of requestor
+	CLRL	EAX
+	CALL	knlResumeOutput##	;Let him have the buffer
+	POPL	EDI
+	POPL	EBX
+	POPL	ES
+	POPL	EAX
+	CLC				;Make sure C is clear
+	RET				;And return
+
+14$:	CRASH	NWFB			;[Not Waiting For Buffer]
+.PAGE
+	.SBTTL	dcsinfo - Process the DCSINFO class characteristic
+
+;Here for the DCSINFO class characteric to return disk cache status information
+;	c{ECX}    = Size of user's data array
+;	c{ES:EBX} = Address of user's data array
+;	CALL	dcsinfo
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  c{EAX} = Amount of data stored (dcsi_SIZE)
+
+dcsinfo::
+	MOVL	EDI, EBX
+	MOVL	ECX, numsbuf#		;Get total number of system buffers
+	IFFAULT	knlRtnAdrEr##
+	MOVL	ES:dcsi_sbuft.B[EDI], ECX ;Give it to him
+	PUSHL	EDI
+	MOVL	EDX, #CB_SYSMAGIC	;Get value for cb_magic
+	TOFORK
+	MOVL	EAX, xosdskSBufCnt	;Get number of available system buffers
+	IFFAULT	6$
+	MOVL	ES:dcsi_sbufa.B[EDI], EAX ;Give it to him
+	ADDL	EDI, #dcsi_sbuf0.B
+	MOVL	EBX, sbuffirst		;Get usage for system buffers
+	CALL	usgbufrs
+	JC	4$.S
+	FROMFORK
+	POPL	EDI
+	MOVL	ECX, numdbuf#		;Get total number of data buffers
+	IFFAULT	knlRtnAdrEr##
+	MOVL	ES:dcsi_dbuft.B[EDI], ECX ;Give it to him
+	MOVL	EDX, #CB_DATAMAGIC	;Get value for cb_magic
+	TOFORK
+	MOVL	EAX, xosdskDBufCnt	;Get number of available data buffers
+	IFFAULT	8$
+	MOVL	ES:dcsi_dbufa.B[EDI], EAX ;Give it to him
+	ADDL	EDI, #dcsi_dbuf0.B
+	MOVL	EBX, dbuffirst		;Get usage for data buffers
+	CALL	usgbufrs
+	JC	4$.S
+	FROMFORK
+	MOVL	EAX, #dcsi_SIZE		;Return amount stored
+	CLC
+	RET				;All done
+
+;Here if error return from usgbufrs
+
+4$:	FROMFORK
+	STC
+	RET
+
+;Here if address error
+
+	FAULTHDR
+6$:	POPL	EDI
+	FAULTHDR
+8$:	FROMFORK
+	JMP	knlRtnAdrEr##
+.PAGE
+;Subroutine to get usage for system or data buffers - must be called at fork
+;  level
+;	c{EDX} = Expected value for cb_magic
+;	c{ECX} = Number of buffers to check
+;	c{EBX} = Offset of first buffer
+;	c{ES:EDI} = Address of 0 use count
+;	CALL	usgbufrs
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  c{EAX} = 0
+
+usgbufrs:
+	CLRL	EAX			;Clear the user's counts
+	PUSHL	ECX
+	PUSHL	EDI
+	MOVL	ECX, #7
+	SUBL	EDI, #4.B
+	CLD
+	IFFAULT	8$
+	RSTOSL	[EDI]
+	POPL	EDI
+	POPL	ECX
+2$:	MOVZWL	EAX, cb_usecnt.B[EBX]	;Get use count for buffer
+	CMPL	EAX, #0FFFFh		;Free buffer?
+	JNE	4$.S			;No
+	CWL				;Yes
+4$:	CMPL	EAX, #5.B		;No - more than 5 users?
+	JLE	6$.S			;No
+	MOVL	EAX, #5			;Yes - just say 5
+6$:	IFFAULT	knlRtnAdrEr##
+	INCL	ES:[EDI+EAX*4]		;Bump user's count
+	CMPL	cb_magic.B[EBX], EDX	;Is cb_magic right?
+	JNE	12$.S			;No - fail!
+	MOVL	EBX, cb_next.B[EBX]	;Yes - advance to next buffer
+	LOOP	ECX, 2$			;Continue if more
+	TESTL	EBX, EBX		;Make sure really at end
+	JNE	10$.S
+	RET
+
+;Here if address error
+
+	FAULTHDR
+8$:	POPL	EDI
+	POPL	ECX
+	JMP	knlRtnAdrEr##
+
+10$:	CRASH	BDBC			;[BaD Buffer Count]
+
+12$:	CRASH	BDBS			;[BaD Buffer Status]
+.PAGE
+	.SBTTL	Data
+
+	DATA
+
+bufferla::     .LONG la_cbbase	;Linear address for allocating buffers
+xosdskSBufCnt::.LONG 0		;Number of available system buffers
+sbuffirst::    .LONG 0		;First system buffer
+sbuffree::     .LONG 0		;System buffer free list head pointer
+sbufhead::     .LONG 0		;System buffer allocation list head pointer
+sbuftail::     .LONG 0		;System buffer allocation list tail pointer
+xosdskDBufCnt::.LONG 0		;Number of available data buffers
+dbuffirst::    .LONG 0		;First data buffer
+dbuffree::     .LONG 0		;Data buffer free list head pointer
+dbufhead::     .LONG 0		;Data buffer allocation list head pointer
+dbuftail::     .LONG 0		;Data buffer allocation list tail pointer
+lit7:	       .LONG 7t
+
+	LKEEND

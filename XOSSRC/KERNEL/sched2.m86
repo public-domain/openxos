@@ -1,0 +1,3382 @@
+	.TITLE	SCHED2 - Scheduling SVC functions for XOS
+
+;++++
+; This software is in the public domain.  It may be freely copied and used
+; for whatever purpose you see fit, including commerical uses.  Anyone
+; modifying this software may claim ownership of the modifications, but not
+; the complete derived code.  It would be appreciated if the authors were
+; told what this software is being used for, but this is not a requirement.
+
+;   THIS SOFTWARE IS PROVIDED BY THE AUTHORS "AS IS" AND ANY EXPRESS OR
+;   IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
+;   OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+;   IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+;   INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+;   BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS
+;   OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+;   ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR
+;   TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
+;   USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+;----
+
+	.PROC	80486
+	.INCLUD	XOSINC:\XMAC\XOS.PAR
+	.INCLUD	XOSINC:\XMAC\XOSX.PAR
+	.INCLUD	XOSINC:\XMAC\XOSTIME.PAR
+	.INCLUD	XOSINC:\XMAC\XOSDOS.PAR
+	.INCLUD	XOSINC:\XMAC\XOSXTRM.PAR
+	.INCLUD	XOSINC:\XMAC\XOSERR.PAR
+
+	CODE
+
+;A child died signal always generates at least 8 data items as follows:
+;	 0:  Process ID
+;	 4:  Exit status value (as passed in ECX) - high 8 bits contain
+;	       termination reason
+;	 8:  Child EIP
+;	12:  Child CS
+;	16:  Child EFR
+;	20:  Address data (offset)
+;	24:  Address data (segment)
+;	28:  Data
+;If the process terminating is a session process, additional data items are
+;  included to report accounting data as follows:
+;	32:  Billing class (bits 7-0)
+;	     Number of intervals (bits 15-8)
+;	     Number of billing levels in each interval (bits 23-16)
+;	     Reserved, always 0 (bits 31-24)
+;This item is followed by a group of blocks for each interval. There is one
+;  block for each billing level.  Each block contains two items.  The first
+;  item contains the low order 32 bits of the 48 bit accumulated time value.
+;  The low order 16 bits of the second item contains the high 16 bits of the
+;  accumulated time value.  The high order 16 bits contains the rate (cents
+;  per hour) for the billing level for the interval.
+
+;The current implemenation always includes values for 8 billing levels for each
+;  interval, even if some (or all) are 0. It only includes as many intervals as
+;  are actually used (between 0 and 3).
+
+	.SBTTL	svcSchKill - Terminate any process
+
+;Here for the svcSchKill SVC - Terminate any process
+;	int status;		// Exit status value
+;	int process;		// Process ID (0 means self)
+;	rtn = svcSchKill(status, process);
+;  Value returned is 0 if normal or negative error code if error
+
+psvcSchKill::
+	SVCENTR	CNTSchKill#
+rsvcSchKill::
+rsvcSchKillX::
+	MOVL	EBX, SS:pdaArg2#	;Get process
+	CALL	chkkill			;See if this is valid
+	JNC	kill4			;Yes
+ret004:	RET				;No
+
+	.SBTTL	svcSchKillX - Extended terminate any process
+
+;Here for the svcSchKillX SVC - Extended terminate any process.  This SVC is
+;  only valid when executed from the system user segment (GS_USERCODE).  If
+;  executed from any other segment, it is treated as a normal svcSchKill call
+;  and only the first two arguments are used.
+;	ulong status;		// Exit status value
+;	ulong process;		// Process ID (0 means self)
+;	void *memaddr;		// Memory address value
+;	void *cseip;		// CS:EIP value
+;	ulong efr;		// EFR value
+;	ulong data;		// Data value
+;	rtn = svcSchKillX(status, process, memaddr, cseip, efr, data);
+;  Value returned is 0 if normal or negative error code if error
+
+psvcSchKillX::
+	SVCENTR	CNTSchKillX#
+	MOVL	EBX, SS:pdaArg2#	;Get process
+	CALL	chkkill			;See if this is valid
+	JC	ret004.S		;No
+	CMPW	38.B[ESP], #GS_USERCODE|03h ;Is this from the user code
+					    ;  segment?
+	JNE	kill4.S			;No - just do a normal terminate
+					;Yes - get the termination data
+	MOVL	ESI, SS:pdaArg4#	;Memory address offset
+	MOVL	EBX, SS:pdaArg3#	;Memory address selector
+	MOVL	EDI, SS:pdaArg6#	;EIP value
+	MOVL	EDX, SS:pdaArg5#	;CS value
+	MOVL	EBP, SS:pdaArg7#	;EFR value
+	MOVL	ECX, SS:pdaArg8#	;Data value
+	MOVL	EAX, SS:pdaArg1#	;Termination status
+	JMP	reqkill2.S		;Continue
+.PAGE
+	.SBTTL	svcSchExit - Terminate process
+
+;Here for the svcSchExit SVC - Terminate process
+;	int status;		// Exit status value
+;	svcSchExit(status);
+;  Never returns!
+
+psvcSchExit::
+	SVCENTR	CNTSchExit#
+rsvcSchExit::
+	PUSHL	SS
+	POPL	ES
+kill4:	MOVL	EAX, SS:pdaArg1#	;Get exit status value
+	CMPW	38.B[ESP], #GS_USERCODE|03h ;Is this from the user code
+					    ;  segment?
+	JE	reqkill0.S		;Yes - let him supply the code
+	ANDL	EAX, #0FFFFFFh		;No - put code into high byte
+	ORL	EAX, #TC_EXIT<24t
+
+;Enter here to kill process with no termination data other than the termination
+;  status in EAX - WARNING: THIS ROUTINE CLEARS EBP!
+
+reqkill0::
+	CLRL	EDI			;No termination addresses
+	CLRL	EDX
+	CLRL	EBP
+	CLRL	ESI
+	CLRL	EBX
+	CLRL	ECX			;Or data
+
+;Here with termination data in the registers as follows:
+;	c{EAX} = Termination status
+;	c{ESI} = Memory address offset
+;	c{EBX} = Memory address selector
+;	c{EDI} = EIP value
+;	c{EDX} = CS value
+;	c{EBP} = EFR value
+;	c{ECX} = Data
+
+reqkill2::
+	TESTB	ES:pdaStatus1#, #P1$KILL ;Already killing this process?
+	JE	4$.S			;No
+	CMPB	knlForkLvl#, #FORK_MAIN	;Yes - at fork level?
+	JNE	2$.S			;Yes - ignore it
+	MOVL	EAX, ES			;No - killing self?
+	CMPW	knlCurPda#, AX
+	JE	killproc		;Yes - go handle this
+2$:	TOFORK	knlRRequeue#
+	CALL	knlRRequeue#		;No - make the process runable
+	FROMFORK
+	RET
+
+;Here if process is not already being killed
+
+4$:	MOVL	ES:pdaTrmSts#, EAX	;Store termination data
+	MOVL	ES:pdaTrmEIP#, EDI
+	MOVL	ES:pdaTrmCS#, EDX
+	MOVL	ES:pdaTrmEFR#, EBP
+	MOVL	ES:pdaTrmAddr#+0, ESI
+	MOVL	ES:pdaTrmAddr#+4, EBX
+	MOVL	ES:pdaTrmData#, ECX
+	MOVZWL	EAX, ES:pdaSesProc#	;Get session process
+	MOVW	FS, knlProcTable#[EAX*2]
+	MOVZWL	EAX, FS:pdaDosProc#	;Are we its DOS process?
+	CMPW	ES:pdaPid#, AX
+	JNE	6$.S			;No
+	MOVW	FS:pdaDosProc#, #0	;Yes - but not any more!
+6$:	CMPB	knlForkLvl#, #FORK_MAIN	;At fork level?
+	JNE	8$.S			;Yes
+	MOVL	EAX, ES			;No - killing self?
+	CMPW	knlCurPda#, AX
+	JNE	8$.S			;No
+	ORB	SS:pdaStatus1#, #P1$KILL ;Yes
+	ORB	SS:pdaSSigType#, #SSIG$KILL1 ;Request that process be killed
+reqkill6:
+	ORB	SS:pdaSigReq#, #01h
+	MOVL	ESP, #pdaURegEIP#	;Reset the stack
+	CALLF	schedule		;And reschedule (never returns here!)
+	CRASH	KILL
+
+;Here if not killing self
+
+8$:	ORB	ES:pdaStatus1#, #P1$KILL
+	ORB	ES:pdaSSigType#, #SSIG$KILL1
+	ORB	ES:pdaSigReq#, #01h	;Request "level 8" software interrupt
+	TOFORK	10$
+	CALL	10$
+	FROMFORK
+	RET
+
+10$:	CALL	reqsig4#
+	CLRL	EAX			;Return 0
+	MOVL	ES, EAX			;Clear ES so won't cause trouble later
+	RET				;Thats all
+
+knlUnimOp::
+	POPL	lastunimop		;Save for debugging
+	MOVL	EAX, #TC_UNIMOP*1000000h
+	MOVL	EDI, SS:pdaURegEIP#	;Get EIP
+	MOVL	EDX, SS:pdaURegCS#	;Get CS
+	MOVL	EBP, SS:pdaURegEFR#	;Get EFR
+	CLRL	ESI
+	CLRL	EBX
+	PUSHL	SS
+	POPL	ES
+	JMP	reqkill2
+
+	DATA
+
+lastunimop::.LONG 0
+
+	CODE
+.PAGE
+;Here on svcSchExit when process termination is already in progress
+
+killproc:
+	TESTB	SS:pdaStatus2#, #P2$KILLS ;Have we done the first part yet?
+	JNE	10$			;Yes - go on
+	MOVL	EAX, SS			;No - does this process have the exec
+	CMPW	knlXResPda#, AX		;  memory resource?
+	JNE	2$.S			;No
+	CALL	knlGiveXRes#		;Yes - give it up now
+2$:	TOFORK
+	CLRL	EDX			;Remove all pending signals
+	CALL	clrsignal#
+	MOVL	ESI, SS:pdaAlrmFWkB#	;Does process have any alarms active?
+	TESTL	ESI, ESI
+	JE	6$.S			;No
+	CLRL	EAX			;Yes
+	MOVL	SS:pdaAlrmFWkB#, EAX
+4$:	PUSHL	wkb_pnext.B[ESI]	;Remove all alarms
+	CALL	knlWakeRemove#
+	POPL	ESI
+	TESTL	ESI, ESI
+	JNE	4$.S
+6$:	CMPL	SS:pdaAlrmNum#, #0.B	;The alarm count must be 0 now!
+	JNE	12$.S
+	MOVL	ESI, SS:pdaSpndBlk#	;Does process have a suspend timeout
+	TESTL	ESI, ESI		;  active?
+	JE	8$.S			;No
+	CLRL	EAX			;Yes - remove its wake request
+	MOVL	SS:pdaSpndBlk#, EAX
+	CALL	knlWakeRemove#
+8$:	FROMFORK
+	ORB	SS:pdaStatus2#, #P2$KILLS ;Indicate first part of this done
+10$:	MOVZWL	EBX, SS:pdaChildProc#	;Do we have any children?
+	TESTL	EBX, EBX
+	JE	16$.S			;No - go on
+	MOVW	ES, knlProcTable#[EBX*2] ;Yes - kill a child process
+	PUSHL	ES
+	MOVL	EAX, #TC_KILL
+	CALL	reqkill0
+	POPL	ES
+	JMP	waitproc		;Wait until it goes away
+
+12$:	CRASH	BDAC			;[BaD Alarm Count]
+
+;Here if need to wait for a device to finish run-down
+
+14$:	TOFORK
+	CMPL	SS:pdaWaitIndex#, #-1.B	;Did it sneek in?
+	JNE	rqwait			;No - go requeue and schedule
+	JMP	svcredo			;Yes - just re-do the SVC without any
+					;  requeueing or scheduling!
+
+;Here with all scheduler clean-up done
+
+16$:	CALL	resetio#		;Do final IO clean-up
+	JC	14$.S			;If need to wait
+;;;;;;	CMPL	SS:pdaMLckCnt#, #0.B	;Finished - still have any locked pages?
+;;;;;;	JNE	18$.S			;Yes!
+	MOVL	EAX, SS:pdaXffFirst#	;No - still have any IO active?
+	ORL	EAX, SS:pdaXffNum#
+	JNE	20$.S			;Yes!
+	TOFORK
+	CALL	ctlcdone#		;Done - handle any pending control-C's
+	FROMFORK
+	CLRL	EAX			;Clear all user selectors
+	MOVL	-4.B[ESP], EAX
+	MOVL	-8.B[ESP], EAX
+	MOVL	-12t.B[ESP], EAX
+	MOVL	-16t.B[ESP], EAX
+	CALL	resetmem#		;Give up all memory for process
+	JC	24$.S			;Errors should not be possible here
+					;  since the only possible error is due
+					;  to a locked memory pages which can
+					;  only be due to an active IO request
+					;  and we have already closed all
+					;  devices!
+	ORB	SS:pdaSSigType#, #SSIG$KILL2 ;Request that kill be finished
+	JMP	reqkill6
+
+;Here if have some locked pages after calling resetio
+
+18$:	CRASH	PLIO			;[Page Locked for IO]
+
+;Here if have IO active after calling resetio
+
+20$:	CRASH	IOSA			;[IO is Still Active]
+
+;Here if error giving up the process's memory - this can only happen if a page
+;  is locked, which is not possible since we have already closed all devices!
+
+24$:	CRASH	MPIL			;[Memory Page Is Locked]
+.PAGE
+	.SBTTL	svcSchIntrProc - Interrupt child process
+
+;Here for the svcSchIntrProc SVC - Interrupt child process
+;	long pid;		// Process ID
+;	long func;		// Function:
+;				//   1 = Interrupt or kill normal process
+;				//   2 = Interrupt or kill halted process
+;				//   3 = Halt process
+;				//   4 = Resume process
+;	long status;		// Termination status
+;	rtn = svcSchIntrProc(pid, func, status);
+;  Value returned is 0 if process was stopped, 1 if it was interrupted or a
+;    negative error code value if error
+
+psvcSchIntrProc::
+	SVCENTR	CNTSchIntrProc#
+rsvcSchIntrProc::
+	MOVL	EAX, SS:pdaArg1#
+	TESTL	EAX, EAX
+	JNE	2$.S
+	MOVL	EAX, SS:pdaPid#
+2$:	MOVZWL	EBX, AX			;Valid process ID?
+	CMPL	EBX, #MAXPROCS
+	JA	4$.S			;No
+	CMPW	knlProcTable#[EBX*2], #3.B ;Yes - active process?
+	JBE	4$.S			;No
+	MOVW	ES, knlProcTable#[EBX*2] ;Yes - get selector
+	CMPL	EAX, ES:pdaPid#		;Is it the right process?
+	JNE	4$.S			;No
+	MOVW	AX, SS:pdaPid#		;Yes - is it our child?
+	CMPW	ES:pdaParProc#, AX
+	JE	6$.S			;Yes - go on
+4$:	MOVL	EAX, #ER_BDPID		;No - can't interrupt it!
+	RET
+
+;Here if can interrupt process
+
+6$:	TESTB	ES:pdaStatus2#, #P2$KILLS ;Are we killing the process?
+	JNE	4$.S			;Yes - act like its aready gone!
+	MOVL	EAX, SS:pdaArg2#	;No - get function
+	CMPL	EAX, #4.B		;Valid function?
+	JA	knlBadFunc#		;No
+	JMPIL	intpdsp[EAX*4]		;Yes - dispatch on function
+
+	DATA
+
+intpdsp:.LONG	knlBadFunc#	; 0 = Illegal
+	.LONG	intkill		; 1 = Kill or interrupt normal process
+	.LONG	intkill		; 2 = Kill or interrupt halted process
+	.LONG	intphalt	; 3 = Halt process
+	.LONG	intpresume	; 4 = Resume process
+
+	CODE
+.PAGE
+;Here if function = 4, resume process
+
+intpresume:
+	TOFORK
+	ANDB	ES:pdaStatus1#, #~P1$HALTED ;Indicate no longer halted
+	TESTB	ES:pdaSSigType#, #SSIG$HALT ;Has it been halted yet?
+	JE	2$.S			;Yes
+	ANDB	ES:pdaSSigType#, #~SSIG$HALT ;No - clear stop request
+	JNE	4$.S
+	ANDB	ES:pdaSigReq#, #~01h
+	JMP	4$.S
+
+;Here if process was halted
+
+2$:	CALL	knlRRequeue#		;Requeue the process
+4$:	FROMFORK
+	CLRL	EAX			;Return 0
+	RET
+
+;Here if function = 3, halt process
+
+intphalt:
+	ORB	ES:pdaSSigType#, #SSIG$HALT ;Halt the process the next time it
+	ORB	ES:pdaSigReq#, #01h	     ;  tries to run
+	CLRL	EAX
+	RET
+
+;Here if function = 1, kill or interrupt process
+
+intkill:ANDB	ES:pdaStatus1#, #~P1$HALTED ;Indicate no longer halted
+	MOVL	EAX, #VECT_CNTC		;Get vector number
+	MOVL	ECX, SS:pdaArg3#	;Get termination status value
+	TOFORK
+	CALL	knlIntrpProc
+	FROMFORK
+	RET
+.PAGE
+	.SBTTL	knlIntrpProc - Subroutine to interrupt or kill process
+
+;This is the basic subroutine which implements ^C.  The systems trys very hard
+;  to see to it that no output appears after a ^C is echoed and before it
+;  is acted on.  This is done using three items: pdaCCIntCnt, the control-C
+;  interrupt count for each process; dcb_trccstcnt, the total control-C
+;  count for a terminal; and TS0$JUNKX in tdb_sts0, a bit which requests
+;  that all terminal output be discarded. When a request is made to interrupt
+;  or kill a process, pdaCCIntCnt is incremented for the process being
+;  interrupted or killed.  Also, dcb_trccstcnt is incremented for the terminal
+;  and TS0$JUNKX is set.  When the processing for the request is complete
+;  (either the process has been killed or the svcSchCtlCDone system call has
+;  been issued, both counts are decremented.  If dcb_trccstcnt went to 0,
+;  TS0$JUNKX is cleared.
+
+;Subroutine to interrupt or kill process - must be called at fork level.
+;  If the process is a DOS process, it is first determined if there is a exec
+;  current process.  If so, this processes is interrupted, and this process is
+;  NOT interrupted.  If there is no current exec process, then it is determined
+;  if there is more than one sub-task present.  If so, the current sub-task is
+;  interrupted.  If not, the process is interrupted.  If the process is not a
+;  DOS process, it is interrupted.
+;	c{EAX} = Software interrupt vector number
+;	c{ECX} = Termination status
+;	c[ES]  = Selector of PDA for process
+;	CALL	knlIntrpProc
+;	C:set = Cannot interrupt or kill process
+;	C:clr = Process interrupted or killed
+;	  c{EAX} = 0 if processes killed
+;		   1 if process interrupted
+
+knlIntrpProc::
+	TESTB	ES:pdaStatus1#, #P1$DOSSEG ;Have a DOS environment?
+	JE	10$.S			;No - go on
+	MOVZWL	EBX, ES:pdaRMPage0#+dda_execproc ;Yes - does this process have
+	TESTL	EBX, EBX			 ;  an exec process?
+	JE	4$.S			;No - go on
+	PUSHL	ES			;Yes - interrupt the exec process
+2$:	MOVW	ES, knlProcTable#[EBX*2] ;Get selector for PDA for exec process
+	POPL	ES			;Restore our PDA selector
+	RET
+
+;Here if DOS process does not have any children
+
+4$:	CMPW	ES:pdaRMPage0#+1Bh*4+2, #100h ;Does he want the ^C interrupt?
+
+	JMP	8$.S
+
+	JB	8$.S			;No
+	CALL	knlGetQel#		;Yes
+	JC	6$.S
+	MOVB	slb_szindx.B[ESI], #0
+	MOVL	EAX, #21Bh		;Get vector number
+	CLRL	ECX
+	MOVB	BL, #SIGT_NORMAL
+	CLRL	EDX
+	CALL	knlReqSignal#		;Request the signal
+	CLRL	EAX			;Indicate interrupted and clear C
+	INCL	EAX
+6$:	RET
+
+;Here if should interrupt a DOS process
+
+8$:	NOP				;SHOULD CHECK FOR SUB-TASK TO TERMINATE!
+
+;FOR NOW, JUST FALL INTO THE CODE BELOW!!!
+
+;Here if not a DOS process
+
+10$:	TESTB	ES:pdaIdt#+it_type[EAX*8], #87h ;Does he want an interupt?
+	JE	16$.S			;No - kill the process
+	CALL	knlGetQel#		;Yes - get interrupt link block
+	JC	6$.S			;If none available
+	MOVB	slb_szindx.B[ESI], #0
+	CLRL	ECX			;No interrupt data
+	MOVB	BL, #SIGT_CC		;Get interrupt type
+	CLRL	EDX
+	CALL	knlReqSignal#		;Request signal
+	PUSHL	#1.B			;Indicate interrupted
+	JMP	18$.S
+
+;Here if should kill the process
+
+16$:	MOVL	EAX, ECX
+	ANDL	EAX, #0FFFFFFh
+	ORL	EAX, #TC_KILL*1000000h
+	PUSHL	ES
+	PUSHL	EBP
+	CALL	reqkill0		;Start killing it
+	POPL	EBP
+	POPL	ES
+	PUSHL	#0.B			;Indicate killed
+18$:	MOVZWL	EDI, ES:pdaSesProc#	;Get session process number
+	CALL	incccicnt#		;Increment the control-C counts
+	CLC
+	POPL	EAX
+	RET
+.PAGE
+;Subroutine to see if it is valid to kill a process
+;	c{EBX} = Process ID
+;	CALL	chkkill
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = OK to kill process
+;	  c[ES] = Selector for PDA for process to kill
+
+chkkill::
+	CALL	getproc			;Get PDA for process
+	JC	4$.S			;If error
+chkkil2:MOVW	AX, SS:pdaSesProc#	;Is it a member of our session?
+	CMPW	ES:pdaSesProc#, AX
+	JE	4$.S			;Yes
+	MOVW	AX, SS:pdaPid#		;No - is it our child?
+	CMPW	ES:pdaParProc#, AX
+	JE	4$.S			;Yes
+	BTL	SS:pdaActPriv#, #PP%ALLPROC ;No - can he do this?
+	JNC	6$.S			;No
+	CLC				;Yes
+4$:	RET
+
+6$:	MOVL	EAX, #ER_BDPID
+	STC
+	RET
+
+;Subroutine to get selector for PDA for process
+;	c{EBX} = PID
+;	CALL	getproc
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  c[ES] = Selector for PDA for process
+
+getproc::
+	TESTL	EBX, EBX		;Self?
+	JE	10$.S			;Yes
+	MOVZWL	EAX, BX
+	CMPL	EAX, #MAXPROCS		;No - valid process number?
+	JA	6$.S			;No
+	CMPW	knlProcTable#[EAX*2], #3.B ;Yes - active process?
+	JBE	6$.S			;No
+	MOVW	ES, knlProcTable#[EAX*2] ;Yes - get selector
+	CMPL	ES:pdaMagic#, #PDA_MAGIC ;Really a process?
+	JNE	6$.S			;No
+	CMPL	ES:pdaPid#, EBX		;Yes - does PID really match?
+	JNE	6$.S			;No
+	RET				;Yes - OK
+
+;Here if self
+
+10$:	PUSHL	SS
+	POPL	ES
+	RET
+.PAGE
+	.SBTTL	killproc1 - First routine to kill process
+
+;First routine to kill process - get here initially on a kill request
+
+killproc1::
+	MOVB	ES:pdaSigReq#, #0	;Remove kill request
+	MOVB	ES:pdaSSigType#, #0
+	CMPL	ES:pdaWaitIndex#, #-1.B	;Is process waiting for something?
+	JE	2$.S			;No
+	CALL	clrwait#		;Yes - remove it from the wait list
+2$:	FROMFORK			;Get back to main program level
+	MOVL	ES:pdaTss#+tss_EIP, #killclean# ;Run cleanup routine next
+	MOVL	ES:pdaTss#+tss_CS, #GS_USERCODE|03
+	MOVL	ES:pdaTss#+tss_EFR, #0200h
+	MOVL	ES:pdaTss#+tss_ESP, #killstack#
+	MOVL	ES:pdaTss#+tss_SS, #GS_USERJUNK|03
+	MOVL	ES:pdaTss#+tss_stk0, #pdaXStackP#
+	CLRL	EAX
+	MOVL	ES:pdaTss#+tss_DS, EAX
+	MOVL	ES:pdaTss#+tss_ES, EAX
+	MOVL	ES:pdaTss#+tss_FS, EAX
+	MOVL	ES:pdaTss#+tss_GS, EAX
+	IRET				;Switch to task context
+	JMP	scheduler#
+.PAGE
+	.SBTTL	killproc2 - Second routine to kill process
+
+;Second routine to kill process - get here after the process run-down stuff
+;  has been done
+
+killproc2::
+	ANDB	ES:pdaStatus1#, #~P1$PQ1R
+	MOVZWL	EDX, ES:pdaParProc#	;Get parent process
+	TESTL	EDX, EDX
+	JE	8$.S			;If none!
+	MOVW	FS, knlProcTable#[EDX*2]
+	TESTB	FS:pdaStatus1#, #P1$DOSSEG ;Does the parent have a DOS
+					 ;  environment?
+	JE	2$.S			;No
+	MOVL	EAX, ES:pdaPid#		;Yes - is this its current EXEC process?
+	CMPL	FS:pdaRMPage0#+dda_execproc, EAX
+	JNE	2$.S
+	MOVL	EAX, ES:pdaTrmSts#	;Yes - store our termination status
+	MOVL	FS:pdaRMPage0#+dda_execterm, EAX
+2$:	MOVL	ECX, ES			;Scan the parent's children looking
+	MOVL	ESI, #pdaChildProc#	;  for this one
+4$:	MOVZWL	EBX, FS:[ESI]		;Get next child
+	TESTL	EBX, EBX		;Really have another child?
+	JE	6$.S			;No!
+	MOVZWL	EBX, knlProcTable#[EBX*2]	;Yes
+	CMPL	EBX, ECX		;Is it this one?
+	JE	havepar.S		;Yes
+	MOVL	FS, EBX			;No - advance to next
+	MOVL	ESI, #pdaSibProc#
+	JMP	4$.S
+
+6$:	CRASH	BDCL			;[BaD Child List]
+
+;Here if no parent process
+
+8$:	MOVL	EAX, ES:pdaTrmSts#	      ;None - display termination status
+	MOVL	crshdata+pg0_crshDATA#+0, EAX ;  in the crash data
+	CRASH	KL0P			;[Killing Level 0 Process]
+.PAGE
+;Here when found this process in the list of its parent's children
+
+havepar:MOVW	AX, ES:pdaSibProc#	;Remove from list of children
+	MOVW	FS:[ESI], AX
+	TESTB	ES:pdaStatus1#, #P1$SETUP|P1$NOCDS ;Should we generate a child
+	PUSHL	ES				   ;  died signal?
+	MOVW	ES, knlProcTable#[EDX*2]
+	JE	killcds			;Yes
+	CMPB	ES:pdaTrmEvent#, #0FFh	;No - want a termination event?
+	JE	killfin			;No
+	PUSHL	CS			;Yes - no see if he has a ^XOS^PROC
+	POPL	FS			;  event cluster
+	MOVL	ESI, #runecname
+	CALL	findec4#
+	JC	16$.S			;If no event cluster, forget it!
+	MOVL	FS, [ESP]		;OK
+	MOVL	EAX, FS:pdaTrmSts#	;Get termination status
+	TESTB	FS:pdaStatus1#, #P1$SETUP ;Is the process still in set up mode?
+	JE	12$.S			;No
+	SHRL	EAX, #24t		;Yes
+	CMPL	EAX, #TCEMAX.B		;Get error code which corresponds to the
+	JB	2$.S			;  termination code
+	CLRL	EAX
+2$:	MOVXWL	EAX, tcetbl[EAX*2]
+	TESTL	EAX, EAX		;Need special treatment?
+	JS	12$.S			;No
+	JNE	4$.S			;Yes - is it a run termination?
+	MOVL	EAX, FS:pdaTrmSts#	;Yes - we already have an error code
+	ORL	EAX, #7F000000h		;Set the high bits
+	JMP	14$.S
+
+;Here if have a TC_NOVECT termination
+
+4$:	MOVZWL	EAX, FS:pdaTrmSts#	;Get the vector number
+	CMPL	EAX, #100h		;Is there a special error code for it?
+	JB	6$.S			;No
+	CMPL	EAX, #13Fh		;Maybe
+	JBE	8$.S			;Yes
+6$:	CLRL	EAX
+8$:	ANDL	EAX, #1Fh.B
+	CMPL	EAX, #SIEMAX.B
+	JB	10$.S
+	CLRL	EAX
+10$:	MOVXWL	EAX, sietbl[EAX*2]	;Get error code for vector
+
+12$:	BTZL	EAX, #31t		;Make sure sign bit is not set
+14$:	MOVZBL	ECX, FS:pdaTrmEvent#	;Get the event number
+	CALL	setevent#		;Set the event for the parent
+16$:	JMP	killfin			;Continue
+
+	DATA
+
+	.MOD	2
+tcetbl:	.WORD	ER_ERROR	;	    = 0
+	.WORD	ER_ABORT	;TC_EXIT    = 1  - Normal exit
+	.WORD	ER_ABORT	;TC_KILL    = 2  - Process killed
+	.WORD	ER_ERROR	;TC_PIPE    = 3  - No input available from pipe
+	.WORD	1		;TC_NOVECT  = 4  - Vector not set up
+	.WORD	ER_STKER	;TC_BDUSTK  = 5  - Bad user stack address
+	.WORD	ER_NEMA		;TC_NOMEM   = 6  - No memory available
+	.WORD	ER_NTIMP	;TC_UNIMOP  = 7  - Unimplemented operation
+	.WORD	0		;TC_RUNFAIL = 8  - RUN failure
+	.WORD	ER_ERROR	;	    = 9
+	.WORD	ER_ERROR	;	    = 10
+	.WORD	ER_DOSMC	;TC_SUBTSK  = 11 - Sub-task error
+	.WORD	ER_DOSMC	;TC_MEMCRPD = 12 - DOS memory corrupted
+TCEMAX=!{$-tcetbl}/2
+
+sietbl:	.WORD	ER_DIVER	;VECT_xDIVERR  = 100/120 - Divide error
+	.WORD	ER_UNXSI	;VECT_xDEBUG   = 101/121 - Debug trap
+	.WORD	ER_UNXSI	;VECT_xNMI     = 102/122 - Non-maskable intrpt.
+	.WORD	ER_UNXSI	;VECT_xBRKPNT  = 103/123 - Breakpoint
+	.WORD	ER_UNXSI	;VECT_xINTO    = 104/124 - INTO instruction
+	.WORD	ER_UNXSI	;VECT_xBOUND   = 105/125 - BOUND instruction
+	.WORD	ER_ILLIN	;VECT_xILLINS  = 106/126 - Illegal instruction
+	.WORD	ER_UNXSI	;VECT_xFPPNAVL = 107/127 - FPP not available
+	.WORD	ER_UNXSI	;VECT_xDBLEXP  = 108/128 - Double exception
+	.WORD	ER_UNXSI	;VECT_xFPPSOVR = 109/129 - FPP segment overrun
+	.WORD	ER_UNXSI	;VECT_xITSS    = 10A/12A - Invalid TSS
+	.WORD	ER_ADRER	;VECT_xSEGNP   = 10B/12B - Segment not present
+	.WORD	ER_STKER	;VECT_xSTKERR  = 10C/12C - Stack error
+	.WORD	ER_ADRER	;VECT_xPROT    = 10D/12D - Memory prot. error
+	.WORD	ER_ADRER	;VECT_xPAGEFLT = 10E/12E - Page fault
+	.WORD	ER_UNXSI	;	       = 10F/12F
+	.WORD	ER_UNXSI	;VECT_xFPERR   = 110/130 - FPP error
+	.WORD	ER_ADRER	;VECT_xALNCHK  = 111/131 - Alignment check
+SIEMAX=!{$-sietbl}/2
+
+	CODE
+.PAGE
+;Here if we should generate a child died signal
+
+killcds:TESTB	ES:pdaIdt#+it_type+VECT_CHILD*8, #70h
+					;Does parent want child died signal?
+	JE	killfin			;No
+	MOVL	FS, [ESP]		;Get selector for the PDA
+	CLRL	ECX			;Assume not a session level process
+	MOVL	EBX, FS:pdaSesData#	;Get offset of the session data
+	ORL	EBX, EBX
+	JE	4$.S			;If no session data
+	MOVZBL	ECX, FS:ses_billlvl[EBX] ;Have session data - get current
+	CLI				 ;  billing level
+	MOVL	EAX, knlTickCnt#	;Get current date/time in system format
+	MOVL	EDX, knlSysDate#
+	STI
+	CALL	knlTick2SysTime#
+	SUBL	EAX, FS:ses_billtime+0[EBX] ;Get incremental value
+	SBBL	EDX, FS:ses_billtime+4[EBX]
+	ADDL	FS:ses_rates1+0[EBX+ECX*8], EAX ;Add it in to the current
+	ADCW	FS:ses_rates1+4[EBX+ECX*8], DX  ;  level
+	MOVZBL	EDX, FS:ses_numper[EBX]	;Get number of billing periods
+	IMULL	EDX, #68t.B		;Times 68
+	ADDL	EDX, #slb_data+36t.B	;Plus 36 for the fixed items
+	CALL	knlGetIndex#		;Get size index for the buffer we need
+4$:	CALL	knlGetXmb#		;Yes - get a queue element
+	JC	killfin			;Forget it if no queue element
+	MOVB	slb_szindx.B[ESI], CL	;  available! (this is not a good thing
+	MOVL	EAX, FS:pdaPid#		;  to do, but there is little choise!)
+	MOVL	slb_data+0.B[ESI], EAX	;Get process ID
+	MOVL	EAX, FS:pdaTrmSts#	;Get termination status
+	MOVL	slb_data+4.B[ESI], EAX
+	MOVL	EAX, FS:pdaTrmEIP#	;Get EIP value
+	MOVL	slb_data+8.B[ESI], EAX
+	MOVL	EAX, FS:pdaTrmCS#	;Get CS value
+	MOVL	slb_data+12t.B[ESI], EAX
+	MOVL	EAX, FS:pdaTrmEFR#	;Get EFR value
+	MOVL	slb_data+16t.B[ESI], EAX
+	MOVL	EAX, FS:pdaTrmAddr#+0	;Get memory address offset
+	MOVL	slb_data+20t.B[ESI], EAX
+	MOVL	EAX, FS:pdaTrmAddr#+4	;Get memory address selector
+	MOVL	slb_data+24t.B[ESI], EAX
+	MOVL	EAX, FS:pdaTrmData#	;Get data
+	MOVL	slb_data+28t.B[ESI], EAX
+	MOVL	ECX, #8			;Get number of data items if no billing
+					;  data is present
+	ORL	EBX, EBX		;Do we have billing data?
+	JE	12$.S			;No
+	MOVL	EAX, #80000h		;Yes - we always store 8 billing levels
+	MOVB	AL, FS:ses_billcls[EBX] ;Get billing class
+	MOVB	AH, FS:ses_numper[EBX]	;Get number of intervals
+	MOVZBL	EDX, AH
+	MOVL	slb_data+32t.B[ESI], EAX
+	PUSHL	ES			;Save selector of parent PDA
+	PUSHL	ESI			;Save offset of the SLB
+	LEAL	EDI, slb_data+36t.B[ESI]
+	PUSHL	DS
+	POPL	ES
+	ADDL	EBX, #ses_atime1
+	LEAL	ESI, ses_rates1-ses_atime1.B[EBX]
+
+;Get here with registers set up to copy accounting data:
+;	c{EDX} = Number of intervals (0 to 3)
+;	c{EDI} = Offset in SLB for accounting data
+;	c{EBX} = Offset in PDA of first time value
+;	c{ESI} = Offset in PDA of first rate/total value
+
+6$:	DECL	EDX			;Another interval?
+	JS	10$.S			;No - finished here
+	MOVL	EAX, FS:[EBX]		;Yes - store time value
+	ADDL	EBX, #4t.B
+	STOSL	[EDI]
+	MOVL	ECX, #16t
+	RMOVSL	[EDI], FS:[ESI]
+	JMP	6$.S			;No - go to next interval
+
+;Here with all accounting data stored
+
+10$:	MOVL	ECX, EDI
+	POPL	ESI			;Restore offset of the SLB
+	POPL	ES			;Restore selector of parent PDA
+	SUBL	ECX, ESI
+	SUBL	ECX, #slb_data.B
+	SHRL	ECX, #2t
+12$:	MOVL	EAX, #VECT_CHILD	;Get vector number
+	MOVB	BL, #SIGT_NORMAL	;Get signal type
+	CLRL	EDX
+	CALL	knlReqSignal#		;Request signal for parent
+					;Fall into killfin on next page
+.PAGE
+;Here when almost finished killing a process - all we have left at this point
+; is a PDA, a page directory, and 3 global selectors
+
+killfin:POPL	ES
+	MOVZWL	EAX, ES:pdaPid#		;Wake up any processes waiting for this
+	CALL	knlEndWaitAll#		;  one to die
+	MOVXWL	ESI, ES:pdaQuePrev#	;Get previous PDA in current queue
+	MOVXWL	EDI, ES:pdaQueNext#	;Get next PDA in current queue
+	TESTL	ESI, ESI		;Is this the first PDA in the queue?
+	JNS	2$.S			;No
+	MOVW	qpbase#[ESI], DI	;Yes - update head pointer
+	JMP	4$.S
+
+2$:	MOVL	FS, ESI
+	MOVW	FS:pdaQueNext#, DI	;Update forward pointer in previous PDA
+4$:	TESTL	EDI, EDI		;Is this the last PDA in the queue?
+	JNS	6$.S			;No
+	MOVW	qpbase#+2[EDI], SI	;Yes - update tail pointer
+	JMP	8$.S
+
+6$:	MOVL	FS, EDI
+	MOVW	FS:pdaQuePrev#, SI	;Update backward pointer in next PDA
+
+;Now give up the memory for the PDA and the page directory for the process
+
+8$:	FROMFORK
+	CALL	rmvrmtmr		;Remove process from the real mode timer
+	MOVL	EAX, knlProcTable#	;  list
+;;;;;;;	MOVL	EDX, ES			;Does this process own the FPU?
+;;;;;;;	CMPW	fpupda#, DX
+;;;;;;;	JNE	12$.S			;No
+	CMPB	fpustate#, #0		;Yes - do we have an FPU?
+	JE	10$.S			;No
+	CLTS				;Yes
+	FNINIT				;Reset the FPU
+10$:
+;;;;;;;	MOVL	fpupda#, EAX
+12$:	MOVL	knlCurPda#, EAX		;Indicate null process is current
+					;  process (this is necessary so can
+					;  handle clock interrupts (which
+					;  reference the current PDA) while
+					;  we are giving up the PDA)
+	CMPB	fpustate#, #0		;Should the FPU be enabled?
+	JE	16$.S			;No
+	MOVL	EAX, CR0		;Yes - make sure it is
+	ANDB	AL, #~04h
+	ORB	AL, #02h
+	MOVL	CR0, EAX
+16$:	MOVL	EAX, ES:pdaRunTime#+0	;Add time accumulated by this process
+	MOVL	EDX, ES:pdaRunTime#+4	;  into the total used time
+	ADDL	EAX, ES:pdaXffTime#+0
+	ADCL	EDX, ES:pdaXffTime#+4
+	ADDL	timeused#+0, EAX
+	ADCL	timeused#+4, EDX
+	MOVL	EBX, ES:pdaTssSel#	;No - give up the TSS selector
+	CALL	knlGiveGSelector#
+	MOVL	EBX, ES:pdaTss#+tss_LDT ;Give up the LDT selector
+	CALL	knlGiveGSelector#
+	LIDTL	SS:pdaIdtrVal#		;Switch to the scheduler's IDT now
+	MOVL	EBX, ES:pdaLAddr#	;Get linear address for the PDA
+	PUSHL	EBX			    ;Get maximum number of pages to
+	MOVL	ECX, #{pda_TSIZE-2000h}>12t ;  give up
+	MOVL	EAX, #PDA_MAGIC		   
+	PUSHL	ES
+	CALL	giveuppda		;Give up the PDA
+	POPL	EAX
+	POPL	EBX
+	ADDL	EBX, #pdaPageDir#	;And give up the page directory for the
+	CLRL	ECX			;  process
+	INCL	ECX
+	MOVZWL	EAX, AX
+	CALL	knlGivePages#
+	JC	22$.S
+.IF NE $$MEMDEBUG
+	CALL	chkmfl#
+.ENDC
+	JMP	getrun#			;All done - go find another process
+					;  to run
+
+22$:	CRASH	MPLK			;[Memory Page is LocKed]
+
+runecname:.ASCIZ "^XOS^PROC"
+.PAGE
+;Subroutine to remove process from the real mode timer list
+;	c[ES] = Selector for PDA
+;	CALL	rmvrmtmr
+
+rmvrmtmr::
+	CMPW	ES:pdaRMTimer#, #-1.B	;Is this process in the real mode timer
+					;  list?
+	JE	6$.S			;No
+	MOVL	EDX, ES			;Yes
+	MOVL	EBX, #rmtmrhd#		;Search real mode timer list for this
+	PUSHL	DS			;  PDA
+	POPL	FS
+2$:	CMPW	FS:[EBX], DX		;This one?
+	JE	4$.S			;Yes
+	MOVZWL	EAX, FS:[EBX]		;No - advance to next
+	MOVL	FS, EAX
+	MOVL	EBX, #pdaRMTimer#
+	TESTL	EAX, EAX
+	JNE	2$.S
+	CRASH	BRTL			;[Bad Real mode Timer List]
+
+;Here with this PDA found in the real mode timer list
+
+4$:	MOVZWL	EAX, ES:pdaRMTimer#	;Remove this PDA from the list
+	MOVW	FS:[EBX], AX
+	MOVW	ES:pdaRMTimer#, #-1
+6$:	RET
+.PAGE
+;Subroutine to give up all PDA (or SDA) pages
+;	c{EAX} = Magic number
+;	c{EBX} = Linear address of the PDA
+;	c{ECX} = Maximum number of pages to give up
+;	CALL	giveuppda
+
+giveuppda::
+	MOVL	EDX, EBX		;Get slot number
+	SUBL	EDX, #la_pda+pda_TSIZE
+	SHRL	EDX, #pda_SHIFT
+	MOVW	ES, knlProcTable#[EDX*2] ;Get selector
+	CMPL	ES:pdaMagic#, EAX
+	JNE	20$
+	PUSHL	EDX
+
+;DEBUG CODE TO CHECK FOR BUSY PDAs
+
+	MOVZWL	EAX, knlProcTable#[EDX*2]
+	MOVZWL	EDX, xfffirst#
+	PUSHL	ES
+2$:	TESTL	EDX, EDX
+	JE	6$.S
+	MOVL	ES, EDX
+	CMPW	ES:xffPda#, AX
+	JE	4$.S
+	MOVZWL	EDX, ES:xffSysNext#
+	JMP	2$.S
+
+4$:	CRASH	PDAB
+
+;END OF DEBUG CODE
+
+6$:	POPL	ES
+
+;;;;;;;	CLRL	EBX
+;;;;;;;	MOVW	BX, ES
+;;;;;;;	CMPW	gdtable+8+sd_lnksel[EBX], BX ;Any user selectors linked?
+;;;;;;;	JE	10$.S			;No
+;;;;;;;	CALL	unlinkgselector		;Yes - unlink them
+;;;;;;;	MOVW	gdtable+8+sd_lnksel[EBX], BX
+;;;;;;;	MOVL	gdtable+8+sd_lnkpda[EBX], #1
+
+10$:	CLRL	EAX
+	MOVW	AX, ES
+	CALL	knlGivePages#		;Give up the PDA pages
+	JC	18$.S			;If error (impossible)
+	POPL	EDX
+	MOVZWL	EBX, knlProcTable#[EDX*2] ;Give up the PDA selector
+knlGiveProcSlot::
+	CLRL	EAX
+	MOVL	ES, EAX
+	MOVL	FS, EAX
+	MOVL	GS, EAX
+	CALL	knlGiveGSelector#
+	MOVW	knlProcTable#[EDX*2], #0 ;Clear the process slot
+	CMPL	EDX, knlProcHigh#	;Is this the highest in use slot?
+	JNE	16$.S			;No - finished here
+14$:	DECL	EDX
+	CMPW	knlProcTable#[EDX*2], #0.B ;Yes - find next highest in use slot
+	JBE	14$.S
+	MOVL	knlProcHigh#, EDX	;Update high slot number
+16$:	DECL	knlProcInUse#		;Reduce total slot count
+	CLC
+	RET
+	
+18$:	CRASH	MPLK			;[Memory Page is LocKed]
+
+20$:	CRASH	WPDA			;[Wrong PDA]
+.PAGE
+	.SBTTL	svcSchDismiss - Supervisor call to dismiss software interrupt
+
+;Here for the svcSchDismiss SVC - Dismiss software interrupt
+;	c{{ESP}+0}  = New user GS
+;	c{{ESP}+4}  = New user FS
+;	c{{ESP}+8}  = New user ES
+;	c{{ESP}+12} = New user DS
+;	c{{ESP}+16} = New user EIP
+;	c{{ESP}+20} = New user CS
+;	c{{ESP}+24} = New user EFR
+;	c[{ESP}+28] = Number of data items on stack (each item is 32 bits)
+;	c[{ESP}+30] = Software interrupt number
+;	c{{ESP}+32} = First data item
+;	....
+;	c{{ESP}+..} = New user ESP (These 2 items are normally only present when
+;	c{{ESP}+..} = New user SS     changing between real and protected modes)
+
+;	CALLF	svcSchDismiss
+;  This call never returns to the caller!
+
+;The EFR value has the following format:
+;	Bits 31-30 - Not used (should be 0)
+;	Bit  29    - If 1 dda_dpmilckrsflg is set to 0
+;	Bit  28    - 0
+;	Bit  27    - If 1 dda_dpmilpsflg is set to 0
+;	Bit  26    - not used (should be 0)
+;	Bit  25    - If 1 SS:ESP is always restored from the stack, even if not
+;		       switching modes
+;	Bit  24    - If 1 interrupt level is not changed
+;	Bit  23    - If 1 interrupt level is restored DOS style
+;	Bits 22-19 - Not used (should be 0)
+;	Bit  18    - AC flag (alignment check - 486 and above only)
+;	Bit  17    - VM flag
+;	Bit  16    - RF
+;	Bit  15    - 0
+;	Bits 14-12 - Low 3 bits of software interrupt level
+;	Bit  11    - OF
+;	Bit  10    - DF
+;	Bit   9    - Complement of bit 3 of software interrupt level
+;	Bit   8    - TF
+;	Bit   7    - SF
+;	Bit   6    - ZF
+;	Bit   5    - 0
+;	Bit   4    - AF
+;	Bit   3    - 0
+;	Bit   2    - PF
+;	Bit   1    - 1
+;	Bit   0    - CF	
+
+;  NOTE:  This SVC is setup as if it has 1 argument - this causes one item
+;	  to be copied from the user stack which has the effect of reserving
+;	  a slot on the stack to receive the EFR value!  It also causes the
+;	  segment registers to be saved in the standard places.
+
+rsvcSchDismiss::			;Real mode entry
+	POPL	EAX			;Discard the SVC return address
+	MOVZWL	EBX, SS:pdaURegESP#	;Point to his stack
+	MOVZWL	EAX, SS:pdaURegSS#
+	SHLL	EAX, #4
+	ADDL	EBX, EAX
+	PUSHL	#GS_REAL16.B
+	POPL	ES
+	JMP	2$.S
+
+psvcSchDismiss::			;Protectred mode entry
+	PUSHAL				;We don't use SVCENTR here since we
+	PUSHL	DS			;  don't want a return address and
+	PUSHL	ES			;  don't need to set pdaArgCnt
+	PUSHL	FS
+	PUSHL	GS
+	PUSHFL
+	POPL	SS:pdaXRegEFR#
+	PUSHL	#GS_DATA.B
+	POPL	DS			;Point to his stack
+	LESL	EBX, SS:pdaURegESP#	   ;Indicate process is not in "set up"
+2$:	ANDB	SS:pdaStatus1#, #~P1$SETUP ;  mode any longer
+	IFFCALL	badusrstk#
+	TESTB	ES:24t+2.B[EBX], #02h	;Returning to real mode?
+	JNE	6$.S			;Yes
+	IFFCALL	badusrstk#
+	ORB	ES:20t.B[EBX], #03	;No - make sure user level CS
+	IFFCALL	badusrstk#		;Restore his segment registers
+	MOVL	EAX, ES:[EBX]
+	MOVL	SS:pdaURegGS#, EAX
+	IFFCALL	badusrstk#
+	MOVL	EAX, ES:4t.B[EBX]
+	MOVL	SS:pdaURegFS#, EAX
+	IFFCALL	badusrstk#
+	MOVL	EAX, ES:8t.B[EBX]
+	MOVL	SS:pdaURegES#, EAX
+	IFFCALL	badusrstk#
+	MOVL	EAX, ES:12t.B[EBX]
+	MOVL	SS:pdaURegDS#, EAX
+	JMP	8$.S
+
+;Here if returning to real mode
+
+	IFFCALL	badusrstk#		;Restore his segment registers
+6$:	MOVL	EAX, ES:[EBX]
+	MOVL	SS:pdaVRegGS#, EAX
+	IFFCALL	badusrstk#
+	MOVL	EAX, ES:4t.B[EBX]
+	MOVL	SS:pdaVRegFS#, EAX
+	IFFCALL	badusrstk#
+	MOVL	EAX, ES:8t.B[EBX]
+	MOVL	SS:pdaVRegES#, EAX
+	IFFCALL	badusrstk#
+	MOVL	EAX, ES:12t.B[EBX]
+	MOVL	SS:pdaVRegDS#, EAX
+	CLRL	EAX
+	MOVL	SS:pdaURegGS#, EAX
+	MOVL	SS:pdaURegFS#, EAX
+	MOVL	SS:pdaURegES#, EAX
+	MOVL	SS:pdaURegDS#, EAX
+	IFFCALL	badusrstk#
+8$:	MOVL	EAX, ES:16t.B[EBX]	;Get his return EIP
+	MOVL	SS:pdaURegEIP#, EAX
+	IFFCALL	badusrstk#
+	MOVL	EAX, ES:20t.B[EBX]	;And his return CS
+	MOVL	SS:pdaURegCS#, EAX
+	IFFCALL	badusrstk#
+	MOVL	EAX, ES:24t.B[EBX]	;And his return EFR
+	BTL	EAX, #27t		;Want to clear dda_dpmilckpsflg?
+	JNC	10$.S			;No
+	PUSHL	#GS_REAL32.B		;Yes
+	POPL	GS
+	IFFAULT	10$
+	MOVB	GS:dda_dpmilckpsflg, #0
+	FAULTHDR
+10$:	MOVL	EDX, EAX		;Save the EFR value for later
+	MOVL	ECX, EDX
+	ANDL	EAX, #30FFFh		;Clear unwanted hardware bits
+	ORB	AH, #02h		;Always set IF
+	MOVL	SS:pdaURegEFR#, EAX
+	MOVZWL	EAX, ES:28t.B[EBX]	;Get data item count
+	LEAL	EAX, 32t[EAX*4]
+	ADDL	SS:pdaURegESP#, EAX	;Adjust his stack pointer
+	ADDL	EBX, EAX		;Want to change the software interrupt
+	BTL	EDX, #24t		;  level?
+	JC	18$.S			;No
+	BTL	EDX, #23t		;Yes - should we do it DOS style?
+	JNC	12$.S			;No
+	MOVB	DL, SS:pdaSigLvl#	;Yes - assume should disable interrupts
+	ORB	DL, #04h
+	TESTB	DH, #02h		;Right?
+	JE	16$.S			;Yes
+	ANDB	DL, #~04h		;No
+	JMP	16$.S
+
+;Here to set signal level
+
+12$:	ANDB	DH, #7Fh
+	TESTB	DH, #02h		;Should software interrupts be enabled?
+	JNE	14$.S			;Yes
+	ORB	DH, #80h		;No - get the right value
+14$:	SHRL	EDX, #12t
+16$:	ANDL	EDX, #0Fh.B
+	MOVB	SS:pdaSigLvl#, DL	;Make this his new level
+	MOVB	AL, masktbl[EDX]	;Get new interrupt mask value
+	MOVB	SS:pdaSigMask#, AL
+18$:	MOVB	AL, SS:pdaXRegEFR#+2	;Are we changing modes?
+	XORB	AL, SS:pdaURegEFR#+2
+	TESTB	AL, #02h
+	JNE	20$.S			;Yes
+	BTL	ECX, #25t		;No - forcing stack switch?
+	JC	24$.S			;Yes
+	JMP	knlTrapDone#		;No - finished here
+
+;Here if changing modes
+
+20$:	MOVL	EAX, SS:pdaURegESP#	;Get his previous stack pointer
+	ADDL	EAX, #8t.B
+	TESTB	SS:pdaURegEFR#+2, #02h	;Returning to protected mode?
+	JE	22$.S			;Yes
+	PUSHL	#GS_REAL16.B
+	POPL	GS
+	IFFCALL	badusrstk#
+	MOVL	GS:dda_dpmicurpESP, EAX	;No
+	MOVL	EAX, SS:pdaURegSS#
+	MOVL	GS:dda_dpmicurpSS, EAX
+	MOVL	SS:pdaTss#+tss_stk0, #pdaXStackV# ;Setup to use virtual stack now
+	JMP	24$.S
+
+;Here if returning to protected mode from real mode
+
+22$:
+
+;;;;;	PUSHL	#GS_REAL16.B
+;;;;;	POPL	GS
+;;;;;	IFFCALL	badusrstk#
+;;;;;	MOVL	GS:rmda_vmESP, EAX
+;;;;;	MOVL	EAX, SS:pdaURegSS#
+;;;;;	MOVL	GS:rmda_vmSS, EAX
+
+	MOVL	SS:pdaTss#+tss_stk0, #pdaXStackP# ;Set to use protected mode
+	IFFCALL	badusrstk#			  ;  exec stack
+24$:	MOVL	EAX, ES:[EBX]		;Store stack pointer for the new mode
+	MOVL	SS:pdaURegESP#, EAX
+	IFFCALL	badusrstk#
+	MOVL	EAX, ES:4.B[EBX]
+	MOVL	SS:pdaURegSS#, EAX
+	JMP	knlTrapDone#
+.PAGE
+	.SBTTL	svcSchIRet - Supervisor call to do extended interurpt return
+
+;Here for the svcSchIRet SVC - Do extended interrupt return - this is an
+;  extension of the hardware IRET instruction (it does what the hardware
+;  instruction really should have done).  It always uses a 32 bit stack
+;  frame (independent of the current segment widths) with the following
+;  format:
+;	c{{ESP}+0}  = New user EIP
+;	c{{ESP}+4}  = New user CS
+;	c{{ESP}+8}  = New user EFR
+;	c{{ESP}+12} = New user ESP (These 6 items are normally only present when
+;	c{{ESP}+16} = New user SS     switching between real to protected modes)
+;	c{{ESP}+20} = New user ES
+;	c{{ESP}+24} = New user DS
+;	c{{ESP}+28} = New user FS
+;	c{{ESP}+32} = New user GS
+;	CALLF	svcSchIRet
+;  This call never returns to the caller!
+
+;The differences between this SVC and the IRET instruction are as follows:
+;	1: This SVC uses bit 24 of the EFR to suppress changing the interrupt
+;	     level.
+;	2: This SVC uses bit 9 of the EFR to set bit 2 of the software
+;	     interrupt level if bit 24 is not set.
+;	3: This SVC will switch to real mode if bit 17 of the EFR is set when
+;	     executed from protected user mode.
+;	4: This SVC will switch to protected mode if bit 17 of the EFR is
+;	     clear when executed for real user mode.
+
+;The EFR value has the following format:
+;	Bits 31-30 - Not used (should be 0)
+;	Bit  29    - If 1 dda_dpmilckrsflg is set to 0
+;	Bit  28    - 0
+;	Bit  27    - If 1 dda_dpmilckpsflg is set to 0
+;	Bit  26    - If 1 SS:ESP and segment registers are always restored from
+;		       the stack, even if not switching modes
+;	Bit  25    - If 1 SS:ESP is always restored from the stack, even if not
+;		       switching modes
+;	Bit  24    - If 1 interrupt level is not changed
+;	Bits 23-19 - Not used (shoule be 0)
+;	Bit  18    - AC flag (alignment check - 486 and above only)
+;	Bit  17    - VM flag
+;	Bit  16    - RF
+;	Bits 15-12 - 0
+;	Bit  11    - OF
+;	Bit  10    - DF
+;	Bit   9    - Value of bit 2 of software interrupt level
+;	Bit   8    - TF
+;	Bit   7    - SF
+;	Bit   6    - ZF
+;	Bit   5    - 0
+;	Bit   4    - AF
+;	Bit   3    - 0
+;	Bit   2    - PF
+;	Bit   1    - 1
+;	Bit   0    - CF	
+
+;  NOTE:  This SVC is setup as if it has 1 argument - this causes one item
+;	  to be copied from the user stack which has the effect of reserving
+;	  a slot on the stack to receive the EFR value!  It also causes the
+;	  segment registers to be saved in the standard places.
+
+rsvcSchIRet::				;Real mode entry
+	POPL	EAX			;Discard the SVC return address
+	MOVZWL	EBX, SS:pdaURegESP#	;Point to his stack
+	MOVZWL	EAX, SS:pdaURegSS#
+	SHLL	EAX, #4
+	ADDL	EBX, EAX
+	PUSHL	#GS_REAL16.B
+	POPL	ES
+	JMP	2$.S
+
+psvcSchIRet::				;Protectred mode entry
+	PUSHAL				;We don't use SVCENTR here since we
+	PUSHL	DS			;  don't want a return address and
+	PUSHL	ES			;  don't need to set pdaArgCnt
+	PUSHL	FS
+	PUSHL	GS
+	PUSHFL
+	POPL	SS:pdaXRegEFR#
+	PUSHL	#GS_DATA.B
+	POPL	DS
+	LESL	EBX, SS:pdaURegESP#	;Point to his stack
+2$:	IFFCALL	badusrstk#
+	TESTB	ES:8t+2.B[EBX], #02h	;Returning to real mode?
+	JNE	8$.S			;Yes
+	ORB	ES:4t.B[EBX], #03	;No - make sure user level CS
+	TESTB	SS:pdaXRegEFR#+2, #02h	;Comming from real mode or forcing
+					;  segment register restore?
+	JNE	iretpm.S		;Yes
+	IFFCALL	badusrstk#		;No
+	TESTB	ES:8t+3.B[EBX], #04h	;Forcing segment register restore?
+	JE	14$			;No
+	IFFCALL	badusrstk#		;Yes
+iretpm:	MOVL	EAX, ES:20t.B[EBX]	;Restore his protected mode segment
+	MOVL	SS:pdaURegES#, EAX	;  registers
+	IFFCALL	badusrstk#
+	MOVL	EAX, ES:24t.B[EBX]
+	MOVL	SS:pdaURegDS#, EAX
+	IFFCALL	badusrstk#
+	MOVL	EAX, ES:28t.B[EBX]
+	MOVL	SS:pdaURegFS#, EAX
+	IFFCALL	badusrstk#
+	MOVL	EAX, ES:32t.B[EBX]
+	MOVL	SS:pdaURegGS#, EAX
+	ADDL	SS:pdaURegESP#, #16t.B
+	JMP	14$.S
+
+;Here if returning to real mode
+
+8$:	TESTB	SS:pdaXRegEFR#+2, #02h	;Comming from real mode?
+	JE	10$.S			;No
+	IFFCALL	badusrstk#		;Yes
+	TESTB	ES:8t+3.B[EBX], #04h	;Force segment register restore?
+	JE	12$.S			;No
+	IFFCALL	badusrstk#		;Yes
+10$:	MOVL	EAX, ES:20t.B[EBX]	;Restore his real mode segment registers
+	MOVL	SS:pdaVRegES#, EAX
+	IFFCALL	badusrstk#
+	MOVL	EAX, ES:24t.B[EBX]
+	MOVL	SS:pdaVRegDS#, EAX
+	IFFCALL	badusrstk#
+	MOVL	EAX, ES:28t.B[EBX]
+	MOVL	SS:pdaVRegFS#, EAX
+	IFFCALL	badusrstk#
+	MOVL	EAX, ES:32t.B[EBX]
+	MOVL	SS:pdaVRegGS#, EAX
+	ADDL	SS:pdaURegESP#, #16t.B
+12$:	CLRL	EAX			;Clear this protected mode segment
+	MOVL	SS:pdaURegGS#, EAX	;  registers
+	MOVL	SS:pdaURegFS#, EAX
+	MOVL	SS:pdaURegES#, EAX
+	MOVL	SS:pdaURegDS#, EAX
+	IFFCALL	badusrstk#
+14$:	MOVL	EAX, ES:[EBX]		;Get his new EIP value
+	MOVL	SS:pdaURegEIP#, EAX
+	IFFCALL	badusrstk#
+	MOVL	EAX, ES:4t.B[EBX]	;And his new CS value
+	MOVL	SS:pdaURegCS#, EAX
+	IFFCALL	badusrstk#
+	MOVL	EAX, ES:8t.B[EBX]	;And his new EFR value
+	BTL	EAX, #27t		;Want to clear dda_dpmilckpsflg?
+	JNC	16$.S			;No
+	PUSHL	#GS_REAL32.B		;Yes
+	POPL	GS
+	IFFAULT	20$
+	MOVB	GS:dda_dpmilckpsflg, #0
+16$:	BTL	EAX, #29t		;Want to clear dda_dpmilckrsflg?
+	JNC	20$.S			;No
+	PUSHL	#GS_REAL32.B		;Yes
+	POPL	GS
+	IFFAULT	20$
+	MOVB	GS:dda_dpmilckrsflg, #0
+	FAULTHDR
+20$:	MOVL	EDX, EAX		;Save the EFR value for later
+	ANDB	AH, #0Fh		;Clear unwanted hardware bits
+	ORB	AH, #02h		;Always set IF
+	MOVL	SS:pdaURegEFR#, EAX
+	BTL	EDX, #24t		;Want to change the interrupt level?
+	JC	24$.S			;No
+	ANDB	SS:pdaSigLvl#, #~04h	;Yes - assume enabling interrupts
+	TESTB	DH, #02h		;Right?
+	JNE	22$.S			;Yes
+	ORB	SS:pdaSigLvl#, #04h	;No - disable interrupts
+22$:	MOVZBL	EDX, SS:pdaSigLvl#
+	MOVB	AL, masktbl[EDX]	;Get new interrupt mask value
+	MOVB	SS:pdaSigMask#, AL
+24$:	ADDL	SS:pdaURegESP#, #12t.B	;Adjust the user stack pointer
+	MOVB	AL, SS:pdaXRegEFR#+2	;Are we changing modes?
+	XORB	AL, SS:pdaURegEFR#+2
+	TESTB	AL, #02h
+	JNE	26$.S			;Yes
+	IFFCALL	badusrstk#
+	TESTB	ES:8t+3.B[EBX], #02h	;No - forcing stack switch?
+	JNE	30$.S			;Yes
+	JMP	knlTrapDone#		;No - ready to return now
+
+;Here if switching modes
+
+26$:	MOVL	EAX, SS:pdaURegESP#	;Get his stack pointer
+	ADDL	EAX, #8t.B
+	PUSHL	#GS_REAL16.B
+	POPL	GS
+	TESTB	SS:pdaURegEFR#+2, #02h	;Returning to protected mode?
+	JE	28$.S			;Yes
+	IFFCALL	badusrstk#
+	MOVL	GS:dda_dpmicurpESP, EAX	;No
+	MOVL	EAX, SS:pdaURegSS#
+	MOVL	GS:dda_dpmicurpSS, EAX
+	MOVL	SS:pdaTss#+tss_stk0, #pdaXStackV# ;Setup to use real mode
+	JMP	30$.S				  ;  exec stack now
+
+;Here if returning to protected mode from real mode
+
+28$:	IFFCALL	badusrstk#
+	MOVL	GS:dda_dpmicurrSSSP+0, EAX
+	MOVL	EAX, SS:pdaURegSS#
+	MOVW	GS:dda_dpmicurrSSSP+2, AX
+	MOVL	SS:pdaTss#+tss_stk0, #pdaXStackP# ;Set to use protected mode
+	IFFCALL	badusrstk#			  ;  exec stack
+30$:	MOVL	EAX, ES:12t.B[EBX]	;Store stack pointer for the new mode
+	MOVL	SS:pdaURegESP#, EAX
+	IFFCALL	badusrstk#
+	MOVL	EAX, ES:16t.B[EBX]
+	MOVL	SS:pdaURegSS#, EAX
+	JMP	knlTrapDone#
+.PAGE
+;Interrupt mask table
+
+	DATA
+
+masktbl::
+	.BYTE	0FFh		;Level 0
+	.BYTE	7Fh		;Level 1
+	.BYTE	3Fh		;Level 2
+	.BYTE	1Fh		;Level 3
+	.BYTE	0Fh		;Level 4
+	.BYTE	07h		;Level 5
+	.BYTE	03h		;Level 6
+	.BYTE	01h		;Level 7
+	.BYTE	01h		;Level 8 (disabled)
+	.BYTE	01h		;      9
+	.BYTE	01h		;      A
+	.BYTE	01h		;      B
+	.BYTE	01h		;      C
+	.BYTE	01h		;      D
+	.BYTE	01h		;      E
+	.BYTE	01h		;      F
+
+	CODE
+.PAGE
+	.SBTTL	svcSchRMRet - Supervisor call to do return from real mode
+
+;Here for the svcSchRMRet SVC - Return from real mode - this SVC is only
+;  implemented for real mode.  It is intended to provide the means for DPMI
+;  programs to return to protected mode from real mode.  It should only be
+;  executed in a DPMI environment.
+;  When this SVC is executed, the real mode stack should be set up as
+;    follows:
+;	c[[SP]+6] = Saved protected mode SS (16-bits)
+;	c{[SP]+2} = Saved protected mode ESP (32-bits)
+;	c[[SP]+0] = Saved FR value (16-bits)
+;  Also, the protected mode stack pointed to by the values on the real mode
+;    stack should be set up as follows:
+;	c{{ESP}+36} = Saved protected mode GS
+;	c{{ESP}+32} = Saved protected mode FS
+;	c{{ESP}+28} = Saved protected mode DS
+;	c{{ESP}+24} = Saved protected mode ES
+;	c{{ESP}+20} = Saved protected mode SS
+;	c{{ESP}+16} = Saved protected mode ESP
+;	c{{ESP}+12} = Saved protected mode EFR (only high 16 bits are used, low
+;			16 bits come from the FR value on the real mode stack)
+;	c{{ESP}+8}  = Saved protected mode CS
+;	c{{ESP}+4}  = Saved protected mode EIP
+;	c{{ESP}+0}  = Saved real mode SS:SP
+;  This call never returns to the caller!
+
+;The EFR value on the protected mode stack has the following format:
+;	Bits 31-30 - Not used (should be 0)
+;	Bit  29    - If 1 dda_dpmilckrsflg is set to 0
+;	Bit  28    - 0
+;	Bit  27    - If 1 dda_dpmilckpsflg is set to 0
+;	Bit  26    - 0
+;	Bit  25    - 0
+;	Bit  24    - If 1 interrupt level is not changed
+;	Bits 23-19 - Not used (shoule be 0)
+;	Bit  18    - AC flag (alignment check - 486 and above only)
+;	Bit  17    - VM flag (must be 0)
+;	Bit  16    - RF
+;	Bits 15-12 - 0
+;	Bit  11    - OF
+;	Bit  10    - DF
+;	Bit   9    - Value of bit 2 of software interrupt level
+;	Bit   8    - TF
+;	Bit   7    - SF
+;	Bit   6    - ZF
+;	Bit   5    - 0
+;	Bit   4    - AF
+;	Bit   3    - 0
+;	Bit   2    - PF
+;	Bit   1    - 1
+;	Bit   0    - CF	
+
+;This SVC effectively executes an svcSchIRet call from real mode using a
+;  protected mode stack.
+
+;  NOTE:  This SVC is setup as if it has 1 argument - this causes one item
+;	  to be copied from the user stack which has the effect of reserving
+;	  a slot on the stack to receive the EFR value!  It also causes the
+;	  segment registers to be saved in the standard places.
+
+rsvcSchRMRet::				;Real mode entry
+	POPL	EAX			;Discard the SVC return address
+	MOVZWL	EBX, SS:pdaURegESP#	;Point to his stack
+	MOVZWL	EAX, SS:pdaURegSS#
+	SHLL	EAX, #4
+	ADDL	EBX, EAX
+	PUSHL	#GS_REAL32.B
+	POPL	GS
+	IFFCALL	badusrstk#
+	MOVW	AX, GS:[EBX]		;Get FR value
+	IFFCALL	badusrstk#
+	LESL	EBX, GS:2.B[EBX]	;Point to his protected mode stack
+	IFFCALL	badusrstk#
+	MOVW	ES:12t.B[EBX], AX	;Copy FR value to his protected mode
+	IFFCALL	badusrstk#		;  stack
+	MOVL	EAX, ES:[EBX]		;Restore his saved real mode stack
+	IFFCALL	badusrstk#		;  pointer
+	MOVL	GS:dda_dpmicurrSSSP, EAX
+	ADDL	EBX, #4t.B		;Adjust his stack pointer
+	IFFCALL	badusrstk#		;Make sure the VM bit is not set in
+	ANDB	ES:8t+2.B[EBX], #~02h	;  his EFR value
+	ANDB    SS:pdaXRegEFR#+2, #~02h	;Make it look like this is a call from
+					;  protected mode so we will not
+					;  overwrite the real mode stack pointer
+					;  we just restored.
+	MOVL	SS:pdaTss#+tss_stk0, #pdaXStackP# ;Set to use protected mode
+						  ;  exec stack
+	ORB	ES:8t+3.B[EBX], #02h	;Make sure we restore the protected
+					;  mode stack pointer from his stack
+	JMP	iretpm			;Continue
+.PAGE
+
+	.SBTTL	svcSchRstUsrStk - Supervisor call to restore the user's stack
+
+;Here for the svcSchRstUsrStk SVC - Restore user's stack - This SVC is mainly
+;  intended to be used to switch back to the user's stack when using the
+;  DPMI locked protected mode stack.
+
+psvcSchRstUsrStk::
+	SVCENTR	CNTSchRstUsrStk#
+	IFFCALL	badusrstk#
+	LESL	EBX, SS:pdaURegESP#	;Point to the user's stack
+	IFFCALL	badusrstk#
+	MOVL	EAX, ES:[EBX]		;Get the new stack pointer
+	MOVL	SS:pdaURegESP#, EAX
+	IFFCALL	badusrstk#
+	MOVL	EAX, ES:4.B[EBX]
+	MOVL	SS:pdaURegSS#, EAX
+	PUSHL	#GS_REAL32.B
+	POPL	ES
+	IFFCALL	badusrstk#
+	MOVB	ES:dda_dpmilckpsflg, #0	;Clear the locked stack flag
+	MOVL	EAX, 48t.B[ESP]		;Don't change EAX
+	RET
+.PAGE
+;The following functions set software interrupt vectors.  The vector table is
+;  used to store both real hardware vectors and to store software interrupt
+;  vectors.  Vectors 0 to 1F and 80 to 8F are reserved for exec hardware
+;  vectors.  This vectors are always valid hardware vectors with a DPL of 0.
+;  The remaining vectors can specify either use mode address with a DPL of 3
+;  or a software vector address (the P bit will be 0 in this case).  Software
+;  vectors 0 to 1F and 80 to 8F are stored in separate tables.  Also, software
+;  CPU exception vectors are stored in their own table.
+;  The format of each  vector table entry is as follows:
+;	Offset	Size	Use
+;	  0	  2	Low 16 bits of offset value
+;	  2	  2	Selector
+;	  4	  1	Hardware vector:  0
+;			Software vector:  Interrupt count
+;	  5	  1	Vector type:
+;			  Hardware vector:
+;			    Bit  7   = 1 (P bit)
+;			    Bits 6-5 = DPL
+;			    Bits 4-0 = Vector type (0E = Interrupt, 0F = Trap)
+;			  Software vector:
+;			    Bit  7   = 0 (P bit)
+;			    Bits 6-4 = Interrupt level
+;			    Bit  3   = Remote event enable
+;			    Bits 2-0 = Vector type:
+;					 1 = Emulated hardware interrupt
+;					 2 = XOS vector
+;					 3 = DPMI 16-bit protected mode
+;					       v0.9 style exception
+;					 4 = DPMI 32-bit protected mode
+;					       v0.9 style exception
+;					 5 = DPMI 16-bit protected mode
+;					       v1.0 style exception
+;					 6 = DPMI 32-bit protected mode
+;					       v1.0 style exception
+;
+;  Note that for an interrupt to be used as a XOS software interrupt it
+;  must contain a XOS type vector.  Interrupts which contain a hardware
+;  vectors or DPMI exception vectors cannot be used as XOS software
+;  interrupts.  An INT instruction can be executed for any interrupt.  It will
+;  work for all type of XOS software interrupt vectors, DPMI exception
+;  vectors, and hardware vectors.  A hardware vector is MUCH faster and should
+;  be used whenever possible for INTs.  Note that hardware interrupt (as
+;  opposed to trap) vectors are emulated and are thus MUCH slower.  A XOS
+;  software interrupt vector is treated as a trap vector when an INT is
+;  executed for it, i.e., the state of the virtual interrupt system is not
+;  changed.  Vector numbers are used as follows:
+;	  0 -   7:  Software interrupts
+;	  7 -  0F:  Software interrupts, emulated hardware interrupts 0 - 7
+;	 10 -  6F:  Software interrupts
+;	 70 -  FF:  Software interrupts, enulated hardware interrupts 8 - 0F
+;	100 - 11F:  Protected mode CPU exceptions
+;	120 - 13F:  Real mode CPU exceptions
+;	140 - 14F:  XOS exceptions
+;	160 - 1FF:  Reserved
+;	200 - 2FF:  Real mode interrupts
+.PAGE
+	.SBTTL	svcSchSetLevel - Set signal level
+
+;Here for the svcSchSetLevel SVC - Set signal level
+;	int level;		// New signal level
+;				//   Bits 31-8: Not used, ignored
+;				//   Bit     7:	Format returned value as EFR
+;				//   Bits  6-5:	00 = Set level from bits 3-0
+;				//		01 = OR bits 3-0 to level
+;				//		10 = AND complement of bits
+;				//		       3-0 to level
+;				//		11 = Do not change level
+;				//   Bit     4:	0 = Return previous value
+;				//		1 = Do not change EAX
+;				//   Bits  3-0:	New level value
+;	rtn = svcSchSetLevel(level);
+;  Value returned is previous signal level if normal or a negative error code
+;    if error
+
+psvcSchSetLevel::
+	SVCENTR	CNTSchSetLevel#
+rsvcSchSetLevel::
+	MOVZBL	EDX, SS:pdaArg1#	;Get new level
+	MOVZBL	EAX, SS:pdaSigLvl#	;Get current software interrupt level
+	MOVL	ECX, EDX		;Get function
+	ANDB	DL, #0Fh
+	SHRL	ECX, #5t
+	JMPIL	stsidsp[ECX*4]		;Dispatch on the function
+
+	DATA
+
+stsidsp:.LONG	stsiset		;000 - Set new level
+	.LONG	stsior		;001 - OR to level value
+	.LONG	stsiand		;010 - AND complement to level value
+	.LONG	ret004		;011 - No change
+	.LONG	stsiset		;100 - Set new level
+	.LONG	stsior		;101 - OR to level value
+	.LONG	stsiand		;110 - AND complement to level value
+	.LONG	ret004		;111 - Illegal (treat it as as get function for
+				;	 compatibility with XOS 1.7 which used
+				;	 AL = 0FFh for get)
+	CODE
+
+;Here to set new level value
+
+stsiset:MOVB	SS:pdaSigLvl#, DL	;Make this his new level
+	JMP	6$.S
+
+;Here to OR to level value
+
+stsior:	ORB	SS:pdaSigLvl#, DL
+	JMP	4$.S
+
+;Here to AND complement to level value
+
+stsiand:NOTB	DL
+	ANDB	SS:pdaSigLvl#, DL
+4$:	MOVB	DL, SS:pdaSigLvl#
+6$:	MOVB	DL, masktbl[EDX]	;Get new interrupt mask value
+	MOVB	SS:pdaSigMask#, DL
+	TESTB	SS:pdaArg1#, #10h	;Want to preserve EAX?
+	JE	8$.S			;No
+	MOVL	EAX, SS:pdaURegEAX#	;Yes
+	RET				;Finished
+
+;Here if want to return previous level
+
+8$:	TESTB	SS:pdaArg1#+0, #80h	;Want an EFR format value?
+	JE	12$.S			;No
+	SHLL	EAX, #12t		;Yes
+	BTZL	EAX, #15t
+	JC	10$.S
+	ORB	AH, #02h
+10$:	CLC
+12$:	RET
+.PAGE
+	.SBTTL	svcSchSetVector - Set signal vector
+
+;Here for the svcSchSetVector SVC - Set signal vector
+;	long  vector;		// Vector number
+;	long  type;		// Bits 15-8 = Vector type:
+;				//		 VT_NONE    = 0
+;				//		 VT_XOSS    = 1
+;				//		 VT_XOST    = 2
+;				//		 VT_HWT16   = 3
+;				//		 VT_HWT32   = 4
+;				//		 VT_HWS16   = 5
+;				//		 VT_HWS32   = 6
+;				//		 VT_DPMI16O = 7
+;				//		 VT_DPMI32O = 8
+;				//		 VT_DPMI16N = 9
+;				//		 VT_DPMI32N = 10
+;				// Bit  7    = Remote enable (XOS vectors only)
+;				// Bits 6-0  = Software interrupt level (XOS
+;				//		 vectors only)
+;	void far *address;	// Address for vector (if selector is 0,
+;				//   offset part contains 32 bit real mode
+;				//   address) - if address is null, vector
+;				//   is cleared (reset to default hardware
+;				//   vector, level arg should be 0)
+;	rtn = svcSchSetVector(vector, type, address);
+;  Value returned is 0 if normal or negative error code if error
+
+;  Setting a vector type of VT_NONE is not the same as setting to the default
+;  vector (specified with a null address).  A VT_NONE vector real mode vector
+;  contains 0, which causes an immediate process termination any time it is
+;  used.  A protected mode VT_NONE vector also causes an immediate termination
+;  whenever it is used.  When setting to the default vector the vector type
+;  must be VT_HWT16 or VT_HTW32 for protected mode or VT_HWT16 for real mode
+;  vectors.
+
+psvcSchSetVector::
+	SVCENTR	CNTSchSetVector#
+rsvcSchSetVector::
+	CALL	getvect			;Get vector number
+	JC	4$.S			;If error
+	MOVL	EAX, SS:pdaArg2#	;Get level and type values
+	CMPB	AH, #VT_DPMI32N		;Valid type?
+	JA	2$.S			;No - fail
+	TESTB	AL, #78h		;Yes - valid level?
+	JNE	2$.S			;No - fail
+	MOVL	ECX, SS:pdaArg4#	;OK - get new offset for vector
+	MOVZWL	EDX, SS:pdaArg3#	;Get selector
+	CMPB	BH, #2h			;Real interrupt number?
+	JB	6$.S			;No
+	TESTL	EDX, EDX		;Real selector?
+2$:	JNE	knlBadValue#		;No - fail
+	CMPB	AH, #VT_HWT16		;Yes - valid type for this?
+	JNE	2$.S			;No - fail
+	TESTB	SS:pdaStatus1#, #P1$DOSSEG ;Yes - have a DOS environment?
+	JE	knlBadValue#		;No
+	MOVL	SS:pdaRMPage0#-200h*4[EBX*4], ECX ;Yes - store vector
+	CLRL	EAX
+4$:	RET
+
+;Here with system interrupt number
+
+6$:	CMPB	AH, #0			;Clearing the vector?
+	JNE	8$.S			;No
+	CLRL	EAX			;Yes - clear the vector
+	MOVL	0.B[EBP], EAX
+	MOVL	4.B[EBP], EAX
+	JMP	10$.S
+
+;Here if not clearing vector
+
+8$:	TESTL	ECX, ECX		;Is he setting to default vector?
+	JNE	14$.S			;No
+	PUSHL	#GS_SCHPDA		;Yes - just copy the default hardware
+	POPL	ES			;  vector
+	MOVL	EAX, ES:0.B[EBP]
+	MOVL	0.B[EBP], EAX
+	MOVL	EAX, ES:4.B[EBP]
+	MOVL	4.B[EBP], EAX
+10$:	CMPL	EBX, #ITO_PINTLS+1Ch	;BIOS timer tick interrupt?
+	JNE	12$.S			;No
+	TESTB	SS:pdaStatus1#, #P1$DOSSEG ;Yes - have a DOS environment?
+	JE	12$.S			;No
+	CMPW	SS:pdaRMPage0+8*4+2, #100h ;Yes - have a real mode timer vector?
+	JA	12$.S			;Yes
+	CMPW	SS:pdaRMPage0+1Ch*4+2, #100h
+	JA	12$.S			;Yes
+	PUSHL	SS			;No
+	POPL	ES
+	CALL	rmvrmtmr		;Remove from the real mode timer list
+12$:	CLRL	EAX
+	RET
+
+;Here if not setting to default vector
+
+14$:	CMPB	AH, #VT_HWT16		;Want 16-bit hardware vector?
+	JE	16$.S			;Yes
+	CMPB	AH, #VT_HWS16
+	JE	16$.S
+	CMPB	AH, #VT_HWT32		;No - Want 32-bit hardware vector?
+	JE	18$.S			;Yes
+	CMPB	AH, #VT_HWS32
+	JE	18$.S
+	MOVL	it_soffset.B[EBP], ECX	;No - store offset
+	MOVW	it_ssel.B[EBP], DX	;Store selector
+	MOVZBL	EDX, AH
+	MOVB	CL, AL			;Get remote enable bit in right place
+	SHRB	CL, #4
+	ANDB	CL, #080h
+	SHLL	EAX, #12t		;Get level bits in right place
+	ORB	AL, CL			;Merge in the remote enable bit
+	ORB	AH, typeval[EDX]	;Merge in the type value
+	MOVW	SS:it_count.B[EBP], AX	;Store type and count values
+	JMP	22$.S
+
+;Here if want 16-bit hardware vector
+
+16$:	MOVB	AL, #0E7h		;Get vector type value
+	JMP	20$.S
+
+;Here if want 32-bit hardware vector
+
+18$:	MOVB	AL, #0EFh		;Get vector type value
+20$:	TESTL	EDX, EDX		;Yes - real mode address?
+	JE	knlBadValue#		;Yes - fail
+	ORB	DL, #03			;No - make sure user level selector
+	MOVW	it_hoffsetl.B[EBP], CX	;Store new offset
+	SHRL	ECX, #16t
+	MOVW	it_hoffseth.B[EBP], CX
+	MOVW	it_hsel.B[EBP], DX	;Store selector
+	MOVB	it_type.B[EBP], AL	;Store gate type
+	MOVB	it_count.B[EBP], #0	;Count is always 0
+22$:	CMPL	EBX, #ITO_PINTLS+1Ch	;BIOS timer tick interrupt?
+	JNE	24$.S			;No
+	CMPW	SS:pdaRMTimer#, #-1.B	;Yes - is this process in the timer
+					;  list now?
+	JNE	24$.S			;Yes - all set
+	MOVL	EAX, rmtmrhd		;No - link it into the list
+	MOVW	SS:pdaRMTimer#, AX
+	MOVL	rmtmrhd, SS
+24$:	CLRL	EAX			;Return 0
+	RET
+
+	DATA
+
+typeval:.BYTE	0		;VT_IDLE    = 0  - Idle
+	.BYTE	ITV_XOSS	;VT_XOSS    = 1  - XOS signal vector
+	.BYTE	ITV_XOST	;VT_XOST    = 2  - XOS trap vector
+	.BYTE	0		;VT_HWT16   = 3  - 16-bit hardware trap vector
+	.BYTE	0		;VT_HWT32   = 4  - 32-bit hardware trap vector
+	.BYTE	0		;VT_HWS16   = 5  - 16-bit hardware signal vector
+	.BYTE	0		;VT_HWS32   = 6  - 32-bit hardware signal vector
+				;		     vector
+	.BYTE	ITV_DPMI16O	;VT_DPMI16O = 7  - DPMI v0.9 16-bit CPU trap
+				;		     vector
+	.BYTE	ITV_DPMI32O	;VT_DPMI32O = 8  - DPMI v0.9 32-bit CPU trap
+				;		     vector
+	.BYTE	ITV_DPMI16N	;VT_DPMI16N = 9  - DPMI v1.0 16-bit CPU trap
+				;		     vector
+	.BYTE	ITV_DPMI32N	;VT_DPMI32N = 10 - DPMI v1.0 32-bit CPU trap
+				;		     vector
+	CODE
+.PAGE
+	.SBTTL	svcSchInitVector - Initialize all protected mode vectors
+
+;Here for the svcSchInitVector SVC - Initalize all protected mode vectors
+;	int type;		// Vector type in bits 8-15.  Must be
+;				//   VT_NONE, VT_HWT16, or VT_HWT32
+;	rtn = svcSchInitVector(type);
+;  Value returned is always 0 if OK or a negative error code if error.
+
+psvcSchInitVector::
+	SVCENTR	CNTSchInitVector#
+rsvcSchInitVector::
+	MOVL	EDX, SS:pdaArg1#	;Get vector type
+	TESTL	EDX, #0FFFF00FFh
+2$:	JNE	knlBadValue#
+	CLD
+	PUSHL	SS
+	POPL	ES
+	CMPB	DH, #VT_NONE		;Want to clear all vectors?
+	JNE	4$.S			;No
+	MOVL	ECX, #80t*2		;Yes - clear 20 through 6F
+	MOVL	EDI, #pdaIdt+20h*8
+	CLRL	EAX
+	RSTOSL	[EDI]
+	MOVL	ECX, #272t*2		;Clear 80 through 18F
+	MOVL	EDI, #pdaIdt+80h*8
+	RSTOSL	[EDI]
+	RET
+
+;Here if do not want to clear all vectors.  In this case we set the 256
+;  protected INT vectors to point to the default routines.  This includes
+;  table entries 20-6F, 70-FF, 160-17F, 180-18F.  We always clear table entries
+;  100-15F.
+
+4$:	MOVL	EBX, #0EF00h		;Assume want 32-bit vectors
+	MOVL	EAX, #pint32dft#+{{GS_USERCODE|03h}<16t}
+	MOVL	ESI, #spec32
+	CMPB	DH, #VT_HWT32		;Right
+	JE	6$.S			;Yes
+	CMPB	DH, #VT_HWT16		;No - want 16-bit vectors?
+	JNE	2$.S			;No - fail
+	MOVB	BH, #0E7h		;Yes
+	MOVL	EAX, #pint16dft#+{{GS_USERCODE|03h}<16t}
+	ADDL	ESI, #spec16-spec32.B
+6$:	MOVL	EDI, #pdaIdt#
+	MOVL	EDX, #8t		;Initialize the IDT to contain 256
+8$:	MOVL	ECX, #32t		;  user level trap gates which point to
+10$:	CMPL	EDI, #pdaIdt#+1Fh*8	;Low vector?
+	JA	12$.S			;No
+	CMPL	EDI, #pdaIdt#+03h*8	;Yes - debug vector?
+	JE	16$.S			;Yes
+	MOVL	SS:160h*8+0[EDI], EAX	;No - store the vector
+	MOVL	SS:160h*8+4[EDI], EBX
+	JMP	16$.S
+
+;Here if not a low vector
+
+12$:	CMPL	EDI, #pdaIdt#+7Fh*8	;Middle vector?
+	JA	14$.S			;No
+	CMPL	EDI, #pdaIdt#+70h*8	;Maybe
+	JB	14$.S			;No
+	MOVL	SS:110h*8+0[EDI], EAX	;Yes - store the vector
+	MOVL	SS:110h*8+4[EDI], EBX
+	JMP	16$.S
+
+;Here if normal vector
+
+14$:	MOVL	SS:[EDI], EAX		;Store the vector
+	MOVL	SS:4.B[EDI], EBX
+16$:	ADDL	EAX, #4t.B		;Bump routine address
+	ADDL	EDI, #8t.B		;Bump table pointer
+	LOOP	ECX, 10$		;Continue if more to do in this group
+	ADDL	EAX, #4t.B		;End of group - fix up routine address
+	DECL	EDX			;More to do?
+	JNE	8$.S			;Yes - continue
+	LODSL	[ESI]
+	MOVL	SS:pdaIdt+21h*8+0, EAX	;Store INT 21 vector
+	LODSL	[ESI]
+	MOVL	SS:pdaIdt+2Fh*8+0, EAX	;Store INT 2F vector
+	LODSL	[ESI]
+	MOVL	SS:pdaIdt+31h*8+0, EAX	;Store INT 31 vector
+	LODSL	[ESI]
+	MOVL	SS:pdaIdt+33h*8+0, EAX	;Store INT 33 vector
+	MOVL	ECX, #96t*2-8
+	MOVL	EDI, #pdaIdt+100h*8+20h	;Clear the execption vectors
+	CLRL	EAX
+	RSTOSL	[EDI]
+	RET
+
+	DATA
+
+;Special vector table
+
+	.MOD	4
+spec16:	.LONG	pint16v21#+{{GS_USERCODE|03}<16t}
+	.LONG	pint16v2F#+{{GS_USERCODE|03}<16t}
+	.LONG	pint16v31#+{{GS_USERCODE|03}<16t}
+	.LONG	pint16v33#+{{GS_USERCODE|03}<16t}
+
+spec32:	.LONG	pint32v21#+{{GS_USERCODE|03}<16t}
+	.LONG	pint32v2F#+{{GS_USERCODE|03}<16t}
+	.LONG	pint32v31#+{{GS_USERCODE|03}<16t}
+	.LONG	pint32v33#+{{GS_USERCODE|03}<16t}
+
+	CODE
+.PAGE
+	.SBTTL	svcSchGetVector - Get signal vector
+
+;Here for the svcSchGetVector SVC - Get signal vector
+;	int    vector;		// Vector number
+;	void **address;		// Address to receive address of vector
+;	rtn = svcSchGetVector(vector, address);
+;  Value returned is type and level for vector if normal or negative error
+;    code if error, also, the current address of the vector is stored in
+;    "address"
+
+rsvcSchGetVector::
+	MOVL	EBP, #pdaArg3#
+	CALL	vfixaddr#
+	JMP	2$.S
+
+psvcSchGetVector::
+	SVCENTR	CNTSchGetVector#
+	ORB	SS:pdaArg2#, #03
+2$:	CALL	getvect			;Get vector number
+	JC	8$.S			;If error
+	IFFAULT	knlRtnAdrEr#
+	LESL	EDI, SS:pdaArg3#	;Get address for address
+	CLD
+	CMPB	BH, #2h			;Real mode vector?
+	JB	4$.S			;No
+	TESTB	SS:pdaStatus1#, #P1$DOSSEG|P1$BIOSSEG ;Yes - have a real mode
+						      ;  environment?
+	JE	knlBadValue#		;No
+	MOVL	EAX, SS:pdaRMPage0#-200h*4[EBX*4] ;Yes - get value of vector
+	IFFAULT	knlRtnAdrEr#
+	STOSL	[EDI]
+	CLRL	EAX
+	IFFAULT	knlRtnAdrEr#
+	STOSL	[EDI]
+	CLRL	EAX
+	MOVB	AH, #VT_HWT16		;This is always a 16 bit vector!
+	RET
+
+;Here if don't want a real mode vector
+
+4$:	TESTB	it_type.B[EBP], #80h	;Hardware vector?
+	JE	10$.S			;No
+	MOVW	AX, it_hoffseth.B[EBP]	;Yes - give him the address
+	SHLL	EAX, #16t
+	MOVW	AX, it_hoffsetl.B[EBP]
+	IFFAULT	knlRtnAdrEr#
+	STOSL	[EDI]
+	MOVZWL	EAX, it_hsel.B[EBP]
+	IFFAULT	knlRtnAdrEr#
+	STOSL	[EDI]
+	CLRL	EAX
+	MOVB	AH, #VT_HWT16		;Assume 16-bit vector
+	TESTB	it_type.B[EBP], #08h	;Right?
+	JE	8$.S			;Yes
+	MOVB	AH, #VT_HWT32		;No - its a 32-bit vector
+8$:	RET
+
+;Here if not hardware vector
+
+10$:	MOVL	EAX, it_soffset.B[EBP]	;Give him the address
+	IFFAULT	knlRtnAdrEr#
+	STOSL	[EDI]
+	MOVZWL	EAX, it_ssel.B[EBP]
+	IFFAULT	knlRtnAdrEr#
+	STOSL	[EDI]
+	MOVZBL	EBX, AL			;Save the remote enable bit and the
+	RORB	AL, #4t			;  level
+	ANDL	EAX, #87h
+	ANDL	EBX, #07h.B
+	MOVB	AH, sitype[EBX]
+	RET
+
+	DATA
+
+sitype:	.BYTE	0		;	     = 0 - Illegal
+	.BYTE	VT_XOSS		;ITV_XOSS    = 1 - XOS signal vector
+	.BYTE	VT_XOST		;ITV_XOST    = 2 - XOS trap vector
+	.BYTE	VT_DPMI16O	;ITV_DPMI16O = 3 - DPMI v0.9 16-bit CPU
+				;		     exception vector
+	.BYTE	VT_DPMI32O	;ITV_DPMI32O = 4 - DPMI v0.9 32-bit CPU
+				;		     exception vector
+	.BYTE	VT_DPMI16N	;ITV_DPMI16N = 5 - DPMI v1.0 16-bit CPU
+				;		     exception vector
+	.BYTE	VT_DPMI32N	;ITV_DPMI32N = 6 - DPMI v1.0 32-bit CPU
+				;		     exception vector
+	.BYTE	0		;	     = 7 - Illegal
+
+	CODE
+.PAGE
+;Subroutine to get interrupt vector number from user - number is mapped
+;  to the internal vector number
+;	CALL	getvect
+;	c{EBX} = Internal vector number
+;	c{EBP} = Offset of interrupt vector table entry if system vector
+
+getvect:MOVL	EBX, SS:pdaArg1#	;Get vector number
+	CMPL	EBX, #160h		;System vector number?
+	JB	4$.S			;Yes
+	CMPL	EBX, #200h
+	JB	2$.S			;No
+	CMPL	EBX, #300h
+	JB	10$.S
+2$:	JMP	knlBadValue#	
+
+;Here if not a real mode vector number
+
+4$:	CMPL	EBX, #20h.B		;Low vector?
+	JAE	6$.S			;No
+	ADDL	EBX, #ITO_PINTLS	;Yes - fix up the value
+	JMP	8$.S
+
+;Here if not low vector
+
+6$:	CMPL	EBX, #70h		;Middle vector?
+	JB	8$.S			;No
+	CMPL	EBX, #7Fh		;Maybe
+	JA	8$.S			;No
+	ADDL	EBX, #ITO_PINTMS-70h	;Yes - fix up the value
+8$:	LEAL	EBP, pdaIdt#[EBX*8] ;Get offset of vector table entry
+10$:	CLC
+ret006:	RET
+.PAGE
+	.SBTTL	svcSchClrSignal - Clear signal requests
+
+;Here for the svcSchClrSignal SVC - Clear signal requests
+;	long vector;		// Vector number (-1 clears signals for all
+;				//   vectors
+;	rtn = svcSchClrSignal(vector);
+;  Value returned is number of signals cleared if normal or negative error
+;    code if error
+
+psvcSchClrSignal::
+	SVCENTR	CNTSchClrSignal#
+rsvcSchClrSignal::
+	CLRL	ECX			;Indicate no data
+	CLRL	EDX
+	CLRL	EDI
+	CLRL	EAX			;Indicate all levels
+	DECL	EAX
+	JMP	4$.S
+
+	.SBTTL	svcSchDisSignal - Discard signal requests
+
+;Here for the svcDisClrSignal SVC - Discard signal requests
+;	long  vector;		// Vector number (-1 discards signals for all
+;				//   vectors
+;	long  level;		// Signal level (-1 discards signals for all
+;				//   levels)
+;	long *data;		// Array of data and mask values to match
+;	long  count;		// Number of data values to match (0 does not
+;				//   check any data values, 1 matches single
+;				//   data value without masking, > 1 matches
+;				//   n/2 data values with masking)
+;	rtn = svcSchDisSignal(vector, level, data, count);
+;  Value returned is number of signals discarded if normal or negative error
+;    code if error
+
+$$$=!0
+FRM ds_number , 4t
+FRM ds_count  , 4t
+FRM ds_lsthead, 4t
+FRM ds_level  , 4t		;Level to clear
+FRM ds_data   , 8t		;Address of data list
+FRM ds_datasz , 4t		;Number of data items
+FRM           , 3t
+FRM ds_mask   , 1t
+ds_SIZE=!$$$
+
+rsvcSchDisSignal::
+	MOVL	EBP, #pdaArg4#
+	CALL	vfixaddr#
+	JMP	2$.S
+
+psvcSchDisSignal::
+	SVCENTR	CNTSchDisSignal#
+	ORB	SS:pdaArg3#, #03h
+2$:	MOVL	EAX, SS:pdaArg2#
+	MOVL	EDX, SS:pdaArg3#
+	MOVL	EDI, SS:pdaArg4#
+	MOVL	ECX, SS:pdaArg5#
+
+;	c{EAX}    = Level
+;	c{DX:EDI} = Address of data list
+;	c{ECX}    = Number of data items
+
+4$:	ENTER	ds_SIZE, 0		;Set up our stack frame
+	MOVL	ds_level.B[EBP], EAX
+	MOVL	ds_data+0.B[EBP], EDI
+	MOVL	ds_data+4.B[EBP], EDX
+	CMPL	ECX, #1			;Have a single value?
+	JBE	6$.S
+	MOVB	ds_mask.B[EBP], #1	;No - we have mask values too
+	SHRL	ECX, #1
+	JMP	8$.S
+
+6$:	MOVB	ds_mask.B[EBP], #0	;Single value - no mask
+8$:	MOVL	ds_datasz.B[EBP], ECX
+	MOVL	EAX, SS:pdaArg1#
+	CMPL	EAX, #-1.B
+	JE	10$.S
+	CALL	knlChkVector#		;Check the vector number
+	JC	18$.S			;If error
+	MOVL	SS:pdaArg1#, EAX	;Store adjusted value
+10$:	CLRL	EAX
+	MOVL	ds_number.B[EBP], EAX
+	MOVL	EAX, ds_level.B[EBP]	;Get level
+	CMPL	EAX, #-1.B		;Want all levels?
+	JE	12$.S			;Yes
+	DECL	EAX			;No - valid level?
+	JS	knlBadValueLv#		;No
+	CMPL	EAX, #7.B		;Maybe
+	JAE	knlBadValueLv#		;No
+	LEAL	EAX, pdaL1HeadP#[EAX*4]	;Yes - get offset of head pointer
+	MOVL	ds_lsthead.B[EBP], EAX
+	CALL	dissig
+	JNC	16$.S
+	JMP	18$.S
+
+;Here to discard all levels
+
+12$:	MOVL	ds_count.B[EBP], #7	;Get number of lists
+	MOVL	ds_lsthead.B[EBP], #pdaL1HeadP#	;Point to head pointer for
+14$:	PUSHL	EDI				;  first list
+	PUSHL	ES
+	CALL	dissig
+	POPL	ES
+	POPL	EDI
+	JC	18$.S
+	ADDL	EDI, #4.B
+	DECL	ds_count.B[EBP]
+	JNE	14$.S
+16$:	MOVL	EAX, ds_number.B[EBP]
+18$:	LEAVE
+	RET
+.PAGE
+;Subroutine to discard signals for a single level
+;	c{ES:EDI} = Address of head pointer for signal request list
+;	CALL	dissig
+
+dissig:	TOFORK
+	MOVL	EDI, ds_lsthead.B[EBP]
+	PUSHL	SS
+	POPL	ES
+2$:	MOVL	ESI, ES:[EDI]
+	TESTL	ESI, ESI
+	JE	30$
+	MOVL	EAX, SS:pdaArg1#	;Get the desired vector
+	CMPL	EAX, #-1.B		;All vectors?
+	JE	4$.S			;Yes
+	CMPW	slb_vector.B[ESI], AX	;No - this one?
+	JNE	28$			;No - skip this one
+4$:	MOVL	ECX, ds_datasz.B[EBP]	;Want to check the data?
+	JREGZ	ECX, 14$		;No
+	CMPB	CL, slb_dcnt.B[ESI]	;Yes - do we have enought data here?
+	JA	28$			;No - skip this one
+	IFFAULT	34$			;Yes - check the data values
+	LFSL	EBX, ds_data.B[EBP]
+	LEAL	EDX, slb_data.B[ESI]
+	IFFAULT	34$
+10$:	MOVL	EAX, FS:[EBX]		;Get a data value
+	XORL	EAX, [EDX]		;Compare
+	CMPB	ds_mask.B[EBP], #0	;Want to mask it?
+	JE	12$.S			;No
+	IFFAULT	34$
+	ANDL	EAX, FS:4.B[EBX]	;Yes
+12$:	TESTL	EAX, EAX
+	JNE	28$.S			;If different
+	ADDL	EBX, #8t.B
+	ADDL	EDX, #4t.B
+	LOOP	ECX, 10$
+14$:	MOVL	EDX, slb_grantsub.B[ESI] ;Same - discard this one
+	TESTL	EDX, EDX		;Have a grant subroutine?
+	JE	16$.S			;No
+	PUSHL	EDI			;Yes
+	PUSHL	ESI
+	PUSHL	ECX
+	MOVL	EDI, slb_grantEDI.B[ESI]
+	CLRL	EAX
+	MOVL	slb_grantsub.B[ESI], EAX
+	MOVB	AL, #2			;Indicate clearing the signal
+	CALLI	EDX			;Call the grant subroutine
+	POPL	ECX
+	POPL	ESI
+	POPL	EDI
+16$:	MOVL	EAX, [ESI]		;Get offset of next block
+	MOVL	ES:[EDI], EAX		;Unlink this one
+	TESTL	EAX, EAX		;Have a next block?
+	JE	22$.S			;No - this was the last one
+	CMPL	EDI, #pdaL7HeadP#	;Yes - is it the only one?
+	JBE	20$.S			;Yes
+	MOVL	slb_prev.B[EAX], ESI	;No - update back link
+	JMP	26$.S
+
+;Here if this is was the first block
+
+20$:	MOVL	slb_prev.B[EAX], #0	;Indicate the next block now is the
+	JMP	26$.S			;  block
+
+;Here if this was the last block
+
+22$:	MOVL	ECX, ds_lsthead.B[EBP]
+	MOVL	EAX, EDI
+	CMPL	EAX, #pdaL7HeadP#	;Is there a previous block?
+	JA	24$.S			;Yes
+	CLRL	EAX			;No - this was the last one
+24$:	MOVL	SS:pdaxxTP#.B[ECX], EAX	;Update the tail pointer
+26$:	MOVZBL	ECX, slb_szindx.B[ESI]
+	CALL	knlGiveXmb#		;Give up this signal link block
+	INCL	ds_number.B[EBP]	;Count the signal we cleared
+	JMP	2$
+
+;Here if do not want to remove this request
+
+28$:	MOVL	EDI, ESI		;Advance pointer
+	PUSHL	DS
+	POPL	ES
+	JMP	2$			;Continue
+
+;Here at end of the signal list
+
+30$:	MOVL	EDX, ds_lsthead.B[EBP]	;Get offset of head pointer
+	CMPL	EDI, #pdaL7HeadP#	;Is the list empty now?
+	JA	32$.S			;No
+	MOVL	EAX, #pdaL7HeadP#+4	;Yes - clear request bit
+	SUBL	EAX, EDX
+	SHRL	EAX, #2
+	BTZL	SS:pdaSigReq#, EAX
+32$:	FROMFORK
+	CLC
+	RET
+
+;Here if address error
+
+	FAULTHDR
+34$:	FROMFORK
+	JMP	knlRtnAdrEr#
+.PAGE
+	.SBTTL	knlRealBiosSetup
+
+;Subroutine to setup a real mode BIOS environment
+;	c{ECX} = Amount of real mode memory to allocate above page 0
+;	CALL	knlRealBiosSetup
+;	C:clr = Normal (all register are preserved)
+;	C:set = Error
+;	  c{EAX} = Error code (all other registers are preserved)
+
+knlRealBiosSetup::
+	TESTB	SS:pdaStatus1#, #P1$BIOSSEG ;Do we have a BIOS environment?
+	JNE	2$.S			;Yes - nothing needed here
+	CMPB	knlForkLvl#, #0		;At fork level now?
+	JE	biossetup.S		;No - go on
+	FROMFORK			;Yes - back to main program level
+	CALL	biossetup
+	JC	4$.S
+	TOFORK
+	CLC
+2$:	RET
+
+4$:	TOFORK
+	STC
+	RET
+
+biossetup:
+	PUSHAL				;No - save registers
+	MOVB	DL, SS:pdaSigLvl#	;Save signal state
+	MOVB	DH, SS:pdaSigMask#
+	PUSHL	EDX
+	PUSHL	SS:pdaDosSize#		;Save DOS start and size
+	PUSHL	SS:pdaDosBase#
+	MOVL	SS:pdaDosSize#, #0A0000h
+	MOVL	SS:pdaDosBase#, #1000h
+	ADDL	ECX, #0FFFh
+	ANDL	ECX, #0FFFFF000h
+	SUBL	ECX, #100h
+	PUSHL	EBP
+	CALL	knlDosSetup#		;Create a DOS real mode environment
+	POPL	EBP
+	POPL	SS:pdaDosBase#
+	POPL	SS:pdaDosSize#
+	POPL	EDX
+	MOVB	SS:pdaSigLvl#, DL
+	MOVB	SS:pdaSigMask#, DH
+	JC	8$
+	XORB	SS:pdaStatus1#, #P1$DOSSEG|P1$BIOSSEG ;Change it to be a
+	POPAL					      ;  BIOS environment
+	RET
+
+8$:	MOVL	20h.B[ESP], EAX
+	POPAL
+	RET
+.PAGE
+	.SBTTL	knlExecReal - Execute real mode code in pseudo-exec mode
+
+;Subroutine to execute real mode code in pseudo-exec mode
+;	c{EBX} = Offset (in data segment) of real mode code to execute
+;	c{ECX} = Length of real mode code
+;	c{EDX} = Offset of register value block
+;	c{EDI} = Offset of IO register block
+;	CALL	execreal
+;	C:clr = Normal (all register are preserved)
+;	C:set = Error
+;	  c{EAX} = Error code (all other registers are preserved)
+
+$$$=!0
+FRM xr_ioreg, 4t
+FRM xr_code , 4t
+FRM xr_cdsz , 4t
+FRM xr_regs , 4t
+xr_SIZE=!$$$
+
+;Page 0 is set up as follows:
+;	0000-03FF  Real mode vector table
+;	0400-07FF  BIOS data
+;	0800-0AFF  Saved protected mode stack
+;	0A00-0AFF  Other saved protected mode state
+;	0B00-0EFF  Real mode stack
+;	0F00-0FFF  Real mode code
+
+savestack     =!0800h
+savestksize   =!0A00h
+savepdaSigMask=!0A04h
+savepdaSigLvl =!0A05h
+savepdaXRegEIP=!0A08h
+savepdaXRegCS =!0A0Ch
+savepdaXRegEFR=!0A10h
+savepdaArgCnt =!0A14h
+saveEBX       =!0A18h
+
+
+2$:	TOFORK
+	STC
+4$:	LEAVE
+	MOVL	1C.B[ESP], EAX
+	POPAL
+	RET
+
+6$:	MOVL	EAX, #ER_FUNCM
+	STC
+	RET
+
+knlExecReal::
+	TESTB	SS:pdaStatus1#, #P1$DOSSEG ;Do we have a DOS environment?
+	JNE	6$.S			;Yes - fail!
+	PUSHAL
+	ENTER	xr_SIZE, 0
+	MOVL	xr_ioreg.B[EBP], EDI
+	MOVL	xr_code.B[EBP], EBX
+	MOVL	xr_cdsz.B[EBP], ECX
+	MOVL	xr_regs.B[EBP], EDX
+	PUSHL	DS
+	POPL	ES
+	MOVB	BL, #1
+	CALL	knlIoPorts#
+	JC	4$.S
+	MOVB	SS:pdaRealIO#, #1
+	FROMFORK
+	PUSHL	#GS_REAL32.B
+	POPL	ES
+	CLD
+	MOVL	EDI, #0F00h		;Copy the real mode code to real mode
+	MOVL	ESI, xr_code.B[EBP]	;  memory
+	MOVL	ECX, xr_cdsz.B[EBP]
+	RMOVSL	[EDI], [ESI]
+	PUSHL	EBP
+	MOVL	ECX, #pdaXStackP#	;Save our current stack
+	SUBL	ECX, ESP
+	SHRL	ECX, #2t
+	INCL	ECX
+	MOVL	ES:savestksize, ECX
+	CLD
+	MOVL	ESI, ESP
+	MOVL	EDI, #savestack
+	RMOVSL	[EDI], SS:[ESI]
+	MOVL	EAX, SS:pdaXRegEIP#
+	MOVL	ES:savepdaXRegEIP, EAX
+	MOVL	EAX, SS:pdaXRegCS#
+	MOVL	ES:savepdaXRegCS, EAX
+	MOVL	EAX, SS:pdaXRegEFR#
+	MOVL	ES:savepdaXRegEFR, EAX
+	MOVL	EAX, SS:pdaArgCnt#
+	MOVL	ES:savepdaArgCnt, EAX
+	MOVB	AL, SS:pdaSigLvl#
+	MOVB	ES:savepdaSigLvl, AL
+	MOVB	AL, SS:pdaSigMask#
+	MOVB	ES:savepdaSigMask, AL
+	MOVB	SS:pdaSigLvl#, #8	;Disable signals now
+	MOVB	SS:pdaSigMask#, #1
+	MOVL	EAX, ES:0Dh*4		;Preserve the protection error vector
+	MOVL	ESI, #pagezero		;Restore all other vectors to their
+	CLRL	EDI			;  original real mode values
+	MOVL	ECX, #100h
+	RMOVSL	[EDI], [ESI]
+	MOVL	ES:0Dh*4, EAX
+
+$$$$ZZ::
+
+	MOVL	EAX, pagezero+480h	;Restore the 12 bytes starting at 480
+	MOVL	ES:480h, EAX		;  which (mostly) contain video data
+	MOVL	EAX, pagezero+484h
+	MOVL	ES:484h, EAX
+	MOVL	EAX, pagezero+488h
+	MOVL	ES:488h, EAX
+	MOVL	EAX, pagezero+bda_vidparcb ;Also restore the video parameter
+	MOVL	ES:bda_vidparcb, EAX	   ;  control block pointer
+	CLRL	EAX
+	MOVL	ES:09h*4, EAX		;Clear the keyboard vector
+	MOVL	ES:08h*4, EAX		;Clear the timer vectors
+	MOVL	ES:1Ch*4, EAX
+	MOVL	EBX, xr_regs.B[EBP]
+	MOVL	ES:saveEBX, EBX
+	MOVL	ESP, #pdaXStackV#	;Set up the stack for switching to real
+					;  mode
+	MOVL	SS:pdaTss#+tss_stk0, #pdaXStackV# ;Use his real mode stack
+	PUSHL	xrr_GS.B[EBX]		;Real mode segment registers
+	PUSHL	xrr_FS.B[EBX]
+	PUSHL	xrr_DS.B[EBX]
+	PUSHL	xrr_ES.B[EBX]
+	PUSHL	#0B0h			;SS
+	PUSHL	#400h			;ESP
+	PUSHL	#20200h			;EFR
+	PUSHL	#0F0h			;CS
+	PUSHL	#0.B			;EIP
+	PUSHL	xrr_EAX.B[EBX]		;General registers
+	PUSHL	xrr_ECX.B[EBX]
+	PUSHL	xrr_EDX.B[EBX]
+	PUSHL	xrr_EBX.B[EBX]
+	PUSHL	#0.B
+	PUSHL	xrr_EBP.B[EBX]
+	PUSHL	xrr_ESI.B[EBX]
+	PUSHL	xrr_EDI.B[EBX]
+	PUSHL	#0.B			;Protected mode segment registers
+	PUSHL	#0.B
+	PUSHL	#0.B
+	PUSHL	#0.B
+	JMP	knlTrapDone#
+.PAGE
+	.SBTTL	svcSchExitRXM - Exit real exec mode
+
+;Here for the svcSchExitRXM SVC - Exit from real exec mode
+;	svcSchExitRXM();
+;	Never returns
+
+rsvcSchExitRXM::
+
+;;;	INT3
+
+	CMPB	SS:pdaRealIO#, #0	;Currently in pseudo-exec mode?
+	JE	knlBadFunc#		;No - fail
+	MOVB	SS:pdaRealIO#, #0
+
+	PUSHL	#GS_REAL32.B
+	POPL	FS
+	MOVL	EBX, FS:saveEBX		;Save the real mode register for
+	MOVL	EAX, SS:pdaURegEAX#+4	;  the caller
+	MOVL	xrr_EAX.B[EBX], EAX
+	MOVL	EAX, SS:pdaURegECX#+4
+	MOVL	xrr_ECX.B[EBX], EAX
+	MOVL	EAX, SS:pdaURegEDX#+4
+	MOVL	xrr_EDX.B[EBX], EAX
+	MOVL	EAX, SS:pdaURegEBX#+4
+	MOVL	xrr_EBX.B[EBX], EAX
+	MOVL	EAX, SS:pdaURegEBP#+4
+	MOVL	xrr_EBP.B[EBX], EAX
+	MOVL	EAX, SS:pdaURegESI#+4
+	MOVL	xrr_ESI.B[EBX], EAX
+	MOVL	EAX, SS:pdaURegEDI#+4
+	MOVL	xrr_EDI.B[EBX], EAX
+	MOVL	EAX, SS:pdaURegEFR#+4
+	MOVL	xrr_EFR.B[EBX], EAX
+	MOVL	EAX, SS:pdaVRegDS#
+	MOVL	xrr_DS.B[EBX], EAX
+	MOVL	EAX, SS:pdaVRegES#
+	MOVL	xrr_ES.B[EBX], EAX
+	MOVL	EAX, SS:pdaVRegFS#
+	MOVL	xrr_FS.B[EBX], EAX
+	MOVL	EAX, SS:pdaVRegGS#
+	MOVL	xrr_GS.B[EBX], EAX
+
+	CLD
+	MOVL	ECX, FS:savestksize	;Restore our stack
+	MOVL	EAX, ECX
+	NEGL	EAX
+	LEAL	ESP, pdaXStackP#+4[EAX*4]
+	CLD
+	MOVL	ESI, #savestack
+	MOVL	EDI, ESP
+	PUSHL	SS
+	POPL	ES
+	RMOVSL	[EDI], FS:[ESI]
+
+;;;	INT3
+
+	POPL	EBP
+	MOVL	EDI, xr_ioreg.B[EBP]
+	PUSHL	DS
+	POPL	ES
+	MOVB	BL, #2
+	CALL	knlIoPorts
+
+	MOVL	EAX, FS:savepdaXRegEIP
+	MOVL	SS:pdaXRegEIP#, EAX
+	MOVL	EAX, FS:savepdaXRegCS
+	MOVL	SS:pdaXRegCS#, EAX
+	MOVL	EAX, FS:savepdaXRegEFR
+	MOVL	SS:pdaXRegEFR#, EAX
+	MOVL	EAX, FS:savepdaArgCnt
+	MOVL	SS:pdaArgCnt#, EAX
+	MOVB	AL, FS:savepdaSigLvl
+	MOVB	SS:pdaSigLvl#, AL
+	MOVB	AL, FS:savepdaSigMask
+	MOVB	SS:pdaSigMask#, AL
+	MOVL	SS:pdaTss#+tss_stk0, #pdaXStackP#
+	TOFORK
+	CLC
+	LEAVE
+	POPAL
+	RET
+
+10$:	CRASH	CRVS			;[Can't Remove V-86 Segment]
+.PAGE
+	.SBTTL	svcSysDateTime - Get or set system date and time
+
+;Here for the svcSysDateTime SVC - Get or set system date and time
+;  software interrupt level associated with fixed interrupts
+;	int function;		// Function:
+;				//   1 = Get current date and time (XOS format)
+;				//   2 = Get current date and time (DOS format)
+;				//   3 = Get current date and time with time
+;				//	   zone information (XOS format)
+;				//   4 = Get current date and time with time
+;				//	   zone information (DOS format)
+;				//   5 = Reserved
+;				//   6 = Get process elapsed time (XOS format)
+;				//   7 = Get session elapsed time (XOS format)
+;				//   8 = Get process CPU time (XOS format)
+;				//   9 = Convert date/time to XOS format
+;				//  10 = Convert date/time from XOS format
+;				//  11 = Get current HR date and time (XOS
+;				//	   format)
+;				//  12 = Get process HR elapsed time (XOS
+;				//	   format)
+;				//  13 = Get session HR elapsed time (XOS
+;				//	   format)
+;				//  14 = Get current HR date and time with time
+;				//	   zone information (XOS format)
+;				//  15 = Get RTC date and time (DOS format)
+;				//	   (requires admin priv)
+;				//  16 = Set system date and time (XOS format)
+;				//	   (requires admin priv)
+;				//  17 = Set RTC date and time (DOS format)
+;				//	   (requires admin priv)
+;				//  18 = Get time zone information
+;				//  19 = Set time zone information
+
+;	void far *dttm;		// Address of argument structure (format depends
+;				//   on function)
+;	rtn = svcSysDateTime(function, dttm);
+;  Value returned is 0 if normal or negative error code if error
+
+rsvcSysDateTime::
+	MOVL	EBP, #pdaArg3#
+	CALL	vfixaddr#
+	JMP	2$.S
+
+psvcSysDateTime::
+	SVCENTR	CNTSysDateTime#
+	ORB	SS:pdaArg2#, #03
+	IFFAULT	knlRtnAdrEr#
+2$:	LESL	EBX, SS:pdaArg3#
+	MOVL	EAX, SS:pdaArg1#
+	CMPL	EAX, #DATEMXF.B		;Legal function?
+	JAE	knlBadFunc#		;No
+	JMPIL	datedsp[EAX*4]		;Yes - dispatch on the function
+
+;Date/time function dispatch table
+
+	DATA
+
+datedsp:.LONG	knlBadFunc#	; 0 = Illegal
+	.LONG	gtsysdate	; 1 = Get current date and time (system format)
+	.LONG	gtdosdate	; 2 = Get current date and time (DOS format)
+	.LONG	gtsysdatetz	; 3 = Get current date and time with time zone
+				;	information (system format)
+	.LONG	gtdosdatetz	; 4 = Get current date and time with time zone
+				;	information (DOS format)
+	.LONG	knlBadFunc#	; 5 = Reserved
+	.LONG	gtpcstime	; 6 = Get process elapsed time (system format)
+	.LONG	gtgrptime	; 7 = Get session elapsed time (system format)
+	.LONG	gtcputime	; 8 = Get process CPU time (system format)
+	.LONG	conv2sys	; 9 = Convert date/time to system format
+	.LONG	convfrmsys	;10 = Convert date/time from system format
+	.LONG	gthrdate	;11 = Get HR date and time (system format)
+	.LONG	gthrptime	;12 = Get HR process elapsed time (system
+				;	format)
+	.LONG	gthrstime	;13 = Get HR session elapsed time (system
+				;	format)
+	.LONG	gthrdatetz	;14 = Get HR date and time with time zone
+				;	information (system format)
+	.LONG	gtrtc#		;15 = Get RTC date and time (DOS format)
+	.LONG	stdate		;16 = Set system date and time (system format)
+	.LONG	strtc#		;17 = Set RTC date and time (DOS format)
+	.LONG	gttzone		;18 = Get time zone data
+	.LONG	sttzone		;19 = Set time zone data
+DATEMXF=!{$-datedsp}/4
+
+	CODE
+.PAGE
+;Here to get current system date and time in system format
+;  Format of data returned:
+;	unsigned long time;
+;	unsigned long date;
+
+gtsysdate:
+	MOVL	ECX, #8			;Make sure buffer is writable
+gtsysdt:CALL	knlIoBufrChk#
+	JC	6$.S
+	CALL	knlGetSysDtTm#
+	JMP	4$.S
+
+;Here to get current system date and time with time zone information in
+;  system format
+;  Format of data returned:
+;	unsigned long  time;
+;	unsigned long  date;
+;		 short tzone;
+;		 short dlst;
+
+gtsysdatetz:
+	MOVL	ECX, #12t
+	CALL	gtsysdt
+	JC	6$.S
+rtntz:	MOVL	EAX, dlststate#
+	TESTL	EAX, EAX
+	JE	2$.S
+	MOVL	EAX, dlstoffset#
+2$:	SHLL	EAX, #16t
+	MOVW	AX, timezone#
+	MOVL	ES:8t.B[EBX], EAX
+	CLRL	EAX
+	RET
+
+;Here to get current high resolution system date and time in system format
+;  Format of data returned:
+;	unsigned long time;
+;	unsigned long date;
+
+gthrdate:
+	MOVL	ECX, #8			;Make sure buffer is writable
+gthrdt:	CALL	knlIoBufrChk#
+	JC	6$.S
+	CALL	knlGetSysHRDtTm#
+4$:	MOVL	ES:[EBX], EAX		;Store time in user buffer
+	MOVL	ES:4.B[EBX], EDX	;Store date too
+	CLRL	EAX			;Return 0
+6$:	RET
+
+;Here to get current high resolution system date and time with time zone
+;  information in system format
+;  Format of data returned:
+;	unsigned long  time;
+;	unsigned long  date;
+;		 short tzone;
+;		 short dlst;
+
+gthrdatetz:
+	MOVL	ECX, #12t		;Make sure buffer is writable
+	CALL	gthrdt
+	JMP	rtntz.S
+
+;Here to get current system date and time in DOS format
+;  Format of data returned:
+;	unsigned short millisecond;	// 0 - 999
+;	unsigned short second;		// 0 - 59
+;	unsigned short minute;		// 0 - 59
+;	unsigned short hour;		// 0 - 23
+;	unsigned short day_of_month;	// 1 - 31
+;	unsigned short month;		// 1 - 12
+;	unsigned short year;		// > 1600
+;	unsigned short day_of_week;	// 0 - 6, 0 = Sunday
+;	unsigned short day_of_year;	// 0 - 365
+
+gtdosdate:
+	MOVL	ECX, #18t		;Make sure buffer is writable
+gtdosdt:CALL	knlIoBufrChk#
+	JC	6$.S
+	CLI				;No interrupts here
+	MOVL	ECX, knlDosDate#	;Get DOS format date
+	MOVL	EDI, knlSysDate#	;Get system format date too (for day of
+					;  the week calculation below)
+	MOVL	EAX, knlTickCnt#	;Get tick count
+	STI				;Interrupts OK now
+	MULL	lit5D34553A#		;Get hours and fraction left over
+	SHRDL	EAX, EDX, #16t
+	SHRL	EDX, #16t
+	IFFAULT	knlRtnAdrEr#
+	MOVW	ES:6.B[EBX], DX
+	MULL	lit60#			;Get minutes
+	IFFAULT	knlRtnAdrEr#
+	MOVW	ES:4.B[EBX], DX
+	MULL	lit60#			;Get seconds
+	IFFAULT	knlRtnAdrEr#
+	MOVW	ES:2.B[EBX], DX
+	MULL	lit1000#		;Get milliseconds
+	IFFAULT	knlRtnAdrEr#
+	MOVW	ES:[EBX], DX
+	MOVL	ESI, ECX		;Get day of month
+	ANDL	ESI, #1Fh.B
+	IFFAULT	knlRtnAdrEr#
+	MOVW	ES:8.B[EBX], SI
+	SHRL	ECX, #5			;Get month
+	MOVL	EAX, ECX
+	ANDL	EAX, #0Fh.B
+	IFFAULT	knlRtnAdrEr#
+	MOVW	ES:10t.B[EBX], AX
+	IFFAULT	knlRtnAdrEr#
+	MOVW	ES:16t.B[EBX], #0	;For now, don't return day in year!
+	SHRL	ECX, #4			;Get year
+	ANDL	ECX, #7Fh.B
+	ADDL	ECX, #1980t
+	IFFAULT	knlRtnAdrEr#
+	MOVW	ES:12t.B[EBX], CX
+	LEAL	EAX, -1.B[EDI]		;Get day of week
+	CLRL	EDX
+	DIVL	lit7#
+	IFFAULT	knlRtnAdrEr
+	MOVW	ES:14t.B[EBX], DX
+	CLRL	EAX			;Return 0
+	RET
+
+;Here to get current system date and time with time zone information in
+;  DOS format
+;  Format of data returned:
+;	unsigned short millisecond;	// 0 - 999
+;	unsigned short second;		// 0 - 59
+;	unsigned short minute;		// 0 - 59
+;	unsigned short hour;		// 0 - 23
+;	unsigned short day_of_month;	// 1 - 31
+;	unsigned short month;		// 1 - 12
+;	unsigned short year;		// > 1600
+;	unsigned short day_of_week;	// 0 - 6, 0 = Sunday
+;	unsigned short day_of_year;	// 0 - 365
+;	         short timezone;
+;	         short dlst;
+
+gtdosdatetz:
+	MOVL	ECX, #22t		;Make sure buffer is writable
+	CALL	gtdosdt
+	ADDL	EBX, #10t.B
+	JMP	rtntz
+.PAGE
+;Here to set system date and time - system date and time are always set using
+;  system format
+;  Format of data supplied by caller:
+;	unsigned long time;
+;	unsigned long date;
+
+stdate:	BTL	SS:pdaActPriv#, #PP%SYSADMIN ;Can he do this?
+	JNC	knlPrivFail#		;No - fail
+	IFFAULT	knlRtnAdrEr#
+	MOVL	EAX, ES:[EBX]		;Yes - get time value
+	MULL	knlLitTPD#		;Calculate tick count (this leaves it
+	IFFAULT	knlRtnAdrEr#		;  in EDX)
+	MOVL	EAX, ES:4.B[EBX]	;Get date value
+	CALL	knlSys2DosDate#		;Get it in DOS format
+	JC	ret008.S		;If bad date
+	MOVL	ECX, EAX		;Now back to system format! (this
+	CALL	knlDos2SysDate#		;  ensures that the values match,
+	PUSHL	EAX			;  since not all system date values
+	MOVL	EAX, EDX		;  map to DOS date values!)
+	PUSHL	EAX
+	PUSHL	EAX
+	MULL	litDTPD#		;Calculate DOS tick value
+	DIVL	knlLitTPD#
+	XCHGL	EAX, [ESP]		;Save it for now
+	MULL	litCPT#			;Calculate timer ticks at midnite
+	NEGL	EDX
+	NEGL	EAX
+	SBBL	EDX, #0.B
+	CLI				;No interrupts here
+	ADDL	EAX, knlTimeTtl#+0
+	ADCL	EDX, knlTimeTtl#+4
+	MOVL	timemnite#+0, EAX
+	MOVL	timemnite#+4, EDX
+	POPL	dostcnt#		;Store DOS tick count
+	POPL	knlTickCnt#		;Store time
+	POPL	knlSysDate#		;Store system format date
+	MOVL	knlDosDate#, ECX	;Store DOS format date
+	STI
+	CLRL	EAX
+ret008:	RET				;Thats all
+.PAGE
+;Here to get the time zone data
+;  Format of data returned to caller:
+;	unsigned long  tzone;		// Offset from GMT (minutes)
+;	unsigned long  begintime;	// Daylight savings beginning time
+;					//   (fractional days)
+;	unsigned long  beginday;	// Daylight savings beginning day
+;	unsigned long  endtime;		// Daylight savings ending time
+;					//   (fractional days)
+;	unsigned long  endday;		// Daylight savings ending day
+;	         long  offset;		// Daylight savings offset (minutes) 
+
+;Note that the system's daylight savings time offset is always returned by this
+;  function, even if daylight savings time is not in effect.
+
+gttzone:MOVL	ECX, #24t		;Make sure buffer is writable
+	CALL	knlIoBufrChk#
+	JC	ret008.S
+	MOVL	EAX, timezone#		;Give him the time zone offset
+	MOVL	ES:[EBX], EAX
+	MOVL	EAX, dlstbgntime#	;Give him the daylight savings beginning
+	CALL	knlTick2SysTime#	;  time
+	MOVL	ES:4t.B[EBX], EAX
+	MOVL	EAX, dlstbgnday#	;Give him the daylight savings beginning
+	MOVL	ES:8t.B[EBX], EAX	;  day
+	MOVL	EAX, dlstendtime#	;Give him the daylight savings ending
+	CALL	knlTick2SysTime#	;  time
+	MOVL	ES:12t.B[EBX], EAX
+	MOVL	EAX, dlstendday#	;Give him the daylight savings ending
+	MOVL	ES:16t.B[EBX], EAX	;  day
+	MOVL	EAX, dlstoffset+0	;Give him the daylight savings offset
+	MOVL	EDX, dlstoffset+4
+	IDIVL	lit2D82D8#		;Convert to minutes
+	MOVL	ES:20t.B[EBX], EAX
+	CLRL	EAX
+	RET
+
+;Here to set the time zone data
+;  Format of data supplied by caller:
+;	unsigned long  tzone;		// Offset from GMT (minutes)
+;	unsigned long  begintime;	// Daylight savings beginning time
+;					//   (fractional days)
+;	unsigned long  beginday;	// Daylight savings beginning day
+;	unsigned long  endtime;		// Daylight savings ending time
+;					//   (fractional days)
+;	unsigned long  endday;		// Daylight savings ending day
+;	         long  offset;		// Daylight savings offset (minutes) 
+
+sttzone:BTL	SS:pdaActPriv#, #PP%SYSADMIN ;Can he do this?
+	JNC	knlPrivFail#		;No - fail
+	IFFAULT	knlRtnAdrEr#		;Yes
+	MOVL	EAX, ES:[EBX]		;Get time zone offset
+	MOVL	timezone#, EAX		;Save it
+	IFFAULT	knlRtnAdrEr#
+	MOVL	EAX, ES:4t.B[EBX]	;Get the daylight savings begining time
+	MULL	knlLitTPD#		;Change to ticks
+	MOVL	dlstbgntime#, EDX
+	IFFAULT	knlRtnAdrEr#
+	MOVL	EAX, ES:8t.B[EBX]	;Get the daylight savings begining date
+	MOVL	dlstbgnday#, EAX
+	IFFAULT	knlRtnAdrEr#
+	MOVL	EAX, ES:12t.B[EBX]	;Get the daylight savings ending time
+	MULL	knlLitTPD#		;Change to ticks
+	MOVL	dlstendtime#, EAX
+	IFFAULT	knlRtnAdrEr#
+	MOVL	EAX, ES:16t.B[EBX]	;Get the daylight savings ending date
+	MOVL	dlstendday#, EAX
+	MOVL	EAX, ES:20t.B[EBX]	;Get the daylight savings offset
+	IMULL	lit2D82D8#		;Change to fractional days
+	MOVL	dlstoffset#+0, EAX
+	MOVL	dlstoffset#+4, EDX
+setdlst::
+	CLI
+	MOVL	EDX, yearday#		;Get current day in year
+	MOVL	EAX, knlTickCnt		;Get current time in ticks
+	STI
+	CMPB	dlststate, #0		;Is daylight savings active now?
+	JE	4$.S			;No
+	SUBL	EAX, dlstoffset#	;Yes - adjust for it
+	SBBL	EDX, #0.B
+4$:	CMPL	EDX, dlstbgnday#	;Before beginning?
+	JB	6$.S			;Yes - not active
+	CMPL	EAX, dlstbgntime#	;Maybe
+	JB	6$.S			;Yes
+	CMPL	EDX, dlstendday#	;Past end?
+	JA	6$.S			;Yes - not active
+	CMPL	EAX, dlstendtime#	;Maybe
+	JA	6$.S			;Yes
+	MOVB	AL, #1			;Indicate daylight savings time active
+	JMP	8$.S
+
+6$:	MOVB	AL, #0			;Indicate daylight savings time not
+8$:	MOVB	dlststate, AL
+	CLRL	EAX
+ret010:	RET
+.PAGE
+;Here to get low resolution process elapsed time
+
+gtpcstime:
+	MOVL	ECX, #8			;Make sure buffer is writable
+	CALL	knlIoBufrChk#
+	JC	ret010.S
+	CALL	knlGetSysDtTm#		;Get current date and time
+	JMP	4$.S
+
+;Here to get high resolution process elapsed time (system format)
+
+gthrptime:
+	MOVL	ECX, #8			;Make sure buffer is writable
+	CALL	knlIoBufrChk#
+	JC	ret010.S
+	CALL	knlGetSysHRDtTm#
+2$:	SUBL	EAX, SS:pdaCTime#	;Minus when process created
+	SBBL	EDX, SS:pdaCDate#
+	JMP	6$.S
+
+;Here to get low resolution session elapsed time in system format
+
+gtgrptime:
+	MOVL	ECX, #8			;Make sure buffer is writable
+	CALL	knlIoBufrChk#
+	JC	ret010.S
+	CALL	knlGetSysDtTm#		;Get current date and time
+	JMP	4$.S
+
+;Here to get high resolution session elapsed time in system format
+
+gthrstime:
+	MOVL	ECX, #8			;Make sure buffer is writable
+	CALL	knlIoBufrChk#
+	JC	ret010.S
+	CALL	knlGetSysHRDtTm#
+4$:	MOVZWL	EAX, SS:pdaSesProc#	;Point to session PDA
+	MOVW	FS, knlProcTable#[EAX*2]
+	SUBL	EAX, FS:pdaCTime#	;Minus when session was created
+	SBBL	EDX, FS:pdaCDate#
+6$:	JGE	10$.S
+	CLRL	EAX
+	CLRL	EDX
+	JMP	10$.S
+
+;Here to get process CPU time
+
+gtcputime:
+	MOVL	ECX, #8			;Make sure buffer is writable
+	CALL	knlIoBufrChk#
+	JC	ret012.S
+	TOFORK
+	CALL	getdelta#		;Make sure the time value is current
+	FROMFORK
+	ADDL	SS:pdaRunTime#+0, EAX
+	ADCL	SS:pdaRunTime#+4, EDX
+	SUBL	SS:pdaRunQTime#, EAX
+	MOVL	EAX, SS:pdaRunTime#+0	;Get current run time for process
+	MOVL	EDX, SS:pdaRunTime#+4
+	CALL	clkcnt2sysdttm#		;Change to system format
+	IFFAULT	knlRtnAdrEr#
+10$:	MOVL	ES:[EBX], EAX		;Give him the time part
+	IFFAULT	knlRtnAdrEr#
+	MOVL	ES:4.B[EBX], EDX	;And give the date part
+	CLRL	EAX			;Return 0
+ret012:	RET
+.PAGE
+;Here to convert broken down date and time to system format
+;  Format of data buffer (first two items are modified, rest are only read)
+;	unsigned long  systime;
+;	unsigned long  sysdate;
+;	unsigned short millisecond;	// 0 - 999
+;	unsigned short second;		// 0 - 59
+;	unsigned short minute;		// 0 - 59
+;	unsigned short hour;		// 0 - 23
+;	unsigned short day_of_month;	// 1 - 31
+;	unsigned short month;		// 1 - 12
+;	unsigned short year;		// > 1600
+
+conv2sys:
+	MOVL	ECX, #8t		;Make sure first 2 items are writable
+	CALL	knlIoBufrChk#
+	JC	ret012.S
+	IFFAULT	knlRtnAdrEr#
+	MOVZWL	ECX, ES:8+6t.B[EBX]	;Get hours
+	CMPL	ECX, #24t.B		;Legal value?
+	JAE	2$.S			;No
+	IMULL	ECX, #60t.B		;Yes
+	IFFAULT	knlRtnAdrEr#
+	MOVZWL	EAX, ES:8+4t.B[EBX]	;Get minutes
+	CMPL	EAX, #60t.B		;Legal value?
+	JAE	2$.S			;No
+	ADDL	ECX, EAX		;Yes
+	IMULL	ECX, #60t.B
+	IFFAULT	knlRtnAdrEr#
+	MOVZWL	EAX, ES:8+2t.B[EBX]	;Get seconds
+	CMPL	EAX, #60t.B		;Legal value?
+	JAE	2$.S			;No
+	ADDL	ECX, EAX		;Yes
+	IMULL	ECX, #1000t
+	IFFAULT	knlRtnAdrEr#
+	MOVZWL	EAX, ES:8+0t.B[EBX]	;Get milliseconds
+	CMPL	EAX, #1000t		;Legal value?
+2$:	JAE	knlBadValue#		;No
+	ADDL	EAX, ECX		;Yes
+	MULL	lit31B5D43B#		;Convert to fractional days
+	SHLDL	EDX, EAX, #8
+	IFFAULT	knlRtnAdrEr#
+	MOVZWL	EAX, ES:8+12t.B[EBX]	;Get year
+	SUBL	EAX, #1600t
+	JS	4$.S			;If year value is too small
+	TESTL	EAX, #0FF800000h	;Too large?
+4$:	JNE	knlBadValue#		;Yes
+	SHLL	EAX, #4			;No
+	IFFAULT	knlRtnAdrEr#
+	MOVZWL	ECX, ES:8+10t.B[EBX]	;Get month
+	JREGZ	ECX, 4$			;Legal value?
+	CMPL	ECX, #12t.B		;Maybe
+	JA	4$.S			;No
+	ORL	EAX, ECX		;Yes
+	SHLL	EAX, #5
+	IFFAULT	knlRtnAdrEr#
+	MOVZWL	ECX, ES:8+8t.B[EBX]	;Get day
+	JREGZ	ECX, 4$			;Legal value?
+	CMPL	ECX, #31t.B		;Maybe
+	JA	4$.S			;No
+	ORL	EAX, ECX		;Yes
+	CALL	knlBdv2SysDate#		;Convert to system date
+	MOVL	ES:4.B[EBX], EAX	;Store date value
+	MOVL	ES:[EBX], EDX		;Store time value
+	CLRL	EAX			;Return 0
+ret016:	RET
+.PAGE
+;Here to convert system format date and time to broken down format
+;  Format of data buffer (first two items are only read, rest are modified)
+;	unsigned long  systime;
+;	unsigned long  sysdate;
+;	unsigned short millisecond;	// 0 - 999
+;	unsigned short second;		// 0 - 59
+;	unsigned short minute;		// 0 - 59
+;	unsigned short hour;		// 0 - 23
+;	unsigned short day_of_month;	// 1 - 31
+;	unsigned short month;		// 1 - 12
+;	unsigned short year;		// > 1600
+;	unsigned short day_of_week;	// 0 - 6, 0 = Sunday
+;	unsigned short day_of_year;	// 0 - 365
+
+convfrmsys:
+	MOVL	ECX, #26t		;Make sure entire buffer is writable
+	CALL	knlIoBufrChk#
+	JC	ret016.S
+	MOVL	EDI, ES:[EBX]		;Get time value
+	ADDL	EDI, #XT_MILLISEC/2.B	;Round to nearest millisecond but
+	JNC	4$.S			;  don't round to next day
+	MOVL	EDI, #0FFFFFFFFh
+4$:	MOVL	EAX, ES:4.B[EBX]	;Get date value
+	PUSHL	EAX
+	CALL	knlSys2BdvDate#		;Convert the date
+	MOVW	ES:8+16t.B[EBX], DX	;Store day in year
+	MOVL	ECX, EAX
+	SHRL	ECX, #5
+	ANDL	EAX, #1Fh.B
+	MOVW	ES:8+8.B[EBX], AX	;Store day of month
+	MOVL	EAX, ECX
+	SHRL	ECX, #4
+	ANDL	EAX, #0Fh.B
+	MOVW	ES:8+10t.B[EBX], AX	;Store month
+	ADDL	ECX, #1600t
+	MOVW	ES:8+12t.B[EBX], CX	;Store year
+	POPL	EAX			;Restore system format date
+	DECL	EAX
+	CLRL	EDX			;Get the day of the week
+	DIVL	lit7#
+	MOVW	ES:8+14t.B[EBX], DX
+	MOVL	EAX, EDI		;Calculate time
+	MOVL	ECX, #24t
+	MULL	ECX			;Get hours
+	MOVW	ES:8+6.B[EBX], DX	;Store hours
+	ADDL	ECX, #60t-24t.B		;Get minutes
+	MULL	ECX
+	MOVW	ES:8+4.B[EBX], DX	;Store minutes
+	MULL	ECX			;Get seconds
+	MOVW	ES:8+2.B[EBX], DX	;Store seconds
+	MULL	lit1000#		;Get milliseconds
+	MOVW	ES:8+0.B[EBX], DX	;Store milliseconds
+	CLRL	EAX
+	RET
+.PAGE
+	.SBTTL	svcSchSuspend - Suspend process
+
+;Here for the svcSchSuspend SVC - Suspend process until time limit expires
+;	long far *flag;		// Address of flag item
+;	long timeout;		// Time to suspend (fractional days, max of
+;				//   12 hours), 0xFFFFFFFF means to suspend
+;				//   forever, 0 means to return immediately
+;	rtn = svcSchSuspend(flag, time);
+;  Value returned is 0 or a negative error code
+
+rsvcSchSuspend::
+	MOVL	EBP, #pdaArg2#
+	CALL	vfixaddr#
+	JMP	4$.S
+
+2$:	RET
+
+psvcSchSuspend::
+	SVCENTR	CNTSchSuspend#
+	ORB	SS:pdaArg1#, #03
+	IFFAULT	knlRtnAdrEr#
+4$:	LESL	EDI, SS:pdaArg2#	;Get address of flag word
+	TESTL	EDI, EDI		;Did he specify a flag word?
+	JE	6$.S			;No - go suspend
+	CLRL	EAX
+	IFFAULT	knlRtnAdrEr#
+	CMPL	ES:[EDI], #0.B		;Yes - is his flag value zero?
+	JE	2$.S			;Yes - just return now
+6$:	MOVL	EBP, #-8t		;No - get time argument offset
+	CALL	settimeout		;Set up timeout
+	JBE	2$.S			;If error or if should not wait
+	JMP	8$.S
+
+	.SBTTL	svcSchSleep - Sleep
+
+;Here for the svcSchSleep SVC - Suspend forever (allows software interrupts)
+;	rtn = svcSchSleep();
+;  Never returns
+
+psvcSchSleep::
+	SVCENTR	CNTSchSleep#
+rsvcSchSleep::
+8$:	MOVB	AL, #knlQX_SPND#	;Requeue to the suspend queue
+	TOFORK
+rqwait::PUSHL	SS			;Requeue current process
+	POPL	ES
+	CALL	knlRequeue#
+svcredow::
+	MOVB	knlSchedReq#, #1	;Request scheduling now
+svcredoc::
+	MOVB	AL, SS:pdaSigReq#	;Do we have any unmasked signal
+	ANDB	AL, SS:pdaSigMask#	;  requests now?
+	JE	10$.S			;No
+	PUSHL	SS			;Yes
+	POPL	ES
+	CALL	knlRRequeue#		;Put process back in a run queue
+	JMP	svcredo.S		;Re-do the SVC but don't reschedule
+
+;Here if need to schedule
+
+10$:	MOVB	knlSchedReq#, #1	;Request scheduling now
+
+;Here to re-do an SVC - this is almost like the code at svcfin except that
+;  the user EIP is backed up to point to the CALLF instruction and arguments
+;  are not removed from the user stack
+
+svcredo:FROMFORK
+	TESTB	SS:pdaXRegEFR#+2, #02h	;Virtual DOS mode call?
+	JNE	svcredov		;Yes - go handle that
+	POPL	EAX			;No - discard SVC return
+	SUBL	48t.B[ESP], #7.B	;Adjust the user's return address
+	CLI				;No interrupts now
+	MOVB	AL, SS:pdaSigReq#	;Need to schedule now?
+	ANDB	AL, SS:pdaSigMask#
+	ORB	AL, knlSchedReq#
+	IFFCALL	badusrstk#
+	POPL	GS			;Restore segment registers
+	IFFCALL	badusrstk#
+	POPL	FS
+	IFFCALL	badusrstk#
+	POPL	ES
+	IFFCALL	badusrstk#
+	POPL	DS
+	TESTB	AL, AL
+	POPAL				;Restore registers
+	POPL	SS:pdaXRegEIP#		;Get CS:EIP off of the stack
+	POPL	SS:pdaXRegCS#
+	JNE	14$.S			;If need to schedule now
+	ADDL	ESP, SS:pdaArgCnt#	;Remove arguments from exec stack
+	PUSHL	#200h			;Put EFR value on the stack
+	PUSHL	SS:pdaXRegCS#		;Put CS:EIP back on the stack
+	PUSHL	SS:pdaXRegEIP#
+	IFFCALL	badusrstk#
+	IRET
+
+;Here if need to schedule before returning to user mode - we must fix up the
+;  stack so it looks like a normal trap
+
+14$:	ADDL	ESP, SS:pdaArgCnt#	;Remove arguments from exec stack
+	PUSHL	#200h			;Put EFR value on the stack
+	PUSHL	SS:pdaXRegCS#		;Put CS:EIP back on the stack
+	PUSHL	SS:pdaXRegEIP#
+	CALLF	schedule
+	IFFCALL	badusrstk#
+	IRET
+.PAGE
+;Here if virtual-86 mode
+
+svcredov::
+	POPL	EAX			;Discard SVC return
+	SUBL	48t.B[ESP], #5.B	;Adjust the user's return address
+	CLI				;No interrupts now
+	MOVB	AL, SS:pdaSigReq#	;Need to schedule now?
+	ANDB	AL, SS:pdaSigMask#
+	ORB	AL, knlSchedReq#
+	IFFCALL	badusrstk#
+	POPL	GS			;Restore segment registers
+	IFFCALL	badusrstk#
+	POPL	FS
+	IFFCALL	badusrstk#
+	POPL	ES
+	IFFCALL	badusrstk#
+	POPL	DS
+	TESTB	AL, AL
+	POPAL				;Restore user registers
+	POPL	SS:pdaXRegEIP#		;Get CS:EIP off of the stack
+	POPL	SS:pdaXRegCS#
+	JNE	16$.S
+	ADDL	ESP, SS:pdaArgCnt#	;Remove arguments from exec stack
+	PUSHL	#020200h		;Put EFR value on the stack
+	PUSHL	SS:pdaXRegCS#		;Put CS:EIP back on the stack
+	PUSHL	SS:pdaXRegEIP#
+	IFFCALL	badusrstk#
+	IRET
+
+16$:	ADDL	ESP, SS:pdaArgCnt#	;Remove arguments from exec stack
+	PUSHL	#020200h		;Put EFR value on the stack
+	PUSHL	SS:pdaXRegCS#		;Put CS:EIP back on the stack
+	PUSHL	SS:pdaXRegEIP#
+	CALLF	schedule
+	IFFCALL	badusrstk#
+	IRET
+.PAGE
+	.SBTTL	settimeout - Subroutine to setup for timeout
+
+;Subroutine to setup for timeout - the time-out value is in fractional days
+;  (32 bit value with binary point at left) with a maximum value of 12 hours
+;  or 1/2 day.  This routine may be called to start a wait or to continue an
+;  interrupted wait.  Inorder to handle interrupted waits, the value on the
+;  user stack is changed from fractional days to the absolute tick-count when
+;  the time-out ends (24 bits only).  Only 24 bits are used (which is more than
+;  enought for 12 hours) so the high 8 bits may be used as a flag to indicate
+;  the value has already been modified.  This careful checking is a bit of
+;  overkill, but it does protect against a program specifying a value between
+;  12 and 24 hours which would look like a converted value the first time (if
+;  only the high bit was used as a flag!).  It is still possible for a program
+;  to get a funny interval by specifying an intial value between 0FF000000h
+;  (about 23 hours 14 minutes) and 0FF20F5BCh (about 23 hours and 15 3/4
+;  minutes), but this is a very small range!!  If some other value greater
+;  than 12 hours is specified (high bit set, but high 8 bits not 0FFh), than
+;  a period of 12 hours is used.
+;	c{EBP} = PDA offset of timeout argument relative to pdaArg1
+;		   (pdaArg1 = 0, pdaArg2 = -4, etc)
+;	CALL	settimeout
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  Z:set = Should not reschedule
+;	  Z:clr = Need to reschedule
+
+2$:	RET
+
+settimeout::
+	MOVL	EAX, pdaArg1#[EBP]	;Get timeout argument
+	TESTL	EAX, EAX		;Want to wait at all?
+	JE	2$.S			;No
+	CMPL	EAX, #0FFFFFFFFh.B	;Yes - wait forever?
+	JE	18$			;Yes
+	JG	6$.S			;If this is the first time here
+	CMPB	pdaArg1#+3[EBP], #0FFh	;Probably not - valid value?
+	JE	12$.S			;Yes
+4$:	MOVL	EAX, #80000000h		;No - must be first time with bad value!
+6$:	MULL	knlLitTPD#		;Convert to ticks
+	MOVL	EAX, EDX
+	ADDL	EAX, knlTickTtl#	;Get absolute stop time
+	ORL	EAX, #0FF000000h	;Set high 8 bits as flag
+	ADDL	EBP, SS:pdaArgCnt#	;Calculate offset in user stack of
+	TESTB	SS:pdaXRegEFR#+2, #02h	;  time argument
+	JE	8$.S
+	MOVZWL	ECX, SS:pdaURegESP#
+	MOVZWL	EDX, SS:pdaURegSS#
+	SHLL	EDX, #4
+	ADDL	EDX, ECX
+	PUSHL	#GS_REAL16.B
+	POPL	ES
+	JMP	10$.S
+
+8$:	LESL	EDX, SS:pdaURegESP#
+	IFFAULT	knlRtnAdrEr#
+10$:	MOVL	ES:-4.B[EBP+EDX], EAX	;Store actual stop time in user argument
+12$:	ANDL	EAX, #0FFFFFFh		;Clear high bits
+	MOVL	EBX, knlTickTtl#	;Get number of ticks to wait
+	ANDL	EBX, #0FFFFFFh
+	SUBL	EAX, EBX
+	JG	14$.S			;If still need to wait
+	BTL	EAX, #23t		;Did it wrap around?
+	JC	22$.S			;No - really done
+	ANDL	EAX, #0FFFFFFh		;Yes - remove junk
+14$:	MOVL	ESI, SS:pdaSpndBlk#	;Do we have a wake block now?
+	TESTL	ESI, ESI
+	JE	16$.S			;No - go on
+	CLRL	EAX			;Yes
+	MOVL	SS:pdaSpndBlk#, EAX
+	TOFORK
+	CALL	knlWakeRemove#		;Get rid of it!
+	FROMFORK
+16$:	MOVL	EBX, #waitdone		;Get place to go when finished sleeping
+	CLRL	EDI
+	MOVW	DI, SS
+	TOFORK
+	CALL	knlWakeRequest#		;Enter wake request
+	JC	20$.S			;If error
+	MOVL	SS:pdaSpndBlk#, ESI	;OK - remember offset of wake block
+	FROMFORK
+18$:	TESTL	ESP, ESP		;Clear Z to indicate need to reschedule
+	RET
+
+20$:	FROMFORK
+	STC
+	RET
+
+;Here if do not need to wait any more
+
+22$:	CLRL	EAX			;Set Z to indicate not to reschedule
+	RET
+
+;Here in scheduler context at fork level when waiting time is up
+
+waitdone::
+	MOVL	ES, EDI			;Get PDA selector in right registers
+	CLRL	EAX
+	MOVL	ES:pdaSpndBlk#, EAX
+	CALL	knlRRequeue		;Requeue the process
+	CLC				;Return with C clear to indicate
+	RET				;  finished with the wake block
+.PAGE
+	.SBTTL	svcSchWaitProc - Wait for process to terminate
+
+;Here for the svcSchWaitProc SVC - Wait for process to terminate
+;	long process;		// Process ID of process to wait for
+;	long timeout;		// Time to suspend (fractional days, max of
+;				//   12 hours), 0xFFFFFFFF means to wait
+;				//   forever, 0 means to return immediately
+;	rtn = svcSchWaitProc(process, timeout);
+;  Value returned is 0 if normal or negative error code if error - note that
+;    the normal return is given if the process specified does not exist
+
+psvcSchWaitProc::
+	SVCENTR	CNTSchWaitProc#
+rsvcSchWaitProc::
+	MOVL	EBX, SS:pdaArg1#	;Get process ID
+	CALL	getproc			;Get PDA selector
+	JC	4$.S			;Give good return if no such process
+	CALL	chkkil2			;Can't wait for process we can't kill!
+	JC	6$.S			;If error
+	MOVL	EBP, #-4		;OK - set up timeout value
+	CALL	settimeout
+	JBE	6$.S			;If error or if should not wait
+waitproc:
+	MOVZWL	EAX, ES:pdaPid#		;Use process number as wait index
+	TOFORK
+	CALL	knlSetWait#
+	MOVB	AL, #knlQX_PROC#
+	JMP	rqwait			;Go wait
+
+;Here if bad process ID - just give normal return
+
+4$:	CLRL	EAX
+6$:	RET
+
+	END

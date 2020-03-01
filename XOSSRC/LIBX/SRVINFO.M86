@@ -1,0 +1,231 @@
+	.TITLE	SVRINFO - Function to get server info
+
+;++++
+; This software is in the public domain.  It may be freely copied and used
+; for whatever purpose you see fit, including commerical uses.  Anyone
+; modifying this software may claim ownership of the modifications, but not
+; the complete derived code.  It would be appreciated if the authors were
+; told what this software is being used for, but this is not a requirement.
+
+;   THIS SOFTWARE IS PROVIDED BY THE AUTHORS "AS IS" AND ANY EXPRESS OR
+;   IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
+;   OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+;   IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+;   INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+;   BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS
+;   OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+;   ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR
+;   TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
+;   USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+;----
+
+	.PROC	80386
+
+	.INCLUD	XOSINC:\XMAC\STDIO.PAR
+	.INCLUD	XOSINC:\XMAC\CTYPE.PAR
+	.INCLUD	XOSINC:\XMAC\XOS.PAR
+	.INCLUD	XOSINC:\XMAC\XOSERR.PAR
+	.INCLUD	XOSINC:\XMAC\XOSTIME.PAR
+
+	.STDSEGS
+
+
+
+;The SERVER.DEF file is a text file.  Each line specifies how to access a
+;  single server. The format of each line of the file is as follows:
+
+;	srvname device address
+
+;  Where:
+;	srvname = Formal name of server (MUST be all upper case)
+;	device  = Name of device to use to access server
+;	address = Address of server.  Exact format depends on the protocol
+;		    type as follows:
+;			IPM:			ipmname
+;						[seq.proc]
+;			UDP, TCP, or RCP:	[nn.nn.nn.nn]|port
+;						domainname|port
+
+;Format of the SERVERINFO structure:
+; typedef struct serverinfo
+; {   int  type
+;     struct
+;     {   int  port;
+;         char str[128];
+;     } data;
+; } SERVERINFO;
+
+info_type=!0t
+info_port=!4t
+info_str =!8t
+
+;Calling sequence:
+;	const char *servername;	// Formal server name (input)
+;	      char *devname;	// Device name (output - must be at least 18
+;				//   bytes long)
+;	      char *address;	// Address string (output - must be at least
+;				//   300 bytes long)
+;	int len = serverinfo(servername, devname, address);
+;  Value returned is the number of bytes stored in the info structure
+;    (positive) or a negative error code.
+
+arg_address=!24t
+arg_devname=!20t
+arg_srvname=!16t
+
+$$$=!0
+FRM si_userpnt, 4t
+FRM si_file   , 4t
+FRM si_srvname, 20t
+FRM si_bufr   , 80t
+
+si_SIZE=!$$$
+
+	.PSECT	_TEXT_p
+
+	.ENTRY	serverinfo
+
+serverinfo:
+	PUSHL	EDI
+	PUSHL	ESI
+	ENTER	si_SIZE, 0
+	LEAL	EDX, si_srvname.B[EBP]	;Copy the server name he gave us,
+	MOVL	EBX, arg_srvname.B[EBP]	;  converting to upper case
+	MOVL	ECX, #64t
+	CLRL	EAX
+2$:	MOVB	AL, [EBX]
+	CMPB	AL, #0
+	JE	8$.S
+	INCL	EBX
+	TESTB	_chrtbl#[EAX], #CT$SPACE
+	JNE	8$.S
+	CMPB	AL, #'a'
+	JB	4$.S
+	ADDB	AL, #'A'-'a'
+4$:	MOVB	[EDX], AL
+	INCL	EDX
+	LOOP	ECX, 2$
+	MOVL	EAX, #ER_NTLNG		;If server name is too long
+	JMP	24$
+
+;Here with the server name copied
+
+8$:	MOVB	[EDX], #0		;Put null at end of name
+	PUSHL	#sifmode		;Open the group definition file
+	PUSHL	#sifname
+	CALL	fopen#
+	ADDL	ESP, #8t.B
+	ORL	EAX, EAX
+	JE	30$			;Return error if not there
+	MOVL	si_file.B[EBP], EAX	;OK - store file handle
+silp:	PUSHL	si_file.B[EBP]		;Read a line
+	PUSHL	#80t.B
+	LEAL	EAX, si_bufr.B[EBP]
+	PUSHL	EAX
+	CALL	fgets#
+	ADDL	ESP, #12t.B
+	ORL	EAX, EAX
+	JE	26$			;If error (probably EOF)
+	LEAL	EBX, si_bufr.B[EBP]
+	LEAL	EDI, si_srvname.B[EBP]	;Compare the server name from the file
+	CLRL	EAX			;  with the name he gave us
+10$:	MOVB	AL, [EBX]
+	CMPB	AL, #0
+	JE	12$.S
+	CMPB	AL, #LF
+	JE	12$.S
+	INCL	EBX
+	TESTB	_chrtbl#[EAX], #CT$SPACE
+	JNE	12$.S
+	CMPB	[EDI], AL
+	JNE	silp.S
+	INCL	EDI
+	JMP	10$.S
+
+;Here at end of server name from the file
+
+12$:	CMPB	[EDI], #0		;End of the name he gave us?
+	JNE	silp.S			;No - continue looking
+	CALL	skipws			;Yes - skip possible extra whitespace
+	MOVL	EDI, arg_devname.B[EBP]	;This is it - copy the device name to
+	MOVL	ECX, #17t		;  his buffer
+14$:	MOVB	AL, [EBX]
+	CMPB	AL, #LF
+	JE	18$.S
+	CMPB	AL, #0
+	JE	18$.S
+	INCL	EBX
+	CMPB	AL, #':'
+	JE	18$.S
+	TESTB	_chrtbl#[EAX], #CT$SPACE
+	JNE	18$.S
+	MOVB	[EDI], AL
+	INCL	EDI
+	LOOP	ECX, 14$
+16$:	JMP	silp.S			;Ignore entry if name is too long!
+
+;Here at end of device name
+
+18$:	MOVW	[EDI], #':'		;Store : and null
+	CALL	skipws			;Skip possible extra whitespace
+	MOVL	EDI, arg_address.B[EBP]	;Copy the address to his buffer
+	MOVL	ECX, #299t
+20$:	MOVB	AL, [EBX]
+	CMPB	AL, #LF
+	JE	22$.S
+	CMPB	AL, #0
+	JE	22$.S
+	INCL	EBX
+	TESTB	_chrtbl#[EAX], #CT$SPACE
+	JNE	22$.S
+	MOVB	[EDI], AL
+	INCL	EDI
+	LOOP	ECX, 20$
+	JMP	18$.S			;Ignore entry if address is too long!
+
+;Here at end of address string
+
+22$:	MOVB	[EDI], #0		;Put a null at the end
+	PUSHL	si_file.B[EBP]
+	CALL	fclose#
+	MOVL	EAX, EDI		;Get length of address string
+	SUBL	EAX, arg_address.B[EBP]
+24$:	LEAVE
+	POPL	ESI
+	POPL	EDI
+ret004:	RET
+
+;Here if didn't find the server name in the server definition file - close the
+;  file and report bad name
+
+26$:	PUSHL	si_file.B[EBP]
+	CALL	fclose#
+	POPL	EAX
+	MOVL	EAX, #ER_NSSRV
+	JMP	24$.S
+
+;Here if error opening the server definition file
+
+30$:	MOVL	EAX, errno#
+	NEGL	EAX
+	JMP	24$.S
+
+sifname:.ASCIZ	"XOSCFG:SERVER.DEF"
+sifmode:.ASCIZ	"r"
+
+;Subroutine to skip whitespace
+;	c{EBX} = Pointer to input data
+;	CALL	skipws
+;	c{EBX} = Pointer to first non-whitespace character
+
+skipws:	MOVB	AL, [EBX]
+	CMPB	AL, #0
+	JE	ret004.S
+	CMPB	AL, #LF
+	JE	ret004.S
+	TESTB	_chrtbl#[EAX], #CT$SPACE
+	JE	ret004.S
+	INCL	EBX
+	JMP	skipws.S
+
+	.END

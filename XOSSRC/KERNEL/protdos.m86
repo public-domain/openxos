@@ -1,0 +1,978 @@
+	.TITLE	PROTDOS - Protected mode DOS extender routines for XOS
+
+;++++
+; This software is in the public domain.  It may be freely copied and used
+; for whatever purpose you see fit, including commerical uses.  Anyone
+; modifying this software may claim ownership of the modifications, but not
+; the complete derived code.  It would be appreciated if the authors were
+; told what this software is being used for, but this is not a requirement.
+
+;   THIS SOFTWARE IS PROVIDED BY THE AUTHORS "AS IS" AND ANY EXPRESS OR
+;   IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
+;   OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+;   IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+;   INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+;   BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS
+;   OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+;   ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR
+;   TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
+;   USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+;----
+
+	.PROC	80486
+	.INCLUD	XOSINC:\XMAC\XOS.PAR
+	.INCLUD	XOSINC:\XMAC\XOSX.PAR
+	.INCLUD	XOSINC:\XMAC\XOSXTRM.PAR
+	.INCLUD	XOSINC:\XMAC\XOSERR.PAR
+	.INCLUD	XOSINC:\XMAC\XOSDOS.PAR
+	.INCLUD	XOSINC:\XMAC\XOSDPMI.PAR
+	.INCLUD	PROT.INC
+
+	USERCODE
+
+;Default protected mode INT 21 handler
+
+	PROTINT	21
+
+pintv21:MOVZBL	EAX, dff_EAX+1.B[EBP]	;Get the function
+	CMPL	EAX, #I21MAX.B		;Valid function?
+	JAE	pilli21.S		;No
+	JMPIL	CS:int21tbl[EAX*4]	;Yes - dispatch on the function
+
+;Here for illegal DOS INT 21 function
+
+pilli21:MOVL	EAX, #ER_FUNC
+	JMP	doserr#
+
+;Here to return value of 0FFh in AL (standard CP/M error return)
+
+prtnFFh::
+	MOVB	dff_EAX+0.B[EBP], #0FFh
+pret02:	POPAL				;Restore general registers
+	CALLF	svcSchDismiss#		;Return to user
+
+;Here for illegal INT 21 function which should terminate the process
+
+pbadi21:MOVB	DL, #21h
+pbadint::
+	PUSHL	#TC_UNIMOP<24t
+pbadint2::
+	CLRL	EAX
+	PUSHL	EAX
+	PUSHL	EAX
+	PUSHL	EAX
+	PUSHL	dff_EIP.B[EBP]
+	PUSHL	dff_CS.B[EBP]
+	PUSHL	dff_EFR.B[EBP]
+38$:	MOVL	EAX, dff_EAX+0.B[EBP]	;Get AL and AH
+	XCHGB	AL, AH
+	SHLL	EAX, #16t
+	MOVB	AL, #0CDh		;Indicate INT
+	MOVB	AH, DL			;Get INT number
+	PUSHL	EAX
+	CALLF	svcSchKillX#		;Kill the process
+.PAGE
+	.SBTTL	INT 21 function 1A - Set disk transfer address
+
+;Here for INT 21 function 1A - Set disk transfer address
+;	c(AH)    = 1Ah
+;	c[DS:(E)DX] = Disk transfer area address
+;	INT	21h
+;	Nothing is returned!
+
+psetdtaa:
+	CMPB	dda_dpmitype, #DPMIT_32B ;Have a 32-bit client?
+	JE	2$.S			;Yes
+	MOVZWL	EDX, DX			;No - just use 16 bits
+2$:	MOVL	dxd_protdtaa+0, EDX	;Store offset
+	MOVL	EAX, dff_DS.B[EBP]	;Store selector
+	MOVL	dxd_protdtaa+4, EAX
+	JMP	10$.S
+
+	.SBTTL	INT 21 function 24 - Set random record number
+
+;Here for INT 21 function 24 - Set random record number
+;	c(AH)    = 24h
+;	c[DS:DX] = Address of FCB
+;	INT	21h
+;	Nothing is returned! (Random-record field in FCB is updated)
+
+pfcbstrrn:
+	JMP	pbadi21
+
+	.SBTTL	INT 21 - function 25 - Set interrupt vector
+
+;Here for INT 21 function 25 - Set interrupt vector
+;	c(AL)       = Interrupt vector number
+;	c(AH)       = 25h
+;	c[DS:{E}DX] = New contents for vector
+;	INT	21h
+;	Nothing is returned!
+
+pstintv:MOVL	ECX, #VT_HWT32<8t
+	MOVZBL	EAX, dff_EAX.B[EBP]
+	CMPB	dda_dpmitype, #DPMIT_32B ;Have a 32-bit client?
+	JE	6$.S			;Yes
+	MOVB	CH, #VT_HWT16		;No
+	MOVZWL	EDX, DX
+6$:	PUSHL	EAX			;Stack the vector number
+	PUSHL	ECX			;Stack the vector type
+	PUSHL	dff_DS.B[EBP]		;Stack his vector address selector
+	PUSHL	EDX			;Stack the offset
+	CALLF	svcSchSetVector#	;Set the vector
+	JMP	10$.S
+
+;Here for INT 21 function 2A - Get system date
+;	c(AH) = 2Ah
+;	INT	21h
+;	c(AL) = Day of week (0 = Sunday, 1 = Monday, etc.)
+;	c[CX] = Year (1980 through 2099)
+;	c(DL) = Day of month (1 through 31)
+;	c(DH) = Month (1 through 12)
+
+$$$=!0
+FRM tmx_isdst, 2t		;Daylight saving time flag
+FRM tmx_yday , 2t		;Day of year (0 - 365)
+FRM tmx_wday , 2t		;Day of week (0 - 6, 0 = Sunday)
+FRM tmx_year , 2t		;Year (1600 - )
+FRM tmx_mon  , 2t		;Month in year (1 - 12)
+FRM tmx_mday , 2t		;Day of month (1 - 31)
+FRM tmx_hour , 2t		;Hour (0 - 23)
+FRM tmx_min  , 2t		;Minute (0 - 59)
+FRM tmx_sec  , 2t		;Second (0 -59)
+FRM tmx_msec , 2t		;Milliseconds (0 - 999)
+FRM tmx_data , 0t
+tmx_SIZE=!$$$
+
+pgetdate:
+	SUBL	ESP, #tmx_SIZE.B
+	PUSHL	#2.B			;Get date and time from system
+	PUSHL	SS
+	LEAL	EAX, tmx_data.B[EBP]
+	PUSHL	EAX
+	CALLF	svcSysDateTime#
+	MOVZWL	EAX, tmx_year.B[EBP]	;Get year
+	SUBL	EAX, 1980t
+	MOVW	dff_ECX.B[EBP], AX
+	MOVB	AL, tmx_mon.B[EBP]	;Get month
+	MOVB	dff_EDX+1.B[EBP], AL
+	MOVB	AL, tmx_mday.B[EBP]	;Get day in month
+	MOVB	dff_EDX+0.B[EBP], AL
+	MOVB	AL, tmx_wday.B[EBP]	;Get day of week
+	MOVB	dff_EAX+0.B[EBP], AL
+	ANDB	dff_EFR.B[EBP], #~01h	;Clear his C bit
+8$:	MOVL	ESP, EBP
+10$:	POPAL				;Restore general registers
+	CALLF	svcSchDismiss#		;Return to user
+
+;Here for INT 21 function 2C - Get system time
+;	c(AH) = 2Ch
+;	INT	21h
+;	c(CH) = Hours (0 - 23)
+;	c(CL) = Minutes (0 - 59)
+;	c(DH) = Seconds (0 - 59)
+;	c(DL) = Hundredths of seconds (0 - 99)
+
+pgettime:
+	SUBL	ESP, #tmx_SIZE.B
+	PUSHL	#2.B			;Get date and time from system
+	PUSHL	SS
+	LEAL	EAX, tmx_data.B[EBP]
+	PUSHL	EAX
+	CALLF	svcSysDateTime#
+	MOVB	AL, tmx_hour.B[EBP]	;Get hour
+	MOVB	dff_ECX+1.B[EBP], AL
+	MOVB	AL, tmx_min.B[EBP]	;Get minute
+	MOVB	dff_ECX+0.B[EBP], AL
+	MOVB	AL, tmx_sec.B[EBP]	;Get second
+	MOVB	dff_EDX+1.B[EBP], AL
+	MOVW	AX, tmx_wday.B[EBP]	;Get milliseconds
+	MOVB	CL, #10t		;Change to 1/100 seconds
+	DIVB	CL
+	MOVB	dff_EDX+0.B[EBP], AL
+	JMP	8$.S
+
+	.SBTTL	INT 21 function 2E - Set verify flag
+
+;Here for INT 21 function 2E - Set verify flag
+;	c(AL) = Value for verify flag:
+;		  0 = Off
+;		  1 = On
+;	c(AH) = 2Eh
+;	INT	21h
+;	Nothing is returned!
+;  In the current version of XOS, read-after-write verification is not
+;    supported, so this function does nothing!
+
+psetvrfy:
+	JMP	pbadi21
+.PAGE
+	.SBTTL	INT 21 function 2F - Get disk transfer address
+
+;Here for INT 21 function 2F - Get disk transfer address
+;	c(AH) = 2Fh
+;	INT	21h
+;	c[ES:BX] = Address of disk transfer area
+
+pgetdtaa:
+	MOVL	EAX, dxd_protdtaa+4	;Give him the selector
+	MOVL	dff_ES.B[EBP], EAX
+	MOVL	EAX, dxd_protdtaa+0	;Get offset
+	CMPB	dda_dpmitype, #DPMIT_32B ;Have a 32-bit client?
+	JE	6$.S			;Yes
+	MOVW	dff_EBX.B[EBP], AX	;No - just give him 16 bits
+	JMP	8$.S
+
+6$:	MOVL	dff_EBX.B[EBP], EAX	;Give him 32 bits
+8$:	ANDB	dff_EFR.B[EBP], #~01h	;Clear his C bit
+	MOVL	ESP, EBP
+10$:	POPAL				;Restore general registers
+	CALLF	svcSchDismiss#		;Return to user
+
+	.SBTTL	INT 21 function 30 - Get system version number
+
+;Here for INT 21 function 30 - Get system version number
+;	c(AH) = 30h
+;	INT	21h
+;	c(AL) = Major DOS version number
+;	c(AH) = Minor DOS version number
+;	c[BX] = 0
+;	c[CX] = 0
+
+pgtversn:
+	CLRL	EAX
+	MOVB	AH, #DOSMINV#
+	MOVB	AL, #DOSMAJV#
+	MOVL	dff_EAX.B[EBP], EAX
+	CLRL	EAX
+	MOVW	dff_EBX.B[EBP], AX
+	MOVW	dff_ECX.B[EBP], AX
+	JMP	10$.S
+
+	.SBTTL	INT 21 function 32 - Terminate and stay resident
+
+;Here for INT 21 function 32 - Terminate and stay resident
+;	c(AL) = Return code
+;	c(AH) = 32h
+;	c[DX] = Number of paragraphs of memory to keep
+;	INT	21h
+;	Never returns!
+
+ptermsr:
+	JMP	pbadi21
+
+	.SBTTL	INT 21 function 33 - Get or set ctrl-break flag
+
+;Here for INT 21 function 33 - Get or set ctrl-break flag
+;	c(AL) = Function:
+;		  0 = Get current value
+;		  1 = Set value
+;	c(AH) = 33h
+;	c(DL) = New value for ctrl-break flag if c(AL) = 1:
+;		  0 = Off
+;		  1 = On
+;	INT	21h
+;	If c(AL) = 0 on call, c(DL) = Current value of ctrl-break flag
+;	If c(AL) = 1 on call, nothing is returned
+
+pctlbrk:
+	MOVB	AL, dff_EAX+0.B[EBP]	;Get sub-function
+	CMPB	AL, #1
+	JA	pbadi21			;Fail if illegal
+	JE	10$.S			;Do nothing if trying to change value
+	MOVB	dff_EDX+0.B[EBP], #1	;For now, always say enabled!!
+	JMP	10$.S
+.PAGE
+	.SBTTL	INT 21 function 34 - Get address of the InDOS flag
+
+;Here for INT 21 function 34 - Get address of the InDOS flag
+;	c(AH) = 34h
+;	INT	21h
+;	c{ES:EBX} = Address of the InDOS flag (note that since XOS does not
+;		      use (or need) the InDOS flag, this points to a byte
+;		      which is always 0).  This value is in the correct place
+;		      in the DOS swappable data area.
+
+pgtindos:
+	MOVL	dff_ES.B[EBP], #GS_VDOSDATA
+	MOVL	dff_EBX.B[EBP], #dda_critsecf-dda_base
+	ANDB	dff_EFR.B[EBP], #~01h	;Clear his C bit
+	POPAL				;Restore general registers
+	CALLF	svcSchDismiss#		;Return to user
+
+	.SBTTL	INT 21 - function 35 - Get interrupt vector
+
+;Here for INT 21 function 35 - Get interrupt vector
+;	c(AL) = Interrupt vector number
+;	c(AH) = 35h
+;	INT	21h
+;	c[ES:(E)BX] = Interrupt vector contents
+
+$$$=!0
+FRM vect_value, 8t
+vect_SIZE=!$$$
+
+pgtintv:SUBL	ESP, #vect_SIZE.B	;Allocate stack space
+	MOVZBL	EAX, dff_EAX+0.B[EBP]	;Get exception number
+	PUSHL	EAX
+	PUSHL	SS
+	LEAL	EAX, vect_value.B[EBP]
+	PUSHL	EAX
+	CALLF	svcSchGetVector#	;Get current vector contents
+	TESTL	EAX, EAX
+	JNS	2$.S
+	CLRL	EAX
+	MOVL	vect_value+0.B[EBP], EAX
+	MOVL	vect_value+4.B[EBP], EAX
+2$:	MOVL	EAX, vect_value+0.B[EBP] ;Give the caller the value
+	CMPB	dda_dpmitype, #DPMIT_32B
+	JE	4$.S
+	MOVW	dff_EBX.B[EBP], AX
+	JMP	6$.S
+
+4$:	MOVL	dff_EBX.B[EBP], EAX
+6$:	MOVL	EAX, vect_value+4.B[EBP]
+	MOVW	dff_ES.B[EBP], AX
+	MOVL	ESP, EBP
+	POPAL				;Restore general registers
+	CALLF	svcSchDismiss#		;Return to user
+.PAGE
+	.SBTTL	INT 21 function 37 - Get or set switch character
+
+;Here for INT 21 function 37 - Get or set switch character and device name
+;  handling
+;	c(AL) = Sub-function
+;		  0 = Get current switch character
+;		  1 = Set switch character
+;		  2 = Get device name format:
+;			=0 = Device names only valid in /DEV/
+;			#0 = Device names valid in any directory
+;		  3 = Get device name format (see above)
+;	c(AH) = 37h
+;	c(DL) = Data (if c(AL) = 1 or 3)
+;	INT	21h
+;	c(AL) = 0FFh if error, unchanged if OK
+;	c(DL) = Data (if no error and c(AL) = 0 or 2)
+
+pswchar:MOVZBL	EAX, dff_EAX.B[EBP]	;Get sub-function
+	CMPL	EAX, #3			;Valid?
+	JA	prtnFFh			;No
+	CLC				;Yes
+	JMPIL	CS:swchardsp[EAX*4]	;Dispatch on sub-function
+
+;Switch character sub-function dispatch table
+
+	.MOD	4
+swchardsp:
+	.LONG	gtswchar	; 0 - Get switch character
+	.LONG	stswchar	; 1 - Set switch character
+	.LONG	gtdevnmf	; 2 - Get device name format
+	.LONG	stdevnmf	; 3 - Set device name format
+
+;Here for INT 21 function 37 sub-function 0 - get switch character
+
+gtswchar:
+	MOVB	AL, dxd_switchchr	;Get current switch character
+	JMP	4$.S
+
+;Here for INT 21 function 37 sub-function 1 - set switch character
+
+stswchar:
+	MOVB	AL, dff_EDX+0.B[EBP]	;Get new switch character
+	MOVB	dxd_switchchr, AL	;Store it
+	JMP	10$.S
+
+;Here for INT 21 function 37 sub-function 2 - get device name format
+
+gtdevnmf:
+	MOVB	AL, #1			;For now, we can't change this!
+4$:	MOVB	dff_EDX+0.B[EBP], AL
+
+;Here for INT 21 function 37 sub-function 1 - set device name format
+
+stdevnmf:
+10$:	POPAL				;Restore general registers
+	CALLF	svcSchDismiss#		;Return to user
+.PAGE
+	.SBTTL	INT 21 function 48 - Allocate memory block
+
+;Here for INT 21 function 48 - Allocate memory block
+;	c(AH)    = 48h
+;	c[{E}BX] = Size of block to allocate (paragraphs)
+;	INT	21h
+;	C:set = Error
+;	  c[AX] = Error code
+;	C:clr = Normal
+;	  c[AX] = Selector for block allocated
+
+pallocm:MOVL	EBX, dff_EBX.B[EBP]
+	CMPB	dda_dpmitype, #DPMIT_32B
+	JE	2$.S
+	MOVZWL	EBX, BX
+2$:	ADDL	EBX, #0FFh		;Change to number of pages to allocate
+	SHRL	EBX, #8t
+	PUSHL	#0.B
+	PUSHL	EBX
+	PUSHL	#PG$READ|PG$WRITE	;Get normal read/write pages
+	PUSHL	dda_dpminum
+	CALLF	svcMemBlkAlloc#
+	TESTL	EAX, EAX
+	JS	6$.S			;If error
+	CLRL	EDX
+	MOVL	ECX, EBX
+	SHLL	ECX, #12t
+	CLRL	EBX
+	MOVL	EDI, #0FFFFFFFFh
+	PUSHL	EAX			;Save page number in case error
+	SHLL	EAX, #12t
+	MOVL	ESI, EAX
+	CALL	dpmisetupsegs#		;Set up the selectors
+	JC	6$.S
+	POPL	EDX
+	MOVW	dff_EAX.B[EBP], BX	;Give him the first selector
+	ANDB	dff_EFR.B[EBP], #~01h	;Clear his C bit
+	POPAL				;Restore general registers
+	CALLF	svcSchDismiss#		;Return to user
+
+;Here if error allocating or setting up the descriptor(s)
+
+4$:	PUSHL	EAX			;Save error code
+	PUSHL	EDX			;Give up the memory we just got
+	PUSHL	#0.B
+	PUSHL	#0.B
+	PUSHL	dda_dpminum
+	CALLF	svcMemBlkChange#
+	POPL	EAX			;Restore error code
+6$:	JMP	doserr			;Fail
+.PAGE
+	.SBTTL	INT 21 function 49 - Release memory block
+
+;Here for INT 21 function 48 - Release memory block
+;	c(AH) = 49h
+;	c[ES] = Selector for block
+;	INT	21h
+;	C:set = Error
+;	  c[AX] = Error code
+;	C:clr = Normal
+
+prelsm:	CLRL	EBX
+
+	.SBTTL	INT 21 function 4A - Resize memory block
+
+;Here for INT 21 function 4A - Resize memory block
+;	c(AH)    = 4Ah
+;	c[(E)BX] = New size for block (paragraphs)
+;	c[ES]    = Selector for block
+;	INT	21h
+;	C:set = Error
+;	  c[AX]    = Error code
+;	  c[(E)BX] = Maximum block size available
+;	C:clr = Normal
+
+$$$=!0
+FRM rmb_sel, 8t
+rmb_SIZE=!$$$
+
+pmodm:	SUBL	ESP, #rmb_SIZE.B
+	MOVL	EBX, dff_EBX.B[EBP]
+	CMPB	dda_dpmitype, #DPMIT_32B
+	JE	2$.S
+	MOVZWL	EBX, BX
+2$:	ADDL	EBX, #0FFh		;Change to number of pages to allocate
+	SHRL	EBX, #8t
+	PUSHL	dff_ES.B[EBP]		;Get selector
+	PUSHL	SS			;Read the corresponding descriptor
+	LEAL	EAX, rmb_sel.B[EBP]
+	PUSHL	EAX
+	CALLF	svcMemDescRead#
+	TESTL	EAX, EAX
+	JS	4$.S			;If error
+	MOVB	AL, rmb_sel+st_base+2.B[EBP] ;Get the segment base
+	MOVB	AH, rmb_sel+st_baseh.B[EBP]
+	SHLL	EAX, #16t
+	MOVW	AX, rmb_sel+st_base.B[EBP]
+
+	MOVL	ESP, EBP
+
+	MOVL	EDI, EAX
+	SHRL	EDI, #12t		;Change to linear address page number
+	PUSHL	EDI			;Get the current size of the memory
+	PUSHL	#-1.B			;  block
+	PUSHL	#0.B
+	PUSHL	dda_dpminum
+	CALLF	svcMemBlkChange#
+	TESTL	EAX, EAX
+	JS	10$.S
+	MOVL	EDX, EAX		;Save current size
+	PUSHL	EDI			;Change the size of the block
+	PUSHL	EBX
+	PUSHL	#PG$READ|PG$WRITE	;Get normal read/write pages if
+	PUSHL	dda_dpminum		;  increasing
+	CALLF	svcMemBlkChange#
+	TESTL	EAX, EAX
+4$:	JS	10$.S			;If error
+	MOVL	ECX, EAX		;Get new size
+	SHLL	ECX, #12t		;Change to number of bytes
+	SHLL	EDX, #12t		;Change old size to bytes too
+	MOVZWL	EBX, dff_ES.B[EBP]	;Get the base selector
+	PUSHL	ECX			;Save new size in bytes
+	PUSHL	EDX			;Save old size in bytes
+	SHLL	EDI, #12t		;Get linear address
+	SHLL	EAX, #12t
+	MOVL	ESI, EAX
+	CALL	dpmisetupsegs#		;Set up the selectors
+	POPL	EDX			;Restore old and new size (only needed
+	POPL	ECX			;  if error)
+	JC	8$.S			;If error
+	CMPB	dff_EAX+1.B[EBP], #49h	;Release memory function?
+	JE	6$.S			;Yes - don't return anything!
+	MOVW	dff_EAX.B[EBP], BX	;No - give him the first selector
+	JMP	7$.S
+
+;Here if releasing a memory block
+
+6$:	CLRL	EAX			;Clear his ES register (which points to
+	MOVL	dff_ES.B[EBP], EAX	;  the segment we just gave up!)
+7$:	ANDB	dff_EFR.B[EBP], #~01h	;Clear his C bit
+	MOVL	ESP, EBP
+	POPAL				;Restore general registers
+	CALLF	svcSchDismiss#		;Return to user
+
+;Here if error allocating or setting up the selectors
+
+8$:	CMPL	ECX, EDX		;Did we increase the memory size?
+	JBE	10$.S			;No
+	PUSHL	EAX			;Yes - save the error code
+	PUSHL	ESI			;Cut back to the original amount
+	PUSHL	EDX
+	PUSHL	#0.B
+	PUSHL	dda_dpminum
+	CALLF	svcMemBlkChange#
+	POPL	EAX
+10$:	JMP	doserr
+.PAGE
+	.SBTTL	INT 21 function 4B - Execute program
+
+;Here for INT 21 function 4B - Execute program
+;	c(AL) = Function:
+;		  0 = Load and execute program
+;		  1 = Load program but do not execute
+;		  3 = Load overlay
+;	c(AH) = 4Bh
+;	c[ES:BX] = Address of parameter block
+;	c[DS:DX] = Address of name of program to run
+;	INT	21h
+;	C:set = Error
+;	  c[AX] = Error code
+;	C:clr = Normal
+;	  Nothing is returned (unlike under some version of DOS, all registers
+;	    ARE preserved!)
+
+;Format of the parameter block for real mode and 16-bit protected mode:
+;	Offset Size    Use
+;	   0    2    Segment pointer to environment block
+;	   2    4    Address of command tail
+;	   6    4    Address of first FCB
+;	  10    4    Address of second FCB
+
+$$$=!0
+FRM px_regs, 32h
+FRM        , 2t
+px_SIZE=!$$$
+
+pexec:	SUBL	ESP, #px_SIZE.B
+	PUSHL	#24h.B			;Disable emulated interrupts (they will
+	CALLF	svcSchSetLevel#		;  be re-enabled before the new program
+	ANDB	dff_EFR+1.B[EBP], #~02h	;  runs and disabled again before
+	TESTB	AL, #04h		;  returning to us)
+	JNE	2$.S
+	ORB	dff_EFR+1.B[EBP], #02h
+2$:	PUSHL	dda_dpmilckpsflg	;Save the stack state
+	PUSHL	dda_dpmilckpESP
+	PUSHL	dda_dpmilckpSS
+	MOVL	EAX, ESP
+	SUBL	EAX, #dff_arg+cr_SIZE#.B
+	MOVL	dda_dpmilckpESP, EAX
+	MOVB	dda_dpmilckpsflg, #0
+	MOVL	EAX, dff_EAX.B[EBP]
+	MOVL	px_regs+rds_EAX.B[EBP], EAX
+	MOVL	EAX, dff_EDX.B[EBP]
+	MOVL	px_regs+rds_EDX.B[EBP], EAX
+	MOVL	EAX, dff_EBX.B[EBP]
+	MOVL	px_regs+rds_EBX.B[EBP], EAX
+	MOVL	EAX, dff_DS.B[EBP]
+	MOVW	px_regs+rds_DS.B[EBP], AX
+	MOVL	EAX, dff_ES.B[EBP]
+	MOVW	px_regs+rds_ES.B[EBP], AX
+	CLRL	EAX
+	MOVL	px_regs+rds_SP.B[EBP], EAX
+	MOVL	px_regs+rds_FS.B[EBP], EAX
+	MOVW	px_regs+rds_FR.B[EBP], AX
+	LEAL	EDI, px_regs.B[EBP]
+	PUSHL	SS
+	POPL	ES
+	MOVB	dda_protaddr, #1	;Indicate have protected mode addresses
+	MOVW	AX, #0300h
+	MOVW	BX, #0021h
+	CLRL	ECX
+	INT	31h
+	JC	8$.S			;If error!
+	PUSHL	#24h.B			;Since the EXEC always enables leaves
+	CALLF	svcSchSetLevel#		;  interrupts enabled, we must disable
+					;  them again here
+	POPL	dda_dpmilckpSS		;Restore the stack state
+	POPL	dda_dpmilckpESP
+	POPL	dda_dpmilckpsflg
+	PUSHL	#44h.B			;Enable interrupts now
+	CALLF	svcSchSetLevel#
+	TESTB	px_regs+rds_FR.B[EBP], #01h ;Error?
+	JNE	6$.S			;Yes
+	ANDB	dff_EFR.B[EBP], #~01h	;Clear his C bit
+4$:	MOVL	ESP, EBP
+	POPAL				;Restore general registers
+	CALLF	svcSchDismiss#		;Return to user
+
+;Here if error indicated on the INT 21 function 4B0x
+
+6$:	PUSHL	#44h.B			;Enable interrupts now
+	CALLF	svcSchSetLevel#
+	MOVL	EAX, px_regs+rds_EAX.B[EBP] ;Give him the error code
+	MOVW	dff_EAX.B[EBP], AX
+	ORB	dff_EFR.B[EBP], #01h	;Set his C bit
+	JMP	4$.S
+
+;Here if error indicated on the INT 31 function 0300
+
+8$:	HLT
+.PAGE
+	.SBTTL	INT 21 function 4C - Terminate with return code
+
+;Here for INT 21 function 4C - Terminate with return code
+;	c(AL) = Return code
+;	c(AH) = 4Ch
+;	INT	21h
+;	Does not return!
+
+ptermc:	PUSHL	#08h.B			;No signals now
+	CALLF	svcSchSetLevel#
+	CALL	dpmiterm#		;Terminate the DPMI client
+	MOVB	dda_dpmilckpsflg, #1	;Indicate using locked stack
+	JMP	utermc#			;Terminate the DOS task
+.PAGE
+	.SBTTL	INT 21 function 50 - Set selector for current PSP
+
+;Here for INT 21 function 50 - Set selector for current PSP
+;	c(AH) = 51h or 62h
+;	c[BX] = Selector for new PSP
+;	INT	21h
+;  Nothing is returned!
+
+$$$=!0
+FRM gsb_sel, 8t
+gsb_SIZE=!$$$
+
+psetpsp:SUBL	ESP, #gsb_SIZE.B
+	MOVL	EAX, ESP
+	PUSHL	dff_EBX.B[EBP]
+	PUSHL	SS
+	PUSHL	EAX
+	CALLF	svcMemDescRead#
+	MOVB	DH, st_baseh.B[ESP]
+	MOVB	DL, st_base+2.B[ESP]
+	SHLL	EDX, #16t
+	MOVW	DX, st_base+0.B[ESP]		
+	ADDL	ESP, #8.B
+	TESTL	EAX, EAX
+	JS	4$.S
+	TESTB	DL, #0Fh		;Is this an even paragraph address?
+	JNE	4$.S			;No - fail
+	SHRL	EDX, #4t		;Yes - change it to a paragraph number
+	MOVL	dda_curpsp, EDX		;Set this as the current PSP
+4$:	MOVL	ESP, EBP
+6$:	POPAL				;Restore general registers
+	CALLF	svcSchDismiss#		;Return to user
+
+	.SBTTL	INT 21 functions 51 and 62 - Get selector for current PSP
+
+;Here for INT 21 functions 51 and 62 - Get selector for current PSP
+;	c(AH) = 51h or 62h
+;	INT	21h
+;	c[BX] = Selector for current PSP
+
+;NOTE:	WE REALLY SHOULD NOT USE THE SEGMENT TO DESCRIPTOR ROUTINE HERE! WE
+;	SHOULD DO ABOUT THE SAME THING BUT ONLY ALLOCATE A 256 BYTE SEGMENT!
+;	WE SHOULD ALSO GIVE UP THIS DESCRIPTOR IF THE DOS TASK TERMINATES
+;	WITHOUT TERMINATING THE DPMI CLIENT!!
+
+pgetpsp:MOVZWL	EDX, dda_curpsp		;Get real-mode segment address for PSP
+	CALL	mapreals#		;Get a corresponding selector
+	JNC	8$.S			;If OK
+	CLRL	EAX			;Error - just give him 0!
+8$:	MOVW	dff_EBX.B[EBP], AX	;OK - give him the selector
+	JMP	6$.S
+
+	.SBTTL	INT 21 function 54 - Get verify flag
+
+;Here for INT 21 function 54 - Get verify flag
+;	c(AH) = 54h
+;	INT	21h
+;	c(AL) = Current value of verify flag:
+;		  0 = Off
+;		  1 = On
+;  Always returns a value of 0!
+
+pgtvflg:
+	JMP	pbadi21
+
+	.SBTTL	INT 21 function 58 - Get or set allocation strategy
+
+;Here for INT 21 function 58 - Get or set allocation strategy
+;	c(AL) = Sub-function:
+;		  0 = Get current value
+;		  1 = Set value
+;	c(AH) = 58h
+;	INT	21h
+;	C:set = Error
+;	  c[AX] = Error code
+;	C:clr = Normal
+;	  If c(AL) = 0 on call: c[AX] = Current value
+;	  If c(AL) = 1 on call: Nothing is returned!
+
+pallocs:
+	JMP	pbadi21
+.PAGE
+	.SBTTL	INT 21 function 5D - Server functions
+
+;Here for INT 21 function 5D - Server functions.  We do not currently implement
+;  any of the server functions, but we do support the "get address of DOS
+;  swappable data area" function, which is stuck in the middle of the server
+;  functions!
+;	c(AL) = Sub-function
+;	c(AH) = 5Dh
+;	INT	21h
+;	C:set = Error
+;	  c[AX] = Error code
+;	C:clr = Normal
+;	  Other values returned depent on sub-function
+
+psrvfunc:
+	MOVZBL	EAX, dff_EAX+0.B[EBP]	;Get sub-function
+	CMPB	AL, #0Bh		;Valid?
+	JA	pbadi21			;No
+	JMPIL	CS:srvfdsp[EAX*4]	;Yes - dispatch on the function
+
+	.MOD	4
+srvfdsp:.LONG	pbadi21		;00 - Server function call
+	.LONG	pbadi21		;01 - COmmit all files
+	.LONG	pbadi21		;02 - Close file by name
+	.LONG	pbadi21		;03 - Close all files for given computer
+	.LONG	pbadi21		;04 - Close all files for given process
+	.LONG	pbadi21		;05 - Get open file list entry
+	.LONG	getsda3		;06 - Get address of DOS swappable data area
+	.LONG	pbadi21		;07 - Get redirected printer mode
+	.LONG	pbadi21		;08 - Set redirected printer mode
+	.LONG	pbadi21		;09 - Flush redirected printer output
+	.LONG	pbadi21		;0A - Set extended error information
+	.LONG	getsda4		;0B - Get DOS swappable data areas (DOS 4+)
+
+;Here for function 06 - return address of DOS swappable data area (DOS version
+;  3)
+
+getsda3:
+	MOVL	dff_ECX.B[EBP], #20h
+	CLRL	EAX
+	MOVL	dff_EDX.B[EBP], EAX
+	MOVL	dff_ESI.B[EBP], #dda_swaparea-dda_base
+	JMP	4$.S
+
+;Here for function 0B - return address of DOS swappable data area (DOS version
+;  4+)
+
+getsda4:MOVL	dff_ESI.B[EBP], #dda_slstp-dda_base
+	CLC
+4$:	MOVL	dff_DS.B[EBP], #GS_VDOSDATA
+8$:	ANDB	dff_EFR.B[EBP], #~01h	;Clear his C bit
+	POPAL				;Restore general registers
+	CALLF	svcSchDismiss#		;Return to user
+.PAGE
+	.SBTTL	INT 21 function 59 - Get extended error information
+
+;Here for INT 21 function 59 - Get extended error information
+;	c(AH) = 59h
+;	c[BX] = Version (should be 0 now)
+;	INT	21h
+;	c[AX] = Extended error code
+;	c(BL) = Recommended action
+;	c(BH) = Error class
+;	c(CH) = Error locus
+
+pgtxerr:MOVL	EAX, dxd_lasterr
+	MOVB	dff_EAX+0.B[EBP], AL
+	MOVB	dff_EAX+1.B[EBP], #0
+	MOVB	dff_EBX+1.B[EBP], AH
+	SHRL	EAX, #16t
+	MOVB	dff_EBX+0.B[EBP], AL
+	MOVB	dff_ECX+1.B[EBP], AH
+	POPAL				;Restore general registers
+	CALLF	svcSchDismiss#		;Return to user
+
+	.SBTTL	INT 21 function 66 - Get or set code page
+
+;Here for INT 21 function 66 - Get or set code page
+;	c(AL) = 1 - Get global code page table
+;	      = 2 - Set global code page table
+;		     extended value from c[BX]
+;	c(AH) = 66h
+;	c[BX] = Code page (if c(AL) = 2)
+;	INT	21h
+;	C:set = Error
+;	  c[AX] = Error code
+;	C:clr = Normal
+;	  c[BX] = Active code page
+;	  c[DX] = Default code page
+
+;THIS CODE NEEDS TO BE UPDATED TO PROVIDE FULL COUNTRY SUPPORT!!!!!
+
+pcodepage:
+	CMPB	dff_EAX+0.B[EBP], #2	;Want to change it?
+	JB	4$.S			;No
+	CMPW	dff_EBX.B[EBP], #437h	;Yes - is it the right value?
+	JE	6$.S			;Yes - just return quietly
+	MOVL	EAX, #ER_FILNF		;No - fail!
+	JMP	doserr#
+
+;Here to return current values
+
+4$:	MOVW	dff_EBX.B[EBP], #437h
+	MOVW	dff_EDX.B[EBP], #437h
+6$:	ANDB	dff_EFR.B[EBP], #~01h	;Clear his C bit
+	POPAL				;Restore general registers
+	CALLF	svcSchDismiss#		;Return to user
+.PAGE
+	.SBTTL	INT 21 function 65 - Get extended country information
+
+;Here for INT 21 function 65 - Get extended country information
+
+pextcountry:
+	MOVL	EAX, #ER_FILNF
+	JMP	doserr#
+.PAGE
+
+;Dispatch table for INT 21 functions
+
+	.MOD	4
+int21tbl:
+	.LONG	pbadi21		; 00 - Program terminate (old style)
+	.LONG	ucinput#	; 01 - Character input with echo
+	.LONG	ucoutput#	; 02 - Character output
+	.LONG	uainput#	; 03 - Auxiliary input
+	.LONG	uaoutput#	; 04 - Auxiliary output
+	.LONG	upoutput#	; 05 - Printer output
+	.LONG	uconio#		; 06 - Direct console IO
+	.LONG	uicinne#	; 07 - Image character input without echo
+	.LONG	ucinne#		; 08 - Character input without echo
+	.LONG	uoutstr#	; 09 - Output character string
+	.LONG	ubinput#	; 0A - Buffered input
+	.LONG	ugtists#	; 0B - Get input status
+	.LONG	ucincta#	; 0C - Clear type-ahead and input character
+	.LONG	pret02		; 0D - Disk reset
+	.LONG	useldisk#	; 0E - Set default disk drive
+	.LONG	ufcbopen#	; 0F - Open file using FCB
+	.LONG	ufcbclose#	; 10 - Close file using FCB
+	.LONG	ufcbsffm#	; 11 - Search for first match using FCB
+	.LONG	ufcbsfnm#	; 12 - Search for next match using FCB
+	.LONG	ufcbdel#	; 13 - Delete file using FCB
+	.LONG	ufcbsread#	; 14 - Sequential read using FCB
+	.LONG	ufcbswrite#	; 15 - Sequential write using FCB
+	.LONG	ufcbcreate#	; 16 - Create or truncate file using FCB
+	.LONG	ufcbrename#	; 17 - Rename file using FCB
+	.LONG	pret02		; 18 - No-op
+	.LONG	ugtdftd#	; 19 - Get default disk drive
+	.LONG	psetdtaa	; 1A - Set disk transfer address
+	.LONG	ugtalcid#	; 1B - Get allocation information for default
+				;	 disk
+	.LONG	ugtalcia#	; 1C - Get allocation information for any disk
+	.LONG	pret02		; 1D - No-op
+	.LONG	pret02		; 1E - No-op
+	.LONG	pbadi21 	; 1F - Get default drive parameter block
+	.LONG	pret02		; 20 - No-op
+	.LONG	ufcbrread#	; 21 - Random read using FCB
+	.LONG	ufcbrwrite#	; 22 - Random write using FCB
+	.LONG	ufcbgtfsz#	; 23 - Get file size using FCB
+	.LONG	pfcbstrrn	; 24 - Set random record number
+	.LONG	pstintv		; 25 - Set interrupt vector
+	.LONG	pbadi21		; 26 - Create program segment prefix
+	.LONG	ufcbmread#	; 27 - Multiple record random read using FCB
+	.LONG	ufcbmwrite#	; 28 - Multiple record random write using FCB
+	.LONG	uparse#		; 29 - Parse filename
+	.LONG	pgetdate 	; 2A - Get system date
+	.LONG	prtnFFh		; 2B - Set system date
+	.LONG	pgettime 	; 2C - Get system time
+	.LONG	prtnFFh		; 2D - Set system time
+	.LONG	psetvrfy 	; 2E - Set verify flag
+	.LONG	pgetdtaa	; 2F - Get disk transfer address
+	.LONG	pgtversn 	; 30 - Get system version number
+	.LONG	ptermsr		; 31 - Terminate and stay resident
+	.LONG	pbadi21		; 32 - Get drive parameter block
+	.LONG	pctlbrk		; 33 - Get or set ctrl-break flag
+	.LONG	pgtindos 	; 34 - Return critical section flag pointer
+	.LONG	pgtintv		; 35 - Get interrupt vector
+	.LONG	ugtfdsks#	; 36 - Get free disk space
+	.LONG	pswchar		; 37 - Get/set switch character/device names
+	.LONG	ucountry# 	; 38 - Get or set country
+	.LONG	umkdir#		; 39 - Create directory
+	.LONG	urmdir#		; 3A - Remove directory
+	.LONG	ustcdir#	; 3B - Set current directory
+	.LONG	ucreate#	; 3C - Create or truncate file
+	.LONG	uopen#		; 3D - Open file
+	.LONG	uclose#		; 3E - Close file
+	.LONG	uread#		; 3F - Read file
+	.LONG	uwrite#		; 40 - Write file
+	.LONG	udelete#	; 41 - Delete file
+	.LONG	usetpos#	; 42 - Set file position
+	.LONG	ufattr#		; 43 - Get or set file attributes
+	.LONG	uioctl#		; 44 - Device driver control
+	.LONG	uduphndl#	; 45 - Duplicate handle
+	.LONG	ufdphndl#	; 46 - Force duplicate of handle
+	.LONG	ugtcdir#	; 47 - Get current directory
+	.LONG	pallocm		; 48 - Allocate memory
+	.LONG	prelsm		; 49 - Release memory
+	.LONG	pmodm		; 4A - Modify memory allocation
+	.LONG	pexec		; 4B - Execute program
+	.LONG	ptermc		; 4C - Terminate with return code
+	.LONG	ugtrtnc#	; 4D - Get return code
+	.LONG	usffm#		; 4E - Search for first match
+	.LONG	usfnm#		; 4F - Search for next match
+	.LONG	psetpsp		; 50 - Set PSP segment
+	.LONG	pgetpsp		; 51 - Get PSP segment
+	.LONG	pbadi21		; 52 - Get list of lists
+	.LONG	pbadi21		; 53 - Translate BIOS parameter block
+	.LONG	pgtvflg		; 54 - Get verify flag
+	.LONG	umakechild#	; 55 - Create DOS child process
+	.LONG	urename#	; 56 - Rename file
+	.LONG	ufdttm#		; 57 - Get or set file date and time
+	.LONG	pallocs		; 58 - Get or set allocation strategy
+	.LONG	pgtxerr		; 59 - Get extended error information
+	.LONG	ucrtemp#	; 5A - Create temporary file
+	.LONG	ucrnew#		; 5B - Create new file
+	.LONG	urlock#		; 5C - Record locking
+	.LONG	psrvfunc	; 5D - Server function call
+	.LONG	pilli21		; 5E - Network call
+	.LONG	pilli21		; 5F - Network call
+	.LONG	pbadi21		; 60 - DOS internal (resolve path string to
+				;	 canonical path string)
+	.LONG	pbadi21		; 61 - No-op
+	.LONG	pgetpsp		; 62 - Get program segment prefix address
+	.LONG	pilli21		; 63 - Get lead byte table (2.25 only)
+	.LONG	pbadi21		; 64 - Unknown function!
+	.LONG	pextcountry	; 65 - Country dependent character functions
+	.LONG	pcodepage 	; 66 - Get or set code page
+	.LONG	usethndl#	; 67 - Set handle count
+	.LONG	ucommitf#	; 68 - Commit file
+	.LONG	pilli21		; 69 - Get or set disk serial number
+	.LONG	pilli21		; 6A - Reserved
+	.LONG	pilli21		; 6B - Reserved
+	.LONG	uextopen#	; 6C - Extended open file
+I21MAX=!{$-int21tbl}/4-1
+
+	END

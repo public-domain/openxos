@@ -1,0 +1,1752 @@
+	.TITLE	SLIPADRV - Serial interface network device driver for SLIP protocol
+
+;++++
+; This software is in the public domain.  It may be freely copied and used
+; for whatever purpose you see fit, including commerical uses.  Anyone
+; modifying this software may claim ownership of the modifications, but not
+; the complete derived code.  It would be appreciated if the authors were
+; told what this software is being used for, but this is not a requirement.
+
+;   THIS SOFTWARE IS PROVIDED BY THE AUTHORS "AS IS" AND ANY EXPRESS OR
+;   IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
+;   OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+;   IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+;   INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+;   BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS
+;   OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+;   ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR
+;   TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
+;   USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+;----
+
+	.PROC	80486
+	.INCLUD	XOSINC:\XMAC\XOS.PAR
+	.INCLUD	XOSINC:\XMAC\XOSX.PAR
+	.INCLUD	XOSINC:\XMAC\XOSERR.PAR
+	.INCLUD	XOSINC:\XMAC\XOSTIME.PAR
+	.INCLUD	XOSINC:\XMAC\XOSNET.PAR
+	.INCLUD	XOSINC:\XMAC\XOSXNET.PAR
+	.INCLUD	XOSINC:\XMAC\XOSXIPS.PAR
+	.INCLUD XOSINC:\XMAC\XOSXEN.PAR
+	.INCLUD XOSINC:\XMAC\PCAT.PAR
+	.INCLUD	XOSINC:\XMAC\XOSLKE.PAR
+	.INCLUD	XOSINC:\XMAC\XOSXLKE.PAR
+
+MAJV   =!1t
+MINV   =!2t
+EDITNUM=!0t
+
+;v1.0.0  15-Feb-93
+;	First version
+
+	LKEHEAD	SLIPADRV, MAJV, MINV, EDITNUM, LKETYPE_DEVICE
+
+;Define offsets in the device dependent part of the IDB for the SLIP protocol
+;  serial interface driver
+
+$$$=!idb_SIZE
+BLK idb_slipasts0    , 1t	;Status bits (must be long aligned)
+BLK idb_slipaoflow   , 1t	;Non-zero if using CTS output flow control
+BLK                  , 1t
+BLK idb_slipamodmcon , 1t	;Modem control bits
+BLK idb_sliparate    , 4t	;Baud rate
+BLK idb_slipaostate  , 1t	;Output state
+BLK idb_slipaistate  , 1t	;Input state
+BLK idb_slipamode    , 1t	;Link mode
+BLK idb_slipaotimer  , 1t	;Output timer
+BLK idb_slipapasswrd , 16t	;Link password
+BLK idb_slipaopnt    , 4t	;Output byte pointer
+BLK idb_slipaocnt    , 4t	;Output byte count
+BLK idb_slipaocnx    , 4t	;Output bytes past current chunk
+BLK idb_slipaochunk  , 4t	;Offset of current output chunk
+BLK idb_slipaisize   , 4t	;Size of the receive buffer
+BLK idb_slipaiputpkt , 4t	;Input buffer message putter pointer
+BLK idb_slipaiputbyte, 4t	;Input buffer byte putter pointer
+BLK idb_slipaitake   , 4t	;Input buffer taker pointer
+BLK idb_slipaicntpkt , 4t	;Input buffer packet count
+BLK idb_slipaicntbyte, 4t	;Input buffer byte count for current message
+BLK idb_slipaicntttl , 4t	;Total input byte count
+BLK idb_slipaimax    , 4t	;Maximum bytes for input buffer
+BLK idb_slipaiend    , 4t	;Offset of end of input buffer
+BLK idb_slipalkmsgdst, 24t	;Destination string for link status change
+				;  message
+BLK idb_slipaibufr   , 0t	;Start of input buffer
+idb_slipaSIZE=!$$$
+
+;Define bits for idb_slipasts0
+
+SLAS0$OBUSY=!40h		;Output is busy
+  SLAS0%OBUSY=!6t
+SLAS0$OACT =!20h		;Output is active
+  SLAS0%OACT =!5t
+SLAS0$OHELD=!10h		;Output is being held for flow control
+  SLAS0%OHELD=!4t
+SLAS0$RINGI=!04h		;Ring indicate has changed
+  SLAS0%RINGI=!2t
+SLAS0$IDONE=!02h		;Input is complete (link control mode only)
+  SLAS0%IDONE=!1t
+SLAS0$ODONE=!01h		;Output is complete
+  SLAS0%ODONE=!0t
+.PAGE
+;Define special SLIP characters
+
+SLIP_ESC   =!0DBh		;Slip escape character
+SLIP_END   =!0C0h		;Slip end character
+SLIP_ESCESC=!0DDh		;Code for real 0DBh character (follows SLIP_ESC)
+SLIP_ESCEND=!0DCh		;Code for real 0C0h character (follows SLIP_ESC)
+
+MAXPKSZ=!1510t			;Maximum packet size
+
+;Define values for idb_slipaostate
+
+OS_IDLE=!0t			;Idle
+OS_LCM =!1t			;Link control mode
+OS_NORM=!2t			;Normal
+OS_FIN =!3t			;Finish sending packet
+OS_END =!4t			;Send SLIP_ESCEND next
+OS_ESC =!5t			;Send SLIP_ESCESC next
+
+;Define values for idb_slipaistate
+
+IS_IDLE=!0t			;Idle
+IS_LCM =!1t			;Link control mode
+IS_NORM=!2t			;Normal
+IS_ESC =!3t			;Have SLIP_ESC character
+IS_IGN =!4t			;Ignore input until end of packet
+
+;Define values for idb_slipamode
+
+LNKM_DISABLED=!0t	;Link is disabled
+LNKM_FIXED   =!1t	;Fixed link, no call handling
+LNKM_CALL    =!2t	;Dial-up, can make outgoing calls only
+LNKM_ANSWER  =!3t	;Dial-up, answer incomming calls or make outgoing calls
+
+;Device characteristics for SLIPA NET devices
+
+	DATA
+
+	.MOD	4
+slipadctbl:
+ DCHARBGN  1, knlDCharValCom##
+ DCHARENT  CLASS   , TEXT ,  , 8 , knlDcMsgClass##   , knlDcGetClass##, knlDcSetClass##, 0
+ DCHARENT  TYPE    , TEXT ,  , 4 , knlDcMsgType##    , knlDcGet4Byte##, 0              , dcb_type
+ DCHARENT  IOREG   , HEXV ,  , 4 , knlDcMsgIoReg##   , dcgetioreg     , 0              , 0
+ DCHARENT  INT     , DECV ,  , 1 , knlDcMsgInt##     , dcgetint       , 0              , 0
+ DCHARENT  BUFRSIZE, DECV ,  , 4 , msgbufrsize       , dcgetvalue     , 0              , idb_slipaisize
+ DCHARENT  RATE    , DECV ,  , 4 , msgrate           , dcgetvalue     , dcsetrate      , idb_sliparate
+ DCHARENT  OFLOW   , TEXT ,  , 8 , msgoflow          , dcgetoflow     , dcsetoflow     , 0
+ DCHARENT  STATE   , TEXT ,  , 8 , msgstate          , dcgetstate     , dcsetstate     , idb_state
+ DCHARENT  MODE    , TEXT ,  , 8 , msgmode           , dcgetmode      , dcsetmode      , idb_slipamode
+ DCHARENT  PASSWORD, TEXT ,  , 16, msgpassword       , dcgetpassword  , dcsetpassword  , idb_slipapasswrd
+ DCHARENT  LKMSGDST, STR  ,  , 24, msglkmsgdst       , dcgetlkmsgdst  , dcsetlkmsgdst  , 0
+ DCHARENT  PKTIN   , DECV ,  , 4 , xosnetMsgPktIn##  , dcgetvalue     , dcsetvalue     , idb_cntpktin
+ DCHARENT  BYTEIN  , DECV ,  , 4 , knlDcMsgByteIn##  , dcgetvalue     , dcsetvalue     , idb_cntbytein
+ DCHARENT  PKTOUT  , DECV ,  , 4 , xosnetMsgPktOut## , dcgetvalue     , dcsetvalue     , idb_cntpktout
+ DCHARENT  BYTEOUT , DECV ,  , 4 , knlDcMsgByteOut## , dcgetvalue     , dcsetvalue     , idb_cntbyteout
+ DCHARENT  LINKDOWN, DECV ,  , 4 , xosnetMsgLnkDown##, dcgetvalue     , dcsetvalue     , idb_cntdown
+ DCHARENT  BADSIZE , DECV ,  , 4 , xosnetMsgBadSize##, dcgetvalue     , dcsetvalue     , idb_cntbadsize
+ DCHARENT  BADPROT , DECV ,  , 4 , msgbadprot        , dcgetvalue     , dcsetvalue     , idb_cntbadpnt
+ DCHARENT  NOSBFR  , DECV ,  , 4 , msgnosbfr         , dcgetvalue     , dcsetvalue     , idb_cntnosbfr
+ DCHARENT  NOIBFR  , DECV ,  , 4 , msgnoibfr         , dcgetvalue     , dcsetvalue     , idb_cntnoibfr
+ DCHARENT  IFRAME  , DECV ,  , 4 , msgfrmerr         , dcgetvalue     , dcsetvalue     , idb_cntfa
+ DCHARENT  IBREAK  , DECV ,  , 4 , msgbreakerr       , dcgetvalue     , dcsetvalue     , idb_cntcrc
+ DCHARENT  IOVRRN  , DECV ,  , 4 , msgovrerr         , dcgetvalue     , dcsetvalue     , idb_cntrover
+ DCHARENT  OHUNG   , DECV ,  , 4 , msgohung          , dcgetvalue     , dcsetvalue     , idb_cntxhung
+ DCHARENT  SPURMCC , DECV ,  , 4 , msgspurmcc        , dcgetvalue     , dcsetvalue     , idb_cnthrtbt
+ DCHARENT  SAPTHIS , DATAB, H, 4 , xosnetMsgSapThis##, dcgetsapthis   , dcsetsapthis   , 0
+ DCHARENT  SAPNEXT , DATAB, H, 4 , xosnetMsgSapNext##, dcgetsapnext   , dcsetsapthis   , 0
+ DCHARENT  SAPDEV  , DATAB, H, 16, xosnetMsgSapDev## , dcgetsapdev    , 0              , 0
+
+	CODE
+
+msgrate:    DCHARINFO  {Baud rate}
+msgoflow:   DCHARINFO  {Output flow control}
+msgstate:   DCHARINFO  {Link connect state}
+msgmode:    DCHARINFO  {Link connect mode}
+msgpassword:DCHARINFO  {Link level password}
+msglkmsgdst:DCHARINFO  {Destination for link status messages}
+msgbufrsize:DCHARINFO  {Buffer size (bytes)}
+msgbadprot: DCHARINFO  {Discarded - input protocol error}
+msgnosbfr:  DCHARINFO  {Discarded - no system buffer available}
+msgnoibfr:  DCHARINFO  {Discarded - no interface buffer available}
+msgfrmerr:  DCHARINFO  {Number of input framing errors}
+msgbreakerr:DCHARINFO  {Number of input break characters}
+msgovrerr:  DCHARINFO  {Number of input overrun errors}
+msgohung:   DCHARINFO  {Number of hung output errors}
+msgspurmcc: DCHARINFO  {Number of spurious modem control changes}
+.PAGE
+	.SBTTL	Initialization routine
+
+	INITSUB	initslipa
+
+initslipa:
+	MOVL	EBX, #'SLPA'		;Get network driver name
+	MOVL	EDX, #slipaaddunit	;Get offset of addunit subroutine
+	CALL	xosnetNewDrive##	;Register this network driver
+	JC	4$.S
+	MOVL	ECX, #codetop
+	CLRL	EDX
+	CLRL	EAX
+4$:	MOVL	EBX, #QSTS$DONE
+	RET
+
+	CODE
+.PAGE
+	.SBTTL	slipaaddunit - Subroutine to add serial port interface unit
+
+;Subroutine to add serial port interface unit
+;	c(AL) = Unit number
+;	CALL	slipaaddunit
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+
+$$$=!0
+FRM slau_unit  , 4t	;Unit number
+FRM slau_irout , 4t	;Interrupt routine offset
+FRM slau_bioreg, 4t	;Base IO register number
+FRM slau_int   , 4t	;Interrupt level
+FRM slau_bufrsz, 4t	;Buffer size
+slau_SIZE=!$$$
+
+	DATA
+
+	.MOD	4
+slipaaublk:				;Parameter block for addunitchar
+ DCHARBGN  2, knlDCharValCom##
+ DCHARENT  UNIT    , DECV, , 1, knlDcMsgUnit## , 0, retclc       , 0
+ DCHARENT  TYPE    , TEXT, , 4, knlDcMsgType## , 0, retclc       , 0
+ DCHARENT  IOREG   , HEXV, , 4, knlDcMsgIoReg##, 0, slipaauioreg , 0
+ DCHARENT  INT     , DECV, , 1, knlDcMsgInt##  , 0, slipaauint   , 0
+ DCHARENT  BUFRSIZE, HEXV, , 4, msgbufrsize    , 0, slipaaubufrsz, 0
+
+	CODE
+
+slipaaddunit::
+	ENTER	slau_SIZE, 0		;Allocate our stack frame
+	MOVL	slau_unit.B[EBP], EAX	;Store unit number
+	CLRL	EAX
+	DECL	EAX
+	MOVL	slau_bioreg.B[EBP], EAX	;Store illegal values for port and
+	MOVL	slau_int.B[EBP], EAX	;  interrupt level
+	MOVL	slau_bufrsz.B[EBP], #8t*1024t ;Store default buffer size
+	MOVL	EBX, #slipaaublk	;Process the characteristics
+	MOVB	AL, #0			;Fail if have a bad name
+	CALL	knlAddUnitChar##
+	JC	audone.S		;If error
+	MOVL	EAX, slau_bioreg.B[EBP]	;Did we get all of the values we need?
+	ORL	EAX, slau_int.B[EBP]
+	JS	10$.S			;No - fail
+
+;Now check to see if the physical interface exists
+
+	MOVL	EDX, slau_bioreg.B[EBP]
+	ADDL	EDX, #3.B		;Now check to see if physical interface
+	MOVB	AL, #5			;  exists
+	OUTB	[DX]			;Point to the line control register
+	IOPAUSE				;See if we can change it
+	INB	[DX]
+	IOPAUSE
+	CMPB	AL, #5
+	JNE	4$.S
+	MOVB	AL, #3
+	OUTB	[DX]
+	IOPAUSE
+	INB	[DX]
+	IOPAUSE
+	CMPB	AL, #3
+	JE	haveif.S		;OK - its there!
+4$:	MOVL	EAX, #ER_PDNAV		;Fail if does not exist
+audone:	LEAVE
+	CLRL	ECX
+	MOVL	EBX, #QSTS$DONE
+	STC
+	TOFORK
+ret002:	RET
+
+;Here if a required characteristic is missing
+
+10$:	MOVL	EAX, #ER_CHARM
+	JMP	audone.S
+.PAGE
+;Here if the interface exits.
+
+haveif:	MOVB	CL, slau_int.B[EBP]	;Get interrupt number
+	CALL	knlChkIRqAvl##		;See if its available
+	JC	audone.S		;If not available
+	CALL	knlGetXRes##		;OK - get exec memory resource
+	MOVL	ECX, #SLIPAINTSZ	;Get space for interrupt code
+	CALL	knlGetXCode##
+	JC	4$.S
+	MOVL	slau_irout.B[EBP], EDI	;Remember where code is going
+	MOVL	ESI, #slipaint		;Copy prototype
+	SHRL	ECX, #2
+	MOVB	gdtable+GS_CODEALS+5, #DT_RWDATA+PL_0 ;Enable aliased code space
+	MOVW	AX, #GS_CODEALS
+	MOVL	ES, EAX
+	CLD
+	RMOVSL	[EDI], ES:[ESI]
+	MOVL	ECX, #idb_mSIZE+idb_slipaSIZE ;Get size for our IDB
+	ADDL	ECX, slau_bufrsz.B[EBP]
+	MOVL	EDX, #slipadctbl	;Get offset of device characteristics
+	MOVL	EAX, slau_unit.B[EBP]	;Get unit number
+	CALL	xosnetMakeIdb##		;Make our IDB
+	JNC	6$.S			;OK
+	CLRL	EBX			;Error
+	MOVL	ES, EBX
+	MOVB	gdtable+GS_CODEALS+5, BL ;Disable the aliased code space
+4$:	CALL	knlGiveXRes##
+	JMP	audone
+
+;Here with IDB allocated
+
+6$:	MOVL	idb_typname.B[ESI], #'SLPA';Store type name
+	MOVB	idb_hwhdrsz.B[ESI], #0t ;Store hardware header size
+	MOVL	idb_hwpktsz.B[ESI], #1500t ;Store maximum packet size
+	MOVB	idb_hlen.B[ESI], #0	;Store hardware address size
+	MOVB	idb_hwtype+1.B[ESI], #0	;Store hardware type value for APR
+	MOVL	idb_iopprotocol.B[ESI], #xossnpNetIopSapAddr##
+	MOVL	idb_makedcb.B[ESI], #xossnpMakeDcb##
+	MOVL	idb_netclose1.B[ESI], #xossnpNetClose1##
+	MOVL	idb_setpkt.B[ESI], #setpkt
+	MOVL	idb_setecho.B[ESI], #setpkt
+	MOVL	idb_sendpkt.B[ESI], #sendpkt
+	MOVL	idb_rcvpkt.B[ESI], #rcvpkt
+	MOVL	idb_getetype.B[ESI], #getetype
+	MOVL	EAX, #knlRtnZero##
+	MOVL	idb_sethwa.B[ESI], EAX
+	MOVL	idb_gethwa.B[ESI], EAX
+	MOVL	idb_lnkctl.B[ESI], #slipalnkctl
+	MOVL	idb_icmpecho.B[ESI], #slipaicmpecho
+	MOVL	idb_fdisp.B[ESI], #slipafork ;Store offset of fork routine
+	MOVL	idb_xmtavail.B[ESI], #1
+	MOVL	EAX, slipalidb		;Link into our list of IDBs
+	MOVL	slipalidb, ESI
+	TESTL	EAX, EAX
+	JE	8$.S
+	MOVL	idb_nextd.B[EAX], ESI
+	JMP	10$.S
+
+8$:	MOVL	slipafidb, ESI
+	MOVL	EBX, #slipaoas		;Set up our once-a-second routine the
+	CALL	knlSetupOAS##		;  first time though here
+10$:	MOVL	EDI, slau_irout.B[EBP]	;Fix up the interrupt code
+	PUSHL	#GS_CODEALS
+	POPL	ES
+	MOVL	ES:{fix1-slipaint}+1.B[EDI], ESI
+	MOVL	EAX, EDI
+	SUBL	EAX, #slipaint
+	SUBL	ES:{fix2-slipaint}+1.B[EDI], EAX
+	CLRL	EAX
+	MOVL	ES, EAX
+	MOVB	gdtable+GS_CODEALS+5, AL ;Disable the aliased code space
+	MOVL	EDX, slau_bioreg.B[EBP]
+	MOVL	idb_bioreg.B[ESI], EDX	;Store base IO register number
+	MOVL	EBX, #temp+3		;Build name for interrupt table
+	CLRL	EAX
+	MOVL	1.B[EBX], EAX
+	MOVL	EAX, slau_unit.B[EBP]
+	CALL	knlPutDecNmbr##
+	MOVL	EDX, #temp
+	MOVL	EBX, slau_irout.B[EBP]	;Get address of interrupt routine
+	MOVB	CL, slau_int.B[EBP]	;Get interrupt number
+	MOVB	idb_intlvl.B[ESI], CL	;Remember it
+	MOVB	CH, #DT_TRAP+PL_0	;Set up our interrupt vector
+	CALL	knlSetIRq##
+	CALL	knlGiveXRes##		;Give up the exec memory resource
+	LEAL	EAX, idb_slipaibufr[ESI] ;Set up the receive buffer
+	MOVL	idb_slipaiputbyte[ESI], EAX
+	MOVL	idb_slipaitake[ESI], EAX
+	MOVL	EDX, slau_bufrsz.B[EBP]
+	ADDL	EAX, EDX
+	MOVL	idb_slipaiend[ESI], EAX
+	MOVL	idb_slipaisize[ESI], EDX
+	SUBL	EDX, #8.B
+	MOVL	idb_slipaimax[ESI], EDX
+	CLRL	EAX
+	MOVL	idb_slipaiputpkt[ESI], EAX
+	MOVL	idb_slipaicntpkt[ESI], EAX
+	MOVL	idb_slipaicntttl[ESI], EAX
+	MOVL	EDX, idb_bioreg.B[ESI]	;Set the character format (8 data bits,
+	A2IOP	P_COMLINECON		;  1 stop bit, no parity)
+	MOVB	AL, #03h
+	OUTB	[DX]
+	IOPAUSE
+	A2IOP	P_COMINTENB-P_COMLINECON
+	MOVB	AL, #0Fh		;Enable interrupts
+	OUTB	[DX]
+	IOPAUSE
+	A2IOP	P_COMMODMCON-P_COMINTENB ;Point to modem control reg
+	MOVB	AL, #0Eh		  ;Set RTS, clear DTR and set master
+	MOVB	idb_slipamodmcon[ESI], AL ;  master interrupt enable bit
+	OUTB	[DX]
+	IOPAUSE
+	MOVL	ECX, slau_int.B[EBP]	;Enable our interrupt
+	CALL	knlEnableInt##
+	MOVL	ECX, #4t
+	CLI
+12$:	MOVL	EDX, idb_bioreg.B[ESI]	;Make sure all interrupt conditions are
+	INB	[DX]			;  reset
+	IOPAUSE				;Clear input data available
+	A2IOP	P_COMMODMSTS-P_COMRDATA
+	INB	[DX]			;Clear modem status change
+	IOPAUSE
+	A2IOP	P_COMLINESTS-P_COMMODMSTS
+	INB	[DX]			;Clear line status change
+	IOPAUSE
+	A2IOP	P_COMINTID-P_COMLINESTS
+	INB	[DX]			;Clear output done
+	IOPAUSE
+	TESTB	AL, #01			;Any interrupts left pending?
+	LOOPE	ECX, 12$		;Yes - try again if not too many times
+	JE	16$.S			;Fail if can't clear interrupts
+	STI
+	CLRL	EAX			;OK - get our return value
+	MOVL	ECX, #1
+14$:	MOVL	EBX, #QSTS$DONE
+	LEAVE
+	TOFORK
+	RET
+
+;Here if can't clear the interrupt conditions for the interface
+
+16$:	STI
+	MOVL	EAX, #ER_DEVER		;Report as device error
+	CLRL	ECX
+	JMP	14$.S
+.PAGE
+;Subroutine called by addunitchar for the "IOREG" characteristic
+
+slipaauioreg:
+	CMPL	EAX, #100h		;Reasonable value?
+	JB	2$.S			;No
+	MOVL	slau_bioreg.B[EBP], EAX	;Yes - store value
+	TESTL	EAX, #0FFFF0000h
+	JNE	badcharv.S
+	RET
+
+badcharv:
+	MOVL	EAX, #ER_CHARV
+	STC
+	RET
+
+;Subroutine called by addunitchar for the "INT" characteristic
+
+slipaauint:
+	CMPL	EAX, #2.B		;See if valid interrupt level
+2$:	JB	badcharv.S		;Too small
+	JNE	4$.S			;Not level 2
+	MOVB	AL, #9			;Level 2 - change it to level 9
+4$:	MOVL	slau_int.B[EBP], EAX	;Store interrupt level
+	CMPL	EAX, #15t.B		;Too large?
+	JAE	badcharv.S		;No - fail
+retclc:	CLC
+	RET
+
+ ;Subroutine called by addunitchar for the "BUFRSIZE" characteristic
+
+slipaaubufrsz:
+	CMPL	EAX, #4t*1024t		;Is it big enough?
+	JA	6$.S			;Yes
+	MOVL	EAX, #4t*1024t		;No - make it the minimum
+6$:	CMPL	EAX, #64t*1024t		;Is it too big?
+	JB	8$.S			;Yes
+	MOVL	EAX, #64t*1024t		;No - make the maximum
+8$:	ADDL	EAX, #3t		;Make sure even number of longs
+	ANDL	EAX, #0FFFFFFFCh.B
+	MOVL	slau_bufrsz.B[EBP], EAX
+	CLC
+	RET
+.PAGE
+;Here to get the value of the IOREG characteristic
+
+dcgetioreg:
+	MOVL	ESI, dcb_netidb.B[EDI]
+	MOVL	EAX, idb_bioreg.B[ESI]
+	CLRL	EDX
+	RET
+
+;Here to get the value of the INT characteristic
+
+dcgetint:
+	MOVL	ESI, dcb_netidb.B[EDI]
+	MOVZBL	EAX, idb_intlvl.B[ESI]
+	CLRL	EDX
+	RET
+
+;Here to get the value of the OFLOW characteristic
+
+dcgetoflow:
+	MOVL	ESI, dcb_netidb.B[EDI]
+	MOVL	EAX, #'NONE'		;Assume no flow control
+	CLRL	EDX
+	CMPB	idb_slipaoflow[ESI], #0	;Right?
+	JE	4$.S			;Yes
+	MOVL	EAX, #'CTSR'		;No
+	MOVL	EDX, #'TS'
+4$:	RET
+
+;Here to get the value of the MODE characteristic
+
+dcgetmode:
+	ADDL	EBX, dcb_netidb.B[EDI]
+	MOVZBL	EAX, [EBX]		;Get current mode value
+	MOVL	EDX, CS:modeval+4[EAX*8] ;Get corresponding text string
+	MOVL	EAX, CS:modeval+0[EAX*8]
+	CLC
+	RET
+
+;Here to get the value of the STATE characteristic
+
+dcgetstate:
+	ADDL	EBX, dcb_netidb.B[EDI]
+	MOVZBL	EAX, [EBX]		;Get current state value
+	MOVL	EDX, CS:stateval+4[EAX*8] ;Get corresponding text string
+	MOVL	EAX, CS:stateval+0[EAX*8]
+	CLC
+	RET
+
+;Here to get the value of an error counter or other value which does not
+;  require special handling
+
+dcgetvalue:
+	ADDL	EBX, dcb_netidb.B[EDI]	;Point to the count value
+	MOVL	EAX, [EBX]		;Get it
+	CLRL	EDX			;Only 32 bits
+	RET
+
+;Here to set the value of an error counter or other value
+
+dcsetvalue:
+	ADDL	EBX, dcb_netidb.B[EDI]	;Point to the count value
+	MOVL	[EBX], EAX		;Set it
+	RET				;Thats all
+.PAGE
+;Here to set the vaue of the RATE characteristic
+
+dcsetrate:
+	MOVL	ESI, dcb_netidb.B[EDI]	;Get offset of our IDB
+	CMPL	EAX, #2.B		;Rate value must be at least 2!
+	JA	4$.S
+	MOVB	AL, #2
+4$:	MOVL	ECX, EAX		;Calculate rate divisor
+	SHRL	EAX, #1
+	ADDL	EAX, #115200t
+	CLRL	EDX
+	DIVL	ECX
+	TESTL	EAX, EAX		;Make sure not zero
+	JNE	6$.S
+	INCL	EAX
+6$:	MOVL	ECX, EAX		;Now calculate actual baud rate that
+	MOVL	EAX, #115200t		;  this divisor will generate
+	CLRL	EDX
+	DIVL	ECX
+	MOVL	idb_sliparate[ESI], EAX ;Store rate
+	MOVL	EDX, idb_bioreg.B[ESI]
+	A2IOP	P_COMLINECON		;Enable access to the divisor registers
+	MOVB	AL, #83h
+	CLI
+	OUTB	[DX]
+	IOPAUSE
+	A2IOP	P_COMBRLSB-P_COMLINECON
+	MOVB	AL, CL
+	OUTB	[DX]
+	IOPAUSE
+	A2IOP	P_COMBRMSB-P_COMBRLSB
+	MOVB	AL, CH
+	OUTB	[DX]
+	IOPAUSE
+	A2IOP	P_COMLINECON-P_COMBRMSB
+	MOVB	AL, #03h		;Disable access to the divisor registers
+	OUTB	[DX]
+	IOPAUSE
+	STI
+	CLC
+	RET
+.PAGE
+;Here to set the value of the OUTFLOW characteristic
+
+dcsetoflow:
+	MOVL	ECX, #FLOWTBLSZ		;Process the value
+	MOVL	EBX, #flowtbl
+	CALL	knlGetDcVal2##
+	JC	14$.S			;If error
+	MOVL	ESI, dcb_netidb.B[EDI]
+	CMPB	idb_slipaoflow[ESI], AL	;Changing the flow control state?
+	JE	14$.S			;No - finished here
+	MOVB	idb_slipaoflow[ESI], AL	;Yes - store new value
+	CMPB	AL, #0			;Setting to no flow control?
+	JE	10$.S			;Yes
+
+;Here if enabling flow control - must get current CTS state
+
+	MOVL	EDX, idb_bioreg.B[ESI]
+	A2IOP	P_COMMODMSTS		;Point to modem status register
+	CLI
+	INB	[DX]			;Read it
+	IOPAUSE
+	TESTB	AL, #04h
+	JE	2$.S
+	ORB	idb_slipasts0[EDI], #SLAS0$RINGI
+2$:	TESTB	AL, #10h		;Yes - is CTS asserted?
+	JNE	12$.S			;Yes
+	ORB	idb_slipasts0[EDI], #SLAS0$OHELD ;Indicate output is held
+	JMP	12$.S
+
+;Here if want no output flow control
+
+10$:	TESTB	idb_slipasts0[ESI], #SLAS0$OHELD ;Is output being held?
+	JE	14$.S			;No
+	ANDB	idb_slipasts0[ESI], #~SLAS0$OHELD ;Yes - not being held now
+	CLI				;No interrupts here
+	TESTB	idb_slipasts0[ESI], #SLAS0$OBUSY ;Is output busy?
+	JE	12$.S			;No
+	TESTB	idb_slipasts0[ESI], #SLAS0$OACT ;Yes - is it active?
+	JNE	12$.S			;Yes - nothing else needed here
+	PUSHL	EDI			;No - must restart output here
+	MOVL	EDI, ESI
+	ORB	idb_slipasts0[EDI], #SLAS0$OACT
+	MOVB	idb_slipaotimer[EDI], #2 ;Start the output timer
+	MOVZBL	EAX, idb_slipaostate[EDI] ;Dispatch on the output state
+	CALLI	outdsp[EAX*4]
+	POPL	EDI
+12$:	STI
+	CLC
+14$:	RET
+.PAGE
+;Here to set the value of the MODE characteristic
+
+dcsetmode:
+	MOVL	EBX, #modeval
+	MOVL	ECX, #MODEVALSZ
+	CALL	knlGetDcVal1##		;Get new value
+	JC	6$.S			;If error
+	MOVL	ESI, dcb_netidb.B[EDI]
+	MOVB	CL, idb_slipamode[ESI]
+	MOVB	idb_slipamode[ESI], AL	;Store new mode value
+	CMPB	CL, #LNKM_CALL		;Were the old and new modes both
+	JB	2$.S			;  CALL or ANSWER?
+	CMPB	AL, #LNKM_CALL
+	JB	2$.S			;No
+	CMPB	idb_state.B[ESI], #LNKS_CNCTD ;Yes - is the link connected?
+	JAE	6$.S			;Yes - don't change state or DTR
+2$:	MOVB	AL, CS:newstate[EAX]	;No - get new state value
+	MOVB	idb_state.B[ESI], AL
+	JMP	setdtr			;Update DTR
+
+;Here to set the value of the STATE characteristic
+
+dcsetstate:
+	MOVL	EBX, #stateval
+	MOVL	ECX, #STATEVALSZ
+	CALL	knlGetDcVal1##
+	JC	6$.S
+	MOVL	ESI, dcb_netidb.B[EDI]
+	MOVB	idb_state.B[ESI], AL
+6$:	RET
+
+;Here to get the value of the PASSWORD characteristic
+
+dcgetpassword:
+	MOVL	EAX, dcb_netidb.B[EDI]
+	ADDL	EAX, EBX
+	RET
+
+;Here to set the value of the PASSWORD characteristic
+
+dcsetpassword:
+	MOVL	ESI, #knlDcValue##
+	MOVL	EDI, dcb_netidb.B[EDI]
+	ADDL	EDI, EBX
+	PUSHL	DS
+	POPL	ES
+	MOVL	ECX, #4t
+	CLD
+	RMOVSL	[EDI], [ESI]
+	RET
+.PAGE
+
+;Here to get the value of the LKMSGDST characteristic
+
+dcgetlkmsgdst:
+	MOVL	EDX, dcb_netidb.B[EDI]
+	ADDL	EDX, #idb_slipalkmsgdst
+	JMP	knlGetSysStr##
+	
+;Here to set the value of the LKMSGDST characteristic
+
+dcsetlkmsgdst:
+	CMPL	ECX, #23t.B
+	JAE	knlBadCharS##
+	MOVL	EDX, dcb_netidb.B[EDI]
+	ADDL	EDX, #idb_slipalkmsgdst
+	JMP	knlSetSysStr##
+.PAGE
+;Here to set the value of the SAPTHIS or SAPNEXT characteristic
+
+dcsetsapthis:
+	TESTL	EAX, EAX		;Want first one?
+	JNE	2$.s			;No
+	TESTL	EDX, EDX		;Maybe
+	JNE	2$.S			;No
+	MOVL	thissapsdb, EAX		;Yes
+	RET
+
+2$:	MOVL	ESI, dcb_netidb.B[EDI]	;Get offset of the IDB
+	MOVL	EBX, idb_sdbhead.B[ESI] ;Get first SDB
+	TESTL	EBX, EBX
+	JE	6$.S
+4$:	CMPL	sdb_sapvalue.B[EBX], EAX ;This one?
+	JE	6$.S			;Yes
+	MOVL	EBX, [EBX]		;No - advance to next
+	TESTL	EBX, EBX
+	JNE	4$.S
+6$:	MOVL	thissapsdb, EBX		;Save the PDB we found
+	RET
+
+;Here to get the value of the SAPNEXT characteristic
+
+dcgetsapnext:
+	MOVL	EAX, thissapsdb		;Get last SDB
+	TESTL	EAX, EAX		;Want first next?
+	JNE	8$.S			;No
+	MOVL	ESI, dcb_netidb.B[EDI]	;Yes - get first SDB
+	MOVL	EAX, idb_sdbhead.B[ESI]
+	JMP	10$.S
+
+8$:	MOVL	EAX, [EAX]		;Get next PDB
+10$:	MOVL	thissapsdb, EAX
+	JMP	14$.S
+
+;Here to get the value of the SAPTHIS characteristic
+
+dcgetsapthis:
+	MOVL	EAX, thissapsdb
+14$:	TESTL	EAX, EAX
+	JE	16$.S
+	MOVL	EAX, sdb_sapvalue.B[EAX]
+16$:	RET
+
+;Here to get the value of the SAPDEV characteristic
+
+dcgetsapdev:
+	CLRL	EAX
+	CLRL	EDX
+	MOVL	ESI, thissapsdb
+	TESTL	ESI, ESI
+	JE	18$.S
+	LEAL	EAX, sdb_name.B[ESI]	;Get offset of device name
+18$:	RET
+
+20$:	MOVL	EAX, #ER_CHARV
+	STC
+	RET
+.PAGE
+	.SBTTL	slipalnkctl - Link control function
+
+;Link control function
+;	c{EAX} = Data
+;	c{EDX} = Function
+;	CALL	sliplnkctl
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+
+slipalnkctl:
+	JMPIL	lnkctldsp[EDX*4]	;Dispatch on the function
+
+	DATA
+
+lnkctldsp:
+	.LONG	lnkctlclear	;LNKCTL_CLEAR  = 0 - Clear link control mode
+	.LONG	lnkctlset	;LNKCTL_SET    = 1 - Set link control mode
+	.LONG	lnkctlinput	;LNKCTL_INPUT  = 2 - Input
+	.LONG	lnkctloutput	;LNKCTL_OUTPUT = 3 - Output
+	.LONG	lnkctlgetmc	;LNKCTL_GETMC  = 4 - Get modem control bits
+	.LONG	lnkctlsetmc	;LNKCTL_SETMC  = 5 - Set modem control bits
+
+	CODE
+
+;Here to clear link control mode
+
+lnkctlclear:
+	CMPL	idb_lnkctldcb.B[ESI], EDI ;Yes - are we in link control mode?
+	JNE	10$.S			;No - error
+	LEAL	EAX, idb_slipaibufr[ESI] ;Yes - reset the receive buffer
+	CLI
+	MOVL	idb_slipaiputbyte[ESI], EAX
+	MOVL	idb_slipaitake[ESI], EAX
+	CLRL	EAX
+	MOVL	idb_lnkctldcb.B[ESI], EAX
+	MOVL	idb_slipaiputpkt[ESI], EAX
+	MOVL	idb_slipaicntpkt[ESI], EAX
+	MOVL	idb_slipaicntbyte[ESI], EAX
+	MOVL	idb_slipaicntttl[ESI], EAX
+	MOVB	idb_slipaistate[ESI], #IS_IDLE ;Reset input state
+	MOVB	idb_slipaostate[ESI], #OS_IDLE ;Reset output state
+	MOVL	idb_fdisp.B[ESI], #slipafork ;Store offset of normal fork
+	STI				     ;  routine
+setdtr:	ANDB	idb_slipamodmcon[ESI], #~01h ;Assume don't want DTR
+	MOVB	AL, #01h
+	CMPB	idb_state.B[ESI], #LNKS_CNCTD ;Need to force DTR?
+	JAE	6$.S			;Yes
+	MOVZBL	EAX, idb_slipamode[ESI]	;No - set it based on the mode
+	MOVB	AL, CS:newdtr[EAX]
+6$:	ORB	idb_slipamodmcon[ESI], AL
+	MOVL	EDX, idb_bioreg.B[ESI]
+	A2IOP	P_COMMODMCON
+	MOVB	AL, idb_slipamodmcon[ESI]
+	OUTB	[DX]
+	IOPAUSE
+	RET
+
+;Here if want to clear link control mode and we are not in link control mode
+
+10$:	MOVL	EAX, #ER_PARMV
+	STC
+	RET
+.PAGE
+;Here if want to set link control mode and we are already in link control mode
+
+10$:	MOVL	EAX, #ER_BUSY
+	STC
+	RET
+
+;Here to set link control mode
+
+lnkctlset:
+	CMPL	idb_lnkctldcb.B[ESI], #0.B ;Already in link control mode?
+	JNE	10$.S			;Yes - fail
+	MOVL	idb_lnkctldcb.B[ESI], EDI ;No, but we are now
+	LEAL	EAX, idb_slipaibufr[ESI] ;Reset the receive buffer
+	CLI
+	MOVL	idb_slipaiputbyte[ESI], EAX
+	MOVL	idb_slipaitake[ESI], EAX
+	CLRL	EAX
+	MOVL	idb_slipaiputpkt[ESI], EAX
+	MOVL	idb_slipaicntpkt[ESI], EAX
+	MOVL	idb_slipaicntbyte[ESI], EAX
+	MOVL	idb_slipaicntttl[ESI], EAX
+	MOVB	idb_slipaotimer[ESI], AL
+	ANDB	idb_slipasts0[ESI], #~{SLAS0$ODONE|SLAS0$OBUSY|SLAS0$OACT|SLAS0$IDONE}
+	MOVB	idb_slipaistate[ESI], #IS_LCM ;Update input state
+	MOVB	idb_slipaostate[ESI], #OS_LCM ;Update output state
+	MOVL	idb_fdisp.B[ESI], #slipalcmfork ;Store offset of link control
+	STI					;  mode fork routine
+	CALL	xosnetAbort##		;Abort all queued network output
+	CLRL	EAX
+	RET
+.PAGE
+;Here for the link control mode input function
+
+lnkctlinput:
+	PUSHL	#0.B
+2$:	CMPL	idb_slipaicntttl[ESI], #0.B ;Have any input now?
+	JNE	4$.S			;Yes
+	MOVL	EAX, SS:xffTimeOut##	;No
+	CALL	knlXfWait##		;Wait until we have some
+	JNC	2$.S
+	JMP	ctlerr.S		;If error
+
+;Here with some input available
+
+4$:	MOVL	ECX, SS:xffCount##
+	LESL	EBX, SS:xffBuffer1##
+6$:	MOVL	EDX, idb_slipaitake[ESI]
+	MOVB	AL, [EDX]
+	INCL	EDX
+	CMPL	EDX, idb_slipaiend[ESI]
+	JB	8$.S
+	LEAL	EDX, idb_slipaibufr[ESI]
+8$:	MOVL	idb_slipaitake[ESI], EDX
+	MOVB	ES:[EBX], AL
+	INCL	EBX
+	INCL	[ESP]
+	DECL	idb_slipaicntttl[ESI]
+	JE	ctldone.S
+	LOOP	ECX, 6$
+ctldone:CLRL	EAX
+ctlerr:	POPL	ECX
+	MOVL	EBX, #QSTS$DONE
+	RET
+.PAGE
+;Here for the link control mode output function
+
+lnkctloutput:
+	MOVL	ECX, SS:xffCount##
+	LESL	EBX, SS:xffBuffer1##
+	PUSHL	#0.B
+	TESTB	idb_slipasts0[ESI], #SLAS0$OBUSY ;Is output busy now?
+	JE	4$.S			;No
+2$:	MOVL	EAX, SS:xffTimeOut##	;Yes
+	CALL	knlXfWait##		;Wait until it is finished
+	JC	ctlerr.S		;If error
+4$:	MOVB	AL, ES:[EBX]		;OK - get next character
+	INCL	EBX
+	CLI
+	ORB	idb_slipasts0[ESI], #SLAS0$OBUSY ;Indicate output is busy
+	MOVL	EDX, idb_bioreg.B[ESI]
+	OUTB	[DX]			;Output the character
+	IOPAUSE
+	MOVB	idb_slipaotimer[ESI], #2 ;Start the output timer
+	STI
+	INCL	[ESP]
+	LOOP	ECX, 2$			;Continue if more to output
+	JMP	ctldone.S
+.PAGE
+;Here for the link control mode get modem control bits function
+
+lnkctlgetmc:
+	MOVL	EDX, idb_bioreg.B[ESI]
+	A2IOP	P_COMMODMSTS
+	INB	[DX]
+	IOPAUSE
+	TESTB	AL, #04h		;Ring indicate change?
+	JE	2$.S			;No
+	ORB	idb_slipasts0[ESI], #SLAS0$RINGI
+2$:	MOVL	EDX, EAX
+	CLRL	EAX
+	BTZL	idb_slipasts0[ESI], #SLAS0%RINGI ;Check RI
+	ADCB	AH, #0.B
+	ADDB	AH, AH
+	BTL	EDX, #7t		;Check CD
+	ADCB	AH, #0.B
+	ADDB	AH, AH
+	BTL	EDX, #4t		;Check CTS
+	ADCB	AH, #0.B
+	ADDB	AH, AH
+	BTL	EDX, #5			;Check DSR
+	ADCB	AH, #0.B
+	MOVB	AL, idb_slipamodmcon[ESI]
+	ANDB	AL, #03
+	RET
+
+;Here for the link control mode set modem control bits function
+
+lnkctlsetmc:
+	ANDB	AL, #03h
+	ORB	AL, #0Ch
+	MOVB	idb_slipamodmcon[ESI], AL
+	MOVL	EDX, idb_bioreg.B[ESI]
+	A2IOP	P_COMMODMCON
+	OUTB	[DX]
+	IOPAUSE
+	RET
+.PAGE
+	.SBTTL	slipaicmpecho - SLIPA ICMP echo function
+
+;Here when an ICMP echo request packet is received.  If the link is in the
+;  LNKS_CNCTD state, this function checks for echo data starting with the
+;  string "PASSWRD:".  If found, the rest of the data in the packet is taken
+;  as a password.  It is compared to the link's password.  If it matches, the
+;  data in the packet is replaced with the string "ESTBLSHD" and the link's
+;  state is changed to LNKS_ESTAB.  If it does not match, the link's state is
+;  not changed and the data in the packet is replaced with the string
+;  "REJECTED".
+;	c{EBX} = Offset of packet buffer
+;	c{EDX} = Offset of start of ICMP part of packet
+;	c{ECX} = Offset of IDB
+;	c{ESI} = Offset of SDB
+;	c{EDI} = Offset of PDB
+;	CALL	slipaicmpecho
+
+slipaicmpecho:
+	CMPB	idb_state.B[ECX], #LNKS_CNCTD ;In the connected state?
+	JE	2$.S			;Yes
+	CMPB	idb_state.B[ECX], #LNKS_ESTAB ;In the established state?
+					;  This is possible is our response was
+					;  lost and the other end retransmitted
+					;  its echo request
+	JNE	6$.S			;No - nothing needed here
+2$:	CMPL	npb_count.B[EBX], #32t.B ;Yes - is it the right length?
+	JNE	6$.S			;No
+	MOVZBL	EAX, npb_npofs.B[EBX]	;Yes - was the destination IP address 0?
+	CMPL	ip_dstipaddr.B[EBX+EAX], #0.B
+	JNE	6$.S			;No
+	CMPL	icmp_data+0.B[EDX], #'PASS' ;Yes - is it a password packet?
+	JNE	6$.S			;No
+	CMPL	icmp_data+4.B[EDX], #'WRD:' ;Maybe
+	JNE	6$.S			;No
+	CMPL	idb_slipapasswrd[ECX], #0.B ;Yes - do we have a password?
+	JE	4$.S			;No - don't check it
+	PUSHL	EDI			;Yes
+	PUSHL	ESI
+	PUSHL	ECX
+	LEAL	EDI, idb_slipapasswrd[ECX] ;Check the password
+	PUSHL	DS
+	POPL	ES
+	LEAL	ESI, icmp_data+8.B[EDX]
+	MOVL	ECX, #4t
+	CLD
+	RECMPSL	[EDI], [ESI]
+	POPL	ECX
+	POPL	ESI
+	POPL	EDI
+	JNE	8$.S			;If it did not match
+4$:	MOVL	icmp_data+0.B[EDX], #'ESTB' ;Match - change data in packet
+	MOVL	icmp_data+4.B[EDX], #'LSH:'
+	MOVB	idb_state.B[ECX], #LNKS_ESTAB ;Change link state
+	PUSHL	EDI
+	PUSHL	EBX
+	PUSHL	ECX
+	PUSHL	EDX
+	MOVL	EDI, ECX
+	MOVB	CL, #1
+	CALL	sendlinkmsg
+	POPL	EDX
+	POPL	ECX
+	POPL	EBX
+	POPL	EDI
+	MOVZBL	EAX, npb_npofs.B[EBX]	;Get the source IP address
+	MOVL	EAX, ip_srcipaddr.B[EBX+EAX]
+	MOVL	pdb_ipadjipa.B[EDI], EAX ;Store it as the adjacent node address
+6$:	RET				;Thats all
+
+;Here if the password did not match
+
+8$:	MOVL	icmp_data+0.B[EDX], #'REJE' ;Change data in packet
+	MOVL	icmp_data+4.B[EDX], #'CTED'
+	RET
+.PAGE
+	.SBTTL	getetype - Subroutine to get Ethertype value for device
+
+;Subroutine to get Ethertype value for device - since this device does not use
+;  an Ethertype value, this routine checks the value and returns an error if
+;  the value is not 0 (meaning no Ethertype) or 0FFFFh
+;	c{EAX} = Standard Ethertype value
+;	CALL	getetype
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  c{EAX} = Device Ethertype value
+
+getetype:
+	TESTL	EAX, EAX		;Is it 0?
+	JE	4$.S			;Yes - OK
+	CMPL	EAX, #0FFFFh		;Or 0FF-FF?
+	JE	4$.S			;Yes - OK
+	MOVL	EAX, #ER_NILPC		;No - bad protocol value
+	STC
+4$:	RET
+.PAGE
+	.SBTTL	Serial interface interrupt routines
+
+;The following is a prototype for the interrupt service routine entry code
+;  - this code is copied for each unit by slipaaddunit
+
+slipaint:
+	PUSHAL				;Save all registers
+	PUSHL	DS
+	PUSHL	ES
+	PUSHL	FS
+	PUSHL	GS
+	PUSHL	#GS_DATA.B		;Make our data addressable
+	POPL	DS
+fix1:	MOVL	EDI, #0			;Get offset of IDB for this interface
+fix2:	JMP	intcom			;Go to the common routine
+SLIPAINTSZ=!$-slipaint
+.PAGE
+	.SBTTL	slipaintcom - Common interrupt routine
+
+intcom:	CLRL	EAX
+intchk:	MOVL	EDX, idb_bioreg.B[EDI]	;Get base IO register for serial port
+	A2IOP	P_COMINTID		;Point to interrupt ID register
+	INB	[DX]			;Get interrupt status
+	IOPAUSE
+	ANDB	AL, #7
+	JMPIL	slipaidsp[EAX*4]	;Dispatch on the interrupt
+
+;Interrupt dispatch table
+
+	DATA
+
+	.MOD	4
+slipaidsp:
+	.LONG	mdmchg		;000 - Modem status change
+	.LONG	intdone		;001
+	.LONG	xmtdone		;010 - Xmit done
+	.LONG	intdone		;011
+	.LONG	inpavl		;100 - Input available
+	.LONG	intdone		;101
+	.LONG	inperr		;110 - Input error
+	.LONG	intdone		;111
+
+	CODE
+
+;Here when have no more interrupt conditions to service
+
+intdone:MOVB	AL, #INT_EOI		;Release interrupt controller
+	CLI
+	CMPB	idb_intlvl.B[EDI], #7	;High interrupt?
+	JBE	4$.S			;No
+	OUTB	P_INC2P0		;Yes - release 2nd interrupt controller
+	IOPAUSE
+4$:	OUTB	P_INC1P0		;Always release 1st interrupt controller
+	IOPAUSE
+	JMP	knlDismissInt2##	;Check for scheduling and dismiss
+.PAGE
+;Here for input error interrupt
+
+inperr:	A2IOP	P_COMLINESTS-P_COMINTID	;Point to the line status register
+	INB	[DX]			;Read it
+	IOPAUSE
+	TESTB	AL, #02h		;Overrun error?
+	JNE	2$.S			;No
+	INCL	idb_cntrover.B[EDI]	;Yes - count the error
+2$:	TESTB	AL, #08h		;Framing error?
+	JNE	4$.S			;No
+	INCL	idb_cntfa[EDI]		;Yes - count the error
+4$:	TESTB	AL, #10h		;Break?
+	JNE	intcom.S		;No
+	INCL	idb_cntcrc[EDI]		;Yes - count the error
+	JMP	intcom.S
+.PAGE
+;Here for input available interrupt
+
+inpavl:	A2IOP	P_COMRDATA-P_COMINTID	;Point to data registser
+	INB	[DX]			;Get the data byte
+	IOPAUSE
+	MOVZBL	ECX, idb_slipaistate[EDI] ;Dispatch on the input state
+	JMPIL	inpdsp[ECX*4]
+
+	DATA
+
+inpdsp:	.LONG	inpidle		;IS_IDLE = 0 - Idle
+	.LONG	inplcm		;IS_LCM  = 1 - Link control mode
+	.LONG	inpnormal	;IS_NORM = 2 - Normal
+	.LONG	inpescape	;IS_ESC  = 3 - Have SLIP_ESC character
+	.LONG	inpignore	;IS_IGN  = 4 - Ignore input until end of packet
+
+	CODE
+
+;Here for the ignore input state
+
+inpignore:
+	CMPB	AL, #SLIP_END		;End of packet?
+	JNE	intcom.S		;No - ignore the character
+	MOVB	idb_slipaistate[EDI], #IS_IDLE ;Yes - reset to idle state
+	JMP	intcom.S
+
+;Here for the escape input state - have character following an escape
+;  character
+
+inpescape:
+	CMPB	AL, #SLIP_ESCESC	;Have escape as input?
+	JE	2$.S			;Yes
+	CMPB	AL, #SLIP_ESCEND	;Have end as input?
+	JNE	22$			;No - protocol error!
+	MOVB	AL, #SLIP_END		;Yes - get actual value
+	JMP	4$.S			;Continue
+
+;Here with escape as input
+
+2$:	MOVB	AL, #SLIP_ESC		;Get actual value
+4$:	MOVB	idb_slipaistate[EDI], #IS_NORM ;Update input state
+	JMP	10$.S			;Continue
+
+;Here for the idle input state
+
+inpidle:CMPB	AL, #SLIP_END		;End of packet?
+	JE	intcom			;Yes - ignore it
+	MOVL	EDX, idb_slipaicntttl[EDI] ;No - is the ring full?
+	CMPL	EDX, idb_slipaimax[EDI]
+	JAE	20$			;Yes - ignore this and count buffer full
+					;  error
+	MOVL	EDX, idb_slipaiputbyte[EDI] ;No - start receiving a packet
+	MOVL	idb_slipaiputpkt[EDI], EDX
+	MOVL	[EDX], #-1
+	ADDL	EDX, #4t.B
+	CMPL	EDX, idb_slipaiend[EDI]
+	JB	6$.S
+	LEAL	EDX, idb_slipaibufr[EDI]
+6$:	MOVL	idb_slipaiputbyte[EDI], EDX
+	ADDL	idb_slipaicntttl[EDI], #4t.B
+	MOVL	idb_slipaicntbyte[EDI], #4t
+	MOVB	idb_slipaistate[EDI], #IS_NORM ;Update input state
+	JMP	8$.S			;Continue
+
+;Here for the normal input state
+
+inpnormal:
+	CMPB	AL, #SLIP_END		;End of packet?
+	JE	inpend			;Yes
+8$:	CMPB	AL, #SLIP_ESC		;No - escape character?
+	JE	14$.S			;Yes
+10$:	CMPL	idb_slipaicntbyte[EDI], #MAXPKSZ ;No - current packet too big?
+	JA	18$.S			;Yes - ignore this and count size error
+	MOVL	EDX, idb_slipaicntttl[EDI] ;No - is the ring full?
+	CMPL	EDX, idb_slipaimax[EDI]
+	JE	20$.S			;Yes - ignore this and count buffer full
+					;  error
+	MOVL	EBX, idb_slipaiputbyte[EDI] ;No - get putter byte pointer
+	MOVB	[EBX], AL		;Store character
+	INCL	EBX			;Bump pointer
+	CMPL	EBX, idb_slipaiend[EDI]	;At end of buffer?
+	JB	12$.S			;No
+	LEAL	EBX, idb_slipaibufr[EDI] ;Yes - reset pointer
+12$:	MOVL	idb_slipaiputbyte[EDI], EBX ;Update pointer
+	INCL	idb_slipaicntbyte[EDI]	;Bump the count for the packet
+	INCL	idb_slipaicntttl[EDI]	;Bump the total input count
+	JMP	intcom			;Continue
+
+;Here if have escape character when processing normal input
+
+14$:	MOVB	idb_slipaistate[EDI], #IS_ESC ;Update the input state
+	JMP	intcom
+
+;Here if input packet is too long
+
+18$:	INCL	idb_cntbadsize.B[EDI]	;Count the error
+	JMP	24$.S			;Go discard the input packet
+
+;Here if input buffer is full
+
+20$:	INCL	idb_cntnoibfr.B[EDI]	;Count the error
+	JMP	24$.S			;Go discard the input packet
+
+;Here if have illegal sequence of characters
+
+22$:	INCL	idb_cntbadpnt.B[EDI]	;Count the error
+24$:	MOVL	EAX, idb_slipaiputpkt[EDI] ;Discard the current packet
+	MOVL	idb_slipaiputbyte[EDI], EAX
+	MOVL	EAX, idb_slipaicntbyte[EDI] ;Restore the total input count
+	SUBL	idb_slipaicntttl[EDI], EAX
+	MOVL	idb_slipaicntbyte[EDI], #0 ;Clear the packet byte count
+	MOVB	idb_slipaistate[EDI], #IS_IGN ;Update input state
+	JMP	intcom
+.PAGE
+;Here if have end of packet when processing normal input
+
+inpend:	MOVL	EAX, idb_slipaicntbyte[EDI] ;Get input byte count
+	SUBL	EAX, #4t.B		;Empty packet?
+	JLE	4$.S			;Yes - ignore it
+	MOVL	EBX, idb_slipaiputpkt[EDI] ;No - point to start of the packet
+	MOVL	[EBX], EAX		;Store count at beginning of the packet
+	INCL	idb_slipaicntpkt[EDI]	;Count the packet
+	MOVL	EAX, idb_slipaiputbyte[EDI] ;Round up the pointer to the next
+	ADDL	EAX, #3t.B		    ;  long
+	ANDL	EAX, #0FFFFFFFCh.B
+	CMPL	EAX, idb_slipaiend[EDI]	;Check for wrap-around
+	JB	2$.S
+	LEAL	EAX, idb_slipaibufr[EDI]
+2$:	MOVL	idb_slipaiputbyte[EDI], EAX
+	ADDL	idb_slipaicntttl[EDI], #3t.B ;Also round up the total count
+	ANDL	idb_slipaicntttl[EDI], #0FFFFFFFCh.B
+	CALL	knlReqFork##		;Request fork
+	CLRL	EAX
+	MOVL	idb_slipaiputpkt[EDI], EAX
+	MOVB	idb_slipaistate[EDI], #IS_IDLE ;Update input state
+4$:	JMP	intcom			;Finished here
+.PAGE
+;Here for input when in link control mode
+
+inplcm:	MOVL	EDX, idb_slipaicntttl[EDI] ;Can we take more?
+	CMPL	EDX, idb_slipaimax[EDI]
+	JAE	6$.S			;No - ignore this
+	MOVL	EBX, idb_slipaiputbyte[EDI] ;Yes - get putter pointer
+	MOVB	[EBX], AL		;Store character
+	INCL	EBX			;Bump the pointer
+	CMPL	EBX, idb_slipaiend[EDI]	;Check for wrap-around
+	JB	4$.S
+	LEAL	EBX, idb_slipaibufr[EDI]
+4$:	MOVL	idb_slipaiputbyte[EDI], EBX ;Update pointer
+	INCL	idb_slipaicntttl[EDI]	;Bump total count
+	ORB	idb_slipasts0[EDI], #SLAS0$IDONE ;Indicate have input
+	CALL	knlReqFork##
+6$:	JMP	intcom
+.PAGE
+;Here for xmit done interrupt
+
+xmtdone:TESTB	idb_slipasts0[EDI], #SLAS0$OHELD ;Should we hold output?
+	JNE	2$.S			;Yes
+xmtdon2:MOVZBL	EAX, idb_slipaostate[EDI] ;No - dispatch on the output state
+	CALLI	outdsp[EAX*4]
+	JMP	intcom
+
+;Here if need to hold output
+
+2$:	ANDB	idb_slipasts0[EDI], #~SLAS0$OACT ;Not active now
+	MOVB	idb_slipaotimer[EDI], #0 ;Clear the output timer
+	JMP	intcom
+
+	DATA
+
+outdsp:	.LONG	ret010		;OS_IDLE = 0 - Idle
+	.LONG	xmtlcm		;OS_LCM  = 1 - Link control mode
+	.LONG	xmtnorm		;OS_NORM = 2 - Normal
+	.LONG	xmtfin		;OS_FIN  = 3 - Finish sending packet
+	.LONG	xmtend		;OS_END  = 4 - Send SLIP_ESCEND next
+	.LONG	xmtesc		;OS_ESC  = 5 - Send SLIP_ESCESC next
+
+	CODE
+.PAGE
+;Here for normal output done
+
+xmtnorm:DECL	idb_slipaocnt[EDI]	;Have any more in the current chunk?
+	JNS	6$.S			;Yes
+	MOVL	EAX, idb_slipaocnx[EDI]	;Get number of bytes left in the packet
+	TESTL	EAX, EAX
+	JE	10$.S			;If completely finished
+	CLRL	ECX			;More to send - clear amount left
+	MOVL	idb_slipaocnx[EDI], ECX
+	MOVL	ECX, idb_slipaochunk[EDI] ;Get current output chunk
+	MOVL	ECX, npc_link.B[ECX]	;Get next output chunk
+	MOVL	idb_slipaochunk[EDI], ECX ;Make it the current one
+	MOVL	idb_slipaopnt[EDI], ECX	;Initialize the pointer
+	MOVZBL	ECX, npc_sizex.B[ECX]	;Get size of this buffer chunk
+	MOVL	ECX, knlXmbSize##[ECX*4]
+	SUBL	ECX, #npc_mSIZE.B
+	CMPL	EAX, ECX		;Does packet use more than this chunk?
+	JBE	4$.S			;No
+	SUBL	EAX, ECX		;Yes - get amount past this chunk
+	MOVL	idb_slipaocnx[EDI], EAX	;Store it for next time
+	MOVL	EAX, ECX
+4$:	DECL	EAX
+	MOVL	idb_slipaocnt[EDI], EAX
+6$:	MOVL	EBX, idb_slipaopnt[EDI]	;Get output pointer
+	INCL	idb_slipaopnt[EDI]	;Bump the pointer
+	MOVB	AL, [EBX]		;Get byte
+	CMPB	AL, #SLIP_END		;Is this an END character?
+	JE	12$.S			;Yes
+	CMPB	AL, #SLIP_ESC		;No - is this an ESC character?
+	JE	14$.S			;Yes
+8$:	A2IOP	P_COMRDATA-P_COMINTID	;Point to the data registser
+	OUTB	[DX]			;Output the byte
+	IOPAUSE
+	MOVB	idb_slipaotimer[EDI], #2 ;Reset the output timer
+ret010:	RET				;Finished here
+
+;Here when finished outputing a packet
+
+10$:	MOVB	idb_slipaostate[EDI], #OS_FIN ;Update the output state
+	MOVB	AL, #SLIP_END		;Send end character
+	JMP	8$.S
+
+;Here if need to output an END character
+
+12$:	MOVB	idb_slipaostate[EDI], #OS_END ;Update the output state
+	JMP	16$.S
+
+;Here if need to output an ESC character
+
+14$:	MOVB	idb_slipaostate[EDI], #OS_ESC ;Update the output state
+16$:	MOVB	AL, #SLIP_ESC		;Send ESC next
+	JMP	8$.S
+
+;Here after sending ESC as prefix for literal END
+
+xmtend:	MOVB	AL, #SLIP_ESCEND
+	JMP	18$.S
+
+;Here after sending ESC as prefix for literal ESC
+
+xmtesc:	MOVB	AL, #SLIP_ESCESC
+18$:	MOVB	idb_slipaostate[EDI], #OS_NORM ;Update the output state
+	JMP	8$.S			;Go send next byte
+
+;Here with output completely finished (end character sent)
+
+xmtfin:	ANDB	idb_slipasts0[EDI], #~{SLAS0$OBUSY|SLAS0$OACT}
+	MOVB	idb_slipaotimer[EDI], #0
+	MOVB	idb_slipaostate[EDI], #OS_IDLE ;Update the output state
+xmtlcm:	ORB	idb_slipasts0[EDI], #SLAS0$ODONE ;Indicate done
+	JMP	knlReqFork##		;Request fork
+.PAGE
+;Here for modem status change interrupt
+
+mdmchg:	A2IOP	P_COMMODMSTS-P_COMINTID	;Point to modem status register
+	INB	[DX]			;Read it
+	IOPAUSE
+	TESTB	AL, #04h
+	JE	2$.S
+	ORB	idb_slipasts0[EDI], #SLAS0$RINGI
+2$:	TESTB	AL, #06h		;Data set change that we don't expect?
+	JE	4$.S			;No
+	INCL	idb_cnthrtbt[EDI]	;Yes - count it
+4$:	CMPB	idb_slipamode[EDI], #LNKM_DISABLED ;Should we check carrier
+						   ;  detect?
+	JE	10$.S			;No
+	CMPB	idb_slipamode[EDI], #LNKM_FIXED ;Maybe
+	JE	10$.S			;No
+	TESTB	AL, #80h		;Yes - is CD asserted now?
+	JNE	8$.S			;Yes
+	MOVB	idb_state.B[EDI], #LNKS_DISCNCTD ;No - indicate disconnected
+	ANDB	idb_slipamodmcon[EDI], #~01h ;Assume don't want DTR
+	CMPB	idb_slipamode[EDI], #LNKM_ANSWER ;Right
+	JNE	6$.S			;Yes
+	ORB	idb_slipamodmcon[EDI], #01h ;No - set DTR
+6$:	A2IOP	P_COMMODMCON-P_COMMODMSTS
+	PUSHL	EAX
+	MOVB	AL, idb_slipamodmcon[EDI] ;Update the data set bits
+	OUTB	[DX]
+	IOPAUSE
+	POPL	EAX
+	JMP	10$.S
+
+;Here if carrier detect is asserted now
+
+8$:	CMPB	idb_state.B[EDI], #LNKS_ESTAB ;Is link established now?
+	JE	10$.S			;Yes - leave it that way
+	MOVB	idb_state.B[EDI], #LNKS_CNCTD ;No - make it connected
+10$:	CMPB	idb_slipaoflow[EDI], #0	;Doing flow control?
+	JE	14$.S			;No
+	TESTB	AL, #10h		;Yes - is CTS asserted?
+	JE	12$.S			;No
+	TESTB	idb_slipasts0[EDI], #SLAS0$OHELD ;Yes - are we holding output?
+	JE	14$.S			;No - nothing needed here
+	ANDB	idb_slipasts0[EDI], #~SLAS0$OHELD ;Yes - but not any more
+	TESTB	idb_slipasts0[EDI], #SLAS0$OBUSY ;No - is output active now?
+	JE	14$.S			;No
+	TESTB	idb_slipasts0[EDI], #SLAS0$OACT ;Yes - is output active?
+	JNE	14$.S			;Yes
+	ORB	idb_slipasts0[EDI], #SLAS0$OACT ;No
+	MOVB	idb_slipaotimer[EDI], #2
+	MOVL	EDX, idb_bioreg.B[EDI]
+	A2IOP	P_COMINTID		;Point to right IO registser
+	JMP	xmtdon2			;And go restart output
+
+;Here if CTS is not asserted now
+
+12$:	ORB	idb_slipasts0[EDI], #SLAS0$OHELD ;Indicate output is held
+14$:	JMP	intcom			;Thats all
+.PAGE
+	.SBTTL	slipafork - Fork level routine
+
+;Here for device fork requests in normal mode
+
+slipafork:
+	MOVL	ESI, EDI
+2$:	CMPL	idb_slipaicntpkt[ESI], #0.B ;Have any input?
+	JNE	havepkt.S		;Yes
+	TESTB	idb_slipasts0[ESI], #SLAS0$ODONE ;No - is output done?
+	JE	4$.S			;No
+	ANDB	idb_slipasts0[ESI], #~{SLAS0$ODONE|SLAS0$OBUSY} ;Yes
+	CLRL	EAX
+	CALL	xosnetFinXmit##		;Do output done processing
+	JMP	2$.S			;Go check for input again
+
+4$:	RET
+
+;Here with an input packet to process
+
+havepkt:DECL	idb_slipaicntpkt[ESI]
+	MOVL	EDX, idb_slipaitake[ESI]
+	MOVL	ECX, [EDX]		;Get length of packet
+	INCL	idb_cntpktin.B[ESI]	;Count the received packet
+	ADDL	idb_cntbytein.B[ESI], ECX
+	CLRL	EDI
+	CALL	xosnetGetBufr##		;Get a network buffer to hold it
+	JC	14$.S			;Can't get a buffer - junk the packet!
+	PUSHL	ECX
+	MOVL	EAX, idb_slipaiend[ESI]
+	PUSHL	ESI
+	LEAL	ESI, 4.B[EDX]
+	MOVL	EDI, EBX
+	PUSHL	DS
+	POPL	ES
+	CLD
+	SUBL	EAX, ESI		;Calculate distance to end of buffer
+	CMPL	ECX, EAX		;Are we wrapping?
+	JBE	8$.S			;No - go on
+	SUBL	ECX, EAX		;Yes - calculate amount wrapped
+	PUSHL	ECX			;Save it
+	MOVL	ECX, EAX		;Copy first part
+	SHRL	ECX, #2t
+	RMOVSL	[EDI], [ESI]
+	POPL	ECX			;Restore size of second part
+	MOVL	ESI, [ESP]		;Point to start of buffer
+	ADDL	ESI, #idb_slipaibufr
+8$:	ADDL	ECX, #3t.B
+	SHRL	ECX, #2t
+	RMOVSL	[EDI], [ESI]		;Copy data to the buffer
+	MOVL	ESI, [ESP]
+	MOVL	ECX, 4.B[ESP]
+	CALL	rcvpkt			;Process the received packet
+	POPL	ESI
+	POPL	ECX
+10$:	ADDL	ECX, #7t.B
+	ANDL	ECX, #0FFFFFFFCh.B
+	SUBL	idb_slipaicntttl[ESI], ECX ;Reduce total input byte count
+	ADDL	ECX, idb_slipaitake[ESI] ;Update the input taker pointer
+	CMPL	ECX, idb_slipaiend[ESI]
+	JB	12$.S
+	SUBL	ECX, idb_slipaisize[ESI]
+12$:	MOVL	idb_slipaitake[ESI], ECX
+	JMP	2$			;Go check for more input
+
+;Here if can't get a buffer for the input packet
+
+14$:	INCL	idb_cntnosbfr.B[ESI]
+	JMP	10$.S
+.PAGE
+;Here for device fork requests in link control mode - since link control mode
+;  is intended for low volume set up IO, its done almost entirely from extended
+;  fork context, one character at a time!  The input ring buffer is used to
+;  prevent input overruns, but otherwise its not buffered.
+
+slipalcmfork:
+	MOVL	ESI, EDI
+	MOVL	EDI, idb_lnkctldcb.B[ESI]
+2$:	TESTB	idb_slipasts0[ESI], #SLAS0$IDONE ;Have any input?
+	JNE	6$.S			;Yes
+	TESTB	idb_slipasts0[ESI], #SLAS0$ODONE ;No - is output done?
+	JE	4$.S			;No
+	ANDB	idb_slipasts0[ESI], #~{SLAS0$ODONE|SLAS0$OBUSY} ;Yes
+	CALL	knlResumeOutput##
+	JMP	2$.S			;Go check for input again
+
+4$:	RET
+
+;Here with input to process
+
+6$:	ANDB	idb_slipasts0[ESI], #~SLAS0$IDONE
+	CALL	knlResumeInput##
+	JMP	2$.S
+.PAGE
+	.SBTTL	rcvpkt - Subroutine to process received packet
+
+;Subroutine to process received packet
+;	c{EBX} = Offset of packet
+;	c{ECX} = Size of packet
+;	c{ESI} = Offset of IDB
+;	CALL	rcvpkt
+
+rcvpkt:	MOVL	npb_count.B[EBX], ECX	;Store total count in packet
+	MOVB	npb_lpofs.B[EBX], #0	;Store header offsets
+	MOVB	npb_npofs.B[EBX], #0
+	MOVL	EDX, EBX		;Point to start of data
+	MOVL	EAX, #0FFFFh		;Get "Ethertype" value
+	JMP	xossnpRcv##		;Process the received packet
+.PAGE
+	.SBTTL	sendpkt - Subroutine to send a packet
+
+;Subroutine to send a packet over the network - must be called from fork level,
+;  does not wait for completion
+;	c{EBX} = Offset of packet buffer
+;	c{ESI} = Offset of IDB
+;	CALL	sendpkt
+;	C:set = Error
+;	  c{EAX} = Error code
+;	  c{EBX} = Offset of packet buffer
+;	C:clr = Normal
+;	  c{EBX} = 0
+
+sendpkt:LEAL	EAX, npb_data.B[EBX]	;Point to first byte to send
+	MOVL	idb_slipaopnt[ESI], EAX
+	CLRL	EAX
+	MOVL	idb_slipaocnx[ESI], EAX
+	MOVL	idb_slipaochunk[ESI], EBX
+	MOVL	EAX, npb_count.B[EBX]	;Get number of bytes to send
+	MOVZBL	EDX, npb_sizex.B[EBX]	;Get size of this buffer chunk
+	MOVL	EDX, knlXmbSize##[EDX*4]
+	SUBL	EDX, #npb_mSIZE.B
+	CMPL	EAX, EDX		;Does packet use more than one chunk?
+	JBE	4$.S			;No
+	SUBL	EAX, EDX		;Yes - get amount past this chunk
+	MOVL	idb_slipaocnx[ESI], EAX
+	MOVL	EAX, EDX
+4$:	MOVL	idb_slipaocnt[ESI], EAX
+	MOVB	AL, #SLIP_END		;Get the prefix character
+	MOVL	EDX, idb_bioreg.B[ESI]
+	CLI				;Make sure no interrupts here
+	ORB	idb_slipasts0[ESI], #SLAS0$OBUSY|SLAS0$OACT
+					;Indicate output is busy and active
+	ANDB	idb_slipasts0[ESI], #~SLAS0$ODONE
+	MOVB	idb_slipaostate[ESI], #OS_NORM ;Update the output state
+	OUTB	[DX]			;Output the prefix character
+	IOPAUSE
+	MOVB	idb_slipaotimer[ESI], #2 ;Start the output timer
+	STI				;Interrupts are OK now
+	CLRL	EBX
+	RET				;Thats all
+.PAGE
+	.SBTTL	setpkt - Subroutine to set up packet header
+
+;Subroutine to set up hardware level packet header
+;	c[AX]  = Ethertype value
+;	c{EBX} = Offset of packet buffer
+;	c{ESI} = Offset of IDB
+;	CALL	setpkt
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  c{EDX} = Offset of start of software part of packet
+
+setpkt:	MOVB	npb_lpofs.B[EBX], #0	;Store offset of next level
+	MOVL	npb_count.B[EBX], #0	;Store initial total size
+	MOVL	EDX, EBX		;Get pointer to next header
+	CLC
+	RET
+.PAGE
+	.SBTTL	sendlinkmsg
+
+;Subroutine to send IPM message when the link changes state
+;	c(CL)  = Reason:
+;		   01h = Link connected
+;		   02h = Link disconnected
+;	c{EDI} = Offset of IDB
+;	CALL	knlSendLogInMsg
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+
+$$$=!0
+FRM lnkmsg_msg, 20t		;Buffer for message
+lnkmsg_SIZE=!$$$
+
+sendlinkmsg:
+	CMPB	idb_slipalkmsgdst[EDI], #0 ;Do we need to send a message here?
+	JE	10$.S			;No
+	ENTER	lnkmsg_SIZE, 0		;Yes
+	MOVB	lnkmsg_msg+0.B[EBP], #MT_NETLINK ;Store message type
+	MOVB	lnkmsg_msg+1.B[EBP], CL	;Store reason
+	MOVW	lnkmsg_msg+2.B[EBP], #0 ;Make sure unused bytes are 0
+	MOVL	EAX, idb_name+0.B[EDI]	;Store device name in message
+	MOVL	lnkmsg_msg+4.B[EBP], EAX
+	MOVL	EAX, idb_name+4.B[EDI]
+	MOVL	lnkmsg_msg+8.B[EBP], EAX
+	MOVL	EAX, idb_name+8.B[EDI]
+	MOVL	lnkmsg_msg+12t.B[EBP], EAX
+	MOVL	EAX, idb_name+12t.B[EDI]
+	MOVL	lnkmsg_msg+16t.B[EBP], EAX
+	MOVB	lnkmsg_msg+12t.B[EBP], #0 ;Make sure have null at end
+	MOVL	ECX, #-4		;Determine length of message
+	PUSHL	EDI
+	LEAL	EDI, lnkmsg_msg+4.B[EBP]
+	PUSHL	SS
+	POPL	ES
+	CLD
+	RNSCASB	[EDI]
+	POPL	EDI
+	NOTL	ECX
+	LEAL	ESI, lnkmsg_msg.B[EBP]	;Get address of the message buffer
+	PUSHL	SS
+	POPL	FS
+	LEAL	EBX, idb_slipalkmsgdst[EDI] ;Get address of destination string
+	PUSHL	DS
+	POPL	ES
+	MOVL	EDX, #netsrcstr		;Get address of the source string
+	PUSHL	CS
+ 	POPL	GS
+	CALL	knlIpmSendMsg##		;Send the message
+	LEAVE
+10$:	RET
+
+netsrcstr:.ASCIZ "DEV^NET"
+.PAGE
+	.SBTTL	slipaoas - Once-a-second routine
+
+;Once-a-second routine
+
+slipaoas:
+	MOVL	ESI, slipafidb		;Point to our first IDB
+2$:	CLI				;No interrupts here
+	CMPB	idb_slipaotimer[ESI], #0 ;Is the output timer running?
+	JE	10$.S			;No
+	DECB	idb_slipaotimer[ESI]	;Yes - has it run out?
+	JNE	14$			;No
+	CMPL	idb_lnkctldcb[ESI], #0.B ;Yes - in link control mode?
+	JE	6$.S			;No
+	ORB	idb_slipasts0[ESI], #SLAS0$ODONE ;Yes - indicate done
+	MOVL	EDI, ESI
+	CALL	knlReqFork##		;Request fork
+	STI
+	JMP	8$.S
+
+;Here if have hung serial output and are not in link control mode
+
+6$:	MOVB	idb_slipaostate[ESI], #OS_IDLE ;Update the output state
+	INCL	idb_cntxhung[ESI]	;Count the error
+	TOFORK
+	MOVL	EAX, #ER_DEVER		;Report this as a device error
+	STC
+	CALL	xosnetFinXmit##		;Do output done processing
+	FROMFORK
+8$:	MOVL	EDX, idb_bioreg.B[ESI]	;Point to interrupt enable register
+	A2IOP	P_COMINTENB
+	MOVB	AL, #0Fh		;Make sure interrupts are enabled
+	OUTB	[DX]
+	IOPAUSE
+	JMP	16$.S
+
+;Here if the output timer is not running
+
+10$:	TESTB	idb_slipasts0[ESI], #SLAS0$OHELD ;Are we holding output?
+	JE	14$.S			;No
+	MOVL	EDX, idb_bioreg.B[ESI]	;Yes - get the modem status bits
+	A2IOP	P_COMMODMSTS
+	INB	[DX]
+	IOPAUSE
+	TESTB	AL, #04h		;Ring indicate change?
+	JE	12$.S			;No
+	ORB	idb_slipasts0[ESI], #SLAS0$RINGI ;Yes - remember that
+12$:	TESTB	AL, #10h		;Is CTS asserted?
+	JE	14$.S			;No
+	ANDB	idb_slipasts0[ESI], #~SLAS0$OHELD ;Yes - stop holding output!
+	TESTB	idb_slipasts0[ESI], #SLAS0$OBUSY ;Is output busy?
+	JE	14$.S			;No
+	TESTB	idb_slipasts0[ESI], #SLAS0$OACT ;Yes - is it active?
+	JNE	14$.S			;Yes - nothing else needed here
+	ORB	idb_slipasts0[ESI], #SLAS0$OACT ;No - restart it
+	MOVB	idb_slipaotimer[ESI], #2 ;Start the output timer
+	MOVL	EDI, ESI
+	MOVZBL	EAX, idb_slipaostate[EDI] ;Dispatch on the output state
+	CALLI	outdsp[EAX*4]
+14$:	STC
+16$:	MOVL	ESI, idb_nextd.B[ESI]	;Advance to next IDB
+	TESTL	ESI, ESI		;Any more?
+	JNE	2$			;Yes - continue
+	RET				;No - finished
+.PAGE
+	.SBTTL	Data
+
+;Table of values for the OFLOW characteristic
+
+	.MOD	4
+flowtbl:.LONG	'CTSR', 'TS' , 1
+	.LONG	'CTS' , 0    , 1
+	.LONG	'NONE', 0    , 0
+FLOWTBLSZ =!{$-flowtbl}/12t
+
+;Table of values for the MODE characteristic
+
+modeval:.LONG	'DISA', 'BLED'	;LNKM_DISABLED = 0.
+	.LONG	'FIXE', 'D'	;LNKM_FIXED    = 1.
+	.LONG	'CALL', 0	;LNKM_CALL     = 2.
+	.LONG	'ANSW', 'ER'	;LNKM_ANSWER   = 3.
+MODEVALSZ=!{$-modeval}/8
+
+;Table of values for the STATE characteristic
+
+stateval:
+	.LONG	'DISA', 'BLED'	;LNKS_DISABLED = 0.
+	.LONG	'DISC', 'NCTD'	;LNKS_DISCNCTD = 1.
+	.LONG	'CNCT', 'D'	;LNKS_CNCTD    = 2.
+	.LONG	'ESTA', 'B'	;LNKS_ESTAB    = 3.
+STATEVALSZ=!{$-stateval}/8
+
+;Table of new state values used when changing the MODE characteristic
+
+newstate:
+	.BYTE	LNKS_DISABLED	;LNKM_DISABLED= 0.
+	.BYTE	LNKS_ESTAB	;LNKM_FIXED   = 1.
+	.BYTE	LNKS_DISCNCTD	;LNKM_CALL    = 2.
+	.BYTE	LNKS_DISCNCTD	;LNKM_ANSWER  = 3.
+
+;Talbe of DTR value as function of the current MODE value
+
+newdtr:	.BYTE	0		;LNKM_DISABLED= 0.
+	.BYTE	1		;LNKM_FIXED   = 1.
+	.BYTE	0		;LNKM_CALL    = 2.
+	.BYTE	1		;LNKM_ANSWER  = 3.
+
+	DATA
+
+	.MOD	4
+
+slipafidb: .LONG 0		;Offset of first IDB for this type of interface
+slipalidb: .LONG 0		;Offset of last IDB for this type of interface
+thissapsdb:.LONG 0
+temp:	   .LONG 'NET', 0
+
+	LKEEND

@@ -1,0 +1,1244 @@
+	.TITLE	USRRNRUN - Routine to load XOS RUN images for execution
+
+;++++
+; This software is in the public domain.  It may be freely copied and used
+; for whatever purpose you see fit, including commerical uses.  Anyone
+; modifying this software may claim ownership of the modifications, but not
+; the complete derived code.  It would be appreciated if the authors were
+; told what this software is being used for, but this is not a requirement.
+
+;   THIS SOFTWARE IS PROVIDED BY THE AUTHORS "AS IS" AND ANY EXPRESS OR
+;   IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
+;   OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+;   IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+;   INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+;   BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS
+;   OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+;   ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR
+;   TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
+;   USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+;----
+
+	.PROC	80486
+	.INCLUD	XOSINC:\XMAC\XOS.PAR
+	.INCLUD	XOSINC:\XMAC\XOSX.PAR
+	.INCLUD	XOSINC:\XMAC\XOSERR.PAR
+	.INCLUD	XOSINC:\XMAC\XOSDISK.PAR
+	.INCLUD	XOSINC:\XMAC\XOSXDISK.PAR
+	.INCLUD	XOSINC:\XMAC\XOSRUN.PAR
+	.INCLUD	XOSINC:\XMAC\XOSXRUN.PAR
+
+	USERCODE
+
+;When the program to be run is loaded, the registers are setup as follows:
+;	c{ES:EDI} = Address of argument area (EDI will always contain 0)
+;	c{DX:EBX} = Actual starting address of program (not debugger)
+;	c{SS:ESP} = Initial user stack pointer
+;	c{CS:EIP} = Address of first instruction to execute
+;	c{EFR}    = 00000000
+;All other registers are unchanged if loading into the same process or are
+;  set to 0 if loading into a child process.
+
+;The argument area is placed in its own segment in memory.
+.PAGE
+	.SBTTL	usrloadrun - Load XOS RUN file as overlay (single msect)
+
+;Here to load single msect from an XOS RUN file as an overlay
+
+usrloadrun::
+	MOVL	EAX, #ER_IRFT
+	STC
+	RET
+.PAGE
+	.SBTTL	usrrnrun - Load XOS RUN file for execution
+
+;Here if have a XOS RUN file to load
+
+usrrnrun::
+	CMPB	run_itype#, #0		;Is the image type known yet?
+	JNE	2$.S			;Yes
+	MOVB	run_itype#, #IT_RUN386	;No - store image type now
+2$:	BTL	run_option#, #R%DOSEXEC	;Is this a DOS EXEC?
+	JNC	6$.S			;No
+	BTL	run_option#, #R%DEBUG	;Yes - is it a debug load?
+	JNC	6$.S			;No
+	MOVL	EAX, #ER_FUNC		;Yes - fail!
+	STC
+4$:	RET
+
+6$:	MOVL	ECX, #6t		;Read next part of file header
+	MOVL	EBX, #run_header#+2
+	CALL	usrrnrdbytes#
+	JC	4$.S
+	MOVZBL	ECX, run_header+ih_hdrsize
+	SUBL	ECX, #2.B
+	MOVL	EBX, #run_header+8
+	MOVB	AL, run_header#+ih_ver	;Get file version
+	CMPB	AL, #1			;Version 1 file?
+	JNE	8$.S			;No
+	CMPL	ECX, #18t.B		;Yes - is the header the right size?
+	JNE	badrunf			;No
+	CALL	usrrnrdbytes#		;Yes - read rest of header
+	JC	4$.S
+	MOVB	AL, run_header#+24t
+	MOVB	run_header#+ih_stackms, AL
+	MOVL	EAX, run_header#+20t
+	MOVL	run_header#+ih_stack, EAX
+	MOVB	AL, run_header#+18t
+	MOVB	run_header#+ih_debugms, AL
+	MOVL	EAX, run_header#+14t
+	MOVL	run_header#+ih_debug, EAX
+	JMP	14$.S
+
+;Here if do not have a version 1 file
+
+8$:	CMPB	AL, #2			;Version 2 file?
+	JNE	badrunf
+	CMPL	ECX, #56t.B		;Is the header the right size?
+	JE	10$.S			;Yes
+	JB	badrunf			;No - fail if too small
+	MOVB	CL, #56t
+10$:	CALL	usrrnrdbytes#		;Yes - read rest of header
+	JC	18$.S
+	MOVZBL	ECX, run_header#+ih_hdrsize ;Need to skip any excess header?
+	SUBL	ECX, #58t.B
+	JLE	14$.S			;No
+	CALL	usrrnrdskip#		;Yes
+	JC	18$.S
+14$:	MOVB	AL, run_header#+ih_startms ;Do we have someplace to start?
+	ORB	AL, run_header#+ih_debugms
+	JNE	16$.S			;Yes - go on
+	MOVL	EAX, #ER_NOSAD		;Error = NO Starting ADdress
+	STC
+	RET
+
+;Here with start address
+
+16$:	CMPB	run_header#+ih_stackms, #0 ;Do we have a stack specified?
+	JNE	20$.S			;Yes
+	MOVL	EAX, #ER_NOSTK		;Error = NO STacK
+	STC
+18$:	RET
+
+;Here with stack specified
+
+20$:	MOVL	run_segpnt#, #run_segtbl# ;Store initial offsets for segment
+	MOVL	run_mscpnt#, #run_msctbl# ;  and msect tables
+	MOVB	AL, run_header#+ih_numseg ;Store number of segments
+	MOVB	run_segcnt#, AL
+	CMPB	run_header#+ih_type, #2	;XOS user mode image?
+	JE	xosrun.S		;Yes
+badrunf:MOVL	EAX, #ER_IRFF
+	STC
+ret006:	RET
+.PAGE
+;Here if have XOS user mode image to load
+
+xosrun:	MOVL	run_nummsc#, #0
+2$:	MOVL	ECX, #sh_SIZE		;Get header for segment
+	MOVL	EBX, #run_seghdr#
+	CALL	usrrnrdbytes#
+	JC	ret006.S
+	MOVZBL	ECX, run_seghdr#+sh_hdrsize ;Need to skip any extra bytes?
+	SUBL	ECX, #sh_SIZE.B
+	JBE	4$.S			;No
+	CALL	usrrnrdskip#
+	JC	ret006.S
+4$:	MOVZBL	EAX, run_seghdr#+sh_nummsc ;Get number of msects
+	TESTL	EAX, EAX		;Can't be 0!
+5$:	JE	badrunf.S
+	ADDL	run_nummsc#, EAX	;Add into total number of msects
+	CMPL	run_nummsc#, #MAXNUMMSC	;Too many?
+6$:	JA	badrunf.S		;Yes - fail
+	MOVB	run_msccnt#, AL		;No - store count
+	MOVL	ESI, run_segpnt#	;Point to segment data block
+	MOVL	rs_nummsc.B[ESI], EAX
+	MOVW	AX, run_seghdr#+sh_select ;Store selector
+	CMPW	AX, #0FFFFFFF8h.B
+	JB	7$.S
+	MOVL	EAX, #0FFF8h
+7$:	MOVW	rs_select.B[ESI], AX
+	MOVW	rs_spec.B[ESI], AX
+	MOVB	AL, run_seghdr#+sh_type	;Store segment type
+	MOVB	rs_type.B[ESI], AL
+	MOVB	AL, run_seghdr#+sh_status ;Store segment status byte
+	MOVB	rs_sts.B[ESI], AL
+	MOVB	AL, run_header#+ih_numseg ;Store segment number
+	SUBB	AL, run_segcnt#
+	INCL	EAX
+	MOVB	rs_number.B[ESI], AL
+	MOVZBL	EAX, run_seghdr#+sh_linked ;Get number of linked segment
+	TESTL	EAX, EAX		;If none
+	JE	8$.S
+	CMPB	AL, rs_number.B[ESI]	;Really a different segment?
+	JE	5$.S			;No - fail
+	CMPB	AL, run_header#+ih_numseg ;Yes - valid value?
+	JA	6$.S			;No - fail
+	DECL	EAX			;Yes - get pointer to linked segment
+	IMULL	EAX, #rs_SIZE.B
+	ADDL	EAX, #run_segtbl#
+8$:	MOVL	rs_linked.B[ESI], EAX	;Store it
+	LEAL	EAX, rs_firstrm.B[ESI]	;Initialize msect list pointers
+	MOVL	run_prevrm#, EAX
+10$:	MOVL	ECX, #6			;Get first part of the msect header
+	CMPB	run_header#+ih_ver, #1
+	JE	11$.S
+	ADDL	ECX, #2.B
+11$:	MOVL	EBX, #run_mschdr#
+	PUSHL	ECX
+	CALL	usrrnrdbytes#
+	POPL	EDX
+12$:	JC	ret006
+	MOVZBL	ECX, run_mschdr#+mh_hdrsize ;Get size of header
+	SUBL	ECX, EDX		;Minus amount already read
+	JS	badrunf
+	PUSHL	ECX
+	CMPL	ECX, #36t-8t.B
+	JBE	13$.S
+	MOVB	CL, #36t-8t
+13$:	MOVL	EBX, #run_mschdr#+8
+	CALL	usrrnrdbytes#
+	POPL	ECX
+	JC	12$.S
+	SUBL	ECX, #36t-8t.B		;Need to skip any extra bytes?
+	JBE	14$.S			;No
+	CALL	usrrnrdskip#
+	JC	12$.S
+14$:	MOVL	EBX, run_mscpnt#	;Get pointer to our buffer
+	MOVL	EAX, run_prevrm#	;Link into msect list for segment
+	MOVL	[EAX], EBX
+	CLRL	EAX
+	MOVL	rm_next.B[EBX], EAX
+	LEAL	EAX, rm_next.B[EBX]
+	MOVL	run_prevrm#, EAX
+	MOVL	EAX, run_segpnt#	;Store pointer to segment data
+	MOVL	rm_seg.B[EBX], EAX
+	INCL	run_msnum#		;Store msect number
+	MOVL	EAX, run_msnum#
+	MOVL	rm_num.B[EBX], EAX
+	MOVL	EAX, run_mschdr#+mh_addr ;Get offset or modulus
+	TESTB	run_mschdr#+mh_status, #MS$ABS ;Absolute msect?
+	JNE	20$.S			;Yes
+	CMPL	EAX, #0FFFFFFFFh.B
+	JE	16$.S
+	ANDL	EAX, #0FFE00000h	;No - make sure modulus value is
+					;  reasonable
+	JNE	18$.S			;Is modulus value 0?
+16$:	MOVL	EAX, #1			;Yes - make it 1
+18$:	MOVL	rm_mod.B[EBX], EAX	;Store modulus value
+	MOVL	rm_base.B[EBX], #0FFFFFFFFh
+	JMP	22$.S
+
+;Here if offset specified for msect
+
+20$:	ADDL	EAX, #0FFFh		;Round up to page boundry
+	ANDL	EAX, #0FFFFF000h
+	MOVL	rm_base.B[EBX], EAX	;Store offset value
+	MOVL	rm_mod.B[EBX], #1	;Make the modulus 1
+22$:	MOVL	EAX, run_mschdr#+mh_alloc ;Store amount to allocate
+	ADDL	EAX, #0FFFh
+	ANDL	EAX, #0FFFFF000h
+	MOVL	rm_alloc.B[EBX], EAX
+	MOVL	EAX, run_mschdr#+mh_avail ;Get amount to reserve
+	ADDL	EAX, #0FFFh
+	ANDL	EAX, #0FFFFF000h
+	CMPL	EAX, rm_alloc.B[EBX]	;Is it big enough?
+	JAE	24$.S			;Yes
+	MOVL	EAX, rm_alloc.B[EBX]	;No
+24$:	MOVL	rm_space.B[EBX], EAX
+	MOVL	EAX, run_mschdr#+mh_dataos ;Get offset in file for data
+	MOVL	rm_dataos.B[EBX], EAX
+	MOVL	EAX, run_mschdr#+mh_datasz ;Get amount to load
+	MOVL	rm_datasz.B[EBX], EAX
+	MOVL	EAX, run_mschdr#+mh_relos ;Get offset in file for relocation
+	MOVL	rm_relos.B[EBX], EAX	 ;  information
+	MOVL	EAX, run_mschdr#+mh_relsz ;Get size of relocation information
+	MOVL	rm_relsz.B[EBX], EAX
+	ADDL	run_mscpnt#, #rm_SIZE.B	;Bump msect data pointer
+	DECB	run_msccnt#		;More msects for this segment?
+	JNE	10$			;Yes - continue
+	ADDL	run_segpnt#, #rs_SIZE.B	;Bump segment data pointer
+	DECB	run_segcnt#		;Have another segment to load?
+	JNE	2$			;Yes - continue
+					;Fall into runrun4 on next page
+.PAGE
+;Here after finished reading the RUN file header information - first check all
+;  specified segment selectors for conflicts
+
+runrun4:MOVL	ESI, #run_segtbl#	;Reset pointer for segment data
+	MOVB	AL, run_header#+ih_numseg ;Reset segment count
+	MOVB	run_segcnt#, AL
+4$:	MOVW	AX, rs_select.B[ESI]	;Get selector specified
+	TESTW	AX, AX			;Was one specified?
+	JE	10$.S			;No - go on
+	MOVL	EDX, #run_segtbl#	;Point to start of the segment table
+	MOVZBL	ECX, run_header#+ih_numseg ;Get number of segments
+6$:	CMPL	EDX, ESI		;Is this the one we are checking?
+	JE	8$.S			;Yes
+	CMPW	rs_select.B[EDX], AX	;No - this one?
+	JE	memcnflt		;If conflict
+8$:	ADDL	EDX, #rs_SIZE.B		;No - bump pointer (this leaves Z clear)
+	LOOP	ECX, 6$			;Continue if more to check
+					;Not found - OK
+10$:	ADDL	ESI, #rs_SIZE.B		;Bump data pointer
+	DECB	run_segcnt#		;More segments?
+	JNE	4$.S			;Yes - continue
+
+;Now check and allocate offsets for msects.  First we sort the msects for each
+;  segment so that all msects with offsets specified are first in order of
+;  increasing offsets.  Next we check for overlaps and then assign offsets for
+;  all msects for which no offsets are specified.
+
+	MOVL	ESI, #run_segtbl#	;Reset segment data pointer
+	PUSHL	DS
+	POPL	ES
+	MOVB	AL, run_header#+ih_numseg ;Reset segment count
+	MOVB	run_segcnt#, AL
+14$:	MOVL	EBX, rs_linked.B[ESI]	;Is this a linked segment?
+	TESTL	EBX, EBX
+	JE	20$.S			;No
+	CMPL	rs_linked.B[EBX], ESI	;Yes - is it a 1-to-1 link?
+	JNE	memcnflt		;Bad format if not 1-to-1
+	CMPL	rs_firstrm.B[ESI], #0.B	;OK - does it have any msects now?
+	JE	34$			;No - must have already seen them
+	MOVL	EAX, rs_firstrm.B[ESI]	;Find last msect for this segment
+16$:	CMPL	rm_next.B[EAX], #0.B
+	JE	18$.S
+	MOVL	EAX, rm_next.B[EAX]
+	JMP	16$.S
+
+18$:	MOVL	EDX, rs_firstrm.B[EBX]	;Link linked segment's msects to end of
+	MOVL	rm_next.B[EAX], EDX	;  list for this segment
+	CLRL	EAX			;Clear out the linked segment's pointer
+	MOVL	rs_firstrm.B[EBX], EAX
+20$:	LEAL	EDX, rs_firstrm.B[ESI]	;Get offset of pointer to first msect
+	MOVL	EDI, [EDX]		;Point to first msect for segment
+	MOVB	CH, #0			;Clear swapped indicator
+22$:	MOVL	EBX, rm_next.B[EDI]	;Anything left to compare?
+	TESTL	EBX, EBX
+	JE	28$.S			;No - go see if more sorting needed
+	MOVL	EAX, rm_base.B[EDI]	;Yes - need to swap here?
+	CMPL	rm_base.B[EBX], EAX
+	JAE	26$.S			;No
+	MOVL	EAX, rm_next.B[EBX]	;Yes - do it
+	MOVL	rm_next.B[EDI], EAX
+	MOVL	rm_next.B[EBX], EDI
+	MOVL	[EDX], EBX
+	MOVL	EDI, EBX
+	INCB	CH			;Indicate swap done
+26$:	MOVL	EDI, rm_next.B[EDI]	;Advance to next block
+	JMP	22$.S			;And continue
+
+;Here when finished with scan of the msects
+
+28$:	TESTB	CH, CH			;Did we do any swaps this time?
+	JNE	20$.S			;Yes - go do it all again
+
+;Here with all msects sorted - now check for conflicts
+
+	MOVL	EDI, rs_firstrm.B[ESI]
+	MOVL	EDX, #1000h		;Start allocating at the second page if
+					;  no offsets at all specified
+30$:	MOVL	EAX, rm_base.B[EDI]	;Was an offset specified?
+	CMPL	EAX, #0FFFFFFFFh.B
+	JNE	32$.S			;Yes - use it
+	MOVL	EAX, EDX		;No - use next available offset
+	ADDL	EAX, rm_mod.B[EDI]	;Round up to modulus
+	DECL	EAX
+	CLRL	EDX
+	DIVL	rm_mod.B[EDI]
+	IMULL	EAX, rm_mod.B[EDI]
+	MOVL	rm_base.B[EDI], EAX	;Store as base offset for msect
+32$:	ADDL	EAX, rm_space.B[EDI]	;Get highest offset needed here
+	CMPL	EAX, #maxoffset#+1	;Is it too big?
+	JA	memcnflt.S		;Yes - fail
+	MOVL	EDX, EAX		;Remember it for allocation
+	MOVL	EAX, rm_base.B[EDI]	;Get actual top for overlap check
+	ADDL	EAX, rm_alloc.B[EDI]
+	MOVL	EDI, rm_next.B[EDI]	;No - advance to next msect
+	TESTL	EDI, EDI		;More to check?
+	JE	34$.S			;No
+	CMPL	EAX, rm_base.B[EDI]	;Yes - does next msect conflict?
+	JBE	30$.S			;No - continue
+memcnflt:				;Here if have memory conflict
+	MOVL	EAX, #ER_MACFT
+retsc8:	STC
+ret008:	RET
+
+;Here with all msects checked and offsets assigned
+
+34$:	ADDL	ESI, #rs_SIZE.B		;Bump segment data pointer
+	DECB	run_segcnt#		;More segments?
+	JNE	14$			;Yes - continue
+					;No - fall into loadrdy on next page
+.PAGE
+;Here when ready to actually load data from the RUN file.  All segment and
+;  msect headers have been read.
+
+loadrdy:MOVL	EDX, run_header#+ih_importos ;Have any imported symbols?
+	TESTL	EDX, EDX
+2$:	JE	loadrd2			;No - go on
+	MOVL	EAX, run_header#+ih_importno ;Yes - get number of symbols
+	TESTL	EAX, EAX		;(just to be safe!)
+	JE	2$.S
+	MOVL	run_relitem#, EAX
+	MOVL	EAX, run_free#		;Store offset of symbol table we will
+	MOVL	run_symtbl#, EAX	;  construct here
+	CALL	usrrnrdbyte1r#		;Read the first header byte
+	JC	8$.S			;If error
+4$:	CALL	usrrnrdname#		;Get symbol name
+	JC	8$.S			;If error
+	CMPL	run_symsize#, #4t.B	;Is the name long enough?
+	JB	undfsym.S		;No - fail
+	MOVL	EAX, run_symname#	;Yes - get the prefix part
+	ANDL	EAX, #0FFFFFFh
+	MOVL	EDX, #GS_EXPORT
+	MOVL	ES, EDX			;Set up to search the prefix table
+	MOVL	EDX, ES:0
+6$:	CMPL	EAX, ES:4.B[EDX]	;This one?
+	JE	10$.S			;Yes
+	MOVL	EDX, ES:[EDX]		;No - advance to next entry
+	TESTL	EDX, EDX
+	JNE	6$.S			;Continue if more to check
+undfsym:MOVL	EAX, #ER_IRFSU
+	STC
+8$:	RET
+
+;Here with match on the symbol prefix
+
+10$:	MOVL	EAX, ES:12t.B[EDX]	;Get number of entries in table
+	MOVL	run_relcnt#, EAX
+	ADDL	EDX, #16t		;Get offset of table
+	MOVZBL	EAX, run_symsize#	;Get length of the symbol
+	SUBL	EAX, #4t.B		;Minus 4
+	CLD
+12$:	MOVB	CL, ES:1.B[EDX]		;Might it be this one?
+	ANDL	ECX, #1Fh.B
+	CMPB	AL, CL
+	JNE	14$.S			;No
+	LEAL	EDI, 2.B[EDX]		;Yes
+	MOVL	ESI, #run_symname#+3
+	INCL	ECX
+	RECMPSB	[EDI], [ESI]		;Compare names
+	JE	20$.S			;If match
+14$:	MOVZBL	ECX, ES:[EDX]		;Not this one - advance to next
+	ADDL	EDX, ECX
+	DECL	run_relcnt#		;More to check?
+	JNE	12$.S			;Yes - continue
+	JMP	undfsym.S		;No - fail
+
+;Here with match on symbol name
+
+20$:	MOVB	AL, ES:1.B[EDX]
+	CLRL	EBX			;Get length of selector
+	TESTB	AL, #80h		;Address?
+	JE	22$.S			;No
+	INCL	EBX			;Yes
+	TESTB	AL, #40h		;1 byte value?
+	JE	22$.S			;Yes	
+	INCL	EBX			;No - its 2 bytes
+22$:	ANDL	EAX, #1F.B		;Get length of symbol - 1
+	MOVZBL	ECX, ES:[EDX]		;Get total length
+	SUBL	ECX, EAX
+	SUBL	ECX, EBX
+	SUBL	ECX, #3.B
+	CMPL	ECX, #4.B		;Is the length valid?
+	JA	24$.S			;No - fail
+	JMPIL	CS:symosd[ECX*4]
+
+	.MOD	4
+symosd:	.LONG	osf0
+	.LONG	osf1
+	.LONG	osf2
+	.LONG	osf3
+	.LONG	osf4
+
+24$:	MOVL	EAX, #ER_IFXST
+	STC
+	RET
+
+osf0:	CLRL	EAX
+	TESTB	ES:1.B[EDX], #20h
+	JE	26$.S
+	DECL	EAX
+	JMP	26$.S
+
+osf1:	MOVZBL	EAX, ES:[EDI]
+	INCL	EDI
+	TESTB	ES:1.B[EDX], #20h
+	JE	26$.S
+	ORL	EAX, #0FFFFFF00h
+	JMP	26$.S
+
+osf2:	MOVZWL	EAX, ES:[EDI]
+	ADDL	EDI, #2.B
+	TESTB	ES:1.B[EDX], #20h
+	JE	26$.S
+	ORL	EAX, #0FFFF0000h
+	JMP	26$.S
+
+osf3:	MOVZWL	EAX, ES:1.B[EDI]
+	SHLL	EAX, #8t
+	MOVB	AL, ES:[EDI]
+	ADDL	EDI, #3.B
+	TESTB	ES:1.B[EDX], #20h
+	JE	26$.S
+	ORL	EAX, #0FF000000h
+	JMP	26$.S
+
+osf4:	MOVL	EAX, ES:[EDI]
+	ADDL	EDI, #4.B
+26$:	PUSHL	EAX
+	JMPIL	CS:symssd[EBX*4]
+
+	.MOD	4
+symssd:	.LONG	sel0
+	.LONG	sel1
+	.LONG	sel2
+
+sel0:	CLRL	EAX
+	JMP	28$.S
+
+sel1:	MOVZBL	EAX, ES:[EDI]
+	JMP	28$.S
+
+sel2:	MOVZWL	EAX, ES:[EDI]
+28$:	PUSHL	EAX
+	MOVL	ECX, #8t
+	CALL	usrrngetmem#		;Allocate memory for table entry
+	JC	30$.S			;If error
+	POPL	4.B[EDI]		;Store symbol value in table
+	POPL	[EDI]
+	DECL	run_relitem#		;More symbols?
+	JE	loadrd2.S		;No - all done with this
+	CALL	usrrnrdbyte1s#		;Yes - discard next header byte
+	JNC	4$			;Continue if OK
+ret012:	RET				;If error
+
+;Here if error allocating memory for symbol table entry
+
+30$:	POPL	EDX			;Fix up the stack
+	POPL	EDX
+	RET
+.PAGE
+loadrd2:CALL	usrrncontext#		;Get into correct context to finish
+	JC	ret012.S		;If error
+	JNE	ret012.S		;If finished
+
+;Here in correct context to load program - if loading into same process, all
+;  memory has been given up - if loading into child process, we are now
+;  executing in the context of that process
+
+2$:	MOVL	run_mscpnt, #run_msctbl# ;Reset data block pointer
+	MOVB	AL, run_nummsc#
+	MOVB	run_msccnt#, AL
+loadmsc:MOVL	EBX, run_mscpnt#	;Get pointers to our data blocks
+	CMPL	rm_alloc.B[EBX], #0.B	;Anything to allocate for this one?
+	JE	16$			;No - skip it!
+	MOVL	ESI, rm_seg.B[EBX]	;Yes
+	CMPB	rs_alloc.B[ESI], #0	;Is the segment allocated yet?
+	JNE	12$.S			;Yes
+	MOVZWL	EAX, rs_spec.B[ESI]	;No - get selector for segment
+	PUSHL	EAX
+	CMPL	rs_linked.B[ESI], #0.B	;Is this a linked segment?
+	JE	6$.S			;No
+	CMPL	rs_firstrm.B[ESI], #0.B	;Yes - have we already created it?
+	JE	8$.S			;Yes - link to it this time
+6$:	PUSHL	#ST_32RWDATA.B		;Make it a 32 bit read/write data
+					;  segment
+	CALLF	svcMemCreate#		;Create the segment
+	JMP	10$.S
+
+;Here if need to link to segment we have already created
+
+8$:	MOVL	EAX, rs_linked.B[ESI]
+	PUSHL	rs_select.B[EAX]	;Make it a 32 bit read/write data
+	PUSHL	#ST_32RWDATA.B		;  segment
+	CALLF	svcMemLink#		;Link to the segment
+10$:	TESTL	EAX, EAX
+	JS	14$.S
+	INCB	rs_alloc.B[ESI]		;Indicate segment allocated
+	MOVL	EBX, run_mscpnt#	;Get pointers
+	MOVL	ESI, rm_seg.B[EBX]
+	MOVW	rs_spec.B[ESI], AX
+	CMPW	AX, #0FFFFFFF8h.B	;Real mode selector?
+	JAE	12$.S			;Yes
+	MOVW	rs_select.B[ESI], AX	;No
+12$:	MOVXWL	EAX, rs_spec.B[ESI]	;Yes - get selector for segment
+	PUSHL	EAX
+	PUSHL	rm_base.B[EBX]		;Get offset for msect
+	PUSHL	#PG$WRITE|PG$READ.B	;Make it a read/write msect
+	PUSHL	rm_alloc.B[EBX]		;Get number of memory blocks needed
+	CALLF	svcMemChange#		;Allocate memory for the msect
+	TESTL	EAX, EAX
+14$:	JS	usrrnexit#		;If error
+	MOVL	EBX, run_mscpnt#	;Get pointers again
+	MOVL	ESI, rm_seg.B[EBX]
+	MOVL	EDX, rm_dataos.B[EBX]	;Get offset in file for data
+	MOVL	ECX, rm_datasz.B[EBX]	;Get amount to load
+	MOVL	EBX, rm_base.B[EBX]	;Get address to load into
+	MOVW	ES, rs_select.B[ESI]
+	CALL	usrrnrdblkr#		;Read the data for the msect
+	JC	usrrnexit#		;If error
+16$:	ADDL	run_mscpnt#, #rm_SIZE.B	;Bump buffer pointer
+	DECB	run_msccnt#		;Have another msect to load?
+	JNE	loadmsc			;Yes - go load load it
+					;No - continue on next page
+.PAGE
+	MOVL	run_mscpnt#, #run_msctbl ;Reset data block pointer
+	MOVB	AL, run_nummsc#		;And count
+	MOVB	run_msccnt#, AL
+relmsc:	MOVL	EBX, run_mscpnt#	;Get pointer to msect data
+	MOVL	EAX, rm_relsz.B[EBX]	;Have any relocation information?
+	TESTL	EAX, EAX
+	JE	reldone			;No - go on
+	MOVL	run_relcnt#, EAX	;Yes - store count
+	MOVL	EAX, rm_base.B[EBX]	;Initialize offset for relocation
+	MOVL	run_apply#+0, EAX
+	MOVL	EDX, rm_relos.B[EBX]	;Get offset in file for relocation
+	CALL	usrrnrdbyte1r#		;Read the first header byte
+	JC	4$.S
+relloop:MOVB	run_reltype#, AL	;Save the byte
+	MOVB	run_temp#, AL		;Save size of offset field
+	ANDB	run_temp#, #3
+	CMPB	run_header#+ih_ver, #1	;Version 1 file?
+	JNE	10$.S			;No - must be version 2
+	SHRB	AL, #2			;Get item number
+	ANDB	AL, #7
+	CMPB	AL, #7			;Need more than 3 bits?
+	JNE	2$.S			;No
+	CALL	usrrnrdbyte1s#		;Yes - read another byte
+	JC	4$.S			;If error
+2$:	TESTB	AL, AL			;Make sure not 0
+	JNE	6$.S
+badreloc:
+	MOVL	EAX, #ER_IRFRD		;Indicate relocation error
+4$:	JMP	usrrnexit#		;And go fail
+
+;Here with item number
+
+6$:	CALL	getdelta		;Get delta value
+	JC	4$.S
+	SHRB	DL, #5
+	JE	relseg
+	TESTL	EAX, EAX
+	JE	badreloc.S
+	CMPL	EAX, run_nummsc#
+	JA	badreloc.S
+	IMULL	EAX, #rm_SIZE.B		;Change to index into data table
+	JMPIL	CS:relcdsp-4[EDX*4]
+
+;Dispatch table for version 1 relocation type
+
+	.MOD	4
+relcdsp:.LONG	relam16ofs	; 1 - 16 bit absolute msect offset
+	.LONG	relam32ofs	; 2 - 32 bit absolute msect offset
+	.LONG	relrm16ofs	; 3 - 16 bit relative msect offset
+	.LONG	relrm32ofs	; 4 - 32 bit absolute msect offset
+	.LONG	badreloc	; 5 - Illegal
+	.LONG	badreloc	; 6 - Illegal
+	.LONG	badreloc	; 7 - Illegal
+
+;Here for version 2 relocation
+
+10$:	CALL	getvarval		;Get item number
+	JC	4$.S			;If error
+	CALL	getdelta		;Get the delta value
+	JC	4$.S
+	MOVL	ECX, EDX
+	SHRL	EDX, #2t
+	ANDL	EDX, #03h
+	JMPIL	CS:kinddsp[EDX*4]	;Dispatch on the relocation kind
+
+	.MOD	4
+kinddsp:.LONG	rel2seg		; 0 - Segment
+	.LONG	rel2msect	; 1 - Msect
+	.LONG	rel2sym		; 2 - Symbol
+	.LONG	badreloc	; 3 - Illegal
+
+;Here if relocation specified with a segment
+
+rel2seg:TESTB	CL, #0E0h		;Type must be 0
+	JE	relseg
+12$:	JMP	badreloc
+
+;Here if relocation specified with an msect
+
+rel2msect:
+	TESTL	EAX, EAX		;Valid msect number?
+	JE	12$.S			;No
+	CMPL	EAX, run_nummsc#	;Maybe
+	JA	12$.S			;No
+	IMULL	EAX, #rm_SIZE.B		;Yes - change to index into data table
+	SHRL	ECX, #4t		;Get relocation type
+	ANDL	ECX, #0Fh
+	JMPIL	CS:typemsdsp[ECX*4]	;Dispatch on the type
+
+typemsdsp:
+	.LONG	relmsseg	; 0 - Selector
+	.LONG	badreloc	; 1 - Illegal
+	.LONG	badreloc	; 2 - Illegal
+	.LONG	badreloc	; 3 - Illegal
+	.LONG	relam8ofs	; 4 - 8-bit absolute offset
+	.LONG	relrm8ofs	; 5 - 8-bit relative offset
+	.LONG	relam16ofs	; 6 - 16-bit absolute offset
+	.LONG	relrm16ofs	; 7 - 16-bit relative offset
+	.LONG	relam32ofs	; 8 - 32-bit absolute offset
+	.LONG	relrm32ofs	; 9 - 32-bit relative offset
+	.LONG	relam16adr	;10 - 16-bit address
+	.LONG	relam32adr	;11 - 32-bit address
+	.LONG	relam16adr	;12 - 16-bit address
+	.LONG	badreloc	;13 - Illegal
+	.LONG	relam32adr	;14 - 32-bit address
+	.LONG	badreloc	;15 - Illegal
+
+;Here to relocate selector given an msect number
+
+relmsseg:
+	CMPL	EAX, run_nummsc#
+	JA	12$.S
+	IMULL	EAX, #rm_SIZE.B
+	MOVL	EAX, run_msctbl#+rm_seg[EAX]
+	MOVL	EAX, rs_select.B[EAX]
+	JMP	relsg2
+
+;Here if relocation is specified with a symbol value
+
+rel2sym:
+	TESTL	EAX, EAX		;Valid symbol number?
+	JE	badreloc		;No
+	CMPL	EAX, run_header+ih_importno ;Maybe
+	JA	badreloc		;No - fail
+	MOVL	EDX, run_symtbl#	;Yes
+	SHRL	ECX, #4t
+	ANDL	ECX, #0Fh
+	JMPIL	CS:typesymdsp[ECX*4]
+
+typesymdsp:
+	.LONG	relsymseg	; 0 - Selector
+	.LONG	badreloc	; 1 - Illegal
+	.LONG	badreloc	; 2 - Illegal
+	.LONG	badreloc	; 3 - Illegal
+	.LONG	relasym8ofs	; 4 - 8-bit absolute offset
+	.LONG	relrsym8ofs	; 5 - 8-bit relative offset
+	.LONG	relasym16ofs	; 6 - 16-bit absolute offset
+	.LONG	relrsym16ofs	; 7 - 16-bit relative offset
+	.LONG	relasym32ofs	; 8 - 32-bit absolute offset
+	.LONG	relrsym32ofs	; 9 - 32-bit relative offset
+	.LONG	relasym16adr	;10 - 16-bit address
+	.LONG	relasym32adr	;11 - 32-bit address
+	.LONG	relasym16adr	;12 - 16-bit absolute address
+	.LONG	badreloc	;13 - Illegal
+	.LONG	relasym32adr	;14 - 32-bit absolute address
+	.LONG	badreloc	;15 - Illegal
+
+;Here to relocate using selector value for symbol
+
+relsymseg:
+	MOVL	EAX, 4-8.B[EDX+EAX*8]	;Get offset
+	JMP	rel16			;Go relocate it
+
+;Here to relocate using absolute 8-bit offset value for symbol
+
+relasym8ofs:
+	MOVL	EAX, 0-8.B[EDX+EAX*8]	;Get offset
+	JMP	rel8			;Go relocate it
+
+;Here to relocate using absolute 16-bit address for symbol
+
+relasym16adr:
+	MOVL	ECX, 4-8.B[EDX+EAX*8]	;Get selector
+	ADDW	FS:2.B[ESI], CX		;Relocate the selector
+					;Fall into relasym16ofs
+
+;Here to relocate using absolute 16-bit offset value for symbol
+
+relasym16ofs:
+	MOVL	EAX, 0-8.B[EDX+EAX*8]	;Get offset
+	JMP	rel16			;Go relocate it
+
+;Here to relocate using absolute 32-bit address for symbol
+
+relasym32adr:
+	MOVL	ECX, 4-8.B[EDX+EAX*8]	;Get selector
+	ADDW	FS:4.B[ESI], CX		;Relocate the selector
+					;Fall into relasym32ofs
+
+;Here to relocate using absolute 32-bit offset value for symbol
+
+relasym32ofs:
+	MOVL	EAX, 0-8.B[EDX+EAX*8]	;Get offset
+	JMP	rel32			;Go relocate it
+
+;Here to relocate using relative 8-bit offset value for symbol
+
+relrsym8ofs:
+	MOVL	EAX, 0-8.B[EDX+EAX*8]	;Get offset
+	JMP	rel8r			;Go relocate it
+
+;Here to relocate using relative 16-bit offset value for symbol
+
+relrsym16ofs:
+	MOVL	EAX, 0-8.B[EDX+EAX*8]	;Get offset
+	JMP	rel16r			;Go relocate it
+
+;Here to relocate using relative 32-bit offset value for symbol
+
+relrsym32ofs:
+	MOVL	EAX, 0-8.B[EDX+EAX*8]	;Get offset
+	JMP	rel32r			;Go relocate it
+.PAGE
+;Here to relocate segment selector given segment number
+
+relseg:	CMPB	AL, run_header+ih_numseg
+	JA	badreloc
+	IMULL	EAX, #rs_SIZE.B		;No - change to index into data table
+	MOVW	AX, run_segtbl#+rs_select-rs_SIZE[EAX] ;Get selector
+relsg2:	ORB	AL, #07h
+	JMP	rel16.S
+
+;Here to relocate 8-bit absolute msect offset
+
+relam8ofs:
+	MOVL	EAX, run_msctbl#+rm_base-rm_SIZE[EAX] ;Get base of msect
+	JMP	rel8.S
+
+;Here to relocate 16-bit absolute msect address
+
+relam16adr:
+	MOVL	ECX, run_msctbl#+rm_seg-rm_SIZE[EAX]
+	MOVL	ECX, rs_select[ECX] ;Get selector
+	ADDW	FS:2.B[ESI], CX		;Relocate it
+					;Fall into relam16ofs
+
+;Here to relocate 16-bit absolute msect offset
+
+relam16ofs:
+	MOVL	EAX, run_msctbl#+rm_base-rm_SIZE[EAX] ;Get base of msect
+	JMP	rel16.S
+
+;Here to relocate 32-bit absolute msect address
+
+relam32adr:
+	MOVL	ECX, run_msctbl#+rm_seg-rm_SIZE[EAX]
+	MOVL	ECX, rs_select[ECX] ;Get selector
+	ADDW	FS:4.B[ESI], CX		;Relocate it
+					;Fall into relam32ofs
+
+;Here to relocate 32-bit absolute msect offset
+
+relam32ofs:
+	MOVL	EAX, run_msctbl#+rm_base-rm_SIZE[EAX] ;Get base of msect
+	JMP	rel32.S
+
+;Here to relocate 8-bit relative msect offset
+
+relrm8ofs:
+	MOVL	EAX, run_msctbl#+rm_base-rm_SIZE[EAX] ;Get base of msect
+rel8r:	SUBL	EAX, rm_base.B[EBX]	;Minus base of msect being relocated
+rel8:
+
+	MOVB	DL, FS:[ESI]
+	MOVB	CL, #8t
+
+	ADDB	FS:[ESI], AL		;Do the relocation
+	JMP	relnext.S		;Done with this item
+
+;Here to relocate 16-bit relative msect offset
+
+relrm16ofs:
+	MOVL	EAX, run_msctbl#+rm_base-rm_SIZE[EAX] ;Get base of msect
+rel16r:	SUBL	EAX, rm_base.B[EBX]	;Minus base of msect being relocated
+rel16:
+	MOVW	DX, FS:[ESI]
+	MOVB	CL, #16t
+
+	ADDW	FS:[ESI], AX		;Do the relocation
+	JMP	relnext.S		;Done with this item
+
+;Here to relocate 32-bit relative msect offset
+
+relrm32ofs:
+	MOVL	EAX, run_msctbl#+rm_base-rm_SIZE[EAX] ;Get base of msect
+rel32r:	SUBL	EAX, rm_base[EBX]	;Minus base of msect being relocated
+rel32:
+	MOVL	EDX, FS:[ESI]
+	MOVB	CL, #32t
+
+	ADDL	FS:[ESI], EAX		;Do the relocation
+relnext:JNO	8$.S			;Go on if no overflow
+	MOVL	EAX, #ER_DATTR		;Indicate relocation truncation
+	JMP	usrrnexit#
+
+8$:	DECL	run_relcnt#		;More relocation to do here?
+	JE	reldone.S		;No
+	CALL	usrrnrdbyte1s#		;Read one byte (sequential)
+	JNC	relloop			;OK - continue
+10$:	JMP	usrrnexit#		;If error
+
+;Here when finished doing relocation for an msect - if this is the last msect
+;  in its segment we now make sure the segment is set up correctly
+
+reldone:MOVL	EAX, run_mscpnt#	;Point to data for segment
+	MOVL	EBX, rm_seg.B[EAX]
+	CMPL	EBX, rm_seg+rm_SIZE.B[EAX] ;Is this the last msect for its
+					   ;  segment?
+	JE	16$.S			;No - go on
+	CMPB	rs_alloc.B[EBX], #0	;Yes - did we allocate the segment?
+	JE	16$.S			;No
+	MOVZBL	ECX, rs_type.B[EBX]	;Yes - get segment type
+	CMPB	CL, #ST_REAL		;Real mode segment?
+	JE	16$.S			;Yes - nothing needed here
+	ANDB	CL, #03h		;No
+	MOVB	DL, rs_sts.B[EBX]
+	TESTB	DL, #SS$32BIT		;32 bit segment?
+	JE	12$.S			;No
+	ORB	CL, #04h		;Yes
+12$:	ANDB	DL, #SS$READ|SS$WRITE
+
+	ORB	DL, #SS$READ|SS$WRITE	;;;;TEMP SINCE THESE BITS ARE NOT SET
+					;;;;  IN THE CURRENT RUN FILES!!!
+
+	ORB	CL, DL
+	MOVZBL	ECX, CS:segtype[ECX]	;Get desired segment type
+	MOVZWL	EDX, rs_select.B[EBX]
+	PUSHL	EDX
+	PUSHL	ECX
+	CALLF	svcMemSegType#		;Set the segment type
+	TESTL	EAX, EAX
+	JS	10$.S
+16$:	ADDL	run_mscpnt#, #rm_SIZE.B	;Bump buffer pointer
+	DECB	run_msccnt#		;Have another msect to relocate?
+	JNE	relmsc			;Yes - go relocate it
+					;No - fall into loadok on next page
+.PAGE
+;Here with program loaded without any errors
+
+loadok:	MOVL	EAX, run_loadhndl#	;Get device handle
+	CALL	usrrnclose#		;Close the file
+	BTL	run_option#, #R%DOSEXEC	;DOS exec call?
+	JNC	4$.S			;No
+	MOVL	EAX, run_fnlen#		;Yes - move argument string up to make
+	DECL	EAX			;  room for the first atom (we assume
+	MOVL	ECX, arg_cmdlen		;  this will fit on our argument page
+	MOVL	ESI, arg_cmdofs		;  since DOS command tails can't be
+	LEAL	ESI, -1.B[ESI+ECX]	;  longer than 127 bytes!)
+	LEAL	EDI, [ESI+EAX]
+	PUSHL	DS
+	POPL	ES
+	STD
+	RMOVSB	[EDI], [ESI]
+	MOVL	ECX, EAX		;Copy file name as first command atom
+	MOVL	ESI, run_fnbgn#		;  since DOS programs don't supply it!
+	MOVL	EDI, arg_cmdofs
+	ADDL	arg_cmdlen, EAX
+	CLD
+	RMOVSB	[EDI], [ESI]
+4$:	BTL	run_option#, #R%DEBUG	;Is this a debug load?
+	JC	rundebg			;Yes
+	MOVL	EBX, #run_header#+ih_stack
+	CALL	reldata			;Relocate user stack address
+	VERW	DX			;Make sure writable
+	JNE	urbadrunf
+	MOVL	SS, EDX			;Switch to the program's stack
+	MOVL	ESP, EAX
+	MOVL	EBX, #run_header#+ih_debug ;Assume have debugger address
+	CMPB	4.B[EBX], #0.B		;Right?
+	JNE	6$.S			;Yes
+	MOVL	EBX, #run_header#+ih_start ;No - use program start address
+6$:	CALL	relcode			;Relocate the address
+8$:	JC	urbadrunf
+	CLRL	ECX
+	PUSHL	ECX			;Store item count and vector number
+	PUSHL	ECX			;Store EFR value
+	PUSHL	EDX			;Stack the intial CS value
+	PUSHL	EAX			;Stack the inital EIP value
+	PUSHL	ECX			;Store DS value
+	PUSHL	DS			;Store ES value
+	PUSHL	ECX			;Store FS value
+	PUSHL	ECX			;Store GS value
+	MOVL	EBX, #run_header#+ih_start
+	CALL	relcode			;Relocate actual program start address
+	JC	8$.S
+	PUSHL	EDX
+	PUSHL	EAX
+	CALL	usrrnfin#
+	PUSHL	DS
+	PUSHL	#run_base#		;Give up our data page
+	PUSHL	#0.B
+	PUSHL	#0.B
+	CALLF	svcMemChange#
+	POPL	EBX			;Get program start address in the
+	POPL	EDX			;  right registers
+	CLRL	EAX			;Clear unused registers
+	CLRL	ECX
+	CLRL	EDI			;Start the program (we must use an
+	CLRL	ESI			;  sav_schdismiss call here instead
+	CLRL	EBP			;  of a simple RETF to clear the
+	CALLF	svcSchDismiss#		;  set-up state of this process)
+.PAGE
+;Here for debug load of protected mode RUN file
+
+rundebg:CALL	strdebg			;Store relocation data
+	JC	usrrnexit#
+	MOVL	ES:rd_ES.B[EDI], DS	;Put selector for argument segment in ES
+	MOVL	EBX, #run_header#+ih_stack
+	CALL	reldata			;Relocate user stack address
+	MOVL	ES:rd_ESP.B[EDI], EAX
+	VERW	DX			;Make sure writable
+	JNE	urbadrunf.S
+	MOVL	ES:rd_SS.B[EDI], EDX
+	MOVL	EBX, #run_header#+ih_start
+	CALL	relcode			;Relocate program start address
+	JC	urbadrunf.S
+	MOVL	ES:rd_EBX.B[EDI], EAX
+	MOVL	ES:rd_EDX.B[EDI], EDX
+	MOVL	EBX, #run_header#+ih_debug ;Assume have debugger address
+	CMPB	run_header#+ih_debug+4, #0 ;Right?
+	JNE	6$.S			;Yes
+	MOVL	EBX, #run_header#+ih_start ;No - use program start address
+6$:	CALL	relcode			;Relocate the address
+	JC	urbadrunf.S
+	MOVL	ES:rd_EFR.B[EDI], #0200h ;Store initial EFR value
+debgdn:	MOVL	ES:rd_EIP.B[EDI], EAX
+	MOVL	ES:rd_CS.B[EDI], EDX
+	CALL	usrrnfin#		;Finish up
+	PUSHL	DS
+	PUSHL	#run_base#		;Give up our data page
+	PUSHL	#0.B
+	PUSHL	#0.B
+	CALLF	svcMemChange#
+	CLRL	EAX
+rel014:	RET
+
+;Here if have bad RUN file format
+
+urbadrunf::
+	MOVL	EAX, #ER_IRFF
+	STC
+	RET
+.PAGE
+;Subroutine to get delta value for relocation
+;	c(AL) = Item number
+;	CALL	getdelta
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  c{EAX} = Item number
+;	  c{EDX} = Header byte value
+;	  c{ESI} = Offset for relocation
+
+getdelta:
+	MOVL	run_relitem#, EAX	;Save item number
+	CLRL	EAX
+	MOVL	run_delta#, EAX
+	CALL	usrrnrdbyte1s#		;Get byte for delta value
+	JC	4$.S			;If error
+	MOVB	run_delta#+0, AL
+	DECB	run_temp#		;Need more?
+	JS	2$.S			;No
+	CALL	usrrnrdbyte1s#		;Yes - get next byte for delta value
+	JC	4$.S			;If error
+	MOVB	run_delta#+1, AL
+	DECB	run_temp#		;Need more?
+	JS	2$.S			;No
+	CALL	usrrnrdbyte1s#		;Yes - get next byte for delta value
+	JC	4$.S			;If error
+	MOVB	run_delta#+2, AL
+	DECB	run_temp#		;Need more?
+	JS	2$.S			;No
+	CALL	usrrnrdbyte1s#		;Yes - get next byte for delta value
+	JC	4$.S			;If error
+	MOVB	run_delta#+3, AL
+2$:	MOVL	EAX, run_delta#
+	ADDL	run_apply#, EAX
+	MOVL	EBX, run_mscpnt#	;Point to data for msect being relocated
+	MOVL	ESI, rm_seg.B[EBX]	;Point to data for its segment
+	MOVW	FS, rs_select.B[ESI]	;Get its selector
+	MOVL	ESI, run_apply#		;Get offset for relocation
+	MOVZBL	EDX, run_reltype#	;Get relocation type
+	MOVL	EAX, run_relitem#
+	CLC
+4$:	RET
+.PAGE
+getvarval:
+	CALL	usrrnrdbyte1s#		;Get first byte
+	JC	2$.S
+	TESTB	AL, #80h		;Single byte value?
+	JE	2$.S			;Yes
+	SHLL	EAX, #8t		;No
+	PUSHL	EAX
+	CALL	usrrnrdbyte1s#
+	JC	4$.S
+	MOVB	[ESP], AL
+	TESTB	1.B[ESP], #40h		;Two byte value?
+	JE	6$.S			;Yes
+	SHLL	[ESP], #8t		;No
+	CALL	usrrnrdbyte1s#
+	JC	4$.S
+	MOVB	[ESP], AL
+	TESTB	2.B[ESP], #20h		;Three byte value?
+	JE	8$.S			;Yes
+	SHLL	[ESP], #8t		;No
+	CALL	usrrnrdbyte1s#
+	JC	4$.S
+	MOVB	[ESP], AL
+	POPL	EAX
+2$:	RET
+
+;Here if error
+
+4$:	POPL	EDX
+	RET
+
+;Here if have a two byte value
+
+6$:	POPL	EAX
+	ANDL	EAX, #3FFFh
+	RET
+
+;Here if have a three byte value
+
+8$:	POPL	EAX
+	ANDL	EAX, #1FFFFFFFh
+	RET
+.PAGE
+;Subroutine to get relocated data address for protected mode
+;	c{DS:EBX} = Address of address to fix
+;	CALL	reldata
+;	c{EAX} = Relocated offset value
+;	c[DX]  = Selector value
+
+reldata:MOVZBL	EDX, 4.B[EBX]		;Get msect number
+	IMULL	EDX, #rm_SIZE.B		;Change to index
+	MOVL	EAX, run_msctbl#+rm_base-rm_SIZE[EDX] ;Get base of msect
+	ADDL	EAX, [EBX]		;Get relocated offset
+	MOVL	EDX, run_msctbl#+rm_seg-rm_SIZE[EDX] ;Get pointer to segment
+						     ;  data
+	MOVZWL	EDX, rs_select.B[EDX]	;Get selector
+	ORB	DL, #07h		;Make sure its a user level selector
+	RET
+
+;Subroutine to get relocated code address for protected mode
+;	c{DS:EBX} = Address of address to fix
+;	CALL	relcode
+;	C:set = Error - not code segment
+;	C:clr = Normal
+;	  c{EAX} = Relocated offset value
+;	  c[DX]  = Selector value
+
+relcode:MOVZBL	EDX, 4.B[EBX]		;Get msect number
+	IMULL	EDX, #rm_SIZE.B		;Change to index
+	MOVL	EAX, run_msctbl#+rm_base-rm_SIZE[EDX] ;Get base of msect
+	ADDL	EAX, [EBX]		;Get relocated offset
+	MOVL	EDX, run_msctbl#+rm_seg-rm_SIZE[EDX] ;Get pointer to segment
+						     ;  data
+	CMPB	rs_type.B[EDX], #ST_CODE
+	JNE	4$.S
+	MOVZWL	EDX, rs_select.B[EDX]	;Get selector
+	ORB	DL, #07h		;Make sure its a user level selector
+	RET
+
+;Here if not code selector
+
+4$:	STC
+	RET
+.PAGE
+;Subroutine to store relocation data in the user's relocation buffer
+;	CALL	strdebg
+;	c{ES:EDI} = Address of relocation data buffer
+
+strdebg:SUBL	run_rlbsize#, #rd_data.B ;Is there enough room for the data?
+	JB	14$.S			;No - fail
+	LESL	EDI, run_rlbaddr#	;Yes - point to his relocation data
+					;  block
+	MOVL	EDX, run_nummsc#	;Get number of msects
+	MOVW	ES:rd_nmsect.B[EDI], DX
+	MOVZBL	ECX, run_header#+ih_numseg ;Get number of segments
+	MOVW	ES:rd_nseg.B[EDI], CX
+	ADDL	EDI, #rd_data.B		;Point to start of data area
+	MOVL	EBX, #run_segtbl#	;Point to start of segment table
+	CLD
+4$:	SUBL	run_rlbsize#, #4.B	;Have room for next entry?
+	JB	14$.S			;No - fail
+	MOVZWL	EAX, rs_spec.B[EBX]	;Get selector for segment
+	STOSL	[EDI]			;Store it in his data block
+	ADDL	EBX, #rs_SIZE.B		;Bump pointer
+	LOOP	ECX, 4$			;Continue if more sesgments
+	MOVL	EBX, #run_msctbl#	;Point to start of msect table
+	MOVL	ECX, EDX		;Get number of msects
+	CLRL	EDX
+10$:	PUSHL	EDI
+	MOVL	EAX, rm_num.B[EBX]	;Get msect number
+	SHLL	EAX, #4t		;Calculate offset for data
+	LEAL	EDI, -16t.B[EDI+EAX]
+	CMPL	EAX, run_rlbsize#	;Have enough room?
+	JA	12$.S			;No - fail!
+	MOVL	EAX, rm_seg.B[EBX]	;Yes - get segment number
+	MOVZBL	EAX, rs_number.B[EAX]
+	STOSL	[EDI]
+	MOVL	EAX, rm_base.B[EBX]	;Get offset for msect
+	STOSL	[EDI]
+	MOVL	EAX, rm_alloc.B[EBX]	;Get size of msect
+	ADDL	EDX, EAX
+	STOSL	[EDI]
+	CLRL	EAX			;Final 4 bytes are not used now
+	STOSL	[EDI]
+	POPL	EDI
+	ADDL	EBX, #rm_SIZE.B		;Bump pointer
+	LOOP	ECX, 10$		;Continue if more msects
+	MOVL	EDI, run_rlbaddr#+0	;Store total size for program
+	MOVL	ES:rd_size.B[EDI], EDX
+	RET
+
+;Here if relocation data buffer is too small
+
+12$:	POPL	EDI
+14$:	JMP	ubdvalue#
+.PAGE
+;Table which maps segment type from the RUN file header into the argument value
+;  for the svcMemSegType system call.  Index value is constructed as follows:
+;	Bit 4	 - SS$READ bit from segment status byte in segment header
+;	Bit 3	 - SS$WRITE bit from segment status byte in segment header
+;	Bit 2	 - Set if 32 bit segment, clear if 16 bit segment
+;	Bits 1-0 - Low 2 bits of segment type byte from the segment header:
+;			00 - Illegal
+;			01 - Data segment
+;			10 - Code segment
+;			11 - Stack segment
+
+	.MOD	4
+segtype:.BYTE	0		;00000
+	.BYTE	ST_16RODATA	;00001 -      ,      , 16-bit, Data
+	.BYTE	ST_16NXOCODE	;00010 -      ,      , 16-bit, Code
+	.BYTE	ST_16STACK	;00011 -      ,      , 16-bit, Stack
+	.BYTE	0		;00100
+	.BYTE	ST_32RODATA	;00101 -      ,      , 32-bit, Data
+	.BYTE	ST_32NXOCODE	;00110 -      ,      , 32-bit, Code
+	.BYTE	ST_32STACK	;00111 -      ,      , 32-bit, Stack
+	.BYTE	0		;01000
+	.BYTE	ST_16RWDATA	;01001 -      ,Write , 16-bit, Data
+	.BYTE	ST_16NXOCODE	;01010 -      ,Write , 16-bit, Code
+	.BYTE	ST_16STACK	;01011 -      ,Write , 16-bit, Stack
+	.BYTE	0		;01100
+	.BYTE	ST_32RWDATA	;01101 -      ,Write , 32-bit, Data
+	.BYTE	ST_32NXRCODE	;01110 -      ,Write , 32-bit, Code
+	.BYTE	ST_32STACK	;01111 -      ,Write , 32-bit, Stack
+	.BYTE	0		;10000
+	.BYTE	ST_16RODATA	;10001 - Read ,      , 16-bit, Data
+	.BYTE	ST_16NXRCODE	;10010 - Read ,      , 16-bit, Code
+	.BYTE	ST_16STACK	;10011 - Read ,      , 16-bit, Stack
+	.BYTE	0		;10100
+	.BYTE	ST_32RODATA	;10101 - Read ,      , 32-bit, Data
+	.BYTE	ST_32NXRCODE	;10110 - Read ,      , 32-bit, Code
+	.BYTE	ST_32STACK	;10111 - Read ,      , 32-bit, Stack
+	.BYTE	0		;11000
+	.BYTE	ST_16RWDATA	;11001 - Read ,Write , 16-bit, Data
+	.BYTE	ST_16NXRCODE	;11010 - Read ,Write , 16-bit, Code
+	.BYTE	ST_16STACK	;11011 - Read ,Write , 16-bit, Stack
+	.BYTE	0		;11100
+	.BYTE	ST_32RWDATA	;11101 - Read ,Write , 32-bit, Data
+	.BYTE	ST_32NXRCODE	;11110 - Read ,Write , 32-bit, Code
+	.BYTE	ST_32STACK	;11111 - Read ,Write , 32-bit, Stack
+
+	END

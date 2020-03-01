@@ -1,0 +1,1131 @@
+	.TITLE	IPMCLS - Interprocess message class driver for XOS
+
+;++++
+; This software is in the public domain.  It may be freely copied and used
+; for whatever purpose you see fit, including commerical uses.  Anyone
+; modifying this software may claim ownership of the modifications, but not
+; the complete derived code.  It would be appreciated if the authors were
+; told what this software is being used for, but this is not a requirement.
+
+;   THIS SOFTWARE IS PROVIDED BY THE AUTHORS "AS IS" AND ANY EXPRESS OR
+;   IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
+;   OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+;   IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+;   INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+;   BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS
+;   OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+;   ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR
+;   TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
+;   USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+;----
+
+	.PROC	80486
+	.INCLUD	XOSINC:\XMAC\XOS.PAR
+	.INCLUD	XOSINC:\XMAC\XOSX.PAR
+	.INCLUD	XOSINC:\XMAC\XOSERR.PAR
+
+;This driver implements the XOS interprocess message system as a class driver
+;  using the queued IO input and output datagram functions
+
+;Opening the device IPM: with O$IN set allows the process to receive messages
+;  sent to its process ID by queueing input requests.  Opening the device
+;  IPM:foobaz allows the process to receive messages sent to the special name
+;  foobaz.  If O$OUT is set, the process can send messages by using the
+;  queued output datagram function.  The source of the message will be the
+;  processes process ID if no name was used when the device was opened or the
+;  else the name that was used.  Only one IPM device without a name may be
+;  opened by a process.
+
+MSGMAX=!1024t		;Maximum length of a PDA message
+
+;Define offsets in the IPM DCB
+
+$$$=!4
+BLK dcb_ipmhead   , 4t		;Message queue head pointer
+BLK dcb_ipmtail   , 4t		;Message queue tail pointer
+BLK dcb_ipmnext   , 4t		;Offset of next IPM device
+BLK dcb_ipmprev   , 4t		;Offset of previous IPM device
+BLK dcb_ipmsts    , 1t		;Status byte
+BLK               , 2t
+BLK dcb_ipmourlen , 1t		;Length of IPM name
+BLK dcb_ipmourname, 32t		;IPM name for this device
+BLK dcb_ipmpda    , 2t
+BLK               , 1t
+BLK dcb_ipmdstlen , 1t		;Length of destination name
+BLK dcb_ipmdstname, 32t		;Destination name
+dcb_ipmSIZE=!$$$
+XMBINDEX dcb_ipmINDEX, dcb_ipmSIZE+dcb_cSIZE
+
+;Define bits for dcb_ipmsts
+
+IPM$MSGWAIT=!40h		;Waiting for message to receive
+
+;Define offsets in an IPM message block
+
+$$$=!0
+BLK im_next  , 4t	;Offset of next block
+BLK im_pid   , 4t	;PID of sender of message
+BLK im_sizex , 1t	;Size index for this block
+BLK im_offset, 1t	;Offset of start of message data
+BLK im_length, 2t	;Length of message data
+BLK im_src   , 0	;First byte of source name
+
+	CODE
+
+	.SBTTL	SVC dispatch table for IPM class devices
+
+;SVC dispatch table for IPM class devices
+
+ipmdsp:	.LONG	knlRtnZero#	;sd_mount	= 0.  - Mount
+	.LONG	knlRtnZero#	;sd_cleardev	= 4.  - Clear device
+	.LONG	ipmcdcb		;sd_cleardcb	= 8.  - Clear DCB
+	.LONG	knlRtnZero#	;sd_commit	= 12. - Commit data to disk
+	.LONG	knlRtnZero#	;sd_transold    = 16. - Transfer device/old
+	.LONG	knlRtnZero#	;sd_transnew    = 20. - Transfer device/new
+	.LONG	knlRtnBusy#	;sd_opena	= 24. - Open additional
+	.LONG	ipmopen		;sd_open1	= 28. - Open device/file
+	.LONG	knlRtnZero#	;sd_devparm     = 32. - Device parameters
+	.LONG	knlIFnDev#	;sd_delete	= 36. - Delete
+	.LONG	knlIFnDev#	;sd_rename	= 40. - Rename (top level)
+	.LONG	ipminpblk	;sd_inblock	= 44. - Input block
+	.LONG	ipmoutblk	;sd_outblock	= 48. - Output block
+	.LONG	knlIllOut#	;sd_outblockq	= 52. - Output block (XFF)
+	.LONG	knlIFnDevGQ#	;sd_outstring	= 56. - Output string
+	.LONG	knlRtnZero#	;sd_getiosts	= 60. - Get input/output status
+	.LONG	knlIFnDevGQ#	;sd_special     = 64. - Special device function
+	.LONG	ipmclose	;sd_close	= 68. - Close file
+	.LONG	knlNullLabel#	;sd_getlabel    = 72. - Get device label
+	.LONG	knlNullQioGQ#	;sd_commitfunc	= 76. - Commit data to disk
+	.LONG	ipminfo		;sd_devinfo     = 80. - Get device info
+
+;Class function dispatch table for IPM class devices
+
+	.LONG	CLSFMX
+ipmcls:	.LONG	knlIFnDev	;CF_ADDUNIT = 1. - Add unit
+CLSFMX=!{$-ipmcls}/4
+.PAGE
+;Class characteristics tables for the IPM device class
+
+	DATA
+
+	.MOD	4
+ipmdctbl:
+ DCHARBGN  1, knlDCharValCom#
+ DCHARENT  NUMBER , DECV, , 4, msgnumber , knlGetSysVal#, 0         , ipmdcbnum
+ DCHARENT  MAXIMUM, DECV, , 4, msgmaximum, knlGetSysVal#, knlSetSysVal#, ipmdcbmax
+ DCHARENT  LIMIT  , DECV, , 4, msglimit  , knlGetSysVal#, knlSetSysVal#, ipmdcblmt
+
+	CODE
+
+msgnumber: DCHARINFO  {Number of in use IPM devices}
+msgmaximum:DCHARINFO  {Maximum number of in use IPM devices}
+msglimit:  DCHARINFO  {Maximum number of IPM devices allowed}
+.PAGE
+;Device parameter table for IPM class devices
+
+	CODE
+
+	.MOD	4
+	.LONG	PARMMAX
+ipmparms::
+	.LONG	ipmgenparms	;IOPAR_xxxxxx = 00xx - Generic IO parameters
+	.LONG	knlNullFilParms#;IOPAR_FILxxx = 01xx - File system IO parameters
+	.LONG	knlNullTrmParms#;IOPAR_TRMxxx = 02xx - Terminal IO parameters
+	.LONG	0		;IOPAR_DSKxxx = 03xx - Disk IO parameters
+	.LONG	0		;IOPAR_TAPxxx = 04xx - Tape IO parameters
+	.LONG	0		;IOPAR_NETxxx = 05xx - Network IO parameters
+	.LONG	ipmipmparms	;IOPAR_IPMxxx = 06xx - IPM IO parameters
+	.LONG	ipmdgparms	;IOPAR_DGxxx  = 07xx - Datagram IO parameters
+PARMMAX=!{$-ipmparms}/4
+
+	.LONG	PARMGENMAX
+ipmgenparms:
+	.LONG	0		;		   = 0000h
+	.LONG	0		;IOPAR_FILOPTN     = 0001h
+	.LONG	0		;IOPAR_FILSPEC     = 0002h
+	.LONG	knlIopDevSts#	;IOPAR_DEVSTS      = 0003h
+	.LONG	knlIopUnitNum#	;IOPAR_UNITNUM     = 0004h
+	.LONG	knlIopGlbId#	;IOPAR_GLBID       = 0005h
+	.LONG	0		;IOPAR_DELAY       = 0006h
+	.LONG	ipmtimeout	;IOPAR_TIMEOUT	   = 0007h
+	.LONG	0		;IOPAR_INPSTS      = 0008h
+	.LONG	0		;IOPAR_OUTSTS      = 0009h
+	.LONG	0		;IOPAR_INPQLMT	   = 000Ah
+	.LONG	0		;IOPAR_OUTQLMT	   = 000Bh
+	.LONG	0		;IOPAR_SIVECT1     = 000Ch
+	.LONG	0		;IOPAR_SIVECT2     = 000Dh
+	.LONG	0		;IOPAR_SIDATA      = 000Eh
+	.LONG	knlIopNumOpen#	;IOPAR_NUMOPEN     = 000Fh
+	.LONG	0		;IOPAR_BUFRLMT	   = 0010h
+PARMGENMAX=!{$-ipmgenparms}/4
+
+	.LONG	PARMIPMMAX
+ipmipmparms:
+	.LONG	0		;		   = 0600h
+	.LONG	rmtpid		;IOPAR_IPMRMTPID   = 0601h
+PARMIPMMAX=!{$-ipmipmparms}/4
+
+	.LONG	PARMDGMAX
+ipmdgparms:
+	.LONG	0		;		   = 0700h
+	.LONG	lcladdr		;IOPAR_DGLCLADDR   = 0701h
+	.LONG	rmtaddrs	;IOPAR_DGRMTADDRS  = 0702h
+	.LONG	rmtaddrr	;IOPAR_DGRMTADDRR  = 0703h
+PARMDGMAX=!{$-ipmdgparms}/4
+.PAGE
+	.SBTTL	Initialization routine
+
+	INITSUB	initipm
+
+initipm:MOVL	EDI, #ipmchk		;OK - install our class
+	MOVL	EBX, #ipmcls		;Offset of class function dispatch table
+	MOVL	EAX, #'IPM'
+	CLRL	EDX
+	MOVL	ECX, #ipmdctbl
+	MOVL	ESI, #ipmccb
+	CALL	knlNewClass#
+	JC	4$.S			;This should not fail!
+	CLRL	EAX
+	RET
+
+4$:	CRASH	CIMC
+
+	CODE
+.PAGE
+	.SBTTL	ipmchk - Device check routine for IPM class devices
+
+;Device check routine for IPM class devices.
+;	c{SS:EBX} = Address of device name (16 bytes)
+;	CALL	ipmchk
+;	C:set = Error (match found)
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  Z:set = Match found
+;	    c{EDI} = Offset of DCB
+;	  Z:clr = Not found
+;  EBX and ESI are preserved
+
+ipmchk:	CMPL	SS:[EBX], #'IPM'	;Is this IPM?
+	JNE	6$.S			;No
+	MOVL	EDI, ipmdcbnum		;Yes - can we have another one?
+	CMPL	EDI, ipmdcblmt
+	JAE	8$.S			;No
+	MOVL	EDI, #DS$DUPLEX|DS$QIN|DS$DOUT ;Yes - allocate a DCB
+	MOVL	ECX, #dcb_ipmINDEX
+	CALL	knlGetDymDcb#
+	JC	4$.S
+	PUSHL	ESI
+	MOVL	ESI, #ipmccb
+	CALL	knlLinkDcb#
+	POPL	ESI
+	INCL	ipmdcbnum		;Count it
+	MOVL	EAX, ipmdcbnum		;New maximum?
+	CMPL	EAX, ipmdcbmax
+	JB	2$.S			;No
+	MOVL	ipmdcbmax, EAX		;Yes - remember it
+2$:	MOVL	dcb_sdisp.B[EDI], #ipmdsp
+	CLRL	EAX			;Set Z
+4$:	RET				;And return
+
+;Here if not for IPM (Z is clear)
+
+6$:	CLC
+	RET
+
+;Here if have too many IPM devices
+
+8$:	MOVL	EAX, #ER_TMDVC		;Error = Too Many DeVices for Class
+	STC
+	RET
+.PAGE
+ipminfo:LEAL	EBX, dcb_ipmourname.B[ESI] ;Point to our name
+	MOVL	EDX, #32t
+	CMPB	[EBX], #0		;Really have a name?
+	JNE	knlInfoSimple#		;Yes
+	MOVL	EBX, #nonamestr		;No
+	JMP	knlInfoSimple#
+.PAGE
+	.SBTTL	sd_open - Open function
+
+;Here for the open function
+;	c{SS:EDX} = Address of file name
+;	c{EDI}    = Offset of IPM DCB
+;	CALL	ipmopen
+
+ipmopen:MOVW	ES, SS:xffPda#
+	MOVW	dcb_ipmpda.B[EDI], ES
+	CMPB	SS:[EDX], #0		;Was a name specified?
+	JNE	10$.S			;Yes
+	LEAL	EBX, dcb_ipmourname.B[EDI] ;Store our process ID as the IPM name
+	PUSHL	EBX
+	MOVZWL	EAX, ES:pdaPid#+2
+	CALL	knlPutDecNmbr#
+	MOVB	[EBX], #'.'
+	INCL	EBX
+	MOVZWL	EAX, ES:pdaPid#+0
+	CALL	knlPutDecNmbr#
+	MOVB	[EBX], #0
+	POPL	EAX
+	SUBL	EBX, EAX
+	MOVB	dcb_ipmourlen.B[EDI], BL
+	JMP	12$.S
+
+;Here if a name was given and is already in use
+
+2$:	MOVL	EAX, #ER_ALDEF
+8$:	CLRL	ECX
+	STC
+	RET
+
+;Here if an IPM name was given
+
+10$:	MOVL	ESI, EDX
+	PUSHL	SS
+	POPL	FS
+	MOVL	ECX, #-1		;Collect the name
+	MOVL	EBX, #dcb_ipmourname
+	CALL	strname
+	JC	8$.S			;If bad name
+12$:	MOVZBL	ECX, dcb_ipmourlen.B[EDI]
+	LEAL	EBX, dcb_ipmourname.B[EDI]
+	PUSHL	DS
+	POPL	FS
+	CALL	finddst			;See if it already defined
+	JNC	2$.S			;Fail if found it
+	CMPL	EAX, #ER_NTDEF.B	;Is the error "NoT DEFined"?
+	JNE	8$.S			;No - fail
+	MOVL	EAX, ipmhead		;Link this DCB into the name list
+	MOVL	dcb_ipmnext.B[EDI], EAX
+	TESTL	EAX, EAX
+	JE	14$.S
+	MOVL	dcb_ipmprev.B[EAX], EDI
+14$:	MOVL	ipmhead, EDI
+16$:	CLRL	EAX
+	MOVL	ECX, #1
+	RET
+.PAGE
+;Subroutine to store IPM name in the DCB
+;	c{FS:ESI} = Address of name string
+;	c{ECX}    = Maximum length of name string
+;	c{EDI}    = Offset of DCB
+;	c{EBX}    = DCB offset for name
+;	CALL	strname
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+
+strname:PUSHL	EDI
+	MOVL	EDI, ESI		;Get length of the string (including
+	PUSHL	FS			;  final null)
+	POPL	ES
+	MOVL	EDX, ECX
+	CLD
+	CLRL	EAX
+	IFFAULT	10$
+	RNSCASB	[EDI]
+	JNE	2$.S
+	INCL	ECX
+2$:	SUBL	EDX, ECX
+	CMPL	EDX, #33t.B		;Is it too long?
+	JA	6$.S			;Yes - fail
+	JB	4$.S			;Exactly 32 bytes long?
+	DECL	EDX			;Yes - don't copy the null at the end
+4$:	MOVL	EDI, [ESP]
+	ADDL	EDI, EBX
+	MOVB	-1.B[EDI], DL		;Store length of name
+	PUSHL	DS
+	POPL	ES
+	MOVL	ECX, EDX		;Copy the name to the DCB
+	CLD
+	IFFAULT	10$
+	RMOVSB	[EDI], FS:[ESI]
+	POPL	EDI
+	RET
+
+;Here if have bad name
+
+6$:	MOVL	EAX, #ER_BDSPC
+8$:	POPL	EDI
+	STC
+	RET
+
+;Here if address error
+
+10$:	MOVL	EAX, #ER_ADRER
+	JMP	8$.S
+.PAGE
+	.SBTTL	sd_cleardcb - Clear DCB function
+
+;Here for the clear DCB function
+;	c{EDI} = Offset of DCB
+
+ipmcdcb:DECL	ipmdcbnum		;Reduce count
+	MOVL	ECX, #dcb_ipmINDEX	;Give up the DCB
+	JMP	knlGiveDymDcb#
+.PAGE
+	.SBTTL	sd_inpblk - Input block function
+
+;Here for the input block function
+;	c{EDI} = Offset of DCB
+;	c{ESI} = Offset of IORB
+;	CALL	ipminpblk
+;	C:set  = Error
+;	C:clr  = Normal
+;	c{EAX} = Error code
+;	c{EBX} = Status bits
+;	c{ECX} = Amount actually transfered
+
+$$$=!0			;WARNING: First 4 items must match first 4 for ipmoutdg
+FRM ipmi_rmtpidv , 8t	;Address for remote process ID value
+FRM ipmi_rmtpids , 4t	;Size of the remote process ID value field
+FRM ipmi_timeout , 4t	;Time-out value
+FRM ipmi_rmtarbfr, 8t	;Address of remote address (receive) buffer
+FRM ipmi_rmtarszp, 8t	;Address of remote address (receive) length value
+FRM ipmi_rmtarlen, 4t	;Length of remote address (receive) buffer
+FRM ipmi_msgamnt , 4t	;Length of message given to user
+FRM ipmi_qsts    , 4t	;Value for qab_status
+ipmi_SIZE=!$$$
+
+ipminpblk:
+	CALL	knlIoQabLock#		;Lock the QAB
+	JC	2$.S			;If error
+	CALL	knlIoReadLock#		;Lock the buffer
+	JC	2$.S			;If error
+	MOVB	iorb_queue.B[ESI], #dcb_inpframe
+	MOVL	iorb_routine.B[ESI], #ipminpblk1
+	JMP	knlXfQueue#		;Switch to extended fork context
+
+2$:	TOFORK
+	RET
+
+;Here in extended fork context
+
+ipminpblk1:
+	ENTER	ipmi_SIZE, 0		;Yes - set up our stack frame
+	CLRL	EAX
+	MOVL	ipmi_rmtpidv+0.B[EBP], EAX
+	MOVL	ipmi_rmtarbfr+0.B[EBP], EAX
+	MOVL	ipmi_msgamnt.B[EBP], EAX
+	DECL	EAX
+	MOVL	ipmi_timeout.B[EBP], EAX
+	MOVL	ipmi_qsts.B[EBP], #QSTS$DONE
+	CMPL	SS:xffParm#, #0.B
+	JE	4$.S
+	LFSL	EDX, SS:xffParm#	;Get address of parameter list
+	MOVL	EBX, #ipmparms		;Process parameters
+	MOVL	ECX, #knlComDPParms#
+	CALL	knlProcDevParm#
+	JC	inpfin.S		;If error
+4$:	CMPL	SS:xffCount#, #0.B	;Really want to do input?
+	JNE	6$.S			;Yes
+	CLRL	EAX			;No - finished here
+inpfin:	CLRL	ECX
+	MOVL	EBX, #QSTS$DONE
+	LEAVE
+	RET
+
+;Here if really want to do input
+
+6$:	BTL	SS:xffCmd#, #O%IN	;Is input allowed?
+	JNC	knlIllInpLv#		;No - fail
+					;Yes - fall into inploop on next page
+.PAGE
+inploop:MOVL	ESI, dcb_ipmhead.B[EDI]	;Any messages to receive?
+	TESTL	ESI, ESI
+	JNE	4$.S			;Yes
+	ORB	dcb_ipmsts.B[EDI], #IPM$MSGWAIT ;Indicate waiting for message
+	MOVL	EAX, ipmi_timeout.B[EBP] ;Get time-out value
+	CALL	knlXfWait#		;Wait until we have a message
+	JC	inpfin.S		;If error
+	ANDB	dcb_ipmsts.B[EDI], #~IPM$MSGWAIT
+	JMP	inploop.S		;Go check again if OK
+
+;Here with a message available
+
+4$:	CMPL	SS:xffBuffer1#+0, #0.B	;Do we really want the message now?
+	JE	6$.S			;No
+	MOVL	EAX, [ESI]		;Yes - unlink the message
+	MOVL	dcb_ipmhead.B[EDI], EAX
+	TESTL	EAX, EAX
+	JNE	6$.S
+	MOVL	dcb_ipmtail.B[EDI], EAX
+6$:	CMPL	ipmi_rmtpidv+0.B[EBP], #0.B ;Does he want the remote PID?
+	JE	8$.S			;No - go on
+	MOVL	EAX, im_pid.B[ESI]	;Yes - get the remote PID
+	IFFAULT	14$
+	LESL	EBX, ipmi_rmtpidv.B[EBP] ;Get address for the value
+	MOVL	ECX, ipmi_rmtpids.B[EBP] ;Get length of value
+	CALL	knlStrParm4#		;Store the remote PID
+	JC	22$.S			;If error
+8$:	CMPL	ipmi_rmtarbfr+0.B[EBP], #0.B ;Do we have a buffer for the source
+					     ;  string?
+	JE	28$			;No
+	LEAL	EDX, im_src.B[ESI]	;Yes
+	PUSHL	EDI
+	IFFAULT	18$			  ;Get address of buffer for source
+	LESL	EDI, ipmi_rmtarbfr.B[EBP] ;  string
+	CLRL	ECX
+	MOVB	AL, [EDX]		;Get first byte of source
+	INCL	EDX
+	CMPB	AL, #0FFh		;Have binary value?
+	JNE	10$.S			;No
+	CMPL	ipmi_rmtarlen.B[EBP], #5.B ;Yes - is his buffer big enough?
+	JB	12$.S			;No - fail
+	IFFAULT	18$			;Yes
+	STOSB	[EDI]
+	MOVL	EAX, [EDX]		;Get value
+	IFFAULT	18$
+	STOSL	[EDI]
+	JMP	26$.S
+
+;Here if source string is text
+
+10$:	IFFAULT	18$
+	STOSB	[EDI]			;Store byte
+	CMPB	AL, #0			;End of string?
+	JE	26$.S			;Yes
+	INCL	ECX			;No - count it
+	CMPL	ECX, ipmi_rmtarlen.B[EBP] ;Room for more?
+	JAE	12$.S			;No - fail
+	MOVB	AL, [EDX]		;Yes - get next byte
+	INCL	EDX
+	JMP	10$.S			;Continue
+
+;Here if source buffer is not big enough
+
+12$:	IFFAULT	18$
+	LESL	EBX, ipmi_rmtarszp.B[EBP] ;Point to source size word
+	IFFAULT	18$
+	ORB	ES:-12t.B[EBX], #PAR$ERROR ;Indicate parameter error
+	MOVL	EAX, #ER_PARMS
+	JMP	20$.S
+
+;Here if have address error with nothing extra saved on the stack
+
+	FAULTHDR
+14$:	MOVL	EAX, #ER_ADRER
+	JMP	22$.S
+
+;Here if have address error while storing source string
+
+	FAULTHDR
+16$:	POPL	ESI
+	FAULTHDR
+18$:	MOVL	EAX, #ER_ADRER
+20$:	POPL	EDI
+22$:	CMPL	SS:xffBuffer1#+0, #0.B	;Really reading the message?
+	JE	24$.S			;No
+	MOVL	ECX, im_sizex.B[ESI]	;Yes - get size index for the message
+	CALL	knlGiveXmb#		;Give it up
+24$:	LEAVE
+	CLRL	ECX
+	MOVL	EBX, #QSTS$DONE
+	RET
+
+;Here with source string stored
+
+26$:	POPL	EDI
+	IFFAULT	14$
+	LESL	EBX, ipmi_rmtarszp.B[EBP] ;Point to source size word
+	IFFAULT	14$
+	MOVW	ES:[EBX], CX		;Store source size
+28$:	MOVZWL	ECX, im_length.B[ESI]	;Get length of the message text
+	CMPL	SS:xffBuffer1#, #0.B	;Really reading the message?	
+	JE	34$.S			;No - just return the message size
+	IFFAULT	14$			;Yes
+	LESL	EBX, SS:xffBuffer1#	;Get address of his data buffer
+	CMPL	ECX, SS:xffCount#	;Is it big enough?
+	JBE	30$.S			;Yes
+	MOVL	ECX, SS:xffCount#	;No - just give him what we can
+	ORB	ipmi_qsts.B[EBP], #QSTS$TRUNC ;And indicate message truncated
+30$:	CLD
+	MOVL	ipmi_msgamnt.B[EBP], ECX
+	PUSHL	EDI
+	PUSHL	ESI
+	MOVZBL	EAX, im_offset.B[ESI]	;Point to message text
+	ADDL	ESI, EAX
+	MOVL	EDI, EBX		;Is the message long enough to justify
+	CMPL	ECX, #4.B		;  bothering to copy whole longs?
+	JBE	32$.S			;No - just copy bytes
+	MOVL	EAX, ECX		;Yes - copy enough bytes to long allign
+	MOVL	ECX, #4			;  the destination
+	SUBL	ECX, EDI
+	ANDL	ECX, #03.B
+	SUBL	EAX, ECX
+	IFFAULT	16$
+	RMOVSB	[EDI], [ESI]
+	MOVL	ECX, EAX		;Copy as many whole longs as we can
+	SHRL	ECX, #2			;Change to number of longs (round down)
+	IFFAULT	16$
+	RMOVSL	[EDI], [ESI]
+	MOVL	ECX, EAX		;Finally, copy any bytes left over
+	ANDL	ECX, #03.B
+32$:	IFFAULT	16$
+	RMOVSB	[EDI], [ESI]
+	POPL	ESI
+	POPL	EDI
+	MOVZBL	ECX, im_sizex.B[ESI]	;Get size index for the message block
+	CALL	knlGiveXmb#		;Give it up
+	MOVL	ECX, ipmi_msgamnt.B[EBP] ;Get amount stored
+34$:	CLRL	EAX
+	MOVL	EBX, ipmi_qsts.B[EBP]	;Get status bits
+	LEAVE				;Give up our stack frame
+	RET				;Thats all
+.PAGE
+;Subroutine called when scanning parameters for the IOPAR_TIMEOUT parameter
+;	c{ES:EBX} = Address of buffer for string
+;	c{ECX}    = Length of the buffer
+;	c{FS:EDX} = Address of word to receive length of string
+;	CALL	ipmtimeout
+
+	DPARMHDR  SET, DECV
+ipmtimeout:
+	TESTB	AH, #PAR$SET		;Want to set value?
+	JE	2$.S			;No
+	CALL	knlGetParm#		;Yes - get value
+	JC	2$.S
+	MOVL	ipmi_timeout.B[EBP], EAX ;Store value
+2$:	RET
+
+;Subroutine called when scanning parameters for the IOPAR_IPMRMTADDRR parameter
+;	c{ES:EBX} = Address of buffer for string
+;	c{ECX}    = Length of the buffer
+;	c{FS:EDX} = Address of word to receive length of string
+;	CALL	rmtaddrr
+
+	DPARMHDR  GET, STR
+rmtaddrr:
+	CMPB	knlForkLvl#, #FORK_XFF	;Is this a reveive function?
+	JNE	4$.S			;No - fail
+	MOVL	ipmi_rmtarbfr+0.B[EBP], EBX ;Yes - store address of the buffer
+	MOVL	ipmi_rmtarbfr+4.B[EBP], ES
+	MOVL	ipmi_rmtarszp+0.B[EBP], EDX ;Store address of the length value
+	MOVL	ipmi_rmtarszp+4.B[EBP], FS
+	MOVL	ipmi_rmtarlen.B[EBP], ECX ;Store length of the buffer
+	CLC
+	RET
+
+4$:	MOVL	EAX, #ER_PARMF
+	STC
+	RET
+.PAGE
+;Subroutine called when scanning parameters for the IOPAR_IPMLCLADDR parameter
+;	c{ES:EBX} = Address of value
+;	c{ECX}    = Size of value field
+;	CALL	rmtpid
+
+	DPARMHDR  GET, STR
+lcladdr:PUSHL	EDI
+	LEAL	ESI, dcb_ipmourname.B[EDI]
+	MOVZWL	EAX, dcb_ipmourlen.B[EDI]
+	JMP	4$.S
+
+;Subroutine called when scanning parameters for the IOPAR_IPMRMTADDRS parameter
+;	c{ES:EBX} = Address of buffer for string
+;	c{ECX}    = Length of the buffer
+;	c{FS:EDX} = Address of word to receive length of string
+;	CALL	rmtaddrs
+
+	DPARMHDR  BOTH, STR
+rmtaddrs:
+	TESTB	AH, #PAR$SET		;Want to set the value?
+	JE	2$.S			;No
+	PUSHL	EAX			;Yes
+	PUSHL	ES
+	PUSHL	EBX
+	PUSHL	FS
+	PUSHL	EDX
+	MOVL	ESI, EBX
+	PUSHL	ES
+	POPL	FS
+	MOVL	EBX, #dcb_ipmdstname
+	CALL	strname
+	POPL	EDX
+	POPL	FS
+	POPL	EBX
+	POPL	ES
+	JC	8$.S			;If error
+	POPL	EAX
+2$:	TESTB	AH, #PAR$GET		;Want value returned?
+	JE	6$.S			;No - finished now
+	LEAL	ESI, dcb_ipmdstname.B[EDI] ;Yes
+	MOVZWL	EAX, dcb_ipmdstlen.B[EDI]
+4$:	XCHGL	ECX, EAX
+	CMPL	ECX, EAX
+	JAE	12$.S
+	IFFAULT	knlRtnAdrEr#
+	MOVW	FS:[EDX], CX		;Store length of the name
+	PUSHL	EDI
+	MOVL	EDI, EBX
+	IFFAULT	10$
+	RMOVSB	[EDI], [ESI]		;Store name
+	CLRL	EAX
+	IFFAULT	10$
+	STOSB	[EDI]			;Store final null
+	POPL	EDI
+6$:	RET
+
+;Here if error storing the remote name
+
+8$:	POPL	ECX			;Fix up the stack
+	RET				;Return (C is set)
+
+;Here if address error
+
+10$:	POPL	EDI
+	JMP	knlRtnAdrEr#
+
+;Here if field is too small
+
+12$:	MOVL	EAX, #ER_PARMS
+	STC
+	RET
+
+;Subroutine called when scanning parameters for the IOPAR_IPMRMTPID parameter
+;	c{ES:EBX} = Address of value
+;	c{ECX}    = Size of value field
+;	CALL	rmtpid
+
+	DPARMHDR  GET, HEXV
+rmtpid:	CMPL	ECX, #4.B		;Is the field big enough?
+	JB	10$.S			;No
+	MOVL	ipmi_rmtpidv+0.B[EBP], EBX ;Yes - store address for the value
+	MOVL	ipmi_rmtpidv+4.B[EBP], ES
+	MOVL	ipmi_rmtpids.B[EBP], ECX ;And store size of value field
+	CLC
+	RET
+.PAGE
+	.SBTTL	sd_outblk - Output block function
+
+;Here for the output block function
+;	c{ECX} = Device command bits
+;	c{EDI} = Offset of DCB
+;	c{ESI} = Offset of IORB
+;	CALL	ipmoutblk
+;	C:set  = Error
+;	C:clr  = Normal
+;	c{EAX} = Error code
+;	c{EBX} = Status bits
+;	c{ECX} = Amount actually transfered
+
+$$$=!0			;WARNING: First 4 items must match first 4 for ipmoutdg
+FRM ipmo_rmtpidv, 8t	;Address of remote process ID value
+FRM ipmo_rmtpids, 4t	;Size of the remote process ID value field
+FRM ipmo_timeout, 4t	;Time-out value
+FRM ipmo_buffer , 8t	;Address of data buffer
+FRM ipmo_length , 4t	;Length of data buffer
+FRM ipmo_srclen , 4t	;Length of the source string (rounded to longs)
+ipmo_SIZE=!$$$
+
+;Here if cannot do output
+
+2$:	MOVL	EAX, #ER_NOOUT
+	JMP	10$.S
+
+;Here if have bad count
+
+4$:	MOVL	EAX, #ER_ICDEV
+	JMP	10$.S
+
+;Here if have address error before IORB is given up
+
+	FAULTHDR
+8$:	MOVL	EAX, #ER_ADRER
+10$:	CALL	knlGiveQel#		;Give up the IORB
+12$:	CLRL	ECX
+	MOVL	EBX, #QSTS$DONE
+	STC
+	LEAVE
+	TOFORK
+	RET
+
+ipmoutblk:
+	ENTER	ipmo_SIZE, 0		;Set up a stack frame
+	CLRL	EAX
+	MOVL	ipmo_rmtpidv+0.B[EBP], EAX
+	CMPL	iorb_parm.B[ESI], #0.B	;Have any parameters?
+	JE	14$.S			;No
+	PUSHL	ECX			;Yes
+	IFFAULT	8$
+	LFSL	EDX, iorb_parm.B[ESI]	;Get address of parameter list
+	MOVL	EBX, #ipmparms		;Process parameters
+	MOVL	ECX, #knlComDPParms#
+	CALL	knlProcDevParm#
+	POPL	ECX
+	JC	10$.S			;If error
+14$:	MOVL	EAX, iorb_count.B[ESI]
+	TESTL	EAX, EAX
+	JE	10$.S
+	BTL	ECX, #O%OUT		;Is output allowed?
+	JNC	2$.S			;No - fail
+	CMPL	EAX, #MSGMAX		;Is his message too long?
+	JA	4$.S			;Yes - fail
+	MOVL	ipmo_length.B[EBP], EAX	;No - store length of the data buffer
+	IFFAULT	8$
+	LESL	EAX, iorb_buffer1.B[ESI]
+	MOVL	ipmo_buffer+0.B[EBP], EAX
+	MOVL	ipmo_buffer+4.B[EBP], ES
+	CALL	knlGiveQel#		;Give up the IORB
+	MOVL	ECX, ipmo_length.B[EBP]
+	MOVL	EAX, SS:pdaPid#		;Get our PID as the source PID
+	LFSL	ESI, ipmo_buffer.B[EBP]
+
+;;;;;;qqqqqq
+
+	PUSHL	DS
+	POPL	GS
+	TOFORK
+	CALL	sendmsg			;Send the message
+	JC	20$.S			;If error
+	CMPL	ipmo_rmtpidv+0.B[EBP], #0.B ;OK - does he want the remote PID?
+	JE	16$.S			;No - nothing needed here
+	MOVW	ES, dcb_ipmpda.B[EDX]	;Yes - get the remote PID
+	MOVL	EAX, ES:pdaPid#
+	IFFAULT	knlRtnAdrEr#
+	LESL	EBX, ipmo_rmtpidv.B[EBP] ;Get address for the value
+	MOVL	ECX, ipmo_rmtpids.B[EBP] ;Get length of value
+	CALL	knlStrParm4#		;Store the remote PID
+16$:	CLRL	EAX
+	MOVL	ECX, ipmo_length.B[EBP] ;Get length of the message
+18$:	MOVL	EBX, #QSTS$DONE
+	LEAVE
+ret010:	RET
+
+20$:	CLRL	ECX
+	JMP	18$.S
+.PAGE
+	.SBTTL	sd_close - Close function
+
+;Here for the close function
+;	c{EDI} = Offset of DCB
+;	c{ESI} = Offset of IORB
+
+ipmclose:
+	MOVL	EAX, dcb_ipmnext.B[EDI]	;Remove the DCB from the name list
+	MOVL	EBX, dcb_ipmprev.B[EDI]
+	TESTL	EBX, EBX		;Is this the first one?
+	JE	6$.S			;Yes
+	MOVL	dcb_ipmnext.B[EBX], EAX	;No - update forward link
+	JMP	8$.S
+
+6$:	MOVL	ipmhead, EAX		;Update head pointer
+8$:	TESTL	EAX, EAX		;Is this the last one?
+	JE	10$.S			;Yes
+	MOVL	dcb_ipmprev.B[EAX], EBX	;No - update backward link
+
+;Now we give up any messages queued to this DCB
+
+10$:	PUSHL	ESI
+	MOVL	ESI, dcb_ipmhead.B[EDI]	;Get message buffer
+12$:	TESTL	ESI, ESI		;Have another one?
+	JE	14$.S			;No
+	PUSHL	[ESI]			;Yes - save offset of next message
+	MOVZBL	ECX, im_sizex.B[ESI]	;Give it up
+	CALL	knlGiveXmb#
+	POPL	ESI			;Restore offset of next message
+	JMP	12$.S			;Continue
+
+;Here with all message buffers given up
+
+14$:	POPL	ESI			;Restore offset of the IORB
+	TOFORK
+	JMP	knlCloseFin#		;Finish the close
+.PAGE
+	.SBTTL	knlSendLogInMsg
+
+;Subroutine to send login message to the login symbiont
+;	c{EBX} = Offset of termnal name
+;	c(CL)  = Auto rate detect type
+;	c(DL)  = Character
+;	c(DH)  = Reason:
+;		   00h = Data
+;		   01h = Carrier detect
+;		   02h = Ring indicate
+;		   20h = X.25 network connection
+;		   30h = TCP network connection
+;		   31h = RCP network connection
+;	c{EDI} = Offset of source string for message
+;	c{ESI} = Offset of destination string (without prefix)
+;	CALL	knlSendLogInMsg
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+
+$$$=!0
+FRM logi_msg, 20t		;Buffer for message
+FRM logi_src, 4t		;Offset of source string
+FRM logi_dst, 24t		;Buffer for destination string
+logi_SIZE=!$$$
+
+knlSendLogInMsg::
+	ENTER	logi_SIZE, 0
+	MOVB	logi_msg+0.B[EBP], #MT_TERMDATA ;Store message type
+	MOVB	logi_msg+1.B[EBP], DH	;Store reason
+	MOVB	logi_msg+2.B[EBP], DL	;Store data byte
+	MOVB	logi_msg+3.B[EBP], CL	;Store auto-rate detect type
+	MOVL	EAX, [EBX]		;Store device name in message
+	MOVL	logi_msg+4.B[EBP], EAX
+	MOVL	EAX, 4.B[EBX]
+	MOVL	logi_msg+8.B[EBP], EAX
+	MOVL	EAX, 8.B[EBX]
+	MOVL	logi_msg+12t.B[EBP], EAX
+	MOVL	EAX, 12t.B[EBX]
+	MOVL	logi_msg+16t.B[EBP], EAX
+	MOVL	logi_src.B[EBP], EDI	;Store offset of source string
+	MOVL	logi_dst+0.B[EBP], #'SYS^' ;Store prefix for destination string
+	MOVL	EAX, [ESI]		;Store rest of destination string
+	MOVL	logi_dst+4.B[EBP], EAX
+	MOVL	EAX, 4.B[ESI]
+	MOVL	logi_dst+8.B[EBP], EAX
+	MOVL	EAX, 8.B[ESI]
+	MOVL	logi_dst+12t.B[EBP], EAX
+	MOVL	EAX, 12t.B[ESI]
+	MOVL	logi_dst+16t.B[EBP], EAX
+	CLRL	EAX			;Make sure null at end
+	MOVB	logi_dst+20t.B[EBP], AL
+	MOVB	logi_msg+12t.B[EBP], AL
+	MOVL	ECX, #-4		;Determine length of message
+	LEAL	EDI, logi_msg+4.B[EBP]
+	PUSHL	SS
+	POPL	ES
+	CLD
+	RNSCASB	[EDI]
+	NOTL	ECX
+	LEAL	ESI, logi_msg.B[EBP]	;Get address of the message buffer
+	PUSHL	SS
+	POPL	FS
+	LEAL	EBX, logi_dst.B[EBP]	;Get address of the destination string
+	PUSHL	SS
+	POPL	ES
+	MOVL	EDX, logi_src.B[EBP]	;Get address of the source string
+	PUSHL	DS
+ 	POPL	GS
+	CALL	knlIpmSendMsg		;Send the message
+	LEAVE
+	RET
+.PAGE
+	.SBTTL	knlIpmSendMsg - Subroutine to send message to process
+
+;Subroutine to send message to process - must be called at fork level
+;	c{EAX}    = Source PID
+;	c{ECX}    = Length of message to send
+;	c{FS:ESI} = Address of message to send
+;	c{ES:EBX} = Address of destination string
+;	c{GS:EDX} = Address of source string
+;	CALL	knlIpmSendMsg
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  c{EAX} = 0
+;	  c{EDX} = Offset of destination DCB
+;  EDI is respected
+
+$$$=!0
+FRM ipmsm_srcpid, 4t		;Source PID
+FRM ipmsm_srcbfr, 8t		;Address of source name string
+FRM ipmsm_srclen, 4t		;Length of source name string
+FRM ipmsm_dstbfr, 8t		;Address of destination name string
+FRM ipmsm_dstlen, 4t		;Length of destination name string
+FRM ipmsm_msgbfr, 8t		;Address of massage
+FRM ipmsm_msglen, 4t		;Length of message
+ipmsm_SIZE=!$$$
+
+knlIpmSendMsg::
+	REQUIREFORK
+	ENTER	ipmsm_SIZE, 0		;Set up a stack frame
+	PUSHL	EDI
+	CLRL	EAX
+	MOVL	ipmsm_srcpid.B[EBP], EAX
+	MOVL	ipmsm_msglen.B[EBP], ECX
+	MOVL	ipmsm_msgbfr+0.B[EBP], ESI
+	MOVL	ipmsm_msgbfr+4.B[EBP], FS
+	MOVL	ipmsm_srcbfr+0.B[EBP], EDX
+	MOVL	ipmsm_srcbfr+4.B[EBP], GS
+	MOVL	ipmsm_dstbfr+0.B[EBP], EBX
+	MOVL	ipmsm_dstbfr+4.B[EBP], ES
+	MOVL	EDI, EBX		;Find length of the destination string
+	CLRL	ECX
+	DECL	ECX
+	CLD
+	CLRL	EAX
+	IFFAULT	22$
+	RNSCASB	[EDI]			;Find end of string
+	NOTL	ECX			;Get length of string (including final
+	DECL	ECX			;  null)
+	MOVL	ipmsm_dstlen.B[EBP], ECX
+	MOVL	EDI, EDX
+	PUSHL	GS
+	POPL	ES
+	CLRL	ECX			;Find length of the source string
+	CMPB	ES:[EDI], #0FFh
+	JNE	2$.S
+	MOVB	CL, #5
+	JMP	4$.S
+
+2$:	DECL	ECX
+	CLRL	EAX
+	IFFAULT	22$
+	RNSCASB	[EDI]
+	NOTL	ECX
+	DECL	ECX
+4$:	MOVL	ipmsm_srclen.B[EBP], ECX ;Store source string length
+	JMP	10$.S			;Continue
+
+;Here if name is too long
+
+6$:	MOVL	EAX, #ER_VALUE
+8$:	POPL	EDI
+	LEAVE
+	RET
+
+sendmsg:ENTER	ipmsm_SIZE, 0		;Set up a stack frame
+	PUSHL	EDI
+	MOVL	ipmsm_msglen.B[EBP], ECX
+	MOVL	ipmsm_msgbfr+0.B[EBP], ESI
+	MOVL	ipmsm_msgbfr+4.B[EBP], FS
+	MOVL	EAX, SS:pdaPid#
+	MOVL	ipmsm_srcpid.B[EBP], EAX
+	LEAL	EAX, dcb_ipmourname.B[EDI]
+	MOVL	ipmsm_srcbfr+0.B[EBP], EAX
+	MOVL	ipmsm_srcbfr+4.B[EBP], DS
+	MOVZBL	EAX, dcb_ipmourlen.B[EDI]
+	MOVL	ipmsm_srclen.B[EBP], EAX
+	LEAL	EAX, dcb_ipmdstname.B[EDI]
+	MOVL	ipmsm_dstbfr+0.B[EBP], EAX
+	MOVL	ipmsm_dstbfr+4.B[EBP], DS
+	MOVZBL	EAX, dcb_ipmdstlen.B[EDI]
+	MOVL	ipmsm_dstlen.B[EBP], EAX
+	IFFAULT	22$
+10$:	LFSL	EBX, ipmsm_dstbfr.B[EBP]
+	MOVL	ECX, ipmsm_dstlen.B[EBP]
+	CALL	finddst			;Find destination DCB
+	JC	8$.S			;If error
+	PUSHL	EDX
+	MOVL	EDX, ipmsm_srclen.B[EBP] ;Calculate total message length
+	ADDL	EDX, #im_src+4.B
+	ANDL	EDX, #0FFFFFFFCh.B
+	ADDL	EDX, ipmsm_msglen.B[EBP]
+	CALL	knlGetIndex#		;Get corresponding size index
+	POPL	EDX
+	JC	8$.S
+	CALL	knlGetXmb#
+	JC	8$.S			;If error
+	MOVB	im_sizex.B[ESI], CL	;Store size index in the block
+	MOVL	EAX, ipmsm_srcpid.B[EBP] ;Store the source PID in the message
+	MOVL	im_pid.B[ESI], EAX	 ;  block
+	LEAL	EDI, im_src.B[ESI]
+	PUSHL	DS
+	POPL	ES
+	PUSHL	ESI
+	IFFAULT	20$
+	LFSL	ESI, ipmsm_srcbfr.B[EBP] ;Point to the source string
+	MOVL	ECX, ipmsm_srclen.B[EBP]
+	IFFAULT	20$
+	RMOVSB	[EDI], FS:[ESI]		;Store it in the message buffer
+	MOVB	ES:[EDI], #0		;Plus a trailing null
+	POPL	ESI
+	MOVL	ECX, ipmsm_msglen.B[EBP] ;Get length of message
+	MOVW	im_length.B[ESI], CX	;Store it in the message block
+	MOVL	EAX, ipmsm_srclen.B[EBP] ;Calculate place to put message
+	ADDL	EAX, #im_src+4.B
+	ANDL	EAX, #0FFFFFFFCh.B
+	MOVB	im_offset.B[ESI], AL
+	LEAL	EDI, [ESI+EAX]
+	PUSHL	DS
+	POPL	ES
+	PUSHL	ESI
+	LFSL	ESI, ipmsm_msgbfr.B[EBP] ;Get address of message
+	MOVL	EAX, ECX
+	SHRL	ECX, #2t
+	CLD
+	IFFAULT	20$
+	RMOVSL	[EDI], FS:[ESI]		;Store message in the message block
+	MOVL	ECX, EAX
+	ANDL	ECX, #03h.B
+	RMOVSB	[EDI], FS:[ESI]
+	POPL	ESI
+	MOVL	EDI, EDX
+	MOVL	EAX, dcb_ipmtail.B[EDI]	;Get current tail of list
+	TESTL	EAX, EAX
+	JE	12$.S
+	MOVL	[EAX], ESI		;Link to end of list
+	JMP	14$.S
+
+12$:	MOVL	dcb_ipmhead.B[EDI], ESI
+14$:	MOVL	dcb_ipmtail.B[EDI], ESI
+	CLRL	EAX
+	MOVL	[ESI], EAX
+	TESTB	dcb_ipmsts.B[EDI], #IPM$MSGWAIT ;Is he waiting for a message?
+	JE	16$.S			;No
+	CALL	knlResumeInput#		;Yes - wake him up
+16$:	CLRL	EAX
+18$:	POPL	EDI
+	LEAVE				;Finished here
+	RET	
+
+;Here if address error
+
+	FAULTHDR
+20$:	POPL	ESI
+	MOVZBL	ECX, im_sizex.B[ESI]
+	CALL	knlGiveXmb#
+	FAULTHDR
+22$:	MOVL	EAX, #ER_ADRER
+24$:	STC
+	JMP	18$.S
+.PAGE
+	.SBTTL	finddst - Subroutine to find destination process
+
+;Subroutine to find destination process - must be called at fork level
+;	c{ECX}    = Length of destination string
+;	c{FS:EBX} = Address of destination string
+;	CALL	finddst
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  c{EDX} = Offset of DCB for destination IPM device
+;	  c[ES]  = Selector of PDA of destination process
+
+finddst:MOVL	EDX, ipmhead		;Point to first IPM DCB
+	TESTL	EDX, EDX
+	JE	6$.S			;If none
+2$:	CMPB	CL, dcb_ipmourlen.B[EDX] ;Might it match this one?
+	JNE	4$.S			;No
+	PUSHL	EDI
+	PUSHL	ECX			;Yes - compare names
+	MOVL	ESI, EBX
+	LEAL	EDI, dcb_ipmourname.B[EDX]
+	PUSHL	DS
+	POPL	ES
+	CLD
+	IFFAULT	10$
+	RECMPSB [EDI], FS:[ESI]
+	POPL	ECX
+	POPL	EDI
+	JE	8$.S			;If match
+4$:	MOVL	EDX, dcb_ipmnext.B[EDX]	;Not this one - get next entry
+	TESTL	EDX, EDX
+	JNE	2$.S
+6$:	MOVL	EAX, #ER_NTDEF
+	STC
+8$:	RET
+
+;Here if have address error
+
+	FAULTHDR
+10$:	POPL	ECX
+	POPL	EDI
+	JMP	knlRtnAdrEr#
+.PAGE
+	.SBTTL	Data
+
+	DATA
+
+ipmccb:   .BLKB  ccb_SIZE	;IPM CCB
+ipmdcbnum:.LONG  0		;Number of in use IPM DCBs
+ipmdcbmax:.LONG  0		;Maximum number of in use IPM DCBs
+ipmdcblmt:.LONG  10000t		;Maximum number of IPM DCBs allowed
+ipmhead:  .LONG  0		;Head pointer for IPM name list
+nonamestr:.ASCIZ "No name"
+
+	END

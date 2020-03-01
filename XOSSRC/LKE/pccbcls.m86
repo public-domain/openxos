@@ -1,0 +1,1892 @@
+	.TITLE	PCCBCLS - PC-card controller class/device driver for XOS, type B
+
+;*--------------------------------------------------------------------------*
+;* PCCACLS.M86
+;*
+;* Written by: John Goltz
+;*
+;* Edit History:
+;*
+;*--------------------------------------------------------------------------*
+
+;++++
+; This software is in the public domain.  It may be freely copied and used
+; for whatever purpose you see fit, including commerical uses.  Anyone
+; modifying this software may claim ownership of the modifications, but not
+; the complete derived code.  It would be appreciated if the authors were
+; told what this software is being used for, but this is not a requirement.
+
+;   THIS SOFTWARE IS PROVIDED BY THE AUTHORS "AS IS" AND ANY EXPRESS OR
+;   IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
+;   OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+;   IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+;   INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+;   BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS
+;   OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+;   ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR
+;   TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
+;   USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+;----
+
+	.PROC	80486
+	.INCLUD	XOSINC:\XMAC\XOS.PAR
+	.INCLUD	XOSINC:\XMAC\XOSX.PAR
+	.INCLUD	XOSINC:\XMAC\XOSTIME.PAR
+	.INCLUD	XOSINC:\XMAC\XOSERR.PAR
+	.INCLUD	XOSINC:\XMAC\XOSLKE.PAR
+	.INCLUD	XOSINC:\XMAC\XOSXLKE.PAR
+	.INCLUD	XOSINC:\XMAC\PCAT.PAR
+	.INCLUD	XOSINC:\XMAC\XOSXELAN.PAR
+
+MAJV   =!1t
+MINV   =!0t
+EDITNUM=!0t
+
+	LKEHEAD	PCCBCLS, MAJV, MINV, EDITNUM, LKETYPE_CLASS
+
+;This device class implements the interface to the AMD SC300 (Elan)
+;  internal PC-card controller.  The functions of this device are to
+;  initialize the controller, obtain device configuration information, and
+;  to set the devices' configuration registers.  It also provides an internal
+;  interface which allows other device drivers to change a PC-card's memory
+;  mapping.  This device only provides the mechanism for the set-up functions.
+;  The actual logic which interpets the configuration information and decides
+;  how to configure the devices is contained in a user mode program which uses
+;  this device to access the PC-card controller.
+
+;This device is implemented using a static DCB for each PC-card controller.
+;  The device is sharable, so it can be accessed by multiple processes.
+;  Since there is no state saved between accesses and since all accesses
+;  are atomic, this works.
+
+;All access to the controller's registers is though the Elan's configuration
+;  register file.  These registers are accessed through index and data
+;  registers at IO locations 22h and 23h.  An index value is written into the
+;  index register and the value of the register is read or written through the
+;  data register.  Since this device is an integral part of the SC300 CPU
+;  chip there can never be more than one in a system.  Also, the IO addresses
+;  cannot be changed.  Therefore, this driver is written to use only these
+;  addresses and to support only one controller, which supports two sockets.
+
+;This driver uses the ELANAEXT routines to manage the MMS.  It allocates one
+;  MMS page for each socket plus a third MMS page which is used when accessing
+;  CIS for either socket.  The MMS page allocations are fixed, with the MMS
+;  page at 0C8000h (page 6) used for socket A and the MMS page at 0CC000h
+;  (page 7) used for socket B.  The MMS page at 0D0000h (page 8) is used for
+;  CIS accesses for both sockets.  This means that memory mapping is restricted
+;  to a single fixed physical address, fixed size (16KB) window for each
+;  socket!  The only settable memory mapping value if the card address, which
+;  can be set both by a device characteristic and directly by a device driver.
+
+;Mapping of IO registers is controlled only by the PCCB device characteristics.
+;  Mapping of memory is controlled by PCCB device characteristics or by the
+;  device driver associated with the socket.
+
+;An interface is provided which allows a device driver to associate a device
+;  unit with a socket.  This device driver then is notified when a card is
+;  inserted or removed and can directly control memory mapping.
+
+	.EXPORT	xospcbRegister
+	.EXPORT	xospcbMapMemory
+
+;Define offsets in the PC-card DCB
+
+$$$=!dcb_devbgn
+BLK dcb_pccbsocket   , 4t		;Socket number for class chars
+BLK dcb_pccbint      , 4t		;Interrupt number
+BLK dcb_pccbchanged  , 1t		;Hardware changed bits
+BLK                  , 3t
+BLK dcb_pccbvector   , 2t		;Signal vector for status change
+BLK dcb_pccbvectpda  , 2t		;PDA for status change signal
+BLK dcb_pccbvectdata , 4t		;Signal data value for status change
+BLK dcb_pccbcisoffset, 4t		;Data segment offset for CIS access
+BLK dcb_pccbAio0addr , 4t		;Socket A IO window 0 address
+BLK dcb_pccbAio0size , 4t		;Socket A IO window 0 size
+BLK dcb_pccbAio1addr , 4t		;Socket A IO window 1 address
+BLK dcb_pccbAio1size , 4t		;Socket A IO window 1 size
+BLK dcb_pccbAmemcard , 4t		;Socket A memory window card address
+BLK dcb_pccbAconfig  , 4t		;Socket A configuration bits
+BLK dcb_pccbAcfgaddr , 4t		;Socket A configuration reg address
+BLK dcb_pccbAcfgval  , 4t		;Socket A configuraiton reg value
+BLK dcb_pccbAsocirq  , 1t		;Socket A IRQ number
+BLK dcb_pccbAmemenb  , 1t		;Socket A memory window enabled
+BLK dcb_pccbAsts     , 1t		;Socket A status bits
+BLK dcb_pccbAtimer   , 1t		;Socket A debounce timer counter
+BLK dcb_pccbAdevname , 4t		;Socket A associated driver device name
+BLK dcb_pccbAdevdata , 4t		;Socket A associated driver data value
+BLK dcb_pccbAstschng , 4t		;Socket A associated driver status
+					;  change routine offset
+BLK dcb_pccbBio0addr , 4t		;Socket B IO window 0 address
+BLK dcb_pccbBio0size , 4t		;Socket B IO window 0 size
+BLK dcb_pccbBio1addr , 4t		;Socket B IO window 1 address
+BLK dcb_pccbBio1size , 4t		;Socket B IO window 1 size
+BLK dcb_pccbBmemcard , 4t		;Socket B memory window card address
+BLK dcb_pccbBconfig  , 4t		;Socket B configuration bits
+BLK dcb_pccbBcfgaddr , 4t		;Socket B configuration reg address
+BLK dcb_pccbBcfgval  , 4t		;Socket B configuration reg value
+BLK dcb_pccbBsocirq  , 1t		;Socket B IRQ number
+BLK dcb_pccbBmemenb  , 1t		;Socket B memory window enabled
+BLK dcb_pccbBsts     , 1t		;Socket B status bits
+BLK dcb_pccbBtimer   , 1t		;Socket B debounce timer counter
+BLK dcb_pccbBdevname , 4t		;Socket B associated driver device name
+BLK dcb_pccbBdevdata , 4t		;Socket B associated driver data value
+BLK dcb_pccbBstschng , 4t		;Socket B associated driver status
+					;  change routine offset
+dcb_pccbSIZE=!$$$
+XMBINDEX dcb_pccbINDEX, dcb_cSIZE+dcb_pccbSIZE
+
+;Define values for dcb_pccbAconfig and dcb_pccBconfig
+
+CFG$8BITMEM=!0004h		;Card is configured for 8-bit memory only
+CFG$8BITIO =!0002h		;Card is configured for 8-bit IO only
+CFG$IOCARD =!0001h		;Card is configured as an IO card
+
+;Define values for dcb_pccbAsts and dcb_pccBsts
+
+STS$WAITDONE=!0004h		;Debounce time-out done (set by clock routine
+				;  and cleared by fork level when event is
+				;  processed)
+STS$PRESENT =!0002h		;Card is present (set at fork level after
+				;  debounce time-out - cleared immediately
+				;  when status change is seen)
+;;;STS$REMOVED =!0001h		;Card has been removed (set by interrupt level
+;;;				;  code when get status change and card is
+;;;				;  present - cleared by fork level when
+;;;				;  card removed event is processed)
+
+;PC-card controller (type A for Intel 8236SL) device characteristics table
+
+	DATA
+
+	.MOD	4
+pccbdctbl:
+ DCHARBGN  1, knlDCharValCom##
+ DCHARENT  CLASS   , TEXT ,  ,    8, knlDcMsgClass##, knlDcGetClass##, knlDcSetClass##, 0
+ DCHARENT  INT     , DECV ,  ,    1, knlDcMsgInt##  , knlDcGet4Byte##, 0              , dcb_pccbint
+ DCHARENT  NUMSOC  , DECV ,  ,    1, msgnumsoc      , getnumsoc      , 0              , 0
+ DCHARENT  SOCKET  , DECV ,  ,    1, msgsocket      , knlDcGet4Byte##, setsocket      , dcb_pccbsocket
+ DCHARENT  CARDTYPE, TEXT ,  ,    8, msgcardtype    , getcardtype    , setcardtype    , 0
+ DCHARENT  PRESENT , TEXT ,  ,    4, msgpresent     , getpresent     , 0              , 0
+ DCHARENT  CLEAR   , DECV ,  ,    1, msgclear       , knlRtnZero##   , setclear       , 0
+ DCHARENT  ENABLE  , TEXT ,  ,    4, msgenable      , getenable      , setenable      , 0
+ DCHARENT  SOCINT  , DECV ,  ,    1, msgsocint      , getsocint      , setsocint      , 0
+ DCHARENT  CFGADDR , HEXV ,  ,    4, msgcfgaddr     , getcfgaddr     , setcfgaddr     , 0
+ DCHARENT  CFGVALUE, HEXV ,  ,    1, msgcfgvalue    , getcfgvalue    , setcfgvalue    , 0
+ DCHARENT  IO0SIZE , HEXV ,  ,    4, msgio0size     , getiosize      , setiosize      , dcb_pccbAio0addr+{CX_PCCIOA1S<16t}
+ DCHARENT  IO0REG  , HEXV ,  ,    4, msgio0reg      , getioreg       , setioreg       , dcb_pccbAio0addr+{CX_PCCIOA1S<16t}
+ DCHARENT  IO1SIZE , HEXV ,  ,    4, msgio1size     , getiosize      , setiosize      , dcb_pccbAio1addr+{CX_PCCIOA2S<16t}
+ DCHARENT  IO1REG  , HEXV ,  ,    4, msgio1reg      , getioreg       , setioreg       , dcb_pccbAio1addr+{CX_PCCIOA2S<16t}
+ DCHARENT  IOWID   , DECV ,  ,    1, msgiowid       , getiowid       , setiowid       , 0
+ DCHARENT  READONLY, TEXT ,  ,    4, msgreadonly    , getreadonly    , 0              , 0
+ DCHARENT  MEM0SIZE, HEXV ,  ,    4, msgmemsize     , getmemsize     , setmemsize     , 0
+ DCHARENT  MEM0SYS , HEXV ,  ,    4, msgmemsys      , getmemsys      , setmemsys      , 0
+ DCHARENT  MEM0CARD, HEXV ,  ,    4, msgmemcard     , getmemcard     , setmemcard     , 0
+ DCHARENT  MEMWID  , DECV ,  ,    1, msgmemwid      , getmemwid      , setmemwid      , 0
+ DCHARENT  CISDATA , DATAS, H, 1024, msgcisdata     , getcisdata     , 0              , 0
+
+	CODE
+
+msgnumsoc:  DCHARINFO  {Number of sockets}
+msgsocket:  DCHARINFO  {Socket number}
+msgcardtype:DCHARINFO  {Card type}
+msgpresent: DCHARINFO  {Card is present}
+msgenable:  DCHARINFO  {Socket is enabled}
+msgcfgaddr: DCHARINFO  {Configuration register address}
+msgcfgvalue:DCHARINFO  {Configuration register value}
+msgclear:   DCHARINFO  {Clear all socket parameters}
+msgsocint:  DCHARINFO  {Socket interrupt level}
+msgio0reg:  DCHARINFO  {IO window 0 register}
+msgio0size: DCHARINFO  {IO window 0 size}
+msgio1reg:  DCHARINFO  {IO window 1 register}
+msgio1size: DCHARINFO  {IO window 1 size}
+msgiowid:   DCHARINFO  {IO data width}
+msgreadonly:DCHARINFO  {Card is read-only}
+msgmemsys:  DCHARINFO  {Memory window system address}
+msgmemcard: DCHARINFO  {Memory window card address}
+msgmemsize: DCHARINFO  {Memory window size}
+msgmemwid:  DCHARINFO  {Memory data width}
+msgcisdata: DCHARINFO  {CIS data}
+.PAGE
+	.SBTTL	SVC dispatch table for PCCB class devices
+
+;SVC dispatch table for PCCB class devices
+
+	CODE
+
+pccbdsp:.LONG	knlRtnZero##	;sd_mount	=  0. - Mount
+	.LONG	knlRtnZero##	;sd_cleardev	=  4. - Clear device
+	.LONG	knlRtnZero##	;sd_cleardcb	=  8. - Clear DCB
+	.LONG	knlRtnZero##	;sd_commit	= 12. - Commit data to disk
+	.LONG	knlRtnZero##	;sd_transold    = 16. - Transfer device/old
+	.LONG	knlRtnZero##	;sd_transnew    = 20. - Transfer device/new
+	.LONG	knlNullQio##	;sd_opena	= 24. - Open additional
+	.LONG	pccbopen	;sd_open1	= 28. - Open device/file
+	.LONG	pccbopen	;sd_devparm     = 32. - Device parameters
+	.LONG	knlIFnDev##	;sd_delete	= 36. - Delete file
+	.LONG	knlIFnDev##	;sd_rename	= 40. - Rename file
+	.LONG	pccbio		;sd_inblock	= 44. - Input block
+	.LONG	pccbio		;sd_outblock	= 48. - Output block
+	.LONG	knlIFnDevGQ##	;sd_outblockq	= 52. - Output block (XFF)
+	.LONG	knlIFnDevGQ##	;sd_outstring	= 56. - Output string
+	.LONG	pccbio		;sd_getiosts	= 60. - Get input/output status
+	.LONG	knlIFnDevGQ##	;sd_special     = 64. - Special device function
+	.LONG	pccbclose	;sd_close	= 68. - Close file
+	.LONG	knlNullLabel##	;sd_getlabel    = 72. - Get device label
+	.LONG	knlNullQioGQ##	;sd_commitfunc	= 76. - Commit data to disk
+	.LONG	knlInfoNone##	;sd_devinfo     = 80. - Get device info
+PCCDSPSZ=!{$-pccbdsp}/4
+
+;Class function dispatch table for PCCB class devices
+
+	.LONG	CLSFMX
+pccbcls:.LONG	pccbaddunit	;CF_ADDUNIT = 1. - Add unit
+	.LONG	pccbunitinfo	;CF_PUNITS  = 2. - Get information about
+				;		     physical units
+	.LONG	knlIFnDev##	;CF_AUNITS  = 3. - Get information about active
+				;		     units
+CLSFMX=!{$-pccbcls}/4
+.PAGE
+
+;Class characteristics table for the PCCB device class
+
+	DATA
+
+	.MOD	4
+pccbcctbl:
+ DCHARBGN  2, knlDCharValCom##
+ DCHARENT  NUMBER , DECV, , 4, msgnumber , knlGetSysVal##, 0             , pccbdcbnum
+ DCHARENT  MAXIMUM, DECV, , 4, msgmaximum, knlGetSysVal##, knlSetSysVal##, pccbdcbmax
+ DCHARENT  LIMIT  , DECV, , 4, msglimit  , knlGetSysVal##, knlSetSysVal##, pccbdcblmt
+
+;Device characteristics table for the PCCB device class
+
+	CODE
+
+msgnumber:  DCHARINFO  {Number of in use PCCB devices}
+msgmaximum: DCHARINFO  {Maximum number of in use PCCB devices}
+msglimit:   DCHARINFO  {Maximum number of PCCB devices allowed}
+.PAGE
+;Device parameter table for pccbn: opens
+
+	.MOD	4
+	.LONG	OPARMMAX	;Size of table
+pccbopnparms:
+	.LONG	pccbopngenparms	 ;IOPAR_xxxxxx = 00xx - Generic IO parameters
+	.LONG	knlNullFilParms##;IOPAR_FILxxx = 01xx - File system IO
+				 ;			  parameters
+	.LONG	knlNullTrmParms##;IOPAR_TRMxxx = 02xx - Terminal IO parameters
+OPARMMAX=!{$-pccbopnparms}/4
+
+	.LONG	OPARMGENMAX	;Size of table
+pccbopngenparms:
+	.LONG	0		;	        = 0000h
+	.LONG	knlIopFilOptn##	;IOPAR_FILOPTN  = 0001h
+	.LONG	knlIopFilSpec##	;IOPAR_FILSPEC  = 0002h
+	.LONG	knlIopDevSts##	;IOPAR_DEVSTS   = 0003h
+	.LONG	knlIopUnitNum##	;IOPAR_UNITNUM  = 0004h
+	.LONG	knlIopGlbId##	;IOPAR_GLBID    = 0005h
+	.LONG	knlIopDelay##	;IOPAR_DELAY    = 0006h
+	.LONG	knlIopTimeOut##	;IOPAR_TIMEOUT  = 0007h
+	.LONG	0		;IOPAR_INPSTS	= 0008h
+	.LONG	0		;IOPAR_OUTSTS	= 0009h
+	.LONG	0		;IOPAR_INPQLMT	= 000Ah
+	.LONG	0		;IOPAR_OUTQLMT	= 000Bh
+	.LONG	pccbstsvect	;IOPAR_SIGVECT1 = 000Ch
+	.LONG	0		;IOPAR_SIGVECT2 = 000Dh
+	.LONG	pccbstsdata	;IOPAR_SIGDATA  = 000Eh
+	.LONG	knlIopNumOpen##	;IOPAR_NUMOPEN  = 000Fh
+OPARMGENMAX=!{$-pccbopngenparms}/4
+
+;Device parameter table for pccbn: IO operations
+
+	.LONG	PARMMAX		;Size of table
+pccbioparms:
+	.LONG	pccbiogenparms	 ;IOPAR_xxxxxx = 00xx - Generic IO parameters
+	.LONG	knlNullFilParms##;IOPAR_FILxxx = 01xx - File system IO
+				 ;			  parameters
+	.LONG	knlNullTrmParms##;IOPAR_TRMxxx = 02xx - Terminal IO parameters
+PARMMAX=!{$-pccbioparms}/4
+
+	.LONG	PARMGENMAX	;Size of table
+pccbiogenparms:
+	.LONG	0		;	        = 0000h
+	.LONG	0		;IOPAR_FILOPTN  = 0001h
+	.LONG	0		;IOPAR_FILSPEC  = 0002h
+	.LONG	knlIopDevSts##	;IOPAR_DEVSTS   = 0003h
+	.LONG	knlIopUnitNum##	;IOPAR_UNITNUM  = 0004h
+	.LONG	knlIopGlbId##	;IOPAR_GLBID    = 0005h
+	.LONG	knlIopDelay##	;IOPAR_DELAY    = 0006h
+	.LONG	knlIopTimeOut##	;IOPAR_TIMEOUT  = 0007h
+	.LONG	0		;IOPAR_INPSTS	= 0008h
+	.LONG	0		;IOPAR_OUTSTS	= 0009h
+	.LONG	0		;IOPAR_INPQLMT	= 000Ah
+	.LONG	0		;IOPAR_OUTQLMT	= 000Bh
+	.LONG	pccbstsvect	;IOPAR_SIGVECT1 = 000Ch
+	.LONG	0		;IOPAR_SIGVECT2 = 000Dh
+	.LONG	pccbstsdata	;IOPAR_SIGDATA  = 000Eh
+	.LONG	knlIopNumOpen##	;IOPAR_NUMOPEN  = 000Fh
+PARMGENMAX=!{$-pccbioparms}/4-1
+.PAGE
+	.SBTTL	Initialization routine
+
+	DATA
+
+initblk:				;Characteristics description
+ DCHARBGN  3, knlDCharValCom##		;  block for initialization
+ DCHARENT  BOOT  , DECV, , 4, 0, 0              , initboot, 0
+ DCHARENT  RESULT, STR , , 0, 0, knlGetDcNullS##, 0       , 0
+
+	INITSUB	initpccb
+
+initpccb:
+	PUSHL	FS
+	PUSHL	EDX
+	MOVL	EDI, #pccbchk		;Install our class
+	MOVL	EBX, #pccbcls		;Offset of class function dispatch table
+	MOVL	EAX, #'PCCB'
+	CLRL	EDX
+	MOVL	ECX, #pccbcctbl
+	MOVL	ESI, #pccbccb
+	CALL	knlNewClass##		;Create the PCCB class
+	POPL	EDX
+	POPL	FS
+	JC	10$.S			;If error
+	TESTL	EDX, EDX		;Have a characteristics list?
+	JE	2$.S			;No
+	MOVL	EBX, #initblk		;Yes - point to characteristics table
+	CALL	knlAddUnitChar##	;Process characteristics
+	JC	10$.S			;If error
+2$:	PUSHL	CS			;Register the system string which
+	POPL	FS			;  defines the driver register routine
+	MOVL	EBX, #regname		;  (We have to do this so device
+	PUSHL	SS			;  drivers don't have to import this
+	POPL	GS			;  symbol since this would make it
+	PUSHL	#xospcbRegister		;  necessary to load this LKE to
+	MOVL	EDX, ESP		;  load any of the drivers which use
+	MOVL	ECX, #4t		;  it if they need to!)
+	CALL	knlSysStrDefine##
+	ADDL	ESP, #4t.B
+	CLRL	EAX			;OK
+	CLRL	EDX
+	MOVL	ECX, #codetop
+	CLC
+6$:	RET
+
+;Here if error after driver has been registered
+
+10$:	CRASH	pccb
+
+regname:.ASCIZ	"pccbDrvRegister"
+.PAGE
+	 .MOD	4
+ibootchar:
+	DCHAR	UNIT, SET, DECV, 1
+	.BYTE	0
+	DCHAR	INT , SET, HEXV, 1
+	.BYTE	9t
+	DCHAR	BOOT, SET, DECV, 1
+ibtboot=!$-ibootchar
+	.BYTE	0
+	.BYTE	0
+IBOOTCHARSZ=!{{$-ibootchar}+3}&{~3}
+
+;Here for the BOOT characteristic
+
+$$$=!0
+FRM iboot_char, IBOOTCHARSZ
+iboot_SIZE=!$$$
+
+initboot:
+	ENTER	iboot_SIZE, 0
+	LEAL	EDI, iboot_char.B[EBP]	;Copy the characteristics list to our
+	PUSHL	SS			;  stack frame
+	POPL	ES
+	MOVL	ESI, #ibootchar
+	MOVL	ECX, #IBOOTCHARSZ/4
+	CLD	
+	MOVL	EDX, EDI
+	PUSHL	SS
+	POPL	FS
+	RMOVSL	[EDI], CS:[ESI]
+	CLRL	ESI
+	CALL	pccbaddunit
+	FROMFORK
+	LEAVE
+	BTL	EAX, #31t
+	RET
+.PAGE
+	.SBTTL	pccbaddunit - Class function to add unit
+
+;Here for the CL_ADDUNIT function - for this device the add unit function
+;  actually sets up a single PCCB controller.  The unit number MUST be 0!
+;	c{ES:EDI} = Address of parameter block
+;	CALL	pccbaddunit
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  c{EAX}  = 0
+
+;Description block for knlAddUnitChar:
+
+	DATA
+
+	.MOD	4
+pccbaublk:
+ DCHARBGN  4, knlDCharValCom##
+ DCHARENT  UNIT, DECV, , 1, 0, 0, auunit, 0
+ DCHARENT  INT , DECV, , 1, 0, 0, auint , 0
+ DCHARENT  BOOT, DECV, , 1, 0, 0, auboot, 0
+
+	CODE
+
+$$$=!0
+FRM au_unit     , 4t		;Unit number
+FRM au_boot     , 4t
+FRM au_cisaddr  , 4t		;Physical address for CIS buffer
+FRM au_cisoffset, 4t		;CIS data buffer offset
+FRM au_int      , 4t		;Interrupt number
+FRM             , 3t
+FRM au_xres     , 1t		;Non-zero if got exec memory resource here
+au_SIZE=!$$$
+
+pccbaddunit:
+	ENTER	au_SIZE, 0		;Set up and initialize our stack frame
+	CLRL	EAX
+	MOVB	au_xres.B[EBP], AL
+	DECL	EAX
+	MOVL	au_unit.B[EBP], EAX
+	MOVL	au_boot.B[EBP], EAX
+	MOVL	au_int.B[EBP], EAX
+	TESTL	ESI, ESI		;Is this a BOOT call?
+	JE	2$.S			;Yes
+	IFFAULT	6$
+	LFSL	EDX, iorb_buffer2.B[ESI]
+	CALL	knlGiveQel##		;Give up the IORB	
+2$:	MOVL	EBX, #pccbaublk		;Process the characteristics
+	MOVB	AL, #0			;Fail if bad names here
+	CALL	knlAddUnitChar##
+	JNC	8$.S			;If no error
+4$:	CLRL	ECX
+	MOVL	EBX, #QSTS$DONE
+	LEAVE				;Fail
+	TOFORK
+	STC
+	RET
+
+;Here if address error with IORB
+
+	FAULTHDR
+6$:	CALL	knlGiveQel##
+	MOVL	EAX, #ER_ADRER
+	JMP	4$.S
+
+;Here with all parameters processed - make sure we got a unit number
+
+8$:	MOVL	EAX, au_unit.B[EBP]
+	ORL	EAX, au_int.B[EBP]
+	INCL	EAX
+	JNE	12$.S
+10$:	MOVL	EAX, #ER_CHARM
+	JMP	4$.S
+
+;Here with all needed parameters found
+
+12$:	CMPL	pccbccb+ccb_dcbhead, #0.B ;Do we already have a unit?
+	JE	14$.S			;No - go on
+	MOVL	EAX, #ER_DUADF		;Yes - fail
+	JMP	4$.S
+
+;Here if unit is not now defined. We simply assume that the hardware exists!
+;  This driver only works on the SC300 which always has a PC-card controller
+;  and there is no resonable way to check for the controller's existance anyway!
+
+14$:	MOVL	ECX, au_int.B[EBP]	;See if the interrupt is available
+	CALL	knlChkIRqAvl##
+	JC	4$.S
+	MOVL	EBX, #codebeginPCCBCLS	;Allocate MMS page 6
+	MOVB	AL, #6
+	CALL	xoselnMMSGetPage##
+	JC	4$.S			;If error
+	MOVL	EAX, #0406h		;Set it up for socket A
+	CALL	xoselnMMSSetPage##
+	JC	40$
+	MOVL	EBX, #codebeginPCCBCLS	;Allocate MMS page 7
+	MOVB	AL, #7
+	CALL	xoselnMMSGetPage##
+	JC	40$			;If error
+	MOVL	EAX, #0507h		;Set it up for socket B
+	CALL	xoselnMMSSetPage##
+	JC	38$
+	MOVL	EBX, #codebeginPCCBCLS	;Allocate MMS page 8
+	MOVB	AL, #8
+	CALL	xoselnMMSGetPage##
+	JC	38$			;If error
+	MOVL	au_cisaddr.B[EBP], EBX	;OK - save CIS buffer address
+	MOVL	EAX, #0408h		;Set it up for socket A
+	CALL	xoselnMMSSetPage##
+	JC	36$
+	MOVL	EAX, SS			;Do we have the exec memory resource?
+	CMPW	knlXResPda##, AX
+	JE	16$.S			;Yes
+	CALL	knlGetXRes##		;No - get it now
+	MOVB	au_xres.B[EBP], #1
+16$:	MOVL	ECX, #4000h		;Allocate 16KB of address space for CIS
+	CALL	knlGetXSpace##		;  reads
+	JC	34$
+	MOVL	au_cisoffset.B[EBP], EDI
+	LEAL	EBX, la_data[EDI]	;Map pages for CIS reads
+	MOVL	EDX, au_cisaddr.B[EBP]
+	MOVL	ECX, #4
+	MOVL	EAX, #67h
+	MOVL	EDI, #-1
+	CALL	knlMapPhyPages##
+	JC	24$.S
+	MOVB	AL, #CX_PCCSCIE		;Make sure status change interrupts are
+	OUTB	P_CFGINDEX		;  disabled
+	MOVB	AL, #0
+	OUTB	P_CFGDATA
+	MOVL	EAX, #'PCCB'		;Set up our interrupt vector
+	MOVL	EDX, #'0'
+	MOVL	ECX, au_int.B[EBP]
+	MOVL	EBX, #pccbint
+	MOVB	CH, #DT_TRAP
+	CALL	knlSetIRq##
+	JC	24$.S
+	MOVB	AL, #CX_PCCSTSC		;Clear the status change bits
+	OUTB	P_CFGINDEX
+	MOVB	AL, #0
+	OUTB	P_CFGDATA
+	MOVB	AL, #CX_PCCSTSC
+	OUTB	P_CFGINDEX
+	MOVB	AL, #0FFh
+	OUTB	P_CFGDATA
+	MOVB	AL, #CX_PCCSCIR		;Set the status change interrupt number
+	OUTB	P_CFGINDEX
+	MOVL	EAX, au_int.B[EBP]
+	OUTB	P_CFGDATA
+	MOVB	AL, #CX_PCCSCIE		;Enable the card detect status change
+	OUTB	P_CFGINDEX		;  interrupt
+	MOVB	AL, #03h
+	OUTB	P_CFGDATA
+	MOVL	ECX, #dcb_pccbSIZE+dcb_cSIZE ;Create the DCB
+	MOVL	EBX, #DS$PHYS|DS$DIN|DS$MLTUSER
+	MOVL	EDI, #pccbdsp
+	CALL	knlMakeDcb##
+	JC	24$.S
+	PUSHL	EDI
+	MOVL	EBX, #pccboas		;Setup our once-a-second routine
+	CALL	knlSetupOAS##
+	CMPB	au_xres.B[EBP], #0	;Did we get the exec memory resource?
+	JE	22$.S			;No
+	CALL	knlGiveXRes##		;Yes - give it up
+22$:	POPL	EDI
+	MOVL	ESI, #pccbccb
+	CALL	knlLinkDcb##
+24$:	JC	32$
+	MOVL	dcb_name+0.B[EDI], #'PCCB' ;Setup device name
+	MOVL	dcb_name+4.B[EDI], #'0'
+	MOVB	dcb_punit.B[EDI], #0
+	MOVL	dcb_devchar.B[EDI], #pccbdctbl ;Store offset of devchar table
+	MOVL	EAX, au_cisoffset.B[EBP]
+	MOVL	dcb_pccbcisoffset.B[EDI], EAX
+	MOVL	dcb_fdisp.B[EDI], #pccbfork ;Store fork location
+	MOVL	EAX, au_int.B[EBP]	;Store interrupt number
+	MOVL	dcb_pccbint.B[EDI], EAX
+	MOVL	dcb_pccbsocket.B[EDI], #1 ;Initialize both sockets
+	CALL	setclear
+	DECL	dcb_pccbsocket.B[EDI]
+	CALL	setclear
+	MOVB	AL, #CX_PCCASTS		;Get hardware card present status
+	OUTB	P_CFGINDEX		;  for socket A
+	INB	P_CFGDATA
+	TESTB	AL, #20h		;Is a card present?
+	JNE	26$.S			;No
+	ORB	dcb_pccbAsts.B[EDI], #STS$PRESENT ;Yes - remember that
+26$:	MOVB	AL, #CX_PCCBSTS		;Get hardware card present status
+	OUTB	P_CFGINDEX		;  for socket B
+	INB	P_CFGDATA
+	TESTB	AL, #10h		;Is a card present?
+	JNE	28$.S			;No
+	ORB	dcb_pccbBsts.B[EDI], #STS$PRESENT ;Yes - remember that
+28$:	CMPL	au_boot.B[EBP], #0.B	;Is this a boot operation?
+	JS	30$.S			;No
+
+;Here if doing a BOOT addunit - in this case we initialize socket A to our
+;  standard ATA configuration (which is NOT the primary IDE configuration):
+;	CFGADDR  = 0x200
+;	IO0REG   = 0x180
+;	IO0SIZE  = 16
+;	SOCINT   = 15
+;	CFGVALUE = 0x41
+
+	CLRL	EAX
+	MOVL	dcb_pccbsocket.B[EDI], EAX
+	MOVL	EAX, #200h
+	CALL	setcfgaddr
+	MOVL	EAX, #41h
+	CALL	setcfgvalue
+	MOVL	EBX, #dcb_pccbAio0addr+{CX_PCCIOA1S<16t}
+	MOVL	EAX, #180h
+	CALL	setioreg
+	MOVL	EBX, #dcb_pccbAio0addr+{CX_PCCIOA1S<16t}
+	MOVL	EAX, #16t
+	CALL	setiosize
+	MOVL	EAX, #15t
+	CALL	setsocint
+30$:	MOVL	ECX, au_int.B[EBP]	;Enable our interrupt
+	CALL	knlEnableInt##
+	LEAVE
+	CLRL	EAX
+	CLRL	ECX
+	INCL	ECX
+	MOVL	EBX, #QSTS$DONE
+	TOFORK
+	RET
+
+;Here if error after CIS buffer address space allocated
+
+32$:	PUSHL	EAX
+	MOVL	EBX, knlSvSpacePnt##
+	CALL	knlGiveXSpace##
+	POPL	EAX
+34$:	CALL	knlGiveXRes##
+
+;Here if error after MMS page(s) allocated
+
+36$:	PUSHL	EAX
+	MOVB	AL, #8
+	CALL	xoselnMMSGivePage##
+	POPL	EAX
+38$:	PUSHL	EAX
+	MOVB	AL, #7
+	CALL	xoselnMMSGivePage##
+	POPL	EAX
+40$:	PUSHL	EAX
+	MOVB	AL, #6
+	CALL	xoselnMMSGivePage##
+	POPL	EAX
+	JMP	4$
+.PAGE
+
+;Subroutine called by adduchar for the "UNIT" characteristic
+
+auunit:	TESTL	EAX, EAX		;Unit number must be 0!
+	JNE	knlBadCharV##
+	MOVL	au_unit.B[EBP], EAX
+	RET
+
+;Subroutine called by adduchar for the "BOOT" characteristic
+
+auboot:	MOVL	au_boot.B[EBP], EAX
+	CLC
+	RET
+
+;Subroutine called by addunitchar for the "INT" characteristic
+
+auint:	CMPL	EAX, #2.B		;Valid value?
+	JB	6$.S			;No
+	JNE	2$.S			;Maybe
+	MOVB	AL, #9t			;Yes - do vector 2 fixup
+2$:	CMPL	EAX, #15t		;Maybe
+	JA	6$.S			;No
+	BTL	CS:irqok, EAX
+	JNC	6$.S
+	MOVL	au_int.B[EBP], EAX	;Yes - store value
+	CLC
+	RET
+
+6$:	JMP	knlBadCharV##
+.PAGE
+	.SBTTL	pccbunitinfo - PCCB class get phyical unit information function
+
+;Here for the get physical unit information class function (CL_PUNITS) for the
+;  PCCB class
+;	c{EBX} = Offset of CCB
+;	c{ESI} = Offset of IORB
+;	CALL	pccbunitinfo
+;	c{EAX} = Error code
+;	c{EBX} = Status bits
+;	c{ECX} = Item count
+;  A zero count (iorb_count) requests that the number of units only be returned
+;    in qab_amount.  A non-zero count indicates that a buffer is available for
+;    that many unit names (8 characters each, null padded).
+
+pccbunitinfo:
+	MOVL	EAX, #ER_NIYT
+	CLRL	EAX
+	MOVL	EBX, #QSTS$DONE
+	RET
+.PAGE
+;Here to get the value of the NUMSOC characteristic (which is always 2)
+
+getnumsoc:
+	MOVL	EAX, #2
+	CLC
+	RET
+
+;Here to get the value of the ENABLE characteristic
+
+getenable:
+	MOVL	EAX, #'Yes'
+	CLC
+	RET
+
+;Here to get the value of the SOCINT characteristic
+
+getsocint:
+	IMULL	ESI, dcb_pccbsocket.B[EDI], #dcb_pccbBsocirq-dcb_pccbAsocirq.B
+	MOVZBL	EAX, dcb_pccbAsocirq.B[EDI+ESI]
+	CLC
+	RET
+
+;Here to get the value of the CARDTYPE characteristic
+
+getcardtype:
+	IMULL	ESI, dcb_pccbsocket.B[EDI], #dcb_pccbBconfig-dcb_pccbAconfig.B
+	MOVL	EAX, #'IO'
+	CLRL	EDX
+	TESTB	dcb_pccbAconfig.B[EDI+ESI], #CFG$IOCARD
+	JNE	4$.S
+	MOVL	EAX, #'Memo'
+	MOVL	EDX, #'ry'
+4$:	RET
+
+;Here to get the value of the CFGADDR characteristic
+
+getcfgaddr:
+	IMULL	ESI, dcb_pccbsocket.B[EDI], #dcb_pccbBcfgaddr-dcb_pccbAcfgaddr.B
+	MOVL	EAX, dcb_pccbAcfgaddr.B[EDI+ESI]
+	CLC
+	RET
+
+;Here to get the value of the CFGVALUE characteristic - This reads the value
+;  directly from the card
+
+getcfgvalue:
+	IMULL	ESI, dcb_pccbsocket.B[EDI], #dcb_pccbBcfgaddr-dcb_pccbAcfgaddr.B
+	MOVL	ESI, dcb_pccbAcfgaddr.B[EDI+ESI]
+	CALL	setupmemory
+	ANDL	ESI, #0FFFh
+	ADDL	ESI, dcb_pccbcisoffset.B[EDI]
+	MOVZBL	EAX, [ESI]
+	CLC
+	RET
+
+;Here to get the value of the PRESENT characteristic - This reads the current
+;  value from the interface.  This code is slightly different for most of
+;  the routines here since the status registers for socket A and socket B
+;  have DIFFERENT bit layouts!!
+
+getpresent:
+	CALL	checkpresent
+	MOVL	EAX, #'Yes'		;Assume present
+	JE	6$.S			;If right
+	MOVL	EAX, #'No'		;No present
+6$:	RET
+
+;Subroutine to see if a card is present in a socket
+;	CALL	checkpresent
+;	Z:clr = No card in socket
+;	Z:set = Card present
+
+checkpresent:
+	CMPL	dcb_pccbsocket.B[EDI], #0.B ;Which socket?
+	JNE	8$.S			;Socket B
+	MOVB	AL, #CX_PCCASTS		;Socket A - get status byte
+	OUTB	P_CFGINDEX
+	INB	P_CFGDATA
+	TESTB	AL, #20h
+	RET
+
+;Here for socket B
+
+8$:	MOVB	AL, #CX_PCCBSTS		;Get status byte
+	OUTB	P_CFGINDEX
+	INB	P_CFGDATA
+	TESTB	AL, #10h
+	RET
+
+;Here to get the value of the READONLY characteristic - This reads the current
+;  value from the interface.
+
+getreadonly:
+	MOVB	AL, #CX_PCCASTS		;Assume socket A
+	CMPL	dcb_pccbsocket.B[EDI], #0.B ;Right?
+	JE	14$.S			;Yes
+	MOVB	AL, #CX_PCCBSTS		;No - its socket B
+14$:	OUTB	P_CFGINDEX
+	INB	P_CFGDATA
+	TESTB	AL, #01h
+	MOVL	EAX, #'No'		;Assume not read-only
+	JE	16$.S			;If right
+	MOVL	EAX, #'Yes'		;Wrong - its read-only
+16$:	RET
+.PAGE
+;Here to get the value of the IOnSIZE characteristic
+
+getiosize:
+	IMULL	ESI, dcb_pccbsocket.B[EDI], #dcb_pccbBio0size-dcb_pccbAio0size.B
+	ADDW	SI, BX
+	MOVL	EAX, dcb_pccbAio0size-dcb_pccbAio0addr[EDI+ESI]
+	RET
+
+;Here to get the value of the IOnREG characteristic
+
+getioreg:
+	IMULL	ESI, dcb_pccbsocket.B[EDI], #dcb_pccbBio0addr-dcb_pccbAio0addr.B
+	ADDW	SI, BX
+	MOVL	EAX, [EDI+ESI]
+	RET
+
+;Here to get the value of the IOWID characteristic
+
+getiowid:
+	IMULL	ESI, dcb_pccbsocket.B[EDI], #dcb_pccbBconfig-dcb_pccbAconfig.B
+	MOVL	EAX, #16t.B		;Assume 16-bit IO accesses
+	TESTB	dcb_pccbAconfig.B[EDI+ESI], #CFG$8BITIO
+	JE	2$.S
+	MOVB	AL, #8t
+2$:	RET
+.PAGE
+;Here to get the value of the MEMnSIZE characteristic - This value is fixed!
+;  This characteristic is provided for compatablity with other PC-card
+;  controllers which allow this value to be changed.  For the Elan, the
+;  memory window size is always 16KB if the window is enabled.
+
+getmemsize:
+	MOVL	EAX, #4000h
+	CLC
+	RET
+
+;Here to get the value of the MEMnSYS characteristic - This value is fixed!
+;  This characteristic is provided for compatablity with other PC-card
+;  controllers which allow this value to be changed.  For the Elan, the
+;  memory window physical address is always 0C8000h for socket A and 0CC000h
+;  for socket B.
+
+getmemsys:
+	IMULL	EAX, dcb_pccbsocket.B[EDI], #4000h
+	ADDL	EAX, #0C8000h
+	RET
+
+;Here to get the value of the MEMnCARD characteristic - This is the PC-card
+;  address space address for the memory window
+
+getmemcard:
+	IMULL	ESI, dcb_pccbsocket.B[EDI], #dcb_pccbBmemcard-dcb_pccbAmemcard.B
+	MOVL	EAX, [EDI+ESI]
+	CLC
+	RET
+
+;Here to get the value of the MEMWID characteristic
+
+getmemwid:
+	IMULL	ESI, dcb_pccbsocket.B[EDI], #dcb_pccbBconfig-dcb_pccbAconfig.B
+	MOVL	EAX, #16t.B		;Assume 16-bit IO accesses
+	TESTB	dcb_pccbAconfig.B[EDI+ESI], #CFG$8BITMEM
+	JE	4$.S
+	MOVB	AL, #8t
+4$:	RET
+.PAGE
+;Here to set the value of the SOCKET characteristic.  This value determines
+;  which socket all of the remaining socket related characteristics refer to.
+;  Note that this value is sticky.  There is only one value which affects all
+;  open instances of the device!
+
+setsocket:
+	CMPL	EAX, #1t.B
+	JBE	knlDcSet4Byte##
+	JMP	knlBadCharV##
+
+;Here to set the clear characteristic.  This clears (initializes) all data
+;  for the socket and disables the socket.
+
+setclear:
+	CLRL	EAX			;Clear the interrupt assignement
+	CALL	setsocint
+	MOVL	EBX, #dcb_pccbAio0addr+{CX_PCCIOA1S<16t}
+	CLRL	EAX			;Disable IO window 0
+	CALL	setioreg
+	MOVL	EBX, #dcb_pccbAio1addr+{CX_PCCIOA2S<16t}
+	CLRL	EAX			;Disable IO window 1
+	CALL	setioreg
+	CLRL	EAX			;Disable the memory window
+	CALL	setmemcard
+	MOVL	EAX, #16t		;Enable 16-bit IO access
+	CALL	setiowid
+	MOVL	EAX, #16t		;Enable 16-bit memory access
+	CALL	setmemwid
+	CLRL	EAX			;Make it an IO card
+	CALL	setcardtype2
+	CLC
+	RET
+
+;Here to set the socket enabled status.  Note that the Elan does not support
+;  socket enabling and disabling.  This characteristic is a no-op which is
+;  provided for compatability with other controllers!
+
+setenable:
+	CLC
+	RET
+.PAGE
+	.MOD	4
+typeval:.LONG	'IO', 0
+	.LONG	'MEMO', 'RY'
+TYPEVALSZ=!{$-typeval}/8t
+
+setcardtype:
+	MOVL	EBX, #typeval
+	MOVL	ECX, #TYPEVALSZ
+	CALL	knlGetDcVal1##
+	JC	10$.S
+setcardtype2:
+	IMULL	ESI, dcb_pccbsocket.B[EDI], #dcb_pccbBconfig-dcb_pccbAconfig.B
+	TESTL	EAX, EAX		;IO card?
+	JNE	4$.S			;No - memory card
+
+;Here if this should be an IO card
+
+	ORB	dcb_pccbAconfig.B[EDI+ESI], #CFG$IOCARD
+	MOVB	AL, #01			;Set REG
+	JMP	6$.S
+
+;Here if this should be a memory card
+
+4$:	ANDB	dcb_pccbAconfig.B[EDI+ESI], #~CFG$IOCARD
+	CLRL	EAX			;Clear REG
+6$:	IMULL	EDX, dcb_pccbsocket.B[EDI], #4.B
+	ADDL	EDX, xoselnRegA##	;Set REG to 0 if memory card or to 1
+	OUTB	[DX]			;  if IO card
+	MOVB	DL, AL
+	IMULL	EAX, dcb_pccbsocket.B[EDI], #CX_PCCIRQB-CX_PCCIRQA.B
+	ADDL	EAX, #CX_PCCIRQA.B	;Set controller card type 
+	OUTB	P_CFGINDEX
+	INB	P_CFGDATA
+	ANDB	AL, #0FBh		;Get all but the IO card bit
+	SHLB	DL, #2			;Position the new bit
+	ORB	AL, DL
+	OUTB	P_CFGDATA		;Output it
+10$:	RET
+.PAGE
+;Here to set the value of the SOCINT characteristic - This sets the interrupt
+;  request to be used for card interrupts for the currently selected socket.
+;  It also disables all IO accesses to the card.  NOTE:  This does not
+;  allocate or intialize the interrupt for use! It is the responsibility of
+;  the associated device driver to allocate and initialize the interrupt!!
+
+setsocint:
+	CMPL	EAX, #15t.B
+	JA	knlBadCharV##
+	CMPB	AL, #2t
+	JNE	4$.S
+	MOVB	AL, #9t
+	JMP	6$.S
+
+4$:	BTL	CS:irqok, EAX
+	JNC	knlBadCharV##
+6$:	IMULL	ESI, dcb_pccbsocket.B[EDI], #dcb_pccbBsocirq-dcb_pccbAsocirq.B
+	MOVB	dcb_pccbAsocirq.B[EDI+ESI], AL
+
+;The IRQ number is written to the high order 4 bits of the CX_PCCIRQA or
+;  CX_PCCIRQB configuration register.
+;  the card for IO.
+
+	MOVL	EDX, EAX
+	IMULL	EAX, dcb_pccbsocket.B[EDI], #CX_PCCIRQB-CX_PCCIRQA.B
+	ADDL	EAX, #CX_PCCIRQA.B
+	OUTB	P_CFGINDEX
+	INB	P_CFGDATA
+	ANDB	AL, #0Fh
+	SHLB	DL, #4t
+	ORB	AL, DL
+	OUTB	P_CFGDATA
+	CLC
+	RET
+
+	.MOD	4
+irqok:	.LONG	0DEB9h
+.PAGE
+;Here to set the value of the CFGADDR characteristic - This stores the
+;  address of the CIS configuration register for later access with the
+;  CFGVALUE characteristic.
+
+setcfgaddr:
+	IMULL	ESI, dcb_pccbsocket.B[EDI], #dcb_pccbBcfgaddr-dcb_pccbAcfgaddr.B
+	MOVL	dcb_pccbAcfgaddr.B[EDI+ESI], EAX
+	CLC
+	RET
+
+;Here to set the value of the CFGVALUE characteristic - This writes the value
+;  directly to the card CIS address specified by the CFGADDR characteristic.
+
+setcfgvalue:
+	PUSHL	EAX
+	CALL	setupcis
+	IMULL	ESI, dcb_pccbsocket.B[EDI], #dcb_pccbBcfgaddr-dcb_pccbAcfgaddr.B
+	MOVL	ESI, dcb_pccbAcfgaddr.B[EDI+ESI]
+	CALL	setupmemory
+	POPL	EAX
+	ANDL	ESI, #0FFFh
+	ADDL	ESI, dcb_pccbcisoffset.B[EDI]
+	MOVB	[ESI], AL
+12$:	RET
+.PAGE
+;Here to set the value of the IOnSIZE characteristic - This specifies the
+;  size of the IO window.  This must be the last characteristic set when
+;  setting up an IO window.  It also enables the window if the size is not
+;  0.  It should be noted that an IO window cannot cross a 256 byte boundry.
+;  If the specified size would cross such a boundry, the size if reduced to
+;  the largest valid size (which will always be at least 1)
+
+setiosize:
+	MOVZWL	ESI, BX			;Get offset of the address value in
+					;  the DCB
+	SHRL	EBX, #16t		;Get base configuration register for
+					;  window for socket A
+	CMPL	dcb_pccbsocket.B[EDI], #0.B ;Which socket?
+	JE	2$.S			;Socket A
+	ADDL	ESI, #dcb_pccbBio0addr-dcb_pccbAio0addr.B ;Socket B - fix up
+	ADDL	EBX, #10h.B				  ;  the values
+2$:	ADDL	ESI, EDI
+	TESTL	EAX, EAX		;Is size 0?
+	JNE	4$.S			;No
+	MOVL	dcb_pccbAio0size-dcb_pccbAio0addr.B[ESI], EAX ;Store size
+	JMP	10$.S
+
+;Here if not setting size to 0
+
+4$:	MOVL	ECX, [ESI]		;No - calculate upper register number
+	MOVL	EDX, ECX
+	LEAL	ECX, -1.B[ECX+EAX]
+	CMPB	CH, DH			;Is the high byte the same?
+	JE	6$.S			;Yes
+	MOVB	CH, DH			;No - make it as big as we can!
+	MOVB	CL, #0FFh
+6$:	MOVL	EDX, ECX		;Calculate actual size
+	SUBL	ECX, [ESI]
+	INCL	ECX
+	MOVL	dcb_pccbAio0size-dcb_pccbAio0addr.B[ESI], ECX ;Store size
+	LEAL	EAX, CX_PCCIOA1E-CX_PCCIOA1S.B[EBX]
+	OUTB	P_CFGINDEX
+	MOVB	AL, DL			;Set upper port number
+	OUTB	P_CFGDATA
+	MOVB	AH, #1			;Enable the window
+10$:	CALL	enableiowin
+	CLC
+	RET
+.PAGE
+;Here to set the value of the IOnREG characteristic - This specifies the
+;  base register for the IO window.  Setting this value sets the window size
+;  to 0 and disables the window.
+
+setioreg:
+	MOVZWL	ESI, BX			;Get offset of the address value in
+					;  the DCB
+	SHRL	EBX, #16t		;Get base configuration register for
+					;  window for socket A	
+	CMPL	dcb_pccbsocket.B[EDI], #0.B ;Which socket?
+	JE	4$.S			;Socket A
+	ADDL	ESI, #dcb_pccbBio0addr-dcb_pccbAio0addr.B ;Socket B - fix up
+	ADDL	EBX, #10h.B				  ;  the values
+4$:	ADDL	ESI, EDI
+	MOVL	[ESI], EAX		;Store base register in the DCB
+	MOVL	dcb_pccbAio0size-dcb_pccbAio0addr.B[ESI], #0 ;Store size
+	MOVB	AH, #0			;Disable the window
+	CALL	enableiowin
+10$:	LEAL	EAX, CX_PCCIOA1H-CX_PCCIOA1S.B[EBX] ;Set high order byte
+	OUTB	P_CFGINDEX
+	MOVB	AL, 1.B[ESI]
+	OUTB	P_CFGDATA
+	MOVL	EAX, EBX		;Set low order byte
+	OUTB	P_CFGINDEX
+	MOVB	AL, [ESI]
+	OUTB	P_CFGDATA
+	CLC
+	RET
+
+;Here to set the value of the IOnWID characteritsic - This specifies the data
+;  width for IO accesses.  Valid values are:
+;	 8 - Forces 8 bit transfers
+;	16 - Allows 16 bit transfers if requested by card
+
+setiowid:
+	IMULL	ESI, dcb_pccbsocket.B[EDI], #dcb_pccbBconfig-dcb_pccbAconfig.B
+	ANDB	dcb_pccbAconfig.B[EDI+ESI], #~CFG$8BITIO
+	MOVB	DL, #04h		;Assume 8-bit only
+	CMPL	EAX, #8t.B		;Right?
+	JA	12$.S			;Yes
+	MOVB	DL, #0			;No
+	ORB	dcb_pccbAconfig.B[EDI+ESI], #CFG$8BITIO
+12$:	MOVL	ECX, dcb_pccbsocket.B[EDI] ;Position a mask bit
+	MOVB	AH, #0FBh
+	ROLB	AH, CL
+	SHLB	DL, CL			;And position the new value
+	MOVB	AL, #CX_PCCDWID
+	OUTB	P_CFGINDEX
+	INB	P_CFGDATA		;Get current value
+	ANDB	AL, #0Fh		;Make sure high order 4 bits are right
+	ORB	AL, #0A0h
+	ANDB	AL, AH			;Remove current bit
+	ORB	AL, DL			;Put in the new bit
+	OUTB	P_CFGDATA		;Write it out
+	RET
+.PAGE
+;Here to set the value of the MEMnSIZE characteristic - This specifies the
+;  size of the memory window.  If the size is 0, the window is disabled.  If
+;  it is non-0, the window is enabled.  Since the memory window size is fixed
+;  at 16KB, this is the only valid non-0 value!
+
+setmemsize:
+	IMULL	ESI, dcb_pccbsocket.B[EDI], #dcb_pccbBmemcard-dcb_pccbAmemcard.B
+	TESTL	EAX, EAX		;Want to disable the memory window?
+	JE	4$.S			;Yes
+	CMPL	EAX, #4000h		;No - is the size correct?
+	JNE	knlBadCharV##		;No - fail!
+	MOVB	AH, #1
+4$:	MOVB	dcb_pccbAmemenb.B[EDI+ESI], AH ;Indicate enabled or disabled
+	MOVB	AL, dcb_pccbsocket.B[EDI]
+	ADDB	AL, #6
+	CALL	xoselnMMSEnbPage##
+	CLC
+	RET
+
+;Here to set the value of the MEMnSYS characteristic - This specifies the
+;  system address for the memory window.  Since this address is fixed for
+;  this driver, this characteristic is provided only for compatability with
+;  other devices which allow it to be changed.  The value here must be
+;  0C8000h for socket A and 0CC000h for socket B or an ER_CHARV error will
+;  result!
+
+setmemsys:
+	IMULL	EDX, dcb_pccbsocket.B[EDI], #4000h
+	ADDL	EDX, #0C8000h
+	CMPL	EAX, EDX		;Is the value correct?
+	JNE	knlBadCharV##		;No - fail!
+	CLRL	EAX			;Yes - just disable the window
+	JMP	4$.S
+
+;Here to set the value of the MEMnCARD characteristic - This specifies the
+;  card address for the memory window.  Setting this value also disables the
+;  window.
+
+setmemcard:
+	IMULL	ESI, dcb_pccbsocket.B[EDI], #dcb_pccbBmemcard-dcb_pccbAmemcard.B
+	MOVL	dcb_pccbAmemcard.B[EDI+ESI], EAX ;Store new address
+	PUSHL	EAX
+	MOVB	AL, dcb_pccbsocket.B[EDI] ;Disable the memory window
+	ADDB	AL, #6
+	MOVB	AH, #0
+	CALL	xoselnMMSEnbPage##
+	POPL	EBX
+	MOVB	AL, dcb_pccbsocket.B[EDI] ;MMS page number is our socket number
+	ADDB	AL, #6			  ;  plus 6
+	CALL	xoselnMMSMapPage##	;Change mapping for the MMS page
+	CLC
+	RET
+.PAGE
+;Here to set the value of the MEMWID characteritsic - This specifies the data
+;  width for memory accesses.  Valid values are:
+;	 8 - Forces 8 bit transfers
+;	16 - Allows 16 bit transfers if requested by card
+
+setmemwid:
+	IMULL	ESI, dcb_pccbsocket.B[EDI], #dcb_pccbBconfig-dcb_pccbAconfig.B
+	ANDB	dcb_pccbAconfig.B[EDI+ESI], #~CFG$8BITMEM
+	MOVB	DL, #01h		;Assume 8-bit only
+	CMPL	EAX, #8t.B		;Right?
+	JA	12$.S			;No
+	MOVB	DL, #0			;Yes
+	ORB	dcb_pccbAconfig.B[EDI+ESI], #CFG$8BITMEM
+12$:	MOVL	ECX, dcb_pccbsocket.B[EDI] ;Position a mask bit
+	MOVB	AH, #0FEh
+	RORB	AH, CL
+	SHRB	DL, CL			;And position the new value
+	MOVB	AL, #CX_PCCDWID
+	OUTB	P_CFGINDEX
+	INB	P_CFGDATA		;Get current value
+	ANDB	AL, #0Fh		;Make sure high order 4 bits are right
+	ORB	AL, #0A0h
+	ANDB	AL, AH			;Remove current bit
+	ORB	AL, DL			;Put in the new bit
+	OUTB	P_CFGDATA		;Write it out
+	RET
+.PAGE
+;Here to get the value of the CISDATA characteristic - This returns the
+;  complete CIS contents for the card.  Long and short links are followed
+;  and removed from the data returned.
+
+$$$=!0
+FRM cis_count , 4t
+FRM cis_amount, 4t
+FRM cis_bufr  , 4t
+FRM cis_addr  , 4t
+FRM cis_link  , 4t
+FRM cis_limit , 4t
+FRM cis_first , 1t	;Non-0 if processing first tuple list
+FRM cis_power , 1t	;Non-0 if card power has been turned on
+FRM           , 2t
+FRM cis_card  , 4t	;Saved value of dcb_pccbxmemcard
+cis_SIZE=!$$$
+
+getcisdata:
+	MOVL	ECX, #1023t
+	ENTER	cis_SIZE, 0
+	MOVL	cis_count.B[EBP], ECX
+	MOVL	cis_bufr.B[EBP], EBX
+	CLRL	EAX
+	MOVL	cis_amount.B[EBP], EAX	;Initialize amount input
+	MOVL	cis_link.B[EBP], EAX
+	MOVB	cis_power.B[EBP], AL
+	DECL	EAX
+	MOVB	cis_first.B[EBP], AL
+	MOVL	cis_addr.B[EBP], EAX
+	MOVL	cis_limit.B[EBP], #1024t
+	CALL	setupcis
+	JNC	8$.S
+	LEAVE				;No - fail
+	CLRL	ECX
+	STC
+6$:	RET
+
+;Here if there is a card in the socket
+
+8$:	CLRL	ESI
+10$:	CALL	getcisbyte
+	JC	20$.S
+	CMPB	AL, #0
+	JE	10$.S
+	CMPB	AL, #0FFh		;End of data?
+	JE	30$			;Yes
+	CMPB	AL, #14h		;No - No link control tuple?
+	JNE	12$.S			;No
+	CALL	getcisbyte		;Yes - get link (count) byte
+	JC	20$.S
+	CMPB	AL, #0			;It must be 0
+	JNE	36$
+	MOVL	cis_link.B[EBP], #-1	;Indicate no link present
+	JMP	10$.S
+
+;Here if not no link control tuple
+
+12$:	CMPB	AL, #12h		;Common long link tuple?
+	JNE	14$.S			;No
+	MOVB	AL, #0			;Yes - indicate common memory
+	JMP	18$.S
+
+;Here if not common long link tuple
+
+14$:	CMPB	AL, #13h		;Attribute long link tuple?
+	JNE	22$.S			;No
+	MOVB	AL, #80h		;Yes - indicate attribute memory
+18$:	MOVB	cis_link+3.B[EBP], AL	;Store attribute memory bit
+	CALL	getcisbyte		;Get link (count) byte
+20$:	JC	26$.S
+	CMPB	AL, #4t			;Must be 4
+	JNE	36$
+	CALL	getcisbyte		;Get and store the 4 byte link address
+	JC	26$.S
+	MOVB	cis_link+0.B[EBP], AL
+	CALL	getcisbyte
+	JC	26$.S
+	MOVB	cis_link+1.B[EBP], AL
+	CALL	getcisbyte
+	JC	26$.S
+	MOVB	cis_link+2.B[EBP], AL
+	CALL	getcisbyte
+	JC	26$.S
+	ANDB	AL, #7Fh
+	ORB	cis_link+3.B[EBP], AL
+	MOVB	cis_first.B[EBP], #0	;Indicate most have a link target
+					;  control tuple now
+	JMP	10$.S			;Continue
+
+;Here if not a tuple which we process
+
+22$:	CALL	storecisbyte		;Give caller the type byte
+	JC	26$.S
+	CALL	getcisbyte		;Get the link (count) byte
+	JC	26$.S
+	CALL	storecisbyte		;Give it to the caller
+	JC	26$.S
+	MOVZBL	ECX, AL
+	JREGZ	ECX, 28$
+24$:	CALL	getcisbyte		;Give him the data bytes
+26$:	JC	42$.S
+	CALL	storecisbyte
+	JC	42$.S
+	LOOP	ECX, 24$
+28$:	JMP	10$
+
+;Here with end of data marker
+
+30$:	CALL	storecisbyte		;Give caller the end of data byte
+	JC	26$.S
+	CMPL	cis_link.B[EBP], #-1.B	;All finished?
+	JE	40$.S			;Yes
+	MOVL	cis_addr.B[EBP], #-1
+	MOVL	ESI, cis_link.B[EBP]	;No
+	MOVL	cis_link.B[EBP], #-1.B
+	CALL	getcisbyte		;Is this a link target control tuple?
+	JC	42$.S
+	CMPB	AL, #13h
+	JNE	32$.S
+	CALL	getcisbyte
+	JC	42$.S
+	CMPB	AL, #03h
+	JNE	32$.S
+	CALL	getcisbyte
+	JC	42$.S
+	CMPB	AL, #'C'
+	JNE	32$.S
+	CALL	getcisbyte
+	JC	42$.S
+	CMPB	AL, #'I'
+	JNE	32$.S
+	CALL	getcisbyte
+	JC	42$.S
+	CMPB	AL, #'S'
+	JNE	32$.S
+	MOVB	cis_first.B[EBP], #0	;Yes - remember not in first list
+	JMP	10$			;Continue
+
+;Here if target of a branch is not a link target control tuple.  Since not
+;  all cards properly insert the no link control tuple in the initial list
+;  we ignore this quietly if the branch is from the initial list and no
+;  branch address was explicitly specified!
+
+32$:	CMPB	cis_first.B[EBP], #0	;In first list?
+	JNE	40$.S			;Yes - just terminate quietly
+36$:	MOVL	EAX, #ER_IDFMT		;No - indicate illegal data format
+	JMP	42$.S
+
+;Here when finished with the CIS data
+
+40$:	CLRL	EAX
+42$:	IMULL	ESI, dcb_pccbsocket.B[EDI], #dcb_pccbBconfig-dcb_pccbAconfig.B
+	TESTB	dcb_pccbAconfig.B[EDI+ESI], #CFG$IOCARD ;IO card?
+	JNE	44$.S			;Yes - leave REG set
+	PUSHL	EAX			;No - clear REG
+	IMULL	EDX, dcb_pccbsocket.B[EDI], #4.B
+	ADDL	EDX, xoselnRegA##
+	CLRL	EAX
+	OUTB	[DX]
+	POPL	EAX
+44$:	MOVL	ECX, cis_amount.B[EBP]	;Get count to return
+	LEAVE				;Finished
+	BTL	EAX, #31t		;Set C if error
+	RET
+.PAGE
+storecisbyte:
+	DECL	cis_count.B[EBP]
+	JS	2$.S
+	MOVL	EDX, cis_bufr.B[EBP]
+	MOVB	ES:[EDX], AL
+	INCL	cis_bufr.B[EBP]
+	INCL	cis_amount.B[EBP]
+	CLC
+	RET
+
+;Here if user's buffer is full - indicate data truncated
+
+2$:	MOVL	EAX, #ER_DATTR
+	STC
+	RET
+
+;Here if we have too many configuration bytes
+
+4$:	MOVL	EAX, #ER_RTOBG
+	STC
+	RET
+
+;Subroutine to get a byte from CIS
+;	c{ESI} = CIS byte number (common memory if bit 31 = 0, attribute
+;		   memory if bit 31 = 1)
+;	CALL	getcisbyte
+;	c(AL)  = Value
+;	c{ESI} = Original value + 1
+
+getcisbyte:
+	DECL	cis_limit.B[EBP]
+	JS	4$.S
+	PUSHL	ESI
+	MOVL	EAX, cis_addr.B[EBP]	;Same memory page?
+	XORL	EAX, ESI
+	TESTL	EAX, #0FFFFE000h
+	JE	10$.S			;Yes
+	MOVL	cis_addr.B[EBP], ESI	;No - set up for the new page
+	CALL	setupmemory
+10$:	ANDL	ESI, #0FFFh		;Get offset in the data segment
+	ADDL	ESI, dcb_pccbcisoffset.B[EDI]
+	MOVB	AL, [ESI]		;Get the data byte
+	POPL	ESI
+	ADDL	ESI, #2t.B		;Bump the CIS address
+	RET
+.PAGE
+;Subroutine to set up to access CIS memory for a card
+;	CALL	setupcis
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+
+setupcis:
+	CALL	checkpresent
+	JNE	2$.S
+	MOVL	EAX, #0408h		;Set the CIS page to the right socket
+	ADDB	AH, dcb_pccbsocket.B[EDI]
+	CALL	xoselnMMSSetPage##
+	IMULL	EDX, dcb_pccbsocket.B[EDI], #4.B ;Set REG for the socket
+	ADDL	EDX, xoselnRegA##
+	MOVB	AL, #01h
+	OUTB	[DX]
+	CLC
+	RET
+
+2$:	MOVL	EAX, #ER_PDNAV
+	STC
+	RET
+
+;Subroutine to set up card memory mapping to access configuration data
+;	c{ESI} = Card address (bit 31 set if attribute memory)
+;	c{EDI} = Offset of DCB
+
+setupmemory:
+	PUSHL	ESI
+	MOVB	AL, #8
+	MOVL	EBX, ESI
+	CALL	xoselnMMSMapPage##
+	IMULL	EDX, dcb_pccbsocket.B[EDI], #4.B ;Set REG
+	ADDL	EDX, xoselnRegA##
+	MOVB	AL, #01h
+	OUTB	[DX]
+	POPL	ESI
+	RET
+.PAGE
+	.SBTTL	enableiowin - Subroutine to enable or disable an IO window
+
+;Subroutine to enable or disable an IO window
+;	c(AH)  = 0 to disable window, 1 to enable it
+;	c(BL)  = IO window number (low 4 bits 0 or non-0 or windows 0 or 1)
+;	c{EDI} = Offset of DCB
+;	CALL	enableiowin
+
+enableiowin:
+	MOVB	AL, dcb_pccbsocket.B[EDI] ;Get control register number
+	SHLB	AL, #4t
+	ADDB	AL, #6t
+	CLRL	ECX			;Get amount to shift the bit
+	TESTB	BL, #0Fh
+	JE	4$.S
+	INCL	ECX
+4$:	MOVB	DL, #0FEh		;Get mask for the bit
+	ROLB	DL, CL
+	ROLB	AH, CL			;Position the new bit
+	OUTB	P_CFGINDEX		;Get current register value
+	INB	P_CFGDATA
+	ANDB	AL, DL			;Remove the enable bit
+	ORB	AL, AH			;Put in the new value
+	OUTB	P_CFGDATA		;Write it out
+	RET
+.PAGE
+	.SBTTL	pccbchk - Device check routine for PCCB class devices
+
+;Device check routine for PCCB class devices
+;	c{SS:EBX} = Address of device name (16 bytes)
+;	CALL	pccbchk
+;	C:set = Error (match found)
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  Z:set = Match found
+;	    c{EDI} = Offset of DCB
+;	  Z:clr = Not found
+;  EBX and ESI are preserved
+
+pccbchk:CMPL	SS:[EBX], #'PCCB'	;Is this PCCB*?
+	JNE	6$.S			;No
+	MOVL	EDI, pccbccb+ccb_dcbhead ;Yes - point to first PCCB ICB
+	TESTL	EDI, EDI
+	JE	6$.S			;If none at all
+2$:	MOVL	EAX, dcb_name+4.B[EDI]	;Does name match?
+	CMPL	SS:4.B[EBX], EAX
+	JNE	4$.S
+	MOVL	EAX, dcb_name+8.B[EDI]
+	CMPL	SS:8.B[EBX], EAX
+	JNE	4$.S
+	MOVL	EAX, dcb_name+12t.B[EDI]
+	CMPL	SS:12t.B[EBX], EAX
+	JE	8$.S			;Yes - this is it!
+4$:	MOVL	EDI, [EDI]		;No - try next
+	TESTL	EDI, EDI
+	JNE	2$.S			;Continue if another
+6$:	TESTL	ESP, ESP		;No more - clear Z
+8$:	RET
+.PAGE
+	.SBTTL	sd_open - Open device
+
+;Here for the open device entry (sd_open) - also used for the device parameters
+;  entry (sd_parm)
+;	c{EDI} = Offset of DCB
+
+pccbopen:
+	CMPL	SS:xffParm##, #0.B
+	JE	4$.S
+	MOVL	EBX, #pccbopnparms	;Process device parameters
+	MOVL	ECX, #knlComDPParms##
+	IFFAULT	knlRtnAdrEr##
+	LFSL	EDX, SS:xffParm##
+	CALL	knlProcDevParm##
+	JC	8$.S
+4$:	MOVL	EAX, pccbdcbnum
+	CMPL	EAX, pccbdcblmt
+	JAE	10$.S
+	INCL	EAX
+	CMPL	pccbdcbmax, EAX
+	JAE	6$.S
+	MOVL	pccbdcbmax, EAX
+6$:	MOVL	pccbdcbnum, EAX
+	CLRL	EAX
+8$:	RET
+
+;Here if have too many PCCB devices open
+
+10$:	MOVL	EAX, #ER_TMDVC
+	STC
+	RET
+.PAGE
+	.SBTTL	sd_close - Close device
+
+;Here for the close device entry
+;	c{ECX} = Close option bits
+;	c{EDI} = Offset of DCB
+;	c{ESI} = Offset of device table entry
+;	CALL	pccbclose
+;	C:set = Error or not ready
+;	  c{EAX} = Error code (0 means not ready)
+;	C:clr = Normal
+
+pccbclose:
+	CLRL	EAX
+	MOVL	EDX, SS
+	CMPW	dcb_pccbvectpda.B[EDI], DX ;Does this process have a vector set?
+	JNE	4$.S			;No
+	MOVW	dcb_pccbvector.B[EDI], AX ;Yes - clear it
+	MOVW	dcb_pccbvectpda.B[EDI], AX
+4$:	TOFORK
+	JMP	knlCloseFin##
+.PAGE
+	.SBTTL	sd_xxblock - Input and output functions
+
+;Here for the input and output functions - This device cannot do input or
+;  output, so the only purpose of this code is to allow processing of
+;  parameter lists
+
+pccbio:	CMPL	iorb_count.B[ESI], #0.B	;Null IO request?
+	JNE	knlIFnDevGQ##		;No - fail!
+	CMPL	iorb_parm.B[ESI], #0.B	;Yes - do we have a parameter list?
+	JE	4$.S			;No - nothing to do here
+	IFFAULT	10$
+	LFSL	EDX, iorb_parm.B[ESI]	;Yes - get address of parameter list
+	CALL	knlGiveQel##		;Give up the IORB
+	MOVL	EBX, #pccbioparms	;Process parameters
+	MOVL	ECX, #knlComDPParms#
+	CALL	knlProcDevParm#
+	JC	6$.S			;If error
+4$:	CLRL	EAX
+6$:	CLRL	ECX
+	MOVL	EBX, #QSTS$DONE
+	TOFORK
+	RET
+
+	FAULTHDR
+10$:	CALL	knlGiveQel##
+	MOVL	EAX, #ER_ADRER
+	JMP	6$.S
+.PAGE
+	.SBTTL	pccbstsvect - Routine to process IOPAR_SIGVECT1 parameter
+
+;Routine to process IOPAR_SIGVECT1 parameter - this parameter is used to set
+;  the card status change signal vector.  This signal occurs when a card is
+;  inserted or removed.  There are two interrupt data items.  The first
+;  contains the socket number in the low 31 bits.  Bit 31 is set if the card
+;  has just been inserted and clear if it has just been removed.  The second
+;  contains the user specified data value.
+;	c{ES:EBX} = Address of value
+;	c{ECX}    = Length of the value
+;	CALL	pccbstsvect
+
+	DPARMHDR  BOTH, HEXV
+pccbstsvect:
+	TESTB	AH, #PAR$SET		;Want to set value?
+	JE	6$.S			;No
+	PUSHL	EAX			;Yes
+	CALL	knlGetParm##		;Get his value
+	JC	12$.S			;If error
+	CMPL	EAX, #100h		;Valid value?
+	JB	4$.S			;Yes
+	CMPL	EAX, #200h		;Maybe
+	JB	10$.S			;No
+	CMPL	EAX, #300h		;Maybe
+	JAE	10$.S			;No
+4$:	MOVW	dcb_pccbvector.B[EDI], AX ;Yes - store new value
+	MOVW	dcb_pccbvectpda.B[EDI], SS ;Store PDA selector for interrupt
+	POPL	EAX
+6$:	TESTB	AH, #PAR$GET		;Want value returned?
+	JE	14$.S			;No - finished here
+	MOVZWL	EAX, dcb_pccbvector.B[EDI] ;Yes - get value
+	JMP	knlStrParm4##
+
+;Here if bad vector number
+
+10$:	MOVL	EAX, #ER_PARMV
+	STC
+12$:	POPL	EDX
+14$:	RET
+
+	.SBTTL	pccbstsdata - Routine to process IOPAR_SIGDATA parameter
+
+;Routine to process IOPAR_SIGDATA parameter
+;	c{ES:EBX} = Address of value
+;	c{ECX}    = Length of the value
+;	CALL	pccbstsdata
+
+	DPARMHDR  BOTH, HEXV
+pccbstsdata:
+	TESTB	AH, #PAR$SET		;Want to set value?
+	JE	16$.S			;No
+	PUSHL	EAX			;Yes
+	CALL	knlGetParm##		;Get his value
+	JC	12$.S			;If error
+	MOVL	dcb_pccbvectdata.B[EDI], EAX ;OK - store the new value
+	POPL	EAX
+16$:	TESTB	AH, #PAR$GET		;Want value returned?
+	JE	14$.S			;No - finished here
+	MOVL	EAX, dcb_pccbvectdata.B[EDI] ;Yes - get value
+	JMP	knlStrParm4##
+.PAGE
+	.SBTTL	
+
+;Subroutine to associate a device driver with a PC-card socket.
+;	c{EAX} = PC-card interface number (must be 0 for this driver)
+;	c{EDX} = Socket number (must be 0 or 1)
+;	c{EBX} = Offset of status change routine
+;	c{EDI} = Data value for device (value put in EDI when event routine
+;		   is called)
+;	c{ESI} = Offset of name of device
+;	CALL	xospcbRegister
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  c{EAX} = Offset of PCCB device DCB
+
+xospcbRegister:
+	TESTL	EAX, EAX		;Is unit number 0?
+	JNE	4$.S			;No - fail
+	CMPL	EDX, #1			;Valid socket number?
+	JA	4$.S			;No - fail
+	MOVL	EAX, pccbccb+ccb_dcbhead ;Get our DCB
+	ORL	EAX, EAX
+	JE	4$.S			;Fail if device not set up
+	IMULL	EDX, #dcb_pccbBdevname-dcb_pccbAdevname.B
+	MOVL	dcb_pccbAdevdata.B[EAX+EDX], EDI ;Store data value
+	MOVL	dcb_pccbAdevname.B[EAX+EDX], ESI ;Store offset of device name
+	MOVL	dcb_pccbAstschng.B[EAX+EDX], EBX ;Store offset of status
+	CLC					 ;  change routine
+	RET
+
+;Here if error
+
+4$:	MOVL	EAX, #ER_VALUE
+	STC
+	RET
+.PAGE
+;Subroutine to set memory mapping for PC-card socket
+;	c{EAX} = PC-card interface number (must be 0 for this driver)
+;	c{EDX} = Socket number (must be 0 or 1)
+;	c{EBX} = PC-card memory address
+;	c{ECX} = Size of memory window
+;	CALL	xospcbMapMemory
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Nornal
+;	  c{EBX} = Offset of memory buffer
+
+xospcbMapMemory:
+
+	CRASH	????
+.PAGE
+	.SBTTL	pccbint - PC card controller interrupt routine
+
+pccbint:PUSHAL				;Save all registers
+	PUSHL	DS
+	PUSHL	ES
+	PUSHL	FS
+	PUSHL	GS
+	PUSHL	#GS_DATA.B
+	POPL	DS
+	MOVL	EDI, pccbccb+ccb_dcbhead ;Get our DCB
+	MOVB	AL, #CX_PCCSTSC		;Get the status change bits
+	OUTB	P_CFGINDEX
+	INB	P_CFGDATA
+	ORB	dcb_pccbchanged.B[EDI], AL
+	MOVB	AL, #CX_PCCSTSC		;Clear the status change bits
+	OUTB	P_CFGINDEX
+	MOVB	AL, #0
+	OUTB	P_CFGDATA
+	MOVB	AL, #CX_PCCSTSC
+	OUTB	P_CFGINDEX
+	MOVB	AL, #0FFh
+	OUTB	P_CFGDATA
+	CALL	knlReqFork##
+	MOVB	AL, #INT_EOI		;Release interrupt controllers
+	CMPB	dcb_pccbint.B[EDI], #7
+	CLI
+	JBE	4$.S
+	OUTB	P_INC2P0
+4$:	OUTB	P_INC1P0
+	JMP	knlDismissInt2##	;And dismiss interrupt
+.PAGE
+
+;Fork level routine for PCCB.  This routine handles card insertion and
+;  removal events.  Three status bits (STS$WAITDONE, STS$PRESENT, and
+;  STS$REMOVED) are used to synchronize the interrupt, fork, and clock
+;  routines and to debounce card insertion.  When a status change interrupt
+;  occures the following is done:
+;	If card is present and STS$PRESENT is set, the interrupt is ignored.
+;	If card is present and STS$PRESENT is clear, the debounce timer is
+;	    started.
+;	If card is not present and STS$PRESENT is set, STS$PRESENT is cleared
+;	    and STS$REMOVED is set and a fork request is made (note that in
+;	    this case, the debounce timer cannot be active).
+;	If card is not present and STS$PRESENT is  clear, the debounce timer
+;	    is clared, otherwise the interrupt is ignored.
+;  When the debounce timer completes (1 to 2 seconds), STS$WAITDONE is set
+;    and a fork request is made.
+;  When a fork request is processed the following is done:
+;	If STS$REMOVED is set, all status bits are cleared and the associated
+;	    device driver is notified of the remove event.
+;	Else if STS$WAITDONE is set, STS$WAITDONE is cleared, STS$PRESENT is
+;	    set, and the associated device driver is notified of the insertion
+;	    event.
+;The STS$WAITDONE and STS$REMOVED bits are local to these;  routines and are
+;  used for internal synchronization.  The STS$PRESENT bit is global and is
+;  the indication that a card is present and usable.  Note that the debounce
+;  timer cannot be active when the STS$PRESENT bit is set which also implies
+;  that STS$PRESENT and STS$WAITDONE cannot be set at the same time.
+
+$$$=!0
+FRM pcf_socket , 4t
+FRM            , 3t
+FRM pcf_changed, 1t
+pcf_SIZE=!$$$
+
+pccbfork:
+	ENTER	pcf_SIZE, 0
+	LEAL	ESI, dcb_pccbAsts.B[EDI] ;Point to the socket A status byte
+	MOVB	AL, dcb_pccbchanged.B[EDI] ;Get the status changed bits
+	MOVB	pcf_changed.B[EBP], AL
+	MOVL	pcf_socket.B[EBP], #0
+	MOVB	dcb_pccbchanged.B[EDI], #0
+	MOVB	AL, #CX_PCCASTS		;Get hardware card present status
+	OUTB	P_CFGINDEX
+	INB	P_CFGDATA
+	CALL	chkchng
+	SHRB	pcf_changed.B[EBP], #1
+	INCL	pcf_socket.B[EBP]
+	LEAL	ESI, dcb_pccbBsts.B[EDI] ;Point to the socket B status byte
+	MOVB	AL, #CX_PCCBSTS		;Get hardware card present status
+	OUTB	P_CFGINDEX
+	INB	P_CFGDATA
+	ADDB	AL, AL			;Put the bit in the right place
+	CALL	chkchng
+	LEAVE
+	RET
+
+;	c(AL)  = Card present status (bit 4 = 1 if card present)
+;	c(DL)  = Status changed bit (bit 0)
+;	c{ESI} = Offset of socket status byte in DCB
+
+chkchng:TESTB	[ESI], #STS$WAITDONE	;Has the debounce timer timed-out?
+	JE	2$.S			;No - go on
+	ANDB	[ESI], #~STS$WAITDONE	;Yes - clear the bit
+	TESTB	AL, #20h		;Is the card really still present?
+	JNE	12$.S			;No - ignore this
+	ORB	[ESI], #STS$PRESENT	;Yes - indicate card is present
+	MOVL	EAX, #1
+	JMP	4$.S			;Go notify driver
+
+;Here if debounce timer has not timed-out
+
+2$:	TESTB	pcf_changed.B[EBP], #01h ;Has this card's present status changed?
+	JE	12$.S			;No
+	TESTB	AL, #20h		;Yes - is card present now?
+	JE	10$.S			;Yes
+	TESTB	[ESI], #STS$PRESENT	;No - do we think it is present?
+	JE	12$.S			;No - nothing to do here
+	ANDB	[ESI], #~STS$PRESENT	;Yes - clear the present status
+	CLRL	EAX			;Notify driver if there is one
+4$:	CMPL	dcb_pccbAstschng-dcb_pccbAsts.B[ESI], #0.B
+	JE	6$.S
+	PUSHL	EDI
+	MOVL	EDI, dcb_pccbAdevdata-dcb_pccbAsts.B[ESI]
+	PUSHL	EAX
+	CALLI	dcb_pccbAstschng-dcb_pccbAsts.B[ESI]
+	POPL	EAX
+	POPL	EDI
+6$:	MOVL	EDX, EAX
+	MOVZBL	EAX, dcb_pccbvector.B[EDI] ;Get vector number
+	TESTL	EAX, EAX
+	JE	12$.S			;If no signal wanted
+	CALL	knlGetQel##		;Get a QEL
+	JC	12$.S			;Forget it if error
+	MOVB	slb_szindx.B[ESI], #0
+	MOVB	BL, #SIGT_NORMAL
+	MOVL	ECX, #2			;We have 2 data items
+	SHLL	EDX, #31t		;Put the present bit in bit 31
+	ORL	EDX, pcf_socket.B[EBP]	;Add the socket number
+	MOVL	slb_data+0.B[ESI], EDX	;Store the first data item
+	MOVL	EDX, dcb_pccbvectdata.B[EDI] ;Store the second data item
+	MOVL	slb_data+4.B[ESI], EDX
+	MOVW	ES, dcb_pccbvectpda.B[EDI] ;Get PDA selector
+	CLRL	EDX
+	JMP	knlReqSignal##		;Request the signal
+
+;Here if card is present now
+
+10$:	TESTB	[ESI], #STS$PRESENT	;Do we think it is present?
+	JNE	12$.S			;Yes - nothing to do here
+	MOVB	dcb_pccbAtimer-dcb_pccbAsts.B[ESI], #2 ;No - start debounce
+12$:	RET					       ;  timer
+.PAGE
+	.SBTTL	pccboas - Once-a-second routine
+
+;Once-a-second routine - This routine debounces card insertion.
+
+pccboas:MOVL	EDI, pccbccb+ccb_dcbhead ;Get offset of our DCB
+	CMPB	dcb_pccbAtimer.B[EDI], #0 ;Waiting for socket A?
+	JE	6$.S			;No
+	DECB	dcb_pccbAtimer.B[EDI]	;Yes - finished waiting?
+	JNE	6$.S			;No
+	ORB	dcb_pccbAsts.B[EDI], #STS$WAITDONE ;Yes - indicate done waiting
+	CALL	knlReqFork##
+6$:	CMPB	dcb_pccbBtimer.B[EDI], #0 ;Waiting for socket B?
+	JE	10$.S			;No
+	DECB	dcb_pccbBtimer.B[EDI]	;Yes - finished waiting?
+	JNE	10$.S			;No
+	ORB	dcb_pccbBsts.B[EDI], #STS$WAITDONE ;Yes - indicate done waiting
+	CALL	knlReqFork##
+10$:	RET
+
+.PAGE
+	.SBTTL	PCCB class driver data
+
+	DATA
+
+pccbdcbnum:  .LONG 0		;Number of in use PCCB DCBs
+pccbdcbmax:  .LONG 0		;Maximum in use PCCB DCBs
+pccbdcblmt:  .LONG 10000t	;Maximum number of PCCB DCBs allowed
+pccbccb:     .BLKB ccb_SIZE	;pccb CCB
+pccbfirsticb:.LONG 0		;Offset of first PCCB ICB
+pccblasticb: .LONG 0		;Offset of last PCCB ICB
+enables:     .BYTE 0
+	     .BYTE 0, 0, 0
+
+	LKEEND

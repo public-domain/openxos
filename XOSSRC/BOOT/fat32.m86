@@ -1,0 +1,357 @@
+	.TITLE	FAT32 - XOS disk bootstrap level 1 for 32-bit FAT FS
+
+;++++
+; This software is in the public domain.  It may be freely copied and used
+; for whatever purpose you see fit, including commerical uses.  Anyone
+; modifying this software may claim ownership of the modifications, but not
+; the complete derived code.  It would be appreciated if the authors were
+; told what this software is being used for, but this is not a requirement.
+
+;   THIS SOFTWARE IS PROVIDED BY THE AUTHORS "AS IS" AND ANY EXPRESS OR
+;   IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
+;   OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+;   IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+;   INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+;   BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS
+;   OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+;   ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR
+;   TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
+;   USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+;----
+
+	.PROC	80386
+	.STK16
+
+	.INCLUD	XOSINC:\XMAC\XOS.PAR
+	.INCLUD	XOSINC:\XMAC\XOSX.PAR
+	.INCLUD	XOSINC:\XMAC\XOSRUN.PAR
+	.INCLUD XOSINC:\XMAC\XOSDISK.PAR
+	.INCLUD	XOSINC:\XMAC\XOSXDISK.PAR
+	.INCLUD XOSINC:\XMAC\XOSXDFS.PAR
+	.INCLUD	BOOT.PAR
+
+	.SEG	boot_s , DATA, READ, WRITE, 16BIT
+.IF EQ $$DEBUG1
+	.MSECT	fat32_m, boot_s, ADDR=7C00h
+.IFF
+	.MSECT	fat32_m, boot_s, ADDR=0h
+.ENDC
+
+;The 32-bit DOS fat file system uses a 2 level bootstrap.  Level 1 is
+;  contained in a single block and is stored in the boot block of the disk or
+;  partition.  Level 2 is the common bootstrap code.  The level 1 bootstrap
+;  contains enough code to read a file by following its fat chain, to search
+;  the root directory and find the XOS.BSF file and read it into memory.  Since
+;  this code only supports 32-bit fats, instead of both 12-bit and 16-bit fats,
+;  and does not support floppy disks (since we should never see a floppy with
+;  a FAT32 file system), it is considerably shorter than the 12/16-bit version
+;  so all the code needed to read and load the complete bootstrap will fit in
+;  the boot block.  A seperate level 2 to include the code to handle fat
+;  chains is not needed.  The common bootstrap code is a completely separate
+;  program that does not use any code from the level 1 bootstrap.  A copy of
+;  the original DOS boot block is kept in XOS.BSF at offset 0.  It is copied
+;  to its normal place in memory and used to boot DOS when this is requested.
+
+;The following code is the level 1 bootstrap.  It is copied to the disk
+;  partition's boot block by mkboot.  It is loaded into memory at a physical
+;  address of 7C00h.  It is entered at its first location using any combination
+;  of selector and offset that produces the correct physical address.  The
+;  CS:IP will normally be 0:7C00 although the CS:IP will sometimes be 7C0:0
+;  (this has only been observed on some systems when booting from a CD).  The
+;  area below loaded code (down to load address - 1C00) is used for a stack.
+;  Locations between 4000h and 4FFFh are used for the bootstrap's data.
+;  Locations above 8000h are used for loaded code.
+
+	.PSECT	fat32_p, fat32_m
+
+;Allocate space for the boot block header stuff
+
+.IF NE $$DEBUG1
+	.BLKB	7C00h
+	.START	begin
+.ENDC
+
+bb:	JMP	begin.S
+	NOP
+
+.IF NE $$DEBUG1
+$=bb+db_secpcls
+	.BYTE	8
+$=bb+db_ressec
+	.WORD	32
+$=bb+db_numfats
+	.BYTE	2
+$=bb+db_rdirent
+	.WORD	0
+$=bb+db_secpfat
+	.WORD	0t
+$=bb+db_secptrk
+	.WORD	63t
+$=bb+db_heads
+	.WORD	128t
+$=bb+db_rootcls
+	.LONG	0
+$=bb+db_devunit
+	.BYTE	80h
+$=bb+db_ttlsecpfat
+	.LONG	2400t
+$=bb+db_rootcls
+	.LONG	2
+$=bb+db_fatbegin
+	.LONG	5Fh
+$=bb+db_databegin
+	.LONG	130Fh
+.ENDC
+$=bb+db_code32
+
+;Start of level 1 bootstrap
+
+begin:	CLI
+	PUSHW	CS
+	CALL	2$			;Put the original CS:IP on the
+2$:	PUSHW	BP			;  original stack
+	MOVW	BP, SP
+	SUBW	2.B[BP], #2$-bb
+	POPW	BP
+	PUSHW	AX
+	PUSHW	DX
+	CALL	4$			;Adjust the CS:IP so that our initial
+4$:	POPW	AX			;  IP value is 1C00 (which will 
+	SUBW	AX, #4$-bb+cb		;  normally result in a CS value
+	SARW	AX, #4			;  of 600)
+	MOVW	DX, CS
+	ADDW	AX, DX
+	PUSHW	AX			;Push adjusted CS
+	PUSHW	#6$-bb+cb		;Push offset in segment of next ins
+	RETF				;Adjust CS and IP
+
+6$:	POPW	DX
+	POPW	AX
+	MOVW	CS:cb-402h, SS		;Save registers we need to restore
+	MOVW	CS:cb-404h, SP		;  when loading DOS
+	MOVL	CS:cb-408h, EAX
+	MOVW	AX, CS
+	MOVW	SS, AX			;Set up our stack below our code
+	MOVW	SP, #cb-408h		;  segment
+	PUSHAL				;Save the rest of the registers
+	PUSHW	DS
+	PUSHW	ES
+	CLRW	AX
+	MOVW	ES, AX
+	MOVW	DS, AX
+	LGSW	SI, 78h			;Copy the floppy parameter table
+	MOVW	BX, SI
+	MOVW	flptblsave+0, SI
+	MOVW	flptblsave+2, GS
+	MOVW	DI, #flptbl
+	MOVW	78h+0, DI
+	MOVW	78h+2, DS
+	MOVW	CX, #11t
+	CLD
+	RMOVSB	[DI], GS:[SI]
+	MOVB	AL, CS:cb+db_secptrk
+	MOVB	4.B[BX], AL
+	MOVB	9.B[BX], #1
+	STI				;Allow interrupts now
+	MOVB	DL, #0			;Reset disks
+	MOVB	AH, #0
+	INT	13h
+	PUSHW	CS
+	POPW	ES
+	MOVW	BX, #cb+level2-bb
+	MOVL	EAX, CS:cb+db_level2	;Read the level 2 code
+	CALL	readblk
+	CMPL	CS:cb+level2-bb+0, #-1
+	JNE	booter1.S
+	CMPL	CS:cb+level2-bb+4, #'XOSB'
+	JNE	booter1.S
+	CMPL	CS:cb+level2-bb+8, #'OOT'
+	JNE	booter1.S
+	JMP	lvl2bgn
+
+;Subroutine to read a block from the disk
+;	c{EAX}   = Block number on disk
+;	c[ES:BX] = Address of buffer
+;	CALL	readblk
+
+readblk:MOVZWL	ECX, CS:cb+db_secptrk	;Get number of sectors
+	CLRL	EDX
+	DIVL	ECX			;Calculate sector
+	INCW	DX
+	PUSHW	DX
+	CLRL	EDX
+	MOVZWL	ECX, CS:cb+db_heads
+	DIVL	ECX			;Calculate head and cylinder numbers
+	POPW	CX
+	MOVB	DH, DL
+	MOVB	CH, AL
+	SHLB	AH, #6
+	ORB	CL, AH
+	MOVB	AL, #1			;Always read 1 block
+	MOVB	DL, #80h		;Get drive number
+	MOVB	AH, #02h		;Read the block
+	INT	13h
+	JC	booter1.S
+	RET
+
+booter1:MOVW	SI, #errmsg		;Not there - get message
+10$:	LODSB	[SI]			;Get character
+	CMPB	AL, #0			;End of message?
+	JE	14$.S			;Yes
+	MOVB	AH, #0Eh		;No - display character
+	CLRW	BX
+	INT	10h
+	JMP	10$.S			;Continue
+
+14$:	MOVB	AH, #0			;Wait for a key
+	INT	16h
+	INT	19h			;Reboot
+
+.IF NE 0
+xxx:	PUSHAL
+	PUSHW	ES
+	MOVW	CX, #0B800h
+	MOVW	ES, CX
+	MOVW	CX, #8
+100$:	ROLL	EAX, #4
+	PUSHL	EAX
+	ANDB	AL, #0Fh
+	CMPB	AL, #9
+	JLE	102$.S
+	ADDB	AL, #'A'-'0'-10t
+102$:	ADDB	AL, #'0'
+	MOVW	BX, CS:cb+xxxdata-bb
+	ADDW	CS:cb+xxxdata-bb, #2.B
+	MOVB	AH, #70h
+	MOVW	ES:[BX], AX
+	POPL	EAX
+	LOOP	CX, 100$
+	POPW	ES
+	POPAL
+	ADDW	CS:cb+xxxdata-bb, #2.B
+	RET
+
+xxxdata:.WORD	320t
+
+.ENDC
+
+;Error message text (WARNING: Do not modifiy this - it is used by MKBOOT to
+;  determine that there is an XOS bootstrap on the disk!)
+
+$=bb+1DDh
+	.BYTE	VERSION, EDITNUM
+errmsg:.ASCIZ	"? Boot error - press any key"{0Dh}{0Ah}
+
+;Store the boot block signature
+
+$=bb+1FEh
+	.BYTE	55h, 0AAh
+.PAGE
+	.SBTTL	Level 2 bootsrap routine
+
+;The following code is the level 2 bootstrap
+;	c{EAX} = First block in file
+
+$=bb+200h
+
+level2:	.LONG	0FFFFFFFFh
+	.ASCIZ	"XOSBOOT"
+
+lvl2bgn:MOVL	curfat, #-1		;Indicate no current FAT block
+	MOVL	EAX, CS:cb+db_rootcls
+	CALL	setfile
+10$:	MOVW	BX, #buffer
+	PUSHW	BX
+	PUSHW	DS
+	POPW	ES
+	CALL	readfile
+	POPW	BX
+	MOVB	CL, #16t
+16$:	TESTB	de_attrib.B[BX], #A$LABEL ;This a label or extended name entry?
+	JNE	18$.S			;Yes
+	CMPL	[BX], #'XOS '		;No - check name
+	JNE	18$.S			;If not it
+	CMPL	4.B[BX], #'    '	;Maybe
+	JNE	18$.S			;Nope
+	MOVB	de_ext+3.B[BX], #0
+	CMPL	de_ext.B[BX], #'BSF'	;Check extension
+	JE	fnd1.S			;If found it
+18$:	ADDW	BX, #32t.B		;Not this one - advance to next
+	LOOP	CX, 16$			;Continue if more to check here
+	CALL	advfile			;End of block - advance to next block
+	JNC	10$.S			;Continue if not end of directory
+	JMP	booter1			;End of directory - give error!
+.PAGE
+;Here with the XOS.BSF file found
+
+fnd1:	MOVW	AX, de_pntrhi.B[BX]	;Get high 16 bits of cluster
+	SHLL	EAX, #16t
+	MOVW	AX, de_pntr.B[BX]	;Get low 16 bits of cluster number
+	CALL	setfile
+	CALL	advfile			;Skip the first block
+	MOVW	loadpnt, #800h		;Initialize load pointer
+4$:	MOVW	ES, loadpnt		;Read the next block
+	CLRW	BX
+	CALL	readfile
+	ADDW	loadpnt, #20h.B
+	CALL	advfile
+	JNC	4$.S
+	MOVB	DL, #80h		;Get default unit (always hard disk)
+	JMPF	600:2404h		;Go to level 3 code
+.PAGE
+;Subroutine to read next block from a file
+;	c[ES:BX] = Address of buffer
+;	CALL	readfile
+
+readfile:
+	MOVL	EAX, curblk
+	JMP	readblk
+
+;Subroutine to advance to next block in a file
+;	CALL	advfile
+;	C:set = EOF
+;	C:clr = Another block is available
+
+advfile:INCL	curblk			;Bump block number
+	DECW	blkcnt			;More to read in this cluster?
+	JNE	6$.S			;Yes - continue
+	MOVL	EAX, curcls		;No - get FAT number
+	PUSHW	AX			;Save low bits of number
+	SHRL	EAX, #7t
+	CMPL	EAX, curfat		;Do we have it in memory now?
+	JE	4$.S			;Yes
+	MOVL	curfat, EAX		;No
+	ADDL	EAX, CS:cb+db_fatbegin
+	MOVW	BX, #fatbufr		;Read it now
+	PUSHW	DS
+	POPW	ES
+	CALL	readblk
+4$:	POPW	BX
+	ANDW	BX, #7Fh.B
+	SHLW	BX, #2t
+	MOVL	EAX, fatbufr[BX]	;Get next cluster
+	CMPL	EAX, #0FFFFFF0h		;EOF?
+	JGE	8$.S			;Yes
+					;No - fall into setfile to set the
+					;  file pointers for the new cluster
+
+;Subroutine to set up a file for access
+;	c{EAX} = Next cluster in file
+;	CALL	setfile
+
+setfile:MOVL	curcls, EAX
+	MOVZBL	ECX, CS:cb+db_secpcls
+	MOVW	blkcnt, CX
+	IMULL	EAX, ECX
+	ADDL	EAX, CS:cb+db_databegin
+	MOVL	curblk, EAX
+6$:	CLC
+	RET
+
+;Here if at EOF
+
+8$:	STC
+ret010:	RET
+
+$=bb+3FFh
+	.BYTE	0

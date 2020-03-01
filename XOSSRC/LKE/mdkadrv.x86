@@ -1,0 +1,642 @@
+	.TITLE	MDKADRV - Memory disk device driver type A
+
+;++++
+; This software is in the public domain.  It may be freely copied and used
+; for whatever purpose you see fit, including commerical uses.  Anyone
+; modifying this software may claim ownership of the modifications, but not
+; the complete derived code.  It would be appreciated if the authors were
+; told what this software is being used for, but this is not a requirement.
+
+;   THIS SOFTWARE IS PROVIDED BY THE AUTHORS "AS IS" AND ANY EXPRESS OR
+;   IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
+;   OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+;   IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+;   INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+;   BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS
+;   OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+;   ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR
+;   TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
+;   USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+;----
+
+	.PROC	80486
+	.INCLUD	XOSINC:\XMAC\XOS.PAR
+	.INCLUD	XOSINC:\XMAC\XOSX.PAR
+	.INCLUD	XOSINC:\XMAC\XOSERR.PAR
+	.INCLUD	XOSINC:\XMAC\PCAT.PAR
+	.INCLUD	XOSINC:\XMAC\XOSDISK.PAR
+	.INCLUD	XOSINC:\XMAC\XOSXDISK.PAR
+	.INCLUD	XOSINC:\XMAC\XOSXDFS.PAR
+	.INCLUD	XOSINC:\XMAC\XOSTIME.PAR
+	.INCLUD	XOSINC:\XMAC\XOSLKE.PAR
+	.INCLUD	XOSINC:\XMAC\XOSXLKE.PAR
+
+;;;;; WARNING: THIS FILE IS NOT CURRENT AND SHOULD NOT BE USED UNTIL
+;;;;;		 IT IS UPDATED!!!!
+
+;This is the device driver for the WinSystems USSD memory disk card.  This
+;  is a STD bus IO mapped memory card which can support up to 4MB of memory.
+;  It provides either volatile or static memory, dependingon the type of chips
+;  used or if an external battery is used for power.
+
+
+MAJV   =!1t
+MINV   =!1t
+EDITNUM=!3t
+
+;v1.0.0  29-Jun-94
+;	Initial version
+
+	LKEHEAD	MDKADRV, MAJV, MINV, EDITNUM, LKETYPE_DEVICE
+
+;Define offsets for the controller dependent part of the UCB for MDKA disks
+
+$$$=!ucb_kondep
+BLK ucb_mdrdonly, 1t	;Zero if disk is read-only
+BLK             , 3t
+ucb_mdSIZE=!$$$
+
+;Define offsets in the device dependent part of the KCB for MDKA disks
+
+$$$=!kcb_devdep
+kcb_mdSIZE=!$$$
+
+	CODE
+
+;Memory disk device driver dispatch table
+
+mdkdsp:	.LONG	knlRtnZero##	;kf_init     =  0. - Initialize controller
+	.LONG	mdkreaddata	;kf_readraw  =  4. - Read raw block
+	.LONG	mdkreaddata	;kf_readdata =  8. - Read block
+	.LONG	mdkreadlist	;kf_readlist = 12. - Read buffer list
+	.LONG	0		;kf_readid   = 16. - Read ID field
+	.LONG	mdkwritdata	;kf_writraw  = 20. - Write raw block
+	.LONG	mdkwritdata	;kf_writdata = 24. - Write block
+	.LONG	mdkwritlist	;kf_writlist = 28. - Write buffer list
+	.LONG	knlIFnDev##	;kf_format   = 32. - Format track
+	.LONG	0		;kf_chkwp    = 36. - Check write protect status
+	.LONG	0		;kf_chkchg   = 40. - Check for possible disk
+				;		       change at fork level
+				;		       (never called for memory
+				;		       disk!)
+	.LONG	knlRtnZero##	;ks_media    = 44. - Determine media type
+	.LONG	knlRtnZero##	;ks_chkwp    = 48. - Check write protect status
+	.LONG	xosdskNotChg##	;ks_chkchg   = 52. - Check for possible disk
+				;		       change
+	.LONG	xosdskNotChg##	;ks_senchg   = 56. - Sense disk change
+	.LONG	mdkaddunit	;ks_addunit  = 60. - Add disk unit
+	.LONG	knlRtnZero##	;ks_unmount  = 64. - Unmount disk
+
+;Memory disk device characteristics table
+
+	DATA
+
+	.MOD	4
+mdkdchartbl:
+ DCHARBGN  1,knlDCharValCom##
+ DCHARENT  CLASS   , TEXT, , 8, knlDcMsgClass##    , knlDcGetClass## , knlDcSetClass## , 0
+ DCHARENT  TYPE    , TEXT, , 4, knlDcMsgType##     , knlDcGet4Byte## , 0               , dcb_type
+ DCHARENT  IOREG   , HEXV, , 2, knlDcMsgIoReg##    , xosdskGtU2Byte##, 0               , ucb_ioreg1
+ DCHARENT  UNITTYPE, TEXT, , 4, knlDcMsgUnitType## , xosdskUnitType##, 0               , 0
+ DCHARENT  MSENSOR , TEXT, , 4, xosdskMsgMSensor## , xosdskGetBits## , xosdskSetBits## , UB$MEDIAC
+ DCHARENT  REMOVE  , TEXT, , 4, xosdskMsgRemove##  , xosdskGetBits## , 0               , UB$REMOVE
+ DCHARENT  READONLY, TEXT, , 4, msgreadonly        , getreadonly     , setreadonly     , 0
+ DCHARENT  DOSNAME , TEXT, , 8, xosdskMsgDosName## , xosdskGtU8Byte##, xosdskStU8Byte##, ucb_dosname
+ DCHARENT  VOLNAME , TEXT, , 8, xosdskMsgVolName## , xosdskGtU8Byte##, xosdskStU8Byte##, ucb_volname
+ DCHARENT  PARTN   , HEXV, , 1, xosdskMsgPartn##   , xosdskGtU1Byte##, 0               , ucb_partnx
+ DCHARENT  PARTOFF , DECV, , 4, xosdskMsgPartOff## , xosdskGtU4Byte##, 0               , ucb_partnoff
+ DCHARENT  CBLKSZ  , DECV, , 2, xosdskMsgCBlkSz##  , xosdskGtU4Byte##, 0               , ucb_csecsz
+ DCHARENT  CHEADS  , DECV, , 1, xosdskMsgCHeads##  , xosdskGtU1Byte##, xosdskStU1Byte##, ucb_cheads
+ DCHARENT  CSECTS  , DECV, , 4, xosdskMsgCSects##  , xosdskGtU4Byte##, xosdskStU4Byte##, ucb_csects
+ DCHARENT  CCYLNS  , DECV, , 4, xosdskMsgCCylns##  , xosdskGtU4Byte##, xosdskStU4Byte##, ucb_ccylns
+ DCHARENT  CBLOCKS , DECV, , 4, xosdskMsgCBlocks## , xosdskGtU4Byte##, 0               , ucb_cblocks
+ DCHARENT  IBLKSZ  , DECV, , 2, xosdskMsgIBlkSz##  , xosdskGtU4Byte##, 0               , ucb_isecsz
+ DCHARENT  IHEADS  , DECV, , 1, xosdskMsgIHeads##  , xosdskGtU1Byte##, xosdskStU1Byte##, ucb_iheads
+ DCHARENT  ISECTS  , DECV, , 4, xosdskMsgISects##  , xosdskGtU4Byte##, xosdskStU4Byte##, ucb_isects
+ DCHARENT  ICYLNS  , DECV, , 4, xosdskMsgICylns##  , xosdskGtU4Byte##, xosdskStU4Byte##, ucb_icylns
+ DCHARENT  IBLOCKS , DECV, , 4, xosdskMsgIBlocks## , xosdskGtU4Byte##, 0               , ucb_iblocks
+ DCHARENT  BLOCKIN , DECV, , 4, xosdskMsgBlockIn## , xosdskGtU4Byte##, xosdskStU4Byte##, ucb_blockin
+ DCHARENT  BLOCKOUT, DECV, , 4, xosdskMsgBlockOut##, xosdskGtU4Byte##, xosdskStU4Byte##, ucb_blockout
+ DCHARENT  BYTEIN  , DECV, , 4, knlDcMsgByteIn##   , xosdskGtU4Byte##, xosdskStU4Byte##, ucb_bytein
+ DCHARENT  BYTEOUT , DECV, , 4, knlDcMsgByteOut##  , xosdskGtU4Byte##, xosdskStU4Byte##, ucb_byteout
+ DCHARENT  FSTYPE  , TEXT, , 8, xosdskMsgFSType##  , xosdskGtU8Byte##, 0               , ucb_fsname
+ DCHARENT  CLSSZ   , DECV, , 4, xosdskMsgClsSz##   , xosdskGtU4Byte##, 0               , ucb_clussize
+ DCHARENT  CLUSTERS, DECV, , 4, xosdskMsgClsters## , xosdskGtU4Byte##, 0               , ucb_total
+ DCHARENT  AVAIL   , DECV, , 4, xosdskMsgAvail##   , xosdskGtU4Byte##, 0               , ucb_avail
+ DCHARENT  FATMODE , HEXV, , 1, xosdskMsgFatMode## , xosdskGtU1Byte##, 0               , ucb_fatmode
+
+	CODE
+
+msgreadonly:DCHARINFO  {Disk is read-only}
+.PAGE
+	.SBTTL	Initialization
+
+	INITSUB	initmdka
+
+	DATA
+
+	.MOD	4
+mdkinitblk:					;Characteristics description
+ DCHARBGN  2, knlDCharValCom##			;  block for initialization
+ DCHARENT  BOOT  , DECV, , 4, 0, 0              , initboot, 0
+ DCHARENT  RESULT, STR , , 0, 0, knlGetDcNullS##, 0       , 0
+
+	ONCE
+
+initmdka::
+	PUSHL	FS
+	PUSHL	EDX
+	MOVL	EBX, #'MDKA'		;Get disk driver name
+	MOVL	EDX, #mdkdsp		;Get offset of dispatch table
+	CALL	xosdskNewDriver##	;Register this disk driver
+	POPL	EDX
+	POPL	FS
+	JC	6$.S			;If error
+	TESTL	EDX, EDX		;Have a characteristics list?
+	JE	2$.S			;No
+	MOVL	EBX, #mdkinitblk	;Yes - point to characteristics table
+	CALL	knlAddUnitChar##	;Process characteristics
+	JC	10$.S			;If error
+2$:	CLRL	EAX			;OK
+	CLRL	EDX
+	MOVL	ECX, #codetop
+6$:	RET
+
+;Here if error after driver has been registered
+
+10$:	CALL	xosdskUnlinkDriver##	;Unlink the driver
+	STC				;Return failure
+	RET
+
+	CODE
+.PAGE
+	.MOD	4
+memchar:DCHAR	UNIT  , SET, DECV, 1
+	.BYTE	0
+	DCHAR	TYPE  , SET, TEXT, 4
+	.ASCII	'MDKA'
+	DCHAR	IOREG , SET, HEXV, 2
+	.WORD	210h
+	DCHAR	BLOCKS, SET, HEXV, 1
+	.BYTE	0
+	.BYTE	0
+
+MEMCHARSZ=!{{$-memchar}+3}&{~3}
+
+;Here for the BOOT characteristic
+
+$$$=!0
+FRM iboot_char, MEMCHARSZ
+iboot_SIZE=!$$$
+
+initboot:
+	ENTER	iboot_SIZE, 0
+	LEAL	EDI, iboot_char.B[EBP]	;Copy the characteristics list to our
+	PUSHL	SS			;  stack frame
+	POPL	ES
+	MOVL	ESI, #memchar
+	MOVL	ECX, #MEMCHARSZ/4
+	CLD
+	RMOVSL	[EDI], CS:[ESI]
+	CALL	knlGetQel##
+	JC	4$.S
+	PUSHL	DS			;Clear the QEL
+	POPL	ES
+	MOVL	EDI, ESI
+	MOVL	ECX, #16t
+	CLRL	EAX
+	CLD
+	STOSL	[EDI]
+	LEAL	EAX, iboot_char.B[EBP]
+	MOVL	iorb_buffer2+0.B[ESI], EAX
+	MOVW	iorb_buffer2+4.B[ESI], SS
+	MOVL	EAX, xosdskCcb##+ccb_fdsp
+	CALLI	CS:CF_ADDUNIT-8.B[EAX]
+	FROMFORK
+	BTL	EAX, #31t
+4$:	LEAVE
+	RET
+
+	CODE
+.PAGE
+	.SBTTL	mdkaddunit - Subroutine to add disk unit
+
+;Subroutine to add disk unit
+;	c{EAX}    = Unit number
+;	c{EBX}    = Offset of KCB for controller (0 if none)
+;	c{ECX}    = Index on controller
+;	c{FS:EDX} = Address of characteristics list
+;	c{ESI}    = Base IO register
+;	CALL	mdkaddunit
+;	c{EAX} = Error code
+;	c{EBX} = Status bits
+;	c{ECX} = Item count (number of units added)
+
+$$$=!0
+FRM mau_char  , 8t	;Address of characteristics list
+FRM mau_ioreg , 4t	;Base IO register number
+FRM mau_bits  , 1t	;Value for ubc_bits
+FRM mau_unit  , 1t	;Unit number
+FRM mau_xres  , 1t	;Non-zero if aquired exec memory resource here
+FRM           , 1t
+FRM mau_blocks, 4t	;Number of blocks
+FRM mau_buffer, 512t
+mau_SIZE=!$$$
+
+	DATA
+
+	.MOD	4
+mdkaublk:				;Characteristics description block
+ DCHARBGN  3, knlDCharValCom##		;  for addunit
+ DCHARENT  TYPE  , TEXT, , 8, 0, 0, knlRtnZero##, 0
+ DCHARENT  UNIT  , DECV, , 4, 0, 0, knlRtnZero##, 0
+ DCHARENT  IOREG , HEXV, , 4, 0, 0, knlRtnZero##, 0
+ DCHARENT  BLOCKS, DECV, , 4, 0, 0, maublocks   , 0
+
+	CODE
+
+mdkaddunit:
+	ENTER	mau_SIZE, 0		;Allocate our stack frame
+	MOVB	mau_unit.B[EBP], AL	;Store unit number
+	MOVL	mau_ioreg.B[EBP], ESI	;Store base IO register
+	MOVL	mau_char+0.B[EBP], EDX	;Store address of characteristis list
+	MOVL	mau_char+4.B[EBP], FS
+	CLRL	EAX
+	MOVB	mau_xres.B[EBP], AL
+	DECL	EAX
+	MOVL	mau_blocks.B[EBP], EAX
+	MOVL	EBX, #mdkaublk		;Point to our characteristics table
+	IFFAULT	knlQAdrErr0Lv##
+	LFSL	EDX, mau_char.B[EBP]	;Point to caller's characteristics list
+	CALL	knlAddUnitChar##	;Process characteristics
+	JC	2$.S			;If error
+	CMPL	mau_blocks.B[EBP], #0.B
+	JNS	4$.S
+	MOVL	EAX, #ER_CHARM
+2$:	JMP	8$
+
+;We should have code here to see if the board exists.  Unfortunately, there is
+;  no way to determine this!  The board has very few of registers (5) and less
+;  than half of them (2) are readable!  We could try to modify the memory and
+;  read it back, but the board may be poplulated with ROMs, so this might not
+;  work!  We could also try doing sequential reads from the data port to see
+;  if we get different values, but the memory might not be intialized (this
+;  is actually likely) in which case we would probably get all 1s or all 0s,
+;  so this does not help much either.  Basically, there is NOTHING that we can
+;  change and read back or just read to determine if the board is there!!  Thus
+;  we just assume its there and go on!
+
+4$:	MOVL	EAX, SS
+	CMPW	knlXResPda##, AX
+	JE	6$.S
+  	CALL	knlGetXRes##		;Get exec memory resource
+	INCB	mau_xres.B[EBP]
+6$:	MOVL	ECX, #kcb_mdSIZE	;Make a KCB
+	MOVL	EBX, #mdkdsp
+	MOVB	AL, #KB$AHEAD+KB$DEFER
+	MOVL	EDX, #'MDKA'
+	CLRL	ESI
+	CALL	xosdskMakeKcb##
+	JC	10$
+	MOVL	EAX, mau_ioreg.B[EBP]	;Store base IO register number in the
+	MOVL	kcb_ioreg1.B[EDI], EAX	;  KCB
+	MOVL	EAX, mdkakcb		;OK - link into our list of KCBs
+	MOVL	mdkakcb, EDI
+	MOVL	kcb_nexts.B[EDI], EAX
+	MOVL	EBX, EDI
+	MOVB	AH, #'D'		;Get first letter of our name
+	MOVZBL	EDX, mau_unit.B[EBP]	;Get unit number
+	MOVL	ECX, #ucb_mdSIZE
+	CALL	xosdskMakeUcb##		;Make a UCB
+	JC	20$			;If error
+	MOVL	ucb_devchar.B[ESI], #mdkdchartbl ;Store offset of our device
+						 ;  characteristics table
+	MOVL	ucb_ramax[ESI], #1t	;Store the read-ahead limit (note that
+					;  this is meaningless for memory disks
+	MOVB	AL, mau_bits.B[EBP]	;  and cannot be changed)
+	MOVB	ucb_bits.B[ESI], AL	;Store value for ucb_bits
+	ANDB	ucb_bits.B[ESI], #0F8h
+	MOVB	ucb_unittype.B[ESI], #DT_MEM
+	MOVL	EAX, #512t		;Store sector size (always 512)
+	MOVL	ucb_csecsz.B[ESI], EAX
+	MOVL	ucb_isecsz.B[ESI], EAX
+	MOVL	EAX, mau_blocks.B[EBP]	;Store number of blocks
+	TESTL	EAX, EAX		;Was it specified?
+	JNE	8$.S			;Yes
+	MOVL	ECX, #512t		;No - read the boot block and set the
+	CLRL	EDX			;  size of the RAM-disk from that
+	LEAL	EBX, mau_buffer[EBP]	;  (assumes a DOS file system)
+	PUSHL	SS
+	POPL	ES
+	CALL	readdata
+	CMPW	mau_buffer+bb_bootsig[EBP], #0AA55h
+	JNE	18$.S
+	MOVZWL	EAX, mau_buffer+bb_sectors[EBP]
+	TESTL	EAX, EAX
+	JNE	8$.S
+	MOVL	EAX, mau_buffer+bb_ttlsec[EBP]
+	CMPL	EAX, #100t.B
+	JB	18$.S
+	CMPL	EAX, #100000h
+	JA	18$.S
+8$:	MOVL	ucb_cblocks.B[ESI], EAX
+	MOVL	ucb_iblocks.B[ESI], EAX
+	MOVL	EDX, mau_ioreg.B[EBP]	;Store base IO register number in the
+	MOVL	ucb_ioreg1.B[ESI], EDX	;  UCB
+	CALL	setrdwr			;Start out with disk read-only if we can
+	CLRL	EAX
+10$:	CMPB	mau_xres.B[EBP], #0
+	JE	12$.S
+	CALL	knlGiveXRes##
+12$:	LEAVE
+	MOVL	EBX, #QSTS$DONE
+	CLRL	ECX
+	TESTL	EAX, EAX
+	SETE	CL
+	TOFORK
+	RET
+
+;Here if BLOCKS value was 0 and we did not have a valid boot block
+
+18$:	CALL	xosdskGiveupUcb##
+	MOVL	EAX, #ER_CHARV
+
+;Here if error creating the UCB - we must give up the KCB we just made
+
+20$:	MOVL	EDX, #mdkakcb
+	MOVL	EBX, [EDX]
+	PUSHL	EAX
+	CALL	xosdskGiveupKcb##
+	POPL	EAX
+	JMP	10$.S
+.PAGE
+;Here for the BLOCKS characteristic when adding a unit
+
+maublocks:
+	CMPL	EAX, #32768t		;Valid value?
+	JA	2$.S			;No - fail
+	CMPL	EAX, #256t
+	JA	4$.S
+	TESTL	EAX, EAX
+2$:	JNE	knlBadCharV##
+4$:	MOVL	mau_blocks.B[EBP], EAX
+	RET
+.PAGE
+;Here to get the value of the READONLY device characteristic
+
+getreadonly:
+	MOVL	ESI, [EDI]
+	MOVL	EAX, #'YES'		;Assume it is read-only
+	TESTB	ucb_sts1.B[ESI], #U1$WPROT ;Right?
+	JNE	2$.S			;Yes
+	MOVL	EAX, #'NO'		;No
+2$:	RET
+
+;Here to set the value of the READONLY device characteristic
+
+setreadonly:
+	MOVL	ESI, [EDI]
+	CALL	knlGetYesNo##
+	JC	2$.S
+	MOVL	EDX, ucb_ioreg1.B[ESI]
+	JNE	setrdwr.S		;If want it to be read-write
+	A2IOP	4			;If want it to be read-only
+setrdo:	MOVB	AL, #0			;Make the hardware read-only
+	OUTB	[DX]
+	ORB	ucb_sts1.B[ESI], #U1$WPROT
+	RET
+
+;Here if want the disk to be read-write
+
+setrdwr:A2IOP	4			;Make the hardware read-write
+	MOVB	AL, #1
+	OUTB	[DX]
+	CLRL	EAX			;Try to change the first byte
+	A2IOP	-4
+	OUTB	[DX]
+	A2IOP	1
+	OUTB	[DX]
+	A2IOP	2
+	INB	[DX]			;Get current value
+	MOVB	AH, AL			;Save it
+	NOTB	AL			;Complement it
+	OUTB	[DX]			;Write it out
+	IOPAUSE
+	INB	[DX]			;Read it back
+	CMPB	AL, AH			;Same?
+	JE	6$.S			;Yes - fail
+	MOVB	AL, AH			;No - put it back
+	OUTB	[DX]
+	ANDB	ucb_sts1.B[ESI], #{~U1$WPROT}&0FFh ;Indicate it's read-write
+	RET
+
+;Here if disk can't be make read-write (must have ROMs on the board!)
+
+6$:	A2IOP	1
+	CALL	setrdo
+	JMP	knlBadCharV##
+.PAGE
+	.SBTTL	kf_readlist - Read buffer list
+
+;Here for the read buffer list function at fork level
+;	c{ES:EBX} = Address of buffer
+;	c{ECX}    = Amount to transfer
+;	c{ESI}    = Offset of UCB
+;	c{EDI}    = Offset of DCB
+;	CALL	mdkreadlist
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  c{EAX} = 0
+
+mdkreadlist:
+	MOVL	EDX, dcb_dkdblk.B[EDI]
+	PUSHL	#0.B
+2$:	MOVL	ECX, #512t
+	PUSHL	EBX
+	PUSHL	EDX
+	CALL	readdata
+	POPL	EDX
+	POPL	EBX
+	JC	4$.S
+	ADDL	[ESP], ECX
+	INCL	EDX
+	MOVL	EBX, cb_xnext.B[EBX]
+	TESTL	EBX, EBX
+	JNE	2$.S
+	CLRL	EAX
+4$:	POPL	ECX
+	RET
+
+	.SBTTL	kf_readdata - Read block
+
+;Here for the read block function at fork level
+;	c{ES:EBX} = Address of buffer
+;	c{ECX}    = Amount to transfer
+;	c{ESI}    = Offset of UCB
+;	c{EDI}    = Offset of DCB
+;	CALL	mdkreaddata
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  c{EAX} = 0
+
+$$$=!0
+FRM rd_count , 4t
+FRM rd_amount, 4t
+FRM rd_offset, 4t
+rd_SIZE=!$$$
+
+mdkreaddata:
+	CMPL	ECX, #512t
+	JA	icdev.S
+	MOVL	EDX, dcb_dkdblk.B[EDI]	;Get disk block number
+readdata:
+	ENTER	rd_SIZE, 0
+	MOVL	rd_count.B[EBP], ECX
+	MOVL	rd_amount.B[EBP], ECX
+	CMPL	EDX, ucb_cblocks.B[ESI]	;Valid block?
+	JA	bddbk.S			;No - fail!
+	ADDL	EDX, EDX		;Yes - change to address value
+	MOVL	rd_offset.B[EBP], EDX
+	CLD
+6$:	MOVL	EDX, ucb_ioreg1.B[ESI]	;Get base IO register
+	MOVB	AL, rd_offset+1.B[EBP]
+	OUTB	[DX]			;Write MSB address value
+	IOPAUSE
+	INCL	EDX
+	MOVB	AL, rd_offset+0.B[EBP]
+	OUTB	[DX]			;Write LSB address value
+	IOPAUSE
+	INCL	EDX
+	INCL	rd_offset.B[EBP]
+	CMPL	ECX, #256t
+	JB	8$.S
+	MOVL	ECX, #256t
+8$:	SUBL	rd_count.B[EBP], ECX
+	PUSHL	EDI
+	MOVL	EDI, EBX
+	ADDL	EBX, ECX
+	RINSB	[EDI]
+	POPL	EDI
+	MOVL	ECX, rd_count.B[EBP]
+	TESTL	ECX, ECX
+	JNE	6$.S
+	MOVL	ECX, rd_amount.B[EBP]	;Get amount we transfered
+	LEAVE
+	CLRL	EAX
+	RET
+
+;Here if count is larger than 512
+
+icdev:	MOVL	EAX, #ER_ICDEV
+	CLRL	ECX
+	STC
+	RET
+
+;Here if disk block number is out of range
+
+bddbk:	LEAVE
+	MOVL	EAX, #ER_BDDBK
+	STC
+	RET
+.PAGE
+	.SBTTL	kf_writlist - Write buffer list
+
+;Here for the write buffer list function
+;	c{ES:EBX} = Address of buffer
+;	c{ECX}    = Amount to transfer
+;	c{ESI}    = Offset of UCB
+;	c{EDI}    = Offset of DCB
+;	CALL	mdkwritlist
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  c{EAX} = 0
+
+mdkwritlist:
+	PUSHL	#0.B
+	MOVL	EDX, dcb_dkdblk.B[EDI]	;Get disk block number
+2$:	MOVL	ECX, #512t
+	PUSHL	EBX
+	PUSHL	EDX
+	CALL	writdata
+	POPL	EDX
+	POPL	EBX
+	JC	4$.S
+	ADDL	[ESP], ECX
+	INCL	EDX
+	MOVL	EBX, cb_xnext.B[EBX]
+	TESTL	EBX, EBX
+	JNE	2$.S
+	CLRL	EAX
+4$:	POPL	ECX
+	RET
+
+	.SBTTL	kf_writdata - Write block
+
+;Here for the write block function
+;	c{ES:EBX} = Address of buffer
+;	c{ECX}    = Amount to transfer
+;	c{ESI}    = Offset of UCB
+;	c{EDI}    = Offset of DCB
+;	CALL	mdkwritdata
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  c{EAX} = 0
+
+$$$=!0
+FRM wd_count , 4t
+FRM wd_amount, 4t
+FRM wd_offset, 4t
+wd_SIZE=!$$$
+
+mdkwritdata:
+	CMPL	ECX, #512t
+	JA	icdev.S
+	MOVL	EDX, dcb_dkdblk.B[EDI]
+writdata:
+	ENTER	wd_SIZE, 0
+	MOVL	wd_count.B[EBP], ECX
+	MOVL	wd_amount.B[EBP], ECX
+	CMPL	EDX, ucb_cblocks.B[ESI]	;Valid block?
+	JA	bddbk.S			;No - fail!
+	ADDL	EDX, EDX		;Yes - change to address value
+	MOVL	wd_offset.B[EBP], EDX
+	CLD
+6$:	MOVL	EDX, ucb_ioreg1.B[ESI]	;Get base IO register
+	MOVB	AL, wd_offset+1.B[EBP]
+	OUTB	[DX]			;Write MSB address value
+	IOPAUSE
+	INCL	EDX
+	MOVB	AL, wd_offset+0.B[EBP]
+	OUTB	[DX]			;Write LSB address value
+	IOPAUSE
+	INCL	EDX
+	INCL	wd_offset.B[EBP]
+	CMPL	ECX, #256t
+	JB	8$.S
+	MOVL	ECX, #256t
+8$:	SUBL	wd_count.B[EBP], ECX
+	PUSHL	ESI
+	MOVL	ESI, EBX
+	ADDL	EBX, ECX
+	ROUTSB	ES:[ESI]
+	POPL	ESI
+	MOVL	ECX, wd_count.B[EBP]
+	TESTL	ECX, ECX
+	JNE	6$.S
+	MOVL	ECX, wd_amount.B[EBP]	;Get amount we transfered
+	LEAVE
+	CLRL	EAX
+	RET
+.PAGE
+	.SBTTL	Data
+
+	DATA
+
+	.MOD	4
+mdkakcb:.LONG	0		;Offset of first MDKA KCB
+
+	LKEEND

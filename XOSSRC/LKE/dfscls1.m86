@@ -1,0 +1,2815 @@
+	.TITLE	DFSCLS1 - DOS file system class driver - part 1
+
+;++++
+; This software is in the public domain.  It may be freely copied and used
+; for whatever purpose you see fit, including commerical uses.  Anyone
+; modifying this software may claim ownership of the modifications, but not
+; the complete derived code.  It would be appreciated if the authors were
+; told what this software is being used for, but this is not a requirement.
+
+;   THIS SOFTWARE IS PROVIDED BY THE AUTHORS "AS IS" AND ANY EXPRESS OR
+;   IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
+;   OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+;   IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+;   INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+;   BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS
+;   OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+;   ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR
+;   TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
+;   USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+;----
+
+	.PROC	80486
+	.INCLUD	XOSINC:\XMAC\XOS.PAR
+	.INCLUD	XOSINC:\XMAC\XOSX.PAR
+	.INCLUD	XOSINC:\XMAC\XOSERR.PAR
+	.INCLUD	XOSINC:\XMAC\XOSDISK.PAR
+	.INCLUD	XOSINC:\XMAC\XOSXDISK.PAR
+	.INCLUD	XOSINC:\XMAC\XOSXDFS.PAR
+	.INCLUD	XOSINC:\XMAC\XOSDOS.PAR
+	.INCLUD	XOSINC:\XMAC\XOSTIME.PAR
+	.INCLUD	XOSINC:\XMAC\XOSLKE.PAR
+	.INCLUD	XOSINC:\XMAC\XOSXLKE.PAR
+
+MAJV   =!1t
+MINV   =!0t
+EDITNUM=!9t
+
+;1.0.1 - 19-Dec-94
+;	Fixed problem with setting default group size to 0 if cluster size
+;	was 32K or greater.
+;1.0.2 - 22-Dec-94
+;	Fixed problem with trying to get ownership info from a null directory.
+;1.0.3 - 5-Jan-95
+;	Fixed problem with setting up buffer list for write when number of
+;	buffers limited by controllers ability to handle memory fragments.
+;1.0.4 - 17-Dec-95
+;	Major rewrite of the output code - was not handling defered writes
+;	very well, also added ability to seperately specify amount to write
+;	each time (WTMAX characteristic).
+;1.0.5 - 1-Jan-95
+;	Changes to support the rewrite of the unit search logic to support
+;	removable partitioned disks; fixed bug where was not unlocking all
+;	buffers when output was aborted.
+;1.0.6 - 5-Jan-95
+;	Fixed problem with forcing O$OUT clear when O$ODF was set (resulted in
+;	trying to update the root's FIB!)
+;1.0.7 - 25-Jan-96
+;	Fixed doswrpos to unlock posible pending write buffer before getting
+;	disk resource (problem introduced by changes to disk output code in
+;	1.0.4).
+;1.0.8 - 29-Feb-96
+;	Fixed problem with returning incorrect directory offset when file
+;	specification buffer overflowed on repeated operation.
+;1.0.9 - 17-Feb-03
+;	Changed to indicate in root FIB that there is no directory entry for
+;	the root directory.  Caused crash if had error opening file in the
+;	at the same time the root directory was changed.
+
+
+	LKEHEAD	DFSCLS, MAJV, MINV, EDITNUM, LKETYPE_CLASS
+
+$$CHKCHAIN=!0
+
+	CODE
+
+;SVC dispatch table for DOS file system class devices
+
+	.MOD	4
+dfsdsp::.LONG	xosdskMount##	;sd_mount      = 0.   - Mount
+	.LONG	knlRtnZero##	;sd_cleardev   = 4.   - Clear device
+	.LONG	xosdskCDcb##	;sd_cleardcb   = 8.   - Clear DCB
+	.LONG	dfswritefats#	;sd_commit     = 12.  - Commit data to disk
+	.LONG	knlRtnZero##	;sd_transold   = 16.  - Transfer device/old
+	.LONG	knlRtnZero##	;sd_transnew   = 20.  - Transfer device/new
+	.LONG	knlRtnZero##	;sd_opena      = 24.  - Open additional
+	.LONG	xosdskLclOpen##	;sd_open1      = 28.  - Open device/file
+	.LONG	xosdskLclParm##	;sd_devparm    = 32.  - Device parameters
+	.LONG	xosdskLclDelete##;sd_delete    = 36.  - Delete file
+	.LONG	xosdskLclRename##;sd_rename    = 40.  - Rename file
+	.LONG	dfsinpblk	;sd_inblock    = 44.  - Input block
+	.LONG	dfsoutblk	;sd_outblock   = 48.  - Output block
+	.LONG	dfsoutblk1	;sd_outblockq  = 52.  - Output block (XFF)
+	.LONG	dfsoutstr	;sd_outstring  = 56.  - Output string
+	.LONG	knlRtnMOne##	;sd_getiosts   = 60.  - Get input/output status
+	.LONG	knlIFnDevGQ##	;sd_special    = 64.  - Special device function
+	.LONG	dfsclose#	;sd_close      = 68.  - Close file
+	.LONG	dfslabel	;sd_label      = 72.  - Get device label
+	.LONG	dfscommit	;sd_commitfunc = 76.  - Commit data to disk
+	.LONG	dfsinfo		;sd_devinfo    = 80.  - Return device info
+	.LONG	dfsvfychg	;dd_vfychg     = 84.  - Verify changed disk
+	.LONG	dfsopen#	;dd_openn      = 88.  - Open file
+	.LONG	dfsopen#	;dd_opend      = 92.  - Open file/directory
+	.LONG	dfsrename	;dd_rename     = 96.  - Rename file
+	.LONG	dfsclose2#	;dd_close      = 100. - Close file
+	.LONG	dfsopenparms	;dd_openparms  = 104. - Offset of open parms
+	.LONG	dfssetpath	;dd_setpath    = 108. - Set up path data
+	.LONG	dfschkpath	;dd_chkpath    = 112. - Check path data
+	.LONG	dfsclrpath	;dd_clrpath    = 116. - Clear path data
+	.LONG	knlNullCharStr##;dd_gtrtprot   = 120. - Get root protection
+	.LONG	knlBadCharF##	;dd_strtprot   = 124. - Set root protection
+.PAGE
+;IO parameter table for DOS file system open operations
+
+	.LONG	OPARMMAX
+dfsopenparms::
+	.LONG	opnpgenparms	  ;IOPAR_xxxxxx = 00xx - Generic IO parameters
+	.LONG	opnpfilparms	  ;IOPAR_FILxxx = 01xx - File IO parameters
+	.LONG	knlNullTrmParms## ;IOPAR_TRMxxx = 02xx - Terminal IO parameters
+	.LONG	xosdskIoDskParms##;IOPAR_DSKxxx = 03xx - Disk IO parameters
+OPARMMAX=!{$-dfsopenparms}/4
+
+	.LONG	OPARMGENMAX
+opnpgenparms:
+	.LONG	0		;		   = 0000h
+	.LONG	knlIopDummyN##	;IOPAR_FILOPTN     = 0001h
+	.LONG	knlIopDummyS##	;IOPAR_FILSPEC     = 0002h
+	.LONG	knlIopDevSts##	;IOPAR_DEVSTS      = 0003h
+	.LONG	knlIopUnitNum##	;IOPAR_UNITNUM     = 0004h
+	.LONG	opnpglbid	;IOPAR_GLBID       = 0005h
+	.LONG	knlIopDummyN##	;IOPAR_DELAY       = 0006h
+	.LONG	knlIopDummyN##	;IOPAR_TIMEOUT     = 0007h
+	.LONG	0		;IOPAR_INPSTS      = 0008h
+	.LONG	0		;IOPAR_OUTSTS	   = 0009h
+	.LONG	0		;IOPAR_INPQLMT	   = 000Ah
+	.LONG	0		;IOPAR_OUTQLMT	   = 000Bh
+	.LONG	knlIopDummyN##	;IOPAR_SIVECT1     = 000Ch
+	.LONG	knlIopDummyN##	;IOPAR_SIVECT2     = 000Dh
+	.LONG	knlIopDummyN##	;IOPAR_SIDATA      = 000Eh
+	.LONG	knlIopNumOpen##	;IOPAR_NUMOPEN     = 000Fh
+	.LONG	0		;IOPAR_BUFRLMT	   = 0010h
+OPARMGENMAX=!{$-opnpgenparms}/4
+
+	.LONG	OPARMFILMAX
+opnpfilparms:
+	.LONG	0		;		   = 0000h
+	.LONG	knlIopDummyN##	;IOPAR_DIRHNDL     = 0101h
+	.LONG	knlIopDummyN##	;IOPAR_SRCATTR     = 0102h
+	.LONG	opnpattr	;IOPAR_FILATTR     = 0103h
+	.LONG	opnpdirofs	;IOPAR_DIROFS      = 0104h
+	.LONG	xosdskOpnPioPos##;IOPAR_ABSPOS	   = 0105h
+	.LONG	xosdskOpnPioPos##;IOPAR_RELPOS	   = 0106h
+	.LONG	xosdskOpnPioPos##;IOPAR_EOFPOS	   = 0107h
+	.LONG	0		;		   = 0108h
+	.LONG	opnplength	;IOPAR_LENGTH      = 0109h
+	.LONG	opnpalloc	;IOPAR_REQALLOC    = 010Ah
+	.LONG	opnpalloc	;IOPAR_RQRALLOC    = 010Bh
+	.LONG	opnpgrpsize	;IOPAR_GRPSIZE     = 010Ch
+	.LONG	opnpmdate	;IOPAR_ADATE       = 010Dh
+	.LONG	opnpmdate	;IOPAR_CDATE       = 010Eh
+	.LONG	opnpmdate	;IOPAR_MDATE       = 010Fh
+	.LONG	knlIopDummyN##	;IOPAR_PROT        = 0110h
+	.LONG	knlIopDummyS##	;IOPAR_OWNER       = 0111h
+	.LONG	0		;                  = 0112h
+	.LONG	0		;IOPAR_SETLOCK	   = 0113h
+	.LONG	0		;IOPAR_CLRLOCK	   = 0114h
+	.LONG	knlIopDummyN##	;IOPAR_CLSTIME     = 0115h
+	.LONG	knlIopDummyS##	;IOPAR_CLSNAME     = 0116h
+	.LONG	knlIopDummyT##	;IOPAR_CLSMSG	   = 0117h
+	.LONG	knlIopDummyN##	;IOPAR_SHRPARMS    = 0118h
+	.LONG	0		;IOPAR_ACSNETWK    = 0119h
+OPARMFILMAX=!{$-opnpfilparms}/4
+.PAGE
+;IO parameter table for DOS file system data transfer operations
+
+	.LONG	PARMMAX
+dfsioparms::
+	.LONG	dfsiogenparms	  ;IOPAR_xxxxxx = 00xx - Generic IO parameters
+	.LONG	dfsiofilparms	  ;IOPAR_FILxxx = 01xx - File IO parameters
+	.LONG	knlNullTrmParms## ;IOPAR_TRMxxx = 02xx - Terminal IO parameters
+	.LONG	xosdskIoDskParms##;IOPAR_DSKxxx = 03xx - Disk IO parameters
+PARMMAX=!{$-dfsioparms}/4
+
+	.LONG	PARMGENMAX
+dfsiogenparms::
+	.LONG	0		;		   = 0000h
+	.LONG	knlIoxFilOptn##	;IOPAR_FILOPTN     = 0001h
+	.LONG	knlIoxFilSpec##	;IOPAR_FILSPEC     = 0002h
+	.LONG	knlIopDevSts##	;IOPAR_DEVSTS      = 0003h
+	.LONG	knlIopUnitNum##	;IOPAR_UNITNUM     = 0004h
+	.LONG	opnpglbid	;IOPAR_GLBID       = 0005h
+	.LONG	knlIopNullN##	;IOPAR_DELAY       = 0006h
+	.LONG	knlIopNullN##	;IOPAR_TIMEOUT     = 0007h
+	.LONG	knlIopIoSts##	;IOPAR_INPSTS	   = 0008h
+	.LONG	knlIopIoSts##	;IOPAR_OUTSTS	   = 0009h
+	.LONG	knlIopInpQLmt##	;IOPAR_INPQLMT	   = 000Ah
+	.LONG	knlIopOutQLmt##	;IOPAR_OUTQLMT	   = 000Bh
+	.LONG	0		;IOPAR_SIVECT1     = 000Ch
+	.LONG	0		;IOPAR_SIVECT2     = 000Dh
+	.LONG	0		;IOPAR_SIDATA      = 000Eh
+	.LONG	knlIopNumOpen##	;IOPAR_NUMOPEN     = 000Fh
+	.LONG	0		;IOPAR_BUFRLMT     = 0010h
+PARMGENMAX=!{$-dfsiogenparms}/4
+
+	.LONG	PARMFILMAX
+dfsiofilparms:
+	.LONG	0		;		   = 0100h
+	.LONG	0		;IOPAR_DIRHNDL     = 0101h
+	.LONG	0		;IOPAR_SRCATTR     = 0102h
+	.LONG	dfsiopfilattr	;IOPAR_FILATTR     = 0103h
+	.LONG	0		;IOPAR_DIROFS      = 0104h
+	.LONG	dfsiopabspos	;IOPAR_ABSPOS	   = 0105h
+	.LONG	dfsioprelpos	;IOPAR_RELPOS	   = 0106h
+	.LONG	dfsiopeofpos	;IOPAR_EOFPOS	   = 0107h
+	.LONG	0		;		   = 0108h
+	.LONG	dfsioplength	;IOPAR_LENGTH      = 0109h
+	.LONG	dfsiopalloc	;IOPAR_REQALLOC    = 010Ah
+	.LONG	dfsiopalloc	;IOPAR_RQRALLOC    = 010Bh
+	.LONG	dfsiopgrpsize	;IOPAR_GRPSIZE     = 010Ch
+	.LONG	dfsiopcdate	;IOPAR_ADATE       = 010Dh
+	.LONG	dfsiopcdate	;IOPAR_CDATE       = 010Eh
+	.LONG	dfsiopcdate	;IOPAR_MDATE       = 010Fh
+	.LONG	knlIopNullN##	;IOPAR_PROT        = 0110h
+	.LONG	knlIopDummyT##	;IOPAR_OWNNAME     = 0111h
+	.LONG	knlIopDummyT##	;IOPAR_GRPNAME     = 0112h
+	.LONG	dfsiopsetlock	;IOPAR_SETLOCK	   = 0113h
+	.LONG	dfsiopclrlock	;IOPAR_CLRLOCK	   = 0114h
+	.LONG	0		;IOPAR_CLSTIME     = 0115h
+	.LONG	0		;IOPAR_CLSNAME     = 0116h
+	.LONG	0		;IOPAR_CLSMSG	   = 0117h
+	.LONG	dfsiopshrparms	;IOPAR_SHRPARMS	   = 0118h
+	.LONG	0		;IOPAR_ACSNETWK    = 0119h
+PARMFILMAX=!{$-dfsiofilparms}/4
+.PAGE
+	.SBTTL	Initialization routine
+
+	INITSUB	initdfs
+
+initdfs::
+	MOVL	EBX, #dfschk1		;Register the file system
+	MOVL	EDX, #dfschk2
+	CALL	xosdskMakeFscb##
+	JC	10$.S			;If error
+	MOVL	ECX, #xcodetop#
+	CLRL	EDX
+	CLRL	EAX
+10$:	MOVL	EBX, #QSTS$DONE
+	RET
+
+	CODE
+.PAGE
+;Here for the IOPAR_GLBID parameter for open - Get global device ID
+;  For disks the global device is formatted as follows: (low order bytes first)
+;	Size     Use
+;	  4	File ID (position of file on disk)
+;	  4	Device ID (offset of UCB)
+;	  4     Node ID (network address) (always 0 for disks)
+;	  4	Network ID (always 0 for disks)
+;	c{ES:EBX} = Address of value
+;	c{ECX}    = Length of the value
+;	CALL	opnpglbid
+
+	DPARMHDR  GET, DECV
+opnpglbid:
+	CMPL	ECX, #16t		;Is his value large enough?
+	JB	knlBadParmS.S		;No - fail
+	MOVL	ESI, [EDI]		;Get offset of UCB
+	TESTL	ESI, ESI
+	JE	knlNoUnit##
+	MOVL	EAX, dcb_dkfilepnt.B[EDI] ;Point to base FIB
+	TESTL	EAX, EAX
+	JE	4$.S
+	MOVL	EAX, ff_f1pnt+1.B[EAX]	;Get first cluster for file
+	IFFAULT	knlRtnAdrEr#
+4$:	MOVL	ES:[EBX], EAX
+	CLRL	EAX
+	IFFAULT	knlRtnAdrEr#
+	MOVL	ES:12t.B[EBX], EAX
+	MOVL	ES:4.B[EBX], ESI	;Store offset of the UCB
+	MOVL	ES:8.B[EBX], EAX
+	RET
+.PAGE
+;Here for the IOPAR_LENGTH parameter for open - Written length of file
+
+	DPARMHDR  BOTH, DECV
+opnplength:
+	TESTB	AH, #PAR$GET		;Want to get value?
+	JE	ret002.S		;No
+	MOVL	EAX, dcb_dkfilepnt.B[EDI] ;Yes - really have a file open?
+	TESTL	EAX, EAX
+	JE	ret002.S		;No
+	MOVL	EAX, ff_size.B[EAX]	;Yes - get written length of file
+1$:	JMP	knlAddParm4##		;Give it to the user
+
+;Here for the IOPAR_REQALLOC or IOPAR_RQRALLOC parameters for open - Allocated
+;  length of file
+
+	DPARMHDR  BOTH, DECV
+opnpalloc:
+	TESTB	AH, #PAR$GET		;Want to get value?
+	JE	ret002.S		;No
+	MOVL	EAX, dcb_dkfilepnt.B[EDI] ;Yes - really have a file open?
+	TESTL	EAX, EAX
+	JE	ret002.S		;No
+	MOVL	EAX, ff_alloc.B[EAX]	;Yes - get number of clusters allocated
+	MOVL	ESI, [EDI]		;Get offset of the UCB
+	TESTL	ESI, ESI
+	JE	knlNoUnit##
+	MOVL	ESI, ucb_bpclus.B[ESI]	;Get size of a cluster
+	MULL	ESI			;Calculate number of bytes allocated
+	JMP	knlAddParm8##		;Give it to the user
+
+;Here for the IOPAR_FILATTR parameter for open - File attributes for file
+
+	DPARMHDR  BOTH, HEXV
+opnpattr:
+	TESTB	AH, #PAR$GET		;Want to get value?
+	JE	ret002.S		;No
+	MOVL	EDX, opn_frame1.B[EBP]	;Yes
+	MOVZBL	EAX, SS:opn_curattr[EDX]
+	CMPL	dcb_dkfilepnt.B[EDI], #0.B ;Is the file still open?
+	JNE	2$.S			;Yes
+	ANDB	AL, #A$DIRECT		;No - just give him the directory bit
+2$:	JMP	knlStrParm4##
+
+;Here for the IOPAR_DIROFS parameter for open - Directory offset for search
+
+	DPARMHDR  BOTH, DECV
+opnpdirofs:
+	TESTB	AH, #PAR$GET		;Want to get value?
+	JE	ret002.S		;No
+	MOVL	EDX, opn_frame1.B[EBP]
+	MOVL	EAX, SS:opn_dirofs.B[EDX]
+	JMP	knlStrParm4##
+
+ret002:	RET
+
+;Here for the IOPAR_GRPSIZE parameter for open - Allocation group size
+
+	DPARMHDR  BOTH, DECV
+opnpgrpsize:
+	TESTB	AH, #PAR$GET		;Want to get value?
+	JE	ret002.S		;No
+	MOVL	EAX, dcb_dkfilepnt.B[EDI] ;Yes - really have a file open?
+	TESTL	EAX, EAX
+	JE	4$.S			;No
+	MOVL	EAX, ff_grpsize.B[EAX]	;Yes
+4$:	JMP	knlStrParm4##
+
+;Here for the IOPAR_MDATE parameter - Modify date/time
+
+	DPARMHDR  BOTH, HEXV
+opnpmdate:				;This is the same as creation date/time
+	TESTB	AH, #PAR$GET		;Want to get value?
+	JE	ret002.S		;No
+	MOVL	EDX, dcb_dkfilepnt.B[EDI] ;Yes - really have a file open?
+	TESTL	EDX, EDX
+	JE	4$.S			;No
+	CMPL	ECX, #4.B		;Want date and time in DOS format?
+	JA	10$.S			;No
+	MOVL	EAX, ff_date.B[EDX]	;Yes - get file's date
+	SHLL	EAX, #16t
+	ORW	AX, ff_time.B[EDX]	;Get file's time
+	JMP	knlStrParm4##
+
+;Here if want date and time in system format
+
+10$:	MOVL	EAX, ff_date.B[EDX]	;Get file's date
+	PUSHL	EDX
+	CALL	knlDos2SysDate#		;Change to system format
+	POPL	EDX
+	PUSHL	EAX			;Save date
+	MOVZWL	EAX, ff_time.B[EDX]	;Get file's time
+	CALL	knlDos2SysTime##	;Change to system format
+	POPL	EDX			;Restore date
+12$:	JMP	knlStrParm8##		;Go give it to the user
+.PAGE
+	.SBTTL	dfsiopabspos - IOPAR_ABSPOS - set or get absolute position
+
+;Here for the IOPAR_ABSPOS parameter for a DOS file system transfer - set or
+;  get absolute IO position
+
+	DPARMHDR  BOTH, DECV
+dfsiopabspos:
+	TESTB	AH, #PAR$SET		;Want to change value?
+	JE	4$.S			;No
+	PUSHL	EAX			;Yes
+	CALL	knlGetParm#		;Get value for position
+	JC	6$.S
+2$:	MOVL	dcb_dkfpos.B[EDI], EAX	;Store value
+	POPL	EAX
+4$:	TESTB	AH, #PAR$GET		;Want value returned?
+	JE	8$.S			;No
+	MOVL	EAX, dcb_dkfpos.B[EDI]	;Yes - get value
+	JMP	knlStrParm4##		;Give it to him
+
+6$:	POPL	ECX			;Fix up the stack
+8$:	RET
+
+	.SBTTL	dfsioprelpos - IOPAR_RELPOL - set or get relative position
+
+;Here for the IOPAR_RELPOS parameter for a DOS file system transfer - set or
+;  get relative IO position
+
+	DPARMHDR  BOTH, DECV
+dfsioprelpos:
+	TESTB	AH, #PAR$SET		;Want to change value?
+	JE	4$.S			;No
+	PUSHL	EAX			;Yes
+	CALL	knlGetParm##		;Get value for position
+	JC	6$.S
+	ADDL	EAX, dcb_dkfpos.B[EDI]	;Make it relative
+10$:	JNO	2$.S
+	POPL	ECX			;Report value error if overflow
+	JMP	knlBadParmV##
+
+	.SBTTL	dfsiopeofpos - IOPAR_EOFPOS - set or get position relative to EOF
+
+;Here for the IOPAR_EOFPOS parameter for a DOS file system transfer - set or
+;  get IO position relative to EOF
+
+	DPARMHDR  BOTH, DECV
+dfsiopeofpos:
+	TESTB	AH, #PAR$SET		;Yes - want to change value?
+	JE	4$.S			;No
+	PUSHL	EAX			;Yes
+	CALL	knlGetParm##		;Get value for position
+	JC	6$.S
+	MOVL	EDX, dcb_dkfilepnt.B[EDI] ;Make it relative to EOF
+	ADDL	EAX, ff_size.B[EDX]
+	JMP	10$.S
+.PAGE
+	.SBTTL	dfsiopfilattr - IOPAR_FILATTR - Set or get attributes for file
+
+;Here for the IOPAR_FILATTR parameter for a DOS file system transfer - set or
+;  get attributes for file
+
+	DPARMHDR  BOTH, HEXV
+dfsiopfilattr:
+	CMPL	dcb_dkfilepnt.B[EDI], #0.B ;Have a file open?
+	JE	knlBadParmI##		;No - say bad parameter
+	TESTB	AH, #PAR$SET		;Yes - want to change value?
+	JE	8$.S			;No
+	PUSHL	EAX			;Yes
+	CALL	knlGetParm##		;Get value for length
+	JC	12$.S			;If error
+	MOVL	EDX, dcb_dkfilepnt.B[EDI]
+	ANDB	AL, #A$DIRECT|A$LABEL|A$RDONLY|A$HIDDEN|A$SYSTEM|A$ARCH
+	JNE	2$.S
+	MOVB	AL, #A$NORMAL
+2$:	TESTB	AL, #A$LABEL
+	JE	4$.S
+	MOVB	AL, #A$LABEL
+4$:	MOVB	AH, AL			;Trying to change the directory bit?
+	XORB	AH, ff_attrib.B[EDX]
+	TESTB	AH, #A$DIRECT
+	JNE	10$.S			;Yes - fail
+	MOVB	ff_attrib.B[EDX], AL	;OK - store new value
+	ORB	cb_sts.B[EDX], #CB$CHNGD ;Indicate FIB has been changed
+	POPL	EAX
+8$:	TESTB	AH, #PAR$GET		;Want to return value?
+	JE	ret006.S			;No
+	MOVZBL	EAX, ff_attrib.B[EDX]	;Yes - get value
+	JMP	knlStrParm4##		;Give it to him
+
+10$:	MOVL	EAX, #ER_PARMV
+	STC
+12$:	POPL	EBX			;Fix up the stack
+ret006:	RET				;Return
+.PAGE
+	.SBTTL	dfsioplength - DOS file IO parameter - set or get written length
+
+;Here for the IOPAR_LENGTH parameter for a DOS file system transfer - set or get
+;  written length of file
+
+	DPARMHDR  BOTH, DECV
+dfsioplength:
+	CMPL	dcb_dkfilepnt.B[EDI], #0.B ;Have a file open?
+	JE	knlBadParmI##		;No - say bad parameter
+	TESTB	AH, #PAR$SET		;Yes - want to change value?
+	JE	14$.S			;No
+	MOVL	EDX, dcb_dkfilepnt.B[EDI] ;Yes
+	TESTB	ff_attrib.B[EDX], #A$DIRECT|A$LABEL|A$RDONLY
+	JNE	knlIllOut##		;No - fail
+	PUSHL	EAX			;Yes
+	CALL	knlGetParm##		;Get value for length
+	JC	12$.S			;If error
+	PUSHL	ES			;Save address of the value
+	PUSHL	EBX
+	PUSHL	EAX
+	MOVL	EBX, dcb_dkfilepnt.B[EDI] ;Lock the file
+	CALL	xosdskLockBufrW##
+	POPL	EDX			;Restore value
+	CMPL	EDX, #-1.B		;Want current position?
+	JNE	4$.S			;No
+	MOVL	EDX, dcb_dkfpos.B[EDI]	;Yes
+4$:	MOVL	EBX, dcb_dkfilepnt.B[EDI] ;Get offset of the base FIB
+	CMPL	EDX, ff_size.B[EBX]	;Really changing the file length?
+	JE	10$.S			;No
+	JA	8$.S			;Yes - if increasing the size
+	ORB	ff_status.B[EBX], #FS$MODIFIED ;Descreasing size - indicate
+					       ;  file modified
+	MOVL	ff_size.B[EBX], EDX	;Reduce written length of file
+	ORB	cb_sts.B[EBX], #CB$CHNGD ;Indicate FIB has been changed
+	JMP	10$.S
+
+;Here if value would place us before the beginning of the file
+
+6$:	ADDL	ESP, #12t.B		;Fix up the stack
+	MOVL	EAX, #ER_PARMV		;Get error code
+	STC				;Fail
+	RET
+
+;Here if need to extend file
+
+8$:	ORB	ff_status.B[EBX], #FS$MODIFIED ;Indicate file modified
+	MOVL	dcb_dkfpos.B[EDI], EDX	;Set position to desired new EOF
+	CLRL	ECX			;Write zero bytes (this will extend
+	CALL	dfswrite		;  the file as needed here)
+	JC	16$.S			;If error
+	MOVL	EBX, dcb_dkfilepnt.B[EDI]
+10$:	CALL	xosdskUnlkBufr##	;Unlock the file
+	POPL	EBX			;Restore address of the parameter value
+	POPL	ES
+12$:	JC	retpbx.S		;If error
+	POPL	EAX
+14$:	TESTB	AH, #PAR$GET		;Want to return value?
+	JE	ret010.S		;No
+	MOVL	EDX, dcb_dkfilepnt.B[EDI] ;Yes - get offset of the base FIB
+	MOVL	EAX, ff_size.B[EDX]	;Get length of file
+	JMP	knlStrParm4##		;Give it to him
+
+;Here if error writing to the file (file is locked when get here)
+
+16$:	MOVL	EBX, dcb_dkfilepnt.B[EDI] ;Unlock the file
+	CALL	xosdskUnlkBufr##
+	POPL	EBX
+	POPL	EBX
+retpbx:	POPL	EBX			;Fix up the stack
+ret010:	RET				;Return
+.PAGE
+	.SBTTL	dfsiopalloc - DOS file IO parameter - Get amount allocated
+
+;Here for the IOPAR_REQALLOC or IOPAR_RQRALLOC parameter for a DOS file
+;  transfer - Get amount allocated
+
+	DPARMHDR  GET, DECV
+dfsiopalloc:
+	CMPL	dcb_dkfilepnt.B[EDI], #0.B ;Have a file open?
+	JE	knlBadParmI##		;No - say bad parameter
+	TESTB	AH, #PAR$GET		;Yes - want to get the value?
+	JE	ret010.S		;No
+	MOVL	ESI, [EDI]		;Yes - get offset of our UCB
+	TESTL	ESI, ESI		;Make sure have one now
+	JE	knlNoUnit##
+	PUSHL	ES
+	MOVL	EDX, dcb_dkfilepnt.B[EDI] ;Get offset of base FIB
+	CMPL	ff_alloc.B[EDX], #-1.B	;Have we scanned the FATs yet?
+	JNE	2$.S			;Yes
+	PUSHL	EBX			;No
+	PUSHL	ECX
+	MOVL	EBX, EDX
+	CALL	xosdskLockBufrW##	;Lock the file
+	CALL	dfsscanfats#		;Do it now
+	JC	4$.S			;If error
+	CALL	xosdskUnlkBufr##
+	MOVL	EDX, EBX
+	POPL	ECX
+	POPL	EBX
+2$:	MOVL	EDX, dcb_dkfilepnt.B[EDI] ;Get offset of base FIB
+	MOVL	EAX, ff_alloc.B[EDX]	;Get amount allocated to file
+	MULL	ucb_bpclus.B[ESI]	;Convert to bytes
+	POPL	ES
+	JMP	knlStrParm8##
+
+;Here if error
+
+4$:	PUSHL	EAX
+	CALL	xosdskUnlkBufr##
+	POPL	EAX
+	POPL	ECX
+	POPL	EBX
+	POPL	ES
+	STC
+ret014:	RET
+
+	.SBTTL	dfsiogrpsize - DOS file IO parameter - Get allocation group size
+
+;Here for the IOPAR_GRPSIZE parameter for a DOS file transfer - Get allocation
+;  group size
+
+	DPARMHDR  GET, DECV
+dfsiopgrpsize:
+	CMPL	dcb_dkfilepnt.B[EDI], #0.B ;Have a file open?
+	JE	knlBadParmI##		;No - say bad parameter
+	TESTB	AH, #PAR$GET		;Yes - want to get the value?
+	JE	ret014.S		;No
+	MOVL	EDX, dcb_dkfilepnt.B[EDI] ;Yes - get FIB offset
+	MOVZWL	EAX, ff_grpsize.B[EDX]	;Get allocation group size
+	JMP	knlStrParm4##
+.PAGE
+	.SBTTL	dfsiopcdate - DOS file IO parameter - Get or set creation date/time
+
+;Here for the IOPAR_CDATE parameter for a DOS file transfer - Get or set file
+;  date and time (DOS only keeps one date and time value)
+
+	DPARMHDR  BOTH, HEXV
+dfsiopcdate::
+	CMPL	dcb_dkfilepnt.B[EDI], #0.B ;Have a file open?
+	JE	knlBadParmI##		;No - say bad parameter
+	TESTB	AH, #PAR$SET		;Yes - want to change value?
+	JE	6$.S			;No
+	PUSHL	EAX			;Yes
+	CALL	knlGetParm##		;Get new value
+	JC	retpbx
+	CMPL	ECX, #4.B		;Already in DOS format?
+	JA	2$.S			;No
+	MOVL	EDX, dcb_dkfilepnt.B[EDI] ;Yes - get offset of file FIB
+	MOVW	ff_time.B[EDX], AX	;This is easy!
+	SHRL	EAX, #16t
+	JMP	4$.S
+
+;Here if have date and time in system format
+
+2$:	PUSHL	EDX			;Save date value
+	CALL	knlSys2DosTime##	;Convert time to DOS format value
+	MOVL	EDX, dcb_dkfilepnt.B[EDI]
+	MOVW	ff_time.B[EDX], AX	;Store it
+	ORB	cb_sts.B[EDX], #CB$CHNGD ;Indicate FIB has been changed
+	POPL	EAX			;Get date value
+	CALL	knlSys2DosDate##	;Convert it to DOS format value
+	JNC	4$.S
+	MOVL	EAX, #21h		;Before 1980 - make it 1-Jan-80
+4$:	MOVL	EDX, dcb_dkfilepnt.B[EDI] ;Yes - get offset of file FIB
+5$:	MOVW	ff_date.B[EDX], AX
+	ORB	cb_sts.B[EDX], #CB$CHNGD ;Indicate FIB has been changed
+	ORB	ff_status.B[EDX], #FS$DATESET ;Indicate date and time has
+	POPL	EAX			      ;  been set
+6$:	TESTB	AH, #PAR$GET		;Want to get value?
+	JE	ret016.S		;No - finished
+	CMPL	ECX, #4.B		;Want date and time in DOS format?
+	JA	10$.S			;No
+	MOVL	EDX, dcb_dkfilepnt.B[EDI] ;Yes - get offset of file FIB
+	MOVZWL	EAX, ff_date.B[EDX]	;Get file's date
+	SHLL	EAX, #16t
+	ORW	AX, ff_time.B[EDX]	;Get file's time
+	CLRL	EDX
+	JMP	12$.S
+
+;Here if want date and time in system format
+
+10$:	MOVL	EDX, dcb_dkfilepnt.B[EDI]
+	MOVZWL	EAX, ff_date.B[EDX]	;Get file's date
+	CALL	knlDos2SysDate##	;Change to system format
+	PUSHL	EAX			;Save date
+	MOVZWL	EAX, ff_time.B[EDX]	;Get file's time
+	CALL	knlDos2SysTime##	;Change to system format
+	POPL	EDX			;Restore date
+12$:	JMP	knlStrParm8##		;Go give it to the user
+
+ret016:	RET
+.PAGE
+	.SBTTL	dfsiopsetlock/dfsiopclrlock - IOPAR routines for file system locks
+
+;Here for the IOPAR_SETLOCK parameter for setting a DOS file lock.  This
+;  parameter must be specified with 8 data bytes.  The first 4 bytes specify
+;  the offset in the file of the start of the region to lock and the 2nd 4
+;  bytes specify the length of the region to lock.
+
+;Note: The ordering of the stack frame MUST match the reverse order of the
+;      offsets defined in knlDOS as fle_*, since we bulk-copy the data over
+
+$$$=!0
+FRM sl_psp   , 2t	;PSP if DOS process
+FRM sl_pda   , 2t	;PDA selector for process owning lock
+FRM sl_size  , 4t	;Size of locked region in file
+FRM sl_offset, 4t	;Offset of beginning of lock in file
+FRM sl_dcb   , 4t	;DCB lock was created under
+FRM sl_begin , 0t	;Beginning of data block
+sl_SIZE=!$$$
+
+	DPARMHDR  SET, HEXV
+dfsiopsetlock:
+	ENTER	sl_SIZE, 0
+	CMPL	dcb_dkfilepnt.B[EDI], #0.B ;Have a file open?
+	JE	knlBadParmI##		;No - say bad parameter index
+	CMPL	ECX, #8t.B		;Have enough data?
+	JB	knlBadParmS##		;No - bad parameter size
+	PUSHL	EDI			;Yes - save offset of DCB
+	MOVL	ECX, ES:4.B[EBX]	;Get size of locked region
+	PUSHL	EBX			;Save pointer to user parameters
+	MOVL	EBX, ES:[EBX]		;Get offset of beginning of lock
+	CLRL	EAX			;Do strict lock checking
+	CALL	dfschklock1		;Yes - Make sure no current lock
+	POPL	EBX			;Restore pointer to user parameters
+	JC	50$			;Fail if have lock conflict
+	MOVW	AX, SS:xffPda##		;OK - get PDA selector for process
+	MOVW	sl_pda.b[EBP], AX	;Store in lock
+	MOVL	sl_dcb.b[EBP], EDI	;Save current DCB in lock
+	MOVL	GS, EAX			;Get selector for PDA
+	TESTB	GS:pdaStatus1##, #P1$DOSSEG ;Is this a DOS process?
+	JE	5$.S
+	PUSHL	#GS_REAL16.B
+	POPL	GS			;Point to real mode segment
+	MOVL	EAX, GS:dda_curpsp	;Get current PSP
+	SHRL	EAX, #4.B		;Shift in 16-bit value
+5$:	MOVW	sl_psp.B[EBP], AX	;Save in new lock
+	MOVL	EAX, ES:[EBX]		;Get file offset of locked region
+	MOVL	sl_offset.B[EBP], EAX
+	ADDL	EBX, #4.B		;Move to size of locked region
+	MOVL	EAX, ES:[EBX]		;Get size of locked region
+	MOVL	sl_size.B[EBP], EAX
+	MOVL	EDX, dcb_dkfilepnt.B[EDI] ;No - get FIB offset
+	MOVL	EDI, ff_lock.B[EDX]	;Get head of lock list
+10$:	TESTL	EDI, EDI		;Check if any locks defined
+	JE	30$.S			;Allocate new lock block
+
+;Search existing lock blocks
+
+	PUSHL	EDI
+	ADDL	EDI, #fl_1st		;Point to first item in block
+	PUSHL	ECX			;Save EBX, contains offset of lock data
+	MOVL	ECX, #60t/fle_SIZE	;Set counter for block
+20$:	CMPL	fle_dcb.b[EDI], #0	;Is this lock entry in use?
+	JNE	25$
+	POPL	EAX			;Done, clear stack
+	POPL	EAX
+	JMP	40$.S			;No - use it
+
+25$:	ADDL	EDI, #fle_SIZE.B	;Size of a lock entry
+	LOOP	ECX, 20$		;Go back around and do next entry
+	POPL	ECX
+	POPL	EDI			;Done, restore offset of block
+	MOVL	EDI, fl_next.B[EDI]	;Get offset of next block
+	JMP	10$.S			;And go process it
+
+;Here to allocate new block for lock
+
+30$:	CALL	knlGetQel##		;Get a QEL
+	JC	50$.S			;Error getting QEL, return it
+	PUSHL	ESI			;Save pointer to head of block
+	MOVL	EDI, ESI
+	PUSHL	DS			;Clear the block
+	POPL	ES
+	MOVL	ECX, #64t/4
+	CLRL	EAX
+	CLD
+	RSTOSL	[EDI]
+	POPL	EDI			;Restore pointer to block
+	MOVL	EDX, [ESP]		;Restore DCB offset
+	MOVL	EDX, dcb_dkfilepnt.B[EDX] ;Get FIB offset
+	MOVL	ECX, ff_lock.B[EDX]	;Get head of lock list
+	MOVL	fl_next.B[EDI], ECX
+	MOVL	ff_lock.B[EDX], EDI	;Point head to new block
+	ADDL	EDI, #fl_1st.B		;Adjust to first entry
+40$:	LEAL	ESI, sl_begin.B[EBP]
+	MOVL	ECX, #fle_SIZE/4	;Size of entry to copy
+	PUSHL	DS
+	POPL	ES
+	CLD
+	RMOVSL	[EDI], SS:[ESI]		;Copy new lock entry over
+	CLRL	EAX
+	CLC
+50$:	POPL	EDI			;Restore offset of DCB
+	LEAVE
+	RET				;Return error from knlGetQel
+.PAGE
+;Here for the IOPAR_CLRLOCK parameter for clearing a DOS file lock.  This
+;  parameter must be specified with 8 data bytes.  The first 4 bytes specify
+;  the offset in the file of the start of the region to lock and the 2nd 4
+;  bytes specify the length of the region to lock.  The offset and size must
+;  EXACTLY match the values specified when the lock was set.
+
+	DPARMHDR  SET, HEXV
+dfsiopclrlock:
+	CMPL	dcb_dkfilepnt.B[EDI], #0.B ;Have a file open?
+	JE	knlBadParmI##		;No - say bad parameter
+	TESTB	AH, #PAR$SET		;Yes - want to set the value?
+	JE	knlBadParmI##		;No
+	CMPL	ECX, #8t.B		;Correct number of bytes?
+	JNE	knlBadParmI##		;No - fail
+	MOVL	EDX, dcb_dkfilepnt.B[EDI] ;Yes - get FIB offset
+	MOVL	ESI, ff_lock.B[EDX]	;Get head of lock list
+5$:	TESTL	ESI, ESI		;Any locks defined?
+	JE	30$.S			;No - return error
+	PUSHL	ESI			;Save ptr to head of block
+	ADDL	ESI, #fl_1st.B		;Point to first entry in block
+	PUSHL	ECX
+	MOVL	ECX, #60t/fle_SIZE	;# of entries in each block
+10$:	MOVL	EAX, fle_offset.b[ESI]	;Get offset of this entry
+	CMPL	EAX, ES:[EBX]		;Check against request
+	JNE	20$.S			;Not this one
+	MOVL	EAX, fle_size.B[ESI]	;Get size of region
+	CMPL	EAX, ES:4.B[EBX]	;Check against request
+	JNE	20$.S			;Not this one
+	MOVW	AX, fle_pda.B[ESI]	;Get PDA selector
+	CMPW	AX, SS:xffPda##		;Is the the requestor?
+	JNE	20$.S			;No
+	MOVL	FS, EAX			;Yes
+	TESTB	FS:pdaStatus1##, #P1$DOSSEG ;Is this a DOS program?
+	JE	15$.S			;No
+	PUSHL	#GS_REAL16.B		;Yes
+	POPL	FS			;Point to real mode segment
+	MOVL	EAX, FS:dda_curpsp	;Get current PSP
+	SHRL	EAX, #4.B		;Make into 16-bit value
+15$:	CMPW	AX, fle_psp.B[ESI]	;Check against value in lock
+	JNE	20$.S			;Doesn't match - not this lock
+	CMPL	EDI, fle_dcb.B[ESI]	;Check against requestor DCB
+	JE	40$.S			;Correct block - go kill it
+20$:	ADDL	ESI, #fle_SIZE.B
+	LOOP	ECX, 10$		;Go back around and check next block
+	POPL	ECX
+	POPL	ESI
+	MOVL	ESI, fl_next.B[ESI]	;Point to next block
+	JMP	5$.S			;And go process it
+
+30$:	MOVL	EAX, #ER_LOCK		;Didn't find the requested lock
+	STC
+	RET
+
+;Here with lock to remove
+
+40$:	CLRL	EAX			;Obtain a zero
+	MOVL	fle_offset.b[ESI],EAX	;Clear offset of region
+	MOVL	fle_size.B[ESI], EAX	;Clear size of region
+	MOVL	fle_dcb.B[ESI], EAX	;Clear DCB offset
+	MOVL	fle_pda.B[ESI], EAX	;Clear PDA & PSP
+	POPL	ECX			;Clean up stack
+	POPL	ESI
+	CLC
+	RET
+.PAGE
+	.SBTTL	dfschklock - subroutine to check for a lock violation
+
+;Subroutine to check for a lock violation
+;	c{ECX} = Amount to transfer
+;	c{EDI} = Offset of DCB
+;	CALL	dfschklock
+;	C:set  = Error (conflicting lock found)
+;	  C{EAX} = Error code
+;	C:clr  = No conflicting locks found
+
+dfschklock:
+	PUSHL	EBX			;Save this register
+	MOVL	EBX, dcb_dkfpos.B[EDI]	;Get offset for transfer
+	MOVB	AL, #1t			;Don't do strict lock checking
+	CALL	dfschklock1
+	POPL	EBX
+	RET
+
+;Internal subroutine to check for a lock violation
+;	c(AL)  = Strict flag
+;	c{ECX} = Amount
+;	c{EBX} = Offset in file
+;	c{EDI} = Offset of DCB
+;	CALL	dfschklock
+;	C:set  = Error (conflicting lock found)
+;	  C{EAX} = Error code
+;	C:clr  = No conflicting locks found
+
+$$$=!0
+FRM chl_strict, 1t	;Flag for strict lock checking
+FRM           , 3t
+FRM chl_xfersz, 4t	;Size of transfer
+FRM chl_count , 4t	;Retry counter
+chl_SIZE=!$$$
+
+dfschklock1:
+	ENTER	chl_SIZE, 0
+	PUSHL	FS
+	PUSHL	EDX
+	MOVB	chl_strict.B[EBP], AL	;Save the strict flag for now
+	MOVL	chl_xfersz.B[EBP], ECX	;Save size of transfer
+	MOVZWL	EAX, dcb_dkshrrty.B[EDI] ;Initialize retry count
+	MOVL	chl_count.B[EBP], EAX
+6$:	MOVL	EDX, dcb_dkfilepnt.B[EDI] ;Get FIB offset
+	MOVL	EDX, ff_lock.B[EDX]	;Get head of lock list
+10$:	TESTL	EDX, EDX		;Check if any locks defined
+	JE	50$.S			;No - return success
+	PUSHL	EDX
+	ADDL	EDX, #fl_1st.B		;Point to first item in block
+	PUSHL	ECX
+	MOVL	ECX, #60t/fle_SIZE	;Set counter for block
+20$:	CMPL	fle_dcb.B[EDX], #0	;Is this lock entry in use?
+	JE	30$.S			;No - skip it
+	MOVL	EAX, EBX		;Get offset in file
+	SUBL	EAX, fle_offset.B[EDX]	;Is this a violation?
+	JE	28$.S			;Yes - check PDA
+	JL	25$.S			;Offset/lock follows offset/xfer
+	CMPL	EAX, fle_size.B[EDX]	;Check if lock is before xfer
+	JGE	30$.S			;Yes - xfer OK, check next lock
+	JMP	28$.S			;No - check PDA for violation
+
+;Here when offset of lock follows offset of xfer
+
+25$:	NEGL	EAX			;Make into a positive value
+	CMPL	EAX, chl_xfersz.B[EBP]	;Does xfer end before lock?
+	JGE	30$.S			;Yes - xfer OK, check next lock
+
+;Here when xfer overlaps lock - check ownership of lock
+
+28$:	CMPB	chl_strict.B[EBP], #0	;Are we ignoring lock ownership?
+	JE	60$.S			;Yes - report lock violation
+	MOVW	AX, fle_pda.B[EDX]	;No - get PDA selector of lock owner
+	CMPW	AX, SS:xffPda##		;Is this the owner?
+	JNE	60$.S			;No - report lock violation
+	MOVL	GS, EAX			;Get selector for PDA
+	TESTB	GS:pdaStatus1##, #P1$DOSSEG ;Is it a DOS process?
+	JE	29$.S			;No - use zero for PSP value
+	PUSHL	#GS_REAL16.B		;Get selector for the real mode segment
+	POPL	FS
+	MOVL	EAX, FS:dda_curpsp	;Get offset of PSP
+	SHRL	EAX, #4			;Make into 16-bit value
+29$:	CMPW	AX, fle_psp.B[EDX]	;Check against PSP of lock
+	JNE	60$.S
+	CMPL	EDI, fle_dcb.B[EDX]	;Check against DCB of requestor
+	JNE	60$.S			;No - report lock violation
+
+;Here to check next lock
+
+30$:	ADDL	EDX, #fle_SIZE.B	;Size of a lock entry
+	LOOP	ECX, 20$		;Go back around and do next entry
+	POPL	ECX
+	POPL	EDX			;Done, restore offset of block
+	MOVL	EDX, fl_next.B[EDX]	;Get offset of next block
+	JMP	10$.S			;And go process it
+
+;Here if no lock violation found
+
+50$:	POPL	EDX
+	POPL	FS
+	CLRL	EAX
+	LEAVE
+	RET
+
+;Here if lock violation found - we delay and try again if necessary
+
+60$:	POPL	ECX			;Restore original ECX value
+	POPL	EDX			;Restore offset of beginning of block
+	MOVL	ESI, [EDI]
+	DECL	chl_count.B[EBP]	;Should we try again?
+	JS	64$.S			;No - fail!
+	INCL	ucb_shrretry[ESI]	;Yes - count this
+	MOVZWL	EAX, dcb_dkshrdly.B[EDI] ;Get the amount to delay
+	IMULL	EAX, #XT_MILLISEC	;Change to fractional days
+	IMULL	EAX, ucb_shrdelay.B[ESI] ;Adjust the value
+	CALL	knlXfTimeWait##		;Delay that long
+	JNC	6$			;Continue if OK
+
+;Here if we have tried this enough or if have error while waiting - return
+;  failure
+
+64$:	INCL	ucb_shrfail[ESI]	;Count the failure
+	POPL	EDX			;Restore original EDX value
+	POPL	FS
+	MOVL	EAX, #ER_LOCK		;Lock violation
+	STC
+	LEAVE
+ret020:	RET
+.PAGE
+;Here for the IOPAR_SHRPARMS parameter.  This parameter set or gets the share
+;  retry parameters for the file.
+
+	DPARMHDR  BOTH, DECV
+dfsiopshrparms:
+	CMPL	dcb_dkfilepnt.B[EDI], #0.B ;Have a file open?
+	JE	knlBadParmI##		;No - say bad parameter
+	TESTB	AH, #PAR$SET		;Yes - want to change the value?
+	JE	12$.S			;No
+	PUSHL	EAX			;Yes
+	CALL	knlGetParm##		;Get new value
+	JC	retpbx
+	CMPW	AX, #0FFFFFFFFh.B	;Want default for process?
+	JNE	2$.S			;No
+	MOVW	ES, SS:xffPda##
+	MOVW	AX, ES:pdaShrRetry##
+2$:	CMPW	AX, #64t.B		;Too big?
+	JB	4$.S			;No
+	MOVW	AX, #64t		;Yes - reduce it to a reasonable value
+4$:	RORL	EAX, #16t
+	CMPW	AX, #0FFFFFFFFh.B	;Want default for process?
+	JNE	6$.S			;No
+	MOVW	ES, SS:xffPda##
+	MOVW	AX, ES:pdaShrDelay##
+6$:	CMPW	AX, #10t.B		;Too small?
+	JA	8$.S			;No
+	MOVB	AL, #10t		;Yes - increase it
+8$:	CMPW	AX, #5000t		;Too big?
+	JB	10$.S			;No
+	MOVW	AX, #5000t		;Yes - reduce it to a reasonable value
+10$:	RORL	EAX, #16t
+	MOVL	dcb_dkshrrty.B[EDI], EAX ;Store new value
+	POPL	EAX
+12$:	TESTB	AH, #PAR$GET		;Want to get the value?
+	JE	ret020.S		;No - finished
+	MOVL	EAX, dcb_dkshrrty.B[EDI] ;Yes
+	JMP	knlStrParm4##		;Go give it to the user
+.PAGE
+	.SBTTL	dfschk1 - File system check routine 1 for DOS file system
+
+;File system check routine 1 for DOS file system - this routine is called
+;  during the first file system identification scan.  It will only accept a
+;  disk as containing a DOS file system if the partition type is a valid
+;  DOS or SpeedStor partition type or if the disk is not partitioned and if
+;  the boot block has a valid signature and if the boot block data is
+;  consistant.
+;	c{EDI} = Offset of DCB
+;	CALL	dfschk1
+;	C:set = Error (match found)
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  Z:set = Match found
+;	    c{EAX} = 0
+;	  Z:clr = Not found
+
+;Define stack frame offsets for this routine
+
+$$$=!0
+FRM ds_dirent, 4t	;Number of root directory entires
+FRM ds_fatpnt, 8t	;Pointer to FAT index table
+FRM ds_prev  , 4t	;Selector for previous FAT
+FRM ds_total , 4t	;Total clusters
+FRM ds_factor, 4t	;Sector size factor
+FRM ds_fatnum, 4t	;FAT block number
+ds_SIZE=!$$$
+
+dfschk1::
+	ENTER	ds_SIZE, 0		;Setup our stack frame
+	MOVL	ESI, [EDI]		;Point to the UCB
+	TESTL	ESI, ESI
+	JE	knlNoUnitLv##
+	CMPB	ucb_fstype.B[ESI], #FS_DOS32 ;Is this known to be a DOS
+	JE	2$.S			     ;  partition with 32 bit FATs?
+	CMPB	ucb_fstype.B[ESI], #FS_DOS32X
+	JNE	4$.S			;No
+2$:	MOVL	ucb_fsname+4[ESI], #'2'
+	MOVL	ucb_fsname+0[ESI], #'DOS3'
+	ORB	ucb_sts3.B[ESI], #U3$FAT32
+	ANDB	ucb_sts3.B[ESI], #~U3$FAT12
+	JMP	30$
+
+;Here if not a DOS partition with 32 bit FAT entries
+
+4$:	CMPB	ucb_fstype.B[ESI], #FS_DOS16 ;Is this known to be a DOS
+	JE	12$.S			     ;  partition with 16 bit FATs?
+	CMPB	ucb_fstype.B[ESI], #FS_DOS16H
+	JE	10$.S
+	CMPB	ucb_fstype.B[ESI], #FS_DOS16X
+	JE	10$.S
+	CMPB	ucb_fstype.B[ESI], #FS_DSS16
+	JE	6$.S
+	CMPB	ucb_fstype.B[ESI], #FS_DSS16L
+	JNE	18$.S			;No
+	MOVL	ucb_fsname+4[ESI], #'6L'
+	JMP	8$.S
+
+;Here if have a SpeedStor DOS16 partition
+
+6$:	MOVL	ucb_fsname+4[ESI], #'6'
+8$:	MOVL	ucb_fsname+0[ESI], #'DSS1'
+	JMP	16$.S
+
+;Here if have a DOS16 partition with is 32MB or larger
+
+10$:	MOVL	ucb_fsname+0[ESI], #'DOS1'
+	MOVL	ucb_fsname+4[ESI], #'6H'
+	JMP	16$.S
+
+;Here if have a standard DOS16 partition
+
+12$:	MOVL	ucb_fsname+4[ESI], #'6'
+14$:	MOVL	ucb_fsname+0[ESI], #'DOS1'
+16$:	ANDB	ucb_sts3.B[ESI], #~{U3$FAT12|U3$FAT32}
+	JMP	30$.S
+
+;Here if not a DOS partition with 16 bit FAT entries
+
+18$:	CMPB	ucb_fstype.B[ESI], #FS_DOS12 ;Is it known to have 12 bit entires?
+	JE	24$.S
+	CMPB	ucb_fstype.B[ESI], #FS_DSS12
+	JE	20$.S
+	CMPB	ucb_fstype.B[ESI], #FS_DSS12L
+	JNE	28$.S			;No
+	MOVL	ucb_fsname+4[ESI], #'2L'
+	JMP	22$.S
+
+20$:	MOVL	ucb_fsname+4[ESI], #'2'
+22$:	MOVL	ucb_fsname+0[ESI], #'DSS1'
+	JMP	26$.S
+
+;Here if have 12 bit FAT entries
+
+24$:	MOVL	ucb_fsname+4[ESI], #'2'
+	MOVL	ucb_fsname+0[ESI], #'DOS1'
+26$:	ANDB	ucb_sts3.B[ESI], #~U3$FAT32
+	ORB	ucb_sts3.B[ESI], #U3$FAT12
+	JMP	30$.S
+
+;Here if not a known DOS partition type
+
+28$:	CMPB	ucb_fstype.B[ESI], #0	;Might it be a DOS partition?
+	JNE	32$.S			;No - return with Z clear
+30$:	CALL	chkboot			;Yes - read and check the boot block
+	JC	34$.S			;If error
+	JE	gdboot.S		;If valid DOS boot block
+32$:	TESTL	EBP, EBP
+34$:	LEAVE
+	RET
+.PAGE
+	.SBTTL	dfschk2 - File system check routine 2 for DOS file system
+
+;File system check routine 2 for DOS file system - this routine is called
+;  during the second file system identification scan.  It will accept any
+;  disk as containing a DOS file system if the first two bytes of the first
+;  FAT block are correct.  If the boot block data is inconsistant, a reasonable
+;  guess will be made as to what it should be.  This allows DOS floppies which
+;  do not have valid boot blocks to be used.
+;	c{EDI} = Offset of DCB
+;	CALL	dfschk2
+;	C:set = Error (match found)
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  Z:set = Match found
+;	    c{EAX} = 0
+;	  Z:clr = Not found
+
+dfschk2::
+	ENTER	ds_SIZE, 0		;Setup our stack frame
+	CALL	chkboot			;First check the boot block (this might
+					;  be valid here if this is a partition
+					;  type we don't know about but which
+					;  contains a valid DOS file structure)
+	JC	4$.S			;If error
+	JNE	chkmore.S		;If not valid, go check some more
+	MOVB	ucb_fstype.B[ESI], #0	;OK - clear funny partition type
+	MOVL	ucb_fsname+0[ESI], #'None'
+	CLRL	EAX
+	MOVL	ucb_fsname+4[ESI], EAX
+	JMP	gdboot.S		;Continue
+
+;If get here we do not have a valid DOS boot block - now we must try to figure
+;  out if this might be a DOS disk anyway!  If this is a hard disk, we can't
+;  do much with it since there are too many variables, but if it is a floppy,
+;  we assume it is a floppy without a boot block, and assume the following
+;  default values:
+;	Bytes/sector           = 512
+;	Sectors/cluster        = 1
+;	Number of FATs         = 2
+;	Root directory entries = ?
+;	Total sectors          = Drive value
+;	Sectors/FAT            = Calculated from total sectors value
+;	Sectors/track          = Drive value
+;	Number of heads        = Drive value
+
+chkmore:TESTL	ESP, ESP		;This will be added soon - for now
+4$:	LEAVE				;  say this is not a DOS disk!
+	RET
+.PAGE
+;Here with valid DOS boot block
+
+gdboot:	MOVZWL	EAX, db_secsize.B[EBX]	;Get size of a logical sector
+	CLRL	EDX			;Calculate size factor
+	DIVL	knlLit512##
+	TESTL	EDX, EDX		;Must be multiple of 512
+	JNE	bdboot.S
+	TESTL	EAX, EAX		;Also must not be 0
+	JE	bdboot.S
+	MOVL	ds_factor.B[EBP], EAX
+	MOVZBL	EAX, db_secpcls.B[EBX]	;Get sectors per cluster
+	IMULL	EAX, ds_factor.B[EBP]
+	MOVL	ucb_clussize.B[ESI], EAX ;Save it
+	BSFL	EDX, EAX		;Determine shift count
+	SHLL	EAX, #9t		;Calculate bytes per cluster
+	MOVL	ucb_bpclus.B[ESI], EAX	;Save it
+	MOVB	ucb_clusx.B[ESI], DL	;Save shift count
+	MOVZBL	EDX, db_numfats.B[EBX]	;Get number of FATs
+	TESTB	DL, DL			;Must not be 0!
+	JE	bdboot.S
+	CMPB	DL, #2			;Or greater than 2!
+	JA	bdboot.S
+	MOVB	ucb_numsat.B[ESI], DL
+	CMPB	ucb_fstype.B[ESI], #0	;Is the file structure type known?
+	JNE	2$.S			;Yes
+	CMPW	db_rdirent.B[EBX], #0.B	;No - might it be a FAT32 boot block?
+	JNE	2$.S			;No
+	CMPW	db_secpfat.B[EBX], #0.B	;Maybe
+	JNE	2$.S			;No
+	MOVB	ucb_fstype.B[ESI], #FS_DOS32
+	MOVL	ucb_fsname+4[ESI], #'2'	;Yes, it is a FAT32 boot block!
+	MOVL	ucb_fsname+0[ESI], #'DOS3'
+	ORB	ucb_sts3.B[ESI], #U3$FAT32
+	ANDB	ucb_sts3.B[ESI], #~U3$FAT12
+2$:	MOVZWL	EAX, db_secpfat.B[EBX]	;Get 16 bit size of each FAT
+	TESTB	ucb_sts3.B[ESI], #U3$FAT32 ;Have 32 bit FATs?
+	JE	4$.s			;No
+	TESTL	EAX, EAX		;Yes - 16 bit FAT size must be 0
+	JNE	bdboot.S
+	MOVL	EAX, db_ttlsecpfat.B[EBX] ;Get 32 bit FAT size
+	TESTL	EAX, EAX		;It must not be 0
+	JNE	setupdfs.s
+	JMP	bdboot.S
+
+;Here if don't have 32 bit FATs
+
+4$:	TESTL	EAX, EAX		;16 bit FAT size must not be 0
+	JNE	setupdfs.S
+bdboot:	CALL	xosdskGiveLkBufr##	;Give up the boot block buffer
+	JMP	notdfs
+.PAGE
+;Here with good boot block - now set up the DOS file structure
+
+setupdfs:
+	IMULL	EAX, ds_factor.B[EBP]
+	MOVL	ucb_satsize.B[ESI], EAX
+	MOVZWL	EAX, db_ressec.B[EBX]	;Get position of first FAT
+	IMULL	EAX, ds_factor.B[EBP]
+	MOVL	ucb_ffatblk.B[ESI], EAX
+	MOVZWL	ECX, db_rdirent.B[EBX]	;Get number of directory entires
+	MOVL	ds_dirent.B[EBP], ECX	;Save for later
+	TESTB	ucb_sts1.B[ESI], #U1$FIXCFG ;Is the configuration fixed?
+	JNE	2$.S			;Yes
+	MOVZBL	EAX, db_heads.B[EBX]	;No - get number of heads
+	MOVL	ucb_cheads.B[ESI], EAX
+	MOVZBL	EAX, db_secptrk.B[EBX] ;Get number of sectors per track
+	MOVL	ucb_csects.B[ESI], EAX
+2$:	MOVL	EAX, ucb_satsize.B[ESI]	;Get number of sectors per FAT
+	MULL	EDX			;Times number of FATs
+	PUSHL	EBX
+	MOVZWL	EBX, db_ressec.B[EBX]	;Plus number of reserved sectors
+	IMULL	EBX, ds_factor.B[EBP]
+	ADDL	EAX, EBX
+	POPL	EBX
+	TESTB	ucb_sts3.B[ESI], #U3$FAT32 ;Have 32 bit FATs?
+	JNE	4$.S			;Yes
+	MOVL	ucb_rootblk.B[ESI], EAX	;No - store the block for the root
+					;  directory
+	MOVL	ucb_rootcls.B[ESI], #1	;Store 1 as the root cluster number
+	ADDL	ECX, #15t.B		;Get number of sectors in root
+	SHRL	ECX, #4			;  directory
+	ADDL	EAX, ECX		;Plus size of root directory
+	JMP	5$.S
+
+;Here if have 32 bit FATs
+;	c{EAX} = Total number of overhead sectors
+
+4$:	MOVL	EDX, db_rootcls.B[EBX]	;Get cluster number for root directory
+	MOVL	ucb_rootcls.B[ESI], EDX
+5$:	MOVZWL	EDX, db_sectors.B[EBX]	;Get number of sectors on disk
+	TESTL	EDX, EDX		;Is it 0?
+	JNE	6$.S			;No
+	MOVL	EDX, db_ttlsec.B[EBX]	;Yes - get the 32 bit size
+6$:	IMULL	EDX, ds_factor.B[EBP]
+	PUSHL	EDX			;Save total size of volume
+	SUBL	EDX, EAX		;Reduce by size of overhead area
+	SUBL	EAX, ucb_clussize.B[ESI] ;Minus 2 clusters
+	SUBL	EAX, ucb_clussize.B[ESI] ;Save block number for first allocated
+	MOVL	ucb_fcblk.B[ESI], EAX	 ;  cluster
+	MOVB	CL, ucb_clusx.B[ESI]	;Change to number of clusters
+	SHRL	EDX, CL
+	MOVL	ucb_total.B[ESI], EDX	;Store total number of clusters
+	MOVL	EAX, ucb_csects.B[ESI]	;Calculate blocks per cylinder
+	MULL	ucb_cheads.B[ESI]
+	POPL	ECX			;Restore size of volume
+	CMPB	ucb_fstype.B[ESI], #0	;Is the file structure type known?
+	JE	8$.S			;No
+	CMPB	ucb_fstype.B[ESI], #FS_DOS16H ;Yes - is it a DOS huge partition?
+	JNE	10$.S			;No - go on
+8$:	MOVB	ucb_fstype.B[ESI], #FS_DOS12 ;Yes - assume 12 bit FATs
+	MOVL	ucb_fsname+0[ESI], #'DOS1'
+	MOVL	ucb_fsname+4[ESI], #'2'
+	ORB	ucb_sts3.B[ESI], #U3$FAT12
+	ANDB	ucb_sts3.B[ESI], #~U3$FAT32
+	CMPL	ucb_total.B[ESI], #4087t ;Too many clusters for 12 bits?
+	JB	10$.S			;No
+	MOVB	ucb_fstype.B[ESI], #FS_DOS16 ;Yes - assume 16 bit FATs
+	MOVB	ucb_fsname+4[ESI], #'6'
+	ANDB	ucb_sts3.B[ESI], #~U3$FAT12
+10$:	XCHGL	ECX, EAX		;Calculate number of cylinders (round
+	ADDL	EAX, ECX		;  up)
+	DECL	EAX
+	DIVL	ECX
+	MOVL	ucb_ccylns.B[ESI], EAX	;Store number of cylinders
+	MOVL	ucb_csecsz.B[ESI], #512t ;Store sector size (always 512 bytes)
+	CALL	xosdskGiveLkBufr##	;Give up the boot block buffer
+	MOVL	ucb_satraa.B[ESI], #7FFFFFFFh ;Read-ahead as much as possible
+	TESTB	ucb_dsp.B[ESI], #DS$REMOVE ;Is this disk removeable?
+	JE	18$.S			;No - don't bother with a checksum
+	CLRL	EAX			;Yes - checksum the first 4 FAT blocks
+	CALL	dfsgetfatblock#
+	JC	notdfs.S
+	MOVL	EDX, #ucb_fat1cs
+12$:	CALL	dfsblkcs		;Calculate block checksum
+	MOVL	[ESI+EDX], EAX		;Store checksum in UCB
+	CMPL	EDX, #ucb_fat4cs	;Finished?
+	JAE	18$.S			;Yes
+	ADDL	EDX, #4.B		;No
+	CALL	dfsgetnxtfatblock#	;Get next FAT
+	JNC	12$.S			;Continue if OK
+notdfs:	CLRL	EAX
+	MOVL	ucb_satraa.B[ESI], EAX	;No more FAT read-ahead
+	MOVL	ucb_total.B[ESI], EAX	;Clear file structure related data
+	MOVL	ucb_avail.B[ESI], EAX
+	MOVL	ucb_satsize.B[ESI], EAX
+	MOVL	ucb_ffatblk.B[ESI], EAX
+	MOVB	ucb_fstype.B[ESI], AL
+	MOVB	ucb_fatmode.B[ESI], AL
+	MOVL	ucb_fsname+0[ESI], EAX
+	MOVL	ucb_fsname+4[ESI], EAX
+	MOVB	ucb_clusx.B[ESI], AL
+	MOVL	ucb_clussize.B[ESI], EAX
+	MOVL	ucb_bpclus.B[ESI], EAX
+	MOVL	ucb_highcl.B[ESI], EAX
+	MOVL	ucb_rootpnt.B[ESI], EAX
+	MOVL	ucb_numsat.B[ESI], EAX
+	MOVL	ucb_fcblk.B[ESI], EAX
+	MOVL	ucb_grpsize.B[ESI], EAX
+	TESTL	ESP, ESP		;Clear Z to indicate not a DOS disk!
+	LEAVE
+	RET
+
+;Now scan all FATs and count blocks
+
+18$:	CLRL	EAX			;Clear total
+	MOVL	ds_total.B[EBP], EAX
+	MOVL	ucb_avail.B[ESI], EAX	;Clear amount available on disk
+	CLRL	EAX			;Get the first FAT block
+	CALL	dfsgetfatblock#
+	JC	notdfs.S		;If error
+	CLRL	ECX			;Initialize cluster number and pointer
+	CLRL	EDX
+	CALL	dfsgetnxtfatent#	;Get first entry (low 8 bits are the
+	JC	notdfs.S		;  FAT mode byte
+	MOVB	AL, [EBX]
+	MOVB	ucb_fatmode.B[ESI], AL
+	CALL	dfsgetnxtfatent#	;Discard next entry
+	JC	notdfs.S
+20$:	CALL	dfsgetnxtfatent#	;Get FAT entry
+22$:	JC	notdfs.S
+	JNE	24$.S			;If not available
+	INCL	ucb_avail.B[ESI]	;Available - count it
+24$:	INCL	ds_total.B[EBP]		;Bump total count
+	MOVL	EAX, ds_total.B[EBP]
+	CMPL	EAX, ucb_total.B[ESI]	;Finished?
+	JB	20$.S			;No - continue
+	MOVL	ucb_highcl.B[ESI], ECX	;Yes - remember high cluster number
+	MOVL	ucb_satraa.B[ESI], #0	;No more FAT read-ahead
+	MOVL	EAX, #32t		;Get default group size for this disk
+	MOVB	CL, ucb_clusx.B[ESI]	;Change to number of clusters
+	SHRL	EAX, CL
+	JNE	25$.S			;Make sure not 0
+	INCL	EAX
+25$:	MOVL	ucb_grpsize.B[ESI], EAX	;Store default group size for DOS
+	TESTB	ucb_dsp.B[ESI], #DS$REMOVE ;Is this disk removeable?
+	JE	26$.S			;No - don't bother with a checksum
+	MOVL	EAX, ucb_rootblk.B[ESI]	;Yes - get first block of the root
+	MOVL	dcb_dkdblk.B[EDI], EAX	;  directory
+	CLRL	EDX
+	CALL	xosdskFindSBufr##
+	JC	22$.S
+	CALL	dfsblkcs		;Calculate checksum for this block
+	MOVL	ucb_root1cs[ESI], EAX	;Store it
+	CALL	xosdskRelsLkBufr##	;Release the buffer
+26$:	MOVL	dcb_dkdblk.B[EDI], #02000000h ;Get block for the root directory
+	CALL	xosdskNewSBufr##	      ;  FIB
+	JC	22$.S			;If error
+	MOVL	ucb_rootpnt.B[ESI], EBX
+	MOVL	ff_label.B[EBX], #'RFIB'
+	MOVL	ff_dirpos.B[EBX], #-1	;Indicate don't have parent directory
+	TESTB	ucb_sts3.B[ESI], #U3$FAT32 ;Have 32 bit FATS
+	JE	28$.S			;No
+	MOVL	EAX, ucb_rootcls.B[ESI]	;Yes - store starting cluster number
+	MOVL	ff_f1pnt+1.B[EBX], EAX	;  for root directory
+	MOVL	ff_alloc.B[EBX], #-1	;Indicate FATs not scanned yet
+	JMP	30$.S			;Continue
+
+;Here to set up the root directory FIB if don't have 32 bit FATs
+
+28$:	MOVL	EAX, ds_dirent.B[EBP]	;Get size of the root directory in
+	MOVL	EDX, EAX		;  number of entries
+	SHLL	EAX, #5			;Change to bytes
+	MOVL	ff_size.B[EBX], EAX	;Store in FIB
+	MOVL	ff_mxsz.B[EBX], EAX
+	ADDL	EDX, #15t.B		;Get blocks in root directory
+	SHRL	EDX, #4
+	MOVL	ucb_rootsize.B[ESI], EDX
+	ADDL	EDX, ucb_clussize.B[ESI] ;Get number of clusters in root
+	DECL	EDX			;  directory (round down!) - we never
+	MOVB	CL, ucb_clusx.B[ESI]	;  really use this number!!
+	SHRL	EDX, CL
+	MOVL	ff_alloc.B[EBX], EDX	;Store as number of clusters in file
+	MOVL	ff_roof.B[EBX], eDX	;Store as top of this FIB
+	MOVB	ff_f1pnt+0.B[EBX], DL	;Store as count for first pointer
+	MOVB	ff_f1pnt+1.B[EBX], #1	;Store "cluster number" in pointer
+30$:	MOVB	ff_attrib.B[EBX], #A$DIRECT|A$SYSTEM
+					;Indicate directory and system file
+	CALL	xosdskUnlkBufr##	;Unlock buffer, but keep it so it will
+					;  stay around as long as the disk is
+					;  mounted
+	ORB	ucb_sts1.B[ESI], #U1$MOUNT ;Indicate disk is mounted now
+	ANDB	ucb_sts2.B[ESI], #~U2$REQUNMNT
+	MOVL	EAX, #dfsdsp		;DOS disk - use our dispatch tables
+	MOVL	ucb_sdisp.B[ESI], EAX
+	MOVL	ucb_unmount.B[ESI], #dfsunmount
+	MOVL	EDX, ucb_dsp.B[ESI]
+	ANDL	EDX, #DS$REMOVE.B
+	ORL	EDX, #DS$FILE|DS$NAMEEXT|DS$ALIAS|DS$SODIR|DS$NOABORT|DS$LCLDISK|DS$QIN|DS$QOUT
+	MOVL	ucb_dsp.B[ESI], EDX
+	TESTL	SS:xffCmd#, #O$PHYS|O$RAW ;Physical IO?
+	JNE	44$.S			;Yes
+	MOVL	dcb_sdisp.B[EDI], EAX	;No - update DCB pointer and bits
+	MOVL	dcb_dsp.B[EDI], EDX
+44$:	CLRL	EAX			;Set Z to indicate have DOS disk
+	LEAVE
+	RET
+.PAGE
+	.SBTTL	chkboot - Subroutine to read and check a DOS boot block
+
+;Subroutine to read and check a DOS boot block
+;	CALL	chkboot
+;	C:set = Error
+;	C:clr = Normal
+;	  Z:set = Valid DOS boot block
+;	  Z:clr = Not a valid DOS boot block
+
+chkboot:CLRL	EAX			;Read the boot block
+	MOVL	dcb_dkdblk.B[EDI], EAX
+	CLRL	EDX
+	CALL	xosdskFindSBufr##
+	JC	6$.S			;If error
+	CMPW	db_bootsig[EBX], #0AA55h ;OK - check for valid signature
+	JNE	4$.S			;Nope
+	CMPB	db_jump+0.B[EBX], #0
+	JE	10$.S
+	CMPB	db_jump+0.B[EBX], #0E9h
+	JE	10$.S			;OK
+	CMPB	db_jump+0.B[EBX], #0EBh
+	JNE	4$.S
+	CMPB	db_jump+2.B[EBX], #90h
+	JE	10$.S
+4$:	CALL	xosdskGiveLkBufr##	;Give up the buffer
+	TESTL	EBP, EBP		;Clear Z to indicate not DOS!
+6$:	RET
+
+;Here with boot block with valid signature
+
+10$:	CLRL	EAX			;Indicate DOS disk
+	RET				;And return
+.PAGE
+	.SBTTL	dfsblkcs - Subroutine to calculate DOS block checksum
+
+;Subroutine to calculate DOS block checksum - this value is only used to
+;  determine if a removeable disk has been changed
+;	c{EBX} = Offset of buffer containing block
+;	CALL	dfsblkcs
+;	c{EAX} = Checksum value
+;  EDX and ESI are respected
+
+dfsblkcs::
+	MOVL	ECX, #512t/4
+	PUSHL	EDX
+	PUSHL	ESI
+	CLRL	EDX
+	MOVL	ESI, EBX
+	CLD
+2$:	LODSL	[ESI]
+	RORL	EDX, #1
+	XORL	EDX, EAX
+	LOOP	ECX, 2$
+	MOVL	EAX, EDX
+	POPL	ESI
+	POPL	EDX
+	RET
+.PAGE
+	.SBTTL	dfsvfychg - Verify changed disk
+
+;Here for the verify changed disk entry (dd_chkchg) - this routine is called
+;  for DOS file structured disks only
+;	c{EDI} = Offset of DCB
+;	CALL	dfsvfychg
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+
+dfsvfychg:
+	MOVL	ESI, [EDI]
+	TESTL	ESI, ESI
+	JE	knlNoUnit##
+	MOVL	EBX, ucb_kcb.B[ESI]
+	TESTB	ucb_sts2.B[ESI], #U2$REQUNMNT ;Currently being unmounted?
+	JNE	16$			;Yes - it has been changed
+	CALL	xosdskGetSBufr##	;No - get a system buffer
+	JC	6$.S			;If error
+	MOVW	cb_lockxff.B[EBX], SS	;Lock the buffer (this is needed since
+	INCL	SS:xffLockCnt##		;  xosdskReadBufr expects a locked
+					;  buffer - it serves no other purpose
+					;  since this buffer is not hashed)
+	CLRL	EAX			;Read the boot block
+	MOVL	dcb_dkdblk.B[EDI], EAX
+	CALL	xosdskReadBufr##
+	JC	6$.S			;If error (buffer given up)
+
+;CODE GOES HERE TO CHECK VOLUME ID AND OTHER THINGS IN BOOT BLOCK!!!
+
+	MOVL	EAX, ucb_ffatblk.B[ESI]	;Get the first FAT block
+	MOVL	dcb_dkdblk.B[EDI], EAX
+	LEAL	EDX, ucb_fat1cs[ESI]
+	MOVL	ECX, ucb_numsat.B[ESI]	;Get number of FAT blocks
+	CMPL	ECX, #4.B		;Have more than 4?
+	JBE	4$.S			;No
+	MOVL	ECX, #4			;Yes - just check 4
+4$:	PUSHL	ECX
+	PUSHL	EDX
+	CALL	xosdskReadBufr##
+	POPL	EDX
+	JC	8$.S			;If error (buffer given up)
+	CALL	dfsblkcs		;Calculate block checksum
+	POPL	ECX
+	CMPL	[EDX], EAX		;Is it the same?
+	JNE	12$.S			;No - different disk!
+	ADDL	EDX, #4.B		;Bump pointer
+	INCL	dcb_dkdblk.B[EDI]	;Bump disk block number
+	LOOP	ECX, 4$			;Continue if more to check
+	MOVL	EAX, ucb_rootblk.B[ESI]	;Get first block of the root directory
+	MOVL	dcb_dkdblk.B[EDI], EAX
+	CALL	xosdskReadBufr##
+	JC	14$.S			;Error - assume disk changed
+	CALL	dfsblkcs		;Calculate checksum for this block
+	CMPL	ucb_root1cs[ESI], EAX	;Is it the same?
+	JNE	12$.S			;No - assume disk changed
+	CALL	xosdskGiveLkBufr##	;Give up the buffer
+	CLRL	EAX			;Set Z to indicate not changed
+6$:	RET
+
+;Here if error
+
+8$:	POPL	ECX
+	JMP	14$.S
+
+;Here if disk has been changed
+
+12$:	CALL	xosdskGiveLkBufr##	;Give up our buffer
+14$:	ORB	ucb_sts2.B[ESI], #U2$REQUNMNT
+16$:	MOVL	EAX, #ER_MDCHG
+	STC
+	RET
+.PAGE
+	.SBTTL	dfsunmount - Unmount DOS file structured disk
+
+;Here for the unmount disk entry - this routine removes all of knowledge of
+;  a disk from the system without attempting to read or write to the disk
+;  - it is normally called when it is determined that a removable disk has
+;  been changed or when a serious IO error occures (such as an error when
+;  updating the FAT blocks) - all buffers for the disk are unhashed - if
+;  they are not in use, they are given up, if they are in use, they are
+;  marked with an error (ER_MDCHG or ER_???)
+;	c{EDI} = Offset of DCB
+;	c{ESI} = Offset of UCB
+;	c{EAX} = Error code for in use buffers
+;	CALL	dfsunmount
+;  EAX is preserved
+
+dfsunmount::
+	PUSHL	EAX			;Save error code
+	MOVL	EBX, ucb_rootpnt.B[ESI]	;Get offset of the root FIB
+	CALL	xosdskGiveBufr##	;Give it up (use count must be at least
+					;  2 here so this does not really give
+	MOVL	ucb_rootpnt.B[ESI], #0	;  it up!)
+	POPL	EAX			;Restore error code to use
+	JMP	xosdskUnmount##		;Go finish up
+.PAGE
+	.SBTTL	dfsunitinfo - DOS file system get phyical unit information function
+
+;Here for the get physical unit information class function (CL_PUNITS) for the
+;  DOS file system class to return detailed device information - For the DOS
+;  file system, this consists of the complete path and name of the open file.
+;	c{ECX}    = Size of buffer
+;	c{ES:EDI} = Address of user buffer
+;	c{ESI}    = Offset of DCB
+;	CALL	xosdskunitinfo
+;	c{EAX} = Error code
+;	c{EBX} = Status bits
+;	c{ECX} = Item count
+
+dfsinfo:CLRL	EDX
+	MOVL	EBX, dcb_dkfilepnt.B[ESI] ;Get FIB for file
+	TESTL	EBX, EBX
+	JE	8$.S			;If none
+	CALL	info2
+	JC	6$.S
+	CMPL	cb_dirfib.B[EBX], #0.B	;Is the root open?
+	JE	2$.S			;Yes
+	INCL	ECX			;No - remove the last \
+	DECL	EDI
+2$:	DECL	ECX
+	JS	4$.S
+	IFFAULT	knlRtnAdrErP1##
+	MOVB	ES:[EDI], #0
+4$:	MOVL	EAX, EDX
+6$:	RET
+
+;Here if don't have a FIB
+
+8$:	MOVL	EBX, #nofilestr
+	MOVL	EDX, #-1
+	JMP	knlInfoSimple##
+
+
+info2:	PUSHL	EBX
+	MOVL	EBX, cb_dirfib.B[EBX]	;Get directory FIB
+	TESTL	EBX, EBX
+	JE	10$.S
+	CALL	info2
+	JC	6$.S
+10$:	POPL	EBX
+	CMPL	cb_dirfib.B[EBX], #0.B	;Is this the root?
+	JE	18$.S			;Yes - just store \
+	CLD
+	PUSHL	EBX
+	ADDL	EBX, #ff_filename.B
+	CMPL	[EBX], #0.B		;Have a file name in the FIB?
+	JNE	12$.S			;Yes
+
+;Here if don't have a short name in the FIB
+
+	CMPL	4.B[EBX], #0.B		;Have a file name in an exec buffer?
+	JE	14$.S			;No - no name at all!
+	MOVL	EBX, 4.B[EBX]
+	ADDL	EBX, #3t.B
+12$:	MOVB	AL, [EBX]		;Yes
+	INCL	EBX
+	CMPB	AL, #0
+	JE	16$.S
+	DECL	ECX
+	JS	20$.S
+	IFFAULT	knlRtnAdrEr##
+	STOSB	[EDI]
+	JMP	12$.S
+
+;Here if don't have a name stored (possible if we ran out of memory!!)
+
+14$:	MOVL	EBX, #nonamestr
+	JMP	12$.S
+
+;Here with the name stored
+
+16$:	POPL	EBX
+18$:	DECL	ECX
+	JS	20$.S
+	MOVB	AL, #'\'
+	IFFAULT	knlRtnAdrEr##
+	STOSB	[EDI]
+20$:	INCL	EDX
+	CLC
+	RET
+.PAGE
+	.SBTTL	dfsinpblk - Queued input block
+
+;Here for the sd_qinpblk entry - Input block
+;	c{EDI} = Offset of DCB
+;	c{ESI} = Offset of IORB
+;	CALL	dfsinpblk
+;	c{EAX} = Error code
+;	c{ECX} = Amount output
+;	c{EBX} = Status bits
+
+dfsinpblk:
+	CALL	knlIoQabLock##		;Lock the QAB
+	JC	2$.S			;If error
+	CALL	knlIoReadLock##		;Lock the input buffer
+	JC	2$.S			;If error
+	MOVB	iorb_queue.B[ESI], #dcb_outframe
+	MOVL	iorb_routine.B[ESI], #dfsinpblk1
+	JMP	knlXfQueue##		;Switch to extended fork context
+
+2$:	TOFORK
+	RET
+
+4$:	CLRL	EAX
+6$:	CLRL	ECX
+	MOVL	EBX, #QSTS$DONE
+	RET
+
+;Here in extended fork context
+
+dfsinpblk1:
+.IF NE $$CHKCHAIN
+	CALL	checkchain#
+.ENDC
+	CMPL	SS:xffParm##, #0.B	;Have any device parameters?
+	JE	8$.S			;No
+	MOVL	EBX, #dfsioparms	;Yes - process parameters
+	MOVL	ECX, #knlComDPParms##
+	LFSL	EDX, SS:xffParm##
+	CALL	knlProcDevParm##
+	JC	6$.S			;If error
+8$:	MOVL	ECX, SS:xffCount##	;Get count
+	JREGZ	ECX, 4$
+	BTL	SS:xffCmd##, #O%IN	;Input allowed?
+	JNC	knlIllInp##		;No - fail
+	CALL	dfschklock		;Check if a lock violation
+	JC	6$.S			;Yes - fail
+	MOVL	EBX, dcb_dkfilepnt.B[EDI]
+	CALL	xosdskLockBufrW##	;Lock the file
+	LESL	EBX, SS:xffBuffer1##	;Get address of buffer
+	MOVL	ESI, #dfsrdpos#		;Get offset of disk address calculate
+					;  subroutine
+	CALL	xosdskRead##		;Do the transfer
+	JC	10$.S
+	CLRL	EAX
+10$:	MOVL	EBX, dcb_dkfilepnt.B[EDI]
+	CALL	xosdskUnlkBufr##	;OK - unlock file and return
+.IF NE $$CHKCHAIN
+	CALL	checkchain#
+.ENDC
+	MOVL	EBX, #QSTS$DONE
+12$:	JMP	xosdskLclDone##
+.PAGE
+	.SBTTL	dfsoutstr - Output null terminated string
+
+;Here for the sd_outstring entry - output null terminated string
+;	c{EDI} = Offset of DCB
+;	c{ESI} = Offset of IORB
+;	CALL	dfsoutstr
+;	c{EAX} = Error code
+;	c{ECX} = Amount output
+;	c{EBX} = Status bits
+
+dfsoutstr:
+	CALL	knlIoQabLock##		;Lock the QAB
+	JC	2$.S			;If error
+	CALL	knlIoStringLock##	;Lock output string
+	JNC	4$.S			;OK - go on
+2$:	TOFORK				;If error
+	RET
+
+	.SBTTL	dfsoutblk - Output block
+
+;Here for the sd_outblock entry - output block
+;	c{EDI} = Offset of DCB
+;	c{ESI} = Offset of IORB
+;	CALL	dfsoutblk
+;	c{EAX} = Error code
+;	c{ECX} = Amount output
+;	c{EBX} = Status bits
+
+dfsoutblk:
+	CALL	knlIoQabLock##		;Lock the QAB
+	JC	2$.S			;If error
+	CALL	knlIoWriteLock##	;Lock the output buffer
+	JC	2$.S			;If error
+4$:	MOVB	iorb_queue.B[ESI], #dcb_outframe
+	MOVL	iorb_routine.B[ESI], #dfsoutblk1
+	JMP	knlXfQueue##		;Switch to extended fork context
+
+6$:	CLRL	EAX
+8$:	CLRL	ECX
+	MOVL	EBX, #QSTS$DONE
+	JMP	xosdskLclDone##
+
+;Here in extended fork context
+
+dfsoutblk1:
+.IF NE $$CHKCHAIN
+	CALL	checkchain#
+.ENDC
+	CMPL	SS:xffParm##, #0.B	;Have any device parameters?
+	JE	10$.S			;No
+	MOVL	EBX, #dfsioparms	;Yes - process parameters
+	MOVL	ECX, #knlComDPParms##
+	LFSL	EDX, SS:xffParm##
+	CALL	knlProcDevParm##
+	JC	8$.S			;If error
+10$:	MOVL	ECX, SS:xffCount##	;Get count
+	JREGZ	ECX, 6$
+	MOVL	EBX, dcb_dkfilepnt.B[EDI] ;Is this a directory, a label, or a
+					  ;  read-only file?
+	TESTB	ff_attrib.B[EBX], #A$DIRECT|A$LABEL|A$RDONLY
+	JNE	knlIllOut#		;Yes - can't do this!
+	BTL	SS:xffCmd##, #O%OUT	;No - output allowed?
+	JNC	knlIllOut##		;No - fail
+	CALL	dfschklock		;Yes - does this violate a record lock?
+	JC	8$.S			;Yes - return error
+	MOVL	EBX, dcb_dkfilepnt.B[EDI] ;No - lock the file
+	CALL	xosdskLockBufrW##
+	BTL	SS:xffCmd##, #O%FAPPEND	;Force append?
+	JNC	12$.S			;No - go on
+	MOVL	EAX, ff_size.B[EBX]	;Yes - set IO position to EOF
+	MOVL	dcb_dkfpos.B[EDI], EAX
+12$:	ORB	ff_status.B[EBX], #FS$MODIFIED ;Indicate file modified
+	LESL	EBX, SS:xffBuffer1##	;Get address of buffer
+	CALL	dfswrite		;Do the transfer
+	JC	14$.S			;If error
+	CLRL	EAX			;OK
+14$:	MOVL	EBX, dcb_dkfilepnt.B[EDI]
+	CALL	xosdskUnlkBufr##	;Unlock the file
+.IF NE $$CHKCHAIN
+	CALL	checkchain#
+.ENDC
+	MOVL	EBX, #QSTS$DONE
+	JMP	xosdskLclDone##
+.PAGE
+	.SBTTL	dfswrite - Subroutine to write data to the disk
+
+2$:	LEAVE
+	RET
+
+;Subroutine to write data to the disk
+;	c{ECX}    = Number of bytes to write
+;	c{ES:EBX} = Buffer address
+;	c{EDI}    = Offset of DCB
+;	CALL	dfswrite
+;	c{ECX} = Number of bytes written
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+
+$$$=!0
+FRM wr_bufr  , 8t	;Data buffer address
+FRM wr_done  , 4t	;Amount transfered
+FRM wr_tamnt , 4t	;Amount to transfer
+FRM wr_aamnt , 4t	;Amount available at current position in file
+FRM wr_xamnt , 4t	;Amount to extend file
+FRM wr_ramnt , 4t	;Amount really available when extending
+FRM wr_begin , 4t	;Disk block number for first buffer in list
+FRM wr_head  , 4t	;Offset of first buffer in list
+FRM wr_tail  , 4t	;Offset of last buffer in list
+FRM wr_last  , 4t	;Offset of last buffer filled
+FRM wr_endpnt, 4t	;Last pointer used to fill last block
+FRM wr_blocks, 4t	;Total blocks to output each time
+FRM wr_actual, 4t	;Actual amount output each time (does not include parts
+wr_SIZE=!$$$		;  of first or last block not filled by user)
+
+dfswrite:
+	MOVL	EAX, [EDI]		;Get UCB offset
+	TESTL	EAX, EAX
+	JE	knlNoUnit##		;If no UCB
+	TESTB	ucb_sts1.B[EAX], #U1$WPROT ;Is the disk write protected?
+	JNE	knlWPrErr##		;Yes - fail
+	ENTER	wr_SIZE, 0		;No - setup a stack frame
+	MOVL	wr_tamnt.B[EBP], ECX	;Save amount wanted
+	MOVL	wr_bufr+0.B[EBP], EBX	;Save buffer address
+	MOVL	wr_bufr+4.B[EBP], ES
+	CLRL	EAX			;Initialize some local items:
+	MOVL	wr_actual.B[EBP], EAX	;  Amount transfered each time
+	MOVL	wr_done.B[EBP], EAX	;  Total amount transfered
+	MOVL	wr_head.B[EBP], EAX	;  Buffer list head pointer
+	MOVL	wr_tail.B[EBP], EAX	;  Buffer list tail pointer
+	MOVL	wr_last.B[EBP], EAX	;  Pointer to last buffer filled
+	MOVL	wr_blocks.B[EBP], EAX	;  Number of blocks to output
+	MOVL	wr_endpnt.B[EBP], EAX	;  Ending pointer
+	MOVL	ESI, [EDI]		;Get offset of our UCB
+	TESTL	ESI, ESI
+	JE	knlNoUnitLv##
+	MOVL	EBX, dcb_dkpbfr.B[EDI]	;Get offset of pending write buffer
+	TESTL	EBX, EBX
+	JE	4$.S			;If none
+	CALL	xosdskLockBufrW##	;Lock it
+	JC	dfswrtdone		;If error
+4$:	CLRL	EAX
+	MOVL	wr_xamnt.B[EBP], EAX
+	MOVL	EBX, dcb_dkfilepnt.B[EDI] ;Point to base FIB
+	MOVL	EAX, dcb_dkfpos.B[EDI]	;Get desired position
+	SUBL	EAX, ff_mxsz.B[EBX]	;Past end of maximum written extent?
+	JBE	dfswrt2			;No
+	MOVL	wr_xamnt.B[EBP], EAX	;Yes - store amount to extend file
+dfsxtdlp:
+	MOVL	EAX, ff_mxsz.B[EBX]	;Set position in file to end of written
+	MOVL	dcb_dkfpos.B[EDI], EAX	;  extent
+	CALL	dfswrpos#		;Get disk address
+	JC	16$.S			;If error
+	MOVL	ESI, [EDI]		;Make sure have offset of UCB
+	TESTL	ESI, ESI
+	JE	knlNoUnitLv##
+	MOVL	wr_ramnt.B[EBP], ECX	;Remember the real amount in case want
+					;  write after we are done zeroing
+	CMPL	ECX, wr_xamnt.B[EBP]	;Is more available than we need?
+	JBE	6$.S			;No
+	MOVL	ECX, wr_xamnt.B[EBP]	;Yes
+6$:	MOVL	EAX, xosdskDBufCnt##
+	SHRL	EAX, #1			;Get 1/2 of available buffers
+	CMPL	EAX, ucb_wtmax[ESI]	;Is this more than we can use?
+	JBE	8$.S			;No
+	MOVL	EAX, ucb_wtmax[ESI]	;Yes - just use maximum
+8$:	SHLL	EAX, #9			;Change to bytes
+	MOVL	EBX, dcb_dkfpos.B[EDI]
+	ANDL	EBX, #1FFh
+	SUBL	EAX, EBX
+	CMPL	ECX, EAX
+	JBE	10$.S
+	MOVL	ECX, EAX
+10$:	MOVL	wr_aamnt.B[EBP], ECX
+
+;Here to fill next buffer
+
+12$:	MOVL	ECX, #200h		;Get amount to zero in this block
+	SUBL	ECX, EBX
+	CMPL	ECX, wr_aamnt.B[EBP]	;More than we need?
+	JBE	14$.S			;No
+	MOVL	ECX, wr_aamnt.B[EBP]	;Yes - just get what we need
+14$:	CALL	getwriteblk		;Get buffer for block
+16$:	JC	dfswrterr		;If error
+	JNE	dfswrt4			;If must stop here
+	MOVL	EAX, dcb_dkfpos.B[EDI]
+	ANDL	EAX, #1FFh
+	ADDL	dcb_dkfpos.B[EDI], ECX	;Bump position in file
+	PUSHL	EDI
+	LEAL	EDI, [EBX+EAX]
+	ORB	cb_sts.B[EBX], #CB$FULL|CB$CHNGD ;Make sure block is marked as
+	PUSHL	DS				 ;  dirty
+	POPL	ES
+	SUBL	wr_xamnt.B[EBP], ECX	;Reduce total amount to zero
+	SUBL	wr_ramnt.B[EBP], ECX	;Reduce real amount left at this point
+	SUBL	wr_aamnt.B[EBP], ECX	;Reduce amount available at this point
+	CLRL	EAX
+	CLD
+	CMPL	ECX, #4.B		;Have fewer than 4 bytes to zero?
+	JB	20$.S			;Yes
+	MOVL	EDX, ECX		;No - first zero enough bytes to long
+	MOVL	ECX, EDI		;  align the destination
+	NEGL	ECX
+	ANDL	ECX, #03.B
+	SUBL	EDX, ECX
+	RSTOSB	[EDI]
+	MOVL	ECX, EDX		;Next zero as many longs as we can
+	SHRL	ECX, #2
+	RSTOSL	[EDI]
+	MOVL	ECX, EDX		;Finally, zero any bytes left over
+	ANDL	ECX, #03.B
+20$:	RSTOSB	[EDI]
+	MOVL	wr_endpnt.B[EBP], EDI
+	LEAL	EAX, -512t[EDI]
+	POPL	EDI
+	CMPL	EAX, EBX		;Did we zero to the end of the block?
+	JB	dfswrt4			;No - must be finished zeroing
+	INCL	dcb_dkdblk.B[EDI]	;Yes - bump block on disk
+	CMPL	wr_aamnt.B[EBP], #0.B	;More to do here?
+	JE	24$.S			;No
+	MOVL	EAX, wr_blocks.B[EBP]	;Yes - can we do more now?
+	CMPL	EAX, ucb_wtmax[ESI]
+	JAE	dfswrt4			;No
+	CMPL	xosdskDBufCnt##, #3t.B	;Yes - at least 3 buffers available?
+	JB	dfswrt4			;No - stop now
+	CLRL	EBX
+	JMP	12$
+
+;Here if nothing more to extend in current extent
+
+24$:	CMPL	wr_xamnt.B[EBP], #0.B	;Still more to extend?
+	JNE	dfswrt4			;Yes - go write out what we have so far
+
+	CMPL	wr_ramnt.B[EBP], #0.B	;Any space left to write data here?
+	JE	dfswrt4			;No
+	MOVL	ECX, wr_ramnt.B[EBP]	;Yes
+	JMP	dfswrt3.S		;Continue
+.PAGE
+;Here when ready to start write to file - note that we have have already
+;  set up some zeroed (or partly zeroed) buffers if we have to extend the
+;  file before the start of this write
+
+dfswrt2:CMPL	wr_tamnt.B[EBP], #0.B	;Really want to write anything?
+	JE	dfswrt4			;No
+dfswrtlp:
+	CALL	dfswrpos#		;Calculate disk address
+	JC	20$.S			;If error
+	MOVL	ESI, [EDI]		;Make sure have offset of UCB
+	TESTL	ESI, ESI
+	JE	knlNoUnitLv##
+dfswrt3:CMPL	ECX, wr_tamnt.B[EBP]	;Is more available than we want?
+	JBE	4$.S			;No
+	MOVL	ECX, wr_tamnt.B[EBP]	;Yes
+4$:	MOVL	EDX, dcb_dkfpos.B[EDI]	;Get starting offset in block
+	ANDL	EDX, #1FFh
+	ADDL	ECX, EDX		;Adjust count
+	MOVL	EAX, xosdskDBufCnt##
+	SHRL	EAX, #1			;Get 1/2 of available buffers
+	CMPL	EAX, ucb_wtmax[ESI]	;Is this more than we can use?
+	JBE	6$.S			;No
+	MOVL	EAX, ucb_wtmax[ESI]	;Yes - just use maximum
+6$:	SUBL	EAX, wr_blocks.B[EBP]	;Minus amount from zeroing
+	JG	8$.S
+	MOVL	EAX, #1
+8$:	SHLL	EAX, #9			;Change to bytes
+	CMPL	ECX, EAX
+	JBE	10$.S
+	MOVL	ECX, EAX
+10$:	SUBL	ECX, EDX
+	MOVL	wr_aamnt.B[EBP], ECX
+	MOVL	ECX, #512t		;Get amount to transfer from this block
+	SUBL	ECX, EDX
+
+;Here to fill next buffer
+;	c{ECX} = Amount to transfer
+
+12$:	CMPL	ECX, wr_aamnt.B[EBP]	;More than we want?
+	JB	16$.S			;No
+	MOVL	ECX, wr_aamnt.B[EBP]	;Yes - just get what we want
+16$:	MOVL	EBX, wr_last.B[EBP]	;Do we already have the block we need?
+	TESTL	EBX, EBX
+	JE	18$.S			;No
+	MOVL	EAX, dcb_dkdblk.B[EDI]	;Maybe
+	CMPL	EAX, cb_block.B[EBX]
+	JE	22$.S			;Yes
+18$:	CALL	getwriteblk
+20$:	JC	dfswrterr
+	JNE	dfswrt4
+22$:	MOVL	EAX, dcb_dkfpos.B[EDI]
+	ANDL	EAX, #1FFh
+	ADDL	dcb_dkfpos.B[EDI], ECX	;Bump position in file
+	PUSHL	EDI
+	LEAL	EDI, [EBX+EAX]
+	ORB	cb_sts.B[EBX], #CB$FULL|CB$CHNGD ;Make sure block is marked as
+	PUSHL	ESI				 ;  dirty
+	PUSHL	DS
+	POPL	ES
+	LFSL	ESI, wr_bufr.B[EBP]
+	ADDL	wr_bufr.B[EBP], ECX	;Bump position for next time around
+	SUBL	wr_tamnt.B[EBP], ECX	;Reduce amount to go
+	SUBL	wr_aamnt.B[EBP], ECX
+	ADDL	wr_actual.B[EBP], ECX	;And increase amount done
+	CLD
+	CMPL	ECX, #4.B		;Have fewer than 4 bytes to copy?
+	JB	24$.S			;Yes
+	MOVL	EAX, ECX		;No - first copy enough bytes to long
+	MOVL	ECX, EDI		;  align the destination
+	NEGL	ECX
+	ANDL	ECX, #03.B
+	SUBL	EAX, ECX
+	RMOVSB	[EDI], FS:[ESI]
+	MOVL	ECX, EAX		;Next copy as many longs as we can
+	SHRL	ECX, #2
+	RMOVSL	[EDI], FS:[ESI]
+	MOVL	ECX, EAX		;Finally, copy any bytes left over
+	ANDL	ECX, #03.B
+24$:	RMOVSB	[EDI], FS:[ESI]
+	MOVL	wr_endpnt.B[EBP], EDI
+	POPL	ESI
+	POPL	EDI
+	INCL	dcb_dkdblk.B[EDI]	;Bump block on disk
+	CMPL	wr_aamnt.B[EBP], #0.B	;More available here?
+	JE	dfswrt4.S		;No
+	MOVL	ECX, #512t		;Yes - get size for next block
+	CMPL	xosdskDBufCnt##, #3t.B	;Yes - at least 3 buffers available?
+	JAE	12$			;Yes - continue
+					;No - fall into dfswrt4 on next page
+.PAGE
+;Here if have stopped filling buffers, either because we have output all
+;  of our data, we have filled the current available extent, or we have
+;  encountered a locked buffer
+
+dfswrt4:MOVL	EBX, dcb_dkpbfr.B[EDI]	;Have something defered now?
+	TESTL	EBX, EBX
+	JE	4$.S			;No
+
+;Here if we currently have a pending write buffer - We output it first before
+;  outputting any of the current buffers. Note that the pending write buffer
+;  cannot be the same as one of the current buffers since we check for this
+;  when we are collecting the buffers.  Also, note that we have already locked
+;  the pending write buffer.
+
+	CLRL	EAX			;This is not the pending write buffer
+	MOVL	dcb_dkpbfr.B[EDI], EAX	;  any more
+	CALL	xosdskWriteBufr##	;Write out the buffer
+	JC	34$			;If error
+	CALL	xosdskRelsLkBufr##	;OK - give up the buffer
+
+;Here with the pending write buffer output if necessary
+
+4$:	MOVL	EBX, wr_last.B[EBP]	;Get last buffer filled
+	TESTL	EBX, EBX
+	JE	12$.S			;If none
+	CLRL	EAX
+	MOVL	wr_last.B[EBP], EAX
+	MOVL	EAX, wr_endpnt.B[EBP]	;Did we completely fill the last buffer?
+	SUBL	EAX, #512t
+	CMPL	EAX, EBX
+	JAE	6$.S			;Yes - don't defer writing it
+	BTL	SS:xffCmd##, #O%NODFWR	;No - should we defer writing it?
+	JC	6$.S			;No
+
+;Here if we should defer writing the last buffer (note that we don't explicity
+;  check that this is the last buffer, but we know that a buffer that was not
+;  filled to the end MUST be the last buffer).
+
+	MOVL	dcb_dkpbfr.B[EDI], EBX	;Yes - make it our pending write buffer
+	JMP	12$.S
+
+;Here if do not want to defer writing the last buffer, either because it was
+;  completely filled or because the user specified no defered writes (note
+;  that this may or may not be the last buffer of the transfer, we really don't
+;  care which there).
+
+6$:	MOVL	EAX, wr_tail.B[EBP]	;Link the last buffer to the end of
+	TESTL	EAX, EAX		;  our list
+	JNE	8$.S
+	MOVL	wr_head.B[EBP], EBX
+	MOVL	EAX, cb_block.B[EBX]
+	MOVL	wr_begin.B[EBP], EAX
+	JMP	10$.S
+
+8$:	MOVL	cb_xnext.B[EAX], EBX
+10$:	MOVL	wr_tail.B[EBP], EBX
+	CLRL	EAX
+	MOVL	wr_last.B[EBP], EAX
+	INCL	wr_blocks.B[EBP]
+12$:	MOVL	EBX, wr_head.B[EBP]	;Get offset of first buffer in list
+	TESTL	EBX, EBX		;Do we have any?
+	JE	16$.S			;No (note that we must update our
+					;  totals anyway, since we might have
+					;  just defered some output)
+	MOVL	EAX, wr_begin.B[EBP]	;Yes - set disk block for first buffer
+	MOVL	dcb_dkdblk.B[EDI], EAX	;  in list
+	PUSHL	DS
+	POPL	ES
+	MOVL	ECX, wr_blocks.B[EBP]	;Get total amount to output
+	SHLL	ECX, #9t
+	MOVL	EAX, #kf_writlist
+	CALL	xosdskXfer##		;Do the transfer
+	JC	dfswrterr		;If error
+	MOVL	EBX, wr_head.B[EBP]	;OK - release the buffers we have just
+	CLRL	EAX			;  output
+	MOVL	wr_head.B[EBP], EAX
+	MOVL	wr_tail.B[EBP], EAX
+14$:	ANDB	cb_sts.B[EBX], #~CB$CHNGD
+	PUSHL	cb_xnext.B[EBX]
+	CALL	xosdskRelsLkBufr##
+	POPL	EBX
+	TESTL	EBX, EBX
+	JNE	14$.S
+16$:	MOVL	EAX, wr_actual.B[EBP]	;Update total amount done
+	ADDL	wr_done.B[EBP], EAX
+	CLRL	EAX
+	MOVL	wr_blocks.B[EBP], EAX	;Clear the block count
+	MOVL	wr_actual.B[EBP], EAX	;And clear the amount transfered
+	MOVL	EBX, dcb_dkfilepnt.B[EDI] ;Did we extend the file?
+	MOVL	EAX, dcb_dkfpos.B[EDI]
+	CMPL	ff_size.B[EBX], EAX
+	JAE	18$.S			;No
+	MOVL	ff_size.B[EBX], EAX	;Yes - update file length
+	ORB	cb_sts.B[EBX], #CB$CHNGD ;Indicate FIB has been changed
+	CMPL	ff_mxsz.B[EBX], EAX	;Extending maximum written extent?
+	JAE	18$.S			;No
+	MOVL	ff_mxsz.B[EBX], EAX	;Yes
+18$:	TESTB	SS:xffStatus1##, #XF1$ABORT ;Has this operation been aborted?
+	JNE	24$.S			;Yes - fail
+	CMPL	wr_xamnt.B[EBP], #0.B	;Need to extend some more?
+	JNE	dfsxtdlp		;Yes
+	CMPL	wr_tamnt.B[EBP], #0.B	;No - need to write more?
+	JNE	dfswrtlp		;Yes
+	CLRL	EAX			;Indicate no error
+20$:	MOVL	EBX, dcb_dkpbfr.B[EDI]	;Have a pending write buffer?
+	TESTL	EBX, EBX
+	JE	dfswrtdone.S		;No
+	PUSHL	EAX
+	CALL	xosdskUnlkBufr##	;Yes - unlock it
+	POPL	EAX
+dfswrtdone:
+	MOVL	ECX, wr_done.B[EBP]	;Get count
+	LEAVE
+	RET
+
+;Here if operation has been aborted
+
+24$:	MOVL	EAX, #ER_ABORT
+	JMP	20$.S
+
+;Here if error after at least one buffer has been filled - in this case we
+;  mark all of the buffers we have filled as empty (this is conservative:
+;  we do not want to try to write anything additional to the disk since we
+;  know there is a problem)
+
+dfswrterr:
+	PUSHL	EAX
+	MOVL	EBX, dcb_dkpbfr.B[EDI]	;Do we have a pending write buffer?
+	TESTL	EBX, EBX
+	JE	26$.S			;No
+	MOVL	EAX, SS			;Yes - do we have it locked?
+	CMPW	AX, cb_lockxff.B[EBX]
+	JNE	26$.S			;No
+	CALL	xosdskUnlkBufr#		;Yes - unlock it
+26$:	MOVL	EBX, wr_head.B[EBP]
+	TESTL	EBX, EBX
+	JE	30$.S
+28$:	PUSHL	cb_xnext.B[EBX]
+	ANDB	cb_sts.B[EBX], #CB$FULL
+	CALL	xosdskGiveLkBufr##
+	POPL	EBX
+	TESTL	EBX, EBX
+	JNE	28$.S
+30$:	MOVL	EBX, wr_last.B[EBP]
+	TESTL	EBX, EBX
+	JE	32$.S
+	CALL	xosdskGiveLkBufr##
+32$:	POPL	EAX
+	STC
+	JMP	dfswrtdone.S
+
+;Here if error when writing the pending write buffer
+
+34$:	PUSHL	EAX
+	CALL	xosdskGiveLkBufr##	;Give up the pending write buffer
+	JMP	26$.S			;Go process the error (This is not	POPL	EAX
+					;  really right, since it makes it
+					;  look like the error occured on this
+					;  buffer, but there's not much else
+					;  we can do at this point!)
+.PAGE
+;Subroutine to get next disk block for write
+;	c{dcb_dkdblk{EDI} = Block number on disk
+;	CALL	getwriteblk
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  Z:set = Have block
+;	  Z:clr = Cannot get block now - need to write all pending blocks first
+
+getwriteblk:
+	MOVL	EAX, dcb_dkdblk.B[EDI]	;Get block number
+	MOVL	EBX, wr_last.B[EBP]	;Do we have a buffer now?
+	TESTL	EBX, EBX
+	JE	4$.S			;No
+	CMPL	EAX, cb_block.B[EBX]	;Yes - do we have the buffer we want?
+	JE	16$.S			;Yes
+4$:	MOVL	EBX, dcb_dkpbfr.B[EDI]	;No - do we have a pending write block?
+	TESTL	EBX, EBX
+	JE	10$.S			;No
+	CMPL	EAX, cb_block.B[EBX]	;Yes - do we want the pending write
+					;  block?
+	JNE	10$.S			;No
+	CLRL	EAX			;Yes - its no longer pending (we already
+	MOVL	dcb_dkpbfr.B[EDI], EAX	;  have it locked)
+	JMP	16$.S
+
+;Here if the block we want is not the pending write block
+
+10$:	PUSHL	ECX
+	CALL	xosdskSrchDBufr##	;Find the buffer but don't read block
+	POPL	ECX
+	JC	22$.S			;If error
+	CALL	xosdskLockBufrF##	;OK - try to lock it
+	JC	22$.S			;If error
+	JE	12$.S			;If lock succeeded
+	MOVL	EAX, wr_head.B[EBP]	;Lock attempt failed - do we have any
+	ORL	EAX, dcb_dkpbfr.B[EDI]	;  buffers locked now?
+	JNE	22$.S			;Yes - return with Z clear
+	CALL	xosdskLockBufrW##	;No - wait until we can have this one
+	JC	22$.S			;If error
+
+;Here with the desired buffer locked
+
+12$:	TESTB	cb_sts.B[EBX], #CB$FULL	;Is this buffer full now?
+	JNE	16$.S			;Yes
+	MOVL	EAX, dcb_dkfpos.B[EDI]	;No
+	ANDL	EAX, #1FFh		;Does write start at beginning of block?
+	JNE	14$.S			;No - must always read block
+	CMPL	ECX, #200h		;Yes - writing entire block?
+	JE	16$.S			;Yes - don't need to read the block
+	MOVL	EAX, dcb_dkfpos.B[EDI]	;No - writing beyond maximum extent of
+	ADDL	EAX, ECX		;  file?
+	MOVL	EDX, dcb_dkfilepnt.B[EDI]
+	CMPL	ff_mxsz.B[EDX], EAX
+	JBE	16$.S			;Yes - don't need to read the block
+14$:	PUSHL	ECX
+	CALL	xosdskReadBufr##	;No - read the disk block
+	POPL	ECX
+	JC	24$.S			;If error
+16$:	MOVL	EAX, wr_last.B[EBP]	;Do we have a last buffer now?
+	TESTL	EAX, EAX
+	JE	26$.S			;No
+	MOVL	EDX, wr_tail.B[EBP]	;Yes - link it to the end of our
+	TESTL	EDX, EDX		;  buffer list
+	JNE	18$.S
+	MOVL	wr_head.B[EBP], EAX
+	JMP	20$.S
+
+18$:	MOVL	cb_xnext.B[EDX], EAX
+20$:	MOVL	wr_tail.B[EBP], EAX
+	INCL	wr_blocks.B[EBP]
+22$:	CLRL	EAX
+	MOVL	cb_xnext.B[EBX], EAX
+	MOVL	wr_last.B[EBP], EBX
+24$:	RET
+
+;Here if this is the first block
+
+26$:	MOVL	EAX, dcb_dkdblk.B[EDI]	;Remember block for first buffer in list
+	MOVL	wr_begin.B[EBP], EAX
+	JMP	22$.S
+.PAGE
+	.SBTTL	dfsrename - Rename file
+
+;Here for the rename file entry - file to be renamed is open for exclusive
+;  write access but is not locked.  New directory is open but is not locked.
+;	c{SS:EDX} = Address of buffer containing new name for file
+;	c{EDI}    = Offset of DCB for directory to rename to
+;	c{ESI}    = Offset of DCB for file to rename
+;	CALL	dfsrename
+;	New directory always left open and not locked, file always closed
+;	C:set = Error
+;	  c{EAX} = Error code
+;	  c{ECX} = Number of files renamed (0 or 1)
+;	C:clr = Normal
+;	  c{ECX} = 1
+
+;Rename presents a major problem in that two different names must be locked
+;  at the same time to prevent races.  The old name is open for exclusive
+;  write access, which keeps anyone else from deleting or renaming it even
+;  though we do not have it locked.  If we are renaming to the same directory,
+;  the call to dfsopen2 returns with the directory locked, which provides
+;  enough protection.
+
+dfsrename::
+.IF NE $$CHKCHAIN
+	CALL	checkchain#
+.ENDC
+	PUSHL	EDX			;Save pointer to name
+	CMPB	SS:[EDX], #0		;Null name?
+	JE	4$.S			;Yes - fail
+2$:	MOVB	AL, SS:[EDX]		;Get name character
+	INCL	EDX
+	TESTB	AL, AL			;End of name?
+	JE	12$.S			;Yes
+	CMPB	AL, #'*'		;No - wild card character?
+	JE	4$.S
+	CMPB	AL, #'?'
+	JE	4$.S
+	CMPB	AL, #LB
+	JNE	2$.S
+4$:	POPL	EDX			;Here with illegal character in name
+	MOVL	EAX, #ER_BDSPC
+	JMP	10$.S
+
+;Here with write protect error
+
+6$:	MOVL	EAX, #ER_WPRER
+	JMP	10$.S
+
+;Here if have no UCB
+
+8$:	MOVL	EAX, #ER_MDCHG
+10$:	MOVL	EDI, ESI		;Get offset of file DCB
+	JMP	rener2			;Go finish up
+
+;Here with name scanned
+
+12$:	POPL	EDX			;Restore pointer to name
+	MOVL	EAX, [EDI]		;Is the disk write protected?
+	TESTL	EAX, EAX
+	JE	8$.S
+	TESTB	ucb_sts1.B[EAX], #U1$WPROT
+	JNE	6$.S			;Yes - fail
+	ENTER	of_SIZE, 2		;Setup stack frame for dfsopen2
+	PUSHL	ESI			;Save offset of file's DCB
+	PUSHL	SS:xffCmd##
+	MOVL	SS:xffCmd##, #O$XWRITE|O$CREATE|O$FAILEX
+	CLRL	EAX			;Make sure start search at start of
+	MOVL	dcb_dkfpos.B[EDI], EAX	;  directory
+	CALL	dfsopen2#		;Do first part of open
+	POPL	SS:xffCmd##
+	JC	38$			;If error
+	JNE	34$			;This should not be possible!
+					;When get here, the directory for the
+					;  new name is open and locked
+	MOVL	ESI, [ESP]		;Get offset of the file DCB
+	MOVL	EBX, dcb_dkfilepnt.B[ESI] ;Get offset of the file FIB
+	MOVL	EAX, cb_dirfib.B[EBX]	;Get offset of FIB for old directory
+	CMPL	dcb_dkfilepnt.B[EDI], EAX ;Same directory?
+	JNE	chgdir			;No
+
+;Here if renaming in the same directory - In this case we much first determine
+;  if the new name will fit in the same or fewer slots as the old name.  If so,
+;  we first give up any extra slots and then store the new directory entry
+;  over the old entry.  If not, we remove the old entry and create a completely
+;  new entry.
+
+	MOVZBL	EAX, ff_dirsize.B[EBX]	;Get current directory entry size - 1
+	MOVL	ECX, EAX
+	MOVL	EDX, of_dentneed.B[EBP]	;Will the new entry be larger?
+	DECL	EDX
+	SUBL	ECX, EDX
+	JL	renmore			;Yes
+	JE	30$.S			;No - go on if same size
+	IMULL	EAX, #-32t.B		;Get offset to first entry
+	PUSHL	EAX
+	PUSHL	ECX
+16$:	CALL	dfsgetdirent#		;Get directory entry
+	POPL	ECX
+	JC	34$			;If error
+	POPL	EAX
+18$:	MOVB	[EBX+EDX], #0E5		;OK - mark entry as removed
+	ADDL	EDX, #32t.B
+	ADDL	EAX, #32t.B
+	DECL	ECX			;More to do here?
+	JE	26$.S			;No
+	TESTL	EDX, #1FFh		;Yes - at end of block now?
+	JNE	18$.S			;No
+	PUSHL	EAX
+	PUSHL	ECX
+	CALL	dfswritedir#		;Yes - write out this directory block
+	JC	22$.S
+	CALL	xosdskRelsLkBufr##	;Release the directory buffer
+	MOVL	EAX, [ESP]
+	JMP	16$.S
+
+;Here if error reading a directory buffer
+
+20$:	POPL	EDX
+	JMP	rener2.S
+
+;Here if error writing a directory buffer
+
+22$:	POPL	EDX			;Fix up the stack
+	POPL	ECX
+24$:	PUSHL	EAX			;Save error code
+	JMP	renerr.S
+
+;Here with all extra directory entries for the file removed
+
+26$:	TESTL	EDX, #1FFh		;At end of a block now?
+	JNE	28$.S			;No
+	CALL	dfswritedir#		;Yes - write out the last directory
+	JC	24$.S			;  block
+28$:	CALL	xosdskRelsLkBufr##	;Give up the directory buffer
+	MOVL	EBX, [ESP]		;Restore offset of the file FIB
+	MOVL	EBX, dcb_dkfilepnt.B[EBX]
+30$:	MOVL	EAX, of_dentneed.B[EBP]	;Get position for first directory slot
+	DECL	EAX
+	IMULL	EAX, #-32t.B
+	ADDL	EAX, ff_dirpos.B[EBX]
+	MOVL	of_holepos.B[EBP], EAX
+	MOVB	AL, #1			;Indicate doing rename
+	JMP	32$.S
+
+;Here if new directory entry will be larger than the old one
+
+renmore:XCHGL	EDI, [ESP]		;Get file DCB, save directory DCB
+	MOVL	SS:xffDcb##, EDI
+	CALL	dfsfrmdir#		;Remove the old directory entry
+	MOVL	EBX, dcb_dkfilepnt.B[EDI] ;Get offset of file FIB
+	XCHGL	EDI, [ESP]		;Get directory DCB save file DCB
+	MOVL	SS:xffDcb##, EDI
+	JC	24$.S			;If error
+	MOVB	AL, #0			;Indicate not rename
+32$:	CALL	dfsputindir#
+	JC	renerx.S
+
+.IF NE $$CHKCHAIN
+	CALL	checkchain#
+.ENDC
+	JMP	rencls			;Go finish up
+
+;Here if error while have directory locked
+
+renerx:	PUSHL	EAX
+	JMP	36$.S
+
+;Here if new file already exits
+
+34$:	PUSHL	#ER_FILEX.B
+	JMP	36$.S
+
+;Here if error writing directory (have directory block)
+
+renerr:	CALL	xosdskGiveLkBufr##	;Give up the directory block
+36$:	MOVL	EBX, dcb_dkfilepnt.B[EDI] ;Unlock the directory
+	CALL	xosdskUnlkBufr##
+	POPL	EAX
+38$:	POPL	EDI
+	LEAVE
+rener2:	PUSHL	EAX
+	CLRL	ECX
+	CALL	dfscfile#		;Close the file
+	POPL	EAX
+.IF NE $$CHKCHAIN
+	CALL	checkchain#
+.ENDC
+	CLRL	ECX			;Item count = 0
+	STC
+	RET
+.PAGE
+;Here if changing directories - the original file is open for exclusive write
+;  access but is not locked.  The block containing the old directory entry is
+;  in use and locked.  The directory for the new entry is open and locked.
+;	c{EBX}            = Offset of file FIB
+;	c{EDI}            = Offset of DCB for new directory
+;	c{ESI} = c{{ESP}} = Offset of file DCB
+;  We must check to see if we are renaming a directory, and if so, if we are
+;    renaming it into one of its child directories!
+
+chgdir:	TESTB	ff_attrib.B[EBX], #A$DIRECT ;Renaming a directory?
+	JE	8$.S			;No
+	MOVL	EAX, dcb_dkfilepnt.B[EDI] ;Yes
+2$:	MOVL	EAX, cb_dirfib.B[EAX]	;Get offset of directory FIB
+	TESTL	EAX, EAX
+	JE	8$.S			;OK if no more parents
+	CMPL	EAX, EBX		;Is this the file we are renaming?
+	JNE	2$.S			;No - continue
+	PUSHL	#ER_IDREN		;Yes - fail
+	JMP	renerr.S
+
+;Here if error writing old directory when removing entry for old name
+
+6$:	XCHGL	EDI, [ESP]		;Save file DCB, restore new directory
+	CMPL	EAX, #ER_MDCHG		;  DCB
+	JE	7$.S
+	MOVL	EAX, #ER_DRWER
+7$:	PUSHL	EAX
+	JMP	renerr
+
+;Here if not renaming a directory or if this is a valid directory rename
+
+8$:	XCHGL	EDI, [ESP]		;Save new directory DCB, restore
+	PUSHL	SS:xffDcb##		;  file DCB
+	MOVL	SS:xffDcb##, EDI
+	CALL	dfsfrmdir#		;Remove old directory entry
+	POPL	SS:xffDcb##
+	JC	6$.S			;If error
+	MOVL	EBX, dcb_dkfilepnt.B[EDI]
+	CALL	xosdskRmvHash##		;Un-hash the buffer for the file FIB
+	CLRL	EAX			;Clear block number (dfsputindir will
+	MOVL	cb_block.B[EBX], EAX	;  fix up the block number)
+	MOVZWL	EAX, cb_opencnt.B[EBX]	;Get number of times file is open	
+	PUSHL	EBX
+	MOVL	EBX, cb_dirfib.B[EBX]
+	TESTL	EBX, EBX		;Have a directory?
+	JE	10$.S			;No
+	CALL	dfsgivefibn#		;Yes - reduce its open count
+10$:	POPL	EBX			;Restore offset of file FIB
+	XCHGL	EDI, [ESP]		;Save file DCB, restore new directory
+					;  DCB
+	MOVB	AL, #0			;Indicate not rename since we are moving
+					;  the file to a differnt directory
+	CALL	dfsputindir#		;Put entry for file in new directory
+	JC	renerx
+	MOVL	EBX, dcb_dkfilepnt.B[EDI] ;Get directory FIB
+12$:	MOVL	EAX, [ESP]		;Get the open count for the file
+	MOVL	EAX, dcb_dkfilepnt.B[EAX]
+	MOVZWL	EAX, cb_opencnt.B[EAX]	;Make sure we can increase the
+	MOVL	EDX, EAX		;  directory's use count by this much
+	ADDW	DX, cb_usecnt.B[EBX]
+	JC	13$.S
+	MOVW	cb_usecnt.B[EBX], DX	;OK - bump the counts to account for the
+	ADDW	cb_opencnt.B[EBX], AX	;  file we just put in the directory
+	MOVL	EBX, cb_dirfib.B[EBX]
+	TESTL	EBX, EBX
+	JNE	12$.S
+rencls:	MOVL	EBX, dcb_dkfilepnt.B[EDI] ;Unlock the directory
+	CALL	xosdskUnlkBufr##
+	POPL	EDI
+	MOVL	SS:xffDcb##, EDI
+	MOVL	EBX, dcb_dkfilepnt.B[EDI]
+	LEAL	ECX, of_namshort[EBP]
+	LEAL	EDX, of_namlong[EBP]
+	CALL	dfsstorefname#
+	MOVB	AL, #FS_NFILENAME
+	CALL	dfsgivefilespec#
+	CLRL	ECX
+	CALL	dfscfile#		;Close the file
+	JC	14$.S
+	CLRL	ECX			;Return item count = 1
+	INCL	ECX
+	CLRL	EAX
+	LEAVE
+	RET
+
+13$:	CRASH	TMRB		;NEED TO HANDLE THIS BETTER!!!!!
+
+;Here if error closing file - report error but also return item count of 1
+
+14$:	CLRL	ECX			;Item count = 1
+	INCL	ECX
+	LEAVE
+	STC
+	RET
+.PAGE
+	.SBTTL	dfscommit - Commit data function for DOS disks
+
+;Here for the sd_commitfunc entry - Commit data
+;	c{EDI} = Offset of DCB
+;	c{ESI} = Offset of IORB
+;	CALL	dfscommit
+;	c{EAX} = Error code
+;	c{ECX} = Amount (always 0)
+;	c{EBX} = Status bits
+
+dfscommit:
+	MOVB	iorb_queue.B[ESI], #dcb_outframe
+	MOVL	iorb_routine.B[ESI], #dfscommit1
+	JMP	knlXfQueue##		;Switch to extended fork context
+
+;Here in extended fork context
+
+dfscommit1:
+	CMPL	SS:xffParm##, #0.B	;Have any device parameters?
+	JE	2$.S			;No
+	MOVL	EBX, #dfsioparms	;Yes - process parameters
+	MOVL	ECX, #knlComDPParms##
+	LFSL	EDX, SS:xffParm##
+	CALL	knlProcDevParm##
+	JC	4$.S			;If error
+2$:	CALL	xosdskFinOut##		;OK - do any defered output
+	JC	4$.S
+	CALL	dfsupdfile#		;Update the FATs and the directory entry
+	JC	4$.S
+	CLRL	EAX
+4$:	CLRL	ECX
+	MOVL	EBX, #QSTS$DONE
+	JMP	xosdskLclDone##
+.PAGE
+	.SBTTL	dfslabel - Label functions for DOS disks
+
+;Here for the sd_label entry - Label functions
+;	c{EDI} = Offset of DCB
+;	c{ESI} = Offset of IORB
+;	CALL	dfsinpblk
+;	c{EAX} = Error code
+;	c{ECX} = Amount
+;	c{EBX} = Status bits
+
+dfslabel:
+	CMPB	iorb_option.B[ESI], #2	;Write function?
+	JE	4$.S			;Yes
+	CMPB	iorb_option.B[ESI], #1	;No read function?
+	JNE	knlIFnDevGQ##		;No - fail
+	CALL	knlIoQabLock##		;Yes - lock the QAB
+	JC	2$.S			;If error
+	CALL	knlIoReadLock##		;Lock input buffer
+	JC	2$.S			;If error
+	MOVL	iorb_routine.B[ESI], #getlabel
+	JMP	6$.S
+
+2$:	TOFORK
+	RET
+
+;Here for the write label function
+
+4$:	JMP	knlIFnDevGQ##	;TEMP!!!!!!
+
+	CALL	knlIoQabLock##		;Lock the QAB
+	JC	2$.S			;If error
+	CALL	knlIoWriteLock##	;Lock output buffer
+	JC	2$.S			;If error
+	MOVL	iorb_routine.B[ESI], #putlabel
+6$:	MOVB	iorb_queue.B[ESI], #dcb_outframe
+	JMP	knlXfQueue##		;Switch to extended fork context
+.PAGE
+;Here in extended fork context to read a DOS disk label
+
+bo_label =!16t		;Buffer offset for returned label
+bo_length=!32t		;Buffer offset for length of label
+
+getlabel:
+	CALL	xosdskFinOut##		;Make sure no output pending
+	PUSHL	SS:xffCmd##		;Save state of the current file
+	PUSHL	dcb_dkfilepnt.B[EDI]
+	PUSHL	dcb_dkcfib.B[EDI]
+	PUSHL	dcb_dkfpos.B[EDI]
+	MOVB	AL, dcb_sts2.B[EDI]
+	PUSHL	EAX
+	MOVL	EBX, #knlOpnParms##	;Do initial setup (this also processes
+	CALL	knlOpenSetup##		;  the open parameters)
+	JC	2$.S			;If error
+	CLRL	EAX
+	MOVL	dcb_dkfilepnt.B[EDI], EAX
+	MOVL	dcb_dkcfib.B[EDI], EAX
+	MOVL	SS:xffPCFilSpc##, EAX
+	MOVL	SS:xffPVFilOpt##, #FO$NOPREFIX|FO$FILENAME
+	LEAL	EDX, opn_namebfr+bo_label[EBP]
+	MOVL	SS:xffPPFilSpc##+0, EDX	;Set up to return name
+	MOVL	SS:xffPPFilSpc##+4, SS
+	ADDL	EDX, #bo_length-bo_label.B
+	MOVL	SS:xffPLFilSpc##+0, EDX
+	MOVL	SS:xffPLFilSpc##+4, SS
+	MOVL	SS:xffPSFilSpc##, #16t
+	MOVL	SS:xffHvValue1##, #IOV1$SRCATTR
+	MOVB	opn_srcattr.B[EBP], #A$LABEL ;Search for the label in the root
+	MOVL	opn_namebfr+0[EBP], #'\*.*'
+	MOVB	opn_namebfr+4[EBP], #0
+	LEAL	EDX, opn_namebfr[EBP]
+	CALL	dfsopen#		;Try to open the label
+2$:	MOVL	ECX, #0
+	JC	14$			;If error
+	LESL	EBX, SS:xffBuffer1##	;Found it
+	MOVL	ESI, [EDI]
+	MOVL	EAX, ucb_fsname+0[ESI]	;Give him the file system name
+	MOVL	ES:[EBX], EAX
+	MOVL	EAX, ucb_fsname+4[ESI]
+	MOVL	ES:4.B[EBX], EAX
+	MOVL	EDX, dcb_dkfilepnt.B[EDI]
+	MOVZWL	EAX, ff_time.B[EDX]	;Get file's time
+	CALL	knlDos2SysTime##	;Change to system format
+	MOVL	ES:8.B[EBX], EAX	;Store in user's buffer
+	MOVZWL	EAX, ff_date.B[EDX]	;Get file's date
+	CALL	knlDos2SysDate##	;Change to system format
+	MOVL	ES:12t.B[EBX], EAX	;Store in user's buffer
+	LEAL	EDX, opn_namebfr+bo_label[EBP]
+	ADDL	EBX, #24t.B
+	MOVL	ECX, #8
+4$:	MOVB	AL, SS:[EDX]		;Get label character
+	INCL	EDX
+	CMPB	AL, #'.'		;Period?
+	JE	6$.S			;Yes
+	MOVB	ES:[EBX], AL		;Store in user's buffer
+	INCL	EBX
+	CMPB	AL, #0			;End?
+	JE	12$.S			;Yes
+	LOOPNE	ECX, 4$			;No - loop back if more in name
+	INCL	EDX			;End of name - next must be period
+
+;Here with a period in label
+
+6$:	JREGZ	ECX, 10$
+8$:	MOVB	ES:[EBX], #' '
+	INCL	EBX
+	LOOP	ECX, 8$
+10$:	MOVB	AL, SS:[EDX]		;Get label character
+	INCL	EDX
+	MOVB	ES:[EBX], AL		;Store in user's buffer
+	INCL	EBX
+	CMPB	AL, #0			;End?
+	JNE	10$.S			;No - continue
+12$:	SUBL	EBX, SS:xffBuffer1##	;Calculate length of label data
+	DECL	EBX
+	PUSHL	EBX
+	CALL	dfscfile#
+	POPL	ECX			;Get length for him
+	CLRL	EAX
+14$:	LEAVE
+	POPL	EDX			;Restore state of current file
+	MOVB	dcb_sts2.B[EDI], DL
+	POPL	dcb_dkfpos.B[EDI]
+	POPL	dcb_dkcfib.B[EDI]
+	POPL	dcb_dkfilepnt.B[EDI]
+	POPL	SS:xffCmd##
+	MOVL	EBX, #QSTS$DONE
+	JMP	xosdskLclDone##
+
+putlabel::
+	CRASH	LABL
+.PAGE
+	.SBTTL	dfssetpath - Set up path data for DOS file structures
+
+;Here for the dd_setpath entry - Set up path data for DOS file structures
+;	c{EDI}    = Offset of DCB
+;	c{ES:ESI} = Address of path data block
+;	CALL	dfssetpath
+
+dfssetpath:
+	MOVL	EBX, dcb_dkfilepnt.B[EDI] ;Store offset of FIB buffer
+	MOVL	ES:pn_fpnt1.B[ESI], EBX
+2$:	CMPW	cb_usecnt.B[EBX], #0FFFEh
+	JA	6$.S
+	MOVL	EBX, cb_dirfib.B[EBX]	;Does it have a directory?
+	TESTL	EBX, EBX
+	JNE	2$.S			;Yes - continue
+	MOVL	EBX, dcb_dkfilepnt.B[EDI] ;No - point to the directory FIB again
+4$:	INCW	cb_usecnt.B[EBX]	;Bump use and open counts on the buffer
+	INCW	cb_opencnt.B[EBX]
+	MOVL	EBX, cb_dirfib.B[EBX]	;Does it have a directory?
+	TESTL	EBX, EBX
+	JNE	4$.S			;Yes - continue
+	RET
+
+;Here if can't increase the use count
+
+6$:	MOVL	EAX, #ER_TMRQB
+	STC
+	RET
+
+	.SBTTL	dfschkpath - Check path data for DOS file structures
+
+;Here for the dd_chkpath entry - Check path data for DOS file structures
+;	c{EDI} = Offset of DCB
+;	c{FS:ESI} = Address of path data block
+;	CALL	dfschkpath
+
+dfschkpath:
+	MOVL	EBX, FS:pn_fpnt1.B[ESI]	;Point to FIB buffer
+	TESTL	EBX, EBX
+	JE	8$.S			;If no FIB buffer (possible if had
+					;  error before)
+	CMPW	cb_errcode.B[EBX], #0.B	;Have error on buffer?
+	JE	8$.S			;No
+	MOVL	FS:pn_fpnt1.B[ESI], #0	;Yes
+	PUSHL	ESI
+	CALL	dfsgivefib2#		;Give up the buffer
+	POPL	ESI
+8$:	RET
+
+	.SBTTL	dfsclrpath - Clear path data for DOS file structures
+
+;Here for the dd_clrpath entry - Clear path data for DOS file structures
+;  (note that this routine does NOT use EDI)
+;	c{ES:ESI} = Address of path data block
+;	CALL	dfsclrpath
+
+dfsclrpath:
+	REQUIREFORK
+	MOVL	EBX, ES:pn_fpnt1.B[ESI]	;Get offset of FIB buffer
+	TESTL	EBX, EBX		;Do we have one?
+	JE	10$.S			;No
+	PUSHL	ES
+	PUSHL	ESI			;Yes
+	CALL	dfsgivefib2#		;Give up the FIB buffer
+	POPL	ESI
+	POPL	ES
+10$:	RET					;Fall into strpath on next page
+.PAGE
+	.SBTTL	Data
+
+	DATA
+
+lit13::   .LONG  13t
+nonamestr:.ASCIZ "???"
+nofilestr:.ASCIZ "No file"
+
+	LKEEND

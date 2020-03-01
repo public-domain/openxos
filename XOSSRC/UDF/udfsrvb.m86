@@ -1,0 +1,280 @@
+	.TITLE	UDFSRVB - UDFSRV billing routines
+
+;++++
+; This software is in the public domain.  It may be freely copied and used
+; for whatever purpose you see fit, including commerical uses.  Anyone
+; modifying this software may claim ownership of the modifications, but not
+; the complete derived code.  It would be appreciated if the authors were
+; told what this software is being used for, but this is not a requirement.
+
+;   THIS SOFTWARE IS PROVIDED BY THE AUTHORS "AS IS" AND ANY EXPRESS OR
+;   IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
+;   OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+;   IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+;   INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+;   BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS
+;   OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+;   ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR
+;   TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
+;   USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+;----
+
+	.PROC	80386
+
+	.INCLUD	XOSINC:\XMAC\STDIO.PAR
+	.INCLUD	XOSINC:\XMAC\CTYPE.PAR
+	.INCLUD	XOSINC:\XMAC\PROCARG.PAR
+	.INCLUD	XOSINC:\XMAC\XOS.PAR
+	.INCLUD	XOSINC:\XMAC\XOSX.PAR
+	.INCLUD	XOSINC:\XMAC\XOSERR.PAR
+	.INCLUD	XOSINC:\XMAC\XOSTIME.PAR
+	.INCLUD	XOSINC:\XMAC\XOSTRM.PAR
+	.INCLUD	XOSINC:\XMAC\XOSNET.PAR
+	.INCLUD	XOSINC:\XMAC\XOSXNET.PAR
+	.INCLUD XOSINC:\XMAC\XOSTHREADS.PAR
+	.INCLUD	XOSINC:\XMAC\XOSUDF.PAR
+	.INCLUD	UDFSRV.PAR
+
+	.STDSEGS
+
+	.PSECT	_TEXT_p
+
+;The billing sequence is initiated when a billing request message is received.
+;  The billing thread is created, which builds and sorts the billing list
+;  and sends the initial UDFM_BILLUSR message.  It then suppends until the
+;  billing sequence has been completed.  The remainder of the billing sequence
+;  is handled by code (billfunction) executing in the UDP thread.
+
+;The use of a seperate thread for the billing set up allows this rather long
+;  process to be interrupted for other operations.  The individual message
+;  handling, however, is much more naturally handled directly by the UDP
+;  thread, especially since there is no scheduling problem here.
+
+;Note that the billing routine uses the same static memory area used by the
+;  compression routine.  This means that only one billing or compression
+;  operation can be active at a time.
+
+;This module contains two major sections: billthread, which is the main
+;  thread function for the billing thread; and billfunction, which is called
+;  in the context of the UDP thread when a billing message is received.  It
+;  returns by jumping to udploop.
+
+	.SBTTL	billthread - Main thread function for the billing thread
+
+;Main thread function for the billing thread
+
+billthread::
+	MOVL	ESI, thdData#		;Get offset of the IDB
+	SUBL	ESI, #idb_tdbbill
+
+;We scan the index blocks and build our index list with an entry for each
+;  user for which we need to do billing.
+
+
+	PUSHL	DS			;Allocate initial memory for the index
+	MOVL	EDI, #COMPLSTBASE	;  list
+	PUSHL	EDI
+	PUSHL	#PG$READ|PG$WRITE.B
+	PUSHL	#1000h
+	CALLF	svcMemChange#
+	TESTL	EAX, EAX
+	JNS	4$.S			;Go on if OK
+billfail:
+
+	HLT
+
+;Here with initial memory allocated for the index list.  Only users with
+;  user names can be billed, so all we need to worry about is the user
+;  name hash table.
+
+4$:	ADDL	EAX, #COMPLSTBASE
+	MOVL	idb_billmemtop[ESI], EAX
+	LEAL	EBX, idb_usnmhash[ESI]
+	MOVL	ECX, #1024t
+8$:	MOVL	EDX, [EBX]		;Get first block for this hash bucket
+	ADDL	EBX, #4.B
+	TESTL	EDX, EDX		;Any at all in this bucket?
+	JE	18$.S			;No
+
+10$: ;;;;;;	TESTB	inx_billflg.B[EDX], #BF$DETAIL ;Yes - need detail report?
+
+	JNE	12$.S			;Yes
+	MOVB	AL, inx_billday.B[EDX]	;No - get his billing day
+	CMPB	AL, #0			;Doing billing for him?
+	JE	16$.S			;No
+	CMPB	idb_billminday[ESI], AL	;Yes - need to do it today?
+	JA	16$.S			;No
+	CMPB	idb_billmaxday[ESI], AL	;Maybe
+	JB	16$.S			;No
+12$:	ADDL	EDI, #12t.B		;Yes - do we have enough memory now?
+	CMPL	idb_billmemtop[ESI], EDI
+	JAE	14$.S			;Yes
+	MOVL	EAX, idb_billmemtop[ESI] ;No - allocate more
+	SUBL	EAX, #COMPLSTBASE - 1000h
+	PUSHL	DS
+	PUSHL	#COMPLSTBASE
+	PUSHL	#PG$READ|PG$WRITE.B
+	PUSHL	EAX
+	CALLF	svcMemChange#
+	TESTL	EAX, EAX
+	JS	20$.S			;If error
+	ADDL	EAX, #COMPLSTBASE
+	MOVL	idb_billmemtop[ESI], EAX
+14$:	MOVL	-4t.B[EDI], EDX		;Make a sort block
+	MOVL	-12t.B[EDI], EDI
+16$:	MOVL	EDX, inx_nextid.B[EDX]
+	TESTL	EDX, EDX
+	JNE	10$.S
+18$:	LOOP	ECX, 8$
+
+;Here with our sort list constructed
+
+	CMPL	EDI, COMPLSTBASE	;Do we have anything at all to do?
+
+	HLT
+
+;Here if error allocating memory
+
+20$:	HLT
+
+.PAGE
+	.SBTTL	billfunction - Routine to process billing functions
+
+;Routine to process billing functions - called in the context of the UDP
+;  thread with a billing message in the input buffer
+
+billfunction::
+	MOVZBL	EAX, idb_udpbufr+1[ESI]	;Get the function
+	CMPL	EAX, #UDFMMAX-UDFM_BILLREQ.B ;Valid function?
+	JA	udploop#		;No - ignore it
+	JMPIL	billdsp-UDFM_BILLREQ*4[EAX*4] ;Yes - dispatch to routine
+
+	.MOD	4
+billdsp:.LONG	billreq		;UDFM_BILLREQ = 32 - Billing request
+	.LONG	billstop	;UDFM_BILLSTP = 33 - Stop billing
+	.LONG	billack		;UDFM_BILLACK = 34 - Bill user acknowledgement
+	.LONG	billudone	;UDFM_BILLUDN = 35 - Bill user done
+	.LONG	billupdate	;UDFM_BILLUPD = 36 - Billing update
+UDFMMAX={$-billdsp}/4
+.PAGE
+	.SBTTL	billreq - Process UDFM_BILLREQ message
+
+;Here to process the UDFM_BILLREQ message - This message has the following
+;  format:
+
+;     Name   Offset  Size      Description
+;   Type        0      1    Message type (always MT_UDF = 97)
+;   SubType     1      1    Message sub-type (always UDFM_BILLREQ = 32)
+;   SeqNum      2      2    Sequence number
+;   ClientID    4      4    Client ID (usually client's PID)
+;   BillDay     8      1    Billing day
+;   BillMonth   9      1    Billing month
+;   Window     10      1    Window size
+;              11      1    Reserved, must be 0
+;   Options    12      8    To be defined
+;   GroupLen   20      1    Length of the group name
+;   Group      21      g    Group name
+
+billreq:CMPL	ECX, #25t-16t.B		;Is the message long enough?
+	JB	reqmerr#		;No - fail
+	CMPL	compidb#, #0.B		;Yes - is compression active now?
+	JNE	14$			;Yes - fail
+	CMPL	billidb#, #0.B		;No - is billing active now?
+	JNE	16$			;Yes
+	LEAL	EAX, idb_tdbbill[ESI]	;No - create the billing thread
+	PUSHL	EAX			;Offset for the TDB
+	PUSHL	#THDSTKSIZE		;Stack size
+	PUSHL	#idb_billSIZE		;Size of the TDB
+	PUSHL	#billthread		;Main function for thread
+	PUSHL	#0.B			;Arguments for main function
+	PUSHL	#0.B
+	CALLF	thdCtlCreate#		;Create the compression thread
+	TESTL	EAX, EAX
+	JS	xoserr#			;If error
+	MOVL	billidb#, ESI		;OK - indicate billing is active
+	MOVW	AX, idb_udpbufr+2t[ESI]	;Get the initial sequence number
+	MOVW	idb_billseq[ESI], AX
+	MOVL	EAX, idb_udpbufr+4t[ESI] ;Get the client ID
+	MOVL	idb_billcid[ESI], EAX
+	MOVB	AL, idb_udpbufr+8t[ESI]	;Get the billing day
+	MOVZBL	EDX, idb_udpbufr+9t[ESI] ;Get the billing month
+	CMPL	EDX, #1t.B		;Valid value?
+	JB	udploop
+	CMPL	EDX, #12t.B
+	JA	udploop
+	MOVB	idb_billmon[ESI], DL
+	CMPB	monlentbl-1[EDX], AL	;Billing for last day of month?
+	JNE	4$.S			;No
+	MOVB	AH, #31t		;Yes - bill up to the 31th
+	JMP	6$.S
+
+4$:	MOVB	AH, AL			;No - just bill for the one day
+6$:	MOVB	idb_billminday[ESI], AL
+	MOVB	idb_billmaxday[ESI], AH
+	MOVB	AL, idb_udpbufr+10t[ESI] ;Get the window size
+	MOVB	idb_billwin[ESI], AL
+8$:	MOVL	EBX, #rspbufr#
+	MOVL	EAX, idb_udpbufr+0[ESI]
+	MOVB	AH, #UDFM_BILLACP
+	MOVL	[EBX], EAX
+	MOVL	EAX, idb_udpbufr+4[ESI]
+	MOVL	4t.B[EBX], EAX
+	MOVL	8t.B[EBX], #1234t
+	MOVZBL	EAX, idb_billwin[ESI]
+	MOVL	12t.B[EBX], EAX
+	CLRL	EAX
+	MOVL	16t.B[EBX], EAX
+	MOVL	20t.B[EBX], EAX
+	MOVL	ECX, #24t
+	JMP	usrsend2#
+
+;Here if compression is active
+
+14$:	MOVB	DL, #UDFM_COMPRS
+	JMP	20$.S
+
+;Here if billing is active - see if this might be a retransmission
+
+16$:	CMPB	idb_billstate[ESI], #BS_ACKRCVD ;Have we done anything yet?
+	JE	18$.S			;Yes - fail
+
+	MOVW	AX, idb_udpbufr+2t[ESI] ;No -check sequence number
+	XCHGB	AL, AH
+	CMPW	idb_billseq[ESI], AX
+	JNE	18$.S
+	MOVL	EAX, idb_udpbufr+4t[ESI] ;Check client ID
+	CMPL	idb_billcid[ESI], EAX
+	JE	8$.S			;Same - just resend a UDFM_BILLACK
+18$:	MOVB	DL, #UDFM_BILACT	;Wrong - say we are already active
+20$:	JMP	usrerror0#
+.PAGE
+
+billstop:
+
+billack:
+
+billudone:
+
+billupdate:
+
+
+.PAGE
+	.SBTTL	Data
+
+	.MOD	4
+
+monlentbl:
+	.BYTE	31t		;Jan
+	.BYTE	28t		;Feb
+	.BYTE	31t		;Mar
+	.BYTE	30t		;Apr
+	.BYTE	31t		;May
+	.BYTE	30t		;Jun
+	.BYTE	31t		;Jul
+	.BYTE	31t		;Aug
+	.BYTE	30t		;Sep
+	.BYTE	31t		;Oct
+	.BYTE	30t		;Nov
+	.BYTE	31t		;Dec
+
+	.END

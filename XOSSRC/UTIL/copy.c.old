@@ -1,0 +1,2365 @@
+//--------------------------------------------------------------------------*
+// COPY.C
+// XOS file copy utility
+//
+// Written by: Bruce R. Nevins
+//
+// Edit History:
+// 02/28/89(brn) - Created first version
+// 05/16/89(brn) - Fixed to not do open directory searches on single files,
+//                  and to handle subdirectories with only subdirectories
+// 10/09/89(brn) - Add support for svcIoDstName system function
+// 11/01/89(brn) - Make output file be preallocated for speed and to
+//			eliminate file fragmentation
+// 11/02/89(brn) - Make / or - be the option characters and only take \
+//			for a path specifier
+// 12/07/89(brn) - Remove old dp_str* references
+// 12/19/89(brn) - Add support for procarg subroutine
+// 12/24/89(brn) - Fix bug that zapped input file if no output was specified.
+//		 - Added exclusive read and write
+// 01/24/90(brn) - Add the CHOOSE option for selective file copying
+// 01/27/90(brn) - Add DOS style copy to directory without the \ at the end
+// 02/08/90(brn) - Change CHOOSE to CONFIRM
+// 02/21/90(brn) - Only call chkconsole if doing confirm, add support for
+//			copy multiple files to one file and input from
+//			terminal device.
+// 03/06/90(brn) - Changed fndretrn structure to use allocated (not fixed)
+//			arrays for the device, path, and filenames etc.
+// 03/08/90(brn) - Fix bug printing file copy arrow with no file names
+// 04/11/90(brn) - Fix bug with subdirectory for output and no \
+//			concatinating output
+// 04/17/90(jrg) - Fix handling of VMS path names
+// 04/19/90(brn) - Fix handling of mask from VMS (Its not returned)
+// 01/02/91(brn) - Add support for QAB
+// 01/28/91(tmg) - Change to support new procarg
+// 02/20/91(brn) - Add help_print function from DIR
+// 03/11/91(brn) - Fix ... handling
+// 03/26/91(brn) - Add character transfer rate
+// 04/02/91(brn) - Add support for DOSQUIRK mode
+// 04/21/91(brn) - Remove fractional part of the bytes per second display
+// 05/18/91(brn) - Remove chkconsole routine and do inline.
+// 05/22/91(brn) - Fix divide of 0 bytes copied by the time in report()
+//			Change copy to not look for directories unless
+//			 doing a recursive read.
+//			Fix close of open directory if file not found.
+// 06/17/91(brn) - Fix DOSQUIRK mode filename print bug and help screen
+//			formatting.
+// 06/01/91(jrg) - 1.23	Increased name buffer to 1536 bytes so will work
+//			with TAMSERVER
+// 10/06/91(brn) - Fix to handle network names and paths
+//		   Fix bad handling of unknown prefix values
+// 10/07/91(brn) - Add ASCII, BINARY, and VERIFY options
+// 11/01/91(brn) - Make console input set ascii_read
+// 11/10/91(brn) - Finish ASCII input and output support.
+// 11/11/91(brn) - Finish concatinate file support
+// 11/13/91(brn) - Fix wildcard on output filename (Add if no filename)
+// 11/17/91(brn) - Add support for preserving file attributes on close not
+//			open (This was a mess with read only files).
+// 11/19/91(brn) - Add start option, to start with a specified file.
+// 12/06/91(jrg) - Remove # as a wildcard character
+// 01/08/92(brn) - Fix wildcard copy to a directory not to use ascii mode
+//		   Change helpt display to capitalize the shortest
+//			abreviation
+// 01/12/92(brn) - Remove mkdir filename return of null, causes address error
+// 02/04/92(brn) - Add debug code for trouble shooting, fix bug where adding
+//			\ to the end of a directory name made string to large
+// 02/19/92(brn) - Add spinner to show file being copied.  Display full
+//			file info on start of copy.
+// 04/03/92(brn) - Add O_NOWCL to not allow {} wildcards
+//		   Fix Create subdir on ... copy to close dir after create.
+// 04/05/92(brn) - Change Done message to no message but " -Error" if error
+//			occured.
+// 07/01/92(brn) - Fix wildcard bug with destination dev but no name
+// 08/20/92(brn) - Change reference to global.h from local to library
+// 10/13/92(brn) - Fix bug when source is not file structured and we
+//			try to set the date on the destination.
+// 01/28/93(jrg) - Add beginning of Image disk support to copy full floppies
+// 02/06/93(brn) - Add the rest of the Image disk support for write as well
+//			as read.
+// 02/07/93(brn) - Fix bug with binary mode not sticking and working in the
+//			correct sequence.
+// 02/24/93(brn) - Make call to report at end only if not quiet
+// 02/24/93(brn) - Fix formatting of report display
+// 03/30/94(brn) - Fix bug in nonopt constructing output_device
+// 01/16/95(brn) - Fix divide by zero error and change to use high
+//			percision clock
+// 01/17/95(brn) - Fix svc calls to match new naming rules
+// 18May95 (fpj) - Changed names from progasst.h to proghelp.h, and from
+//                 optusage() to opthelp().
+//
+//-------------------------------------------------------------------------*
+
+// ++++
+// This software is in the public domain.  It may be freely copied and used
+// for whatever purpose you see fit, including commerical uses.  Anyone
+// modifying this software may claim ownership of the modifications, but not
+// the complete derived code.  It would be appreciated if the authors were
+// told what this software is being used for, but this is not a requirement.
+
+//   THIS SOFTWARE IS PROVIDED BY THE AUTHORS "AS IS" AND ANY EXPRESS OR
+//   IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
+//   OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+//   IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+//   INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+//   BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS
+//   OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+//   ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR
+//   TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
+//   USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+//----
+
+#include <STDIO.H>
+#include <STDLIB.H>
+#include <STRING.H>
+#include <TIME.H>
+#include <XOSTIME.H>
+#include <XOSERR.H>
+#include <XOSRTN.H>
+#include <XOS.H>
+#include <XOSSVC.H>
+#include <PROGARG.H>
+#include <PROGHELP.H>
+#include <GLOBAL.H>
+#include <XOSSTR.H>
+
+// Debug define
+
+// #define DEBUG 0
+
+// Local defines
+
+#define PAGESIZE 22             //  Maximum page length for the screen
+#define TIMBFR 40               //  Size of the time string buffer
+#define SIZE 1536		//  Size of buffer for returned filenames
+#define BLOCK_SIZE 512L		//  Basic I/O block size
+#define CPYSIZE 32 * BLOCK_SIZE //  Default size for each read
+
+void longdiv(long *result, long num1, long num2, long dem);
+
+// Local function prototypes
+
+void error_end(void);
+void help_print(char *help_string, int state, int newline);
+struct  fndretrn *filescan(char  *filename,
+                           uint   mode,
+                           struct fndretrn *prev);
+struct  fndretrn *src_filesetup(char *filename);
+int     comp(const void *a, const void *b);
+void    dofilecopy(struct  fndretrn *srcfiles, char *dst);
+void    dorecurse(char fqfile[], char *dst);
+void    interr(void);
+void   *xasbrk(long size);
+int     xabrk(void *ptr);
+void    xosmsg(char *arg, long  code);
+void    report(void);
+
+// 
+// Data structure returned from filescan
+//
+struct fndretrn
+{ 
+    struct fndretrn *next;	//  next file block
+    time_s mod_date;		//  Date file was modified
+    short  filattr;		//  Saved file attribute
+    char   *device;		//  Device name buffer
+    char   *path;		//  Path name buffer
+    char   *name;		//  File name buffer
+    char   *mask;		//  File name mask
+};
+
+// 
+// Switch settings functions
+//
+int  optbefore(arg_data *subopt);
+int  optbinary(arg_data *);
+int  optquiet(arg_data *);
+int  opttotals(arg_data *);
+int  optnototals(arg_data *);
+int  optverbose(arg_data *);
+int  optverify(arg_data *);
+int  optbuffer(arg_data *);
+int  nonopt(char *arg);
+int  optsince(arg_data *subopt);
+int  optsort(arg_data *subopt);
+int  optstart(arg_data *subopt);
+
+int     src_recurse;            //  Do all lower source subdirectories
+int     dst_recurse;            //  Do all lower source subdirectories
+int     totonly;                //  List totals only, no file names
+int     prtacross;              //  Print across
+int     curline = 0;            //  current line on the screen
+int	concat_output = FALSE;	//  Concatinate multiple input files
+// 
+// Misc. variables
+//
+char	prgname[]="COPY";
+Prog_Info pib;
+int	ascii_read = FALSE;	//  True is doing text mode read
+int	binary_read = FALSE;	//  True is doing binary mode read
+int	ascii_write = FALSE;	//  True is doing text mode write
+int	binary_write = FALSE;	//  True is doing binary mode write
+int	verify = FALSE;		//  Verify transfer mode
+int	error_output = FALSE;	//  If error message was printed
+int     majedt = 3;		// major edit number
+int     minedt = 2;		// minor edit number
+char	spin_str[] = "|/-\\";	//  The string to use of spinner
+char    envname[20];		//  Environment option name
+char   *pnt;                    //  pointer to current argv
+char   *cpnt;
+char   *source_file;            //  Pointer to source file name buffer
+char   *destination_file;       //  Pointer to destination file name buffer
+char   *wildcard;               //  pointer to wildcard string
+char   *filename;               //  pointer to the filename
+char	start_from[FILESPCSIZE] = {""};
+				//  File name to start the copy from
+char    src_device[FILESPCSIZE] = {""};
+                                //  current source device name
+char    src_path[FILESPCSIZE] = {""};
+                                //  current source path
+ulong   output_file_count = 0;  //  grand total number of files found
+ulong   grandbytecount = 0;     //  grand total number of bytes transfered
+ulong   dircount = 0;           //  Count of nested directories
+long    rtn;                    //  Return value from XOS svc
+time_s  start_time;		        //  Starting time in seconds for transfer
+time_s  stop_time;		        //  Ending time in seconds for transfer
+char    total_files = TRUE;     //  Print total number of files
+char    total_bytes = FALSE;    //  Print total number of bytes
+char    quiet = FALSE;          //  TRUE if no output wanted
+char    rate = FALSE;           //  TRUE if transfer rate wanted
+char    confirm = FALSE;        //  TRUE if to confirm each file to copy
+char	del_out_file = TRUE;	//  TRUE if delete partial output file
+char	image_enabled = FALSE;	//  Enable disk image I/O handling
+char    verbose = FALSE;        //  TRUE if want full output
+char    do_sort = TRUE;		//  TRUE if sort file names deleted
+char    input_device[FILESPCSIZE] = {""};
+                                //  current device name
+char    input_path[FILESPCSIZE] = {""};
+                                //  current path
+char    input_name[FILESPCSIZE] = {""};
+                                //  current name
+char    input_mask[FILESPCSIZE] = {""};
+                                //  current mask
+char    output_device[FILESPCSIZE] = {""};
+                                //  current device name
+char    output_path[FILESPCSIZE] = {""};
+                                //  current path
+char    output_name[FILESPCSIZE] = {""};
+                                //  current name
+char    output_mask[FILESPCSIZE] = {""};
+                                //  current mask
+char    wild_src;               //  Wild card chars (* and ?) seen
+char   *file_buffer;
+long    copysize;               //  Size of copy buffer
+int     source_seen;		//  Saw source file name
+int     destination_seen;	//  Saw destination file name
+int     console;                //  TRUE if console is output device
+time_s  before_time;		//  Before "Date/Time" which to copy files
+time_s  since_time;		//  Since "Date/Time" which to copy files
+
+struct
+{   byte4_parm  devsts;
+    char        end;
+} parmparm =
+{   {(PAR_GET|REP_HEXV), 4, IOPAR_DEVSTS, 0}
+};
+
+type_qab parmqab =
+{
+    QFNC_WAIT|QFNC_OUTBLOCK,	// qab_open
+    0,				// qab_status
+    0,				// qab_error
+    0,				// qab_amount
+    DH_STDOUT,			// qab_handle
+    0,				// qab_vector
+    0,	        		// qab_level    - Signal level for direct I/O
+    0,  			// qab_prvlevel - Previous signal level (int.)
+    0,				// qab_option
+    0,				// qab_count
+    NULL, 0,			// qab_buffer1
+    NULL, 0,			// qab_buffer2
+    &parmparm, 0		// qab_parm
+};
+
+struct
+{   byte4_parm  options;
+    lngstr_parm spec;
+    byte2_parm  srcattr;
+    byte4_parm  devsts;
+    byte2_parm  filattr;
+    byte4_parm  fillen;
+    byte4_parm  alloc;
+    byte8_parm  cdate;
+    byte8_parm  mdate;
+    byte8_parm  adate;
+    byte4_parm  prot;
+//    byte16_parm ownname;
+//    byte16_parm grpname;
+    char        end;
+} in_fileparm =
+{   {(PAR_SET|REP_HEXV), 4 , IOPAR_FILOPTN , FO_VOLNAME|FO_NODENUM|FO_NODENAME|
+            FO_RVOLNAME|FO_PATHNAME|FO_FILENAME|FO_VERSION},
+    {(PAR_GET|REP_STR ), 0 , IOPAR_FILSPEC , NULL, 0, SIZE, 0},
+    {(PAR_SET|REP_HEXV), 2 , IOPAR_SRCATTR , 0},
+    {(PAR_GET|REP_HEXV), 4 , IOPAR_DEVSTS  , 0},
+    {(PAR_GET|REP_HEXV), 2 , IOPAR_FILATTR , 0},
+    {(PAR_GET|REP_DECV), 4 , IOPAR_LENGTH  , 0},
+    {(PAR_GET|REP_DECV), 4 , IOPAR_REQALLOC, 0},
+    {(PAR_GET|REP_HEXV), 8 , IOPAR_CDATE   , 0},
+    {(PAR_GET|REP_HEXV), 8 , IOPAR_MDATE   , 0},
+    {(PAR_GET|REP_HEXV), 8 , IOPAR_ADATE   , 0},
+    {(PAR_GET|REP_HEXV), 4 , IOPAR_PROT    , 0}
+//    {(PAR_GET|REP_TEXT), 16, IOPAR_OWNNAME , 0},
+//    {(PAR_GET|REP_TEXT), 16, IOPAR_GRPNAME , 0}
+};
+
+type_qab in_fileqab =
+{
+    0,				// qab_func
+    0,				// qab_status
+    0,				// qab_error
+    0,				// qab_amount
+    0,				// qab_handle
+    0,				// qab_vector
+    0,	        		// qab_level    - Signal level for direct I/O
+    0,  			// qab_prvlevel - Previous signal level (int.)
+    0,				// qab_option
+    0,				// qab_count
+    NULL, 0,			// qab_buffer1
+    NULL, 0,			// qab_buffer2
+    NULL, 0			// qab_parm
+};
+
+struct
+{   byte4_parm  options;
+    lngstr_parm spec;
+    byte2_parm  srcattr;
+    byte4_parm  devsts;
+    byte2_parm  filattr;
+    byte4_parm  fillen;
+    byte4_parm  alloc;
+    byte8_parm  cdate;
+    byte8_parm  mdate;
+    byte8_parm  adate;
+    byte4_parm  prot;
+//    byte16_parm ownname;
+//    byte16_parm grpname;
+    char        end;
+} out_fileparm =
+{   {(PAR_SET|REP_HEXV), 4 , IOPAR_FILOPTN , FO_VOLNAME|FO_NODENUM|FO_NODENAME|
+            FO_RVOLNAME|FO_PATHNAME|FO_FILENAME|FO_VERSION},
+    {(PAR_GET|REP_STR ), 0 , IOPAR_FILSPEC , NULL, 0, SIZE, 0},
+    {(PAR_SET|REP_HEXV), 2 , IOPAR_SRCATTR , 0},
+    {(PAR_GET|REP_HEXV), 4 , IOPAR_DEVSTS  , 0},
+    {(PAR_SET|REP_HEXV), 2 , IOPAR_FILATTR , 0},
+    {(PAR_GET|REP_DECV), 4 , IOPAR_LENGTH  , 0},
+    {(PAR_SET|REP_DECV), 4 , IOPAR_REQALLOC, 0},
+    {(PAR_SET|REP_HEXV), 8 , IOPAR_CDATE   , 0},
+    {(PAR_SET|REP_HEXV), 8 , IOPAR_MDATE   , 0},
+    {(PAR_SET|REP_HEXV), 8 , IOPAR_ADATE   , 0},
+    {(PAR_SET|REP_HEXV), 4 , IOPAR_PROT    , 0}
+//    {(PAR_SET|REP_TEXT), 16, IOPAR_OWNNAME , 0},
+//    {(PAR_SET|REP_TEXT), 16, IOPAR_GRPNAME , 0}
+};
+
+type_qab out_fileqab =
+{
+    0,				// qab_open
+    0,				// qab_status
+    0,				// qab_error
+    0,				// qab_amount
+    0,				// qab_handle
+    0,				// qab_vector
+    0,	        		// qab_level    - Signal level for direct I/O
+    0,  			// qab_prvlevel - Previous signal level (int.)
+    0,				// qab_option
+    0,				// qab_count
+    NULL, 0,			// qab_buffer1
+    NULL, 0,			// qab_buffer2
+    &out_fileparm, 0		// qab_parm
+};
+
+struct				//  Paramters for device information	*/
+{
+    byte4_parm  options;
+//     lngstr_parm spec;
+    char        end;
+} md_open =
+{
+    {(PAR_SET|REP_HEXV), 4, IOPAR_FILOPTN, FO_VOLNAME|FO_NODENUM|FO_NODENAME|
+            FO_RVOLNAME|FO_PATHNAME|FO_FILENAME|FO_VERSION},
+//     {(PAR_GET|REP_STR),  0, IOPAR_FILSPEC, NULL, 0, 0, 0},
+    0
+};
+
+struct
+{   byte4_parm  options;
+    lngstr_parm spec;
+    byte2_parm  srcattr;
+    byte4_parm  dirhndl;
+    char        end;
+} dir_searchparm =
+{   {(PAR_SET|REP_HEXV), 4, IOPAR_FILOPTN, FO_VOLNAME|FO_NODENUM|FO_NODENAME|
+            FO_RVOLNAME|FO_PATHNAME|FO_FILENAME|FO_VERSION|FO_ATTR},
+    {(PAR_GET|REP_STR ), 0, IOPAR_FILSPEC, NULL, 0, SIZE, 0},
+    {(PAR_SET|REP_HEXV), 2 , IOPAR_SRCATTR , 0},
+    {(PAR_SET|REP_HEXV), 4 , IOPAR_DIRHNDL , 0}
+};
+
+struct
+{   byte4_parm  options;
+    lngstr_parm spec;
+    char        end;
+} dir_openparm =
+{   {(PAR_SET|REP_HEXV), 4, IOPAR_FILOPTN, FO_VOLNAME|FO_NODENUM|FO_NODENAME|
+            FO_RVOLNAME|FO_PATHNAME|FO_FILENAME|FO_VERSION},
+    {(PAR_GET|REP_STR ), 0, IOPAR_FILSPEC, NULL, 0, SIZE, 0}
+};
+
+struct
+{
+    byte2_parm  filattr;
+    char        end;
+} close_fileparm =
+{
+    {(PAR_SET|REP_HEXV), 2 , IOPAR_FILATTR , 0}
+};
+
+type_qab close_fileqab =
+{
+    QFNC_WAIT|QFNC_CLOSE,	// qab_func
+    0,				// qab_status
+    0,				// qab_error
+    0,				// qab_amount
+    0,				// qab_handle
+    0,				// qab_vector
+    0,	        		// qab_level    - Signal level for direct I/O
+    0,  			// qab_prvlevel - Previous signal level (int.)
+    0,				// qab_option
+    0,				// qab_count
+    NULL, 0,			// qab_buffer1
+    NULL, 0,			// qab_buffer2
+    &close_fileparm, 0		// qab_parm
+};
+
+#define AF(func) (int (*)(arg_data *))func
+
+SubOpts totalscmd[] =
+{
+    {"B*YTES"  , "Total number of bytes copied"},
+    {"F*ILES"  , "Total number of files copied"},
+    {"R*ATE"   , "Total transfer rate for copy"},
+    {"NOB*YTES", "Don't show total number of bytes copied"},
+    {"NOF*ILES", "Don't show total number of files copied"},
+    {"NOR*ATE" , "Don't show total transfer rate for copy"},
+    {NULL      , NULL}
+};
+
+arg_spec options[] =
+{   {"?"        , 0                   , NULL     , AF(opthelp)    , 0     ,
+	"This message"},
+    {"A*SCII"   , ASF_NVAL            , NULL     ,    optbinary    , FALSE ,
+	"Text copy mode"},
+//    {"BE*FORE"  , ASF_VALREQ|ASF_LSVAL, NULL     ,    optbefore    , 0     ,
+//	"Copy all matching files before this Date/Time"},
+    {"B*INARY"  , ASF_NVAL            , NULL     ,    optbinary    , TRUE  ,
+	"Binary copy mode"},
+    {"BU*FFER"  , ASF_VALREQ|ASF_NVAL , NULL     ,    optbuffer    , 0     ,
+	"Change input buffer size"},
+    {"C*ONFIRM" , ASF_BOOL|ASF_STORE  , NULL     , &confirm        , TRUE  ,
+	"Choose which files to copy"},
+    {"D*ELETE"  , ASF_BOOL|ASF_STORE  , NULL     , &del_out_file   , TRUE  ,
+	"Delete incomplete output files"},
+    {"DOSQ*UIRK", ASF_BOOL|ASF_STORE  , NULL     , &gcp_dosquirk   , TRUE  ,
+	"Overrides the global DOSQUIRK setting"},
+    {"DOSD*RIVE", ASF_BOOL|ASF_STORE  , NULL     , &gcp_dosdrive   , TRUE  ,
+	"Overrides the global DOSDRIVE setting"},
+    {"H*ELP"    , 0                   , NULL     , AF(opthelp)    , 0     ,
+	"This message"},
+    {"I*MAGE"   , ASF_BOOL|ASF_STORE  , NULL     , &image_enabled  , TRUE  ,
+	"Disk image I/O handling enabled"},
+    {"Q*UIET"   , ASF_BOOL            , NULL     ,    optquiet     , TRUE  ,
+	"Don't display any copy status"},
+//    {"SI*NCE"   , ASF_VALREQ|ASF_LSVAL, NULL     ,    optsince     , 0     ,
+//	"Copy all matching files since this Date/Time"},
+    {"S*ORT"    , ASF_BOOL            , NULL     ,    optsort      , TRUE  ,
+	"Sort files before copying"},
+    {"ST*ART"   , ASF_VALREQ|ASF_LSVAL, NULL     ,    optstart     , 0     ,
+	"Start copy with the specified file"},
+    {"T*OTALS"  , ASF_XSVAL           , totalscmd,    opttotals    , 0     ,
+	"Display summary of copy"},
+    {"VERB*OSE" , ASF_BOOL            , NULL     ,    optverbose   , TRUE  ,
+	"Display full file names and status"},
+    {"V*ERIFY"  , ASF_BOOL            , NULL     ,    optverify    , TRUE  ,
+	"Verify error free transfer"},
+    {NULL       , 0                   , NULL     , AF(NULL)        , 0     ,
+	0}
+};
+
+//***************
+// main
+// entry for COPY
+//***************
+void main(int argc, char *argv[])
+{
+    int     reduced_size;	//  Reduced buffer size flag
+    char    strbuf[256];        //  String buffer
+    struct  fndretrn *found;    //  pointer to the matching file struct
+    char    *foo[2];
+    void    *start_brk;		//  Pointer to current memory used
+// 
+// set defaults
+//
+    reg_pib(&pib);
+    init_vars(prgname);
+    found = 0;                  //  Start with found = 0
+    reduced_size = FALSE;	//  Buffer size is not reduced
+
+    start_brk = xasbrk(0);	//  Set starting memory used
+    filename = source_file;             //  default filename
+
+    *source_file = '\0';		//  Start source file with no name
+    strcpy(destination_file, wildcard); //  Start the file name with a
+                                        //   wildcard
+
+// 
+// Check Global Configuration Parameters
+//
+    global_parameter(TRUE);
+
+    if (gcp_dosquirk)
+	del_out_file = TRUE;
+
+// 
+// Check Local Configuration Parameters
+//
+    if(svcSysFindEnv(0, envname, NULL, strbuf, sizeof(strbuf), NULL) > 0)
+    {
+	foo[0] = strbuf;
+	foo[1] = '\0';
+	progarg(foo, 0, options, NULL, (int (*)(char *))NULL,
+                (void (*)(char *, char *))NULL, (int (*)(void))NULL, NULL);
+    }
+
+    if (argc >= 2)
+    {
+	++argv;
+	progarg(argv, PAF_PATOM, options, NULL, nonopt,
+                (void (*)(char *, char *))NULL, (int (*)(void))NULL, NULL);
+    }
+
+    if (gcp_dosdrive)
+    {
+        in_fileparm.options.value = FO_DOSNAME|FO_NODENUM|FO_NODENAME|
+		FO_RDOSNAME|FO_PATHNAME|FO_FILENAME|FO_VERSION;
+        out_fileparm.options.value = FO_DOSNAME|FO_NODENUM|FO_NODENAME|
+		FO_RDOSNAME|FO_PATHNAME|FO_FILENAME|FO_VERSION;
+        md_open.options.value = FO_DOSNAME|FO_NODENUM|FO_NODENAME|
+                FO_RDOSNAME|FO_PATHNAME|FO_FILENAME|FO_VERSION;
+        dir_searchparm.options.value = FO_DOSNAME|FO_NODENUM|FO_NODENAME|
+		FO_RDOSNAME|FO_PATHNAME|FO_FILENAME|FO_VERSION|FO_ATTR;
+        dir_openparm.options.value = FO_DOSNAME|FO_NODENUM|FO_NODENAME|
+		FO_RDOSNAME|FO_PATHNAME|FO_FILENAME|FO_VERSION;
+    }
+
+    if (!source_seen)
+    {
+        opthelp();
+        exit(EXIT_INVSWT);
+    }
+
+    console = isctrm(STDIN);		//  Check console output state
+
+    while ((file_buffer = xasbrk(copysize)) == NULL)	//  Allocate a buffer
+    {
+// 
+// Make multiple of block size
+//
+	copysize = (((copysize / 2L) + BLOCK_SIZE - 1L) / BLOCK_SIZE) * BLOCK_SIZE;
+	if (copysize < (BLOCK_SIZE * 2L))
+	{
+            fprintf(stderr, "\n? %s: Not enough memory available\n", pib.prgname);
+            exit(EXIT_MALLOC);
+        }
+	reduced_size = TRUE;
+    }
+
+    if (reduced_size)
+	printf("%% %s: Buffer size reduced to %ld\n", pib.prgname, copysize);
+
+
+    if (wild_src)
+    {
+        if (strpbrk(destination_file, "*?") == NULL)
+        {
+	    concat_output = TRUE;
+        }
+	if (src_recurse)
+            found = filescan(source_file, (A_NORMAL | A_DIRECT), NULL);
+	else
+            found = filescan(source_file, A_NORMAL, NULL);
+
+	if (rate)
+            svcSysDateTime(T_GTHRDTTM, &start_time); //  Get current system date and time
+
+        if (source_seen && found)
+            dofilecopy(found, destination_file); //  Start copying matching files
+
+        if (src_recurse)
+        {
+#ifdef DEBUG
+printf("Call dorecurse source_file = \'%s\' destination_file = \'%s\'\n",
+source_file, destination_file);
+#endif
+            dorecurse(source_file, destination_file);
+        }
+    }
+    else
+    {
+        found = src_filesetup(source_file);
+	if (rate)
+            svcSysDateTime(T_GTHRDTTM, &start_time); //  Get current system date and time
+
+        if (source_seen && found)
+            dofilecopy(found, destination_file); //  Start copying matching files
+
+    }
+
+    if (!found && error_output == TRUE)
+        exit(EXIT_FNF);                 //  if file not found, return
+                                        //   with error
+    if (output_file_count == 0)
+    {
+	xosmsg(source_file, ER_FILNF);
+        exit(EXIT_FNF);                 //  if file not found, return
+    }
+
+    if (rate)
+        svcSysDateTime(T_GTHRDTTM, &stop_time); //  Get current system date and time
+
+    if (!quiet)
+    {
+	report();			//  Do the end of copy report
+    }
+    xabrk(start_brk);			//  Reset memory usage back
+    exit(EXIT_NORM);                    //  Return with no error
+}
+
+//****************************
+// dofilecopy
+// copy all matching filenames
+//****************************
+
+void dofilecopy(struct  fndretrn *srcfiles, char *dst)
+{
+    long temp;				//  Temp int for keyboard status
+    int more;
+    int dont_copy;
+    char chr;
+    int     i, j;			//  Counters
+    int     skipcount;			//  Number of files skiped over (. & ..)
+    long    filenum;			//  number of files found
+    int     out_open;			//  Output file is already open
+    struct  fndretrn **sortarry;	//  pointer to array of pointers
+    struct  fndretrn *fndtmp;		//  temp pointer
+    long    indev;
+    long    outdev;
+    long    errret;
+    uchar  *cp;				//  Character pointer
+    long    size;
+    char   temp_name[FILESPCSIZE];	//  Temp file name string
+    char   src_name[FILESPCSIZE];	//  Source file name string
+    char   dst_name[FILESPCSIZE];	//  Destination file name string
+    char   new_dst[FILESPCSIZE];	//  New Destination file name string
+    char   mdname[FILESPCSIZE];		//  Make dir name string
+    uchar  mask[FILESPCSIZE];		//  File Spec mask
+    char   arrow[5];			//  Arrow string
+    void  *start_brk;			//  Starting break value
+
+    start_brk = xasbrk(0);		//  Setup starting memory use
+    filenum = 0;
+    indev = 0;
+    outdev = 0;
+    out_open = FALSE;
+
+    fndtmp = srcfiles;
+    while (fndtmp)
+    {
+        filenum++;
+        fndtmp = fndtmp->next;
+    }
+
+    sortarry = xasbrk(sizeof(char *) * filenum);
+
+    fndtmp = srcfiles;
+    for (i = 0; i < filenum; i++)
+    {
+        sortarry[i] = fndtmp;
+        fndtmp = fndtmp->next;
+    }
+
+    if (do_sort)
+	qsort((void *)sortarry, (size_t)filenum,
+            (size_t)sizeof(void *), comp);
+
+    skipcount = 0;
+
+#ifdef DEBUG
+    printf("In dofilecopy: filenum = %d\n", filenum);
+#endif
+    for (j = 0; j < filenum; j++)
+    {
+        if (((sortarry[j]->filattr & A_DIRECT) != 0) &&
+	     ((dst_recurse == FALSE) ||
+	      (strcmp(sortarry[j]->name, ".\\") == 0) ||
+	      (strcmp(sortarry[j]->name, "..\\") == 0)))
+	{
+#ifdef DEBUG
+    printf("In dofilecopy: skipping file number = %d\n", j);
+#endif
+            skipcount++;        //  Count the files skipped
+            continue;
+	}
+
+	if (start_from[0] != '\0')
+	{
+	    if (stricmp(sortarry[j]->name, start_from) == 0)
+		start_from[0] = '\0';
+	    else
+		continue;
+	}
+        strmov(strmov(strmov(temp_name, sortarry[j]->device),
+            sortarry[j]->path), sortarry[j]->name);
+
+    	in_fileqab.qab_func = QFNC_WAIT|QFNC_DIO|QFNC_OPEN;
+	in_fileqab.qab_option = O_IN;
+        if (temp_name[strlen(temp_name)-1] == ':')
+        {
+	    if (image_enabled)
+	    {
+        	in_fileqab.qab_option |= O_PHYS;
+        	fprintf(stderr, "%% %s: Doing image copy\n", pib.prgname);
+	    }
+	    else
+	    {
+		fprintf(stderr, "? %s: IMAGE I/O not enabled\n", pib.prgname);
+		exit(EXIT_BADCOMMAND);
+	    }
+        }
+	in_fileqab.qab_buffer1 = temp_name;
+	in_fileqab.qab_parm = &in_fileparm;
+	in_fileparm.srcattr.value = 0;
+	if ((dst_recurse == TRUE) && (sortarry[j]->filattr & A_DIRECT))
+	{
+	    cp = (uchar *)strrchr(temp_name, '\\');
+	    *cp = '\0';			//  Remove \ from dir name
+	    in_fileparm.srcattr.value = A_DIRECT;
+	}
+
+	if ((indev = svcIoQueue(&in_fileqab)) < 0 ||
+	    (indev = in_fileqab.qab_error) < 0)
+        {
+#ifdef DEBUG
+	    printf("Open input file\n");
+	    printf("in_fileparm.srcattr.value = %x\n",
+		    in_fileparm.srcattr.value);
+            printf("in_fileparm.spec.buffer = %s\n", in_fileparm.spec.buffer);
+#endif
+            xosmsg(temp_name, indev);
+            exit(EXIT_BADCOMMAND);
+        }
+	if ((in_fileparm.devsts.value & DS_FILE) != 0)
+	{
+//
+// Check if we skip or copy these based on thier date and time
+//
+//	    if (since_time.time != 0 || since_time.date !=0)
+//	    {
+//		((date_s *)in_fileparm.mdate)
+//	    }
+//	    if (before_time.time != 0 || before_time.date != 0)
+//	    {
+//
+//	    }
+//
+// Build the destination file name
+//
+	    if ((cp = (uchar *)strrchr(sortarry[j]->name, ';')) != NULL)
+                *cp = '\0';
+
+	    mask[0] = FS_FILENAME;
+	    mask[1] = '\0';
+	    strcat(mask, sortarry[j]->name);
+	    strcat(mask, sortarry[j]->mask);
+
+	    if ((errret = svcIoDstName(dst, mask, new_dst, FILESPCSIZE)) < 0)
+	    {
+        	xosmsg(dst, errret);
+        	exit(EXIT_BADCOMMAND);
+	    }
+
+// 
+// Copy file parameters
+//
+            out_fileparm.filattr.value = 0;
+            out_fileparm.fillen.value = in_fileparm.fillen.value;
+            out_fileparm.alloc.value = in_fileparm.alloc.value;
+            memcpy(out_fileparm.adate.value, in_fileparm.adate.value, sizeof(time_s));
+            memcpy(out_fileparm.cdate.value, in_fileparm.cdate.value, sizeof(time_s));
+            memcpy(out_fileparm.mdate.value, in_fileparm.mdate.value, sizeof(time_s));
+            out_fileparm.prot.value = in_fileparm.prot.value;
+//            memcpy(out_fileparm.ownname.value, in_fileparm.ownname.value, 16);
+//            memcpy(out_fileparm.grpname.value, in_fileparm.grpname.value, 16);
+    
+// 
+// Save the input device, path, and file names
+//
+	    cp = (uchar *)in_fileparm.spec.buffer;	//  Point to device & path name
+
+            while (*cp != '\0')
+            {
+                switch (*cp)
+                {
+                case FS_XOSNAME:
+                case FS_DOSNAME:
+                case FS_VOLNAME:
+                    cp++;               //  Point to start
+                    i = 0;              //  Index into device string
+                    while (*cp != '\0' && (*cp < FS_MIN || *cp == FS_ESC))
+                    {
+                        if (*cp == FS_ESC)
+                            cp++;
+                        input_device[i++] = *cp++;
+                    }
+                    input_device[i] = '\0';
+                    break;
+        
+		case FS_NODENAME:
+		case FS_NODENUM:
+		case FS_RXOSNAME:
+		case FS_RDOSNAME:
+		case FS_RVOLNAME:
+                case FS_PATHNAME:
+                    cp++;               //  Point to start
+                    i = 0;              //  Index into path string
+		    while (*cp != '\0' && (*cp < FS_MIN || *cp == FS_NODENAME
+            		|| *cp == FS_NODENUM
+                        || *cp == FS_RXOSNAME || *cp == FS_RDOSNAME
+                        || *cp == FS_RVOLNAME || *cp == FS_PATHNAME))
+                    {
+                        if (*cp == FS_ESC)
+                        {
+                            cp++;
+                            input_path[i++] = *cp++;
+                        }
+                        else if (*cp < FS_MIN)
+                            input_path[i++] = *cp++;
+                        else
+                            cp++;
+                    }
+                    input_path[i] = '\0';
+                    break;
+        
+                case FS_FILENAME:
+                    cp++;               //  Point to start
+                    i = 0;              //  Index into name string
+                    while (*cp != '\0' && (*cp < FS_MIN || *cp == FS_ESC))
+                    {
+                        if (*cp == FS_ESC)
+                            cp++;
+                        input_name[i++] = *cp++;
+                    }
+                    input_name[i] = '\0';
+                    break;
+
+                case FS_VERSION:
+                    cp++;
+    	        
+                    input_name[i++] = ';';
+                    while (*cp != '\0' && *cp < FS_MIN)
+                    {
+                        input_name[i++] = *cp++;
+                    }
+                    input_name[i] = '\0';     //  Make a C string
+                    break;
+	        
+                default:
+                    fprintf(stderr, "? %s: Bad input prefix value: 0x%X\n",
+                            pib.prgname, (int)*cp);
+		    cp++;		//  Skip bad prefix
+                    while (*cp != '\0' && (*cp < FS_MIN || *cp == FS_ESC))
+                    {
+                        if (*cp == FS_ESC)
+                            cp++;
+                        cp++;
+                    }
+                }
+            }
+
+            if (confirm && console)
+	    {
+                more = TRUE;
+	        dont_copy = FALSE;
+
+                while (more == TRUE)
+	        {
+            	    printf("%s `%s%s%s' (Y, N, G, Q) ? ", pib.prgname,
+			    input_device, input_path, input_name);
+                    temp = getch();
+                    more = FALSE;               //  Assume good input
+            	    chr = (char)temp & 0x7f;    //  Just 7 bits worth
+            	    switch (chr)
+            	    {
+            	    case 'g':                   //  Don't ask for any more
+            	    case 'G':
+                	confirm = FALSE;
+                	break;
+
+	    	    case 'n':
+	    	    case 'N':
+			skipcount++;
+			dont_copy = TRUE;
+			break;
+
+            	    case 'q':			//  Quit!, don't print the rest
+            	    case 'Q':
+			printf("\n");		//  Start on a new line
+                	exit(EXIT_NORM);
+
+	    	    case 'y':
+	    	    case 'Y':
+			break;
+
+	    	    case 'h':
+	    	    case '?':
+            	    default:                    	//  Tell him this is wrong
+                	printf("\n\nG - Copy this file and don't ask any more\n");
+                	printf("H or ? - This message\n");
+                	printf("N - Don't copy this file\n");
+                	printf("Q - Quit program\n");
+                	printf("Y - Copy this file\n\n");
+                	more = TRUE;            //  Loop back and check again
+            	    }
+	        }
+	        printf("\n");		//  Start on a new line
+	        if (dont_copy)
+		    continue;
+	    }
+	}
+	else
+	{
+// 
+// Initialize file parameters
+//
+            out_fileparm.filattr.value = 0;
+            out_fileparm.fillen.value = 0;
+            out_fileparm.alloc.value = 0;
+            memcpy(out_fileparm.adate.value, &start_time, sizeof(time_s));
+            memcpy(out_fileparm.cdate.value, &start_time, sizeof(time_s));
+            memcpy(out_fileparm.mdate.value, &start_time, sizeof(time_s));
+            out_fileparm.prot.value = 0;
+//            memcpy(out_fileparm.ownname.value, in_fileparm.ownname.value, 16);
+//            memcpy(out_fileparm.grpname.value, in_fileparm.grpname.value, 16);
+	    strcpy(new_dst, dst);
+	}
+
+	if (!out_open)
+	{
+	    if ((dst_recurse == TRUE) && (sortarry[j]->filattr & A_DIRECT))
+	    {
+	        if ((outdev = svcIoDevParm(O_CREATE|O_ODF|O_FAILEX,
+			new_dst, &md_open)) < 0 && outdev != ER_FILEX)
+                {
+#ifdef DEBUG
+	    	    printf("Creating new directory\n");
+#endif
+                    xosmsg(new_dst, outdev);
+                    exit(EXIT_BADCOMMAND);
+                }
+                if (!quiet && outdev != ER_FILEX)
+                    printf("%% %s: Creating subdirectory \"%s\"\n", pib.prgname,
+				new_dst);
+		continue;
+	    }
+
+	
+    	    out_fileqab.qab_func = QFNC_WAIT|QFNC_OPEN;
+	    out_fileqab.qab_option = O_CREATE|O_TRUNCW|O_OUT|O_XWRITE|O_XREAD;
+	    out_fileqab.qab_buffer1 = new_dst;
+	    out_fileqab.qab_parm = &out_fileparm;
+
+
+	    if ((outdev = svcIoQueue(&out_fileqab)) < 0 ||
+	        (outdev = out_fileqab.qab_error) < 0)
+            {
+
+                if (outdev == ER_DIRNF && dst_recurse)
+                {
+                    strcpy(mdname, new_dst);
+                    cp = (uchar *)strrchr(mdname, '\\');
+                    cp++;                       //  Don't remove the \
+                    *cp = '\0';
+
+		    if ((outdev = svcIoDevParm(O_CREATE|O_ODF|O_FAILEX,
+			    mdname, &md_open)) < 0)
+                    {
+#ifdef DEBUG
+	    		printf("Creating new directory\n");
+#endif
+                        xosmsg(mdname, outdev);
+                        exit(EXIT_BADCOMMAND);
+                    }
+                    if (!quiet)
+                        printf("%% %s: Creating subdirectory \"%s\"\n",
+				pib.prgname, mdname);
+
+	    	    out_fileqab.qab_func = QFNC_WAIT|QFNC_OPEN;
+		    out_fileqab.qab_option = O_CREATE | O_TRUNCW | O_OUT |
+					     O_XWRITE | O_XREAD;
+	            if (new_dst[strlen(new_dst)-1] == ':')
+		    {
+			if (image_enabled)
+			{
+	        	    out_fileqab.qab_option |= O_PHYS;
+	        	    fprintf(stderr, "%% %s: Doing image copy\n", pib.prgname);
+			}
+			else
+			{
+			    fprintf(stderr, "? %s: IMAGE I/O not enabled\n", pib.prgname);
+		            exit(EXIT_BADCOMMAND);
+			}
+		    }
+		    out_fileqab.qab_buffer1 = new_dst;
+
+		    if ((outdev = svcIoQueue(&out_fileqab)) < 0 ||
+		        (outdev = out_fileqab.qab_error) < 0)
+		    {
+#ifdef DEBUG
+			printf("Open output file\n");
+#endif
+                        xosmsg(new_dst, outdev);
+                        exit(EXIT_BADCOMMAND);
+		    }
+                }
+		else if(outdev == ER_FILEX)
+		{
+		    concat_output = FALSE;
+
+	    	    out_fileqab.qab_func = QFNC_WAIT|QFNC_OPEN;
+		    out_fileqab.qab_option = O_CREATE | O_TRUNCW | O_OUT |
+					     O_XWRITE | O_XREAD;
+	            if (new_dst[strlen(new_dst)-1] == ':')
+		    {
+			if (image_enabled)
+			{
+	        	    out_fileqab.qab_option |= O_PHYS;
+	        	    fprintf(stderr, "%% %s: Doing image copy\n", pib.prgname);
+			}
+			else
+			{
+			    strcpy(temp_name, new_dst);
+			    strcat(temp_name, "\\*.*");
+			    svcIoDstName(temp_name, mask, new_dst, FILESPCSIZE);
+			    out_fileqab.qab_buffer1 = new_dst;
+			}
+		    }
+
+		    if ((outdev = svcIoQueue(&out_fileqab)) < 0 ||
+		        (outdev = out_fileqab.qab_error) < 0)
+		    {
+#ifdef DEBUG
+	    		printf("Open output file\n");
+#endif
+                        xosmsg(new_dst, outdev);
+                        exit(EXIT_BADCOMMAND);
+		    }
+		}
+		else
+	        {
+#ifdef DEBUG
+		    printf("Open output file\n");
+#endif
+                    xosmsg(new_dst, outdev);
+                    exit(EXIT_BADCOMMAND);
+                }
+            }
+	    output_file_count++;
+	    if (concat_output)
+	    {
+		out_open = TRUE;
+		if (!binary_read && !ascii_read)
+		    ascii_read = TRUE;
+		if (!binary_write && !ascii_write)
+		    ascii_write = TRUE;
+	    }
+// 
+// Save the output device, path, and file names
+//
+	    cp = (uchar *)out_fileparm.spec.buffer;	//  Point to device & path name
+
+            while (*cp != '\0')
+            {
+                switch (*cp)
+                {
+                case FS_XOSNAME:
+                case FS_VOLNAME:
+                case FS_DOSNAME:
+                    cp++;               //  Point to start
+                    i = 0;              //  Index into device string
+                    while (*cp != '\0' && (*cp < FS_MIN || *cp == FS_ESC))
+                    {
+                        if (*cp == FS_ESC)
+                            cp++;
+                        output_device[i++] = *cp++;
+                    }
+                    output_device[i] = '\0';
+                    break;
+            
+		case FS_NODENAME:
+		case FS_NODENUM:
+		case FS_RXOSNAME:
+		case FS_RDOSNAME:
+		case FS_RVOLNAME:
+                case FS_PATHNAME:
+                    cp++;               //  Point to start
+                    i = 0;              //  Index into path string
+		    while (*cp != '\0' && (*cp < FS_MIN || *cp == FS_NODENAME
+            		|| *cp == FS_NODENUM
+                        || *cp == FS_RXOSNAME || *cp == FS_RDOSNAME
+                        || *cp == FS_RVOLNAME || *cp == FS_PATHNAME))
+                    {
+                        if (*cp == FS_ESC)
+                        {
+                            cp++;
+                            output_path[i++] = *cp++;
+                        }
+                        else if (*cp < FS_MIN)
+                            output_path[i++] = *cp++;
+                        else
+                            cp++;
+                    }
+                    output_path[i] = '\0';
+                    break;
+            
+                case FS_FILENAME:
+                    cp++;               //  Point to start
+                    i = 0;              //  Index into name string
+                    while (*cp != '\0' && (*cp < FS_MIN || *cp == FS_ESC))
+                    {
+                        if (*cp == FS_ESC)
+                            cp++;
+                        output_name[i++] = *cp++;
+                    }
+                    output_name[i] = '\0';
+                    break;
+
+                case FS_VERSION:
+                    cp++;
+        
+                    output_name[i++] = ';';
+                    while (*cp != '\0' && *cp < FS_MIN)
+                    {
+                        output_name[i++] = *cp++;
+                    }
+                    output_name[i] = '\0';     //  Make a C string
+                    break;
+
+                default:
+                    fprintf(stderr, "? %s: Bad output prefix value: 0x%X\n",
+                            pib.prgname, (int)*cp);
+		    cp++;		//  Skip bad prefix
+                    while (*cp != '\0' && (*cp < FS_MIN || *cp == FS_ESC))
+                    {
+                        if (*cp == FS_ESC)
+                            cp++;
+                        cp++;
+                    }
+                }
+            }
+	}
+        strmov(strmov(strmov(dst_name, output_device), output_path),
+		output_name);
+
+        strmov(strmov(strmov(src_name, input_device), input_path),
+		input_name);
+
+	//  Print if output file is not controlling terminal
+
+	if ((out_fileparm.devsts.value & DS_CONTROL) == 0 &&
+	    (in_fileparm.devsts.value & DS_CONTROL) == 0)
+	{
+	    if (gcp_dosquirk && !quiet)
+	    {
+                printf("%s\n", input_name);
+	    }
+	    else
+	    {
+            	if (concat_output)
+		    strcpy(arrow, " +> ");
+	    	else
+	            strcpy(arrow, " -> ");
+
+	    	if (verbose || (wild_src && !quiet))
+	    	{
+                    printf("%s%s%s%s%s%s%s  ", input_device, input_path,
+			   input_name, arrow, output_device, output_path,
+			   output_name);
+	    	}
+	    }
+	}
+
+    	in_fileqab.qab_func = QFNC_WAIT|QFNC_INBLOCK;
+	in_fileqab.qab_buffer1 = file_buffer;
+	in_fileqab.qab_parm = NULL;
+    	out_fileqab.qab_func = QFNC_WAIT|QFNC_DIO|QFNC_OUTBLOCK;
+	out_fileqab.qab_buffer1 = file_buffer;
+	out_fileqab.qab_parm = NULL;
+
+//  Check console output state
+	if (!ascii_read)
+	    ascii_read = (in_fileparm.devsts.value & DS_CONTROL) != 0;
+
+	i = 0;
+        do
+        {
+	    in_fileqab.qab_count = copysize;
+
+	    if ((indev = svcIoQueue(&in_fileqab)) < ER_NOERR ||
+		(indev = in_fileqab.qab_error) < ER_NOERR)
+            {
+		if (indev == ER_EOF)
+		    break;
+
+#ifdef DEBUG
+		printf("Reading input file\n");
+#endif
+		error_end();
+        	xosmsg(temp_name, indev);
+        	exit(EXIT_BADCOMMAND);
+            }
+	    size = in_fileqab.qab_amount;
+
+	    if (ascii_read)
+	    {
+		size = 0;
+		cp = (uchar *)file_buffer;
+		//  While not ^Z
+
+		while (*cp != '\x1a' && size < in_fileqab.qab_amount)
+		{
+			size++;
+			cp++;
+		}
+		if (*cp == '\x1a')
+		{
+		    indev = ER_EOF;
+		}
+	    }
+	    out_fileqab.qab_count = size;
+
+	    grandbytecount += size;
+
+	    if ((outdev = svcIoQueue(&out_fileqab)) < ER_NOERR ||
+		(outdev = out_fileqab.qab_error) < ER_NOERR)
+            {
+#ifdef DEBUG
+		printf("Writing output file\n");
+#endif
+		error_end();
+        	xosmsg(temp_name, outdev);
+		if (del_out_file)
+		{
+	            if ((size = svcIoClose(out_fileqab.qab_handle, C_DELETE)) < 0) //  Close our files
+		    {
+#ifdef DEBUG
+	    		printf("Deleting output file\n");
+#endif
+			error_end();
+			xosmsg(dst_name, size);
+		    }
+		}
+        	exit(EXIT_BADCOMMAND);
+            }
+
+    
+            if (out_fileqab.qab_amount != size)         //  Partial write?
+            {                           //  Yes - complain and give up!
+                fprintf(stderr, "\n? %s: Incomplete output, requested = %u,"
+                                " actual = %u\n", pib.prgname, size,
+				in_fileqab.qab_amount);
+                exit(EXIT_IOERR);
+            }
+
+	    if (!gcp_dosquirk && (verbose || (wild_src && !quiet)) &&
+		(out_fileparm.devsts.value & DS_CONTROL) == 0 &&
+		(in_fileparm.devsts.value & DS_CONTROL) == 0)
+	    {
+		printf("\b%c", spin_str[i++]);
+		if (i >= (sizeof(spin_str) - 1))
+		    i = 0;
+	    }
+        } while (indev == ER_NOERR && outdev == ER_NOERR);
+    
+        if (indev != ER_NOERR && indev != ER_EOF)
+        {
+#ifdef DEBUG
+	    printf("Reading input file\n");
+#endif
+	    error_end();
+            xosmsg(src_name, indev);	 //  Stopped by input error?
+            exit(EXIT_BADCOMMAND);
+        }
+
+	if (indev == ER_EOF &&
+	    ascii_write == TRUE &&
+	    concat_output == FALSE)
+	{
+	    out_fileqab.qab_count = 1;
+
+	    grandbytecount++;
+	    *file_buffer = '\x1a';	//  Put ^Z in file
+
+	    if ((outdev = svcIoQueue(&out_fileqab)) < ER_NOERR ||
+	        (outdev = out_fileqab.qab_error) < ER_NOERR)
+            {
+		error_end();
+                xosmsg(temp_name, outdev);
+	        if (del_out_file)
+	        {
+	       	    if ((size = svcIoClose(out_fileqab.qab_handle, C_DELETE)) < 0) //  Close our files
+		    {
+#ifdef DEBUG
+	    		printf("Deleting output file\n");
+#endif
+			error_end();
+			xosmsg(dst_name, size);
+		    }
+		}
+        	exit(EXIT_BADCOMMAND);
+	    }
+	}
+
+	if (!concat_output)
+	{
+            close_fileparm.filattr.value = in_fileparm.filattr.value;
+	    close_fileqab.qab_handle = out_fileqab.qab_handle;
+
+	    if ((size = svcIoQueue(&close_fileqab)) < 0 ||
+	        (size = close_fileqab.qab_error) < 0)
+            {
+#ifdef DEBUG
+		printf("Closing input file\n");
+#endif
+		error_end();
+        	xosmsg(temp_name, size);
+        	exit(EXIT_BADCOMMAND);
+            }
+	}
+
+        if ((size = svcIoClose(in_fileqab.qab_handle, 0)) < 0)
+        {
+#ifdef DEBUG
+	    printf("Closing input file\n");
+#endif
+	    error_end();
+            xosmsg(src_name, size);
+            exit(EXIT_BADCOMMAND);
+        }
+    
+	//  Print if not controlling terminal
+        if ((in_fileparm.devsts.value & DS_CONTROL) == 0)
+	{
+	    if (!gcp_dosquirk && (verbose || (wild_src && !quiet)))
+            {
+        	printf("\b \n");
+            }
+	}
+    }
+
+    if (concat_output)
+    {
+	if (ascii_write == TRUE)
+	{
+	    out_fileqab.qab_count = 1;
+
+	    grandbytecount++;
+	    *file_buffer = '\x1a';	//  Put ^Z in file
+
+	    if ((outdev = svcIoQueue(&out_fileqab)) < ER_NOERR ||
+	        (outdev = out_fileqab.qab_error) < ER_NOERR)
+            {
+#ifdef DEBUG
+		printf("Open output file\n");
+#endif
+                xosmsg(temp_name, outdev);
+	        if (del_out_file)
+	        {
+	       	    if ((size = svcIoClose(out_fileqab.qab_handle, C_DELETE)) < 0) //  Close our files
+		    {
+#ifdef DEBUG
+	    		printf("Delete output file\n");
+#endif
+			xosmsg(dst_name, size);
+		    }
+		}
+        	exit(EXIT_BADCOMMAND);
+	    }
+	}
+        if ((size = svcIoClose(out_fileqab.qab_handle, 0)) < 0) //  Close our files
+        {
+#ifdef DEBUG
+	    printf("Close output file\n");
+#endif
+            xosmsg(dst_name, size);
+            exit(EXIT_BADCOMMAND);
+        }
+    }
+    filenum -= skipcount;       //  Don't count skipped files
+
+    xabrk(start_brk);
+}
+
+//********************************
+// Function to proces QUIET option
+//********************************
+
+int optquiet(
+    arg_data *subopt)
+
+{
+    quiet = (int)subopt->data;
+    verbose = !(int)subopt->data;
+    return (TRUE);
+}
+
+//*******************************
+// Function to proces SORT option
+//*******************************
+
+int optsort(
+    arg_data *subopt)
+
+{
+    do_sort = (int)subopt->data;
+    return (TRUE);
+}
+
+//********************************
+// Function to proces START option
+//********************************
+
+int optstart(
+    arg_data *subopt)
+
+{
+    strcpy(start_from, subopt->val.s);
+    return (TRUE);
+}
+
+//*********************************
+// Function to proces TOTALS option
+//*********************************
+
+int opttotals(
+     arg_data *subopt)
+
+{
+    if ((subopt->flags & ADF_XSVAL) == 0)
+	return (TRUE);
+
+    switch ((int)subopt->val.n)
+    {
+    case 0:	//  BYTES
+            total_bytes = TRUE;
+	    break;
+
+    case 1:	//  FILES
+            total_files = TRUE;
+	    break;
+
+    case 2:	//  RATE
+            rate = TRUE;
+	    break;
+
+    case 3:	//  NOBYTES
+            total_bytes = FALSE;
+	    break;
+
+    case 4:	//  NOFILES
+            total_files = FALSE;
+	    break;
+
+    case 5:	//  NORATE
+            rate = FALSE;
+	    break;
+
+    default:
+            fprintf(stderr, "? %s: Invalid TOTALS option value, %d\n",
+                pib.prgname, subopt->val.n);
+            exit(EXIT_INVSWT);
+    }
+    return (TRUE);
+}
+
+//**********************************
+// Function to proces VERBOSE option
+//**********************************
+
+int optverbose(
+    arg_data *subopt)
+
+{
+    verbose = (int)subopt->data;
+    quiet = !(int)subopt->data;
+    return (TRUE);
+}
+
+//*********************************
+// Function to proces VERIFY option
+//*********************************
+
+int optverify(
+    arg_data *subopt)
+
+{
+    verify = (int)subopt->data;
+    return (TRUE);
+}
+
+//**********************************
+// Function to process BEFORE option
+//**********************************
+
+#if     0                               // FIXME!
+
+int optbefore(
+    arg_data *arg)
+
+{
+    if (dt_parse(arg->val.s, &before_time))
+    	printf("Couldn't parse >%s<\n", arg->val.s);
+    return (TRUE);
+}
+
+#endif
+
+//*********************************
+// Function to proces BINARY option
+//*********************************
+
+int optbinary(
+    arg_data *subopt)
+
+{
+    if (!destination_seen)    
+    {
+	ascii_write = ascii_read = !(subopt->data);	//  Switch before source file
+	binary_write = binary_read = (int)subopt->data;
+    }
+    else
+    {
+	ascii_write = !(subopt->data);	//  Switch after source file
+	binary_write = (int)subopt->data;
+    }
+    return (TRUE);
+}
+
+//***************************************
+// Function to process BUFFER size option
+//***************************************
+
+int optbuffer(
+    arg_data *subopt)
+
+{
+    copysize = ((subopt->val.n + BLOCK_SIZE - 1) / BLOCK_SIZE) * BLOCK_SIZE;
+    if (copysize < 512)
+    {
+        fprintf(stderr, "\n? %s: Buffer size (%d) is too small\n",
+		pib.prgname, copysize);
+        exit(EXIT_MALLOC);
+    }
+    return (TRUE);
+}
+
+//*********************************
+// Function to process SINCE option
+//*********************************
+
+#if     0                               // FIXME!
+
+int optsince(arg_data *arg)
+{
+    if (dt_parse(arg->val.s, &since_time))
+    	printf("Couldn't parse >%s<\n", arg->val.s);
+    return (TRUE);
+}
+
+#endif
+
+
+//****************************************************
+// filescan
+// scan a file directory for matching entries with the
+//  specified file type
+//****************************************************
+
+struct fndretrn *filescan(
+    char  *filename,
+    uint   mode,
+    struct fndretrn *prev)
+{
+    int i;                      //  Index for string arrays
+    long dirdev;                //  Directory handle
+    struct fndretrn *fndchn;    //  Current block to fill
+    struct fndretrn  *fndret;   //  First block in chain of blocks
+    uchar *cp;	          //  Character pointer
+    char   temp_name[FILESPCSIZE];//  Temp buffer for file name
+    char   temp_mask[FILESPCSIZE];
+    long   src_device_len;
+    long   src_path_len;
+    uchar  chr;
+
+    type_qab dirqab =
+    {
+        QFNC_WAIT|QFNC_OPEN,	// qab_func
+        0,			// qab_status
+        0,			// qab_error
+        0,			// qab_amount
+        0,			// qab_handle
+        0,			// qab_vector
+        0,	        	// qab_level    - Signal level for direct I/O
+        0,  			// qab_prvlevel - Previous signal level (int.)
+        O_ODF,			// qab_option
+        0,			// qab_count
+        NULL, 0,		// qab_buffer1
+        NULL, 0,		// qab_buffer2
+        NULL, 0			// qab_parm
+    };
+
+    dir_openparm.spec.buffer = dir_searchparm.spec.buffer = xasbrk(SIZE);
+    dir_searchparm.srcattr.value = mode;//  Set our search mode
+					//  Set our return string options
+    fndchn = 0;				//  Make sure we start with no blocks
+    fndret = 0;				//  Ditto
+
+    src_device[0] = '\0';
+    src_path[0] = '\0';
+    temp_mask[0] = '\0';
+
+    dirqab.qab_buffer1 = filename;
+    cp = (uchar *)dir_openparm.spec.buffer;	//  Point to device & path name
+    *cp = '\0';				//  In case we don't get a string
+
+    dirqab.qab_parm = &dir_openparm;
+#ifdef DEBUG
+    printf("filename = %s\n", filename);
+#endif
+    if ((dirdev = svcIoQueue(&dirqab)) < 0 || (dirdev = dirqab.qab_error) < 0)
+    {
+#ifdef DEBUG
+	printf("Scanning directory\n");
+	printf("dirdev = %ld\n", dirdev);
+#endif
+        xosmsg(filename, dirdev);
+	error_output = TRUE;
+        return (prev);
+    }
+
+    dir_searchparm.dirhndl.value = dirqab.qab_handle;
+					//  Use the directory handle to scan
+    dirqab.qab_parm = &dir_searchparm;
+
+// 
+// Save the device and path name
+//
+    if (*cp == FS_XOSNAME || *cp == FS_VOLNAME|| *cp == FS_DOSNAME)
+    {
+        cp++;				//  Point to start
+        cpnt = src_device;		//  Index into path string
+        while ((chr = *cp) != '\0' && (chr < FS_MIN || chr == FS_ESC))
+        {
+            cp++;
+            if (chr == FS_ESC)
+                chr = *cp++;
+            *cpnt++ = chr;
+        }
+        *cpnt = '\0';
+	src_device_len = cpnt - src_device + 1;
+    }
+
+    if (*cp == FS_NODENAME || *cp == FS_NODENUM
+            || *cp == FS_RXOSNAME || *cp == FS_RDOSNAME || *cp == FS_RVOLNAME
+            || *cp == FS_PATHNAME)
+    {
+        cp++;				//  Point to start
+        cpnt = src_path;		//  Point to path string
+        while (*cp != '\0' && (*cp < FS_MIN || *cp == FS_NODENAME
+            || *cp == FS_NODENUM || *cp == FS_RXOSNAME
+            || *cp == FS_RDOSNAME || *cp == FS_RVOLNAME || *cp == FS_PATHNAME))
+        {
+            if (*cp == FS_ESC)
+            {
+                cp++;
+                *cpnt++ = *cp++;
+            }
+            else if (*cp < FS_MIN)
+                *cpnt++ = *cp++;
+            else
+                cp++;
+        }
+        *cpnt = '\0';
+	src_path_len = cpnt - src_path + 1;
+    }
+    cp = (uchar *)dir_searchparm.spec.buffer;	//  Point to device & path name
+    *cp = '\0';				//  In case we don't get a string
+    dirqab.qab_func = QFNC_WAIT|QFNC_DEVPARM;
+    dirqab.qab_option = O_REPEAT;
+    do
+    {
+        if ((rtn = svcIoQueue(&dirqab)) < 0 || (rtn = dirqab.qab_error) < 0)
+        {
+            if (rtn == ER_FILNF && (src_recurse || fndret != NULL))
+                break;
+            if (rtn != ER_FILNF || !src_recurse)
+                xosmsg(filename, rtn);
+            if ((rtn = svcIoClose(dir_searchparm.dirhndl.value, 0)) < 0)
+                xosmsg("", rtn);        //  Must close the open directory
+            return (prev);
+        }
+        cp = (uchar *)dir_searchparm.spec.buffer;
+                                    //  Point to device and path name
+
+// 
+// Save the device and path and file name
+//
+        while (*cp != '\0')
+        {
+            switch (*cp)
+            {
+            case FS_XOSNAME:
+            case FS_DOSNAME:
+            case FS_VOLNAME:
+                cp++;			//  Point to start
+                cpnt = src_device;	//  Point to device string
+                while ((chr = *cp) != '\0' && (chr < FS_MIN || chr == FS_ESC))
+                {
+                    cp++;
+                    if (chr == FS_ESC)
+                        chr = *cp++;
+                    *cpnt++ = chr;
+                }
+                *cpnt = '\0';
+		src_device_len = cpnt - src_device + 1;
+                break;
+
+	    case FS_NODENAME:
+	    case FS_NODENUM:
+	    case FS_RXOSNAME:
+	    case FS_RDOSNAME:
+	    case FS_RVOLNAME:
+            case FS_PATHNAME:
+                cp++;			//  Point to start
+                cpnt = src_path;	//  Point to path string
+		while (*cp != '\0' && (*cp < FS_MIN || *cp == FS_NODENAME
+            	    || *cp == FS_NODENUM
+                    || *cp == FS_RXOSNAME || *cp == FS_RDOSNAME
+                    || *cp == FS_RVOLNAME || *cp == FS_PATHNAME))
+                {
+                    if (*cp == FS_ESC)
+                    {
+                        cp++;
+                        *cpnt++ = *cp++;
+                    }
+                    else if (*cp < FS_MIN)
+                        *cpnt++ = *cp++;
+                    else
+                        cp++;
+                }
+                *cpnt = '\0';
+		src_path_len = cpnt - src_path + 1;
+                break;
+
+            case FS_FILENAME:
+                cp++;
+                cpnt = temp_name;
+                while ((chr = *cp) != '\0' && (chr < FS_MIN || chr == FS_ESC))
+                {
+                    cp++;
+                    if (chr == FS_ESC)
+                    	chr = *cp++;
+                    *cpnt++ = chr;
+                }
+		if (*cp == FS_VERSION)
+		{
+                    cp++;
+
+                    *cpnt++ = ';';
+                    while ((chr = *cp) != '\0' && (chr < FS_MIN ||
+                            chr == FS_ESC))
+                    {
+                        cp++;
+                	if (chr == FS_ESC)
+                            chr = *cp++;
+                	*cpnt++ = chr++;
+                    }
+		}
+                *cpnt = '\0';		//  Make a C string
+		i = (int)(cpnt - temp_name) + 2; //  Add 2 one for null and
+						 //   one for possible \
+
+                if (fndchn == 0)
+                {
+                    fndret=xasbrk(sizeof(struct fndretrn) +
+				  i + src_device_len + src_path_len);
+                                            //  Start the beginning ptr
+                    fndchn=fndret;  //  Start the first block
+                }
+                else
+                {
+                    fndchn->next=xasbrk(sizeof(struct fndretrn) +
+				  i + src_device_len + src_path_len);
+                    fndchn=fndchn->next;//  Make this the new end of list
+                }
+
+		fndchn->device = (char *)fndchn + sizeof(struct fndretrn);
+                strcpy(fndchn->device, src_device);
+		fndchn->path = fndchn->device + (int)src_device_len;
+                strcpy(fndchn->path, src_path);
+		fndchn->name = fndchn->path + (int)src_path_len;
+                strcpy(fndchn->name, temp_name);
+		fndchn->mask = "";
+                fndchn->next = prev;		//  initialize link
+                break;
+    
+            case FS_ATTR:
+                fndchn->filattr = *++cp; //  Store the attribute
+//  Must handle second attribute byte
+                cp++;                   //  Skip to next byte
+                cp++;                   //  Skip to next byte
+                if ((fndchn->filattr & A_DIRECT) != 0)
+		{
+                    strcat(fndchn->name, "\\");
+		}
+                break;
+    
+            default:
+                fprintf(stderr, "? %s: Bad input prefix value: 0x%X\n",
+                        pib.prgname, *cp);
+		cp++;		//  Skip bad prefix
+                while ((chr = *cp) != '\0' && (chr < FS_MIN || chr == FS_ESC))
+                {
+                    if (chr == FS_ESC)
+                        cp++;
+                    cp++;
+                }
+            }
+        }
+    } while (dirqab.qab_amount & 0x80000000L);
+
+    if (dirdev < 0 && (dirdev != ER_FILNF ||
+                (!src_recurse && fndret == 0)))
+        xosmsg(filename, dirdev);
+
+    if ((rtn = svcIoClose(dir_searchparm.dirhndl.value, 0)) < 0)
+    {
+#ifdef DEBUG
+	    printf("Closing driectory\n");
+#endif
+            xosmsg(filename, rtn);            //  Must close the open directory
+    }
+
+    if (fndret == 0)
+        return (prev);
+    else
+        return (fndret);
+} 
+ 
+
+//*****************************************************
+//  src_filesetup - setup a single file name for a copy
+//*****************************************************
+
+struct fndretrn *src_filesetup(char *filename)
+{
+    struct fndretrn  *fndret;   //  First block in chain of blocks
+    struct fndretrn  *fndtmp;	//  Pointer into new list of names
+    char *cp, *cp1, *cp2, *cp3;       //  Character pointer
+
+    fndret = NULL;
+
+    cp3 = filename;
+
+    while (*cp3 != '\0')
+    {
+// 
+// Check if concatinating input files
+//
+	cp = cp3;
+
+	if ((cp3 = strpbrk(cp, "+")) != NULL)
+	{
+            concat_output = TRUE;
+	    do_sort = FALSE;
+	    *cp3 = '\0';		//  Terminate this name
+	    cp3++;			//  Point to next name
+	}
+	else
+	    cp3 = cp + strlen(cp);	//  Point to NULL to end loop
+
+// 
+// Save the device and path name
+//
+	if ((cp1 = strrchr(cp, ':')) != NULL)
+	{
+            *strnmov(src_device, cp, (size_t)(cp1 - cp) + 1) = 0;
+            cp1++;
+	}
+	else
+            cp1 = cp;
+
+
+	if ((cp2 = strrchr(cp1, '\\')) != NULL || (cp2 = strrchr(cp1, ']')) != NULL)
+            *strnmov(src_path, cp1, (size_t)(cp2 - cp1) + 1) = 0;
+	else
+            cp2 = cp1;
+
+	if (fndret == NULL)
+	{
+            fndret=xasbrk(sizeof(struct fndretrn));
+                                        //  Start the beginning ptr
+	    fndtmp = fndret;
+	}
+	else
+	{
+            fndtmp->next=xasbrk(sizeof(struct fndretrn));
+                                        //  Start the beginning ptr
+	    fndtmp = fndtmp->next;
+	}
+	fndtmp->next = NULL;
+	fndtmp->mask = xasbrk(1);
+	fndtmp->mask[0] = '\0';
+
+	fndtmp->device = xasbrk(strlen(src_device) + 1);
+	strcpy(fndtmp->device, src_device);
+	fndtmp->path = xasbrk(strlen(src_path) + 1);
+	strcpy(fndtmp->path, src_path);
+
+	fndtmp->name = xasbrk(FILESPCSIZE);
+	if ((cp2 = strrchr(cp1, '\\')) != NULL || (cp2 = strrchr(cp1, ']')) != NULL)
+            strcpy(fndtmp->name, cp2 + 1);
+	else
+            strcpy(fndtmp->name, cp1);
+    }
+
+    return (fndret);
+} 
+
+//***************************************
+// comp
+// compare two filenames in the structure
+//***************************************
+int comp(const void *a, const void *b)
+{
+    char *afile, *bfile;
+
+    afile = (*(struct fndretrn **)a)->name;
+    bfile = (*(struct fndretrn **)b)->name;
+
+    return (strcmp(afile, bfile));
+}
+
+//***************************
+// dorecurse
+// do recursive list of files
+//***************************
+void dorecurse(char fqfile[], char *dst)
+{
+    int     i;				// A counter
+    int     filenum;			// number of files found
+    uchar  *cp;				// misc character pointer
+    char    nextfile[FILESPCSIZE];	// File name buffer
+    char    src_newpath[FILESPCSIZE];	// Path name buffer
+    char    dst_newpath[FILESPCSIZE];	// Path name buffer
+    char    new_dst[FILESPCSIZE];	// File name buffer
+    struct  fndretrn **sortarry;	// pointer to array of pointers
+    struct  fndretrn *fndtmp;		// temp pointer
+    struct  fndretrn *newfiles;		// New dirs to do?
+    void  *start_brk;			// Starting break value
+
+    start_brk = xasbrk(0);
+    filenum = 0;
+
+// Build base source path string
+    strcpy(nextfile, src_device);       // Get source file device
+    strcat(nextfile, src_path);         // Get source file path
+    strcpy(src_newpath, nextfile);
+    strcat(nextfile, wildcard);
+
+// Build base destination path string
+    strcpy(dst_newpath, output_device);	// Get destination file device
+    strcat(dst_newpath, output_path);	// Get destination file path
+    strcpy(new_dst, dst_newpath);
+
+    newfiles = filescan(nextfile, A_DIRECT, NULL);
+#ifdef DEBUG
+    if (error_output)
+	printf("Scanning for Directories\n");
+#endif
+    if (newfiles == NULL)
+        return;
+
+    fndtmp = newfiles;
+    filenum = 0;
+    while (fndtmp != NULL)
+    {
+        filenum++;
+        fndtmp = fndtmp->next;
+    }
+#ifdef DEBUG
+    printf("filenum = %d\n", filenum);
+    printf("dst = %s\n", dst);
+#endif
+
+    sortarry = xasbrk(sizeof(char *) * filenum);
+
+    fndtmp = newfiles;
+    for (i = 0; i < filenum; i++)
+    {
+        sortarry[i] = fndtmp;
+        fndtmp = fndtmp->next;
+    }
+
+    qsort((void *)sortarry, (size_t)filenum,
+        (size_t)sizeof(void *), comp);
+
+    for (i = 0; i < filenum; i++)
+    {
+        if (((sortarry[i]->filattr & A_DIRECT) != 0) &&
+                (strcmp(sortarry[i]->name, ".\\") != 0) &&
+                (strcmp(sortarry[i]->name, "..\\") != 0))
+        {
+#ifdef DEBUG
+printf("sortarry[%d]->name = %s\n", i, sortarry[i]->name);
+#endif
+            strcpy(nextfile, src_newpath);
+            strcat(nextfile, sortarry[i]->name);
+            if (((cp = (uchar *)strrchr(fqfile, '\\')) == NULL) &&
+                ((cp = (uchar *)strrchr(fqfile, ']'))  == NULL) &&
+                ((cp = (uchar *)strrchr(fqfile, ':'))  == NULL))
+            {
+                strcat(nextfile, fqfile);
+            }                   // pointer to file name to find
+            else
+            {
+                if (cp[1] == '\0')
+                {
+                    strcat(nextfile, wildcard);
+                }
+                else
+                {
+                    strcat(nextfile, (char *)++cp);
+                }
+            }
+
+            fndtmp = filescan(nextfile, (A_NORMAL | A_DIRECT), 0);
+#ifdef DEBUG
+	    printf("nextfile = %s\n", nextfile);
+	    if (error_output)
+		printf("Scanning for Files 2\n");
+#endif
+
+            strcpy(new_dst, dst_newpath);
+            if (dst_recurse)
+                strcat(new_dst, sortarry[i]->name);
+        
+            if (((cp = (uchar *)strrchr(dst, '\\')) == NULL) &&
+                ((cp = (uchar *)strrchr(dst, ']'))  == NULL) &&
+                ((cp = (uchar *)strrchr(dst, ':'))  == NULL))
+            {
+                strcat(new_dst, dst);
+            }                   // pointer to file name to find
+            else
+            {
+                if (cp[1] == '\0')
+                {
+                    strcat(new_dst, wildcard);
+                }
+                else
+                {
+                    strcat(new_dst, (char *)++cp);
+                }
+            }
+
+            if (fndtmp)
+	    {
+#ifdef DEBUG
+		printf("new_dst = %s\n", new_dst);
+#endif
+                dofilecopy(fndtmp, new_dst);
+                        // Start printing matching files
+	    }
+            dorecurse(nextfile, new_dst);
+        }
+    }
+
+    xabrk(start_brk);			// Reset back to the beginning
+    return;
+}
+
+//***********************
+// interr
+// Internal error printer
+//***********************
+void interr(void)
+{
+    fprintf(stderr, "? %s: Internal error - string parse failure\n",
+            pib.prgname);
+    exit(EXIT_INTERR);
+}
+
+//************************************************
+// xasbrk
+// Get memory in sbrk style using a separate MSECT
+//************************************************
+void *xasbrk(long size)
+{
+    void *ptr;
+
+#ifdef DBUG
+    fprintf(stderr, "DBUG - xasbrk requested %d\n", size);
+#endif
+    if (size != 0)
+	ptr = sbrk((int)size);
+    else
+	ptr = sbrk(1);		//  Till we find bug in sbrk
+#ifdef DBUG
+    fprintf(stderr, "DBUG - xasbrk returned with %lx\n", ptr);
+#endif //  DEBUG
+    return (ptr);
+}
+
+//******
+// xabrk
+// Restore memory in brk style using a separate MSECT
+//******
+int xabrk(void *ptr)
+{
+    void *tptr;
+
+#ifdef DBUG
+    fprintf(stderr, "DBUG - xabrk called with %lx\n", ptr);
+#endif //  DEBUG
+
+    tptr = brk(ptr);
+    if (tptr == 0)
+	return (-1);
+
+    return (0);
+}
+
+//***************************************
+// xosmsg
+// Function to display XOS error messages
+//***************************************
+
+void xosmsg(arg, code)
+char *arg;
+long  code;
+
+{
+    char buffer[80];            //  Buffer to receive error message
+
+    svcSysErrMsg(code, 3, buffer);     //  Get error message
+    fprintf(stderr, "\n? %s: %s", pib.prgname, buffer); //  Output error message
+    if (*arg != '\0')                   //  Have returned name?
+        fprintf(stderr, "; %s\n", arg);
+    else
+        fprintf(stderr, "\n");
+    error_output = TRUE;
+}
+
+//******************************************
+// report
+// Function to report number of files copied
+//******************************************
+
+void report(void)
+{
+    long xfertime[2];
+    long d;
+
+    if (total_files || total_bytes || rate)
+        printf("        ");
+
+    if (total_files)
+        printf("%ld file%s copied", output_file_count,
+		(output_file_count==1)? "": "s");
+
+    if (total_files && total_bytes)
+        printf(", ");
+
+    if (total_bytes)
+        printf("%lu bytes", grandbytecount);
+
+    if (total_files && rate || total_bytes && rate)
+        printf(", ");
+
+    if (rate)
+    {
+	d = stop_time.time - start_time.time;
+	if (grandbytecount != 0 && d != 0)
+	{
+	    longdiv(xfertime, grandbytecount, XT_SECOND, d);
+	}
+        else
+            xfertime[0] = 0;
+	printf("(%lu Bytes/Sec)", xfertime[0]);
+    }
+    printf("\n");
+}
+
+//*************************************
+// nonopt
+// Function to process non-option input
+//*************************************
+int nonopt(
+    char *arg)
+
+{
+    uchar *cp, *cp2;    //  misc character pointers
+
+    pnt = arg;
+    if (!source_seen)
+    {
+        source_seen = TRUE;
+        strcat(source_file, pnt);   //  copy file name to find
+
+        if ((cp = (uchar *)strstr(source_file, "...\\")) != NULL)
+        {
+            strcpy((char *)cp, ((char *)cp + 4));
+            src_recurse = TRUE;
+        }
+        if (strpbrk(source_file, "*?") != NULL)
+            wild_src = TRUE;
+    }
+    else if (!destination_seen)
+    {
+	if (*pnt == '+')		//  More source string to read
+	{
+            source_seen = TRUE;
+            strcat(source_file, pnt);   //  copy file name to find
+
+            if ((cp = (uchar *)strstr(source_file, "...\\")) != NULL)
+            {
+            	strcpy((char *)cp, ((char *)cp + 4));
+            	src_recurse = TRUE;
+            }
+            if (strpbrk(source_file, "*?") != NULL)
+            	wild_src = TRUE;
+	    if (strcmp(pnt, "+") == 0)
+		source_seen = FALSE;
+	    return (TRUE);
+	}
+
+        destination_seen = TRUE;
+        strcpy(destination_file, pnt);   //  copy file name to find
+        if ((cp = (uchar *)strstr(destination_file, "...\\")) != NULL)
+        {
+            if (!src_recurse)
+            {
+                fprintf(stderr, "%s: Cannot use '...' in destination filename\n",
+                        pib.prgname);
+                exit(EXIT_BADCOMMAND);
+            }
+            strcpy((char *)cp, ((char *)cp + 4));
+            dst_recurse = TRUE;
+        }
+        if ((cp = (uchar *)strrchr(pnt, ':')) != NULL)
+        {
+            strncpy(output_device, pnt, (size_t)((char *)cp - pnt) + 1);
+            cp++;
+	    if (*cp == '\0')
+	    {
+        	strcat(destination_file, wildcard); //  Add wildcard name
+	    }
+        }
+        else
+            cp = (uchar *)pnt;
+
+        if ((cp2 = (uchar *)strrchr((char *)cp, '\\')) != NULL ||
+                (cp2 = (uchar *)strrchr((char *)cp, ']')) != NULL)
+        {
+            strncpy(output_path, (char *)cp, (size_t)(cp2 - cp) + 1);
+	    if (*(++cp2) == '\0')
+        	strcat(destination_file, wildcard); //  Add wildcard name
+        }
+
+        if ((cp = (uchar *)strstr(output_path, "...\\")) != NULL)
+            strcpy((char *)cp, ((char *)cp + 4));
+    }
+    else
+    {
+        fprintf(stderr, "\n? %s: Invalid number of files specified\n", pib.prgname);
+        opthelp();
+        exit(EXIT_INVSWT);
+    }
+    return (TRUE);
+}
+
+//*********************************************
+// error_end
+// Print error at end of file string, if needed
+//*********************************************
+void error_end(void)
+{
+    //  Print if not controlling terminal
+    if ((in_fileparm.devsts.value & DS_CONTROL) == 0)
+    {
+        if (!gcp_dosquirk && (verbose || (wild_src && !quiet)))
+        {
+       	    printf("\b - Error\n");
+        }
+    }
+}
+
+//********************************************************
+// Function: init_vars - Initialize the program info block
+// Returned: none
+//********************************************************
+init_vars(char *name)
+{
+// Set program defaults
+    source_seen = FALSE;        //  Start with no file names
+    destination_seen = FALSE;   //  Start with no file names
+    src_recurse = FALSE;        //  Do all lower source subdirectories
+    dst_recurse = FALSE;        //  Do all lower destination subdirectories
+    totonly = FALSE;            //  List totals only, no file names
+    prtacross = TRUE;           //  Print across on short listing
+    wild_src = FALSE;           //  Assume wildcard on output
+    wildcard = "*.*";           //  wildcard filename
+                                //   and subdirectories
+    copysize = CPYSIZE;         //  Set the Size of the copy buffer
+
+    source_file = xasbrk(FILESPCSIZE);
+                                //  Build our source file buffer
+    destination_file = xasbrk(FILESPCSIZE);
+                                //  Build our destination file buffer
+
+    in_fileparm.spec.buffer = xasbrk(SIZE);
+    out_fileparm.spec.buffer = xasbrk(SIZE);
+
+    sprintf(envname,"^XOS^%s^OPT",strupper(name));
+
+// set Program Information Block variables
+    pib.opttbl=options; 		// Load the option table
+    pib.majedt = 3; 			// major edit number
+    pib.minedt = 1; 			// minor edit number
+    pib.copymsg="";
+    pib.prgname=strupper(name);
+    pib.build=__DATE__;
+    pib.desc="This program will copy one or more files from most standard devices.";
+    pib.example="{{/}{-}option{=sub}} {...\\}source1{+sourcen} {...\\}destination";
+    pib.errno=0;
+    getHelpClr();
+    getTrmParms();
+};

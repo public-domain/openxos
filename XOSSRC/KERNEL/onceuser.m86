@@ -1,0 +1,708 @@
+	.TITLE	ONCEUSER - XOS once-only real mode code
+
+;++++
+; This software is in the public domain.  It may be freely copied and used
+; for whatever purpose you see fit, including commerical uses.  Anyone
+; modifying this software may claim ownership of the modifications, but not
+; the complete derived code.  It would be appreciated if the authors were
+; told what this software is being used for, but this is not a requirement.
+
+;   THIS SOFTWARE IS PROVIDED BY THE AUTHORS "AS IS" AND ANY EXPRESS OR
+;   IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
+;   OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+;   IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+;   INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+;   BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS
+;   OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+;   ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR
+;   TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
+;   USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+;----
+
+	.PROC	80486
+	.INCLUD	XOSINC:\XMAC\XOS.PAR
+	.INCLUD	XOSINC:\XMAC\XOSX.PAR
+	.INCLUD	XOSINC:\XMAC\PCAT.PAR
+
+DEBUG_INIT=!0			;Do not include code for debugging INIT process
+
+	ONCE
+
+sos=!icode-400h			;Define offset for the code/data segment
+
+;Following is copied to user space for the initial process on the system
+
+	.MOD	4
+icode::	CALL	opencon			;Open the console
+	PUSHL	#0.B			;Define XOSSYS: = OORDSK:
+	PUSHL	#0.B
+	PUSHL	DS
+	PUSHL	#nxossys-sos
+	PUSHL	DS
+	PUSHL	#doordsk-sos
+	CALLF	svcIoDefLog#
+	TESTL	EAX, EAX
+	JNS	2$.S			;If OK
+	MOVL	ECX, #ilnmsg1-sos	;If error
+	MOVL	EDX, #iermsg2-sos
+	CALL	onceerr
+	JMP	icode.S			;Keep trying!!
+
+;First we read the BOOT.CFG file which contains a list of the LKEs to load
+;  and programs to execute
+
+2$:	PUSHL	#O$IN.B			;Open the configuration file
+	PUSHL	DS
+	PUSHL	#nboot-sos
+	PUSHL	#0.B
+	PUSHL	#0.B
+	CALLF	svcIoOpen#
+	TESTL	EAX, EAX
+	JS	4$.S			;If error
+	PUSHL	EAX			;Read the configuration file
+	PUSHL	EAX
+	PUSHL	DS
+	PUSHL	#namelist-sos
+	PUSHL	#512t
+	CALLF	svcIoInBlock#
+	TESTL	EAX, EAX
+	JNS	6$.S			;Go on if OK
+4$:	MOVL	ECX, #cfgmsg1-sos	;If error
+	MOVL	EDX, #iermsg2-sos
+	CALL	onceerr
+	JMP	2$			;Keep trying!!
+
+6$:	PUSHL	#0.B			;Close the configuration file
+	CALLF	svcIoClose#
+
+;Next we load all of the LKEs and execute all of the programs in the RAM-disk.
+;  Each is loaded without any characteristics
+
+	CALL	loadlkes
+.PAGE
+;Now we change the logical names to the final operational definitions.  The
+;  base definition is obtained from the definition of the XOSDIR: name.
+
+stuplgl:PUSHL	#0.B			;Get the definition for XOSDIR:
+	PUSHL	#0.B
+	PUSHL	DS
+	PUSHL	#nxosdir-sos
+	PUSHL	#0.B
+	PUSHL	#0.B
+	PUSHL	DS
+	PUSHL	#dxosdir-sos
+	PUSHL	#64t.B
+	PUSHL	#0.B
+	PUSHL	#0.B
+	CALLF	svcIoFindLog#
+	TESTL	EAX, EAX
+	JS	26$
+	ANDL	EAX, #7Fh.B
+	LEAL	EDI, dxosdir-sos[EAX]
+	MOVL	EBX, #bootname-sos	;Copy the device name up through the
+	MOVL	ESI, #dxosdir-sos	;  colon
+	CLD
+4$:	LODSB	[ESI]
+	MOVB	[EBX], AL
+	INCL	EBX
+	CMPB	AL, #':'
+	JNE	4$.S
+	CMPB	dxosdir+1-sos, #'F'	;Booting from a "floppy" disk?
+	JNE	10$.S			;No - go on
+	MOVB	[EBX], #0		;Yes - must find the actual name to use
+	CALL	chkdev2			;Do we really have Fn:?
+	JNS	20$			;Yes - use it
+	MOVB	AL, #'D'		;No - do we really have Dn:?
+	CALL	chkdev
+	JNS	20$			;Yes - use it
+	MOVL	EDX, #nbdmsg-sos	;No - fail
+8$:	CALL	onceer2
+	JMP	icode
+
+;Here if not a floppy disk
+
+10$:	CMPW	dxosdir+1-sos, #'D9'	;Is this an unspecified CDROM?
+	JNE	20$.S			;No
+
+;Here if have a CDROM boot disk but the BIOS did not tell us which unit it 
+;  was - we check disks D0 through D3 and use the first one which is a CDROM
+
+	MOVB	chkname+1-sos, #'0'
+12$:	PUSHL	#O$RAW|O$NOMOUNT
+	PUSHL	DS
+	PUSHL	#chkname-sos
+	PUSHL	#0.B
+	PUSHL	#0.B
+	CALLF	svcIoOpen#
+	TESTL	EAX, EAX
+	JS	16$.S
+	PUSHL	EAX
+	PUSHL	#0.B
+	PUSHL	EAX
+	PUSHL	DS
+	PUSHL	#chkchar-sos
+	CALLF	svcIoDevChar#
+	TESTL	EAX, EAX
+	JS	14$.S
+	CMPL	chktype-sos, #'Cdrm'
+	JE	18$.S
+14$:	CALLF	svcIoClose
+16$:	INCB	chkname+1-sos
+	CMPB	chkname+1-sos, #'3'
+	JBE	12$.S
+	MOVL	EDX, #ncdmsg-sos
+	JMP	8$.S
+
+;Here with the first CDROM
+
+18$:	MOVB	AL, chkname+1-sos	;Fix up the name
+	MOVB	dxosdir+2-sos, AL
+	MOVB	bootname+2-sos, AL
+
+;Here with the boot disk - See if it is a SCSI disk - We don't really have a
+;  good way to determine this since we don't know how to find out from the
+;  BIOS if we are booting for a SCSI disk.  We check to see if the SCSI
+;  device class exists, if it does we assume we are booting from a SCSI
+;  disk.  This is reasonable, since the only time SCSICLS should be loaded
+;  from the RAM-disk is when booting from a SCSI disk.
+
+20$:	PUSHL	DS
+	PUSHL	#scsicls-sos
+	PUSHL	DS
+	PUSHL	#nulllst-sos
+	CALLF	svcIoClsChar#
+	TESTL	EAX, EAX
+	JS	22$.S
+	MOVB	dxosdir+1-sos, #'S'	;Have SCSI boot disk - fix up the name
+	MOVB	bootname+1-sos, #'S'
+22$:	PUSHL	#0.B			;Define XOSDEV:
+	PUSHL	#0.B
+	PUSHL	DS
+	PUSHL	#nxosdev-sos
+	PUSHL	DS
+	PUSHL	#bootname-sos
+	CALLF	svcIoDefLog#
+	TESTL	EAX, EAX
+	JS	24$.S
+	PUSHL	#0.B			;Define Z:
+	PUSHL	#0.B
+	PUSHL	DS
+	PUSHL	#nz-sos
+	PUSHL	DS
+	PUSHL	#bootname-sos
+	CALLF	svcIoDefLog#
+	TESTL	EAX, EAX
+	JS	24$.S
+	MOVB	[EDI], #0
+	MOVL	EBX, #nxosdir-sos	;Redefine XOSDIR:
+	CALL	define
+	JS	24$.S
+	MOVL	[EDI], #'SYS\'
+	MOVL	EBX, #nxossys-sos	;Define XOSSYS:
+	CALL	define
+24$:	JS	26$.S
+	MOVL	[EDI], #'CFG\'
+	MOVL	EBX, #nxoscfg-sos	;Define XOSCFG:
+	CALL	define
+	JS	26$.S
+	MOVL	[EDI], #'CMD\'
+	MOVL	EBX, #nxoscmd-sos	;Define XOSCMD:
+	CALL	define
+	JS	26$.S
+	MOVL	[EDI], #'ACT\'
+	MOVL	EBX, #nxosact-sos	;Define XOSACT:
+	CALL	define
+	JS	26$.S 
+	PUSHL	#0.B			;Define CMD:
+	PUSHL	#0.B
+	PUSHL	DS
+	PUSHL	#ncmd-sos
+	PUSHL	DS
+	PUSHL	#dcmd-sos
+	CALLF	svcIoDefLog#
+	TESTL	EAX, EAX
+	JNS	setpart.S
+26$:	MOVL	ECX, #logmsg1-sos	;Here if have error defining logical
+	MOVL	EDX, #iermsg2-sos	;  names
+	CALL	onceerr
+	JMP	stuplgl			;Keep trying!!
+.PAGE
+setpart:PUSHL	#0.B			;Now open D0 to set up partitions (this
+	PUSHL	DS			;  will fail quietly if we don't have a
+	PUSHL	#idev0-sos		;  D0)
+	PUSHL	#0.B
+	PUSHL	#0.B
+	CALLF	svcIoDevParm#
+	PUSHL	#0.B			;Then open D1 to set up partitions
+	PUSHL	DS
+	PUSHL	#idev1-sos
+	PUSHL	#0.B
+	PUSHL	#0.B
+	CALLF	svcIoDevParm#
+
+;When we get here, we should have the boot mass storage device completely
+;  set up.  Now we load the console display LKEs and initialize the console
+;  display.
+
+	MOVL	EAX, #'XOSC'
+	MOVL	lkeprog+0-sos, EAX
+	MOVL	prgname+0-sos, EAX
+	MOVW	AX, #'MD'
+	MOVW	lkeprog+4-sos, AX
+	MOVW	prgname+4-sos, AX
+	CALL	loadlkes
+	PUSHL	conhndl-sos		;Get the current cursor position from
+	PUSHL	#0.B			;  the once-only display driver (this
+	PUSHL	#0.B			;  is a kludge unique to OOCD0:!)
+	PUSHL	#-1.B
+	CALLF	svcIoOutBlock#
+	MOVW	curpos-sos, AX
+	PUSHL	conhndl-sos		;Save handle for once-only console
+	MOVL	conname+0-sos, #'_TRM'	;  device
+	MOVL	conname+4-sos, #'0S1:'	;Open the real console device
+	CALL	opencon
+	PUSHL	conhndl-sos		;Map the first page of the screen buffer
+	PUSHL	DS
+	PUSHL	#10000h
+	PUSHL	#1000h
+	PUSHL	#0.B
+	CALLF	svcTrmMapScrn#
+	PUSHL	DS			;Allocate a 4K buffer
+	PUSHL	#11000h
+	PUSHL	#PG$READ|PG$WRITE.B
+	PUSHL	#1000h
+	CALLF	svcMemChange#
+	MOVL	ESI, #10000h		;Copy the current screen contents
+	MOVL	EDI, #11000h
+	PUSHL	DS
+	POPL	ES
+	CLD
+	MOVL	ECX, #400h
+	RMOVSL	[EDI], [ESI]
+	PUSHL	conhndl-sos		;Clear the display
+	PUSHL	#1.B
+	PUSHL	#0.B
+	PUSHL	#0.B
+	CALLF	svcTrmDspMode#
+	MOVL	ESI, #11000h		;Restore the screen contents
+	MOVL	EDI, #10000h
+	CLD
+	MOVL	ECX, #400h
+	RMOVSL	[EDI], [ESI]
+	PUSHL	conhndl-sos		;Restore the cursor position
+	PUSHL	#0.B
+	PUSHL	#0.B
+	PUSHL	#0.B
+	PUSHL	DS
+	PUSHL	#curparm-sos
+	CALLF	svcIoOutBlockP#
+	PUSHL	DS			;Unmap the display screen
+	PUSHL	#10000h
+	PUSHL	#0.B
+	PUSHL	#0.B
+	CALLF	svcMemChange#
+	PUSHL	DS			;Give up the buffer
+	PUSHL	#11000h
+	PUSHL	#0.B
+	PUSHL	#0.B
+	CALLF	svcMemChange#
+	PUSHL	conhndl-sos
+	PUSHL	#0.B
+	CALLF	svcIoClose#
+	PUSHL	#0.B			;Close the once-only console device
+	CALLF	svcIoClose#		;  - since this is the last close this
+					;  will cause the driver to remove
+					;  itself from the system
+
+;Next we give up all of the once-only exec code and data.  We do this by opening
+;  the OORDSK: device and closing it with C$ONCEONLY set.
+
+	PUSHL	#O$PHYS
+	PUSHL	DS
+	PUSHL	#anyfile-sos
+	PUSHL	#0.B
+	PUSHL	#0.B
+	CALLF	svcIoOpen#
+	PUSHL	EAX
+	PUSHL	#C$ONCEONLY
+	CALLF	svcIoClose#
+
+;Finally, we replace this code witn INIT
+
+2$:	CLRL	EAX
+	MOVL	conhndl-sos, EAX
+	PUSHL	DS			;Now load INIT
+	PUSHL	#initqab-sos
+	CALLF	svcIoRun#
+	TESTL	EAX, EAX		;If get here, something is wrong - did
+	JNE	14$.S			;  the request get queued?
+	MOVL	EAX, initqab-sos+qab_error ;Yes - get error code
+14$:	MOVL	ECX, #iermsg1-sos
+	MOVL	EDX, #iermsg2-sos
+	CALL	onceerr
+	JMP	2$.S			;Keep trying!!
+.PAGE
+;Subroutine to define logical name
+;	c{EBX} = Offset of name string
+;	CALL	define
+;	S:set = Error
+;	  c{EAX} = Error code
+;	S:clr = Normal
+
+define:	PUSHL	#0.B
+	PUSHL	#40000000h
+	PUSHL	DS
+	PUSHL	EBX
+	PUSHL	DS
+	PUSHL	#dxosdir-sos
+	CALLF	svcIoDefLog#
+	TESTL	EAX, EAX
+	RET
+.PAGE
+;Subroutine to load LKEs and execute programs
+;	CALL	loadlkes
+
+loadlkes:
+	MOVL	ESI, cfgpnt-sos
+	PUSHL	DS
+	POPL	ES
+	CLD
+loadlp:	CMPB	[ESI], #'-'		;Should we skip this one?
+	JE	skipname		;Yes
+	CMPB	[ESI], #'$'		;No - is this a program to run?
+	JE	runprog			;Yes
+	MOVW	prgtail-sos, #'L '	;No - its an LKE to load
+	MOVL	EDI, #prgtail-sos+2
+	MOVL	ECX, #33t
+	CLRL	EDX
+4$:	LODSB	[ESI]
+	CMPB	AL, #CR
+	JE	4$.S
+	CMPB	AL, #0
+	JE	6$.S
+	CMPB	AL, #'#'
+	JE	8$.S
+	CMPB	AL, #LF
+	JE	10$.S
+	STOSB	[EDI]
+	JMP	4$.S
+
+6$:	DECL	ESI
+8$:	MOVL	cfgpnt-sos, ESI
+	RET
+
+;Here at end of name
+
+10$:	CMPL	EDI, #prgtail-sos+2	;Blank line?
+	JE	loadlp.S		;Yes - ignore it
+	MOVB	[EDI], #0		;Store final null
+	MOVL	prgqab-sos+qab_buffer1, #lkeprog-sos
+	PUSHL	DS			;Run LKELOAD
+	PUSHL	#prgqab-sos
+	CALLF	svcIoRun#
+	TESTL	EAX, EAX
+	JS	14$.S			;If error
+	MOVL	EAX, prgqab+qab_error-sos
+	TESTL	EAX, EAX
+	JS	14$.S
+	CMPL	prgqab+qab_amount-sos, #TC_EXIT<24t ;OK - was LKELOAD sucessful?
+	JNE	14$.S			;No
+	MOVL	cfgpnt-sos, ESI		;Yes - update configuration list pointer
+12$:	JMP	loadlkes		;Continue
+
+;Here if error running LKELOAD
+
+14$:	MOVL	ECX, #lkemsg1-sos	;If error
+loaderr:MOVL	EDX, #iermsg2-sos
+	CALL	onceerr
+	JMP	12$.S
+.PAGE
+;Here if we want to skip this name
+skipname:
+	LODSB	[ESI]
+	CMPB	AL, #LF
+	JE	4$.S
+	CMPB	AL, #0
+	JNE	skipname
+4$:	JMP	loadlp
+.PAGE
+;Here if have a program to run
+
+runprog:MOVL	EDI, #prgnm2-sos
+	INCL	ESI
+	MOVL	ECX, #31t
+2$:	LODSB	[ESI]
+	CMPB	AL, #CR
+	JE	2$.S
+	CMPB	AL, #0
+	JE	6$
+	CMPB	AL, #LF
+	JE	8$.S
+	STOSB	[EDI]
+	JMP	2$.S
+
+;Here at end of name
+
+6$:	DECL	ESI
+8$:	CMPL	EDI, #prgnm2-sos	;Blank line?
+	JE	loadlp			;Yes - ignore it
+	MOVL	[EDI], #'.RUN'
+	MOVB	4.B[EDI], #0		;Store final null
+	MOVL	prgtail-sos, #'xxx'	;Store dummy command tail
+	MOVL	prgqab-sos+qab_buffer1, #prgname-sos
+	PUSHL	DS			;Run LKELOAD
+	PUSHL	#prgqab-sos
+	CALLF	svcIoRun#
+	TESTL	EAX, EAX
+	JS	10$.S			;If error
+	MOVL	EAX, prgqab+qab_error-sos
+	TESTL	EAX, EAX
+	JS	10$.S
+	CMPL	prgqab+qab_amount-sos, #TC_EXIT<24t ;OK - was the program
+						    ;   sucessful?
+	JNE	12$.S			;No
+	MOVL	cfgpnt-sos, ESI		;Yes - update configuration list pointer
+	JMP	loadlkes		;Continue
+
+;Here if error running LKELOAD
+
+10$:	MOVL	ECX, #prgmsg1-sos	;If error
+	JMP	loaderr
+
+;Here if the program failed
+
+12$:	MOVL	EDX, #iermsg2-sos
+	JMP	onceer2.S
+.PAGE
+;Subroutine to display error message
+;	c{EAX} = Error code
+;	c{ECX} = Offset of first message string
+;	c{EDX} = Offset of second message string
+;	CALL	onceerr
+
+onceerr:MOVB	ierbufr-sos, #0		;Clear first byte in case no error
+	TESTL	EAX, EAX		;Do we have an error to report?
+	JGE	2$.S			;No
+	PUSHL	EAX			;Yes - get error message string
+	PUSHL	#3.B
+	PUSHL	DS
+	PUSHL	#ierbufr-sos
+	CALLF	svcSysErrMsg#
+2$:	CMPL	conhndl-sos, #0.B	;Do we have the console now?
+	JNE	4$.S			;Yes
+	CALL	opencon			;No - get it now
+4$:	PUSHL	conhndl-sos		;Display the first message string
+	PUSHL	DS
+	PUSHL	ECX
+	PUSHL	#0.B
+	CALLF	svcIoOutString#
+	TESTL	EAX, EAX
+	JS	6$.S
+	CMPB	ierbufr-sos, #0		;Do we have an error message string?
+	JE	onceer2.S		;No
+	PUSHL	conhndl-sos		;Yes - display it
+	PUSHL	DS
+	PUSHL	#ierbufr-sos
+	PUSHL	#0.B
+	CALLF	svcIoOutString#
+	TESTL	EAX, EAX
+	JS	6$.S
+onceer2:PUSHL	conhndl-sos		;Display the second message string
+	PUSHL	DS
+	PUSHL	EDX
+	PUSHL	#0.B
+	CALLF	svcIoOutString#
+	TESTL	EAX, EAX
+	JS	6$.S
+	PUSHL	conhndl-sos
+	PUSHL	DS
+	PUSHL	#ierbufr-sos		;Wait for him to tell us to go on!
+	PUSHL	#10t.B
+	CALLF	svcIoInBlock#
+6$:	PUSHL	conhndl-sos		;Display a new-line
+	PUSHL	DS
+	PUSHL	#crlfmsg-sos
+	PUSHL	#0.B
+	CALLF	svcIoOutString#
+	RET
+.PAGE
+;Subroutine to check for existance of the boot device
+;	c(AL) = First letter of device name
+;	CALL	chkdev
+;	S:set = Error
+;	S:clr = Normal
+
+chkdev:	MOVB	bootname+1-sos, AL
+	MOVB	dxosdir+1-sos, AL
+chkdev2:PUSHL	#O$PHYS
+	PUSHL	DS
+	PUSHL	#bootname-sos
+	PUSHL	#0.B
+	PUSHL	#0.B
+	CALLF	svcIoDevParm#
+	TESTL	EAX, EAX
+	RET
+
+;Subroutine to open the console device
+;	CALL	opencon
+
+opencon:PUSHL	#O$IN|O$OUT|O$PHYS
+	PUSHL	DS
+	PUSHL	#conname-sos
+	PUSHL	#0.B
+	PUSHL	#0.B
+	CALLF	svcIoOpen#
+	TESTL	EAX, EAX
+	JS	6$.S			;If can't!
+	MOVL	conhndl-sos, EAX
+	MOVL	dvhin-sos, EAX
+	MOVL	dvhout-sos, EAX
+	MOVL	dvherr-sos, EAX
+	MOVL	dvhtrm-sos, EAX
+	RET
+
+;Here if can't open the console - just exit!!
+
+6$:	PUSHL	#1.B
+	CALLF	svcSchExit#
+.PAGE
+	.MOD	4
+cfgpnt: .LONG	namelist-sos
+
+chkname:.ASCIZ	"D0:"
+
+chkchar:DCHAR	UNITTYPE, GET, TEXT, 4
+chktype:.LONG	0
+	.BYTE	0
+
+;QAB for running programs
+
+	.MOD	4
+prgqab:	.WORD	RFNC_RUN|RFNC$WAIT	;qab_func
+	.WORD	0			;qab_status
+	.LONG	0			;qab_error
+	.LONG	0			;qab_amount
+	.LONG	0			;qab_handle
+	.BYTE	0, 0, 0, 0		;qab_vector
+	.LONG	R$CHILDTERM		;qab_option
+	.LONG	0			;qab_count
+	.LONG	prgname-sos, 0Fh	;qab_buffer1
+	.LONG	0, 0			;qab_buffer2
+	.LONG	prgparm-sos, 0Fh	;qab_parm
+
+;Parameter list for running programs
+
+prgparm:.BYTE	PAR$SET|REP_STR, SIZE_LNGSTR
+	.WORD	IOPAR_RUNCMDTAIL
+	.LONG	prgtail-sos, 0Fh
+	.WORD	PRGARGSZ, PRGARGSZ
+	.BYTE	PAR$SET|REP_STR, SIZE_LNGSTR
+	.WORD	IOPAR_RUNDEVLIST
+	.LONG	devlist-sos, 0Fh
+	.WORD	DLARGSZ, DLARGSZ
+	.BYTE	0
+
+lkeprog:.ASCIZ	"OORDSK:LKELOAD.RUN"
+prgname:.ASCII	"OORDSK:"
+prgnm2:	.BLKB	40t
+
+	.MOD	4
+prgtail:.BLKB	64t
+PRGARGSZ=!$-prgtail
+
+devlist:
+dvhin:!	.LONG	0, DH_STDIN , O$IN      , 0
+dvhout:!.LONG	0, DH_STDOUT, O$OUT     , 0
+dvherr:!.LONG	0, DH_STDERR, O$OUT     , 0
+dvhtrm:!.LONG	0, DH_STDTRM, O$IN|O$OUT, 0
+	.LONG	0
+DLARGSZ=!$-devlist
+
+conhndl:.LONG	0			;Handle for console device
+
+;QAB for running INIT
+
+	.MOD	4
+initqab:.WORD	RFNC_RUN|RFNC$WAIT	;qab_func
+	.WORD	0			;qab_status
+	.LONG	0			;qab_error
+	.LONG	0			;qab_amount
+	.LONG	0			;qab_handle
+	.BYTE	0, 0, 0, 0		;qab_vector
+	.LONG	R$SAMEPROC		;qab_option
+	.LONG	0			;qab_count
+	.LONG	rfile-sos, 0Fh		;qab_buffer1
+	.LONG	0, 0			;qab_buffer2
+	.LONG	rparm-sos, 0Fh		;qab_parm
+
+;Parameter list for running INIT
+
+rparm:	.BYTE	PAR$SET|REP_STR, SIZE_LNGSTR
+	.WORD	IOPAR_RUNCMDTAIL
+	.LONG	iarg-sos, 0Fh
+	.WORD	IARGSZ, IARGSZ
+	.BYTE	0
+
+dskname:.ASCIZ	"DISK:"
+idev0:	.ASCIZ	"_D0:"
+idev1:	.ASCIZ	"_D1:"
+
+rfile:
+;	.ASCIZ	"XOSCMD:GECKO.RUN"	;Program to run
+	.ASCIZ	"XOSSYS:INIT.RUN"
+conname:.ASCIZ	"_OOCD0:"{0}
+
+iarg:	.ASCII	"GECKO XOSSYS:INIT"
+IARGSZ=!$-iarg
+
+;Parameter list for setting display cursor position
+
+curparm: .BYTE	PAR$SET|REP_HEXV, 2
+	 .WORD	IOPAR_TRMCURPOS
+curpos:	 .WORD	0
+nulllst: .BYTE	0
+
+nxosdir: .ASCIZ "XOSDIR:"
+nxossys: .ASCIZ "XOSSYS:"
+nxoscfg: .ASCIZ "XOSCFG:"
+nxoscmd: .ASCIZ "XOSCMD:"
+nxosact: .ASCIZ	"XOSACT:"
+nxoslib: .ASCIZ "XOSLIB:"
+nxosinc: .ASCIZ	"XOSINC:"
+nxosdev: .ASCIZ	"XOSDEV:"
+ncmd:	 .ASCIZ	"CMD:"
+nz:	 .ASCIZ	"Z:"
+nboot:	 .ASCIZ "OORDSK:BOOT.CFG"
+anyfile: .ASCIZ "OORDSK:*.*"
+dcmd:	 .ASCIZ "XOSCMD:"
+doordsk: .ASCIZ "OORDSK:"
+scsicls: .ASCIZ "SCSI:"
+
+ilnmsg1: .ASCII	{CR,LF}"? KERNEL: Error defining initial logical name"
+crlfmsg: .ASCIZ	{CR,LF}"          "
+cfgmsg1: .ASCII	{CR,LF}"? KERNEL: Error reading initialization configuration "
+	 .ASCIZ	"file (OORDSK:BOOT.CFG)"{CR,LF}"          "
+lkemsg1: .ASCIZ	{CR,LF}"? KERNEL: Error running LKELOAD"{CR,LF}"          "
+prgmsg1: .ASCIZ	{CR,LF}"? KERNEL: Error running program"{CR,LF}"          "
+ncdmsg:  .ASCIZ {CR,LF}"? KERNEL: Could not find CDROM boot device"{CR,LF}
+logmsg1: .ASCII	{CR,LF}"? KERNEL: Error while defining system logical names"
+	 .ASCIZ	{CR,LF}"          "
+iermsg1: .ASCII	{CR,LF}"? KERNEL: Cannot load system initialization program"
+	 .ASCIZ	" (XOSSYS:INIT.RUN)"{CR,LF}"          "
+nbdmsg:  .ASCII {CR,LF}"? KERNEL: INTERNAL ERROR - Cannot access boot device"
+iermsg2: .ASCIZ	{CR,LF,CR,LF}"Type <ENTER> to try again "
+isymsg1: .ASCII	{CR,LF}"? KERNEL: Error creating exported symbol file"
+	 .ASCII	" (XOSSYS:INIT.RUN)"
+	 .ASCIZ	{CR,LF}"          "
+isymsg2: .ASCII	{CR,LF,CR,LF}"Type <ENTER> to continue (the system will be "
+	 .ASCIZ	"unable to load LKEs)"
+ierbufr: .BLKB	80t
+bootname:.BLKB	16t
+dxosdir: .BLKB	68t
+
+	.MOD	4
+namelist:.BLKB  512t
+
+icodeend::!
+
+	END

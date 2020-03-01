@@ -1,0 +1,568 @@
+	.TITLE	PCNTEST
+
+;++++
+; This software is in the public domain.  It may be freely copied and used
+; for whatever purpose you see fit, including commerical uses.  Anyone
+; modifying this software may claim ownership of the modifications, but not
+; the complete derived code.  It would be appreciated if the authors were
+; told what this software is being used for, but this is not a requirement.
+
+;   THIS SOFTWARE IS PROVIDED BY THE AUTHORS "AS IS" AND ANY EXPRESS OR
+;   IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
+;   OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+;   IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+;   INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+;   BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS
+;   OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+;   ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR
+;   TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
+;   USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+;----
+
+	.PROC	80386
+	.INCLUD	XOSINC:\XMAC\XOS.PAR
+	.INCLUD	XOSINC:\XMAC\XOSTRM.PAR
+	.INCLUD	XOSINC:\XMAC\XOSERR.PAR
+	.INCLUD	XOSINC:\XMAC\XOSNET.PAR
+	.INCLUD	XOSINC:\XMAC\PROCARG.PAR
+	.INCLUD	XOSINC:\XMAC\STDIO.PAR
+	.INCLUD	XOSINC:\XMAC\CTYPE.PAR
+
+	.STDSEGS
+
+dspbuffer=!300000h		;Offset for display buffer
+BUFSIZE  =!8t			;Size of display buffer (pages)
+
+IV_PINPUT =!27t
+IV_TINPUT =!28t
+
+	.EXTERN	$mainx
+
+	.PSECT	_odata_p
+
+argmsect:.LONG	0
+
+helpstr:.ASCIZ "HELP"
+
+keyword:.LONG	helpstr , 0, 0, fnchelp , 0
+	.LONG	0
+
+	.SBTTL	Start of program
+
+	.PSECT	_ocode_p
+
+main::	PUSHL	DS			;Change our process name
+	PUSHL	#ourname
+	CALLF	svc_syssetpname#
+	MOVL	ESI, 4.B[ESP]		;Get offset of argument msect
+	MOVL	argmsect, ESI
+	PUSHL	#reqpid
+	PUSHL	ESI
+	CALL	getreqpid#		;Process requestor PID argument
+	ADDL	ESP, #8.B
+	MOVL	EBX, #badpidmsg
+	TESTL	EAX, EAX		;Error?
+	JE	fail1			;Yes
+	MOVL	argpntr, EAX		;No - store argument offset for procarg
+	PUSHL	#0.B			;No default extension for indirect file
+	PUSHL	#0.B			;No next line function
+	PUSHL	#argerr			;Error function
+	PUSHL	#0.B			;Function called for non-keyword args
+	PUSHL	#keyword		;Offset of keyword table
+	PUSHL	#0.B			;Offset of option table
+	PUSHL	#PAF$INDIRECT|PAF$EATQUOTE ;Flag bits
+	PUSHL	#argpntr		;Offset of arg string pointer
+	CALL	procarg#		;Process arguments
+	ADDL	ESP, #32t.B
+	PUSHL	DS			;Give up the argument data
+	PUSHL	argmsect
+	PUSHL	#0.B
+	PUSHL	#0.B
+	CALLF	svc_memchange#
+.PAGE
+;Here with all command line processing done
+
+cmddone:PUSHL	#O$OUT.B		;Open the PCN server side device
+	PUSHL	DS
+	PUSHL	#pcnname
+	PUSHL	#0.B
+	PUSHL	#0.B
+	CALLF	svc_ioopen#
+	MOVL	EBX, #pcopnerm
+	TESTL	EAX, EAX
+	JS	fail2
+	MOVL	pcndev, EAX
+	MOVL	sdfqab+qab_handle, EAX
+	MOVL	pinputqab+qab_handle, EAX
+	PUSHL	#IV_PINPUT.B		;Set PCN input done vector
+	PUSHL	#84h
+	PUSHL	CS
+	PUSHL	#srvpcninput
+	CALLF	svc_schsetsivect#
+	MOVL	EBX, #sivfmsg
+	TESTL	EAX, EAX
+	JS	fail2
+	PUSHL	#IV_TINPUT.B		;Set terminal input done vector
+	PUSHL	#84h
+	PUSHL	CS
+	PUSHL	#srvtrminput
+	CALLF	svc_schsetsivect#
+	TESTL	EAX, EAX
+	JS	fail2.S
+	PUSHL	DS			;Create the buffer msect
+	PUSHL	#dspbuffer
+	PUSHL	#PG$READ|PG$WRITE.B
+	PUSHL	#4096t*BUFSIZE*2
+	CALLF	svc_memchange#
+	MOVL	EBX, #dbufmerm
+	TESTL	EAX, EAX
+	JS	fail2.S
+	PUSHL	DS			;Tell the device about the buffer
+	PUSHL	#sdfqab
+	CALLF	svc_ioqueue#
+	MOVL	EBX, #dbufserm
+	TESTL	EAX, EAX
+	JS	fail2.S
+	MOVL	EAX, sdfqab+qab_error
+	TESTL	EAX, EAX
+	JS	fail2.S
+	MOVL	EDI, #finmsg1		;Send final response message
+	MOVL	ECX, #finsz1
+	CALL	response
+	PUSHL	DS
+	PUSHL	#_ODATABASE		;Give up the once-only data msect
+	PUSHL	#0.B
+	PUSHL	#0.B
+	CALLF	svc_memchange#
+	PUSHL	CS			;Set up arguments to give up the
+	PUSHL	#_CODEBASE		;  once-only code (the actual call
+	PUSHL	#0.B			;  is done at ready since this area
+	PUSHL	#main-_CODEBASE		;  will be given up!)
+	JMP	ready
+.PAGE
+;Here if have fatal error during set up
+;	c{EBX} = Offset of first message string
+;	c{EAX} = Offset of second message string or negative error code
+
+fail1::	CLRL	EAX
+fail2::	SUBL	ESP, #500t		;Allocate a buffer
+	PUSHL	DS
+	POPL	ES
+	MOVL	EDI, ESP
+	PUSHL	EAX			;Save second item
+	MOVL	ESI, #failmsg1
+	MOVL	ECX, #failsz1
+	CLD
+	RMOVSB	[EDI], [ESI]
+	MOVL	ESI, EBX
+2$:	LODSB	[ESI]
+	STOSB	[EDI]
+	TESTB	AL, AL
+	JNE	2$.S
+	DECL	EDI
+	POPL	EAX
+	TESTL	EAX, EAX		;Have a second message line?
+	JE	8$.S			;No
+	MOVL	ESI, #failmsg2		;Yes
+	MOVL	ECX, #failsz2
+	RMOVSB	[EDI], [ESI]
+	TESTL	EAX, EAX		;Is second line a string?
+	JNS	4$.S			;Yes - go on
+	PUSHL	EAX			;No - its an error code - get message
+	PUSHL	#3.B
+	PUSHL	DS
+	PUSHL	EDI
+	CALLF	svc_syserrmsg#
+	ADDL	EDI, EAX
+	JMP	8$.S
+
+;Here if second line specified as a string
+
+4$:	MOVL	ESI, EAX
+6$:	LODSB	[ESI]
+	STOSB	[EDI]
+	TESTB	AL, AL
+	JNE	6$.S
+	DECL	EDI
+8$:	MOVL	ESI, #failmsg3
+	MOVL	ECX, #failsz3
+	RMOVSB	[EDI], [ESI]
+	MOVL	ECX, EDI
+	SUBL	ECX, ESP
+	MOVL	EDI, ESP
+	CALL	response
+	PUSHL	#1.B
+	CALLF	svc_schexit#
+
+;Here if can't get memory during set up
+
+nema:	MOVL	EBX, #nemamsg
+	JMP	fail1.S
+.PAGE
+	.SBTTL	argerr - Function called by procarg on errors
+
+;Function called by procarg on errors
+
+argerr:	POPL	EAX			;Discard return address
+	POPL	EBX			;Get offset of first message string
+	POPL	EAX			;Get offset of second message string
+	JMP	fail2.S
+.PAGE
+	.SBTTL	fnchelp - Function to process HELP keyword
+
+;Function to process the HELP keyword
+
+fnchelp:
+
+	PUSHL	#0.B
+	CALLF	svc_schexit#
+.PAGE
+	.SBTTL	getimem - Subroutine to allocate memory during set up
+
+;Subroutine to allocate memory during set up
+;	c{EAX} = Amount needed
+;	CALL	getimem
+;	c{EDI} = Offset of memory obtained
+
+getimem::
+	PUSHL	EAX
+	CALL	sbrk#
+	POPL	EDI
+	CMPL	EAX, #-1.B
+	JE	4$.S
+	MOVL	EDI, EAX
+	RET
+
+4$:	MOVL	EBX, #nemamsg
+	JMP	fail1
+.PAGE
+	.SBTTL	response - Subroutine to generate response message
+
+;Subroutine to generate response message
+;	c{EDI} = Offset of message
+;	c{ECX} = Length of message
+;	CALL	response
+
+response::
+	CMPL	reqpid, #0.B		;Running from a terminal?
+	JNE	2$.S			;No - go on
+	INCL	EDI			;Yes - output message to the terminal
+	DECL	ECX
+	PUSHL	#DH_STDERR.B
+	PUSHL	DS
+	PUSHL	EDI
+	PUSHL	ECX
+	CALLF	svc_iooutblock#
+	PUSHL	#DH_STDERR.B
+	PUSHL	DS
+	PUSHL	#crlfmsg
+	PUSHL	#0.B
+	CALLF	svc_iooutstring#
+	RET
+
+;Here if not running from a terminal - send response message to requestor
+
+2$:	CMPL	msgqab+qab_handle, #0.B	;Is the message device open?
+	JNE	4$.S			;Yes - us it
+	PUSHL	#O$IN|O$OUT		;No - must open it now
+	PUSHL	DS
+	PUSHL	#msgname
+	PUSHL	#0.B
+	PUSHL	#0.B
+	CALLF	svc_ioopen#
+	TESTL	EAX, EAX
+	JS	ret010.S
+	MOVL	msgqab+qab_handle, EAX
+4$:	MOVL	msgqab+qab_buffer1, EDI	;Store offset of message
+	MOVL	msgqab+qab_count, ECX	;Store length of message
+	PUSHL	DS
+	PUSHL	#msgqab
+	CALLF	svc_ioqueue#
+ret010:	RET
+.PAGE
+	.SBTTL	Main program loop
+
+	.PSECT	_code_p
+
+;Here with all initialization complete
+
+ready::	CALLF	svc_memchange#		;Give up the once-only code
+	PUSHL	DS			;Start pseudo-console input
+	PUSHL	#pinputqab
+	CALLF	svc_ioqueue#
+	TESTL	EAX, EAX
+	JS	pinperr.S
+
+	PUSHL	#DH_STDTRM.B		;Put terminal into full scan code
+	PUSHL	#0.B			;  input mode
+	PUSHL	#0.B
+	PUSHL	#0.B
+	PUSHL	DS
+	PUSHL	#trmxiparms
+	CALLF	svc_ioinblockp#
+
+	PUSHL	DS			;Start terminal input
+	PUSHL	#tinputqab
+	CALLF	svc_ioqueue#
+	TESTL	EAX, EAX
+	JS	tinperr.S
+
+;;;;;;	PUSHL	#O$CREATE|O$TRUNCA|O$OUT
+;;;;;;	PUSHL	DS
+;;;;;;	PUSHL	#debugname
+;;;;;;	PUSHL	#0.B
+;;;;;;	PUSHL	#0.B
+;;;;;;	CALLF	svc_ioopen#
+;;;;;;	MOVL	debugdev, EAX
+
+;;;;;;;;;;;;;;;;;;
+
+	PUSHL	#0.B			;Set software interrupt level to 0
+	CALLF	svc_schsetsilvl#	;  to allow interrupts
+mainloop:
+	PUSHL	#0.B			;Wait for interrupt
+	PUSHL	#0.B
+	PUSHL	#-1.B
+	CALLF	svc_schsuspend#
+
+pinperr:PUSHL	#DH_STDTRM.B
+	PUSHL	DS
+	PUSHL	#pinpermsg
+	JMP	4$.S
+
+tinperr:PUSHL	#DH_STDTRM.B
+	PUSHL	DS
+	PUSHL	#tinpermsg
+4$:	PUSHL	#0.B
+	CALLF	svc_iooutstring#
+	PUSHL	#1.B
+	CALLF	svc_schexit#
+.PAGE
+	.SBTTL	srvpcninput
+
+2$:	POPAL
+	CALLF	svc_schdismiss#
+
+;Here for input done interrupt for the pseudo-console device
+
+srvpcninput::
+	PUSHAL
+4$:	TESTB	pinputqab+qab_status+1, #QSTS$DONE>8
+	JE	2$.S
+	MOVL	ESI, #pinpbufr		;Point to input buffer
+6$:	DECL	pinputqab+qab_amount	;Have any more input?
+	JS	8$.S			;No
+	MOVB	AL, [ESI]		;Yes - get character
+	INCL	ESI	
+;;;;;;	PUSHL	debugdev
+;;;;;;	PUSHL	EAX
+	PUSHL	#DH_STDTRM.B		;Display it
+	PUSHL	EAX
+	CALLF	svc_iooutsingle#
+;;;;;;	CALLF	svc_iooutsingle#
+	JMP	6$.S			;Continue
+
+;Here if no more input to process
+
+8$:	MOVB	pinputqab+qab_vector, #0
+	PUSHL	DS
+	PUSHL	#pinputqab
+	CALLF	svc_ioqueue#
+	TESTL	EAX, EAX
+	JS	10$.S
+	MOVB	pinputqab+qab_vector, #IV_PINPUT
+	JMP	4$.S
+
+;Here if error starting input
+
+10$:	HLT
+.PAGE
+	.SBTTL	srvtrminput
+
+2$:	POPAL
+	CALLF	svc_schdismiss#
+
+;Here for input done interrupt for the terminal device
+
+srvtrminput::
+	PUSHAL
+4$:	TESTB	tinputqab+qab_status+1, #QSTS$DONE>8
+	JE	2$.S
+	SHRL	tinputqab+qab_amount, #2
+	MOVL	ESI, #tinpbufr		;Point to input buffer
+	MOVL	EDI, #poutbufr
+	CLD
+6$:	DECL	tinputqab+qab_amount	;Have any more input?
+	JS	8$.S			;No
+	LODSL	[ESI]			;Yes - get character
+	MOVB	[EDI], AH
+	INCL	EDI
+	JMP	6$.S			;Continue
+
+;Here if no more input to process
+
+8$:	MOVL	ECX, EDI
+	SUBL	ECX, #poutbufr
+	JE	10$.S
+	PUSHL	pinputqab+qab_handle
+	PUSHL	DS
+	PUSHL	#poutbufr
+	PUSHL	ECX
+	CALLF	svc_iooutblock#
+	TESTL	EAX, EAX
+	JS	outerr.S
+10$:	MOVB	tinputqab+qab_vector, #0
+	PUSHL	DS
+	PUSHL	#tinputqab
+	CALLF	svc_ioqueue#
+	TESTL	EAX, EAX
+	JS	14$.S
+	MOVB	tinputqab+qab_vector, #IV_TINPUT
+	JMP	4$.S
+
+;Here if error starting input
+
+14$:	HLT
+
+outerr:	PUSHL	#DH_STDTRM.B
+	PUSHL	DS
+	PUSHL	#outermsg
+	PUSHL	#0.B
+	CALLF	svc_iooutstring#
+	PUSHL	#1.B
+	CALLF	svc_schexit#
+.PAGE
+	.SBTTL	Data
+
+	.PSECT	_data_p
+
+	   .MOD   4
+prgname::  .ASCIZ "PCNTEST"
+pcopnerm:  .ASCIZ "Cannot open pseudo-console device"
+dbufmerm:  .ASCIZ "Cannot allocate memory for display buffer"
+dbufserm:  .ASCIZ "Error setting up display buffer"
+pinpermsg: .ASCIZ "? PCNTEST: Error starting pseudo-console input"{CR,LF}
+tinpermsg: .ASCIZ "? PCNTEST: Error starting terminal input"{CR,LF}
+outermsg:  .ASCIZ "? PCNTEST: Error doing pseudo-console output"{CR,LF}
+pcnname:   .ASCIZ "PCN1:"
+debugname: .ASCIZ "DEBUG.TXT"
+
+	   .MOD   4
+pcndev:    .LONG  0
+debugdev:  .LONG  0
+
+trmxiparms:.BYTE  PAR$SET|REP_HEXV, 4
+	   .WORD  IOPAR_CINPMODE
+	   .LONG  0FFFFFFFEh
+	   .BYTE  PAR$SET|REP_HEXV, 4
+	   .WORD  IOPAR_SINPMODE
+	   .LONG  TIM$IMAGE|TIM$SCNALL
+	   .BYTE  0
+
+	   .MOD   4
+sdfparms:  .BYTE  PAR$SET|REP_TEXT, 4
+	   .WORD  IOPAR_CLASS
+	   .LONG  'PCN'
+	   .BYTE  0
+
+	   .MOD   4
+sdfqab:	   .WORD  QFNC$WAIT|QFNC_SPECIAL
+				;qab_func    = 0.  - Function
+	   .WORD  0		;qab_status  = 2.  - Returned status
+	   .LONG  0		;qab_error   = 4.  - Error code
+	   .LONG  0		;qab_amount  = 8.  - Amount transfered
+	   .LONG  0		;qab_handle  = 12. - Device handle
+	   .BYTE  0		;qab_vector  = 16. - Vector for interrupt
+	   .BYTE  0, 0, 0	;Reserved
+	   .LONG  PCSF_SETBUF	;qab_option  = 20. - Option bits
+	   .LONG  BUFSIZE	;qab_count   = 24. - Size of buffer
+	   .LONG  dspbuffer, !_data_p
+				;qab_buffer1 = 28. - Pointer to data buffer
+	   .LONG  0, 0		;qab_buffer2 = 36. - Not used
+	   .LONG  sdfparms, !sdfparms
+				;qab_parm    = 44. - Pointer to parameter list
+
+msgqab:	   .WORD  QFNC_OUTDATAGRAM
+				;qab_func    = 0.  - Function
+	   .WORD  0		;qab_status  = 2.  - Returned status
+	   .LONG  0		;qab_error   = 4.  - Error code
+	   .LONG  0		;qab_amount  = 8.  - Amount transfered
+	   .LONG  0		;qab_handle  = 12. - Device handle
+	   .BYTE  0		;qab_vector  = 16. - Vector for interrupt
+	   .BYTE  0, 0, 0	;Reserved
+	   .LONG  0		;qab_option  = 20. - Option bits
+	   .LONG  MSGBFRSIZE	;qab_count   = 24. - Amount to transfer
+	   .LONG  msgbfr, !msgbfr;qab_buffer1 = 28. - Pointer to data buffer
+	   .LONG  dststr, !dststr;qab_buffer2 = 36. - Pointer to destination
+				;		       string
+	   .LONG  0, 0		;qab_parm    = 44. - Pointer to parameter list
+
+logmsgbfr: .BYTE  0, 0, '#', 0
+	   .ASCII "% PCNTEST: "
+msgbfr::   .BLKB  150t
+MSGBFRSIZE = $-msgbfr
+
+pinputqab: .WORD  QFNC_INBLOCK	;qab_func    = 0.  - Function
+	   .WORD  0		;qab_status  = 2.  - Returned status
+	   .LONG  0		;qab_error   = 4.  - Error code
+	   .LONG  0		;qab_amount  = 8.  - Amount transfered
+	   .LONG  0		;qab_handle  = 12. - Device handle
+	   .BYTE  IV_PINPUT	;qab_vector  = 16. - Vector for interrupt
+	   .BYTE  0, 0, 0	;Reserved
+	   .LONG  0		;qab_option  = 20. - Option bits
+	   .LONG  1024t		;qab_count   = 24. - Amount to transfer
+	   .LONG  pinpbufr	;qab_buffer1 = 28. - Pointer to data buffer
+	   .LONG  !pinpbufr
+	   .LONG  0, 0		;qab_buffer2 = 36. - Pointer to destination
+				;		       string
+	   .LONG  0, 0		;qab_parm    = 44. - Pointer to parameter list
+
+pinpbufr:  .BLKB  1024t
+
+tinputqab: .WORD  QFNC_INBLOCK	;qab_func    = 0.  - Function
+	   .WORD  0		;qab_status  = 2.  - Returned status
+	   .LONG  0		;qab_error   = 4.  - Error code
+	   .LONG  0		;qab_amount  = 8.  - Amount transfered
+	   .LONG  DH_STDTRM	;qab_handle  = 12. - Device handle
+	   .BYTE  IV_TINPUT	;qab_vector  = 16. - Vector for interrupt
+	   .BYTE  0, 0, 0	;Reserved
+	   .LONG  0		;qab_option  = 20. - Option bits
+	   .LONG  1024t		;qab_count   = 24. - Amount to transfer
+	   .LONG  tinpbufr	;qab_buffer1 = 28. - Pointer to data buffer
+	   .LONG  !tinpbufr
+	   .LONG  0, 0		;qab_buffer2 = 36. - Pointer to destination
+				;		       string
+	   .LONG  0, 0		;qab_parm    = 44. - Pointer to parameter list
+
+tinpbufr:  .BLKB  1024t
+
+poutbufr:  .BLKB  600t
+
+	.PSECT	_odata_p
+
+	 .MOD	4
+membegin:
+
+;Following data is used during initialization only
+
+ourname:  .ASCIZ "PCNTEST"
+failmsg1: .ASCII {MT_FINALERR}"? PCNTEST: "
+failsz1=!$-failmsg1
+failmsg2: .ASCII {CR,LF}"            "
+failsz2=!$-failmsg2
+failmsg3: .ASCIZ {CR,LF}"? PCNTEST: Terminating"
+crlfmsg:  .BYTE  CR, LF, 0
+failsz3=!$-failmsg3
+badpidmsg:.ASCIZ "Bad requestor PID"
+sivfmsg:: .ASCIZ "Cannot initialize interrupt vector"
+nemamsg:  .ASCIZ "Not enough memory available"
+finmsg1:  .ASCII {MT_FINALMSG}"% PCNTEST: v1.0 - Initialization complete"
+finsz1=!$-finmsg1
+msgname:  .ASCIZ "IPM:"
+
+dststr:   .BYTE  0FFh		;Response message destination string (includes
+				;  the four bytes of reqpid)
+reqpid:	  .LONG	 0		;ID of requesting process
+argpntr:  .LONG  0, 0
+
+	END

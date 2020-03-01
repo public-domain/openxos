@@ -1,0 +1,572 @@
+	.TITLE	UDFSRVC - UDFSRV COMPRESS command routines
+
+;++++
+; This software is in the public domain.  It may be freely copied and used
+; for whatever purpose you see fit, including commerical uses.  Anyone
+; modifying this software may claim ownership of the modifications, but not
+; the complete derived code.  It would be appreciated if the authors were
+; told what this software is being used for, but this is not a requirement.
+
+;   THIS SOFTWARE IS PROVIDED BY THE AUTHORS "AS IS" AND ANY EXPRESS OR
+;   IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
+;   OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+;   IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+;   INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+;   BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS
+;   OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+;   ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR
+;   TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
+;   USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+;----
+
+	.PROC	80386
+
+	.INCLUD	XOSINC:\XMAC\STDIO.PAR
+	.INCLUD	XOSINC:\XMAC\CTYPE.PAR
+	.INCLUD	XOSINC:\XMAC\PROCARG.PAR
+	.INCLUD	XOSINC:\XMAC\XOS.PAR
+	.INCLUD	XOSINC:\XMAC\XOSX.PAR
+	.INCLUD	XOSINC:\XMAC\XOSERR.PAR
+	.INCLUD	XOSINC:\XMAC\XOSTIME.PAR
+	.INCLUD	XOSINC:\XMAC\XOSTRM.PAR
+	.INCLUD	XOSINC:\XMAC\XOSNET.PAR
+	.INCLUD	XOSINC:\XMAC\XOSXNET.PAR
+	.INCLUD XOSINC:\XMAC\XOSTHREADS.PAR
+	.INCLUD	XOSINC:\XMAC\XOSUDF.PAR
+	.INCLUD	UDFSRV.PAR
+
+	.STDSEGS
+
+	.PSECT	_TEXT_p
+
+	.SBTTL	cmdcompress - Subroutine to process the COMPRESS command
+
+;Subroutine to process the COMPRESS command
+
+cmdcompress::
+	MOVL	EAX, 4t.B[ESP]		;Process the command string
+	MOVL	EDI, #keyword#
+	CALL	requireinst#
+	JC	2$.S			;If error
+	CMPL	compidb#, #0.B		;Is compression active now?
+	JNE	4$.S			;Yes - fail
+	LEAL	EAX, idb_tdbcomp[ESI]	;No - create the compression thread
+	PUSHL	EAX			;Offset for the TDB
+	PUSHL	#THDSTKSIZE		;Stack size
+	PUSHL	#idb_compSIZE		;Size of the TDB
+	PUSHL	#compthread		;Main function for thread
+	PUSHL	#0.B			;Arguments for main function
+	PUSHL	#0.B
+	CALLF	thdCtlCreate#		;Create the compression thread
+	TESTL	EAX, EAX
+	JS	8$.S			;If error
+	MOVL	compidb#, ESI		;OK - indicate compression is active
+	MOVL	EAX, srvMsgDst#		 ;Store message destination for the
+	MOVL	idb_compmsgdst[ESI], EAX ;  thread
+2$:	RET
+
+;Here if compression is already active
+
+4$:	MOVL	EBX, #cismsg
+	JMP	10$.S
+
+;Here if error creating our thread
+
+8$:	MOVL	EBX, #ectmsg
+10$:	PUSHL	srvMsgDst#		;Error - complain
+	PUSHL	#0.B
+	PUSHL	EBX
+	PUSHL	EAX
+	CALL	srvCmdErrorResp#
+	ADDL	ESP, #16t.B
+	RET
+.PAGE
+	.SBTTL	compthread - Mail thread funciton for the compression thread
+
+compthread:
+	MOVL	ESI, thdData#		;Get offset of the IDB
+	SUBL	ESI, #idb_tdbcomp
+	MOVL	EAX, idb_inxcnt[ESI]	;Get number of index blocks
+	IMULL	EAX, #12t.B		;Times 12
+	PUSHL	DS
+	MOVL	EDI, #COMPLSTBASE
+	PUSHL	EDI
+	PUSHL	#PG$READ|PG$WRITE.B
+	PUSHL	EAX
+	CALLF	svcMemChange#		;Get the memory
+	TESTL	EAX, EAX
+	JNS	4$.S			;Go on if OK
+	MOVL	EBX, #nomemmsg
+compfail:
+	PUSHL	idb_compmsgdst[ESI]	;If error allocating memory
+	PUSHL	#0.B
+	PUSHL	EBX
+	PUSHL	EAX
+	CALL	srvCmdErrorResp#
+	JMP	compdone
+
+;Here with memory allocated for the index list - First copy offsets for
+;  all blocks containing user IDs.  We do this by copying offsets for all
+;  blocks in the user ID hash table.
+
+4$:	LEAL	EDX, 12t.B[EDI]
+	LEAL	EBX, idb_usidhash[ESI]
+	MOVL	ECX, #1024t
+8$:	MOVL	EAX, [EBX]
+	ADDL	EBX, #4.B
+	TESTL	EAX, EAX
+	JE	12$.S
+10$:	MOVL	[EDI], EDX
+	MOVL	8.B[EDI], EAX
+	MOVL	EDI, EDX
+	ADDL	EDX, #12t.B
+	MOVL	EAX, inx_nextid.B[EAX]
+	TESTL	EAX, EAX
+	JNE	10$.S
+12$:	LOOP	ECX, 8$
+
+;Now we copy offsets for blocks that are in the user name hash list only
+
+	LEAL	EBX, idb_usnmhash[ESI]
+	MOVL	ECX, #1024t
+14$:	MOVL	EAX, [EBX]
+	ADDL	EBX, #4.B
+	TESTL	EAX, EAX
+	JE	20$.S
+16$:	CMPB	inx_userid.B[EAX], #0
+	JNE	18$.S
+	MOVL	[EDI], EDX
+	MOVL	8.B[EDI], EAX
+	MOVL	EDI, EDX
+	ADDL	EDX, #12t.B
+18$:	MOVL	EAX, [EAX]
+	TESTL	EAX, EAX
+	JNE	16$.S
+20$:	LOOP	ECX, 14$
+	MOVL	idb_complsttop[ESI], EDI ;Remember where the top of the list is
+	CLRL	EAX
+	MOVL	-12t.B[EDI], EAX
+	LEAL	EAX, -COMPLSTBASE[EDI]
+	CLRL	EDX
+	MOVL	ECX, #12t
+	DIVL	ECX
+	CMPL	EAX, idb_inxcnt[ESI]	;Make sure the count is right!
+	JE	22$.S
+	PUSHL	idb_compmsgdst[ESI]
+	PUSHL	#szwrnmsg		;Warn him if not!
+	CALL	srvCmdResponse#
+	ADDL	ESP, #8t.B
+22$:	PUSHL	idb_compmsgdst[ESI]
+	PUSHL	#sortmsg
+	CALL	srvCmdResponse#
+	ADDL	ESP, #8t.B
+	PUSHL	#0.B			;Now sort the list into disk block order
+	PUSHL	#compfunc
+	PUSHL	#COMPLSTBASE
+	CALL	heapsort#
+	ADDL	ESP, #12t.B
+	MOVL	idb_complsthead[ESI], EAX ;Store the head and tail pointers
+	MOVL	EAX, 4.B[EAX]
+	MOVL	idb_complsttail[ESI], EAX
+.PAGE
+;Here with a sorted list of records to copy to the new UDF we are about to
+;  create.  Now create the new file.
+
+	LEAL	EAX, idb_group[ESI]	;Construct the name
+	PUSHL	EAX
+	PUSHL	#compcfmt
+	LEAL	EAX, idb_compname[ESI]
+	PUSHL	EAX
+	CALL	sprintf#
+	ADDL	ESP, #12t.B
+	PUSHL	#O$IN|O$OUT|O$CREATE|O$TRUNCA	; |O$XWRITE|O$XREAD
+	PUSHL	DS			;Create the file
+	LEAL	EAX, idb_compname[ESI]
+	PUSHL	EAX
+	PUSHL	#0.B
+	PUSHL	#0.B
+	CALLF	svcIoOpen##
+	MOVL	EBX, #cnopfmsg
+	TESTL	EAX, EAX
+	JS	compfail		;If error
+	MOVL	idb_comphndl[ESI], EAX
+	PUSHL	EAX			;Output the 2 header bytes
+	PUSHL	DS
+	PUSHL	#header
+	PUSHL	#2.B
+	CALLF	svcIoOutBlock##
+	TESTL	EAX, EAX
+	JS	26$			;If error
+	CLRL	EAX
+	MOVL	idb_compreccnt[ESI], EAX
+	MOVL	idb_complngcnt[ESI], EAX
+	MOVL	idb_compfmtcnt[ESI], EAX
+	MOVL	idb_compnextrpt[ESI], #COMPRPTINT
+	MOVB	AL, #MT_INTRMDSTS
+	CALL	compreport
+	MOVL	idb_comppos[ESI], #2	;Initialize position in output file
+	MOVL	EDI, idb_complsthead[ESI]
+complp:	MOVL	EAX, 8.B[EDI]		;Get offset of the index block
+	MOVL	EAX, inx_offset.B[EAX]	;Get offset in the file
+	CALL	readbegin#		;Set up to read the record
+	JC	6$.S			;If error
+	CALL	getbyte#		;Get first byte
+6$:	JC	28$			;If error
+	CMPB	AL, #0AAh		;It must be a beginning of record byte
+	JNE	18$			;Opps
+	MOVB	outbfr#+0 , AL
+	CALL	getbyte#		;Get record type
+	JC	6$.S
+	CMPB	AL, #1			;Must be 1 or 2
+	JE	7$.S
+	CMPB	AL, #2
+	JNE	17$
+7$:	MOVB	outbfr#+1, AL		;OK - store record type
+	CLRL	EAX
+	MOVL	idb_lastwrn[ESI], EAX
+	MOVL	outpnt#, #outbfr#+2	;Initialize output buffer pointer
+	MOVL	outleft#, #UDFRECSIZE-2
+8$:	CALL	getl1byte#		;Get item type
+	JC	16$.S
+	CMPB	AL, #0			;End of record?
+	JE	20$			;Yes
+	CALL	putbyteudf#
+	JC	14$.S
+	CALL	getl1varval#		;Get item length
+	JC	16$.S
+	MOVL	idb_lvl2left[ESI], EAX
+	CMPL	EAX, #7Fh.B		;Only need one byte?
+	JBE	10$.S			;Yes
+	PUSHL	EAX
+	MOVB	AL, AH
+	ORB	AL, #80h
+	CALL	putbyteudf#
+	POPL	EAX
+	JC	14$.S
+10$:	CALL	putbyteudf#
+	JC	14$.S
+12$:	CALL	getl2byte#
+	JC	15$.S
+	CALL	putbyteudf#
+	JNC	12$.S
+14$:	MOVL	EAX, outpnt#		;Record is too long - warn him
+	SUBL	EAX, #outbfr#
+	PUSHL	EAX
+	PUSHL	#rtlfmt
+	PUSHL	#msgbufr#
+	CALL	sprintf#
+	ADDL	ESP, #12t.B
+	MOVL	EBX, #msgbufr#
+	CALL	compwarning
+	INCL	idb_complngcnt[ESI]
+	JMP	22$
+
+;Here with error return from getl2byte
+
+15$:	TESTL	EAX, EAX		;Normal end of item?
+	JNE	17$.S			;No - report format error
+	JMP	8$			;Yes - continue
+
+;Here with error return from getl1byte
+
+16$:	TESTL	EAX, EAX		;Normal end of record?
+	JE	20$.S			;Yes
+	JS	28$			;No - if IO error
+	CMPL	EAX, #1.B		;End of file?
+	JE	20$.S			;Yes
+17$:	CMPL	idb_lastwrn[ESI], #0.B ;No - must be format error
+	JNE	8$			;If already reported
+	INCL	idb_lastwrn[ESI]	;No - report it now
+	MOVL	EBX, #fmtemsg
+	INCL	idb_compfmtcnt[ESI]
+	JMP	19$.S
+
+;Here if the beginning of record flag was not found
+
+18$:	MOVL	EBX, #brnfmsg
+	INCL	idb_compnbrcnt[ESI]
+19$:	CALL	compwarning
+	JMP	22$.S
+
+;Here at end of record
+
+20$:	MOVL	EAX, outpnt#
+	SUBL	EAX, #outbfr#
+	MOVL	EDX, 8.B[EDI]		;Get offset of the index block
+	MOVL	ECX, idb_comppos[ESI]	;Update position in file in the index
+	MOVL	inx_offset.B[EDX], ECX	;  block
+	ADDL	idb_comppos[ESI], EAX	;Bump the position
+	PUSHL	idb_comphndl[ESI]	;Output the record
+	PUSHL	DS
+	PUSHL	#outbfr#
+	PUSHL	EAX
+	CALLF	svcIoOutBlock##
+	TESTL	EAX, EAX
+	JS	26$.S
+	INCL	idb_compreccnt[ESI]
+	MOVL	EAX, idb_compreccnt[ESI]
+	CMPL	EAX, idb_compnextrpt[ESI]
+	JB	22$.S
+	MOVB	AL, #MT_INTRMDSTS
+	CALL	compreport
+	ADDL	idb_compnextrpt[ESI], #COMPRPTINT
+22$:	MOVL	EDI, [EDI]		;Advance to next list block
+	ORL	EDI, EDI
+	JNE	complp
+	JMP	compfin			;If finished
+
+;Here if error writing to the new file
+
+26$:	MOVL	EBX, #werrmsg
+	JMP	30$.S
+
+;Here if error reading from the old file
+
+28$:	MOVL	EBX, #rerrmsg
+30$:	PUSHL	EAX			;Save error code
+	MOVL	EAX, 8.B[EDI]		;Get offset of the index block
+	PUSHL	inx_offset.B[EAX]	;Get offset in the file
+	PUSHL	EBX
+	PUSHL	#ftlfmt			;Construct the message
+	PUSHL	#msgbufr#
+	CALL	sprintf#
+	ADDL	ESP, #16t.B
+	MOVB	AL, #MT_INTRMDMSG
+	CALL	compreport
+	PUSHL	DS			;Give up the memory used for our
+	PUSHL	#COMPLSTBASE		;  record list
+	PUSHL	#0.B
+	PUSHL	#0.B
+	CALLF	svcMemChange#
+	MOVL	EBX, #msgbufr#
+	JMP	compfail
+
+szwrnmsg:.ASCIZ	{MT_INTRMDMSG}"UDFSRV: Warning: Record count is inconsistant"
+sortmsg: .ASCIZ	{MT_INTRMDSTS}"UDFSRV: Sorting records"
+nomemmsg:.ASCIZ "Cannot allocate memory for sort array"
+cnopfmsg:.ASCIZ "Cannot create new UDF file"
+rtlfmt:  .ASCIZ "Record is too long (%d) (not copied)"
+brnfmsg: .ASCIZ	"Beginning of record flag not found (not copied)"
+fmtemsg: .ASCIZ "Format error (not copied)"
+cismsg:  .ASCIZ "Compression is active"
+ectmsg:  .ASCIZ "Error creating thread for compression"
+werrmsg: .ASCIZ "Error writing compressed file"
+rerrmsg: .ASCIZ "Error reading original file"
+.PAGE
+;Here when finished copying the file
+
+compfin:PUSHL	DS			;Give up the memory used for our
+	PUSHL	#COMPLSTBASE		;  record list
+	PUSHL	#0.B
+	PUSHL	#0.B
+	CALLF	svcMemChange#
+	MOVB	AL, #MT_INTRMDMSG
+	CALL	compreport		;Display final numbers
+	PUSHL	idb_comphndl[ESI]	;Close the new file
+	PUSHL	#0.B
+	CALLF	svcIoClose##
+	MOVL	EBX, #ecnfmsg
+	TESTL	EAX, EAX
+	JS	compfail		;If error
+	PUSHL	idb_compmsgdst[ESI]
+	PUSHL	#compfcc		;Tell him file creation is complete
+	CALL	srvCmdResponse#
+	ADDL	ESP, #8t.B
+	PUSHL	idb_udfhndl[ESI]	;Close the current file
+	PUSHL	#0.B
+	CALLF	svcIoClose##
+	MOVL	EBX, #eccfmsg
+	TESTL	EAX, EAX
+	JS	compfail		;If error	
+	LEAL	EAX, idb_group[ESI]	;Construct name for the backup file
+	PUSHL	EAX
+	PUSHL	#compofmt
+	PUSHL	#msgbufr#
+	CALL	sprintf#
+	LEAL	EAX, idb_group[ESI]	;Construct name for the current file
+	PUSHL	EAX
+	PUSHL	#grpfmt#
+	PUSHL	#msgbufr#+64t
+	CALL	sprintf#
+	PUSHL	#0.B			;Delete backup file if its there
+	PUSHL	DS
+	PUSHL	#msgbufr#
+	PUSHL	#0.B
+	PUSHL	#0.B
+	CALLF	svcIoDelete##
+	PUSHL	#0.B			;Rename XOSCFG:xxx.UDF to
+	PUSHL	DS			;  XOSCFG:xxx.UDO for backup
+	PUSHL	#msgbufr#+64t
+	PUSHL	DS
+	PUSHL	#msgbufr#
+	PUSHL	#0.B
+	PUSHL	#0.B
+	CALLF	svcIoRename##
+	MOVL	EBX, #ercfmsg
+	TESTL	EAX, EAX
+	JS	compfail		;If error
+	PUSHL	#0.B			;OK - rename XOSCFG:xxx.UDC to
+	PUSHL	DS			;  XOSCFG:xxx.UDF
+	LEAL	EAX, idb_compname[ESI]
+	PUSHL	EAX
+	PUSHL	DS
+	PUSHL	#msgbufr#+64t
+	PUSHL	#0.B
+	PUSHL	#0.B
+	CALLF	svcIoRename##
+	MOVL	EBX, #ernfmsg
+	TESTL	EAX, EAX
+	JS	compfail		;If error
+	PUSHL	#O$IN|O$OUT|O$XWRITE.B	;OK - open the new UDF
+	PUSHL	DS
+	PUSHL	#msgbufr#+64t
+	PUSHL	DS
+	PUSHL	#udfoparms#
+	CALLF	svcIoOpen##
+	MOVL	EBX, #eonfmsg
+	TESTL	EAX, EAX
+	JS	compfail		;If can't open it
+	MOVL	idb_udfhndl[ESI], EAX	;OK
+	MOVL	EAX, udflen#		;Store new file length
+	MOVL	idb_eofpos[ESI], EAX
+	MOVL	idb_blkpos[ESI], #-1	;Make sure we don't use any cached data
+	PUSHL	idb_igncnt[ESI]
+	PUSHL	idb_dupcnt[ESI]
+	PUSHL	idb_delcnt[ESI]
+	PUSHL	#compfsr
+	PUSHL	#msgbufr#
+	CALL	sprintf#
+	PUSHL	idb_compmsgdst[ESI]
+	PUSHL	#msgbufr#
+	CALL	srvCmdResponse#
+	CLRL	EAX
+	MOVL	idb_igncnt[ESI], EAX	;Fix up our UDF status counts
+	MOVL	idb_dupcnt[ESI], EAX
+	MOVL	idb_delcnt[ESI], EAX
+	MOVL	idb_comppos[ESI], EAX
+	MOVL	EAX, idb_inxcnt[ESI]
+	MOVL	idb_reccnt[ESI], EAX
+	PUSHL	idb_compmsgdst[ESI]
+	PUSHL	#compadn		;Give him our final response
+	CALL	srvCmdResponse#
+compdone:
+	CLRL	EAX			;Indicate compression not active
+	MOVL	compidb#, EAX
+	MOVL	idb_comppos[ESI], EAX
+	JMP	thdCtlTerminate#
+
+compcfmt:.ASCIZ	"XOSCFG:%s.UDC"
+compofmt:.ASCIZ "XOSCFG:%s.UDO"
+header:  .BYTE	81h, 0C6h
+compfcc:.ASCII	{MT_INTRMDMSG}"UDFSRV: Compressed UDF file creation "
+	.ASCIZ	"is complete"
+compfsr:.ASCII	{MT_INTRMDMSG, 01h}"UDFSRV: Records removed: Del=%d  "
+	.ASCIZ	"Dup=%d  Ign=%d"
+compadn:.ASCII	{MT_FINALMSG}"UDFSRV: Compression complete, now using the "
+	.ASCIZ	"compressed UDF file"
+ecnfmsg:.ASCIZ	"Error closing compressed file"
+eccfmsg:.ASCIZ	"Error closing current file"
+ercfmsg:.ASCIZ	"Error renaming current file"
+ernfmsg:.ASCIZ	"Error renaming compressed file"
+eonfmsg:.ASCIZ	"Error re-opening compressed file"
+ftlfmt: .ASCIZ	"%s at %d"
+.PAGE
+compfunc:
+	MOVL	EBX, 4.B[ESP]
+	MOVL	EBX, 8.B[EBX]
+	MOVL	EDX, 8.B[ESP]
+	MOVL	EDX, 8.B[EDX]
+	MOVL	EAX, inx_offset.B[EBX]
+	SUBL	EAX, inx_offset.B[EDX]
+	RET
+.PAGE
+	.SBTTL	compreport - Subroutine to generate intermediate status messages
+
+;Subroutine to generate intermediate status messages
+;	c(AL) = Message type
+;	CALL	compreport
+
+compreport:
+	PUSHL	idb_compnbrcnt[ESI]
+	PUSHL	idb_complngcnt[ESI]
+	PUSHL	idb_compfmtcnt[ESI]
+	PUSHL	idb_compreccnt[ESI]
+	PUSHL	idb_inxcnt[ESI]
+	PUSHL	EAX
+	PUSHL	#crptfmt
+	PUSHL	#msgbufr#
+	CALL	sprintf#
+	PUSHL	idb_compmsgdst[ESI]
+	PUSHL	#msgbufr#
+	CALL	srvCmdResponse#
+	ADDL	ESP, #40t.B
+	RET
+
+crptfmt:.ASCIZ	"%cUDFSRV: Ttl=%d Done=%d Fmt=%d Lng=%d Nobr=%d"
+.PAGE
+	.SBTTL	compwarning - Subroutine to generate warning message
+
+;Subroutine to generate warning message
+;	c{EBX} = Offset of message string
+;	CALL	compwarning
+
+compwarning:
+	PUSHL	EAX
+	PUSHL	EBX
+	MOVB	AL, #MT_INTRMDMSG
+	CALL	compreport
+	POPL	EBX
+	POPL	EAX
+	SUBL	ESP, #200t
+	MOVL	EDX, ESP
+	MOVL	ECX, 8.B[EDI]		;Get offset of the index block
+	LEAL	EAX, inx_userid.B[ECX]
+	PUSHL	EAX
+	LEAL	EAX, inx_usernm.B[ECX]
+	PUSHL	EAX
+	PUSHL	inx_offset.B[ECX]	;Get offset in the file
+	PUSHL	EBX
+	PUSHL	#warnfmt
+	PUSHL	EDX
+	CALL	sprintf#
+	ADDL	ESP, #24t.B
+	PUSHL	ESP
+	CALL	srvCmdResponse#
+	ADDL	ESP, #204t
+	RET
+
+warnfmt:.ASCII	{MT_INTRMDMSG}"UDFSRV: Warning: %s at %d"{LF}
+	.ASCIZ	"        User name: <%.16s> User ID: <%.16s>"
+.PAGE
+	.SBTTL	compaddtolist - Subroutine to add entry to the end of the sort list
+
+;Subroutine to add an entry to the end of the sort list
+;	CALL	compaddtolist
+
+compaddtolist::
+	MOVL	EBX, idb_complsttop[ESI]
+	ADDL	idb_complsttop[ESI], #12t.B
+	MOVL	EAX, idb_complsttop[ESI]
+	DECL	EAX
+	XORL	EAX, EBX
+	TESTL	EAX, #0FFF000h		;Need another page?
+	JE	4$.S			;No
+	MOVL	EDI, #COMPLSTBASE	;Yes
+	PUSHL	EDI
+	PUSHL	#PG$READ|PG$WRITE.B
+	MOVL	EAX, idb_complsttop[ESI]
+	INCL	EAX
+	PUSHL	EAX
+	CALLF	svcMemChange#		;Get the memory
+	TESTL	EAX, EAX
+	JS	6$.S			;If error
+4$:	MOVL	EAX, inxblk#
+	MOVL	8.B[EBX], EAX
+	MOVL	EAX, idb_complsttail[ESI]
+	MOVL	[EAX], EBX
+	CLRL	EAX
+	MOVL	[EBX], EAX
+	MOVL	idb_complsttail[ESI], EBX
+6$:	RET
+
+	.END

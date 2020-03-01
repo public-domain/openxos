@@ -1,0 +1,1962 @@
+	.TITLE	LAPBACLS - LAPB (X.25) class driver for XOS
+
+;++++
+; This software is in the public domain.  It may be freely copied and used
+; for whatever purpose you see fit, including commerical uses.  Anyone
+; modifying this software may claim ownership of the modifications, but not
+; the complete derived code.  It would be appreciated if the authors were
+; told what this software is being used for, but this is not a requirement.
+
+;   THIS SOFTWARE IS PROVIDED BY THE AUTHORS "AS IS" AND ANY EXPRESS OR
+;   IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
+;   OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+;   IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+;   INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+;   BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS
+;   OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+;   ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR
+;   TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
+;   USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+;----
+
+	.PROC	80486
+	.INCLUD	XOSINC:\XMAC\XOS.PAR
+	.INCLUD	XOSINC:\XMAC\XOSX.PAR
+	.INCLUD	XOSINC:\XMAC\XOSTIME.PAR
+	.INCLUD	XOSINC:\XMAC\XOSERR.PAR
+	.INCLUD	XOSINC:\XMAC\XOSNET.PAR
+	.INCLUD	XOSINC:\XMAC\XOSXNET.PAR
+	.INCLUD	XOSINC:\XMAC\XOSLKE.PAR
+	.INCLUD	XOSINC:\XMAC\XOSXLKE.PAR
+	.INCLUD	LAPBA.PAR
+
+;This device class implements the link-level LAPB protocol.  It is for use
+;  with serial devices with point-to-point connectections.  It is intended
+;  only for use as the link level protocol module for X25ACLS.  It does not
+;  support direct IO at the link level.  Note that unlike the SNAP driver,
+;  this driver uses a single SDB (service access point data block).  This
+;  driver does not support multiple protocols at a time.
+
+MAJV   =!1t
+MINV   =!1t
+EDITNUM=!0t
+
+	LKEHEAD	LAPBACLS, MAJV, MINV, EDITNUM, LKETYPE_CLASS
+
+	.EXPORT	xoslpaGiveWin
+	.EXPORT	xoslpaLinkDown
+	.EXPORT	xoslpaSdbHead
+	.EXPORT	xoslpaSendInfo
+	.EXPORT	xoslpaSetPkt
+	.EXPORT	xoslpaSetPkt2
+	.EXPORT	xoslpaWaitWin
+
+	.SBTTL	SVC dispatch table for LAPBA class devices
+
+;SVC dispatch table for LAPBA class devices
+
+lapbdsp:.LONG	knlRtnZero##	;sd_mount	=  0. - Mount
+	.LONG	knlRtnZero##	;sd_cleardev	=  4. - Clear device
+	.LONG	xosnetGiveDcb##	;sd_cleardcb	=  8. - Clear DCB
+	.LONG	knlRtnZero##	;sd_commit	= 12. - Commit data to disk
+	.LONG	knlRtnZero##	;sd_transold    = 16. - Transfer device/old
+	.LONG	knlRtnZero##	;sd_transnew    = 20. - Transfer device/new
+	.LONG	knlNullQio##	;sd_opena	= 24. - Open additional
+	.LONG	lapbopen	;sd_open1	= 28. - Open device/file
+	.LONG	lapbopen	;sd_devparm     = 32. - Device parameters
+	.LONG	knlIFnDev##	;sd_delete	= 36. - Delete file
+	.LONG	knlIFnDev##	;sd_rename	= 40. - Rename file
+	.LONG	lapbxfer	;sd_inblock	= 44. - Input block
+	.LONG	lapbxfer	;sd_outblock	= 48. - Output block
+	.LONG	knlIFnDev##	;sd_outblockq	= 52. - Output block (XFF)
+	.LONG	knlIFnDevGQ##	;sd_outstring	= 56. - Output string
+	.LONG	knlRtnMOne##	;sd_getiosts	= 60. - Get input/output status
+	.LONG	knlIFnDevGQ##	;sd_special     = 64. - Special device function
+	.LONG	lapbclose	;sd_close	= 68. - Close file
+	.LONG	knlNullLabel##	;sd_label       = 72. - Get device label
+	.LONG	knlNullQioGQ##	;sd_commitfunc	= 76. - Commit data to disk
+	.LONG	lapbdevinfo	;sd_devinfo     = 80. - Get device info
+LAPBDSPSZ=!{$-lapbdsp}/4
+
+;Class function dispatch table for LAPBA class devices
+
+	.LONG	CLSFMX
+lapbcls:.LONG	lapbaaddunit	;CF_ADDUNIT =  8. - Add unit
+	.LONG	lapbaunitinfo	;CF_PUNITS  =  9. - Get information about
+				;		      physical units
+	.LONG	knlIFnDevGQ##	;CF_AUNITS  = 10. - Get information about active
+				;		      units
+CLSFMX=!{$-lapbcls}/4
+.PAGE
+;Device characteristics tables for LAPBA devices
+
+	DATA
+
+	.MOD	4
+lapbdctbl:
+ DCHARBGN  1, knlDCharValCom##
+ DCHARENT  CLASS   , TEXT, ,  8, knlDcMsgClass##  , knlDcGetClass##, knlDcSetClass##, 0
+ DCHARENT  NETDEV  , TEXT, , 16, xosnetMsgDev##   , lapbgetnetdev  , 0              , 0
+ DCHARENT  TYPE    , TEXT, ,  4, msgtype          , gettype        , settype        , 0
+ DCHARENT  STATE   , TEXT, ,  8, msgstate         , getstate       , setstate       , 0
+ DCHARENT  N1      , DECV, ,  4, msgn1            , getsdbdata     , setsdbdata     , sdb_lapbn1val
+ DCHARENT  N2      , DECV, ,  4, msgn2            , getsdbdata     , setsdbdata     , sdb_lapbn2val
+ DCHARENT  T1      , DECV, ,  4, msgt1            , getticks       , setticks       , sdb_lapbt1val
+ DCHARENT  T2      , DECV, ,  4, msgt2            , getticks       , setticks       , sdb_lapbt2val
+ DCHARENT  ACKLVL  , DECV, ,  4, msgacklvl        , getsdbbyte     , setsdbbyte     , sdb_lapbacklvl
+ DCHARENT  T3      , DECV, ,  4, msgt3            , getsdbdata     , sett3          , sdb_lapbt3val
+ DCHARENT  KATYPE  , TEXT, ,  8, msgkatype        , getkatype      , setkatype      , 0
+ DCHARENT  WININ   , DECV, ,  4, msgwinin         , getsdbdata     , setsdbdata     , sdb_lapbrcvwinsz
+ DCHARENT  WINOUT  , DECV, ,  4, msgwinout        , getsdbdata     , setsdbdata     , sdb_lapbsndwinsz
+ DCHARENT  SENDSABM, TEXT, ,  4, msgsendsabm      , getsendsabm    , setsendsabm    , 0
+ DCHARENT  PKTIN   , DECV, ,  4, xosnetMsgPktIn## , getsdbdata     , setsdbdata     , sdb_lapbcntpktin
+ DCHARENT  BYTEIN  , DECV, ,  4, knlDcMsgByteIn## , getsdbdata     , setsdbdata     , sdb_lapbcntbytein
+ DCHARENT  PKTOUT  , DECV, ,  4, xosnetMsgPktOut##, getsdbdata     , setsdbdata     , sdb_lapbcntpktout
+ DCHARENT  BYTEOUT , DECV, ,  4, knlDcMsgByteOut##, getsdbdata     , setsdbdata     , sdb_lapbcntbyteout
+ DCHARENT  LINKUP  , DECV, ,  4, msglinkup        , getsdbdata     , setsdbdata     , sdb_lapbcntlinkup
+ DCHARENT  NODST   , DECV, ,  4, msgnodst         , getsdbdata     , setsdbdata     , sdb_lapbcntnodst
+ DCHARENT  NOTCON  , DECV, ,  4, msgnotcon        , getsdbdata     , setsdbdata     , sdb_lapbcntnotcon
+ DCHARENT  OUTSEQ  , DECV, ,  4, msgoutseq        , getsdbdata     , setsdbdata     , sdb_lapbcntoutseq
+ DCHARENT  REXMIT  , DECV, ,  4, msgrexmit        , getsdbdata     , setsdbdata     , sdb_lapbcntrexmit
+ DCHARENT  ICTLDET , DECV, ,  4, msgictldet       , getsdbdata     , setsdbdata     , sdb_lapbcntictldet
+ DCHARENT  IINFODET, DECV, ,  4, msgiinfodet      , getsdbdata     , setsdbdata     , sdb_lapbcntiinfodet
+ DCHARENT  INRDET  , DECV, ,  4, msginrdet        , getsdbdata     , setsdbdata     , sdb_lapbcntinrdet
+ DCHARENT  MCAPXDET, DECV, ,  4, msgmcapxdet      , getsdbdata     , setsdbdata     , sdb_lapbcntmcapxdet
+ DCHARENT  ICTLRPT , DECV, ,  4, msgictlrpt       , getsdbdata     , setsdbdata     , sdb_lapbcntictlrpt
+ DCHARENT  IINFORPT, DECV, ,  4, msgiinforpt      , getsdbdata     , setsdbdata     , sdb_lapbcntiinforpt
+ DCHARENT  INRRPT  , DECV, ,  4, msginrrpt        , getsdbdata     , setsdbdata     , sdb_lapbcntinrrpt
+ DCHARENT  MCAPXRPT, DECV, ,  4, msgmcapxrpt      , getsdbdata     , setsdbdata     , sdb_lapbcntmcapxrpt
+ DCHARENT  IADDRRCV, DECV, ,  4, msgiaddrrcv      , getsdbdata     , setsdbdata     , sdb_lapbcntiaddrrcv	
+
+;Class characteristics tables for the LAPBA device class
+
+lapbcctbl:
+ DCHARBGN  2, knlDCharValCom##
+ DCHARENT  NUMBER , DECV, , 4, msgnumber , knlGetSysVal##, 0             , lapbadcbnum
+ DCHARENT  MAXIMUM, DECV, , 4, msgmaximum, knlGetSysVal##, knlSetSysVal##, lapbadcbmax
+ DCHARENT  LIMIT  , DECV, , 4, msglimit  , knlGetSysVal##, knlSetSysVal##, lapbadcblmt
+
+	CODE
+
+msgtype:    DCHARINFO  {X.25 end-point type (DTE or DCE)}
+msgstate:   DCHARINFO  {X.25 link state}
+msgn1:      DCHARINFO  {Maximum packet size (bytes)}
+msgn2:      DCHARINFO  {Number of times to retry output}
+msgt1:      DCHARINFO  {Retry time interval (milliseconds)}
+msgt2:      DCHARINFO  {Maximum acknowledgement delay (milliseconds)}
+msgacklvl:  DCHARINFO  {Acknowledgement delay level}
+msgt3:      DCHARINFO  {Maximum link idle time (seconds)}
+msgkatype:  DCHARINFO  {Keep-alive type (NONE, CMD, or RSP)}
+msgwinin:   DCHARINFO  {Default input window size (packets)}
+msgwinout:  DCHARINFO  {Default output window size (packets)}
+msgsendsabm:DCHARINFO  {Send SABM to bring link up}
+msgnumber:  DCHARINFO  {Number of in use LAPBA devices}
+msgmaximum: DCHARINFO  {Maximum number of in use LAPBA devices}
+msglimit:   DCHARINFO  {Maximum number of LAPBA devices allowed}
+msgrexmit:  DCHARINFO  {Number of retransmitted packets}
+msglinkup:  DCHARINFO  {Number of times link been established}
+msgnodst:   DCHARINFO  {Discarded: no destination for LAPB input}
+msgnotcon:  DCHARINFO  {Discarded: not connected}
+msgoutseq:  DCHARINFO  {Discarded: out of sequence packet received}
+msgictldet: DCHARINFO  {FRMR sent: illegal control field detected}
+msgiinfodet:DCHARINFO  {FRMR sent: illegal i-field detected}
+msginrdet:  DCHARINFO  {FRMR sent: illegal receive seq. no. detected}
+msgmcapxdet:DCHARINFO  {FRMR sent: maximum capacity exceeded detected}
+msgictlrpt: DCHARINFO  {Reset: illegal control field reported}
+msgiinforpt:DCHARINFO  {Reset: illegal i-field reported}
+msginrrpt:  DCHARINFO  {Reset: illegal receive seq. no. reported}
+msgmcapxrpt:DCHARINFO  {Reset: maximum capacity exceeded  reported}
+msgiaddrrcv:DCHARINFO  {Reset: illegal address received}
+
+	.MOD	4
+.PAGE
+;Device parameter table for LAPBA: opens
+
+	.LONG	OPARMMAX
+lapbopnparms:
+	.LONG	lapbopngenparms	 ;IOPAR_xxxxxx = 00xx - Generic IO parameters
+	.LONG	knlNullFilParms##;IOPAR_FILxxx = 01xx - File system IO parameters
+	.LONG	knlNullTrmParms##;IOPAR_TRMxxx = 02xx - Terminal IO parameters
+OPARMMAX=!{$-lapbopnparms}/4
+
+	.LONG	OPARMGENMAX	;Size of table
+lapbopngenparms:
+	.LONG	0		;		   = 0000h
+	.LONG	knlIopDummyN##	;IOPAR_FILOPTN     = 0001h
+	.LONG	knlIopDummyS##	;IOPAR_FILSPEC     = 0002h
+	.LONG	knlIopDevSts##	;IOPAR_DEVSTS      = 0003h
+	.LONG	knlIopUnitNum##	;IOPAR_UNITNUM     = 0004h
+	.LONG	knlIopGlbId##	;IOPAR_GLBID       = 0005h
+	.LONG	knlIopDelay##	;IOPAR_DELAY       = 0006h
+	.LONG	knlIopTimeOut##	;IOPAR_TIMEOUT     = 0007h
+	.LONG	0		;IOPAR_INPSTS      = 0008h
+	.LONG	0		;IOPAR_OUTSTS      = 0009h
+	.LONG	knlIopInpQLmt##	;IOPAR_INPQLMT     = 000Ah
+	.LONG	knlIopOutQLmt##	;IOPAR_OUTQLMT     = 000Bh
+	.LONG	0		;IOPAR_SIVECT1     = 000Ch
+	.LONG	0		;IOPAR_SIVECT2     = 000Dh
+	.LONG	0		;IOPAR_SIDATA      = 000Eh
+	.LONG	knlIopNumOpen##	;IOPAR_NUMOPEN     = 000Fh
+	.LONG	knlIopBufrLmt##	;IOPAR_BUFRLMT	   = 0010h
+OPARMGENMAX=!{$-lapbopngenparms}/4
+
+;Device parameter table for LAPBA: IO operations
+
+	.LONG	PARMMAX
+lapbioparms:
+	.LONG	lapbiogenparms	 ;IOPAR_xxxxxx = 00xx - Generic IO parameters
+	.LONG	knlNullFilParms##;IOPAR_FILxxx = 01xx - File system IO parameters
+	.LONG	knlNullTrmParms##;IOPAR_TRMxxx = 02xx - Terminal IO parameters
+PARMMAX=!{$-lapbioparms}/4
+
+	.LONG	PARMGENMAX	;Size of table
+lapbiogenparms:
+	.LONG	0		;		   = 0000h
+	.LONG	knlIopFilOptn##	;IOPAR_FILOPTN     = 0001h
+	.LONG	knlIopFilSpec##	;IOPAR_FILSPEC     = 0002h
+	.LONG	knlIopDevSts##	;IOPAR_DEVSTS      = 0003h
+	.LONG	knlIopUnitNum##	;IOPAR_UNITNUM     = 0004h
+	.LONG	knlIopGlbId##	;IOPAR_GLBID       = 0005h
+	.LONG	knlIopDelay##	;IOPAR_DELAY       = 0006h
+	.LONG	knlIopTimeOut##	;IOPAR_TIMEOUT     = 0007h
+	.LONG	0		;IOPAR_INPSTS      = 0008h
+	.LONG	0		;IOPAR_OUTSTS      = 0009h
+	.LONG	knlIopInpQLmt##	;IOPAR_INPQLMT     = 000Ah
+	.LONG	knlIopOutQLmt##	;IOPAR_OUTQLMT     = 000Bh
+	.LONG	0		;IOPAR_SIVECT1     = 000Ch
+	.LONG	0		;IOPAR_SIVECT2     = 000Dh
+	.LONG	0		;IOPAR_SIDATA      = 000Eh
+	.LONG	knlIopNumOpen##	;IOPAR_NUMOPEN     = 000Fh
+	.LONG	knlIopBufrLmt##	;IOPAR_BUFRLMT	   = 0010h
+PARMGENMAX=!{$-lapbiogenparms}/4
+.PAGE
+	.SBTTL	Initialization routine
+
+	INITSUB	lapbainit
+
+;The command for installing LAPBACLS is:
+;	LKELOAD LAPBACLS
+
+lapbainit:
+	MOVL	EDI, #lapbchk		;Install our class
+	MOVL	EBX, #lapbcls		;Offset of class function dispatch table
+	MOVL	EAX, #'LAPB'
+	MOVL	EDX, #'A'
+	MOVL	ECX, #lapbcctbl
+	MOVL	ESI, #lapbaccb
+	CALL	knlNewClass##
+	JC	4$.S			;This should not fail!
+	MOVL	ECX, #codetop
+	CLRL	EDX
+	CLRL	EAX
+4$:	MOVL	EBX, #QSTS$DONE
+	RET
+
+	CODE
+.PAGE
+	.SBTTL	lapbaaddunit - Class function to add unit
+
+;Here for the CL_ADDUNIT function
+;	c{ES:EDI} = Address of parameter block
+;	CALL	lapbaaddunit
+;	c{EAX} = Error code
+;	c{EBX} = Status bits
+;	c{ECX} = Item count
+
+;Description block for addunitchar
+
+	DATA
+
+	.MOD	4
+lapbaaublk:
+ DCHARBGN  3, knlDCharValCom##
+ DCHARENT  UNIT  , DECV, ,  1, 0, 0, lauunit  , 0
+ DCHARENT  NETDEV, TEXT, , 16, 0, 0, launetdev, 0
+
+	CODE
+
+$$$=!0
+FRM hau_unit, 4t		;Unit number
+FRM hau_idb , 4t		;Offset of IDB
+FRM hau_char, 8t		;Address of chracteristics list
+hau_SIZE=!$$$
+
+lapbaaddunit:
+	ENTER	hau_SIZE, 0		;Set up and initialize our stack frame
+	CLRL	EAX
+	DECL	EAX
+	MOVL	hau_unit.B[EBP], EAX
+	MOVL	hau_idb.B[EBP], EAX
+	IFFAULT	6$
+	LFSL	EDX, iorb_buffer2.B[ESI]
+	MOVL	hau_char+0.B[EBP], EDX
+	MOVL	hau_char+4.B[EBP], FS
+	CALL	knlGiveQel##		;Give up the IORB
+	MOVL	EBX, #lapbaaublk	;Process the characteristics
+	MOVB	AL, #1			;Ignore bad names here
+	CALL	knlAddUnitChar##
+	JNC	8$.S			;If no error
+4$:	CLRL	ECX
+	MOVL	EBX, #QSTS$DONE
+	LEAVE				;Fail
+	TOFORK
+	STC
+	RET
+
+;Here if address error with IORB
+
+	FAULTHDR
+6$:	CALL	knlGiveQel##
+7$:	MOVL	EAX, #ER_ADRER
+	JMP	4$.S
+
+;Here with all parameters processed - make sure we got everything we need
+
+8$:	MOVL	EAX, hau_unit.B[EBP]
+	ORL	EAX, hau_idb.B[EBP]
+	INCL	EAX
+	JNE	16$.S
+	MOVL	EAX, #ER_CHARM
+	JMP	4$.S
+
+;Here if LAPBA unit is already defined
+
+12$:	MOVL	EAX, #ER_DUADF
+	JMP	4$.S
+
+;Here with all needed parameters found
+
+16$:	MOVB	AL, hau_unit.B[EBP]
+	MOVL	ESI, xoslpaSdbHead	;Point to first LAPBA SDB
+18$:	TESTL	ESI, ESI
+	JE	22$.S			;If no more SDBs
+	CMPB	sdb_unit.B[ESI], AL	;Same unit?
+	JE	12$.S			;Yes - fail
+20$:	MOVL	ESI, [ESI]		;Not this one - try next
+	JMP	18$.S			;Continue
+
+;Here if this unit not defined now
+
+22$:	CALL	knlGetXRes##		;Get exec memory resource
+	MOVL	ECX, #sdb_mSIZE+sdb_lapbaSIZE
+	CALL	knlGetXMem##		;Allocate exec memory for the SDB
+
+	JC	30$			;If error
+	LEAL	ESI, sdb_mSIZE.B[EDI]
+	MOVL	sdb_magic.B[ESI], #'SDB*'
+	MOVL	EDX, hau_idb.B[EBP]	;Store offset of associated IDB
+	MOVL	sdb_idb.B[ESI], EDX
+	MOVL	idb_sdbhead.B[EDX], ESI
+	MOVL	idb_sdbtail.B[EDX], ESI
+	MOVL	sdb_sapvalue.B[ESI], #0FFFFh ;Store the dummy SAP value
+	MOVL	sdb_abort.B[ESI], #lapbaabort ;Store offset of abort output
+					      ;  routine
+	MOVL	sdb_receive.B[ESI], #lapbrcvpkt ;Store offset of receive routine
+	MOVL	sdb_frcrexmit.B[ESI], #frcrexmit
+	MOVL	EAX, lastsdb		;Link into our chain of SDBs
+	TESTL	EAX, EAX
+	JE	24$.S
+	MOVL	sdb_nextd.B[EAX], ESI
+	JMP	26$.S
+
+24$:	MOVL	xoslpaSdbHead, ESI
+	MOVL	EBX, #lapboas
+	CALL	knlSetupOAS##
+26$:	MOVL	lastsdb, ESI
+	MOVL	EAX, hau_unit.B[EBP]
+	MOVB	sdb_unit.B[ESI], AL
+	LEAL	EBX, sdb_name+5.B[ESI]	;Construct unit name
+	MOVL	-5.B[EBX], #'LAPB'
+	MOVB	-1.B[EBX], #'A'
+	CALL	knlPutDecNmbr##
+	MOVL	sdb_hdrsz.B[ESI], #2t	;Store size of the LAPB packet header
+	MOVB	sdb_lapbcmdaddr.B[ESI], #01 ;Make this a DTE to begin with
+	MOVB	sdb_lapbrspaddr.B[ESI], #03
+	MOVL	sdb_lapbn1val.B[ESI], #1024t
+	MOVL	sdb_lapbn2val.B[ESI], #3t
+	MOVL	sdb_lapbt1val.B[ESI], #{1000t+MSPERTICK-1}/MSPERTICK
+	MOVL	sdb_lapbt2val[ESI], #{150t+MSPERTICK-1}/MSPERTICK
+	MOVL	sdb_lapbt3val[ESI], #20t
+	MOVL	sdb_lapbkaval[ESI], #3t
+	MOVB	sdb_lapbacklvl.B[ESI], #1t
+	MOVB	sdb_lapbrcvwinsz[ESI], #3t
+	MOVB	sdb_lapbsndwinsz[ESI], #3t
+	MOVB	sdb_lapbsts1.B[ESI], #LAPBS1$SABM
+	MOVB	sdb_lapbkaaddr.B[ESI], #02h
+	CLRL	EAX
+30$:	CALL	knlGiveXRes##
+	JMP	4$
+.PAGE
+;Subroutine called by adduchars when "NETDEV" characteristic found
+
+launetdev:
+	MOVL	EAX, knlDcValue##+8
+	ORL	EAX, knlDcValue##+12t
+	JNE	8$.S
+	MOVL	ESI, xosnetIdbHead##	;Get offset of first IDB
+	TESTL	ESI, ESI
+	JE	8$.S			;If none
+	MOVL	EAX, knlDcValue##+0
+	MOVL	EDX, knlDcValue##+4
+4$:	CMPL	idb_name+0.B[ESI], EAX	;Check name
+	JNE	6$.S
+	CMPL	idb_name+4.B[ESI], EDX
+	JE	10$.S			;If match
+6$:	MOVL	ESI, idb_nextd.B[ESI]	;Different - advance to next IDB
+	TESTL	ESI, ESI
+	JNE	4$.S			;Continue if have another
+8$:	MOVL	EAX, #ER_NSDEV		;No match found - fail
+	STC
+	RET
+
+;Here with IDB for interface
+
+10$:	CMPL	idb_sdbhead.B[ESI], #0.B ;Is this interface in use now?
+	JNE	12$.S			;Yes - fail
+	MOVL	hau_idb.B[EBP], ESI	;No - OK
+	RET
+
+;Here if already have a LAPB level device associated with the network device
+
+12$:	MOVL	EAX, #ER_DEVIU
+	STC
+	RET
+
+;Subroutine called by adduchars when "UNIT" characteristic found
+
+lauunit:MOVL	hau_unit.B[EBP], EAX
+	CLC
+	RET
+.PAGE
+;Here to get the value of the NETDEV characteristic
+
+lapbgetnetdev:
+	MOVL	EBX, dcb_netidb.B[EDI]	;Get offset of the IDB
+	LEAL	EAX, idb_name+0.B[EBX]	;Get offset of NET device name
+	RET
+.PAGE
+	.SBTTL	getsdbdata - Subroutine to get data item from an SDB
+
+;Subroutine to get data item from an SDB for QFNC_DEVCHAR
+;	c{EBX} = Offset of item
+;	c{EDI} = Offset of DCB
+;	CALL	getsdbdata
+;	C:clr always
+;	c{EAX} = Data value
+
+getsdbdata:
+	ADDL	EBX, dcb_netsdb.B[EDI]	;Point to the data item
+	MOVL	EAX, [EBX]		;Get value
+	CLC
+	RET				;Thats all
+
+	.SBTTL	setsdbdata - Subroutine to set data item in an SDB
+
+;Subroutine to set data item in an SDB for QFNC_DEVCHAR
+;	c{EAX} = Data value
+;	c{EBX} = Offset of item
+;	c{EDI} = Offset of DCB
+;	CALL	setsdbdata
+;	C:clr always
+
+setsdbdata:
+	ADDL	EBX, dcb_netsdb.B[EDI]	;Point to the data item
+	MOVL	[EBX], EAX		;Store value
+	CLC
+	RET				;Thats all
+
+	.SBTTL	getsdbbyte - Subroutine to get 1-byte data item from an SDB
+
+;Subroutine to get 1-byte data item from an SDB for QFNC_DEVCHAR
+;	c{EBX} = Offset of item
+;	c{EDI} = Offset of DCB
+;	CALL	getsdbbyte
+;	C:clr always
+;	c{EAX} = Data value
+
+getsdbbyte:
+	ADDL	EBX, dcb_netsdb.B[EDI]	;Point to the data item
+	MOVZBL	EAX, [EBX]		;Get value
+	CLC
+	RET				;Thats all
+
+	.SBTTL	setsdbbyte - Subroutine to set 1-byte data item in an SDB
+
+;Subroutine to set 1-byte data item in an SDB for QFNC_DEVCHAR
+;	c{EAX} = Data value
+;	c{EBX} = Offset of item
+;	c{EDI} = Offset of DCB
+;	CALL	setsdbbyte
+;	C:clr always
+
+setsdbbyte:
+	ADDL	EBX, dcb_netsdb.B[EDI]	;Point to the data item
+	MOVB	[EBX], AL		;Store value
+	CLC
+	RET				;Thats all
+
+	.SBTTL	gettype
+
+gettype:MOVL	ESI, dcb_netsdb.B[EDI]
+	MOVL	EAX, #'DTE'		;Assume DTE
+	CMPB	sdb_lapbcmdaddr.B[ESI], #01 ;Right?
+	JE	2$.S			;Yes
+	MOVB	AH, #'C'		;No - its DCE
+2$:	CLRL	EDX
+	RET
+
+	.SBTTL	settype
+
+settype:MOVL	EBX, #typeval		;Search the keyword table
+	MOVL	ECX, #TYPEVALSZ
+	CALL	knlGetDcVal1##
+	JC	6$.S			;If error
+	MOVL	ESI, dcb_netsdb.B[EDI]	;Get offset of SDB
+	TESTL	EAX, EAX		;Is it DTE?
+	JE	4$.S			;Yes
+	MOVB	sdb_lapbcmdaddr.B[ESI], #03 ;No - its DCE
+	MOVB	sdb_lapbrspaddr.B[ESI], #01
+	JMP	6$.S
+
+4$:	MOVB	sdb_lapbcmdaddr.B[ESI], #01
+	MOVB	sdb_lapbrspaddr.B[ESI], #03
+6$:	RET
+
+	.MOD	4
+typeval:.LONG	'DTE', 0
+	.LONG	'DCE', 0
+TYPEVALSZ=!{$-typeval}/8t
+
+	.SBTTL	getstate - Get value of STATE characteristic
+
+;Here to get the value of the STATE characteristic
+
+getstate:
+	MOVL	ESI, dcb_netsdb.B[EDI]	;Get offset of SDB
+	MOVZBL	EAX, sdb_lapbstate.B[ESI] ;Get state value
+	MOVL	EDX, CS:stateval+4[EAX*8] ;Get corresponding keyword
+	MOVL	EAX, CS:stateval+0[EAX*8]
+	CLC
+	RET
+
+	.SBTTL	setstate - Set value of STATE characteristic
+
+;Here to set the value of the STATE characteristic
+
+setstate:
+	MOVL	EBX, #stateval		;Search the keyword table
+	MOVL	ECX, #STATEVALSZ
+	CALL	knlGetDcVal1##
+	JC	6$.S			;If error
+	CMPB	AL, #1			;Is this a valid state to specify?
+	JA	8$.S			;No
+	MOVL	ESI, dcb_netsdb.B[EDI]	;Yes - get offset of SDB
+	TOFORK
+	PUSHL	EAX
+	CALL	xoslpaLinkDown		;Make sure the link is down
+	MOVL	sdb_lapbkacnt[ESI], #1	;Reset the keep-alive timer
+	POPL	EAX
+	FROMFORK
+	MOVB	sdb_lapbstate.B[ESI], AL ;Store new state value (which is the
+	CLC				 ;  same as the table index)
+	RET
+
+;Here if invalid state specified
+
+8$:	MOVL	EAX, #ER_CHARV
+	STC
+	RET
+
+	.MOD	4
+stateval:
+	.LONG	'DISA', 'BLED'	;ST_DISABLE = 0 - Link is disabled
+	.LONG	'IDLE', 0	;ST_IDLE    = 1 - Link is idle
+	.LONG	'SABM', 0	;ST_SABM    = 2 - SABM command has been sent
+	.LONG	'CON' , 0	;ST_CON     = 3 - Link is connected
+	.LONG	'DISC', 0	;ST_DISC    = 4 - DISC command has been sent
+STATEVALSZ=!{$-stateval}/8t
+
+	.SBTTL	getticks
+
+getticks:
+	ADDL	EBX, dcb_netsdb.B[EDI]	;Point to the data item
+	IMULL	EAX, [EBX], #MSPERTICK	;Get value
+	CLC
+	RET				;Thats all
+
+	.SBTTL	setticks
+
+setticks:
+	ADDL	EBX, dcb_netsdb.B[EDI]	;Point to the data item
+	ADDL	EAX, #MSPERTICK-1
+	MOVL	ECX, #MSPERTICK
+	CLRL	EDX
+	IDIVL	ECX
+	CMPL	EAX, #2t.B
+	JA	10$.S
+	MOVB	AL, #2
+10$:	MOVL	[EBX], EAX		;Store value
+	CLC
+	RET				;Thats all
+
+	.SBTTL	sett3
+
+sett3:	ADDL	EBX, dcb_netsdb.B[EDI]	;Point to the data item
+	ANDL	EAX, #0FFFFFFFCh.B	;Change to (N/4)*4 + 1
+	JNE	12$.S
+	MOVB	AL, #4t
+12$:	INCL	EAX
+	MOVL	[EBX], EAX		;Store T3 value
+	SHRL	EAX, #2t		;Get the K-A interval
+	MOVL	4.B[EBX], EAX		;Store it
+	RET
+
+	.SBTTL	getkatype
+
+getkatype:
+	MOVL	EBX, dcb_netsdb.B[EDI]
+	MOVZBL	EAX, sdb_lapbkaaddr.B[EBX]
+	MOVL	EBX, #kaaddrval
+	MOVL	ECX, #KAADDRVALSZ
+	JMP	knlGetDcName##
+
+	.SBTTL	setkatype
+
+setkatype:
+	MOVL	EBX, #kaaddrval
+	MOVL	ECX, #KAADDRVALSZ
+	CALL	knlGetDcVal2##
+	JC	14$.S
+	MOVL	EBX, dcb_netsdb.B[EDI]
+	MOVB	sdb_lapbkaaddr.B[EBX], AL
+14$:	RET
+
+	.MOD	4
+kaaddrval:
+	.LONG	'NONE', 0, 0FFh
+	.LONG	'CMD' , 0, 00h
+	.LONG	'RSP' , 0, 02h
+KAADDRVALSZ=!{$-kaaddrval}/12t
+
+	.SBTTL	getsendsabm
+
+;Here to get the value of the SENDSABM characteristic
+
+getsendsabm:
+	MOVL	ESI, dcb_netsdb.B[EDI]
+	MOVL	EAX, #'YES'
+	TESTB	sdb_lapbsts1.B[ESI], #LAPBS1$SABM
+	JNE	20$.S
+	MOVL	EAX, #'NO'
+20$:	CLRL	EDX
+	RET
+
+	.SBTTL	setsendsabm
+
+;Here to set the value of the SENDSABM characteristic
+
+setsendsabm:
+	MOVL	ESI, dcb_netsdb.B[EDI]
+	CALL	knlGetYesNo##		;"YES" or "NO"?
+	JE	16$.S			;"YES"
+	ANDB	sdb_lapbsts1.B[ESI], #~LAPBS1$SABM ;"NO"
+	RET
+
+16$:	ORB	sdb_lapbsts1.B[ESI], #LAPBS1$SABM
+	RET
+.PAGE
+	.SBTTL	lapbaunitinfo - LAPBA class get phyical unit information function
+
+;Here for the get physical unit information class function (CL_PUNITS) for the
+;  LAPBA class
+;	c{EBX} = Offset of CCB
+;	c{ESI} = Offset of IORB
+;	CALL	lapbaunitinfo
+;	c{EAX} = Error code
+;	c{EBX} = Status bits
+;	c{ECX} = Item count
+;  A zero count (iorb_count) requests that the number of units only be returned
+;    in qab_amount.  A non-zero count indicates that a buffer is available for
+;    that many unit names (8 characters each, null padded).
+
+lapbaunitinfo:
+	MOVL	EAX, #ER_NIYT
+	STC
+	RET
+.PAGE
+	.SBTTL	lapbaabort - Subroutine to abort all LAPBA output
+
+;Subroutine to abort all LAPBA output
+;	c{ESI} = Offset of SDB
+;	CALL	lapbaabort
+
+lapbaabort:
+	MOVL	EDI, xoslpaSdbHead	;Get first SDB
+2$:	TESTL	EDI, EDI
+	JE	ret008.S
+	CALLI	sdb_abort.B[EDI]
+	MOVL	EDI, [EDI]
+	JMP	2$.S
+.PAGE
+	.SBTTL	lapbchk - Device check routine for LAPBA devices
+
+;Device check routine for LAPBA devices
+;	c{EBX:EAX} = Device name (8 bytes)
+;	CALL	lapbachk
+;	C:set = Error (match found)
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  Z:set = Match found
+;	    c{EDI} = Offset of DCB
+;	  Z:clr = Not found
+;  ESI is preserved
+
+lapbchk:CMPL	SS:[EBX], #'LAPB'	;Is this for LAPBA*?
+	JNE	8$.S			;No
+	CMPB	SS:4.B[EBX], #'A'	;Maybe
+	JNE	8$.S			;No
+	MOVL	EDI, xoslpaSdbHead	;Yes - point to first SDB
+	TESTL	EDI, EDI
+	JE	8$.S			;If none at all
+	MOVL	EAX, SS:4.B[EBX]
+4$:	CMPL	sdb_name+4.B[EDI], EAX	;Does name match?
+	JE	10$.S			;Yes - this is it!
+	MOVL	EDI, sdb_nextd.B[EDI]	;Not this one - try next
+	TESTL	EDI, EDI
+	JNE	4$.S			;Continue if another
+8$:	TESTL	ESP, ESP		;No more - clear Z
+ret008:	RET
+
+;Here with match on name
+
+10$:	PUSHL	ESI
+	PUSHL	EDI			;Save offset of the SDB
+	PUSHL	SS:12t.B[EBX]		;Device name
+	PUSHL	SS:8.B[EBX]
+	PUSHL	SS:4.B[EBX]
+	PUSHL	SS:[EBX]
+	MOVZBL	EAX, sdb_unit.B[EDI]	;Primary unit number
+	PUSHL	EAX
+	PUSHL	#0.B			;Secondary unit number
+	PUSHL	#dcb_lapbINDEX.B	;Size index
+	PUSHL	#lapbaccb		;Offset of CCB
+	PUSHL	sdb_idb.B[EDI]		;Offset of IDB
+	PUSHL	#DS$DUPLEX		;Description bits
+	CALL	xosnetMakeDcb##		;Get a network DCB
+	POPL	EBX
+	POPL	ESI
+	JC	ret010.S		;If error
+	MOVL	dcb_sdisp.B[EDI], #lapbdsp ;Store offset of SVC dispatch table
+	MOVL	dcb_devchar.B[EDI], #lapbdctbl ;Store offset of devchar table
+	MOVB	dcb_bufrlmt.B[EDI], #4	;Default buffer limit is 4
+	MOVL	dcb_netsdb.B[EDI], EBX	;Store offset of the SDB in the DCB
+	CLRL	EAX			;Set Z
+ret010:	RET				;And return
+.PAGE
+;Here for the get device information entry
+;	c{ECX}    = Length of user buffer
+;	c{ES:EDI} = Address of user buffer
+;	c{ESI}    = Offset of DCB
+;	CALL	lapbdevinfo
+
+lapbdevinfo:
+	MOVL	EAX, #ER_NIYT
+	STC
+	RET
+.PAGE
+	.SBTTL	sd_open - Open device
+
+;Here for the open device entry (sd_open) - also used for the device parameters
+;  entry (sd_parm)
+;	c{EDI} = Offset of DCB
+;	CALL	lapbopen
+;	  c{EAX} = Error code
+;	  c{ECX} = 0
+;	C:clr = Normal
+;	  c{ECX} = 1
+
+lapbopen:
+	CMPL	SS:xffParm##, #0.B
+	JE	6$.S
+	MOVL	EBX, #lapbopnparms	;Process device parameters
+	MOVL	ECX, #knlComDPParms##
+	LFSL	EDX, SS:xffParm##
+	CALL	knlProcDevParm##
+	JC	10$.S
+6$:	CLRL	EAX
+	MOVL	ECX, #1
+	RET
+
+;Here if have an illegal remote address
+
+8$:	MOVL	EAX, #ER_NILAD
+	STC
+10$:	CLRL	ECX
+	RET
+.PAGE
+	.SBTTL	sd_close - Close device
+
+;Here for the close device entry
+;	c{ECX} = Close option bits
+;	c{EDI} = Offset of DCB
+;	c{ESI} = Offset of device table entry
+;	CALL	lapbclose
+;	C:set = Error or not ready
+;	  c{EAX} = Error code (0 means not ready)
+;	C:clr = Normal
+
+lapbclose:
+	CALL	knlIoClsLock##		;Lock the QAB
+	MOVB	iorb_queue.B[ESI], #dcb_outframe
+	MOVL	iorb_routine.B[ESI], #lapbclose1
+	JMP	knlXfQueue##		;Switch to extended fork context
+
+	FAULTHDR
+2$:	MOVL	[ESP], #ER_ADRER
+	JMP	4$.S
+
+;Here in extended fork context
+
+lapbclose1:
+	PUSHL	#0.B
+	CMPL	SS:xffParm##, #0.B	;Have any device parameters?
+	JE	4$.S			;No
+	MOVL	EBX, #lapbioparms	;Yes - process parameters
+	MOVL	ECX, #knlComDPParms##
+	IFFAULT	2$
+	LFSL	EDX, SS:xffParm##
+	CALL	knlProcDevParm##
+	JNC	4$.S
+	MOVL	[ESP], EAX
+4$:	POPL	EAX			;Restore error code
+	JMP	knlXfCloseFin##		;Go finish up
+.PAGE
+	.SBTTL	xoslpaSetPkt - Subroutine to set up LAPB I-frame packet header
+
+;Subroutine to set up LAPB I-frame packet header - must be called at in
+;  extended fork context
+;	c{EBX} = Offset of packet buffer
+;	c{EDI} = Offset of DCB
+;	CALL	xoslpaSetPkt
+;	C:set = Error
+;	  c{EAX} = Error code
+;	  c{EBX} = Offset of packet buffer (unchanged)
+;	C:clr = Normal
+;	  c{EBX} = Offset of packet buffer (unchanged)
+;	  c{EDX} = Offset of first byte beyond LAPB header
+
+xoslpaSetPkt:
+	PUSHL	EDI
+	MOVL	EDI, dcb_netsdb.B[EDI]	;Get offset of SDB
+	CALL	xoslpaSetPkt2
+	POPL	EDI
+	RET
+
+;Subroutine to set up LAPB I-frame packet header - does not require DCB or XFF
+;  so can be called from device fork level
+;	c{EDI} = Offset of SDB
+;	CALL	xoslpaSetPkt2
+;	C:set = Error
+;	  c{EAX} = Error code
+;	  c{EBX} = Offset of packet buffer (unchanged)
+;	C:clr = Normal
+;	  c{EBX} = Offset of packet buffer (unchanged)
+;	  c{EDX} = Offset of first byte beyond LAPB header
+
+xoslpaSetPkt2:
+	CMPL	sdb_magic.B[EDI], #'SDB*'
+	JNE	10$.S
+
+	MOVL	npb_count.B[EBX], #2	;Initialize packet byte count
+
+	LEAL	EDX, 2.B[EBX]		;Point to first byte beyond the header
+	MOVB	npb_npofs.B[EBX], #0	;Store header offsets
+	MOVB	npb_tpofs.B[EBX], #2
+	RET				;Return
+
+10$:	CRASH	NSDB			;[Not an SDB]
+.PAGE
+	.SBTTL	xoslpaWaitWin - Subroutine to wait until send window is open
+
+;Subroutine to wait until send window is open - Must be called in extended
+;  fork context.  Caller MUST call either xoslpaSendInfo or xoslpaGiveWin after
+;  a good return from this routine or output flow control may hang!
+;	c{EDI} = Offset of DCB
+;	CALL	xoslpaWaitWin
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+
+xoslpaWaitWin:
+	MOVL	ESI, dcb_netsdb.B[EDI]	;Get offset of the SDB
+	TESTB	sdb_lapbsts1.B[ESI], #LAPBS1$BUSY ;Busy?
+	JNE	2$.S			;Yes - must wait
+	CMPB	sdb_lapbsndwinavl.B[ESI], #0 ;No - is the window open now?
+	JNE	10$.S			;Yes - just return
+2$:	MOVL	EAX, sdb_lapbwaittail.B[ESI] ;No - link us to the wait list
+	TESTL	EAX, EAX
+	JNE	4$.S
+	MOVW	sdb_lapbwaithead.B[ESI], SS
+	JMP	6$.S
+
+4$:	MOVL	ES, EAX
+	MOVW	ES:xffWaitList##, SS
+6$:	MOVW	sdb_lapbwaittail.B[ESI], SS
+	CALL	knlXfWaitNTO##		;Wait until window opens
+	JC	12$.S			;If error
+
+	DECL	EAX			;Do we need to open the window?
+	JE	8$.S			;Yes
+	CMPB	sdb_lapbsndwinavl.B[ESI], #0 ;No - is it open now?
+	JE	2$.S			;No - must wait some more
+	RET				;Yes - finished here
+
+;Here if the window was closed by the receive code to prevent anyone else
+;  from sneaking in on us
+
+8$:	INCB	sdb_lapbsndwinavl.B[ESI] ;Open the window
+	DECB	sdb_lapbxxxwin.B[ESI]
+10$:	RET
+
+;Here if error while waiting for the window to open - we must remove this
+;  XFF from the wait list
+
+12$:	PUSHL	EAX
+	CLRL	EDX
+	MOVW	CX, SS
+	PUSHL	DS			;Point to the head pointer
+	POPL	ES
+	LEAL	EDX, sdb_lapbwaithead.B[ESI]
+14$:	MOVZWL	EAX, ES:[EDX]		;Get next XFF
+	CMPW	AX, CX			;This one?
+	JE	18$.S			;Yes
+	TESTL	EAX, EAX		;No - have another?
+	JE	16$.S			;No
+	MOVL	ES, EAX
+	MOVL	EDX, #xffWaitList##
+	JMP	14$.S
+
+;Here if this XFF was not found in the list
+
+16$:	CRASH	XFNF
+
+;Here with this XFF found in the wait list
+
+18$:	MOVZWL	EAX, SS:xffWaitList##	;Remove it from the list
+	MOVW	ES:[EDX], AX
+	TESTL	EAX, EAX
+	JNE	20$.S
+	MOVL	sdb_lapbwaittail.B[ESI], EAX
+20$:	POPL	EAX
+	STC
+22$:	RET
+
+	.SBTTL	xoslpaGiveWin - Subroutine to give up window slot
+
+;Subroutine to give up window slot obtained by calling xoslpaWaitWin - This
+;  subroutine must be called after a good return from xoslpaWaitWin if
+;  xoslpaSendInfo is not called.
+;	c{EDI} = Offset of DCB
+;	CALL	xoslpaGiveWin
+
+xoslpaGiveWin:
+	MOVL	ESI, dcb_netsdb.B[EDI]	;Get offset of the SDB
+	CMPL	sdb_lapbwaithead.B[ESI], #0.B ;Anyone waiting?
+	JE	20$.S			;No - nothing needed here
+	MOVL	EAX, #2			;Yes - indicate window not closed
+
+;Here to wake up someone waiting for the window
+;	c{EAX} = 1 if window closed to prevent races, 2 if not
+
+wakewin:MOVL	ES, sdb_lapbwaithead.B[ESI] ;Yes
+	MOVZWL	EDX, ES:xffWaitList##	;Remove the XFF from the list
+	MOVL	sdb_lapbwaithead.B[ESI], EDX
+	TESTL	EDX, EDX
+	JNE	24$.S
+	MOVL	sdb_lapbwaittail.B[ESI], EDX
+24$:	CLRL	EDX
+	MOVL	ES:xffWaitList##, EDX
+	JMP	knlResumeXf##		;Wake him up and return (setting EAX to
+					;  a positive value here ensures that
+					;  an error can't sneak in)
+.PAGE
+	.SBTTL	xoslpaSendInfo - Subroutine to send a LAPB I-frame
+
+;Subroutine to send a LAPB I-frame - must be called at in extended fork context
+;	c{EBX} = Offset of packet buffer
+;	c{ESI} = Offset of SDB
+;	CALL	xoslpaSendInfo
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  Z:clr = Packet sent
+;	  Z:set = Packet queued
+
+xoslpaSendInfo:
+	REQUIREFORK
+	CMPB	sdb_lapbstate.B[ESI], #ST_CON ;Are we connected?
+	JNE	20$			;No - fail
+	TESTB	sdb_lapbsts1.B[ESI], #LAPBS1$BUSY ;Busy?
+	JNE	4$.S			;Yes - must wait
+	CMPB	sdb_lapbsndwinavl[ESI], #0 ;No - is the window open now?
+	JNE	sendinfo2.S		;Yes - go on
+4$:	MOVL	EAX, sdb_lapbsndtail.B[ESI] ;Put the packet on the send list
+	TESTL	EAX, EAX
+	JE	6$.S
+	MOVL	npb_nextsnd.B[EAX], EBX
+	JMP	8$.S
+
+6$:	MOVL	sdb_lapbsndhead.B[ESI], EBX
+8$:	MOVL	sdb_lapbsndtail.B[ESI], EBX
+	CLRL	EAX
+	MOVL	npb_nextsnd.B[EBX], EAX
+	RET				;Return with Z set
+
+;Here if can send the packet now (Enter here at device fork level when window
+;  opens and there are packets waiting)
+
+sendinfo2:
+	CMPL	sdb_lapbrrwake[ESI], #0.B ;Is the delayed RR timer running now?
+	JE	10$.S			;No
+	PUSHL	ESI			;Yes - stop it
+	MOVL	ESI, sdb_lapbrrwake.B[ESI]
+	CALL	knlWakeRemove##
+	POPL	ESI
+	CLRL	EAX
+	MOVL	sdb_lapbrrwake.B[ESI], EAX
+10$:	MOVB	AL, sdb_lapbcmdaddr.B[ESI] ;Store address (always a command)
+	MOVB	[EBX], AL
+	MOVB	AL, sdb_lapbrcvseq.B[ESI] ;Construct the control byte
+	MOVB	sdb_lapbrcvseqsnt.B[ESI], AL
+	SHLB	AL, #4t
+	MOVB	AH, sdb_lapbsndseq.B[ESI]
+	MOVB	npb_seqnum+0.B[EBX], AH
+	ORB	AL, AH
+	ADDB	AL, AL
+	MOVB	1.B[EBX], AL
+	MOVB	AL, sdb_lapbrcvwinsz[ESI]
+	MOVB	sdb_lapbrcvwinavl.B[ESI], AL
+	MOVL	EAX, sdb_lapbkaval[ESI]
+	MOVL	sdb_lapbkacnt[ESI], EAX
+	MOVL	EAX, sdb_lapbheldtail.B[ESI] ;Link this packet to the held list
+	TESTL	EAX, EAX
+	JE	14$.S
+	MOVL	npb_next.B[EAX], EBX
+	JMP	16$.S
+
+;Here if held list was empty
+
+14$:	MOVL	sdb_lapbheldhead.B[ESI], EBX
+	PUSHL	EBX
+	CALL	rexmitreq
+	POPL	EBX
+16$:	MOVL	sdb_lapbheldtail.B[ESI], EBX
+	CLRL	EAX
+	MOVL	npb_next.B[EBX], EAX
+	INCB	sdb_lapbsndseq.B[ESI]	;Bump the send sequence number
+	ANDB	sdb_lapbsndseq.B[ESI], #07h
+	DECB	sdb_lapbsndwinavl[ESI]	;Close the window by 1 packet
+	MOVL	npb_outdone.B[EBX], #ret008 ;Store offset of output done routine
+	PUSHL	ESI
+	MOVL	ESI, sdb_idb.B[ESI]	;Get offset of the IDB
+	CALL	xosnetSendPkt##		;Send the packet
+	POPL	ESI
+	TESTL	ESP, ESP
+	RET
+
+;Here if link is not connected
+
+20$:	CALL	xosnetGiveBufr##
+	MOVL	EAX, #ER_NLKNA
+	STC
+	RET
+.PAGE
+	.SBTTL	frcrexmit - Subroutine to handle forced retransmit condition
+
+;Subroutine called when the output device is completely idle and we have a
+;  forced retransmit condition - This occures when we want to retransmit one
+;  or more packets that are in the process of being output.  In this case we
+;  set the IS$REXMIT bit in idb_sts which causes the device level routines to
+;  not start any additional output when output finishes and to call us here
+;  when the device is completely idle.  We output as many pending retransmit
+;  packets as the device can take.  If we output all we have, we clear the
+;  pending retransmit condition.
+;	c{ESI} = Offset of SDB
+;	CALL	frcrexmit
+;	C:clr = Retransmission is finished
+;	C:set = Still retransmissing
+
+frcrexmit:
+	MOVL	EBX, sdb_lapbheldhead.B[ESI]
+2$:	TESTL	EBX, EBX
+	JE	10$.S
+	TESTB	npb_sts.B[EBX], #NPS$REXREQ ;Need to retransmit this one?
+	JE	4$.S			;No - go on
+	ANDB	npb_sts.B[EBX], #NPS$REXREQ ;Yes
+	PUSHL	ESI
+	MOVL	ESI, sdb_idb.B[ESI]
+	CALL	xosnetSendPkt##		;Output it
+	CMPL	idb_xmtavail.B[ESI], #0.B ;Can we do more now?
+	JE	6$.S			;No
+	POPL	ESI			;Yes
+4$:	MOVL	EBX, npb_next.B[EBX]	;Advance to next packet
+	JMP	2$.S
+
+;Here if device can't take any more output now - scan the rest of the held
+;  packets to see if we are done retransmitting
+
+6$:	POPL	ESI
+8$:	MOVL	EBX, npb_next.B[EBX]
+	TESTL	EBX, EBX
+	JE	10$.S
+	TESTB	npb_sts.B[EBX], #NPS$REXREQ
+	JE	8$.S
+	CLC				;Set C to indicate more to retransmit
+10$:	RET
+.PAGE
+	.SBTTL	lapbrcvpkt - Subroutine called when packet has been input for LAPBA device
+
+;Subroutine called when packet has been input for an LAPBA device
+;	c{EBX} = Offset of start of packet
+;	c{ECX} = Length of packet
+;	c{ESI} = Offset of SDB
+;	CALL	lapbrcvpkt
+
+lapbrcvpkt:
+	ADDL	sdb_lapbcntbytein[ESI], ECX ;Count the packet
+	INCL	sdb_lapbcntpktin[ESI]
+	MOVB	AL, [EBX]		;Get address from packet
+	TESTB	AL, #0FCh		;Is it valid?
+	JNE	4$.S			;No
+	TESTB	AL, #01h		;Maybe
+	JE	4$.S			;No
+	MOVL	EAX, [EBX]		;Yes - get the control byte
+	MOVZBL	EDX, sdb_lapbstate.B[ESI] ;Dispatch on the link state
+	JMPIL	CS:isdsp[EDX*4]
+
+;Here if have bad address - count the error and discard the packet
+
+4$:	INCL	sdb_lapbcntiaddrrcv[ESI]
+	JMP	xosnetGiveBufr#
+
+	.MOD	4
+isdsp:	.LONG	isdisable	;ST_DISABLE = 0 - Link is disabled
+	.LONG	isidle		;ST_IDLE    = 1 - Link is idle
+	.LONG	issabm		;ST_SABM    = 2 - SABM command has been sent
+	.LONG	iscon		;ST_CON     = 3 - Link is connected
+	.LONG	isdisc		;ST_DISC    = 4 - DISC command has been sent
+.PAGE
+;Here with input packet when state is ST_SABM
+
+issabm:	CMPB	AH, #2Fh		;Is this a SABM?
+	JE	4$.S			;Yes
+	CMPB	AH, #3Fh		;Maybe
+	JE	4$.S			;Yes
+	CMPB	AH, #73h		;No - is this a UA response?
+	JNE	isdisable.S		;No
+	CALL	xosnetGiveBufr##
+rcvup:	MOVB	sdb_lapbstate.B[ESI], #ST_CON ;Yes - update the state
+	MOVB	sdb_lapbsndseq.B[ESI], #0
+	MOVB	sdb_lapbrcvseq.B[ESI], #0
+	MOVB	AL, sdb_lapbsndwinsz[ESI] ;Initialize window counts
+	MOVB	sdb_lapbsndwinavl.B[ESI], AL
+	MOVB	AL, sdb_lapbrcvwinsz[ESI]
+	MOVB	sdb_lapbrcvwinavl.B[ESI], AL
+	INCL	sdb_lapbcntlinkup[ESI]	;Count this
+	PUSHL	ESI
+	MOVL	ESI, sdb_pdbhead.B[ESI]	;Tell the packet level about this
+	TESTL	ESI, ESI
+	JE	2$.S
+	CALLI	pdb_linkup.B[ESI]
+2$:	POPL	ESI
+	RET
+
+;Here with SABM after having sent a SABM - we send back a UA but do not
+;  bring the link up
+
+4$:	CALL	xosnetGiveBufr##	;Give up the received packet
+	MOVB	AL, AH
+6$:	ANDB	AL, #10h		;Change frame into a UA (save P/F bit)
+	ORB	AL, #63h
+	MOVB	AH, #02h
+	JMP	sendtwobyte
+
+;Here with input packet when state is ST_DISC
+
+isdisc:	CMPB	AH, #1FH		;Is this a DM response?
+	JNE	isdisable.S		;No
+	MOVB	sdb_lapbstate.B[ESI], #ST_IDLE ;Yes - update the state
+	JMP	xosnetGiveBufr##	;Give up the packet
+
+;Here with input packet when state is ST_IDLE
+
+isidle:	CMPB	AH, #2Fh		;Is this a SABM?
+	JE	rcvsabm.S		;Yes
+	CMPB	AH, #3Fh		;Maybe
+	JE	rcvsabm.S		;Yes
+	CMPB	AH, #43h		;Is this a DISC?
+	JE	6$.S			;Yes
+	CMPB	AH, #53h		;Maybe
+	JE	6$.S			;Yes
+					;No
+
+;Here with packet which we cannot accept because state is ST_SABM,
+;  ST_DISC, ST_IDLE, or ST_DISABLE
+
+isdisable:
+	INCL	sdb_lapbcntnotcon[ESI]
+	JMP	xosnetGiveBufr##
+
+;Here with a SABM when state is ST_IDLE or ST_SABM
+
+rcvsabm:CALL	xosnetGiveBufr##	;Give up the received packet
+	MOVB	AL, AH
+	XORB	AL, #4Ch		;Change SABM into UA
+	MOVB	AH, #02h
+	CALL	sendtwobyte
+	JNC	rcvup
+	RET
+.PAGE
+;Here with input packet when state is ST_CON
+
+iscon:	TESTB	AH, #01h		;Does this packet ack anything?
+	JE	2$.S			;Yes
+	TESTB	AH, #02h		;Maybe
+	JNE	rcvunnum		;No - go on
+2$:	SHRB	AH, #5t			;Yes - get ack number
+	MOVL	EDX, sdb_lapbheldhead.B[ESI] ;Get first held packet
+	TESTL	EDX, EDX
+	JNE	4$.S			;If have at least one
+	CMPB	AH, sdb_lapbsndseq.B[ESI] ;Is N(R) right?
+	JNE	8$.S			;No - fail!
+	JMP	30$			;Yes - go on
+
+;Here if there is at least one held packet
+
+4$:	MOVB	DL, npb_seqnum+0.B[EDX] ;Get lowest number now un-ACKed
+	CMPB	DL, sdb_lapbsndseq.B[ESI] ;Have we wraped?
+	JA	10$.S			;Yes
+	CMPB	AH, DL			;No - ACK number must be larger
+	JB	8$.S
+6$:	CMPB	AH, sdb_lapbsndseq.B[ESI] ;And not larger than first unsent
+	JBE	12$.S
+8$:	INCL	sdb_lapbcntinrdet[ESI]	;Count the error
+	MOVB	AL, #08h		;Indicate invalid receive sequence
+	JMP	sendfrmr		;  number by sending FRMR
+
+;Here if our send sequence number is wraped
+
+10$:	CMPB	AH, DL
+	JB	6$.S
+12$:	PUSHL	EBX
+	MOVL	EBX, sdb_lapbheldhead.B[ESI] ;Get first held output packet
+14$:	CMPB	AH, npb_seqnum+0.B[EBX]	;Is this one acked?
+	JE	24$.S			;No - finished here
+	MOVL	EDX, npb_next.B[EBX]	     ;Yes - remove this packet from the
+	MOVL	sdb_lapbheldhead.B[ESI], EDX ;  held list
+	TESTL	EDX, EDX
+	JNE	16$.S
+	MOVL	sdb_lapbheldtail.B[ESI], EDX
+16$:	CALL	xosnetGiveBufr##	;Give up the buffer
+	INCB	sdb_lapbsndwinavl.B[ESI] ;Increase the send window
+	ANDB	sdb_lapbsts1.B[ESI], #~LAPBS1$REJREC ;Clear possible REJ
+						     ;  recovery state
+20$:	CMPL	sdb_lapbsndwake.B[ESI], #0.B ;Is the retransmit timer going now?
+	JE	22$.S			;No
+	PUSHL	EDX			;Yes - stop it
+	PUSHL	EAX
+	PUSHL	ESI
+	MOVL	ESI, sdb_lapbsndwake.B[ESI]
+	CALL	knlWakeRemove##
+	POPL	ESI
+	CLRL	EAX
+	MOVL	sdb_lapbsndwake.B[ESI], EAX
+	POPL	EAX
+	POPL	EDX
+22$:	MOVL	EBX, EDX
+	TESTL	EBX, EBX		;More packets to check?
+	JNE	14$.S			;Yes - continue
+24$:	CMPL	sdb_lapbheldhead.B[ESI], #0.B ;No - still have any held packets?
+	JE	26$.S			;No
+	CALL	rexmitreq		;Yes - restart the retransmit timer
+26$:	POPL	EBX
+	TESTB	sdb_lapbsts1.B[ESI], #LAPBS1$BUSY ;Busy?
+	JNE	30$.S			;Yes - don't send anything now
+	CALL	continue		;No - continue output if we can
+
+;Here with window processing complete
+
+30$:	MOVL	EAX, [EBX]
+	TESTB	sdb_lapbsts1.B[ESI], #LAPBS1$TMRREC ;In timer recovery state?
+	JE	34$.S			;No
+	CMPB	AL, sdb_lapbrspaddr.B[ESI] ;Yes - is this packet a response?
+	JE	34$.S			;No
+	TESTB	1.B[EBX], #10h		;Yes - is the P-bit set?
+	JE	34$.S			;No
+	ANDB	sdb_lapbsts1.B[ESI], #LAPBS1$TMRREC ;Yes - clear timer recovery
+						    ;  state
+	CMPL	sdb_lapbsndwake.B[ESI], #0.B ;Is the retransmit timer going now?
+	JE	32$.S			;No
+	CMPL	sdb_lapbheldhead.B[ESI], #0.B ;Yes - have any held packets?
+	JNE	32$.S			;Yes
+	PUSHL	EAX			;No - stop the timer
+	PUSHL	EBX
+	PUSHL	ESI
+	MOVL	ESI, sdb_lapbsndwake.B[ESI]
+	CALL	knlWakeRemove##
+	POPL	ESI
+	POPL	EBX
+	CLRL	EAX
+	MOVL	sdb_lapbsndwake.B[ESI], EAX
+	POPL	EAX
+32$:	PUSHL	#sendallheld		;When done here, resend all held packets
+34$:	ANDB	AH, #0EFh
+	TESTB	AH, #01h		;Information packet?
+	JE	rcvinfo			;Yes
+	TESTB	AH, #02h		;No - unnumbered packet?
+	JNE	rcvunnum		;Yes
+					;No - fall into rcvsup on next page
+.PAGE
+;Here with a supervisory command/response (RR, RNR, or REJ) when connected
+
+rcvsup:	TESTB	AH, #0Eh		;Is this an RR?
+	JE	rcvrr.S			;Yes
+	TESTB	AH, #0Ah		;No - is this an RNR?
+	JE	rcvrnr.S		;Yes
+	TESTB	AH, #06h		;No - is this an REJ?
+	JNE	rcvill			;No
+
+;Here with an REJ packet - First, remove all info frames from the output queue
+;  (they are also in the held list, so we don't have to worry about keeping
+;  track of them here)
+
+rcvrej:	MOVL	EDI, sdb_idb.B[ESI]
+	PUSHL	EBX
+	CLRL	ECX
+	LEAL	EDX, idb_outhead.B[EDI]
+4$:	MOVL	EBX, [EDX]		;Get next frame
+	TESTL	EBX, EBX
+	JE	10$.S			;If finsihed
+6$:	TESTB	1.B[EBX], #01h		;Is this an info frame?
+	JNE	8$.S			;No
+	MOVL	EBX, npb_nextsnd.B[EBX]	;Yes - discard it
+	MOVL	[EDX], EBX
+	TESTL	EBX, EBX		;Last one?
+	JNE	6$.S			;No - continue
+	MOVL	idb_outtail.B[EDI], ECX	;Yes - update tail pointer
+	JMP	10$.S
+
+;Here if not an info frame
+
+8$:	MOVL	ECX, EBX		;Remember we are keeping this one
+	LEAL	EDX, npb_nextsnd.B[EBX]	;Advance to next frame
+	JMP	4$.S			;Continue
+
+;Here with all queued info frames discarded
+
+10$:	POPL	EBX			;Restore offset of this frame
+	PUSHL	#sendallheld		;When done here, resend all held frames
+	JMP	rcvrr.S
+
+;Here with an RNR frame
+
+rcvrnr:	ORB	sdb_lapbsts1.B[ESI], #LAPBS1$BUSY ;Indicate busy
+	JMP	14$.S
+
+;Here with an RR frame
+
+rcvrr:	TESTB	sdb_lapbsts1.B[ESI], #LAPBS1$BUSY ;Was he busy?
+	JE	14$.S			;No
+	ANDB	sdb_lapbsts1.B[ESI], #~LAPBS1$BUSY ;Yes - but not now
+	CALL	continue		;Send anything that is pending
+14$:	PUSHL	[EBX]
+	CALL	xosnetGiveBufr##
+	POPL	EAX
+	CMPB	sdb_lapbrspaddr.B[ESI], AL ;Is this a command?
+	JNE	16$.S			;No
+	TESTB	AH, #10h		;Yes - is the P-bit set?
+	JE	16$.S			;No
+	MOVB	AH, #12h		;Yes - send back an RR response with
+	JMP	sendrrrsp2		;  the P-bit set
+
+16$:	RET
+.PAGE
+;Here with an unnumbered frame (SABM, DISC, DM, UA, or FRMR) when connected
+
+rcvunnum:
+	CMPB	AL, sdb_lapbrspaddr.B[ESI] ;Is it a command?
+	JNE	10$.S			;No
+	CMPB	AH, #3Fh
+	JE	6$.S
+	CMPB	AH, #2Fh		;Yes - SABM?
+	JE	6$.S			;Yes
+	CMPB	AH, #53h
+	JE	4$.S
+	CMPB	AH, #43h		;No - DISC?
+	JNE	rcvill.S		;No
+
+;Here for a DISC command when connected - This is a normal way to disconnect
+;  a link.  We send back a DM response and take the link down.
+
+4$:	MOVB	AL, [EBX]		;Preserve the P bit
+	ANDB	AL, #10h
+	ORB	AL, #0Fh
+	MOVB	AH, #02h
+	PUSHL	EBX
+	CALL	sendtwobyte		;Send the DM response
+	POPL	EBX
+
+;Here for a SABM command or DM or UA response when connected - This should not
+;  happen!  If it does, it probably means that the other end restarted without
+;  our knowlege and it now thinks the link is down.  We just take the link down
+;  quietly and let it come back up normally as soon as it can.
+
+6$:	CALL	xosnetGiveBufr##	;Give up the input packet
+	JMP	xoslpaLinkDown		;Take the link down
+
+;Here if not a command
+
+10$:	CMPB	AH, #0FH		;Is it a DM?
+	JE	6$.S			;Yes
+	CMPB	AH, #1FH
+	JE	6$.S
+	CMPB	AH, #73h
+	JE	6$.S
+	CMPB	AH, #63h		;No - is it a UA?
+	JE	6$.S			;Yes
+	CMPB	AH, #97h		;No - is it a FRMR?
+	JE	rcvfrmr.S		;Yes
+	CMPB	AH, #87h		;Maybe
+	JE	rcvfrmr.S		;Yes
+
+;Here for an unreconized command or response
+
+rcvill:	INCL	sdb_lapbcntictldet[ESI]	;Count the error
+	MOVB	AL, #01h		;Indicate illegal control field and
+	JMP	sendfrmr		;  send FRMR
+
+;Here for a FRMR response when connected
+
+rcvfrmr:MOVB	AL, 4.B[EBX]		;Get the error bits
+	BTL	EAX, #0t		;Increment the corresponding counts
+	ADCL	sdb_lapbcntictlrpt[ESI], #0.B
+	BTL	EAX, #1t
+	ADCL	sdb_lapbcntiinforpt[ESI], #0.B
+	BTL	EAX, #2t
+	ADCL	sdb_lapbcntmcapxrpt[ESI], #0.B
+	BTL	EAX, #3t
+	ADCL	sdb_lapbcntinrrpt[ESI], #0.B
+	JMP	xoslpaLinkDown		;Take the link down
+.PAGE
+;Here with an information packet
+
+rcvinfo:MOVB	AL, 1.B[EBX]		;Get the send sequence number
+	SHRB	AL, #1t
+	ANDB	AL, #07h
+	CMPB	AL, sdb_lapbrcvseq.B[ESI] ;Is this the one we are expecting?
+	JNE	6$.S			;No!
+	INCB	sdb_lapbrcvseq.B[ESI]	;Yes - bump the requence number
+	ANDB	sdb_lapbrcvseq.B[ESI], #07h
+	DECB	sdb_lapbrcvwinavl.B[ESI] ;Reduce receive window size
+	JS	10$.S			;If flow control overrun
+	PUSHL	ESI
+	MOVL	ESI, sdb_pdbhead.B[ESI]	;Get offset of connected PDB
+	TESTL	ESI, ESI
+	JE	4$.S			;If none
+	LEAL	EDX, 2.B[EBX]
+	MOVL	ECX, npb_count.B[EBX]
+	SUBL	ECX, #2.B
+	CALLI	pdb_receive.B[ESI]
+	POPL	ESI
+	JMP	reqrrrsp		;Send an RR response soon
+
+;Here if no PDB for the link
+
+4$:	POPL	ESI
+	INCL	sdb_lapbcntnodst[ESI]	;Count the error
+	CALL	xosnetGiveBufr##	;Discard the packet
+	JMP	reqrrrsp
+
+;Here if this packet is out of sequence
+
+6$:	INCL	sdb_lapbcntoutseq[ESI]	;Count the error
+	CALL	xosnetGiveBufr##	;Discard the packet
+	TESTB	sdb_lapbsts1.B[ESI], #LAPBS1$REJREC ;Already have REJ pending?
+	JNE	8$.S			;Yes
+	ORB	sdb_lapbsts1.B[ESI], #LAPBS1$REJREC ;No - but we do now
+	MOVB	AL, sdb_lapbrcvseq.B[ESI] ;Get the desired sequence number
+	MOVB	sdb_lapbrcvseqsnt.B[ESI], AL
+	SHLB	AL, #5t
+	ORB	AL, #09h		;Make it an REJ (with the P-bit clear)
+	MOVB	AH, #02h		;Send as a response
+	JMP	sendtwobyte
+
+8$:	RET
+
+;Here if this packet is beyond the current receive window
+
+10$:	INCL	sdb_lapbcntmcapxdet[ESI] ;Count the error
+	MOVB	AL, #04h		;Indicate overrun and send FRMR
+	JMP	sendfrmr
+.PAGE
+	.SBTTL	continue - Continue output stopped for flow control
+
+;Subroutine to continue output stopped for flow control
+;	CALL	continue
+
+continue:
+	CMPB	sdb_lapbsndwinavl.B[ESI], #0 ;Is the window open at all now?
+	JE	6$.S			;No - go on
+	CMPL	sdb_lapbsndhead.B[ESI], #0.B ;Yes - any packets waiting?
+	JE	4$.S			;No
+	PUSHL	EBX
+	MOVL	EBX, sdb_lapbsndhead.B[ESI] ;Yes
+	MOVL	EAX, npb_nextsnd.B[EBX]
+	MOVL	sdb_lapbsndhead.B[ESI], EAX
+	TESTL	EAX, EAX
+	JNE	2$.S
+	MOVL	sdb_lapbsndtail.B[ESI], EAX
+2$:	MOVL	npb_nextsnd.B[EBX], #-1
+	CALL	sendinfo2		;Send the packet
+	POPL	EBX
+	JMP	continue.S
+
+;Here if window is open with no packets waiting to be sent
+
+4$:	CMPL	sdb_lapbwaithead.B[ESI], #0.B ;Any XFFs waiting?
+	JE	6$.S			;No
+	INCB	sdb_lapbxxxwin.B[ESI]
+	DECB	sdb_lapbsndwinavl.B[ESI] ;Yes - close the window so no one else
+					 ;  can sneek in - the code in
+					 ;  xoslpaWaitWin will reopen it so
+	MOVL	EAX, #1			 ;  the waiting XFF can send its packet
+	CALL	wakewin			;Wake up the XFF
+	CMPB	sdb_lapbsndwinavl.B[ESI], #0 ;Is the window still open?
+	JNE	4$.S			;Yes - continue
+6$:	RET
+.PAGE
+	.SBTTL	sd_outblock - Output block
+
+;Here for the IO data transfer entries - this device does not support direct
+;  IO at link level but does allow a 0 count for accessing device parameters.
+;  These operations are not queued.
+;	c{ESI} = Offset of IORB
+;	c{EDI} = Offset of DCB
+;	CALL	lapbxfer
+;	c{EAX} = Error code
+;	c{ECX} = Amount output
+;	c{EBX} = Status bits
+
+lapbxfer:
+	CMPL	iorb_count.B[ESI], #0.B	;Is the count 0?
+	JNE	knlIFnDevGQ##		;No - fail!
+	CMPL	iorb_parm+0.B[ESI], #0.B ;Yes - have any parameters?
+	JE	2$.S			;No - nothing to do here!
+	MOVL	EBX, #lapbioparms	;Yes - process parameters
+	MOVL	ECX, #knlComDPParms##
+	IFFAULT	6$
+	LFSL	EDX, iorb_parm+0.B[ESI]
+	CALL	knlProcDevParm##
+	JC	4$.S			;If error
+2$:	CLRL	EAX
+4$:	PUSHL	EAX
+	CALL	knlGiveIorb##
+	POPL	EAX
+	CLRL	ECX			;Get amount we transfered (always 0)
+	MOVL	EBX, #QSTS$DONE
+	RET
+
+;Here if address error
+
+	FAULTHDR
+6$:	MOVL	EAX, #ER_ADRER
+	JMP	4$.S
+.PAGE
+	.SBTTL	rexmit - Routine to retransmit output frame
+
+;Here when the retransmit timer goes off
+
+rexmit:	CLRL	EAX
+	MOVL	sdb_lapbsndwake.B[EDI], EAX
+	DECB	sdb_lapbretrycnt.B[EDI] ;Have we done this enough?
+	JS	8$.S			;Yes
+	ORB	sdb_lapbsts1.B[EDI], #LAPBS1$TMRREC ;No - indicate timer
+	MOVL	EAX, sdb_lapbkaval[EDI]		    ;  recovery state
+	MOVL	sdb_lapbkacnt[EDI], EAX	;Reset the keep-alive timer
+	MOVL	EBX, sdb_lapbheldtail.B[EDI] ;Get frame to retransmit
+	TESTL	EBX, EBX		;Do we have one?
+	JE	6$.S			;No
+	CMPL	npb_nextsnd.B[EBX], #-1.B ;Is the frame being output now?
+	JNE	4$.S			;Yes - can't output it again!
+	ORB	1.B[EBX], #10h		;Set the P-bit
+	MOVB	AL, sdb_lapbrcvseq.B[EDI]    ;Get the current receive sequence
+	MOVB	sdb_lapbrcvseqsnt.B[EDI], AL ;  number
+	SHLB	AL, #5t
+	ANDB	1.B[EBX], #1Fh		;Store it in the frame
+	ORB	1.B[EBX], AL
+	MOVL	ESI, sdb_idb.B[EDI]	;Get offset of the IDB
+	MOVL	npb_outdone.B[EBX], #ret008 ;Store offset of output done routine
+	CALL	xosnetSendPkt##		;Send the frame again
+2$:	INCL	sdb_lapbcntrexmit[EDI]	;Count the retransmission
+4$:	MOVL	EAX, sdb_lapbt1val.B[EDI] ;Restart the timer
+	MOVL	EBX, #rexmit
+	CALL	knlWakeRequest##
+	JC	6$.S			;Reset link if can't start timer!
+	MOVL	sdb_lapbsndwake.B[EDI], ESI
+	RET
+
+;Here if don't have a packet to retransmit - This can happen if we get a packet
+;  which ACKs all of the held packets after we start retransmitting which does
+;  not have the P-bit set.  In this case, we send an RR command with the P-bit
+;  set.
+
+6$:	MOVB	AH, #10h		;Send RR as a command with the P-bit set
+	MOVL	ESI, EDI
+	CALL	sendrrrsp2
+	MOVL	EDI, ESI
+	JMP	2$.S
+
+;Here if have tried enough - take the link down!
+
+8$:	MOVL	ESI, EDI
+	CALL	xoslpaLinkDown
+	CLC
+	RET
+.PAGE
+	.SBTTL	rexmitreq - Subroutine to enter retransmit wake request for LAPB
+
+;Subroutine to enter retransmit wake request for LAPB
+;	c{EDI} = Offset of DCB
+;	c{ESI} = Offset of SDB
+;	CALL	rexmitreq
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+
+rexmitreq:
+	MOVB	AL, sdb_lapbn2val.B[ESI] ;Reset the retransmit counter
+	MOVB	sdb_lapbretrycnt.B[ESI], AL
+	MOVL	EAX, sdb_lapbt1val.B[ESI] ;Get the retransmit interval
+	MOVL	EBX, #rexmit
+	PUSHL	EDI
+	MOVL	EDI, ESI
+	CMPL	sdb_lapbsndwake[ESI], #0.B ;Have a timer going now?
+	JE	4$.S			;No
+	MOVL	ESI, sdb_lapbsndwake[EDI] ;Yes - clear it first
+	CLRL	EDX
+	MOVL	sdb_lapbsndwake[EDI], EDX
+	CALL	knlWakeRemove##
+4$:	CALL	knlWakeRequest##	;Enter the wake request
+	MOVL	sdb_lapbsndwake.B[EDI], ESI ;Store offset of the timer block
+	MOVL	ESI, EDI		    ;  (this will be 0 if an error
+	POPL	EDI			    ;  occured)
+	RET				;Finished
+
+	.SBTTL	timerrmv - Subroutine to remove retransmit wake request
+
+;Subroutine to remove retransmit wake request
+;	CALL	timerrmv
+
+timerrmv:
+	CMPL	sdb_lapbsndwake.B[ESI], #0.B ;Have a timer going now?
+	JE	6$.S			;No
+	PUSHL	ESI			;Yes - kill it
+	MOVL	ESI, sdb_lapbsndwake.B[ESI]
+	CALL	knlWakeRemove##
+	POPL	ESI
+	CLRL	EAX
+	MOVL	sdb_lapbsndwake.B[ESI], EAX
+6$:	RET
+.PAGE
+	.SBTTL	xoslpaLinkDown - Subroutine to take link down
+
+;Subroutine to take link down
+;	c{ESI} = Offset of SDB
+;	CALL	xoslpaLinkDown
+
+xoslpaLinkDown:
+	MOVL	EBX, sdb_lapbsndhead.B[ESI] ;Have any output packets pending?
+2$:	TESTL	EBX, EBX
+	JE	4$.S			;No
+	CLRL	EAX
+	MOVL	sdb_lapbsndhead.B[ESI], EAX ;Yes
+	MOVL	sdb_lapbsndtail.B[ESI], EAX
+	PUSHL	npb_nextsnd.B[EBX]
+	CALL	xosnetGiveBufr##
+	POPL	EBX
+	JMP	2$.S
+
+4$:	MOVL	EBX, sdb_lapbheldhead.B[ESI] ;Have any output packets held?
+	TESTL	EBX, EBX
+	JE	6$.S			;No
+	CLRL	EAX
+	MOVL	sdb_lapbheldhead.B[ESI], EAX ;Yes
+	MOVL	sdb_lapbheldtail.B[ESI], EAX
+	CALL	xosnetGiveList##	;Give them up
+
+;Here with all held output packets given up
+
+6$:	CMPL	sdb_lapbsndwake.B[ESI], #0.B ;Is the retransmit timer going now?
+	JE	8$.S			;No
+	PUSHL	ESI			;Yes - kill it
+	MOVL	ESI, sdb_lapbsndwake.B[ESI]
+	CALL	knlWakeRemove##
+	POPL	ESI
+	CLRL	EAX
+	MOVL	sdb_lapbsndwake.B[ESI], EAX
+8$:	CMPL	sdb_lapbrrwake.B[ESI], #0.B ;Is the RR timer going now?
+	JE	10$.S			;No
+	PUSHL	ESI			;Yes - kill it
+	MOVL	ESI, sdb_lapbrrwake.B[ESI]
+	CALL	knlWakeRemove##
+	POPL	ESI
+	CLRL	EAX
+	MOVL	sdb_lapbrrwake.B[ESI], EAX
+10$:	MOVL	EAX, sdb_lapbwaithead.B[ESI] ;Get first XFF which is waiting
+12$:	TESTL	EAX, EAX		     ;  for the output window
+	JE	14$.S			;If no more
+	MOVL	ES, EAX
+	PUSHL	ES:xffWaitList##
+	MOVL	EAX, #ER_NLKNA		;Wake it up
+	CALL	knlResumeXf##
+	POPL	EAX			;Get next
+	JMP	12$.S			;Continue
+
+;Here with all XFFs waiting for the output window restarted with an ER_NLKNA
+;  error
+
+14$:	PUSHL	ESI
+	MOVL	ESI, sdb_pdbhead.B[ESI]
+	TESTL	ESI, ESI
+	JE	16$.S
+	CALLI	pdb_linkdown.B[ESI]
+16$:	POPL	ESI
+	MOVB	sdb_lapbstate.B[ESI], #ST_IDLE ;Indicate link is idle
+	RET
+.PAGE
+	.SBTTL	sendallheld - Subroutine to send all held frames
+
+;Subroutine to send all held frames - Called when REJ received and when the
+;  timer recovery state is terminated
+;	CALL	sendallheld
+
+sendallheld:
+	MOVL	EBX, sdb_lapbheldhead.B[ESI] ;Get first held frame
+2$:	TESTL	EBX, EBX
+	JE	10$.S
+	CMPL	npb_nextsnd.B[EBX], #-1.B ;Is it being output now?
+	JNE	4$.S			;Yes
+	CALL	xoslpaSendInfo		;No - retransmit the frame now
+	MOVL	EBX, npb_next.B[EBX]
+	JMP	2$.S
+
+;Here if frame is currently being output
+
+4$:	ORB	sdb_lapbsts1.B[ESI], #LAPBS1$REXPEND
+6$:	ORB	npb_sts.B[EBX], #NPS$REXREQ ;Request delayed retransmission
+	MOVL	EBX, npb_next.B[EBX]
+	TESTL	EBX, EBX
+	JNE	6$.S
+10$:	RET
+.PAGE
+	.SBTTL	reqrrrsp - Subroutine to request delayed RR response
+
+;Subroutine to request a delayed RR response
+;	CALL	reqrrrsp
+
+reqrrrsp:
+	MOVB	AL, sdb_lapbrcvseq.B[ESI] ;Do we really need this?
+	CMPB	sdb_lapbrcvseqsnt.B[ESI], AL
+	JE	2$.S			;No - forget it
+	MOVB	AL, sdb_lapbrcvwinavl.B[ESI] ;Yes
+	CMPB	AL, sdb_lapbacklvl.B[ESI] ;Can we delay this?
+	JB	sendrrrsp.S		;No
+	CMPL	sdb_lapbrrwake[ESI], #0.B ;Yes - is the RR timer running now?
+	JNE	3$.S			;Yes - nothing needed now
+	MOVL	EBX, #rrrspto		;No - start the timer
+	MOVL	EAX, sdb_lapbt2val[ESI]
+	PUSHL	EDI
+	MOVL	EDI, ESI
+	CALL	knlWakeRequest##
+	JC	4$.S			;If error starting timer, just send the
+					;  RR now
+	MOVL	sdb_lapbrrwake[EDI], ESI ;OK - finished for now
+	MOVL	ESI, EDI
+	POPL	EDI
+2$:	RET
+
+3$:	RET
+
+;Here when the delayed RR timer runs out
+
+rrrspto:MOVL	ESI, EDI		;Get offset of SDB in right register
+	CLRL	EAX
+	MOVL	sdb_lapbrrwake[ESI], EAX
+	CALL	sendrrrsp		;Send an RR packet
+	CLC				;Always return with C clear to indicate
+	RET				;  finished with wake block
+
+;Here if error entering timer request for delayed RR - just send the RR now
+
+4$:	MOVL	ESI, EDI		;Fix up our registers and fall into
+	POPL	EDI			;  sendrrrsp
+
+	.SBTTL	sendrrrsp - Subroutine to send immediate RR response
+
+;Subroutine to send an immediate RR response
+;	CALL	sendrrrsp
+
+sendrrrsp:
+	MOVB	AH, #02h		;Send as response without the P-bit
+sendrrrsp2:				;Enter here with P-bit value (bit-4)
+					;  and cmd/rsp value (bit-1) in AH
+	CMPL	sdb_lapbrrwake[ESI], #0.B ;Is the delayed RR timer running now?
+	JE	6$.S			;No
+	PUSHL	EAX			;Yes - stop it
+	PUSHL	ESI
+	MOVL	ESI, sdb_lapbrrwake.B[ESI]
+	CALL	knlWakeRemove##
+	POPL	ESI
+	CLRL	EAX
+	MOVL	sdb_lapbrrwake.B[ESI], EAX
+	POPL	EAX
+6$:	MOVL	EDX, sdb_lapbkaval[ESI]	;Reset the idle RR timer
+	MOVL	sdb_lapbkacnt[ESI], EDX
+	MOVB	AL, sdb_lapbrcvwinsz[ESI]
+	MOVB	sdb_lapbrcvwinavl.B[ESI], AL
+	MOVB	AL, sdb_lapbrcvseq.B[ESI] ;Get the current sequence number
+	MOVB	sdb_lapbrcvseqsnt.B[ESI], AL
+	SHLB	AL, #5t
+	INCL	EAX			;Make it an RR
+	MOVB	CL, AH
+	ANDB	CL, #10h
+	ORB	AL, CL			;Merge in the P-bit value
+	ANDB	AH, #02h		;Send as a response
+					;Fall into sendtwobyte
+
+	.SBTTL	sendtwobyte - Subroutine to send unnumbered command or response
+
+;Subroutine to send unnumbered command or response
+;	c(AL) = Control byte
+;	c(AH) = 0 for command, 02h for response
+;	c{ESI} = Offset of SDB
+;	CALL	sendtwobyte
+
+sendtwobyte:
+	MOVL	ECX, #2			;Get a buffer for a 2 byte packet
+	PUSHL	EAX
+	CALL	xosnetGetBufr##
+	POPL	EDX
+	JC	18$.S			;Forget it if error
+	MOVB	1.B[EBX], DL		;Store control byte
+	XORB	DH, sdb_lapbcmdaddr.B[ESI]
+	MOVB	[EBX], DH
+	MOVL	ECX, #2
+14$:	MOVL	npb_count.B[EBX], ECX
+	MOVL	npb_outdone.B[EBX], #xosnetGiveBufr##
+	ADDL	sdb_lapbcntbyteout[ESI], ECX ;Count the output
+	INCL	sdb_lapbcntpktout[ESI]
+	MOVL	EDI, ESI
+	MOVL	ESI, sdb_idb.B[ESI]
+	CALL	xosnetSendPkt##		;Send the packet
+	MOVL	ESI, EDI
+18$:	RET
+
+	.SBTTL	sendfrmr - Subroutine to send FRMR response
+
+;Subroutine to send FRMR response - This is sent to indicate a fatal protocol
+;  error.
+;	c(AL)  = Value of bits 17-24
+;	c{EBX} = Offset of offending packet
+;	c{ESI} = Offset of SDB
+;	CALL	sendfrmr
+
+sendfrmr:
+	MOVB	4.B[EBX], AL		;Store error indicators
+	MOVL	EDX, [EBX]		;Get address and control bytes
+	MOVB	AH, sdb_lapbrspaddr.B[ESI] ;Store response address in packet
+	MOVB	[EBX], AH
+	MOVB	1.B[EBX], #97h		;Store control byte for FRMR
+	MOVB	2.B[EBX], DH		;Store offending control field
+	MOVB	AL, sdb_lapbrcvseq.B[ESI]
+	SHLB	AL, #4t
+	ORB	AL, sdb_lapbsndseq.B[ESI]
+	SHLB	AL, #1t
+	CMPB	DL, AH			;Is this a command?
+	JE	20$.S			;Yes
+	ORB	AL, #10h		;No - indicate response
+20$:	MOVB	3.B[EBX], AL
+	MOVL	ECX, #5t
+	JMP	14$.S
+.PAGE
+	.SBTTL	lapboas - Once-a-second routine
+
+;Once-a-second routine for LAPB
+
+lapboas:MOVL	ESI, xoslpaSdbHead
+
+2$:	MOVZBL	EAX, sdb_lapbstate.B[ESI] ;Get link state
+	CALLI	CS:oasdsp[EAX*4]
+	MOVL	ESI, idb_nextd.B[ESI]
+	TESTL	ESI, ESI
+	JNE	2$.S
+	RET
+
+	.MOD	4
+oasdsp:	.LONG	10$		;ST_DISABLE = 0 - Link is disabled
+	.LONG	oasidle		;ST_IDLE    = 1 - Link is idle
+	.LONG	oasidle		;ST_SABM    = 2 - SABM command has been sent
+	.LONG	oascon		;ST_CON     = 3 - Link is connected
+	.LONG	oasdisc		;ST_DISC    = 4 - DISC command has been sent
+
+;Here when link is idle or when SABM has been sent on the link and no reply
+;  received
+
+oasidle:TESTB	sdb_lapbsts1.B[ESI], #LAPBS1$SABM ;Are we sending SABMs?
+	JE	10$			;No
+	DECL	sdb_lapbkacnt[ESI]	;Yes - need to send a SABM now?
+	JNE	10$			;No
+	TOFORK				;Yes
+	MOVB	AL, #3Fh
+	MOVB	AH, #0
+	CALL	sendtwobyte
+	JC	8$.S
+	MOVB	sdb_lapbstate.B[ESI], #ST_SABM ;Update our state
+	JMP	8$.S
+
+;Here when link is connected
+
+oascon:	CMPB	sdb_lapbkaaddr.B[ESI], #0FF ;Are we sending keep-alive RRs?
+	JE	10$			;No
+	DECL	sdb_lapbkacnt[ESI]	;Yes - need a keep-alive RR now?
+	JNE	10$			;No
+	TOFORK				;Yes
+	MOVB	AL, sdb_lapbrcvseq.B[ESI]
+	MOVB	sdb_lapbrcvseqsnt.B[ESI], AL
+	SHLB	AL, #5t
+	INCL	EAX
+	MOVB	AH, sdb_lapbkaaddr.B[ESI]
+	CALL	sendtwobyte
+8$:	MOVL	EAX, sdb_lapbkaval[ESI]
+	MOVL	sdb_lapbkacnt[ESI], EAX
+	FROMFORK
+10$:	RET
+
+;Here when DISC has been sent on the link and no reply received
+
+oasdisc:
+
+	RET
+.PAGE
+	.SBTTL	LAPBA class driver data
+
+	DATA
+
+xoslpaSdbHead:.LONG  0		;Offset of first SAP data block
+lastsdb:      .LONG  0		;Offset of last SAP data block
+lapbadcbnum:  .LONG  0		;Number of in use network DCBs
+lapbadcbmax:  .LONG  0		;Maximum in use network DCBs
+lapbadcblmt:  .LONG  10000t	;Maximum number of network DCBs allowed
+lapbaccb:     .BLKB  ccb_SIZE	;LAPBA CCB
+
+	LKEEND

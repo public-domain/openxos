@@ -1,0 +1,491 @@
+	.TITLE	SVC - Supervisor call routines for XOS
+
+;++++
+; This software is in the public domain.  It may be freely copied and used
+; for whatever purpose you see fit, including commerical uses.  Anyone
+; modifying this software may claim ownership of the modifications, but not
+; the complete derived code.  It would be appreciated if the authors were
+; told what this software is being used for, but this is not a requirement.
+
+;   THIS SOFTWARE IS PROVIDED BY THE AUTHORS "AS IS" AND ANY EXPRESS OR
+;   IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
+;   OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+;   IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+;   INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+;   BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS
+;   OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+;   ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR
+;   TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
+;   USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+;----
+
+	.PROC	80486
+	.INCLUD	XOSINC:\XMAC\XOS.PAR
+	.INCLUD	XOSINC:\XMAC\XOSX.PAR
+	.INCLUD	XOSINC:\XMAC\XOSERR.PAR
+	.INCLUD	SVCDEF.INC
+
+	.MACRO	SD  pcnt, pname, vcnt, vname
+.IF NB {pcnt}
+	.ENTRY	svc'pname
+  svc'pname=$$$:0
+.ENDC
+$$$=!$$$+8
+	.ENDM
+
+$$$=100h
+	SVCDEFSYS
+
+	.MACRO	SD  pname, vname
+.IF NB {pname}
+	.ENTRY	svc'pname
+  svc'pname=GS_USERCODE:$$$
+.ENDC
+$$$=!$$$+8
+	.ENDM
+
+$$$=!1000h
+	SVCDEFUSER
+
+	CODE
+
+	.SBTTL	common subroutine returns
+
+;Here to return zero
+
+knlRtnZero::
+	CLRL	EAX
+	RET
+
+;Here to return one
+
+knlRtnOne::CLRL	EAX
+	INCL	EAX
+	RET
+
+;Here to return minus one
+
+knlRtnMOne::
+	CLRL	EAX
+	DECL	EAX
+	RET
+
+;Here to return address error
+
+	FAULTHDR
+knlRtnAdrErP3::
+	POPL	EAX
+
+	FAULTHDR
+knlRtnAdrErP2::
+	POPL	EAX
+
+	FAULTHDR
+knlRtnAdrErP1::
+	POPL	EAX
+	JMP	knlRtnAdrEr.S
+
+	FAULTHDR
+knlRtnAdrErF::
+	FROMFORK
+
+	FAULTHDR
+knlRtnAdrEr0::
+	CLRL	ECX
+	JMP	knlRtnAdrEr.S
+
+	FAULTHDR
+knlRtnAdrErLv::
+	LEAVE
+
+	FAULTHDR
+knlRtnAdrEr::
+	MOVL	EAX, #ER_ADRER
+	STC
+	RET
+.PAGE
+	.SBTTL	rmsvc - Real mode SVC entry routine
+
+;Get here for HLT HLT n, where n is greater than 300h
+;  NOTE:  When we get here we discard the return address, i.e., the address of
+;	  the HLT HLT n sequence.  This sequence must always be accessed by
+;	  a CALLF instruction, so the real return address is on the user stack!
+
+rmsvc::	SUBL	EAX, #300h		;Remove offset
+	CMPL	EAX, #RMSVCMAX
+	JAE	vbadaddr#
+	MOVL	function, EAX		;Store function
+	MOVZBL	EAX, rmsvcargs[EAX]	;Get number of argument bytes
+	MOVB	SS:pdaArgCnt#, AL	;Save it
+	MOVL	EAX, SS:pdaURegEFR#	;Save his actual EFR
+	MOVL	SS:pdaXRegEFR#, EAX
+	ADDL	ESP, #16t		;Discard saved null segment registers
+	POPAL				;Restore registers
+	ADDL	ESP, #4.B		;Discard EFR from the stack
+	SUBL	ESP, SS:pdaArgCnt#	;Allocate stack space for arguments
+	PUSHAL				;Save registers again
+	CLRL	EAX
+	PUSHL	EAX			;Save null segment registers
+	PUSHL	EAX
+	PUSHL	EAX
+	PUSHL	EAX
+	MOVZWL	ESI, SS:pdaURegSS#	;Point to user stack
+	SHLL	ESI, #4
+	ADDL	ESI, SS:pdaURegESP#
+	PUSHL	#GS_REAL16.B
+	POPL	FS
+	CLD
+	IFFCALL	badusrstk#
+	LODSW	FS:[ESI]		;Get return IP
+	MOVL	48t.B[ESP], EAX		;Put it on the exec stack
+	IFFCALL	badusrstk#
+	LODSW	FS:[ESI]		;Get return CS
+	MOVL	52t.B[ESP], EAX		;Put it on the exec stack
+	ADDL	SS:pdaURegESP#, #4.B	;Update user stack pointer
+	MOVL	ECX, SS:pdaArgCnt#	;Get number of arguments
+	PUSHL	SS			;Set up to copy arguments
+	POPL	ES
+	MOVL	EDI, #pdaArg1#+4
+	SUBL	EDI, ECX
+	SHRL	ECX, #2
+	IFFCALL	badusrstk#
+	RMOVSL	[EDI], FS:[ESI]		;Copy arguments to the exec stack
+	MOVL	EAX, function		;Dispatch on the SVC type
+rmsvcd::CALLI	rmsvcdisp[EAX*4]
+	CMPB	knlForkLvl#, #FORK_MAIN	;Make sure not at fork level!
+	JNE	svcatfk
+	MOVL	44t.B[ESP], EAX		;Store value in his EAX
+	SHRL	EAX, #16t
+	MOVW	36t.B[ESP], AX		;Also store high 16 bits in his DX
+12$:	CLI				;No interrupts now
+	MOVB	AL, SS:pdaSigReq#	;Need to schedule now?
+	ANDB	AL, SS:pdaSigMask#
+	ORB	AL, knlSchedReq#
+	IFFCALL	badusrstk#
+	POPL	GS			;Restore segment registers
+	IFFCALL	badusrstk#
+	POPL	FS
+	IFFCALL	badusrstk#
+	POPL	ES
+	IFFCALL	badusrstk#
+	POPL	DS
+	TESTB	AL, AL
+	POPAL				;Restore user registers
+	XCHGL	SS:pdaArgCnt#, EAX	;Save user's EAX, get argument count
+	POPL	SS:pdaXRegEIP#		;Get CS:EIP off of the stack
+	POPL	SS:pdaXRegCS#
+	JNE	14$.S			;If need to schedule now
+	ADDL	ESP, EAX		;Remove arguments from exec stack
+	ADDL	SS:pdaURegESP#, EAX	;Also remove arguments from user stack
+	XCHGL	SS:pdaArgCnt#, EAX	;Restore user's EAX and argument count
+	PUSHL	SS:pdaXRegEFR#		;Put EFR value on the stack
+	PUSHL	SS:pdaXRegCS#		;Put CS:EIP back on the stack
+	PUSHL	SS:pdaXRegEIP#
+	TESTB	9.B[ESP], #01h		;Do we want a trace trap now?
+	JNE	trctrpx#		;Yes - go do that
+	IFFCALL	badusrstk#
+	IRET				;No - just return to the user
+
+14$:	ADDL	ESP, EAX		;Remove arguments from exec stack
+	ADDL	SS:pdaURegESP#, EAX	;Also remove arguments from user stack
+	XCHGL	SS:pdaArgCnt#, EAX	;Restore user's EAX and argument count
+	PUSHL	SS:pdaXRegEFR#		;Put EFR value on the stack
+	PUSHL	SS:pdaXRegCS#		;Put CS:EIP back on the stack
+	PUSHL	SS:pdaXRegEIP#
+	TESTB	9.B[ESP], #01h		;Do we want a trace trap now?
+	JNE	trctrpx#		;Yes - go do that
+	CALLF	schedule		;No - schedule
+	IFFCALL	badusrstk#		;And return to the user (probably
+	IRET				;  quite a bit later!)
+
+	DATA
+
+	.MOD	4
+function:.LONG	0		;Function value for real mode SVC entry routine
+
+	.MACRO	SD  pcnt, pname, rcnt, rname
+	.NLIST
+.IF B {rcnt}
+	.BYTE	0
+.IFF
+	.BYTE	rcnt't*4
+.ENDC
+	.LIST
+	.ENDM
+
+rmsvcargs:
+	SVCDEFSYS
+RMSVCMAX=!{$-rmsvcargs}
+
+	.MACRO	SD  pcnt, pname, rcnt, rname
+	.NLIST
+.IF B {rcnt}
+	.LONG	knlRtnAdrEr
+.IFF
+	.LONG	rsvc'rname#
+.ENDC
+	.LIST
+	.ENDM
+
+rmsvcdisp::
+	SVCDEFSYS
+
+	CODE
+.PAGE
+	.SBTTL	SVC error returns
+
+knlPrivFail::
+	MOVL	EAX, #ER_PRIV
+	STC
+	RET
+
+knlBadFunc::
+	MOVL	EAX, #ER_FUNC
+	STC
+	RET
+
+	FAULTHDR
+knlBadValueLv::
+	LEAVE
+
+	FAULTHDR
+knlBadValue::
+	MOVL	EAX, #ER_VALUE
+	STC
+	RET
+
+knlBadCharVLv::
+	LEAVE
+knlBadCharV::
+	MOVL	EAX, #ER_CHARV
+	STC
+	RET
+
+knlBadCharF::
+	MOVL	EAX, #ER_CHARF
+	STC
+	RET
+
+	IFFAULT	knlRtnAdrEr
+knlNullCharStr::
+	MOVB	ES:[EBX], #0
+	CLRL	ECX
+	RET
+
+knlBadParmVLv::
+	LEAVE
+knlBadParmV::
+	MOVL	EAX, #ER_PARMV
+	STC
+	RET
+
+knlBadParmILv::
+	LEAVE
+knlBadParmI::
+	MOVL	EAX, #ER_PARMI
+	STC
+	RET
+
+knlBadParmMLv::
+	LEAVE
+knlBadParmM::
+	MOVL	EAX, #ER_PARMM
+	STC
+	RET
+
+
+	.SBTTL	svcfin - Common SVC completion routine
+
+svcatfk:CRASH	ATFK			;[AT ForK level]
+
+;Here when SVC is complete
+;	c{EAX} = Return value
+
+svcfin::CMPB	knlForkLvl#, #FORK_MAIN	;Make sure not at fork level!
+	JNE	svcatfk.S
+	MOVL	44t.B[ESP], EAX		;Store EAX for caller
+	CLI				;No interrupts now
+	MOVB	AL, SS:pdaSigReq#	;Need to schedule now?
+	ANDB	AL, SS:pdaSigMask#
+	ORB	AL, knlSchedReq#
+	IFFAULT	badGS
+2$:	POPL	GS			;Restore segment registers
+	IFFAULT	badFS
+4$:	POPL	FS
+	IFFAULT	badES
+6$:	POPL	ES
+	IFFAULT	badDS
+8$:	POPL	DS
+	TESTB	AL, AL
+	JNE	10$.S			;If need to schedule now
+	MOVL	EAX, SS:pdaArgCnt#	;Get number of arguments
+	JMPIL	CS:retdsp[EAX]		;Dispatch to correct return instruction
+
+;Here if need to schedule before returning to user mode - we must fix up the
+;  stack so it looks like a normal trap
+
+10$:	POPAL				;Restore user registers
+	XCHGL	SS:pdaArgCnt#, EAX	;Save user's EAX, get argument count
+	POPL	SS:pdaXRegEIP#		;Get CS:EIP off of the stack
+	POPL	SS:pdaXRegCS#
+	ADDL	ESP, EAX		;Remove arguments from exec stack
+	ADDL	SS:pdaURegESP#, EAX	;Also remove arguments from user stack
+	XCHGL	SS:pdaArgCnt#, EAX	;Restore user's EAX and argument count
+	PUSHL	SS:pdaXRegEFR#		;Put EFR value on the stack
+	PUSHL	SS:pdaXRegCS#		;Put CS:EIP back on the stack
+	PUSHL	SS:pdaXRegEIP#
+	CALLF	schedule
+	IFFCALL	badusrstk#
+	IRET
+
+;Here if error restoring GS
+
+	FAULTHDR
+badGS:	CLRL	EAX
+	IFFCALL	badusrstk#
+	MOVL	[ESP], EAX
+	JMP	2$.S
+
+;Here if error restoring FS
+
+	FAULTHDR
+badFS:	CLRL	EAX
+	IFFCALL	badusrstk#
+	MOVL	[ESP], EAX
+	JMP	4$
+
+;Here if error restoring ES
+
+	FAULTHDR
+badES:	CLRL	EAX
+	IFFCALL	badusrstk#
+	MOVL	[ESP], EAX
+	JMP	6$
+
+;Here if error restoring DS
+
+	FAULTHDR
+badDS:	CLRL	EAX
+	IFFCALL	badusrstk#
+	MOVL	[ESP], EAX
+	JMP	8$
+.PAGE
+;Dispatch table for return instructions used when scheduling not required
+;  before returning to user mode
+
+	.MOD	4
+retdsp:	.LONG	ret0arg		;0 arguments
+	.LONG	ret1arg		;1 argument
+	.LONG	ret2arg		;2 arguments
+	.LONG	ret3arg		;3 arguments
+	.LONG	ret4arg		;4 arguments
+	.LONG	ret5arg		;5 arguments
+	.LONG	ret6arg		;6 arguments
+	.LONG	ret7arg		;7 arguments
+	.LONG	ret8arg		;8 arguments
+	.LONG	ret9arg		;9 arguments
+	.LONG	ret10arg	;10 arguments
+
+	.MOD	4
+ret0arg:POPAL			;Here if no arguments
+	STI
+	IFFCALL	badusrstk#
+	RETF
+
+	.MOD	4
+ret1arg:POPAL			;Here if 1 argument
+	STI
+	IFFCALL	badusrstk#
+	RETF	1t*4
+
+	.MOD	4
+ret2arg:POPAL			;Here if 2 arguments
+	STI
+	IFFCALL	badusrstk#
+	RETF	2t*4
+
+	.MOD	4
+ret3arg:POPAL			;Here if 3 arguments
+	STI
+	IFFCALL	badusrstk#
+	RETF	3t*4
+
+	.MOD	4
+ret4arg:POPAL			;Here if 4 arguments
+	STI
+	IFFCALL	badusrstk#
+	RETF	4t*4
+
+	.MOD	4
+ret5arg:POPAL			;Here if 5 arguments
+	STI
+	IFFCALL	badusrstk#
+	RETF	5t*4
+
+	.MOD	4
+ret6arg:POPAL			;Here if 6 arguments
+	STI
+	IFFCALL	badusrstk#
+	RETF	6t*4
+
+	.MOD	4
+ret7arg:POPAL			;Here if 7 arguments
+	STI
+	IFFCALL	badusrstk#
+	RETF	7t*4
+
+	.MOD	4
+ret8arg:POPAL			;Here if 8 arguments
+	STI
+	IFFCALL	badusrstk#
+	RETF	8t*4
+
+	.MOD	4
+ret9arg:POPAL			;Here if 9 arguments
+	STI
+	IFFCALL	badusrstk#
+	RETF	9t*4
+
+	.MOD	4
+ret10arg:			;Here if 10 arguments
+	POPAL
+	STI
+	IFFCALL	badusrstk#
+	RETF	10t*4
+.PAGE
+	.SBTTL	vfixmemr - Subroutine to convert real mode memory reference to native address
+
+;Subroutine to convert real mode memory reference in argument to native address
+;	c{EBP} = Offset of argument
+;	CALL	vfixmemr
+
+vfixmemr::
+	CMPL	4.B[EBP], #0FFF8h	;Already have native address?
+	JE	2$.S			;Yes - nothing needed here
+	MOVZWL	EAX, 0.B[EBP]		;No - get offset part
+	MOVZWL	EBX, 2.B[EBP]		;Get selector part
+	SHLL	EBX, #4			;Change to actual offset
+	ADDL	EAX, EBX
+	MOVL	0.B[EBP], EAX		;Store in argument
+	MOVL	4.B[EBP], #0FFF8h	;Store "selector"
+2$:	RET
+
+	.SBTTL	vfixaddr - Subroutine to convert real mode address to native address
+
+;Subroutine to convert real mdoe address in argument to native address
+;	c{EBP} = Offset of argument
+;	CALL	vfixaddr
+
+vfixaddr::
+	MOVL	ECX, #GS_REAL16		;Get native mode selector
+	MOVZWL	EAX, 0.B[EBP]		;Get offset part
+	MOVZWL	EBX, 2.B[EBP]		;Get selector part
+	SHLL	EBX, #4			;Change to actual offset
+	ADDL	EAX, EBX
+	MOVL	0.B[EBP], EAX		;Store in argument
+	JNE	4$.S			;If address not null
+	CLRL	ECX			;If address null, store null selector
+4$:	MOVW	4.B[EBP], CX
+	RET
+
+	END

@@ -1,0 +1,633 @@
+	.TITLE	USRBIOS - XOS user level DOS kernel routines
+
+;++++
+; This software is in the public domain.  It may be freely copied and used
+; for whatever purpose you see fit, including commerical uses.  Anyone
+; modifying this software may claim ownership of the modifications, but not
+; the complete derived code.  It would be appreciated if the authors were
+; told what this software is being used for, but this is not a requirement.
+
+;   THIS SOFTWARE IS PROVIDED BY THE AUTHORS "AS IS" AND ANY EXPRESS OR
+;   IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
+;   OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+;   IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+;   INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+;   BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS
+;   OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+;   ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR
+;   TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
+;   USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+;----
+
+	.PROC	80486
+	.INCLUD	XOSINC:\XMAC\XOS.PAR
+	.INCLUD	XOSINC:\XMAC\XOSX.PAR
+	.INCLUD	XOSINC:\XMAC\XOSDOS.PAR
+	.INCLUD XOSINC:\XMAC\XOSERR.PAR
+	.INCLUD	XOSINC:\XMAC\XOSTRM.PAR
+
+	USERCODE
+
+;The routines in this module implement various BIOS functions.  They are
+;  executed in protected 32 bit user mode.
+
+	.SBTTL	ubios14 - Here in user mode for INT 14 - Serial port functions
+
+;Here in user mode for INT 14 - Serial port functions
+;	c(AH) = Function
+;	c(AL) = Data (if c(AH) = 1)
+;	c[DX] = COM port number
+;	INT	14h
+;	c(AH) = Status (unchanged if error)
+;	c(AL) = Modem status (if c(AH) = 0 or 3) or input character (if
+;		  c(AH) = 2)
+
+$$$=!0
+FRM ub14_qab   , qab_SIZE
+FRM ub14_parm  , 24t
+FRM ub14_buffer, 4t
+ub14_SIZE=!$$$
+
+ubios14::
+	PUSHAL
+	MOVL	EBP, ESP
+	CMPB	AH, #I14MAX		;Legal function?
+	JA	4$.S			;No
+	MOVZBL	EAX, AH			;Yes
+	PUSHL	EAX
+	MOVZWL	EDX, DX			;Get COM port number
+	CMPL	EDX, #3			;Valid COM port number?
+	JA	4$.S			;No
+	LEAL	EBX, 4.B[EDX]		;Yes - get corresponding XOS handle
+	CALL	ubiosxoshandle
+	JC	4$.S			;If error
+	CLRL	ECX			;OK
+	POPL	EBX			;Restore function
+	JMPIL	CS:int14tbl[EBX*4]	;Dispatch to routine for function
+
+;Here if illegal INT 14 function - we just ignore this like the BIOS does
+
+4$:	RET
+
+	.MOD	4
+int14tbl:
+	.LONG	int14inito	; 0 - Initialize serial port (old style)
+	.LONG	int14output	; 1 - Output character
+	.LONG	int14input	; 2 - Input character
+	.LONG	int14sts	; 3 - Get serial port status
+	.LONG	int14initn	; 4 - Initialize serial port (new style)
+	.LONG	int14port	; 5 - Extended port control
+I14MAX=!{$-int14tbl}/4-1
+.PAGE
+;Here to initialize the serial port (old style call)
+;	c(AL) = Serial port characteristics:
+;		  bits 7-5 = Baud rate:
+;			     000 = 110 baud
+;			     001 = 150 baud
+;			     010 = 300 baud
+;			     011 = 600 baud
+;			     100 = 1200 baud
+;			     101 = 2400 baud
+;			     110 = 4800 baud
+;			     111 = 9600 baud
+;		  bits 4-3 = Parity:
+;			     00 = None
+;			     01 = Odd
+;			     10 = None
+;			     11 = Even
+;		  bit  2   = Number of stop bits:
+;			      0 = 1 stop bit
+;			      1 = 2 stop bits
+;		  bits 1-0 = Character size:
+;			     10 = 7 bit characters
+;			     11 = 8 bit characters
+;	c(AH) = 0
+;	c[DX] = Serial port number (0 to 3 for COM1 to COM4)
+;	INT	14h
+;	c(AL) = Modem status
+;	c(AH) = Line status
+
+$$$=!0
+FRM ub14i_qab   , qab_SIZE	;QAB
+FRM ub14i_parm  , 16t		;Parameter list
+FRM ub14i_char  , 96t		;Characteristics list
+ub14i_SIZE=!$$$
+
+int14inito:
+	MOVB	CH, dff_EAX+0.B[EBP]
+	MOVB	CL, CH		;Get baud rate
+	SHRB	CL, #5
+	MOVB	BH, #0		;Assume no parity
+	TESTB	CH, #08h	;Right?
+	JE	2$.S		;Yes
+	MOVB	BH, #1		;No - assume odd parity
+	TESTB	CH, #10h	;Right?
+	JE	2$.S		;Yes
+	MOVB	BH, #2		;No - its even parity
+2$:	MOVB	BL, CH		;Get number of stop bits
+	SHRB	BL, #2
+	ANDB	BL, #01h
+	ANDB	CH, #03h	;Get word length
+	ORB	CH, #02h
+	MOVB	DL, #0		;Never set break
+	JMP	4$.S		;Continue with common routine
+
+;Here to initialize the serial port (new style call)
+;	c(AL) = Break flag
+;		  0 = No break
+;		  1 = Break
+;	c(AH) = 04h
+;	c(BL) = Number of stop bits:
+;		  0 = 1 stop bit
+;		  1 = 2 stop bits (1.5 stop bits if character size = 5)
+;	c(BH) = Parity:
+;		  0 = None
+;		  1 = Odd
+;		  2 = Even
+;		  3 = Stick parity odd?
+;		  4 = Stick parity even?
+;	c(CL) = Baud rate:
+;		  0  = 110 baud
+;		  1  = 150 baud
+;		  2  = 300 baud
+;		  3  = 600 baud
+;		  4  = 1200 baud
+;		  5  = 2400 baud
+;		  6  = 4800 baud
+;		  7  = 9600 baud
+;		  8  = 19200 baud
+;		  9  = 38400 baud (XOS extension)
+;		  10 = 57600 baud (XOS extension)
+;		  11 = 115200 baud (XOS extension)
+;	c(CH) = Character size:
+;		  0 = 5 bit characters
+;		  1 = 6 bit characters
+;		  2 = 7 bit characters
+;		  3 = 8 bit characters
+;	c[DX] = Serial port number (0 to 3 for COM1 to COM4)
+;	INT	14h
+;	c(AL) = Modem status
+;	c(AH) = Line status
+
+int14initn:
+	MOVL	EDX, dff_EDX.B[EBP]	;Get user arguments
+	MOVL	EBX, dff_EBX.B[EBP]
+	MOVL	ECX, dff_ECX.B[EBP]
+4$:	SUBL	ESP, #ub14i_SIZE
+	MOVL	ub14i_qab+qab_func.B[EBP], #QFNC$WAIT|QFNC$DIO|QFNC_DEVCHAR
+	MOVL	ub14i_qab+qab_option.B[EBP], #O$PHYS|O$CRIT|DCF_VALUES
+	MOVL	ub14i_qab+qab_handle.B[EBP], EAX
+	CLRL	EAX
+	MOVL	ub14i_qab+qab_buffer1+0.B[EBP], EAX
+	MOVW	ub14i_qab+qab_vector.B[EBP], AX
+	LEAL	EAX, ub14i_parm.B[EBP]	;Store offset of parameter list
+	MOVL	ub14i_qab+qab_parm+0.B[EBP], EAX
+	ANDB	DL, #01			;Store value for break parameter
+	MOVB	ub14i_qab+qab_parm+4.B[EBP], DL
+	LEAL	EDI, ub14i_char[EBP]	;Store offset of characteristics list
+	MOVL	ub14i_qab+qab_buffer2+0.B[EBP], EDI
+	MOVL	ub14i_qab+qab_buffer2+4.B[EBP], SS
+	PUSHL	SS
+	POPL	ES
+	MOVL	ESI, #initchar		;Copy characteristics list and parameter
+	PUSHL	ECX			;  list skelleton to our stack
+	MOVL	ECX, #initcharSIZE
+	CLD
+	PUSHL	EDI
+	RMOVSL	[EDI], CS:[ESI]
+	POPL	EDI
+	POPL	ECX
+	MOVZBL	EAX, CL			;Get baud rate
+	ANDB	AL, #0Fh
+	MOVZWL	EAX, CS:baudtbl[EAX*4]
+	MOVL	10t.B[EDI], EAX		;Store characteristic value
+	MOVL	24t.B[EDI], EAX
+	MOVZBL	EAX, BH			;Get parity
+	ANDB	AL, #07h
+	MOVB	AL, CS:paritytbl[EAX]
+	MOVB	38t.B[EDI], AL		;Store characteristic value
+	MOVB	49t.B[EDI], AL
+	ANDB	BL, #01h		;Get number of stop bits
+	ADDB	BL, #1
+	MOVB	60t.B[EDI], AL		;Store characteristic value
+	MOVB	71t.B[EDI], AL
+	ANDB	CH, #03h		;Get character size
+	ADDB	CH, #5
+	MOVB	82t.B[EDI], AL		;Store characteristic value
+	MOVB	93t.B[EDI], AL
+	PUSHL	SS
+	LEAL	EAX, ub14i_qab.B[EBP]
+	PUSHL	EAX
+	CALLF	svcIoQueue#
+	ORL	EAX, ub14i_qab+qab_error.B[EBP] ;If error, do nothing
+	JS	10$.S
+	MOVL	EAX, ub14i_parm+9.B[EBP] ;OK - get serial port status
+	MOVW	SS:pdaURegEAX#, AX	;Give it to him
+10$:	RET				;Finished
+
+	.MOD	4
+baudtbl:.LONG	110t		;0
+	.LONG	150t		;1
+	.LONG	300t		;2
+	.LONG	600t		;3
+	.LONG	1200t		;4
+	.LONG	2400t		;5
+	.LONG	4800t		;6
+	.LONG	9600t		;7
+	.LONG	19200t		;8
+	.LONG	38400t		;9
+	.LONG	57600t		;10
+	.LONG	115200t		;11
+	.LONG	115200t		;12
+	.LONG	115200t		;13
+	.LONG	115200t		;14
+	.LONG	115200t		;15
+
+paritytbl:
+	.BYTE	'N'		;0
+	.BYTE	'O'		;1
+	.BYTE	'E'		;2
+	.BYTE	'M'		;3
+	.BYTE	'S'		;4
+	.BYTE	'N'		;5
+	.BYTE	'N'		;6
+	.BYTE	'N'		;7
+
+	.MOD	4
+initchar:
+	.WORD	PAR$SET|REP_DECV+{2<8}
+	.LONG	'IRAT','E'
+	.LONG	0			; +10
+	.WORD	PAR$SET|REP_DECV+{2<8}
+	.LONG	'RATE',''
+	.LONG	0			; +24
+	.WORD	PAR$SET|REP_DECV+{1<8}
+	.LONG	'IPAR','ITY'
+	.BYTE	0			; +38
+	.WORD	PAR$SET|REP_DECV+{1<8}
+	.LONG	'PARI','TY'
+	.BYTE	0			; +49
+	.WORD	PAR$SET|REP_DECV+{1<8}
+	.LONG	'IDBI','TS'
+	.BYTE	0			; +60
+	.WORD	PAR$SET|REP_DECV+{1<8}
+	.LONG	'DBIT','S'
+	.BYTE	0			; +71
+	.WORD	PAR$SET|REP_DECV+{1<8}
+	.LONG	'ISBI','TS'
+	.BYTE	0			; +82
+	.WORD	PAR$SET|REP_DECV+{1<8}
+	.LONG	'SBIT','S'
+	.BYTE	0			; +93
+	.WORD	0
+	.LONG	PAR$SET|REP_HEXV|{1<8}|{IOPAR_TRMSPBREAK<16t}
+	.BYTE	0
+	.LONG	PAR$GET|REP_HEXV|{2<8}|{IOPAR_TRMSPSTATUS<16t}
+	.WORD	0
+	.BYTE	0
+initcharSIZE=!{{$-initchar}+3}/4
+.PAGE
+;Here to output character to the serial port
+;	c(AL) = Character to output
+;	c(AH) = 1
+;	c[DX] = Serial port number (0 to 3 for COM1 to COM4)
+;	INT	14h
+;	c(AH) = Line status
+
+int14output:
+	SUBL	ESP, #ub14_SIZE.B
+	MOVL	ub14_qab+qab_handle.B[EBP], EAX
+	MOVB	AL, dff_EAX.B[EBP]	;Get character
+	MOVB	ub14_buffer+0.B[EBP], AL
+	MOVL	ub14_qab+qab_count.B[EBP], #1
+	MOVW	ub14_qab+qab_func.B[EBP], #QFNC$WAIT|QFNC$DIO|QFNC_OUTBLOCK
+	LEAL	ESI, ub14_buffer.B[EBP]	;Store buffer address
+	MOVL	ub14_qab+qab_buffer1+0.B[EBP], ESI
+	MOVW	ub14_qab+qab_buffer1+4.B[EBP], SS
+	CLRL	EAX
+	MOVL	ub14_qab+qab_buffer2+4.B[EBP], EAX
+	MOVW	ub14_qab+qab_vector.B[EBP], AX
+	LEAL	EDI, ub14_parm.B[EBP]
+	MOVL	ub14_qab+qab_parm+0.B[EBP], EDI
+	MOVL	ub14_qab+qab_parm+4.B[EBP], SS
+	MOVL	[EDI], #{PAR$SET|REP_HEXV}+{4<8}+{IOPAR_TRMCOUTMODE<16t}
+	MOVL	4t.B[EDI], #0FFFFFFFFh
+	MOVL	8t.B[EDI], #{PAR$SET|REP_HEXV}+{4<8}+{IOPAR_TRMSOUTMODE<16t}
+	MOVL	12t.B[EDI], #TOM$IMAGE
+	MOVL	16t.B[EDI], #{PAR$GET}+{2<8}+{IOPAR_TRMSPSTATUS<16t}
+	MOVB	22t.B[EDI], #0
+	PUSHL	SS
+	LEAL	EAX, ub14_qab.B[EBP]
+	PUSHL	EAX
+	CALLF	svcIoQueue#
+	ORL	EAX, ub14_qab+qab_error.B[EBP]
+	JS	6$.S
+	MOVB	AL, 21t.B[EDI]		;Give him the port status byte
+	MOVB	dff_EAX+1.B[EBP], AL
+6$:	RET
+.PAGE
+;Here to input character from the serial port
+;	c(AH) = 2
+;	c[DX] = Serial port number (0 to 3 for COM1 to COM4)
+;	INT	14h
+;	c(AL) = Character
+;	c(AH) = Line status
+
+int14input:
+	SUBL	ESP, #ub14_SIZE.B
+	MOVL	ub14_qab+qab_handle.B[EBP], EAX
+	MOVL	ub14_qab+qab_count.B[EBP], #1
+	MOVW	ub14_qab+qab_func.B[EBP], #QFNC$WAIT|QFNC$DIO|QFNC_INBLOCK
+	LEAL	ESI, ub14_buffer.B[EBP]	;Store buffer address
+	MOVL	ub14_qab+qab_buffer1+0.B[EBP], ESI
+	MOVW	ub14_qab+qab_buffer1+4.B[EBP], SS
+	CLRL	EAX
+	MOVL	ub14_qab+qab_buffer2+4.B[EBP], EAX
+	MOVW	ub14_qab+qab_vector.B[EBP], AX
+	LEAL	EDI, ub14_parm.B[EBP]
+	MOVL	ub14_qab+qab_parm+0.B[EBP], EDI
+	MOVL	ub14_qab+qab_parm+4.B[EBP], SS
+	MOVL	[EDI], #{PAR$SET|REP_HEXV}+{4<8}+{IOPAR_TRMCINPMODE<16t}
+	MOVL	4t.B[EDI], #0FFFFFFFFh
+	MOVL	8t.B[EDI], #{PAR$SET|REP_HEXV}+{4<8}+{IOPAR_TRMSINPMODE<16t}
+	MOVL	12t.B[EDI], #TIM$IMAGE
+	MOVL	16t.B[EDI], #{PAR$GET}+{2<8}+{IOPAR_TRMSPSTATUS<16t}
+	MOVB	22t.B[EDI], #0
+	PUSHL	SS
+	LEAL	EAX, ub14_qab.B[EBP]
+	PUSHL	EAX
+	CALLF	svcIoQueue#
+	ORL	EAX, ub14_qab+qab_error.B[EBP]
+	JS	6$.S
+	MOVB	AH, 21t.B[EDI]		;Give him the port status byte
+	MOVB	AL, ub14_buffer.B[EBP]	;And the character we got
+	MOVW	dff_EAX.B[EBP], AX
+6$:	RET
+.PAGE
+;Here to get serial port status
+;	c(AH) = 3
+;	c[DX] = Serial port number (0 to 3 for COM1 to COM4)
+;	INT	14h
+;	c(AL) = Modum status
+;	c(AH) = Line status
+
+int14sts:
+	SUBL	ESP, #ub14_SIZE.B
+	MOVL	ub14_qab+qab_handle.B[EBP], EAX
+	MOVW	ub14_qab+qab_func.B[EBP], #QFNC$WAIT|QFNC$DIO|QFNC_INBLOCK
+	LEAL	ESI, ub14_buffer.B[EBP]	;Store buffer address
+	MOVL	ub14_qab+qab_buffer1+0.B[EBP], ESI
+	MOVW	ub14_qab+qab_buffer1+4.B[EBP], SS
+	CLRL	EAX
+	MOVL	ub14_qab+qab_buffer2+4.B[EBP], EAX
+	MOVW	ub14_qab+qab_vector.B[EBP], AX
+	MOVL	ub14_qab+qab_count.B[EBP], EAX
+	LEAL	EDI, ub14_parm.B[EBP]
+	MOVL	ub14_qab+qab_parm+0.B[EBP], EDI
+	MOVL	ub14_qab+qab_parm+4.B[EBP], SS
+	MOVL	[EDI], #{PAR$GET}+{2<8}+{IOPAR_TRMSPSTATUS<16t}
+	MOVB	6t.B[EDI], #0
+	PUSHL	SS
+	LEAL	EAX, ub14_qab.B[EBP]
+	PUSHL	EAX
+	CALLF	svcIoQueue#
+	ORL	EAX, ub14_qab+qab_error.B[EBP]
+	JS	6$.S
+	MOVL	EAX, 4t.B[EDI]		;Give him the port status word
+	MOVW	dff_EAX.B[EBP], AX
+6$:	RET
+.PAGE
+;Here to for the extended port control function
+;	c(AL) = Subfunction:
+;		  0 = Read modem control register
+;		  1 = Set modem control register
+;	c(AH) = 5
+;	c(BL) = Modem control register value (if c(AL) = 1)
+;		  Bits 7-5 = Reserved
+;		  Bit  4   = Loop (for testing)
+;		  Bit  3   = Out2
+;		  Bit  2   = Out1
+;		  Bit  1   = Request-to-send
+;		  Bit  0   = Data-terminal-ready
+;	c[DX] = Serial port number (0 to 3 for COM1 to COM4)
+;	INT	14h
+;	If called with c(AL) = 0:
+;	  c(BL) = Modem control register
+;	If called with c(AL) = 1
+;	  c(AL) = Modum status
+;	  c(AH) = Line status
+
+int14port:
+	SUBL	ESP, #ub14_SIZE.B
+	MOVL	ub14_qab+qab_handle.B[EBP], EAX
+	MOVW	ub14_qab+qab_func.B[EBP], #QFNC$WAIT|QFNC$DIO|QFNC_OUTBLOCK
+	CLRL	EAX
+	MOVW	ub14_qab+qab_vector.B[EBP], AX
+	MOVL	ub14_qab+qab_count.B[EBP], EAX
+	LEAL	EDI, ub14_parm.B[EBP]
+	MOVL	ub14_qab+qab_parm+0.B[EBP], EDI
+	MOVL	ub14_qab+qab_parm+4.B[EBP], SS
+	MOVZBL	ECX, dff_EAX.B[EBP]	;Get subfunction
+	DECL	ECX			;Valid value?
+	JG	10$.S			;No - do nothing!
+	JE	4$.S			;If write modem control function
+	MOVL	[EDI], #{PAR$GET}+{1<8}+{IOPAR_TRMSPMODEM<16t}
+	MOVB	5.B[EDI], #0		;If read modem control register
+	JMP	6$.S
+
+4$:	MOVL	[EDI], #{PAR$SET}+{1<8}+{IOPAR_TRMSPMODEM<16t}
+	MOVB	AL, dff_EBX.B[EBP]
+	MOVB	4.B[EDI], AL
+	MOVL	5.B[EDI], #{PAR$GET}+{2<8}+{IOPAR_TRMSPSTATUS<16t}
+	MOVB	11t.B[EDI], #0
+6$:	PUSHL	SS
+	LEAL	EAX, ub14_qab.B[EBP]
+	PUSHL	EAX
+	CALLF	svcIoQueue#
+	ORL	EAX, ub14_qab+qab_error.B[EBP]
+	JS	6$.S
+	JREGZ	ECX, 8$			;If write modem control register
+	MOVB	AL, 4.B[EDI]		;Read modem control register - give him
+	MOVB	dff_EBX.B[EBP], AL	;  the value in his BL
+	JMP	10$.S
+
+8$:	MOVW	AX, 9t.B[EDI]		;Give him the port status word in his
+	MOVW	dff_EAX.B[EBP], AX	;  AX
+10$:	RET
+.PAGE
+	.SBTTL	ubios17 - Here in user mode for INT 17 - Parallel port functions
+
+;Here in user mode for INT 17 - Parallel port functions
+;	c(AH) = Function
+;	c(AL) = Data (if c(AH) = 0)
+;	c[DX] = Printer number
+;	INT	17h
+;	c(AH) = Status (unchanged if error)
+
+$$$=!0
+FRM ub17_qab   , qab_SIZE
+FRM ub17_parm  , 24t
+FRM ub17_buffer, 4t
+ub17_SIZE=!$$$
+
+ubios17::
+	PUSHAL
+	MOVL	EBP, ESP
+	SUBL	ESP, #ub17_SIZE.B
+	CMPB	AH, #I17MAX		;Legal function?
+	JA	4$.S			;No
+	MOVZBL	EAX, AH			;Yes
+	PUSHL	EAX
+	MOVZWL	EDX, DX			;Get printer number
+	CMPL	EDX, #2			;Valid printer number?
+	JA	4$.S			;No
+	LEAL	EBX, 1.B[EDX]		;Yes - get corresponding XOS handle
+	CALL	ubiosxoshandle
+	JC	4$.S			;If error
+	CLRL	ECX			;OK
+	POPL	EBX			;Restore function
+	JMPIL	CS:int17tbl[EBX*4]	;Dispatch to routine for function
+
+;Here if illegal INT 17 function - we just ignore this like the BIOS does
+
+4$:	RET
+
+	.MOD	4
+int17tbl:
+	.LONG	int17write	; 0 - Write character to printer
+	.LONG	int17sts	; 1 - Initialize printer port
+	.LONG	int17sts	; 2 - Get printer status
+I17MAX=!{$-int17tbl}/4-1
+.PAGE
+;Here to output character to the printer
+
+int17write:
+	MOVB	DL, dff_EAX.B[EBP]	;Get character
+	MOVB	ub17_buffer+0.B[EBP], DL
+	INCL	ECX
+
+;Here to get printer status
+
+int17sts:
+	MOVL	ub17_qab+qab_handle.B[EBP], EAX
+	MOVL	ub17_qab+qab_count.B[EBP], ECX
+	MOVW	ub17_qab+qab_func.B[EBP], #QFNC$WAIT|QFNC$DIO|QFNC_OUTBLOCK
+	LEAL	ESI, ub17_buffer.B[EBP]	;Store buffer address
+	MOVL	ub17_qab+qab_buffer1+0.B[EBP], ESI
+	MOVW	ub17_qab+qab_buffer1+4.B[EBP], SS
+	CLRL	EAX
+	MOVL	ub17_qab+qab_buffer2+4.B[EBP], EAX
+	MOVW	ub17_qab+qab_vector.B[EBP], AX
+	LEAL	EDI, ub17_parm.B[EBP]
+	MOVL	ub17_qab+qab_parm+0.B[EBP], EDI
+	MOVL	ub17_qab+qab_parm+4.B[EBP], SS
+	MOVL	[EDI], #{PAR$SET|REP_HEXV}+{4<8}+{IOPAR_TRMCOUTMODE<16t}
+	MOVL	4t.B[EDI], #0FFFFFFFFh
+	MOVL	8t.B[EDI], #{PAR$SET|REP_HEXV}+{4<8}+{IOPAR_TRMSOUTMODE<16t}
+	MOVL	12t.B[EDI], #TOM$IMAGE
+	MOVL	16t.B[EDI], #{PAR$GET}+{1<8}+{IOPAR_OUTSTS<16t}
+	MOVB	21t.B[EDI], #0
+	PUSHL	SS
+	LEAL	EAX, ub17_qab.B[EBP]
+	PUSHL	EAX
+	CALLF	svcIoQueue#
+	TESTL	EAX, EAX
+	JS	6$.S
+	ORL	EAX, ub17_qab+qab_error.B[EBP]
+	JS	6$.S
+	MOVB	DL, #090h		;Assume can take more data
+	CMPB	20t.B[EDI], #0		;Can it take more data now?
+	JNE	2$.S			;Yes	
+	MOVB	DL, #10h		;No - use right bits
+2$:	MOVB	dff_EAX+1.B[EBP], DL	;Store bits
+	RET
+
+;Here if error indicated
+
+6$:	MOVB	DL, #01h		;Assume time-out
+	CMPL	EAX, #ER_NORSP		;Right?
+	JE	2$.S			;Yes
+	MOVB	DL, #20h		;No - assume out-of-paper
+	CMPL	EAX, #ER_NOPAP		;Right?
+	JE	2$.S			;Yes
+	MOVB	DL, #04h		;No - report IO error
+	JMP	2$.S
+.PAGE
+	.SBTTL	ubiosxoshandle - Subroutine to get XOS handle for BIOS function
+
+;Subroutine to get Allegor handle for BIOS function
+;	c{EBX} = BIOS handle
+;	CALL	ubiosxoshandle
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  c{EAX} = XOS handle
+
+$$$=!0
+FRM ubxh_qab, qab_SIZE
+ubxh_SIZE=!$$$
+
+ubiosxoshandle:
+	MOVZBL	EAX, dxd_bioshtbl[EBX]	;Get XOS handle
+	CMPB	AL, #0
+	JE	4$.S			;If none
+	RET				;OK - return
+
+;Here if the BIOS handle is not in use
+
+4$:	LEAL	EAX, biosdev[EBX*8]	;Get offset of device name string
+	ENTER	ubxh_SIZE, 0		;Set up our stack frame
+	MOVL	ubxh_qab+qab_option.B[EBP], #O$OUT|O$IN
+	CMPB	CS:[EAX], #'L'
+	JNE	6$.S
+	MOVB	ubxh_qab+qab_option.B[EBP], #O$OUT
+6$:	MOVW	ubxh_qab+qab_func.B[EBP], #QFNC$WAIT|QFNC$DIO|QFNC_OPEN
+	MOVL	ubxh_qab+qab_buffer1+0.B[EBP], EAX
+	MOVL	ubxh_qab+qab_buffer1+4.B[EBP], CS
+	CLRL	EAX
+	MOVL	ubxh_qab+qab_parm+0.B[EBP], EAX
+	MOVW	ubxh_qab+qab_vector.B[EBP], AX
+	PUSHL	SS
+	LEAL	EAX, ubxh_qab.B[EBP]	;Open the device
+	PUSHL	EAX
+	CALLF	svcIoQueue#
+	TESTL	EAX, EAX		;OK?
+	JS	8$.S			;No - fail
+	ORL	EAX, ubxh_qab+qab_error.B[EBP] ;Maybe
+	JS	8$.S			;No - fail
+	MOVL	EAX, ubxh_qab+qab_handle.B[EBP] ;OK - get XOS handle
+	INCL	EAX
+	MOVB	dxd_bioshtbl[EBX], AL	;Store XOS handle in the DOS handle
+	LEAVE				;  table
+	RET
+
+8$:	LEAVE
+	STC
+	RET
+
+	.MOD	8
+biosdev:.ASCIZ	"TRM:"		; 0
+	.MOD	8
+	.ASCIZ	"LPT1:"		; 1
+	.MOD	8
+	.ASCIZ	"LPT2:"		; 2
+	.MOD	8
+	.ASCIZ	"LPT3:"		; 3
+	.MOD	8
+	.ASCIZ	"COM1:"		; 4
+	.MOD	8
+	.ASCIZ	"COM2:"		; 5
+	.MOD	8
+	.ASCIZ	"COM3:"		; 6
+	.MOD	8
+	.ASCIZ	"COM4:"		; 7
+	.MOD	8
+	.ASCIZ	"F0:"		; 8
+	.MOD	8
+	.ASCIZ	"F1:"		; 9
+	.MOD	8
+	.ASCIZ	"D0:"		;10
+	.MOD	8
+	.ASCIZ	"D1:"		;11
+
+	END

@@ -1,0 +1,502 @@
+	.TITLE	IO
+
+;++++
+; This software is in the public domain.  It may be freely copied and used
+; for whatever purpose you see fit, including commerical uses.  Anyone
+; modifying this software may claim ownership of the modifications, but not
+; the complete derived code.  It would be appreciated if the authors were
+; told what this software is being used for, but this is not a requirement.
+
+;   THIS SOFTWARE IS PROVIDED BY THE AUTHORS "AS IS" AND ANY EXPRESS OR
+;   IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
+;   OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+;   IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+;   INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+;   BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS
+;   OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+;   ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR
+;   TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
+;   USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+;----
+
+	.PROC	80386
+	.INCLUD XOSINC:\XMAC\DEFINES.PAR
+	.INCLUD	XOSINC:\XMAC\XOS.PAR
+	.INCLUD XOSINC:\XMAC\XOSERR.PAR
+	.INCLUD	XOSINC:\XMAC\XOSTRM.PAR
+	.INCLUD XOSINC:\XMAC\CLIBX.PAR
+	.INCLUD XOSINC:\XMAC\PROCARG.PAR
+	.INCLUD	VID.PAR
+
+	.STDSEGS
+
+	.PSECT	_TEXT_p
+
+;Subroutine to initialize a file
+;	CALL	initfile
+;	C:set = Error
+;	  c{EDX} = Offset of error message
+;	C:clr = Normal
+
+initfile::
+	CLRL	ECX			;Search for a free file
+2$:	CMPL	filetbl#[ECX*4], #0.B
+	JE	6$.S
+	INCL	ECX
+	CMPL	ECX, #FILEMAX.B
+	JB	2$.S
+	MOVL	EDX, #tmfmsg#
+	STC
+	RET
+
+;Here with a free slot
+
+6$:	MOVL	EDI, ECX
+	INCL	EDI
+	SHLL	EDI, #26t		;Calculate base offset for the buffer
+	MOVL	filetbl#[ECX*4], EDI	;Store it
+	PUSHL	DS
+	PUSHL	EDI
+	PUSHL	#PG$READ|PG$WRITE.B
+	PUSHL	#1000h
+	CALLF	svcMemChange##		;Allocate first memory page
+	ORL	EAX, EAX
+	JS	10$.S
+	ADDL	EAX, EDI
+	DECL	EAX
+	MOVL	f_memtop.B[EDI], EAX	;Store top address
+	LEAL	EAX, f_filbfr.B[EDI]
+	MOVL	f_endpnt.B[EDI], EAX	;Store end of file pointer
+	RET				;Finished here
+
+;Here if error allocating memory
+
+10$:	MOVL	EBX, #emmemory#
+	JMP	getemsg			;Get error message
+.PAGE
+	.SBTTL	opnfile - Open file for input
+
+;Subroutine to open file for input
+;	c{EDX} = Offset of file name string
+;	CALL	opnfile
+;	c{EBX} = Completion index
+;		   0 = Normal, c{EAX} = File handle
+;		   1 = File not found c{EAX} = ER_FILNF
+;		   2 = Error, c{EAX} = Error code
+
+opnfile::
+	CMPB	tabforce#, #0		;Was /TAB specified?
+	JNE	18$.S			;Yes - go on
+	MOVL	EBX, EDX		;No - find the file's extension
+	CLRL	EAX
+4$:	CMPB	[EBX], #0
+	JE	8$.S
+	CMPB	[EBX], #'.'
+	JNE	6$.S
+	MOVL	EAX, EBX
+6$:	INCL	EBX
+	JMP	4$.S
+
+;Here with start of the extension - now determine if this is a file which
+;  should be displayed with 4 space tabs
+
+8$:	TESTL	EAX, EAX
+	JE	18$.S
+	MOVL	EBX, EAX
+	MOVB	AL, 1.B[EBX]
+	CMPB	AL, #0
+	JE	18$.S
+	CMPB	AL, #'C'
+	JE	10$.S
+	CMPB	AL, #'c'
+	JE	10$.S
+	CMPB	AL, #'H'
+	JE	10$.S
+	CMPB	AL, #'h'
+	JNE	18$.S
+10$:	MOVB	AL, 2.B[EBX]
+	CMPB	AL, #0
+	JE	14$.S
+	CMPB	AL, #'P'
+	JE	12$.S
+	CMPB	AL, #'p'
+	JNE	18$.S
+12$:	MOVB	AL, 3.B[EBX]
+	CMPB	AL, #0
+	JE	14$.S
+	CMPB	AL, #'P'
+	JE	14$.S
+	CMPB	AL, #'p'
+	JNE	18$.S
+14$:	MOVB	tabmask#, #3
+18$:	PUSHL	#O$IN			;Open the file
+	PUSHL	DS
+	PUSHL	EDX
+	PUSHL	DS
+	PUSHL	#parmlist1#
+	CALLF	svcIoOpen##
+	CLRL	EBX			;Assume OK
+	ORL	EAX, EAX		;Right?
+	JNS	20$.S			;Yes
+	INCL	EBX			;No - assume file not found
+	CMPL	EAX, #ER_FILNF		;Right?
+	JE	20$.S			;Yes
+	INCL	EBX			;No - error
+20$:	RET				;Yes - return
+.PAGE
+	.SBTTL	inpfile - Read file into the file buffer
+
+;Subroutine to input file into the file buffer
+;	c{EAX} = File handle
+;	c{EBX} = Offset in file buffer
+;	c{EDX} = Offset of file name string
+;	c{EDI} = Offset of file description block (FDB)
+;	c{ESI} = Offset of window data block (WDB)
+;	CALL	inpfile
+;	c{EBX} = Completion index
+;		   0 = Normal
+;		   1 = File too big
+;		   2 = Error, c{EAX} = Error code
+
+$$$=!0
+FRM inf_holesize, 4t
+FRM inf_holebtm , 4t
+FRM inf_holetop , 4t
+FRM inf_filetop , 4t
+FRM inf_linebgn , 4t
+FRM inf_lastcr  , 1t
+FRM             , 3t
+FRM inf_fileleft, 4t
+FRM inf_amount  , 4t
+FRM inf_blkpnt  , 4t
+FRM inf_blkcnt  , 4t
+FRM inf_handle  , 4t		;File handle
+inf_SIZE=!$$$
+
+inpfile::
+	ENTER	inf_SIZE, 0
+	MOVL	inf_handle.B[EBP], EAX	;Store file handle
+	MOVL	inf_holebtm.B[EBP], EBX	;Remember input offset
+	MOVL	inf_holetop.B[EBP], EBX
+	CLRL	EAX
+	MOVL	inf_holesize.B[EBP], EAX
+	MOVB	inf_lastcr.B[EBP], AL
+	MOVL	EAX, filelen#		;Store file length
+	MOVL	inf_fileleft.B[EBP], EAX
+	MOVL	EAX, f_endpnt.B[EDI]
+	MOVL	inf_filetop.B[EBP], EAX
+	PUSHL	ESI			;Store the file name
+	PUSHL	EDI
+	ADDL	EDI, #f_filename.B
+	PUSHL	DS
+	POPL	ES
+	MOVL	ESI, #filename#
+	MOVL	ECX, #80t/4
+	CLD
+	RMOVSL	[EDI], [ESI]
+	POPL	EDI
+	POPL	ESI
+	MOVL	inf_blkcnt.B[EBP], #1	;Initialize buffer byte count	
+
+;Here to start a new line
+
+6$:	MOVL	EAX, inf_holebtm.B[EBP]	;Remember where next line begins
+	MOVL	inf_linebgn.B[EBP], EAX
+	MOVL	EAX, inf_fileleft.B[EBP] ;Do we have enough space for the
+	ADDL	EAX, #10t.B		 ;  rest of the file now?
+	SUBL	EAX, inf_holesize.B[EBP]
+	JBE	10$.S			;Yes
+	MOVL	EDX, inf_filetop.B[EBP]	;No - calculate new high address needed
+	ADDL	EDX, EAX
+	CALL	chkmem#			;See if need more space
+	MOVL	EBX, #1			;Get termination reason in case error
+	JC	32$			;If error
+	MOVL	ECX, inf_filetop.B[EBP]	;OK - calculate amount to move
+	SUBL	ECX, inf_holetop.B[EBP]
+	INCL	ECX
+	MOVL	inf_amount.B[EBP], ECX	;Remember amount we are moving
+	PUSHL	DS
+	POPL	ES
+	PUSHL	ESI
+	PUSHL	EDI
+	MOVL	ESI, inf_filetop.B[EBP]
+	MOVL	EDI, f_memtop.B[EDI]
+	MOVL	inf_filetop.B[EBP], EDI
+	ADDL	inf_holesize.B[EBP], EDI
+	SUBL	inf_holesize.B[EBP], ESI
+	STD				;Move backwards
+	RMOVSB	[EDI], [ESI]
+	INCL	EDI
+	MOVL	inf_holetop.B[EBP], EDI	;Remember where rest of file buffer
+	POPL	EDI			;  is now
+	POPL	ESI
+10$:	INCL	inf_holebtm.B[EBP]	;Point beyond byte count byte
+	DECL	inf_holesize.B[EBP]
+	MOVL	ECX, #1			;Reset character count for line
+12$:	DECL	inf_blkcnt.B[EBP]	;Any more in current buffer?
+	JNE	18$.S			;Yes - go on
+	PUSHL	inf_handle.B[EBP]	;No - read a block
+	PUSHL	DS
+	PUSHL	#blkbufr#
+	PUSHL	#512t
+	CALLF	svcIoInBlock##
+	TESTL	EAX, EAX
+	JS	14$.S			;If error
+	JNE	16$.S			;If got something
+	MOVL	EAX, #ER_EOF		;No - assume this means EOF (this
+14$:	JMP	28$.S			;  should not be possible)
+
+;Here with new input block
+
+16$:	MOVL	inf_blkcnt.B[EBP], EAX	;Store count
+	MOVL	inf_blkpnt.B[EBP], #blkbufr# ;Reset buffer pointer
+18$:	MOVL	EAX, inf_blkpnt.B[EBP]
+	MOVB	AL, [EAX]		;Get data byte
+	INCL	inf_blkpnt.B[EBP]
+	ORB	AL, AL			;Is it a null?
+	JE	12$.S			;Yes - ignore it
+	DECL	inf_fileleft.B[EBP]	;No - use it
+	MOVB	AH, #0			;Get and clear the last character was
+	XCHGB	AH, inf_lastcr.B[EBP]	;  CR flag
+	CMPB	AL, #0Dh		;Carriage return?
+	JE	24$.S			;Yes - end the line
+	CMPB	AL, #0Ah		;Line feed?
+	JNE	20$.S			;No
+	ORB	AH, AH			;Yes - does it follow a CR
+	JNE	12$.S			;Yes - ignore it
+	JMP	26$.S			;No - end of line	
+
+;Here with normal character
+
+20$:	CMPB	CL, #250t		;Is the line too long
+	JA	22$.S			;Yes
+	MOVL	EBX, inf_holebtm.B[EBP]
+	MOVB	[EBX], AL		;No - store character
+	INCL	inf_holebtm.B[EBP]	;Bump pointer
+	DECL	inf_holesize.B[EBP]
+	INCL	ECX			;And bump count
+	JMP	12$.S			;Continue
+
+;Here if line is too long
+
+22$:	INCL	inf_blkcnt.B[EBP]	;Put back the last character
+	INCL	inf_fileleft.B[EBP]
+	DECL	inf_blkpnt.B[EBP]
+	JMP	26$.S
+
+;Here at end of line
+
+24$:	INCB	inf_lastcr.B[EBP]	;Indicate have CR
+26$:	MOVL	EAX, inf_linebgn.B[EBP]	;Point to count byte for this line
+	MOVB	[EAX], CL		;Store count
+	MOVL	EAX, inf_holebtm.B[EBP]
+	MOVB	[EAX], CL
+	INCL	inf_holebtm.B[EBP]
+	DECL	inf_holesize.B[EBP]
+	INCL	ECX			;Increase character count by size of
+	ADDL	f_numchr.B[EDI], ECX	;  this line (including 2 count bytes)
+	INCL	f_numlin.B[EDI]		;Increase line count
+	JMP	6$			;Continue with next line
+
+;Here with error reading data from disk
+
+28$:	CMPB	CL, #1			;Have an unterminated line at end?
+	JBE	30$.S			;No
+	MOVL	EDX, inf_linebgn.B[EBP]	;Yes - point to count byte for this line
+	MOVB	[EDX], CL		;Store count
+	MOVL	EDX, inf_holebtm.B[EBP]
+	MOVB	[EDX], CL
+	ADDL	inf_holebtm.B[EBP], #2.B ;Increase character count by size of
+	ADDL	f_numchr.B[EDI], ECX	 ;  this line
+	INCL	f_numlin.B[EDI]		;Increase line count
+30$:	DECL	inf_holebtm.B[EBP]
+	CLRL	EBX			;Assume EOF
+	CMPL	EAX, #ER_EOF.B		;Right?
+	JE	32$.S			;Yes
+	MOVB	BL, #2			;No - indicate error
+32$:	PUSHL	EAX			;Save possible error code
+	PUSHL	inf_handle.B[EBP]	;Close the file
+	PUSHL	#0.B
+	CALLF	svcIoClose##
+	POPL	EAX
+	PUSHL	DS			;Close up memory
+	POPL	ES
+	PUSHL	EDI
+	PUSHL	ESI
+	MOVL	ESI, inf_holetop.B[EBP]
+	MOVL	EDI, inf_holebtm.B[EBP]
+	CMPL	ESI, EDI		;Anything to do?
+	JE	34$.S			;No
+	MOVL	ECX, inf_amount.B[EBP]
+	CLD				;Move forwards
+	RMOVSB	[EDI], [ESI]
+	DECL	EDI
+34$:	MOVL	EDX, EDI
+	POPL	ESI
+	POPL	EDI
+	MOVL	f_endpnt.B[EDI], EDX	;Update pointer to end of file buffer
+	LEAVE
+	RET				;And return
+.PAGE
+	.SBTTL	outfile - Write data to file
+
+;Subroutine to write data to file
+;	c{ECX} = Number of lines to output
+;	c{EBX} = Offset of first line to output
+;	c{EDX} = Offset of file specification
+;	CALL	outfile
+;	C:set = Error
+;	  c{EDX} = Offset of error message string
+;	C:clr = Normal
+
+$$$=!0
+FRM outf_addr  , 4t
+FRM outf_count , 4t
+FRM outf_amount, 4t
+FRM outf_blkcnt, 4t
+FRM outf_handle, 4t
+outf_SIZE=!$$$
+
+outfile::
+	ENTER	outf_SIZE, 0
+	MOVL	outf_addr.B[EBP], EBX	;Remember output address
+	INCL	ECX
+	MOVL	outf_count.B[EBP], ECX	;And remember line count
+	PUSHL	#O$CREATE|O$TRUNCA|O$OUT
+	PUSHL	DS
+	PUSHL	EDX
+	PUSHL	#0.B
+	PUSHL	#0.B
+	CALLF	svcIoOpen##		;Open the file
+	ORL	EAX, EAX
+	JS	14$			;If error
+	MOVL	outf_handle.B[EBP], EAX	;OK - store handle
+	MOVL	EBX, outf_addr.B[EBP]	;Restore pointer
+	MOVL	EDX, #blkbufr#		;Set output pointer
+	MOVL	outf_blkcnt.B[EBP], #513t ;And output count
+2$:	DECL	outf_count.B[EBP]	;Finished?
+	JE	8$.S			;Yes
+	MOVB	AL, [EBX]		;Get character count for line
+	ORB	AL, AL			;End of file?
+	JE	8$.S			;Yes - go finish up
+	MOVB	CL, AL			;Get in right register
+4$:	INCL	EBX			;Bump pointer
+	DECB	CL			;More in this line?
+	JE	6$.S			;No
+	MOVB	AL, [EBX]		;Get character
+	CALL	outflc			;Output character
+	JNC	4$.S			;Continue if no error
+	JMP	10$.S			;If error
+
+;Here at end of line
+
+6$:	INCL	EBX			;Skip the 2nd count byte
+	MOVB	AL, #CR			;End the line with CR-LF
+	CALL	outflc
+	JC	10$.S			;If error
+	MOVB	AL, #LF
+	CALL	outflc
+	JNC	2$.S			;Continue if no error
+	JMP	10$.S			;If error
+
+;Here when count runs out or at end of file buffer
+
+8$:	MOVL	ECX, #513t		;Calculate size of last block
+	SUBL	ECX, outf_blkcnt.B[EBP]
+	PUSHL	outf_handle.B[EBP]	;Write out the last block
+	PUSHL	DS
+	PUSHL	#blkbufr#
+	PUSHL	ECX
+	CALLF	svcIoOutBlock##
+	ORL	EAX, EAX
+	JS	12$.S			;If error
+10$:	PUSHL	outf_handle.B[EBP]	;Close the file
+	PUSHL	#0.B
+	CALLF	svcIoClose##
+	ORL	EAX, EAX
+	JS	14$.S			;If error
+	LEAVE				;OK
+	RET				;Return with C clear
+
+;Here if error with file open - close file and then display message
+
+12$:	PUSHL	EAX			;Save error code
+	PUSHL	outf_handle.B[EBP]
+	PUSHL	#0.B
+	CALLF	svcIoClose##
+	POPL	EAX
+14$:	LEAVE
+	MOVL	EBX, #emoutfile#
+	JMP	getemsg			;Get error message and return with C set
+.PAGE
+;Subroutine to output single character to the output file
+;	c{EDI} = Pointer to buffer
+;	c(AL)  = Character to output
+;	CALL	outflc
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+
+outflc:	DECL	outf_blkcnt.B[EBP]	;Is current buffer full?
+	JNE	4$.S			;No - go on
+	PUSHL	EAX			;Yes - save character
+	PUSHL	outf_handle.B[EBP]
+	PUSHL	DS
+	PUSHL	#blkbufr#
+	PUSHL	#512t
+	CALLF	svcIoOutBlock##
+	ORL	EAX, EAX
+	JS	6$.S			;If error
+	POPL	EAX			;Restore character
+	MOVL	outf_blkcnt.B[EBP], #512t ;Reset buffer count
+	MOVL	EDX, #blkbufr#		;And reset buffer pointer
+4$:	MOVB	[EDX], AL		;Store character
+	INCL	EDX			;Bump pointer
+	CLC				;Clear C
+	RET				;And return
+
+;Here if error
+
+6$:	POPL	EBX			;Fix up the stack
+	STC				;Indicate error
+	RET				;And return
+.PAGE
+;Subroutine to output string to terminal
+;	c{EDX} = Offset of string
+;	CALL	trmout
+
+trmout::PUSHL	#DH_STDERR.B
+	PUSHL	DS
+	PUSHL	EDX
+	PUSHL	#0.B
+	CALLF	svcIoOutString##
+	RET
+
+;Subroutine to get error message
+;	c{EAX} = Error code
+;	c{EBX} = Offset of prefix string
+;	CALL	getemsg
+;	C:set Always
+;	c{EDX} = Offset of message
+
+getemsg::
+	MOVL	EDX, #blkbufr#		;Point to buffer
+	PUSHL	EDX
+	PUSHL	EAX			;Stack error code
+2$:	MOVB	AL, [EBX]		;Copy prefix string to buffer
+	CMPB	AL, #0
+	JE	4$.S
+	INCL	EBX
+	MOVB	[EDX], AL
+	INCL	EDX
+	JMP	2$.S
+
+;Here with prefix string copied to the message buffer
+
+4$:	PUSHL	#3.B			;Get system error message
+	PUSHL	DS
+	PUSHL	EDX
+	CALLF	svcSysErrMsg##
+	POPL	EDX			;Restore offset of buffer
+	STC
+	RET

@@ -1,0 +1,1235 @@
+	.TITLE	IPSROUTE - Internet routing routines for XOS
+
+;++++
+; This software is in the public domain.  It may be freely copied and used
+; for whatever purpose you see fit, including commerical uses.  Anyone
+; modifying this software may claim ownership of the modifications, but not
+; the complete derived code.  It would be appreciated if the authors were
+; told what this software is being used for, but this is not a requirement.
+
+;   THIS SOFTWARE IS PROVIDED BY THE AUTHORS "AS IS" AND ANY EXPRESS OR
+;   IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
+;   OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+;   IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+;   INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+;   BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS
+;   OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+;   ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR
+;   TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
+;   USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+;----
+
+	.PROC	80486
+	.INCLUD	XOSINC:\XMAC\XOS.PAR
+	.INCLUD	XOSINC:\XMAC\XOSX.PAR
+	.INCLUD	XOSINC:\XMAC\XOSTIME.PAR
+	.INCLUD	XOSINC:\XMAC\XOSERR.PAR
+	.INCLUD	XOSINC:\XMAC\XOSNET.PAR
+	.INCLUD	XOSINC:\XMAC\XOSXNET.PAR
+	.INCLUD	XOSINC:\XMAC\XOSXSNAP.PAR
+	.INCLUD	XOSINC:\XMAC\XOSXARP.PAR
+	.INCLUD	XOSINC:\XMAC\XOSXIPS.PAR
+	.INCLUD	XOSINC:\XMAC\XOSLKE.PAR
+	.INCLUD	XOSINC:\XMAC\XOSXLKE.PAR
+
+;This module contains routines which implement Internet routing for hosts
+
+	LKECONT
+
+	.EXPORT	xosipsRtChkAddr
+	.EXPORT	xosipsRtRmvOne
+
+	.SBTTL	xosipsRtChkAddr - Subroutine to check if IP address is in the cache
+
+;Subroutine to check if an IP address is in the routing cache.
+;	c{EAX} = IP address
+;	c{EDI} = Offset of PDB
+;	c{ESI} = Offset of SDB
+;	CALL	xosipsRtChkAddr
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+
+xosipsRtChkAddr:
+	MOVB	CL, #1
+	JMP	geta2.S
+
+	.SBTTL	rtgetaddr - Subroutine to get hardware address given IP address
+
+
+;Subroutine to get hardware address given IP address.  This subroutine is
+;  called via the npb_getaddr dispatch by snapsendpkt.  If it can find the
+;  address immediately, it fills it in and returns with EBX unchanged.  If
+;  it must use ARP to get the address, it links the packet to be sent to the
+;  send list for the ARP request and returns EBX pointing to the initial ARP
+;  packet to send.  Note that the sequence needed to find an address (especially
+;  a remote address) is quite complex, but it must all be implemented as a
+;  state machine at device fork level.  This is necessary because we must be
+;  able to resolve addresses of packets (such as ICMP echo requests) which are
+;  processed completely at device fork level.
+;	c{EBX} = Offset of packet buffer
+;	c{EDI} = Offset of PDB
+;	c{ESI} = Offset of SDB
+;	CALL	rtgetaddr
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  c{EDX,EAX} = Hardware address
+;	  c{ECX}     = Offset of routing table entry
+
+$$$=!0
+FRM rtg_ipa    , 4t		;IP address
+FRM rtg_pkt    , 4t		;Offset of packet
+FRM rtg_foreign, 4t
+FRM rtg_test   , 1t
+FRM            , 3t
+rtg_SIZE=!$$$
+
+rtgetaddr::
+	MOVB	CL, #0
+	MOVZBL	EAX, npb_npofs.B[EBX]	;Get offset of the IP header
+	MOVL	EAX, ip_dstipaddr.B[EBX+EAX] ;Get the destination IP address
+geta2:	TESTL	EAX, #0FF000000h	;Invalid IP address
+	JE	6$.S			;Yes - fail!
+	CMPL	EAX, #0FFFFFFFFh.B	;No - limited broadcase address?
+	JE	8$.S			;Yes
+	ENTER	rtg_SIZE, 0		;No - set up our stack frame
+	MOVL	rtg_ipa.B[EBP], EAX	;Save IP address
+	MOVL	rtg_pkt.B[EBP], EBX	;Also save offset of the packet buffer
+	MOVB	rtg_test.B[EBP], CL
+	CMPB	AL, #IPA_LOCAL		;Is this the local echo address?
+	JE	10$.S			;Yes
+	CMPL	pdb_ipaddr.B[EDI], EAX	;No - is it our own address?
+	JE	10$.S			;Yes
+	MOVL	EAX, rtg_ipa.B[EBP]
+	CALL	rtsearch
+	JNE	getanirt		;If not found
+geta7:	CMPB	rt_type.B[ECX], #RTT_LPENDING ;Is this a pending local entry?
+	JE	getapend.S		;Yes - go handle that
+	CMPB	rt_type.B[ECX], #RTT_FPENDING ;Is this a pending foreign entry?
+	JE	getapend.S		;Yes - go handle that
+	CMPB	rt_type.B[ECX], #RTT_DPENDING ;Is this a pending default entry?
+	JE	getapend.S		;Yes - almost like a pending entry!
+	MOVL	EAX, knlTickTtl##	;No - update time-stamp value
+	MOVL	rt_timestamp.B[ECX], EAX
+	CMPB	rt_type.B[ECX], #RTT_FOREIGN ;Is this a foreign entry?
+	JNE	4$.S			;No - go on
+	MOVL	ECX, rt_router.B[ECX]	;Yes - point to associated router entry
+4$:	MOVL	EAX, rt_hwaddr+0.B[ECX] ;Get hardware address
+	MOVL	EDX, rt_hwaddr+4.B[ECX]
+	MOVL	EBX, rtg_pkt.B[EBP]	;Restore offset of packet
+	LEAVE				;Thats all - return with normal packet
+	CLC				;  to send (this is the normal path
+	RET				;  for a routing cache hit)
+
+;Here if have illegal IP address
+
+6$:	MOVL	EAX, #ER_NILAD
+	STC
+	RET
+
+;Here if sending to the IP limited broadcast address
+
+8$:	MOVL	EDX, EAX
+	JMP	14$.S
+
+;Here if sending to own IP address
+
+10$:	CMPB	rtg_test.B[EBP], #0
+	JNE	12$.S
+	MOVL	EDX, sdb_idb.B[ESI]
+	MOVL	EAX, idb_hwaddr+0[EDX]
+	MOVL	EDX, idb_hwaddr+4[EDX]
+	MOVL	EBX, rtg_pkt.B[EBP]	;Restore offset of packet
+	ORB	npb_sts.B[EBX], #NPS$SELF ;Indicate sending packet to self
+12$:	LEAVE
+14$:	CLRL	ECX
+	RET
+.PAGE
+;Here if found a pending ARP routing table entry of some kind - we get here
+;  for RTT_LPENDING, RTT_FPENDING, and RTT_DPENDING entries.  In all cases we
+;  link the packet to send to the hold list for the routing table entry and
+;  return 0 in EBX to indicate that there is nothing to send now.
+
+getapend:
+	CMPB	rtg_test.B[EBP], #0	;Just testing?
+	JNE	getarerr.S		;Yes - fail
+	MOVL	EBX, rtg_pkt.B[EBP]	;No - get offset of the packet
+	TESTL	EBX, EBX
+	JE	6$.S
+	MOVL	EAX, rt_holdtail.B[ECX]	;Link this packet to the tail of the
+	TESTL	EAX, EAX		;  packet hold list
+	JE	2$.S
+	MOVL	npb_nextsnd.B[EAX], EBX
+	CLRL	EAX
+	JMP	4$.S
+
+2$:	MOVL	rt_holdhead.B[ECX], EBX
+4$:	MOVL	rt_holdtail.B[ECX], EBX
+	MOVL	npb_nextsnd.B[EBX], EAX
+	MOVL	npb_holdrt.B[EBX], ECX
+	CLRL	EBX			;Return 0 to indicate no output needed
+	LEAVE				;  now
+6$:	RET
+
+;Here if have internal error with the routing table - This should not happen
+;  but may be possible with certain illegal responses from the network. Also
+;  get here if rtchkaddr is called and we do not have the address in the cache.
+
+getarerr:
+	LEAVE
+	MOVL	EAX, #ER_NRTER		;Report this as a routing error!
+	STC
+	RET
+
+;Here if entry not found in the routing table.  In this case we have to create
+;  a new entry.  If we are looking for a local address, we create an
+;  RTT_LPENDING entry, place the packet on its hold list, and set up an ARP
+;  request packet to send in place of the current packet.  If it is a foreign
+;  address, we create an RTT_DPENDING entry, place the packet on its hold list,
+;  create or find an existing RTT_LPENDING entry which we link to the
+;  RTT_FPENDING entry, and set up an ARP request packet to send in place of
+;  the current packet.  In both cases, ARP response handling and retries are
+;  handled at device fork level.
+
+getanirt:
+	CMPB	rtg_test.B[EBP], #0	;Just testing?
+	JNE	getarerr.S		;Yes - fail
+	XORL	EAX, pdb_ipaddr.B[EDI]	;No - is this a local address?
+	TESTL	EAX, pdb_ipsubnetmask.B[EDI]
+	JNE	getafor.S		;No
+	MOVL	EAX, rtg_ipa.B[EBP]	;Yes - get IP address
+	CALL	doarp			;Insert PENDING routing table entry
+	JC	retlv2.S		;  and make an ARP packet
+	MOVL	EDX, rtg_pkt.B[EBP]	;OK - get offset of original packet
+	MOVL	rt_holdhead.B[ECX], EDX	;Initialize the packet hold list
+	MOVL	rt_holdtail.B[ECX], EDX
+	CLRL	EAX
+	TESTL	EDX, EDX		;Do we have a packet?
+	JE	10$.S			;No
+	ORB	npb_sts.B[EDX], #NPS$USEDARP ;Yes - indicate used ARP for packet
+	MOVL	npb_nextsnd.B[EDX], EAX
+	MOVL	npb_holdrt.B[EDX], ECX
+10$:	DECL	EAX			;This sets EAX to -1
+	MOVL	EDX, EAX
+retlv2:	LEAVE
+ret002:
+	JNC	13$.S
+	TESTL	EAX, EAX
+	JS	11$.S
+	INT3
+
+11$:	STC
+13$:
+
+	RET
+.PAGE
+;Here if have an address for a node on a different sub-net - first we create
+;  an RTT_FOREIGN routing table entry
+
+getafor:CMPL	pdb_ipdrthead.B[EDI], #0.B
+	JE	17$
+	MOVB	BL, #RTT_FOREIGN	;Get routing table entry type
+	MOVB	BH, #1			;Request forced update
+	MOVL	EAX, rtg_ipa.B[EBP]	;Get IP address
+	CLRL	EDX			;No hardware address yet
+	CLRL	ECX
+	CALL	rtupdate		;Put entry in the routing table
+	JC	retlv2.S		;If error
+	MOVL	rtg_foreign.B[EBP], ECX	;OK - remember its offset
+	MOVL	rt_t2lcnt.B[ECX], #RTT2L_FOREIGN ;Store time-out value
+	MOVL	rt_timeout.B[ECX], #rttimeout ;Store offset of time-out routine
+
+;Next we first try to find a routing table entry for any one of the default
+;  routers - if we can't find any, we create a pending entry for each one in
+;  turn
+
+	MOVL	EDX, pdb_ipdrthead.B[EDI]
+2$:	MOVL	EAX, dct_data.B[EDX]	;Get IP address for router
+	PUSHL	EDX
+	CALL	rtsearch		;Look for routing table entry
+	POPL	EDX
+	JE	18$			;If we found one
+	MOVL	EDX, dct_lnknext.B[EDX]	;Not there (or not valid type for this)
+	TESTL	EDX, EDX		;  - advance to next block
+	JNE	2$.S
+
+;Here if could not find a routing table entry for a default router - now we
+;  must try to create one
+
+6$:	MOVL	EDX, pdb_ipdrthead.B[EDI] ;Start with the first default router
+	ORL	EDX, EDX		;Have one?
+	JE	16$.S			;No
+	MOVL	EAX, dct_data.B[EDX]	;Yes - get IP address
+	PUSHL	EDX
+	CALL	doarp
+	POPL	EDX
+	JC	14$.S			;If error
+	MOVL	EAX, dct_ipnum.B[EDX]
+	MOVL	EDX, rtg_foreign.B[EBP]	;Get offset of the new entry
+	MOVB	rt_retry.B[EDX], AL	;Store state
+	MOVB	rt_type.B[EDX], #RTT_DPENDING ;Change routing table entry type
+	MOVL	rt_t2lcnt.B[EDX], #0	      ;  to RTT_DPENDING
+	MOVL	rt_router.B[EDX], ECX	;Link the RTT_DPENDING entry to the
+	MOVL	EAX, rt_rtntail.B[ECX]	;  RTT_LPENDING entry we just made
+	TESTL	EAX, EAX
+	JNE	8$.S
+	MOVL	rt_rtnhead.B[ECX], EDX
+	JMP	10$.S
+
+8$:	MOVL	rt_rtnnext.B[EAX], EDX
+10$:	MOVL	rt_rtntail.B[ECX], EDX
+	MOVL	EAX, rtg_pkt.B[EBP]	;Get offset of original packet
+	MOVL	rt_holdhead.B[EDX], EAX	;Initialize the packet hold list for
+	MOVL	rt_holdtail.B[EDX], EAX ;  the RTT_DPENDING routing table entry
+	TESTL	EAX, EAX		;Do we have a packet?
+	JE	12$.S			;No
+	MOVL	npb_nextsnd.B[EAX], #0
+	MOVL	npb_holdrt.B[EAX], EDX
+	ORB	npb_sts.B[EAX], #NPS$USEDARP ;Indicate used ARP for packet
+12$:	MOVL	EAX, #-1
+	MOVL	EDX, EAX
+	LEAVE				;Return from rtgetaddr to send the first
+
+	JNC	135$.S
+	TESTL	EAX, EAX
+	JS	13$.S
+	INT3
+
+13$:	STC
+135$:
+
+	RET				;  ARP packet
+
+;Here if don't have an IP address for a default router
+
+14$:	MOVL	EDX, dct_lnknext.B[EDX]	;Advance to next default
+	JMP	6$.S			;Continue
+
+;Here if can't find a router
+
+16$:	MOVL	ECX, rtg_foreign.B[EBP]	;No
+	MOVB	rt_type.B[ECX], #RTT_LOCAL
+	MOVL	EAX, rtg_ipa.B[EBP]	;Give up the new entry
+	MOVB	DL, #0
+	CALL	xosipsRtRmvOne
+17$:	MOVL	EBX, rtg_pkt.B[EBP]	;Restore offset of the packet
+	MOVL	EAX, #ER_NRTNA		;Return the error
+	LEAVE
+	STC
+	RET
+
+;Here with routing table entry for a default router
+
+18$:	CMPB	rt_type.B[ECX], #RTT_ROUTER ;Is this a router entry?
+	JE	20$.S			;Yes - go on
+	CMPB	rt_type.B[ECX], #RTT_LOCAL ;No - is this a local entry now?
+	JNE	14$.S			;No - ignore it!
+	MOVB	rt_type.B[ECX], #RTT_ROUTER ;Yes - change it to a router entry
+20$:	MOVL	EAX, dct_ipnum.B[EDX]
+	MOVL	EDX, rtg_foreign.B[EBP]	;Get offset of the new entry we made
+	MOVB	rt_retry.B[EDX], AL	;Save state in case have RTT_LPENDING
+					;  entry
+	MOVL	rt_router.B[EDX], ECX	;Link it to the router entry
+	MOVL	EAX, rt_rtntail.B[ECX]
+	TESTL	EAX, EAX
+	JNE	22$.S
+	MOVL	rt_rtnhead.B[ECX], EDX
+	JMP	24$.S
+
+22$:	MOVL	rt_rtnnext.B[EAX], EDX
+24$:	MOVL	rt_rtntail.B[ECX], EDX
+	MOVL	rt_rtnprev.B[EDX], EAX
+	CMPB	rt_type.B[ECX], #RTT_LPENDING ;Is this a pending entry?
+	JNE	geta7			;No - return with original packet
+	MOVL	ECX, EDX		;Yes
+	MOVB	rt_type.B[EDX], #RTT_DPENDING
+	MOVL	rt_t2lcnt.B[EDX], #0
+	JMP	getapend
+.PAGE
+;Subroutine to setup ARP packet and pending routing table entry
+;	c{EAX} = IP address
+;	c{EDI} = Offset of PDB
+;	CALL	doarp
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  c{ECX} = Offset of pending routing table entry
+;	  c{EBX} = Offset of ARP packet to send
+
+doarp:	CMPL	pdb_iparppdb[EDI], #0.B	;Do we have an ARP protocol?
+	JE	4$.S			;No - fail
+	PUSHL	EAX			;Yes - save IP address
+	MOVB	BL, #RTT_LPENDING.B	;Routing table entry type
+	MOVB	BH, #1			;Forced update
+	CLRL	ECX
+	CLRL	EDX
+	CALL	rtupdate		;Put entry in the routing table
+	JC	10$.S			;If can't put entry in routing table
+	MOVL	rt_t2lcnt.B[ECX], #RTT2L_LPENDING ;Time-to-live value
+	MOVB	rt_retry.B[ECX], #RTRETRY_PENDING ;Retry count value
+	MOVL	rt_timeout.B[ECX], #pendtimeout ;Offset of timeout routine
+	CLRL	EAX
+	MOVL	npb_nextsnd.B[EBX], EAX
+	PUSHL	ECX			;Save offset of routing table entry
+	PUSHL	EDI			;Yes
+	MOVL	EDX, EDI
+	MOVL	EAX, pdb_ipaddr.B[EDI]	;Get our IP address
+	MOVL	ECX, 8.B[ESP]		;Get destination IP address
+	MOVL	EDI, pdb_iparppdb[EDI]	;Point to the ARP PDB
+	CALLI	pdb_arpgenreq.B[EDI]	;Yes - geneate the ARP request packet
+	POPL	EDI
+	JC	6$.S			;If error
+	POPL	ECX			;Restore offset of routing table entry
+	MOVL	rt_pkt.B[ECX], EBX	;Store offset of ARP packet buffer
+	POPL	EAX			;Restore IP address
+	RET				;Return to send the ARP packet
+
+;Here if no ARP protocol is specified
+
+4$:	MOVL	EAX, #ER_NNOPC
+	STC
+	RET
+
+;Here if can't get a packet buffer or can't set up the packet after we have
+;  created the pending routing table entry (if we had a packet, its already
+;  been given up when we get here)
+
+6$:	POPL	ECX			;Restore offset of routing table entry
+	XCHGL	[ESP], EAX		;Save error code, get IP address
+	MOVB	rt_type.B[ECX], #RTT_LOCAL ;Make routing table entry removeable
+	MOVB	DL, #1
+	CALL	xosipsRtRmvOne		;Remove the entry
+	JC	12$.S			;This must work!
+	POPL	EAX			;Restore error code
+
+	TESTL	EAX, EAX
+	JS	7$.S
+	INT3
+7$:
+
+	STC				;Indicate error
+8$:	RET
+
+;Here if can't create a pending routing table entry
+
+10$:	POPL	ECX			;Fix up the stack
+
+	TESTL	EAX, EAX
+	JS	11$.S
+	INT3
+11$:
+
+	STC
+	RET
+
+12$:	CRASH	CFRT			;[Can't Find Routing Table entry]
+.PAGE
+;Subroutine called when pending local routing table entry times out
+;	c{ECX} = Offset of routing table entry
+;	c{ESI} = Offset of SDB
+;	CALL	pendtimeout
+;	c{ECX} = Offset of next routing table entry
+;  ESI may be changed
+
+pendtimeout:
+	MOVL	EBX, rt_pkt.B[ECX]	;Get offset of packet buffer
+	CMPL	npb_nextsnd.B[EBX], #-1.B ;Is the packet still being output?
+	JNE	2$.S			;Yes - just time it out again!
+	DECB	rt_retry.B[ECX]		;No - have we done this enough?
+	JS	pendfail.S		;Yes
+	MOVL	npb_outdone.B[EBX], #4$	;No - reset the output done dispatch
+	MOVL	ESI, sdb_idb.B[ESI]
+	PUSHL	ECX
+	CALL	xosnetSendPkt##		;Output the packet again
+	POPL	ECX
+2$:	MOVL	rt_t2lcnt.B[ECX], #RTT2L_LPENDING ;Reset the time-out count
+	MOVL	ECX, rt_next.B[ECX]	;Continue
+4$:	RET
+.PAGE
+;Here with RTT_LPENDING entry whose retry count has run out.  We first call the
+;  output done routine for each packet in the packet hold list with an error
+;  of ER_NSNOD.  Then we give up the packet containing the ARP request.
+;  Finally, we give up the routing table entry.
+;	c{ECX} = Offset of routing table entry
+;	c{EDI} = Offset of PDB
+;	c{ESI} = Offset of SDB
+
+pendfail:
+	CALL	xosnetGiveBufr##	;Give up the ARP request packet
+	CALL	discard			;Discard any held packets
+pendlp:	CMPL	rt_rtnhead.B[ECX], #0.B	;Have any foreign or default entires
+					;  linked to this one?
+	JE	givefrc			;No - go on
+	MOVL	EDX, rt_rtnhead.B[ECX]	;Yes - unlink one
+	MOVL	EAX, rt_rtnnext.B[EDX]
+	MOVL	rt_rtnhead.B[ECX], EAX
+	TESTL	EAX, EAX
+	JNE	4$.S
+	MOVL	rt_rtntail.B[ECX], EAX
+4$:	PUSHL	ECX
+	MOVL	ECX, EDX
+	CLRL	EAX
+	MOVL	rt_rtnnext.B[ECX], EAX
+	MOVL	rt_rtnprev.B[ECX], EAX
+	CMPB	rt_type.B[ECX], #RTT_DPENDING ;Default entry?
+	JNE	failfrgn		;No - go on
+	MOVB	AL, rt_retry.B[ECX]	;Get the state
+	MOVL	EDX, pdb_ipdrthead.B[EDI]
+6$:	ORL	EDX, EDX
+	JE	failfrgn
+	CMPL	dct_ipnum.B[EDX], EAX
+	JA	nextdft.S
+	MOVL	EDX, dct_lnknext.B[EDX]
+	JMP	6$.S
+.PAGE
+;Here with another default router address to try
+;	c{ECX} = Offset of RTT_DPENDING entry
+
+nextdft:MOVB	AL, dct_ipnum.B[EDX]	;Update state
+	MOVB	rt_retry.B[ECX], AL
+	MOVL	EAX, dct_data.B[EDX]	;Get IP address for router
+	PUSHL	ECX
+	CALL	rtsearch		;Look for routing table entry
+	JE	6$.S			;Found one (must have snuck in!)
+	CALL	doarp			;Create new pending entry and make an
+	POPL	EDX			;  ARP packet
+	JC	failfrgn.S		;Give up if error here
+	MOVL	rt_router.B[EDX], ECX	;Link the new RTT_LPENDING entry to the
+	MOVL	rt_rtnhead.B[ECX], EDX	;  old RTT_DPENDING entry
+	MOVL	rt_rtntail.B[ECX], EDX
+	MOVL	npb_outdone.B[EBX], #ret002
+	MOVL	EAX, #-1
+	MOVL	EDX, EAX
+	CALL	xossnpSendPktHw##	;Send the ARP packet (ignore error - it
+	POPL	ECX			;  will be retried normally in this
+	JMP	pendlp			;  case)
+
+;Here if found a routing table entry for a default router above - it must
+;  have snuck in from someone else trying to access it - if its a LOCAL entry
+;  we use it and finish with this entry - if its a PENDING entry we link to
+;  it and let things finish up as they happen - if its anything else, someone
+;  is confused and we make this attempt fail
+
+6$:	POPL	EDX
+	MOVB	AL, rt_type.B[EDX]
+	CMPB	AL, #RTT_LOCAL		;Is this a local entry?
+	JE	7$.S			;Yes
+	CMPB	AL, #RTT_LPENDING	;No - is it a local pending entry?
+	JE	8$.S			;Yes - go on
+	JMP	failfrgn.S		;No - the sub-net mask must have
+					;  changed - fail this time!
+
+;Here with a local entry - we are finished now
+
+7$:	PUSHL	ECX
+	PUSHL	EDX
+	MOVL	EAX, rt_hwaddr+0.B[ECX]
+	MOVL	EDX, rt_hwaddr+4.B[ECX]
+	CALL	unhold			;Handle any held packets
+	POPL	ECX
+	POPL	EDX
+	MOVB	rt_type.B[ECX], #RTT_FOREIGN ;Update routing entry type
+8$:	MOVL	rt_router.B[EDX], ECX	;Link it to the RTT_LOCAL or
+	MOVL	EAX, rt_rtntail.B[ECX]	;  RTT_LPENDING entry
+	TESTL	EAX, EAX
+	JNE	10$.S
+	MOVL	rt_rtnhead.B[ECX], EDX
+	JMP	12$.S
+
+10$:	MOVL	rt_rtnnext.B[EAX], EDX
+12$:	MOVL	rt_rtntail.B[ECX], EDX
+	POPL	ECX
+	JMP	pendlp			;Continue
+.PAGE
+;Here to give up on the linked entry (either it was a simple foreign entry
+;  or it was a default entry with no more default routers to try)
+;	c{ECX} = Offset of RTT_DPENDINGor RTT_FOREIGN entry
+
+failfrgn:
+	CALL	discard			;Discard any held packets
+	CALL	givefrc			;Remove the routing table entry
+	POPL	ECX			;Restore offset of the RTT_LPENDING
+					;  entry
+	JMP	pendlp			;Continue
+
+;Here with all held packets discarded and any linked foreign or default
+;  entries handled
+
+givefrc:MOVB	rt_type.B[ECX], #RTT_LOCAL ;Change entry type so can remove it
+					;Fall into rttimeout to remove the
+					;  routing table entry
+
+;Subroutine called when normal routing table entry times out
+;	c{ECX} = Offset of routing table entry
+;	c{ESI} = Offset of SDB
+;	CALL	rttimeout
+;	c{ECX} = Offset of next routing table entry
+
+rttimeout::
+	MOVL	EAX, rt_ipaddr.B[ECX]	;Remove the entry
+	CMPB	rt_type.B[ECX], #RTT_ROUTER ;Is this a router entry?
+	JE	18$.S			;Yes
+	MOVB	DL, #0			;No
+	CALL	xosipsRtRmvOne		;Just remove it
+	JC	20$.S			;It must be there!
+	RET
+
+;Here if have router entry - we don't remove it directly but try to ping it
+;  first - the ping timeout routine will remove it if there is no reponse
+
+18$:	MOVB	DL, #2			;Get time-out value
+	MOVB	DH, #3			;Get number of retries
+	PUSHL	rt_next.B[ECX]
+	CALL	icmprouteping#
+	POPL	ECX
+	RET
+
+20$:	CRASH	RTCO			;[Routing Table Corrupted]
+.PAGE
+	.SBTTL	discard - Subroutine to discard held packets for routing table entry
+
+;Subroutine to discard held packets for a routing table entry
+;	c{ECX} = Offset of routing table entry
+;	CALL	discard
+
+discard:MOVL	EBX, rt_holdhead.B[ECX] ;Get first packet to discard
+	TESTL	EBX, EBX
+	JE	10$.S			;If none
+	PUSHL	ECX
+	PUSHL	EDI
+4$:	PUSHL	npb_nextsnd.B[EBX]	;Save next packet to discard
+	ORB	npb_sts.B[EBX], #NPS$NANA ;Indicate ARP failure for packet
+	MOVL	npb_nextsnd.B[EBX], #-1	;Indicate its not being output now
+	MOVL	EDI, npb_dcb.B[EBX]
+	MOVL	ECX, npb_outdone.B[EBX]
+	MOVL	npb_outdone.B[EBX], #0
+	MOVL	EAX, #ER_NSNOD		;Get error code
+	TESTL	ECX, ECX
+	JE	6$.S
+	CALLI	ECX			;Call output done routine for packet
+6$:	POPL	EBX			;Restore next packet to discard
+	TESTL	EBX, EBX		;Have any more?
+	JNE	4$.S			;Yes - continue
+	POPL	EDI			;No
+	POPL	ECX
+	CLRL	EAX
+	MOVL	rt_holdhead.B[ECX], EAX
+	MOVL	rt_holdtail.B[ECX], EAX
+10$:	RET
+.PAGE
+	.SBTTL	rtgood - Subroutine to mark route as good
+
+;Subroutine to mark route as good.  This subroutine is called whenever a
+;  known response is received from a node.  Its main purpose is to reset the
+;  time-to-live timer for the routing table entry to its maximum value.
+;	c{EAX} = IP address
+;	c{EDI} = Offset of PDB
+;	c{ESI} = Offset of SDB
+;	CALL	rtgood
+
+rtgood::CALL	rtsearch		;Find the routing table entry
+	JNE	4$.S			;If not there
+	ORB	rt_sts.B[ECX], #RTS$DATASEEN ;Remember have seen data
+	CMPB	rt_type.B[ECX], #RTT_LPENDING ;Should we do anything else here?
+	JAE	4$.S			;No
+	MOVL	rt_t2lcnt.B[ECX], #RTT2L_LOCAL ;Yes - reset the timer
+	CMPL	rt_router.B[ECX], #0.B	;Is it using a router?
+	JE	4$.S			;No - finished
+	MOVL	EAX, rt_router.B[ECX]	;Yes - update its time too
+	MOVL	rt_t2lcnt.B[EAX], #RTT2L_LOCAL
+4$:	RET
+.PAGE
+	.SBTTL	rtredirect - Subroutine to redirect a route
+
+;Subroutine to redirect a route - this subroutine converts an RTT_FOREIGN,
+;  RTT_FPENDING, or RTT_DPENDING entry to an RTT_FOREIGN or RTT_FPENDING entry
+;  linked to a different RTT_LOCAL or RTT_LPENDING entry.
+;	c{EAX} = Foreign IP address to redirect
+;	c{ECX} = New router IP address (must be local)
+;	c{EDI} = Offset of PDB
+;	c{ESI} = Offset of ICMP TPDB
+;	CALL	rtredirect
+
+$$$=!0
+FRM rtr_ipaddr  , 4t
+FRM rtr_rtipaddr, 4t
+FRM rtr_local   , 4t
+rtr_SIZE=!$$$
+
+rtredirect::
+	ENTER	rtr_SIZE, 0
+	MOVL	rtr_ipaddr.B[EBP], EAX	;Store IP address
+	MOVL	rtr_rtipaddr.B[EBP], ECX ;Store new router address
+	MOVL	EAX, ECX
+	CLRL	EBX			;Indicate no packet
+	CLRL	ECX
+	CALL	geta2			;Get hardware address for the new router
+	JC	16$.S			;If error
+	TESTL	EBX, EBX		;Do we need to send a packet now?
+	JE	2$.S			;No
+	PUSHL	ECX			;Yes
+	MOVL	npb_outdone.B[EBX], #ret002
+	CALL	xossnpSendPktHw##	;Send the packet
+	POPL	ECX
+2$:	MOVB	AL, rt_type.B[ECX]
+	CMPB	AL, #RTT_LPENDING 	;Is it a local address?
+	JE	8$.S
+	CMPB	AL, #RTT_ROUTER
+	JE	8$.S
+	CMPB	AL, #RTT_LOCAL
+	JNE	16$.S			;No - forget it!
+	MOVB	rt_type.B[ECX], #RTT_ROUTER ;OK
+8$:	INCL	tpdb_icmpcntredirect.B[ESI] ;Count the redirected connection
+	MOVL	rtr_local.B[EBP], ECX	;Save offset of local entry
+	MOVL	EAX, rtr_ipaddr.B[EBP]	;Find entry for address to redirect
+	CALL	rtsearch
+	JE	10$.S			;If found it
+	CLRL	EDX			;Note found - create one
+	CLRL	ECX			;Don't worry about the hardware address
+	MOVB	BL, #RTT_TEMP		;  since we don't really need it here!
+	MOVB	BH, #1
+	CALL	rtupdate
+	JC	16$.S
+10$:	CMPL	rt_router.B[ECX], #0.B	;Is it linked to a router now?
+	JE	12$.S			;No
+	CALL	rtunlkf			;Yes - unlink it
+12$:	MOVL	EDX, rtr_local.B[EBP]	;Get offset of entry for router
+	MOVB	AL, #RTT_FOREIGN	;Assume we have the router address now
+	CMPB	rt_type.B[EDX], #RTT_ROUTER ;Right?
+	JE	14$.S			;Yes
+	MOVB	AL, #RTT_FPENDING	;No
+14$:	MOVB	rt_type.B[ECX], AL
+	MOVL	rt_router.B[ECX], EDX
+	MOVL	EAX, rt_rtnhead.B[EDX]
+	MOVL	rt_rtnnext.B[ECX], EAX
+	MOVL	rt_rtnhead.B[EDX], ECX
+	CLRL	EAX
+	MOVL	rt_rtnprev.B[ECX], EAX
+16$:	LEAVE				;Finished
+	RET
+.PAGE
+	.SBTTL	Low level routing table manipulation routines
+
+	.SBTTL	rtupdate - Subroutine to update IP routing table if necessary
+
+;Subroutine to update IP routing table if necessary.  This subroutine handles
+;  updating of existing entries, simple creation of routing table entries,
+;  and conversion of RTT_LPENDING to RTT_LOCAL entries.  Generally, this
+;  subroutine handles all routing table entry creations and conversions that do not
+;  require generating an ARP request packet.  These conversions are handled by
+;  the rtgetaddr and rtredir subroutines, which call this subroutine.  This
+;  subroutine is also called by IPSCLS when an ARP packet is received.
+;	c{EAX}     = IP address
+;	c{EDX,ECX} = New hardware address
+;	c(BL)      = Entry type
+;	c(BH)      = Force update flag (0 = do not force, 1 = force)
+;	c{EDI}     = Offset of PDB
+;	c{ESI}     = Offset of SDB
+;	CALL	rtupdate
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  c{ECX} = Offset of routing table entry (may be 0 if update not forced)
+
+$$$=!0
+FRM rtupd_ipaddr, 4t		;IP address
+FRM rtupd_hwaddr, 8t		;Hardware address
+FRM             , 2t
+FRM rtupd_force , 1t		;1 to force update
+FRM rtupd_type  , 1t		;Entry type
+rtupd_SIZE=!$$$
+
+rtupdate::
+	ENTER	rtupd_SIZE, 0		;Set up our stack frame
+	MOVL	rtupd_ipaddr.B[EBP], EAX ;Store IP address
+	MOVL	rtupd_hwaddr+0.B[EBP], ECX ;Store hardware address
+	MOVL	rtupd_hwaddr+4.B[EBP], EDX
+	MOVL	rtupd_type.B[EBP], EBX	;Store type and force flag
+	CALL	rtsearch		;Search the routing table
+	JE	rtupfnd			;If found it
+	MOVL	EBX, pdb_ipndb[EDI]
+	MOVL	ECX, ndb_inuse.B[EBX]	;Not there - have room for another
+	CMPL	ECX, ndb_rtmax.B[EBX]	;  routing table entry?
+	JB	14$.S			;Yes
+	CMPB	rtupd_force.B[EBP], #0	;No - is this update forced?
+	JNE	6$.S			;Yes
+	CLRL	ECX			;No - nothing to do here
+rtupd3:	LEAVE
+	RET
+
+;Here if have a firm request to update the routing table and the routing table
+;  is full.  In this case (which should not happen very often), we scan the
+;  table and find the entry which was accessed least recently and remove it.
+
+6$:	PUSHL	EDX			;Save routing table hash index for
+					;  new entry
+	MOVL	EBX, ndb_rthead.B[EBX]	;Get first routing table entry
+	MOVL	EDX, #-1		;Initialize oldest entry time
+	CLRL	ECX			;Initialize oldest entry offset
+8$:	CMPB	rt_type.B[EBX], #RTT_PERM ;Can we remove this one?
+	JAE	10$.S			;No
+	CMPL	rt_timestamp.B[EBX], EDX ;Yes - is this one older?
+	JAE	10$.S			;No
+	MOVL	EDX, rt_timestamp.B[EBX] ;Yes - remember it
+	MOVL	ECX, EBX
+10$:	MOVL	EBX, rt_next.B[EBX]	;Advance to next entry
+	TESTL	EBX, EBX
+	JNE	8$.S			;Continue if more to check
+	JREGZ	ECX, 12$		;If we didn't find one we can remove
+	MOVL	EAX, rt_ipaddr.B[ECX]	;Get IP address for oldest entry
+	MOVB	DL, #1
+	CALL	xosipsRtRmvOne		;Remove the entry
+	JC	20$.S			;This should not fail!
+12$:	POPL	EDX
+14$:	PUSHL	ESI			;Get a QEL for a new routing table entry
+	CALL	knlGetQel##
+	MOVL	ECX, ESI
+	POPL	ESI
+	JC	rtupd3.S
+	MOVB	AL, pdb_netnum.B[EDI]	;Store PDB index in the table entry
+	MOVB	rt_pdbx.B[ECX], AL
+	MOVL	EBX, pdb_ipndb[EDI]
+	INCL	ndb_inuse.B[EBX]
+	MOVL	EAX, ndb_hash[EBX+EDX*4] ;Link into hash list
+	MOVL	ndb_hash[EBX+EDX*4], ECX
+	MOVL	[ECX], EAX
+	MOVL	EAX, ndb_rthead.B[EBX]	;Put at beginning of use list
+	MOVL	ndb_rthead.B[EBX], ECX
+	MOVL	rt_next.B[ECX], EAX
+	TESTL	EAX, EAX
+	JE	16$.S
+	MOVL	rt_prev.B[EAX], ECX
+	CLRL	EAX
+16$:	MOVL	rt_prev.B[ECX], EAX
+	MOVL	rt_rtnhead.B[ECX], EAX
+	MOVL	rt_rtntail.B[ECX], EAX
+	MOVL	rt_pkt.B[ECX], EAX
+	MOVB	rt_sts.B[ECX], AL
+	MOVB	rt_type.B[ECX], #RTT_TEMP
+	JMP	rtupd6
+
+20$:	CRASH	RTCO			;[Routing Table COrrupted
+.PAGE
+;Here if a routing table entry was found for this IP address
+
+rtupfnd:CMPB	rt_type.B[ECX], #RTT_LPENDING ;Is this a pending local entry?
+	JNE	rtupd4.S		;No - go on
+	CMPB	rtupd_type.B[EBP], #RTT_LPENDING ;Yes - trying to make a local
+						 ;  pending entry?
+	JE	rtupd3			;Yes - don't update anything
+	MOVL	EBX, rt_pkt.B[ECX]	;No - have a request packet?
+	TESTL	EBX, EBX
+	JE	2$.S			;No
+	CALL	xosnetGiveBufr##	;Yes - give it up
+	CLRL	EBX
+	MOVL	rt_pkt.B[ECX], EBX
+2$:	MOVL	EAX, rtupd_hwaddr+0.B[EBP]
+	MOVL	EDX, rtupd_hwaddr+4.B[EBP]
+	CALL	unhold			;Handle any held packets
+	CMPL	rt_rtnhead.B[ECX], #0.B	;Have any linked RTT_DPENDING or
+					; RTT_FPENDING entries?
+	JE	rtupd6.S		;No - go on
+	PUSHL	ECX			;Yes
+	MOVL	ECX, rt_rtnhead.B[ECX]
+4$:	CMPB	rt_type.B[ECX], #RTT_DPENDING ;Is this an RTT_DPENDING entry?
+	JE	5$.S			;Yes
+	CMPB	rt_type.B[ECX], #RTT_FPENDING ;No - is it an RTT_FPENDING entry?
+	JNE	6$.S			;No!
+5$:	MOVB	rt_type.B[ECX], #RTT_FOREIGN ;Yes - change it to RTT_FOREIGN
+	CALL	unhold			;Send its held packets
+	MOVL	ECX, rt_rtnnext.B[ECX]
+	TESTL	ECX, ECX
+	JNE	4$.S
+	POPL	ECX
+	JMP	rtupd6.S		;Continue
+
+6$:	CRASH	IRTE			;[Illegal Routing Table Entry]
+
+;Here if we did not have a pending local routing table entry
+
+rtupd4:	MOVB	AL, rt_type.B[ECX]	;Are we trying to change the type of
+	CMPB	AL, rtupd_type.B[EBP]	;  the table entry?
+	JE	rtupd6.S		;No - go on
+	CMPB	AL, #RTT_ROUTER		;Yes - is this a router entry?
+	JNE	10$.S			;No
+	CMPB	rtupd_type.B[EBP], #RTT_LOCAL ;Yes - trying to change it to a
+					      ;  local entry?
+	JNE	10$.S			;No
+	MOVB	rtupd_type.B[EBP], AL	;Yes - this is OK, but leave it a
+	JMP	rtupd6.S		;  router entry
+
+;Here if we are trying to change the type of a routing table entry.  This
+;  should never happen but is possible if the user changes the IP address or
+;  sub-net mask while the system is running.  (Note that if it is necessary
+;  to change either the IP address of sub-net mask on a running system, the
+;  routing cache should be flushed immediately afterwards!)  If we get here,
+;  we delete the old entry and return an error!
+
+10$:	CALL	rtrem4			;Remove the routing table entry
+	LEAVE
+	MOVL	EAX, #ER_NRTER
+	STC
+	RET				;And return
+.PAGE
+;Here with type OK
+
+rtupd6:	MOVL	EAX, rtupd_ipaddr.B[EBP] ;Store IP address in entry
+	MOVL	rt_ipaddr.B[ECX], EAX
+	MOVL	EAX, rtupd_hwaddr+0.B[EBP] ;Store hardware address in entry
+	MOVL	rt_hwaddr+0.B[ECX], EAX
+	MOVL	EAX, rtupd_hwaddr+4.B[EBP]
+	MOVL	rt_hwaddr+4.B[ECX], EAX
+	CLRL	EAX
+	MOVL	rt_router.B[ECX], EAX	;Clear router entry offset
+	MOVL	rt_usecnt.B[ECX], EAX	;Clear use count
+	MOVB	AL, rtupd_type.B[EBP]	;Get new entry type
+	CMPB	AL, #RTT_LOCAL		;Changing type to RTT_LOCAL?
+	JNE	4$.S			;No
+	CMPB	rt_type.B[ECX], #RTT_ROUTER ;Yes - is this a router now?
+	JE	6$.S			;Yes - leave the type along
+	CMPL	rt_rtnhead.B[ECX], #0.B	;No - is this really a router?
+	JE	4$.S			;No
+	MOVB	AL, #RTT_ROUTER		;Yes
+4$:	MOVB	rt_type.B[ECX], AL
+6$:	MOVL	EAX, knlTickTtl##	;Store time-stamp value
+	MOVL	rt_timestamp.B[ECX], EAX
+	CLC
+	LEAVE
+	RET
+.PAGE
+	.SBTTL	unhold - Subroutine to handle held packets
+
+;Subroutine to handle held packets
+;	c{EDX,EAX} = Remote hardware address
+;	c{ECX}     = Offset of routing table entry
+;	CALL	unhold
+
+unhold:	MOVL	EBX, rt_holdhead.B[ECX] ;No - get first packet to send
+	TESTL	EBX, EBX
+	JE	6$.S			;If none
+	PUSHL	ECX
+4$:	PUSHL	npb_nextsnd.B[EBX]	;Save next packet to send
+	MOVL	npb_nextsnd.B[EBX], #-1	;Indicate not being output now
+	MOVL	npb_holdrt.B[EBX], #0
+	PUSHL	EAX
+	PUSHL	EDX
+	CALL	xossnpSendPktHw##	;Send the packet
+	POPL	EDX
+	POPL	EAX
+	POPL	EBX			;Restore next packet to send
+	TESTL	EBX, EBX		;Have any more?
+	JNE	4$.S			;Yes - continue
+	POPL	ECX
+	CLRL	EAX			;No - finished here
+	MOVL	rt_holdhead.B[ECX], EAX
+	MOVL	rt_holdtail.B[ECX], EAX
+6$:	RET
+.PAGE
+	.SBTTL	rtremove - Subroutine to remove entry from the IP routing table
+
+;Subroutine to remove entry from the IP routing table.
+;	c{EAX} = IP address to remove (0 to clear routing table)
+;	c(DL)  = Purge flag (1 = purge (do not verify routers), 0 = remove)
+;	c{EDI} = Offset of PDB
+;	c{ESI} = Offset of SDB
+;	CALL	rtremove
+;	C:set = Not in routing table
+;	C:clr = Normal
+;	  c{EAX} = Number of entries removed
+;	  c{ECX} = Offset of next entry
+
+rtremove::
+	REQUIREFORK
+	TESTL	EAX, EAX		;Want to clear the routing table?
+	JNE	xosipsRtRmvOne.S	;No
+	CMPL	sdb_magic.B[ESI], #'SDB*' ;Yes - make sure have an SDB
+	JNE	14$.S
+	PUSHL	#0.B			;Initialize number to return
+	MOVL	EBX, pdb_ipndb[EDI]
+	MOVL	ECX, ndb_rthead.B[EBX]
+	JREGZ	ECX, 8$
+2$:	CMPB	rt_type.B[ECX], #RTT_PERM ;Should we remove this one?
+	JB	4$.S			;Yes
+	CMPB	rt_type.B[ECX], #RTT_PING ;Maybe
+	JAE	12$.S			;No
+4$:	MOVL	EAX, rt_ipaddr.B[ECX]	;Yes - Get IP address
+	PUSHL	ECX
+	CALL	xosipsRtRmvOne		;Try to remove the entry
+	JC	10$.S			;If error
+	POPL	EDX			;OK - discard saved entry offset
+	ADDL	[ESP], EAX		;Count it
+6$:	TESTL	ECX, ECX		;More to do?
+	JNE	2$.S			;Yes - continue
+8$:	POPL	EAX			;No - get number removed
+	RET				;Finished
+
+;Here if have entry which cannot be removed here
+
+10$:	POPL	ECX
+12$:	MOVL	ECX, rt_next.B[ECX]	;Advance to next entry
+	JMP	6$.S			;Continue
+
+14$:	CRASH	NSDB			;[Not an SDB]
+.PAGE
+	.SBTTL	xosipsRtRmvOne - Subroutine to remove single routing table entry
+
+;Subroutine to remove a single entry from the routing table (will also remove
+;  linked foreign entires when router entry removed)
+;	c{EAX} = IP address to remove (0 to clear routing table)
+;	c(DL)  = Purge flag (1 = purge (do not verify routers), 0 = remove)
+;	c{EDI} = Offset of PDB
+;	c{ESI} = Offset of SDB
+;	CALL	rtrmone
+;	C:set = Not in routing table
+;	C:clr = Normal
+;	  c{EAX} = Number of entries removed
+;	  c{ECX} = Offset of next entry
+
+xosipsRtRmvOne::
+	CMPL	sdb_magic.B[ESI], #'SDB*'
+	JNE	4$.S
+	PUSHL	EDX			;Save the purge flag
+	CALL	rtsearch		;Search for entry in the routing table
+	POPL	EDX
+	JNE	12$.S			;If not found
+rtrem4:	MOVB	AL, rt_type.B[ECX]
+	CMPB	AL, #RTT_LPENDING	;Can this entry be removed?
+	JAE	6$.S			;Maybe not
+	CMPB	AL, #RTT_FOREIGN	;Yes - is it a foreign entry
+	JE	rtremfor.S		;Yes
+2$:	CMPL	rt_rtnhead.B[ECX], #0.B	;No - does it have a node list?
+	JNE	rtremrtr.S		;Yes - its a router entry
+	JMP	rtremlcl.S		;No - its just a simple entry
+
+4$:	CRASH	NSDB			;[Not an SDB]
+
+;Here if have a pending entry
+
+6$:	CMPL	rt_holdhead.B[ECX], #0.B ;Is the entry holding any packets?
+	JNE	12$.S			;Yes - it cannot be removed!
+	CMPB	AL, #RTT_LPENDING	;No - is it a local pending entry?
+	JNE	rtremfor.S		;No - its a foreign entry
+	JMP	2$.S			;Yes
+
+;Here if entry not found or cannot be removed
+
+12$:	STC
+	RET
+
+;Here to give up a foreign entry.  This is an entry which specifies a foreign
+;  IP address and which is linked to a local entry which specifies the
+;  corresponding router IP and hardware addresses.  It is linked to the node
+;  list for the router so we must remove it from this list before giving up
+;  the entry.  Also, since a request to remove a foreign entry may indicate a
+;  problem with the associated router, after removing the entry we try to ping
+;  the router.  If it does not respond, we also remove its routing table entry
+;  (and all other associated foreign entries).  If a router fails, the first
+;  indication we get is usually a failure of communication with some foreign
+;  node which is using the router.  Often, this is the ONLY indication we get!
+;  If we do not verify the validity of the router in this case, we may not be
+;  able to route around it, especially if it is the current primary default
+;  router!
+
+rtremfor:
+	PUSHL	EBX			;Save offset of previous entry
+	CMPB	DL, #0			;Should we ping the router?
+	JNE	16$.S			;No
+	PUSHL	ECX			;Yes
+	MOVL	ECX, rt_router.B[ECX]
+	CMPB	rt_type.B[ECX], #RTT_LPENDING ;Is it a pending entry?
+	JAE	14$.S			;Yes - don't bother pinging
+	MOVL	EAX, rt_ipaddr.B[ECX]	;No - ping the router
+	CALL	icmprouteping#
+14$:	POPL	ECX
+16$:	CALL	rtunlkf			;Unlink the foreign entry from its
+					;  router entry
+	POPL	EBX			;Restore offset of previous entry
+					;Fall into rtremlclto give up this
+					;  entry
+
+;Here to give up a local routing table entry
+
+rtremlcl:
+	PUSHL	rt_next.B[ECX]		;Save offset of next entry
+	CALL	rtunlnk2		;Unlink the block from the lists
+	PUSHL	ESI
+	MOVL	ESI, ECX		;Give it up
+	CALL	knlGiveQel##
+	POPL	ESI
+	MOVL	EAX, pdb_ipndb[EDI]
+	DECL	ndb_inuse.B[EAX]
+	POPL	ECX			;Restore offset of next entry
+	CLRL	EAX			;Clear C, return 1
+	INCL	EAX
+	RET
+
+;Here to give up the routing table entry for a router - we first give up all
+;  of the entries in the router's node list
+
+rtremrtr:
+	PUSHL	#1.B
+	PUSHL	EBX
+20$:	PUSHL	ECX
+	MOVL	ECX, rt_rtnhead.B[ECX]	;Get next node which uses the router
+	MOVL	EAX, rt_ipaddr.B[ECX]
+	MOVB	DL, #1
+	CALL	xosipsRtRmvOne		;Remove its entry
+	JC	22$.S			;It must be there!
+	POPL	ECX
+	INCL	4.B[ESP]		;Count it
+	CMPL	rt_rtnhead.B[ECX], #0.B	;Have any more nodes?
+	JNE	20$.S			;Yes - continue
+	POPL	EBX			;No - almost finished
+	CALL	rtremlcl		;Give up the router entry
+	POPL	EAX			;Get value to return
+	RET
+
+22$:	CRASH	RTCO			;[Routing Table COrrupted
+.PAGE
+	.SBTTL	rtunlkf - Subroutine to unlink a foreign routing table entry
+
+;Subroutine to unlink a foreign routing table entry from its router entry
+;	c{ECX} = Offset of foreign entry
+;	CALL	rtunlkf
+
+rtunlkf:
+	MOVL	EBX, rt_router.B[ECX]
+	MOVL	EAX, rt_rtnprev.B[ECX]
+	MOVL	EDX, rt_rtnnext.B[ECX]
+	TESTL	EAX, EAX		;Have previous entry?
+	JE	10$.S			;No
+	MOVL	rt_rtnnext.B[EAX], EDX	;Yes
+	JMP	12$.S
+
+10$:	MOVL	rt_rtnhead.B[EBX], EDX
+12$:	TESTL	EDX, EDX		;Have next entry?
+	JE	14$.S
+	MOVL	rt_rtnprev.B[EDX], EAX
+	JMP	16$.S
+
+14$:	MOVL	rt_rtntail.B[EBX], EAX
+16$:	CLRL	EAX
+	MOVL	rt_router.B[ECX], EAX
+	RET
+.PAGE
+	.SBTTL	rtsearch - Subroutine to search for routing table entry
+
+;Subroutine to search for routing table entry
+;	c{EAX} = IP address to search for
+;	c{EDI} = Offset of PDB
+;	c{ESI} = Offset of SDB
+;	CALL	rtsearch
+;	c{EDX} = Routing table hash index for entry
+;	Z:set = Entry found
+;	  c{ECX} = Offset of routing table entry
+;	  c{EBX} = Offset of previous entry in hash list
+;	Z:clr = Not found
+
+rtsearch:
+	PUSHL	EAX			;Save actual address
+	PUSHL	EAX
+	MOVZBL	EDX, AL			;Calculate hash index
+	XORB	DL, AH
+	SHRL	EAX, #16t
+	XORB	DL, AL
+	XORB	DL, AH
+	POPL	EAX
+	MOVL	EBX, pdb_ipndb[EDI]
+	LEAL	EBX, ndb_hash[EBX+EDX*4]
+4$:	MOVL	ECX, [EBX]		;Get next block
+	JREGZ	ECX, 6$			;If no more
+	CMPL	rt_ipaddr.B[ECX], EAX	;Is it this one?
+	JE	8$.S			;Yes - return with Z set
+	MOVL	EBX, ECX		;No - advance to next
+	JMP	4$.S			;Continue
+
+6$:	INCL	ECX			;Not found - clear Z
+8$:	POPL	EAX			;Restore actual address
+	RET
+.PAGE
+	.SBTTL	rtunlink - Subroutine to remove routing table entry
+
+;Subroutine to remove routing table entry (does NOT give up the memory block)
+;	c{ECX} = Offset of entry
+;	c{EDI} = Offset of PDB
+;	CALL	rtunlink
+
+rtunlink:
+	MOVL	EAX, rt_ipaddr.B[ECX]	;Calculate its hash index
+	MOVZBL	EDX, AL
+	XORB	DL, AH
+	SHRL	EAX, #16t
+	XORB	DL, AL
+	XORB	DL, AH
+	MOVL	EBX, pdb_ipndb[EDI]
+	LEAL	EBX, ndb_hash[EBX+EDX*4]
+4$:	CMPL	[EBX], ECX		;Find previous block
+	JE	rtunlnk2.S		;OK - go unlink everything
+	MOVL	EBX, [EBX]		;Advance to next
+	TESTL	EBX, EBX
+	JNE	4$.S
+	CRASH	BRTH			;[Bad Routing Table Hash list]
+
+	.SBTTL	rtunlnk2 - Subroutine to unlink block from routing table lists
+
+;Subroutine to unlink block from the routing table lists
+;	c{ECX} = Offset of block
+;	c{EBX} = Offset of previous block in hash list (points to hash table
+;		   entry if this is the first block in the hash list)
+;	c{EDI} = Offset of PDB
+;	CALL	rtunlnk2
+
+rtunlnk2:
+	MOVL	EDX, [ECX]		;Remove block from its hash list
+	MOVL	[EBX], EDX
+	MOVL	EBX, rt_next.B[ECX]	;Remove block from the routing table
+	MOVL	EAX, rt_prev.B[ECX]	;  list
+	TESTL	EAX, EAX
+	JE	8$.S
+	MOVL	rt_next.B[EAX], EBX
+	JMP	10$.S
+
+8$:	MOVL	EDX, pdb_ipndb[EDI]
+	MOVL	ndb_rthead.B[EDX], EBX
+10$:	TESTL	EBX, EBX
+	JE	12$.S
+	MOVL	rt_prev.B[EBX], EAX
+12$:	RET
+.PAGE
+	.SBTTL	routeoas - Once-a-second routine for routing
+
+;Once-a-second routine for routing
+
+routeoas::
+	MOVL	EDI, firstndb#		;Get offset of first NDB in system
+	TESTL	EDI, EDI
+	JE	14$.S			;If none
+4$:	TOFORK
+	MOVL	ECX, ndb_rthead.B[EDI]	;Get offset of first routing table entry
+	JREGZ	ECX, 12$		;If none
+6$:	CMPL	rt_t2lcnt.B[ECX], #0.B	;Are we timing this one?
+	JE	8$.S			;No
+	DECL	rt_t2lcnt.B[ECX]	;Yes - count it down
+	JE	20$.S			;If it timed-out
+8$:	MOVL	ECX, rt_next.B[ECX]	;Advance to next routing table entry
+10$:	TESTL	ECX, ECX		;More?
+	JNE	6$.S			;Yes - continue
+12$:	FROMFORK
+	MOVL	EDI, [EDI]		;No - advance to next NDB
+	TESTL	EDI, EDI		;More?
+	JNE	4$.S			;Yes - continue
+14$:	JMP	dnsoas#			;No - all done here - now do the DNS
+					;  once-a-second stuff
+
+;Here with routing table entry which has timed-out
+
+20$:	MOVZBL	EAX, rt_pdbx.B[ECX]
+	PUSHL	EDI
+	MOVL	EDI, ndb_pdb-4.B[EDI+EAX*4]
+	MOVL	ESI, pdb_sdb.B[EDI]
+	CALLI	rt_timeout.B[ECX]	;Call the time-out routine for the entry
+	POPL	EDI
+	JMP	10$.S			;Continue
+
+	LKEEND

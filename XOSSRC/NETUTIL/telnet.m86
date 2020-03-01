@@ -1,0 +1,2594 @@
+	.TITLE	TELNET - Simple TELNET client for XOS
+
+;++++
+; This software is in the public domain.  It may be freely copied and used
+; for whatever purpose you see fit, including commerical uses.  Anyone
+; modifying this software may claim ownership of the modifications, but not
+; the complete derived code.  It would be appreciated if the authors were
+; told what this software is being used for, but this is not a requirement.
+
+;   THIS SOFTWARE IS PROVIDED BY THE AUTHORS "AS IS" AND ANY EXPRESS OR
+;   IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
+;   OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+;   IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+;   INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+;   BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS
+;   OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+;   ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR
+;   TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
+;   USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+;----
+
+	.PROC	80386
+
+	.INCLUD	XOSINC:\XMAC\STDIO.PAR
+	.INCLUD XOSINC:\XMAC\PROCARG.PAR
+	.INCLUD	XOSINC:\XMAC\CTYPE.PAR
+	.INCLUD	XOSINC:\XMAC\XOS.PAR
+	.INCLUD	XOSINC:\XMAC\XOSX.PAR
+	.INCLUD	XOSINC:\XMAC\XOSERR.PAR
+	.INCLUD	XOSINC:\XMAC\XOSTIME.PAR
+	.INCLUD	XOSINC:\XMAC\XOSNET.PAR
+	.INCLUD	XOSINC:\XMAC\XOSXNET.PAR
+	.INCLUD XOSINC:\XMAC\XOSTRM.PAR
+	.INCLUD	XOSINC:\XMAC\XOSDDSP.PAR
+
+	.STDSEGS
+
+scrnbase =!100000h	;Base offset for mapped screen memory
+
+TCPOSIZE =!1200t	;Size of the TCP data output buffers
+TCPCSIZE =!800t		;Size of the TCP command output buffer
+TRMBSIZE =!1600t	;Size of the terminal output buffer
+SUBMAX   =!64t		;Maximum length for subnegotiation data
+
+VECT_TCPIN=!24t		;TCP input ready software interrupt
+VECT_TRM  =!26t		;TRM input ready software interrupt
+
+;Define values for tcpstate
+
+TCPS_NORMAL =!0t	;Normal character is next
+TCPS_CMDNEXT=!1t	;Command byte is next
+TCPS_SUBNEG =!2t	;Sub-negotiation option byte is next
+TCPS_SUBDATA=!3t	;Sub-negotiation data byte is next
+TCPS_SUBIAC =!4t	;TNC_IAC seen during sub-negotiation 
+TCPS_OPTWILL=!5t	;TNC_WILL option byte is next
+TCPS_OPTWONT=!6t	;TNC_WONT option byte is next
+TCPS_OPTDO  =!7t	;TNC_DO option byte is next
+TCPS_OPTDONT=!8t	;TNC_DONT option byte is next
+
+;Define values for trmostate
+
+TO_NORMAL=!0t		;Normal output byte next
+TO_FUNC  =!1t		;DDSP function byte is next
+TO_12ARG =!2t		;12 DDSP arguments are next
+TO_11ARG =!3t		;11 DDSP arguments are next
+TO_10ARG =!4t		;10 DDSP arguments are next
+TO_9ARG  =!5t		;9 DDSP arguments are next
+TO_8ARG  =!6t		;8 DDSP arguments are next
+TO_7ARG  =!7t		;7 DDSP arguments are next
+TO_6ARG  =!8t		;6 DDSP arguments are next
+TO_5ARG  =!9t		;5 DDSP arguments are next
+TO_4ARG  =!10t		;4 DDSP arguments are next
+TO_3ARG  =!11t		;3 DDSP arguments are next
+TO_2ARG  =!12t		;2 DDSP arguments are next
+TO_1ARG  =!13t		;1 DDSP argument is next
+TO_IMGC  =!14t		;Outputting image characters
+TO_IMGCA =!15t		;Outputting image characters and attributes
+
+	.PSECT	_ODATA_p
+
+argmsect:.LONG	0
+argpntr: .LONG  0, 0
+
+onhelp1: .ASCIZ "?"
+onhelp2: .ASCIZ "H"
+onhelp3: .ASCIZ "HEL"
+onhelp4: .ASCIZ "HELP"
+onport1: .ASCIZ "POR"
+onport2: .ASCIZ "PORT"
+ondebug1:.ASCIZ "DEB"
+ondebug2:.ASCIZ "DEBUG"
+onnodeb1:.ASCIZ "NOD"
+onnodeb2:.ASCIZ "NODEB"
+onnodeb3:.ASCIZ "NODEBUG"
+ontrm:   .ASCIZ "TRM"
+onxos:   .ASCIZ "XOS"
+onansi1: .ASCIZ "ANS"
+onansi2: .ASCIZ "ANSI"
+
+options:.LONG	onhelp1 , 0                  , 0, opthelp , 0
+	.LONG	onhelp2 , 0                  , 0, opthelp , 0
+	.LONG	onhelp3 , 0                  , 0, opthelp , 0
+	.LONG	onhelp4 , 0                  , 0, opthelp , 0
+	.LONG	onport1 , ASF$NVAL|ASF$VALREQ, 0, optport , 0
+	.LONG	onport2 , ASF$NVAL|ASF$VALREQ, 0, optport , 0
+	.LONG	ondebug1, ASF$LSVAL          , 0, optdebug, 2
+	.LONG	ondebug2, ASF$LSVAL          , 0, optdebug, 2
+	.LONG	onnodeb1, 0                  , 0, optdebug, 0
+	.LONG	onnodeb2, 0                  , 0, optdebug, 0
+	.LONG	onnodeb3, 0                  , 0, optdebug, 0
+	.LONG	ontrm   , ASF$LSVAL          , 0, opttrm  , 0
+	.LONG	onxos   , 0                  , 0, optxos  , 0
+	.LONG	onansi1 , 0                  , 0, optxos  , -1
+	.LONG	onansi2 , 0                  , 0, optxos  , -1
+	.LONG	0
+
+	.SBTTL	Start of program
+
+	.PSECT	_OTEXT_p
+
+mainalt::
+	PUSHL	DS			;Change our process name
+	PUSHL	#prgname
+	CALLF	svcSysSetPName#
+	MOVL	EAX, 4.B[ESP]		;Get offset of argument msect
+	MOVL	argmsect, EAX
+	MOVL	ESI, 8.B[EAX]		;Point to command tail
+	CLRL	EAX
+	CLD
+2$:	LODSB	[ESI]			;Skip any leading whitespace
+	CMPB	AL, #0
+	JE	6$.S
+	TESTB	_chrtbl#[EAX], #CT$SPACE
+	JNE	2$.S
+4$:	LODSB	[ESI]			;Skip first atom
+	CMPB	AL, #0
+	JE	6$.S
+	TESTB	_chrtbl#[EAX], #CT$SPACE
+	JE	4$.S
+	MOVL	argpntr, ESI		;Store argument offset for procarg
+	PUSHL	#0.B			;No default extension for indirect file
+	PUSHL	#0.B			;No next line function
+	PUSHL	#0.B			;Error function
+	PUSHL	#havehost		;Function called for non-keyword args
+	PUSHL	#0.B			;Offset of keyword table
+	PUSHL	#options		;Offset of option table
+	PUSHL	#PAF$INDIRECT|PAF$EATQUOTE ;Flag bits
+	PUSHL	#argpntr		;Offset of arg string pointer
+	CALL	procarg#		;Process arguments
+	ADDL	ESP, #32t.B
+	PUSHL	DS			;Give up the argument data
+	PUSHL	argmsect
+	PUSHL	#0.B
+	PUSHL	#0.B
+	CALLF	svcMemChange#
+
+;Here with all command line processing done
+
+6$:	MOVL	EBX, #notodomsg		;Was a host specified?
+	CMPL	devnamep, #0.B
+	JE	failner.S		;No - fail
+	PUSHL	#O$PHYS			;Yes - check the device to make sure it
+	PUSHL	DS			;  is a TCP device
+	PUSHL	devnamep
+	PUSHL	DS
+	PUSHL	#devpparms
+	CALLF	svcIoDevParm#
+	TESTL	EAX, EAX
+	JNS	24$.S
+22$:	MOVL	EBX, #tcperrmsg
+	JMP	fail.S
+
+24$:	CMPL	devclass+0, #'TCP'	;Is this really a TCP device?
+	JE	havedev.S		;Yes
+26$:	MOVL	EBX, #nottcpmsg		;No
+failner:CLRL	EAX
+fail:	PUSHL	EAX
+	PUSHL	EBX
+	MOVL	EBX, #fmsg1
+	CALL	outstr
+	POPL	EBX
+	CALL	outstr	
+	POPL	ECX			;Restore error code
+	JREGZ	ECX, 30$
+	PUSHL	trmhndl
+	PUSHL	DS
+	MOVL	EBX, #fmsg2
+	CALL	outstr
+	PUSHL	ECX
+	PUSHL	#3.B
+	PUSHL	DS
+	MOVL	EBX, #devname
+	PUSHL	EBX
+	CALLF	svcSysErrMsg#
+done:	CALL	outstr
+30$:	CALL	outcrlf
+	PUSHL	#0.B
+	CALLF	svcSchExit#
+.PAGE
+;Here when have a TCP device to use
+
+havedev::
+	PUSHL	#VECT_TRM.B		;Set the terminal input ready vector
+	PUSHL	#84h+{VT_XOSS<8t}
+	PUSHL	CS
+	PUSHL	#trmready
+	CALLF	svcSchSetVector#
+	TESTL	EAX, EAX
+	JS	6$.S
+	PUSHL	#VECT_TCPIN.B		;Set the TCP input ready vector
+	PUSHL	#84h+{VT_XOSS<8t}
+	PUSHL	CS
+	PUSHL	#tcpready
+	CALLF	svcSchSetVector#
+	TESTL	EAX, EAX
+	JNS	10$.S
+6$:	MOVL	EBX, #sivfmsg
+	JMP	failner
+
+10$:	PUSHL	#O$IN|O$OUT|O$PARTIAL	;Now open the device
+	PUSHL	DS
+	PUSHL	devnamep
+	PUSHL	DS
+	PUSHL	#openparms
+	CALLF	svcIoOpen#
+	TESTL	EAX, EAX
+	JNS	devopen.S
+12$:	MOVL	EBX, #tcperrmsg
+	JMP	fail
+
+devopen::
+	MOVL	tcpiqab+qab_handle, EAX	;Store the handle
+	PUSHL	#VECT_CNTC
+	PUSHL	#87h+{VT_XOSS<8t}
+	PUSHL	CS
+	PUSHL	#havecc
+	CALLF	svcSchSetVector#
+	PUSHL	trmhndl
+	PUSHL	#0.B
+	PUSHL	#0.B
+	PUSHL	#0.B
+	PUSHL	DS
+	PUSHL	#trminpparms
+	CALLF	svcIoInBlockP#
+	MOVL	EBX, #trminpper
+	TESTL	EAX, EAX
+	JS	fail
+	PUSHL	trmhndl
+	PUSHL	#0.B
+	PUSHL	#0.B
+	PUSHL	#0.B
+	PUSHL	DS
+	PUSHL	#trmoutparms
+	CALLF	svcIoOutBlockP#
+	TESTL	EAX, EAX
+	JNS	16$.S
+	MOVL	EBX, #trmoutper
+	JMP	fail
+
+16$:	CALL	tcpinput		;Start TCP input
+	MOVL	ESI, #initmsg		;Output initial TELNET commands
+	MOVL	ECX, #INITMSG
+	CALL	puttcpstr
+	CALL	dotcpoutput
+	JMP	ready
+.PAGE
+;Function called for command line argument
+
+havehost:
+	MOVL	EBX, #tomnymsg
+	CMPL	devnamep, #0.B		;Already have a host?
+	JNE	failner			;Yes - fail
+	PUSHL	ESI			;No
+	MOVL	ESI, 8.B[ESP]		;Get offset of argument string
+	PUSHL	DS
+	POPL	ES
+	CLD
+	MOVL	EDI, #devname		;Copy the name
+	MOVL	devnamep, EDI
+4$:	LODSB	[ESI]
+	CMPB	AL, #':'		;Is this a colon?
+	JNE	8$.S			;No
+	CMPB	[ESI], #':'		;Yes - is next a colon too?
+	JNE	6$.S			;No
+	MOVB	havenode, #1		;Yes - remember have node
+	STOSB	[EDI]
+	LODSB	[ESI]
+	JMP	8$.S
+
+6$:	MOVB	havename, #1		;Remember have device name
+8$:	STOSB	[EDI]
+	TESTB	AL, AL
+	JNE	4$.S
+	CMPB	havenode, #0		;Did we see a double colon?
+	JNE	10$.S			;Yes
+	CMPB	-2.B[ESI], #':'		;No - did it end with a single colon?
+	JE	10$.S			;Yes
+	MOVL	-1.B[EDI], #'::'	;No - add a double colon to the end
+10$:	CMPB	havename, #0		;Did we see a device name?
+	JNE	12$.S			;Yes
+	ADDL	devnamep, #dftname-devname.B ;No - use default name
+12$:	POPL	ESI
+rtnone:	CLRL	EAX
+	INCL	EAX
+ret004:	RET
+.PAGE
+;Function called for the PORT option
+
+optport:MOVL	EBX, 4.B[ESP]		;Get offset of argument string
+	MOVL	EBX, argdata_value.B[EBX] ;Get port number
+	MOVW	rmtport, BX		;Store it
+	JMP	rtnone.S
+.PAGE
+;Function called for the {NO}DEBUG option
+
+optdebug:
+	MOVL	EBX, 4.B[ESP]
+	MOVB	AL, argdata_data.B[EBX]
+	MOVB	debuglvl, AL
+	BTL	argdata_flags.B[EBX], #ADF%LSVAL ;File spec given?
+	JC	2$.S			;Yes
+	MOVL	EAX, #DH_STDTRM		;No - use his terminal
+	JMP	4$.S
+
+;Here if a file spec was given
+
+2$:	PUSHL	#O$CREATE|O$TRUNCA|O$OUT ;Open the debug output file
+	PUSHL	DS
+	PUSHL	argdata_value.B[EBX]
+	PUSHL	#0.B
+	PUSHL	#0.B
+	CALLF	svcIoOpen#
+	MOVL	EBX, #debgemsg
+	TESTL	EAX, EAX
+	JS	fail
+4$:	MOVL	debughndl, EAX
+	CLRL	EAX
+	INCL	EAX
+	RET
+
+;Function called for the TRM option
+
+opttrm:	MOVL	EBX, 4.B[ESP]
+	MOVB	AL, argdata_data.B[EBX]
+	MOVB	debuglvl, AL
+	BTL	argdata_flags.B[EBX], #ADF%LSVAL ;File spec given?
+	JC	6$.S			;Yes
+	MOVL	EAX, #DH_STDTRM		;No - use his terminal
+	JMP	8$.S
+
+;Here if a file spec was given
+
+6$:	PUSHL	#O$CREATE|O$TRUNCA|O$OUT|O$IN ;Open the terminal device
+	PUSHL	DS
+	PUSHL	argdata_value.B[EBX]
+	PUSHL	#0.B
+	PUSHL	#0.B
+	CALLF	svcIoOpen#
+	MOVL	EBX, #trmemsg
+	TESTL	EAX, EAX
+	JS	fail
+8$:	MOVL	trmhndl, EAX
+10$:	CLRL	EAX
+	INCL	EAX
+	RET
+
+;Function called for the {NO}XOS option
+
+optxos:	MOVL	EBX, 4.B[ESP]
+	MOVB	AL, argdata_data.B[EBX]
+	MOVB	lcltbl+TNO_XOSMODE, AL
+	MOVB	rmttbl+TNO_XOSMODE, AL
+	JMP	10$.S
+
+;Function called for the HELP option
+
+opthelp:MOVL	EBX, #helpmsg
+	CALL	outstr
+	PUSHL	#0.B
+	CALLF	svcSchExit#
+.PAGE
+	.SBTTL	Main program loop
+
+	.PSECT	_TEXT_p
+
+;Here with all initialization complete
+
+ready::
+
+;	CALLF	svcMemChange#		;Give up the once-only code
+
+;;;;;;	PUSHL	#0.B
+;;;;;;	PUSHL	#0.B
+;;;;;;	PUSHL	#XT_SECOND/10t
+;;;;;;	CALLF	svcSchSuspend#
+
+	PUSHL	#0.B			;Set software interrupt level to 0
+	CALLF	svcSchSetLevel#	;  to allow interrupts
+mainloop::
+	PUSHL	DS
+	POPL	ES
+4$:	PUSHL	#0.B			;Wait for interrupt
+	PUSHL	#0.B
+	PUSHL	#-1.B
+	CALLF	svcSchSuspend#
+	JMP	4$.S
+.PAGE
+;Terminal input ready software interrupt routine
+
+trmready::
+	PUSHAL
+	CALL	trmsrv
+	POPAL
+	CALLF	svcSchDismiss#
+
+2$:	RET
+
+;Subroutine to process terminal input - this is a called as a subroutine from
+;  the terminal input ready interrupt service routine so that it can also be
+;  called from the TCP input ready interrupt service routine so that continuous
+;  TCP input will not block terminal input
+
+trmsrv:	TESTB	trmqab+qab_status+1, #QSTS$DONE>8t ;Really have input now?
+	JE	2$.S			;No - false alarm!
+	MOVL	trmipnt, #trmibuf	;Yes - initialize input pointer
+	CMPB	xosmdkb, #0		;Doing XOS mode keyboard handling?
+	JE	trmansi			;No
+	SHRL	trmqab+qab_amount, #2	;Yes - divide count by 4 (since all
+					;  characters are stored as 4 bytes)
+trmloop:DECL	trmqab+qab_amount	;Have another character?
+	JS	trmdone.S		;No
+	MOVL	EBX, trmipnt		;Yes
+	MOVL	EDX, [EBX]
+	MOVZBL	EAX, DH			;Get scan code
+	TESTL	EDX, #{SPC3$LFTALT|SPC3$RHTALT}<16t ;Either alt key pressed?
+	JE	102$.S			;No
+	CMPB	AL, #ISC_PAUSE		;Yes - pause key?
+	JE	local			;Yes - this is special
+102$:	TESTL	EDX, EDX		;Release code?
+	JNS	104$.S			;No
+	ORB	AL, #80h		;Yes
+104$:	ADDL	trmipnt, #4t.B
+	CMPB	flowctl, #0		;Is flow control enabled?
+	JE	4$.S			;No - go on
+	TESTL	EDX, #{SPC3$RHTCTL|SPC3$LFTCTL}<16t ;Yes - either control key
+						    ;  pressed?
+	JE	4$.S			;No
+	CMPB	AL, #4Dh		;Yes - control-Q?
+	JE	havecq			;Yes
+	CMPB	AL, #5Bh		;No - control-S?
+	JE	havecs			;Yes
+4$:	CMPL	tcpopnt, #tcpobuf+TCPOSIZE ;Is the output buffer full?
+	JB	6$.S			;No
+	PUSHL	EAX			;Yes - save character
+	CALL	dotcpoutput		;Do TCP output
+	POPL	EAX
+6$:	MOVL	EBX, tcpopnt		;Store character for TCP output
+	MOVB	[EBX], AL
+	INCL	tcpopnt
+	JMP	trmloop			;Continue
+
+;Here if cannot accept an input character
+
+8$:	NOP			;DO SOMETHING GOOD (LIKE RING THE BELL) HERE!
+	JMP	trmloop
+
+;Here with all input characters processed
+
+trmdone:CALL	dotcpoutput		;Do TCP output if need to
+	MOVB	trmqab+qab_vector, #0	;Queue terminal input request
+	CALL	restarttrm
+	MOVB	trmqab+qab_vector, #VECT_TRM
+	JMP	trmsrv
+.PAGE
+;Here if not doing XOS mode keyboard encoding
+
+trmansi:DECL	trmqab+qab_amount	;Have another character?
+	JS	trmdone.S		;No
+	MOVL	EBX, trmipnt		;Yes
+	MOVB	AL, [EBX]
+	INCL	trmipnt
+
+;NEED TO CHECK FOR BINARY MODE HERE!
+
+	CMPB	AL, #0			;Null?
+	JE	trmansi.S		;Yes - ignore it
+	CMPB	flowctl, #0		;Is flow control enabled?
+	JE	4$.S			;No - go on
+	CMPB	AL, #'Q'-40h		;Yes - control-Q
+	JE	havecq.S		;Yes
+	CMPB	AL, #'S'-40h		;No - control-S
+	JE	havecs.S		;Yes
+4$:	CMPL	tcpopnt, #tcpobuf+TCPOSIZE ;Is the output buffer full?
+	JB	6$.S			;No
+	PUSHL	EAX			;Yes - save character
+	CALL	dotcpoutput		;Do TCP output
+	POPL	EAX
+6$:	MOVL	EBX, tcpopnt		;Store character for TCP output
+	MOVB	[EBX], AL
+	INCL	tcpopnt
+	JMP	trmansi.S		;Continue
+.PAGE
+havecc:	CALLF	svcSchCtlCDone#
+
+;Here for local escape character
+
+local:	MOVL	EBX, #trmmsg
+	JMP	done
+.PAGE
+;Here if flow control is enabled and have a control-Q character
+
+havecq:	CALL	resume			;Resume terminal output
+	JMP	trmloop
+
+;Here if flow control is enabled and have a control-S character
+
+havecs:	MOVB	flowstop, #1		;Indicate output is stopped
+	JMP	trmloop
+.PAGE
+;Subroutine to resume output which has been held - this routines outputs any
+;  terminal output which has been input from TCP but has not been output yet
+;  and then queues a TCP input
+
+resume:	CMPB	flowstop, #0		;Is output stopped now?
+	JE	ret008.S		;No
+	MOVB	flowstop, #0		;Yes - not stopped now
+	CALL	tcpinput		;Start TCP input if need to
+	JMP	trmoutput		;Do terminal output if need to
+.PAGE
+restarttrm:
+	CLRL	EAX
+	MOVW	trmqab+qab_status, AX
+	MOVL	trmqab+qab_amount, EAX
+	PUSHL	DS
+	PUSHL	#trmqab
+	CALLF	svcIoQueue#
+	TESTL	EAX, EAX
+	JS	6$.S
+ret008:	RET
+
+;Here if error starting terminal input
+
+6$:	MOVL	EBX, #trmfmsg
+	CALL	outstr
+	PUSHL	#1.B
+	CALLF	svcSchExit#
+.PAGE
+	.SBTTL	dotcpoutput - Subroutine to do TCP output
+
+;Subroutine to do TCP output - this is a blocking routine which does not
+;  return until all necessary TCP output is complete
+;	CALL	dotcpoutput
+
+dotcpoutput:
+	CMPL	tcpcpnt, #tcpcbuf	;Have any command output to do?
+	JE	6$.S			;No
+	CMPB	debuglvl, #2		;Yes - want debug output?
+	JB	4$.S			;No - go on
+	MOVL	EAX, #'[]'		;Yes
+	MOVL	ESI, #tcpcbuf
+	MOVL	ECX, tcpcpnt
+	SUBL	ECX, ESI
+	CALL	tcpdebug
+4$:	PUSHL	tcpiqab+qab_handle	;Do TCP command output
+	MOVL	EDX, #tcpcbuf
+	PUSHL	DS
+	PUSHL	EDX
+	MOVL	EAX, tcpcpnt
+	SUBL	EAX, EDX
+	PUSHL	EAX
+	MOVL	tcpcpnt, EDX
+	CALLF	svcIoOutBlock#
+	TESTL	EAX, EAX
+	JS	tcpouterror.S
+6$:	CMPL	tcpopnt, #tcpobuf	;Have any normal TCP output to do?
+	JE	10$.S			;No
+	CMPB	debuglvl, #2		;Want debug output?
+	JB	8$.S			;No - go on
+	MOVL	EAX, #'{}'		;Yes
+	MOVL	ESI, #tcpobuf
+	MOVL	ECX, tcpopnt
+	SUBL	ECX, ESI
+	CALL	tcpdebug
+8$:	PUSHL	tcpiqab+qab_handle	;Do normal TCP output
+	MOVL	EDX, #tcpobuf
+	PUSHL	DS
+	PUSHL	EDX
+	MOVL	EAX, tcpopnt
+	SUBL	EAX, EDX
+	PUSHL	EAX
+	MOVL	tcpopnt, EDX
+	CALLF	svcIoOutBlock#
+	TESTL	EAX, EAX
+	JS	tcpouterror.S
+10$:	RET
+
+;Here on TCP output error
+
+tcpouterror:
+	CMPL	EAX, #ER_NCCLR		;Connection cleared error?
+	JE	tcpclr			;Yes - give him a good message
+	MOVL	EBX, #tcpoer		;No - give general error message
+	JMP	fail
+.PAGE
+	.SBTTL	tcpready - TCP input ready software interrupt routine
+
+2$:	POPAL
+	CALLF	svcSchDismiss#
+
+;TCP input ready software interrupt routine
+
+tcpready::
+	PUSHAL
+4$:	TESTB	tcpiqab+qab_status+1, #QSTS$DONE>8t ;Really have input done?
+	JE	2$.S			;No - false alarm!
+	MOVB	tcpinact, #0		;Yes - indicate input not active now
+	MOVL	EAX, tcpiqab+qab_error	;Error?
+	TESTL	EAX, EAX
+	JS	tcpinerror		;Yes
+	CMPB	debuglvl, #2		;Yes - want full debug output?
+	JB	6$.S			;No
+	MOVL	EAX, #'<>'		;Yes - display the TCP input
+	MOVL	ESI, #tcpibuf
+	MOVL	ECX, tcpiqab+qab_amount
+	CALL	tcpdebug
+6$:	MOVL	tcpipnt, #tcpibuf	;Initialize pointer
+tcplp:	DECL	tcpiqab+qab_amount	;Have another character?
+	JS	10$.S			;No
+	MOVL	EBX, tcpipnt		;Yes
+	MOVZBL	EAX, [EBX]		;Get next character
+	INCL	tcpipnt
+	MOVL	EBX, tcpstate		;Dispatch on the state
+	JMPIL	tcpsdsp[EBX*4]
+
+	.PSECT	_DATA_p
+
+tcpsdsp:.LONG	inormal		;TCPS_NORMAL  = 0  - Normal character is next
+	.LONG	cmdnext		;TCPS_CMDNEXT = 1  - Command byte is next
+	.LONG	subneg		;TCPS_SUBNEG  = 2  - Sub-negotiation option byte
+				;		       is next
+	.LONG	subdata		;TCPS_SUBDATA = 3  - Sub-negotiation data byte
+				;		       is next
+	.LONG	subiac		;TCPS_SUBIAC  = 4  - TNC_IAC seen during
+				;		       sub-negotiation 
+	.LONG	optwill		;TCPS_OPTWILL = 5  - TNC_WILL option byte next
+	.LONG	optwont		;TCPS_OPTWONT = 6  - TNC_WONT option byte next
+	.LONG	optdo		;TCPS_OPTDO   = 7  - TNC_DO option byte next
+	.LONG	optdont		;TCPS_OPTDONT = 8  - TNC_DONT option byte next
+
+	.PSECT	_TEXT_p
+
+;Here when finished processing TCP input
+
+10$:	CALL	trmoutput		;Do terminal output if need to (note
+					;  that this can generate TCP output)
+	CALL	dotcpoutput		;Start TCP output if need to
+	MOVB	tcpiqab+qab_vector, #0
+	CALL	tcpinput		;Start TCP input if should
+	TESTB	trmqab+qab_status+1, #QSTS$DONE>8t ;Have any terminal input now?
+	JE	20$.S			;No
+	CALL	trmsrv			;Yes - handle it now
+20$:	MOVB	tcpiqab+qab_vector, #VECT_TCPIN
+	JMP	4$
+
+;Here on TCP input error
+
+tcpinerror:
+	CMPL	EAX, #ER_NCCLR		;Connection cleared error?
+	JE	tcpclr.S		;Yes - give him a good message
+	MOVL	EBX, #tcpier		;No - give general error message
+	JMP	fail
+
+tcpclr:	MOVL	EBX, #ncclrmsg
+	JMP	done
+.PAGE
+;Here for initial receive character processing
+
+inormal:CMPB	AL, #TNC_IAC		;Command prefix character?
+	JE	telnetpfx		;Yes
+	PUSHL	EAX			;No - save character
+	CALL	begintrm
+	POPL	EAX			;Restore data
+					;Fall into normal on next page
+.PAGE
+;Here for receive character in the normal state
+
+normal:	CMPB	AL, #TNC_IAC		;Telnet command prefix character?
+	JE	telnetpfx.S		;Yes
+2$:	MOVL	EBX, trmopnt
+	MOVB	[EBX], AL		;No - just store for output to terminal
+	INCL	trmopnt
+	JMP	tcplp			;Continue
+
+;Here for literal 0FFh character
+
+cmdlitFF:
+	MOVB	tcpstate, #TCPS_NORMAL	;Reset state
+	JMP	2$.S			;Go process character
+
+;Here with Telnet command prefix character
+
+telnetpfx:
+	MOVB	tcpstate, #TCPS_CMDNEXT	;Change state
+	JMP	tcplp			;Continue
+
+;Here when expecting command byte next
+
+cmdnext:CMPB	AL, #0F0h		;Valid command?
+	JB	2$.S			;No - treat it like a normal character!
+	MOVZBL	EAX, AL			;Yes
+	JMPIL	cmdtbl-{0F0h*4}[EAX*4]	;Dispatch on the command
+
+	.PSECT	_DATA_p
+
+;Telnet command table
+
+	.MOD	4
+cmdtbl:	.LONG	cmddone		;TNC_SE   = F0 - End of subnegotiation
+	.LONG	cmddone		;TNC_NOP  = F1 - No operation
+	.LONG	cmddm		;TNC_DM   = F2 - Data mark
+	.LONG	cmdbrk		;TNC_BRK  = F3 - Break
+	.LONG	cmdip		;TNC_IP   = F4 - Interrupt process
+	.LONG	cmdao		;TNC_AO   = F5 - Abort output
+	.LONG	cmdayt		;TNC_AYT  = F6 - Are you there
+	.LONG	cmdec		;TNC_EC   = F7 - Erase character
+	.LONG	cmdel		;TNC_EL   = F8 - Erase line
+	.LONG	cmdga		;TNC_GA   = F9 - Go ahead signal
+	.LONG	cmdsb		;TNC_SB   = FA - Start of subnegoatiation
+	.LONG	cmdwill		;TNC_WILL = FB - WILL
+	.LONG	cmdwont		;TNC_WONT = FC - WONT
+	.LONG	cmddo		;TNC_DO   = FD - DO
+	.LONG	cmddont		;TNC_DONT = FE - DONT
+	.LONG	cmdlitFF	;TNC_FF   = FF - Literal value 0xFF
+
+	.PSECT	_TEXT_p
+.PAGE
+;Here for the TNC_NOP (No operation) command
+
+cmddone:MOVB	tcpstate, #TCPS_NORMAL	;Reset state
+	JMP	tcplp			;Thats all
+
+;Here for the TNC_DM (Data mark) command
+
+cmddm:
+
+	JMP	cmddone.S		;Ignore this one for now!
+
+;Here for the TNC_BRK (Break) command
+
+cmdbrk:
+
+	JMP	cmddone.S		;Ignore this one for now!
+
+;Here for the TNC_IP (Interrupt process function) command
+
+cmdip:
+
+	JMP	cmddone.S		;Ignore this one for now!
+
+;Here for the TNC_AO (Allow output function) command
+
+cmdao:
+
+	JMP	cmddone.S		;Ignore this one for now!
+
+;Here for the TNC_AYT (Are you there function) command
+
+cmdayt:
+
+	JMP	cmddone.S		;Ignore this
+
+;Here for the TNC_EC (Erase character function) command
+
+cmdec:
+
+	JMP	cmddone.S		;Ignore this
+
+;Here for the TNC_EL (Erase line function) command
+
+cmdel:
+
+	JMP	cmddone			;Ignore this
+
+;Here for the TNC_GA (Go ahead signal) command
+
+cmdga:
+
+	JMP	cmddone
+.PAGE
+;Here for the TNC_SB (Start of subnegotiation) command
+
+cmdsb:	MOVB	tcpstate, #TCPS_SUBNEG	;Advance state
+	JMP	tcplp
+
+;Here for subnegotiation option byte
+
+subneg:	MOVB	subopt, AL		;Store the option value
+	MOVL	subpnt, #subbuf		;Reset pointer
+	MOVL	subcnt, #0		;And count
+2$:	INCL	tcpstate		;Advance state
+	JMP	tcplp			;Continue
+
+;Here for subnegotiation data byte
+
+subdata:CMPB	AL, #TNC_IAC		;Is this a command prefix?
+	JE	2$.S			;Yes
+4$:	CMPB	subcnt, #SUBMAX		;No - have too many bytes now?
+	JAE	6$.S			;Yes - ignore this one!
+	MOVL	EDX, subpnt		;No - store byte
+	MOVB	[EDX], AL
+	INCL	subpnt			;Bump pointer
+	INCL	subcnt			;And count
+6$:	JMP	tcplp			;Continue
+
+;Here with byte following TNC_IAC in the subnegotiation data stream
+
+subiac:	CMPB	AL, #TNC_SE		;End of subnegotiation?
+	JE	10$.S			;Yes
+	MOVB	tcpstate, #TCPS_SUBDATA	;No - just treat it as data
+	JMP	4$.S
+
+;Here for the TNC_SE (End of subnegotiation) command - note that this is the
+;  only command reconized in the subnegotiation data stream and that that is
+;  the only place it is reconized!
+
+10$:	MOVB	tcpstate, #TCPS_NORMAL	;Reset state
+	MOVL	EAX, subopt		;Get the option byte
+	CMPB	AL, #TNOMAX		;Valid option?
+	JA	cmddone			;No - ignore all of this!
+	JMPIL	subtbl[EAX*4]		;Dispatch on the option
+.PAGE
+;Here for the TNC_WILL command - this is a request from the host to allow it to
+;  enable an option or an acknowlegement to our request that the host enable an
+;  option.  If it is a request we reply with DO or DONT.  If it is an
+;  acknowlegement (indicated by the option being in a "want to enable" state),
+;  we update the option state but do not send a reply.
+
+cmdwill:MOVB	tcpstate, #TCPS_OPTWILL
+	JMP	tcplp
+
+;Here with the option byte for the TNC_WILL command
+
+optwill:CMPB	AL, #TNOMAX		;Valid option?
+	JA	4$			;No - reply with DONT
+	MOVB	AH, #TNC_DO		;Yes - reply with DO
+	MOVZBL	EDX, AL
+	CALLI	optcmdtbl[EDX*4]	;Call routine for option
+	JNE	4$.S			;If can't enable it for some reason
+	CMPB	rmttbl[EDX], #1		;Are we requesting it be enabled or is
+					;  it now enabled?
+	JGE	2$.S			;Yes - don't send a response
+	MOVB	rmttbl[EDX], #2		;Not enabled - indicate enabled now
+optrply:PUSHL	EAX
+	MOVB	AL, #TNC_IAC		;Output prefix byte
+	CALL	puttcpcmd
+	MOVB	AL, 1.B[ESP]		;Output command byte (TNC_DO, TNC_DONT,
+	CALL	puttcpcmd		;  TNC_WILL, or TNC_WONT)
+	POPL	EAX			;Output option byte
+	CALL	puttcpcmd
+	JMP	cmddone
+
+;Here if option is in the "want to enable" state or is enabled
+
+2$:	MOVB	rmttbl[EDX], #2		;Indicate enabled now
+	JMP	cmddone			;Thats all
+
+;Here for the TNC_WONT command - this indicates that the remote wants to disable
+;  the indicated option or has disabled the option at our request or refuses to
+;  enable the option at our request - note that we NEVER refuse a request to
+;  disable an option!
+
+cmdwont:MOVB	tcpstate, #TCPS_OPTWONT
+	JMP	tcplp
+
+;Here with the option byte for the TNC_WONT command
+
+optwont:CMPB	AL, #TNOMAX		;Valid option?
+	JA	cmddone			;No - ignore it
+	MOVB	AH, #TNC_DONT		;Yes - reply with DONT
+	MOVZBL	EDX, AL
+	CALLI	optcmdtbl[EDX*4]	;Call routine for option
+	CMPB	rmttbl[EDX], #0		;Do we support it?
+	JL	cmddone			;No - ignore it
+	CMPB	rmttbl[EDX], #1		;Is it disabled now or are we trying to
+					;  enable it?
+	JLE	5$.S			;Yes
+	MOVB	rmttbl[EDX], #0		;No - indicate disabled
+4$:	MOVB	AH, #TNC_DONT		;Reply with DONT
+	JMP	optrply.S		;And go send reply
+
+5$:	MOVB	rmttbl[EDX], #0		;Indicate disabled
+	JMP	cmddone			;Thats all
+
+;Here for the TNC_DO command - this indicates that the host wants us to enable
+;  the indicated option or acknowleges that we may enable the option.  Note that
+;  we will refuse to enable any option we don't support
+
+cmddo:	MOVB	tcpstate, #TCPS_OPTDO
+	JMP	tcplp
+
+;Here with the option byte for the TNC_DO command
+
+optdo:	CMPB	AL, #TNOMAX		;Valid option?
+	JA	8$.S			;No - reply with WONT
+	MOVB	AH, #TNC_WILL		;Yes - reply with WILL
+	MOVZBL	EDX, AL
+	CALLI	optcmdtbl[EDX*4]	;Call routine for option
+	JNE	8$.S			;If can't enable it for some reason
+	CMPB	lcltbl[EDX], #1		;Do we want to enable this option or is
+					;  it already enabled?
+	JGE	6$.S			;Yes - don't send a response
+	MOVB	lcltbl[EDX], #2		;Disabled - enable it now
+	JMP	optrply
+
+;Here if already enabled or if its in the "want to enable" state - don't reply
+;  but do call the subroutine for the option
+
+6$:	MOVB	lcltbl[EDX], #2		;Indicate enabled
+	JMP	cmddone			;Thats all
+
+;Here for the TNC_DONT command - this indicates that the host wants us to
+;  disable the indicated option or acknowleges that we may disable the option
+;  or refuses to allows us to enable the option.  Note that we NEVER refuse
+;  a request to disable an option.
+
+cmddont:MOVB	tcpstate, #TCPS_OPTDONT
+	JMP	tcplp
+
+;Here with the option byte for the TNC_DONT command
+
+optdont:CMPB	AL, #TNOMAX		;Valid option?
+	JA	cmddone			;No - ignore it
+	MOVB	AH, #TNC_WONT		;Yes - reply with WONT
+	MOVZBL	EDX, AL
+	CALLI	optcmdtbl[EDX*4]	;Call routine for option
+	CMPB	lcltbl[EDX], #1		;Is it unsupported or disabled?
+	JL	cmddone			;No - nothing needed
+	JE	10$.S			;If we were trying to enable it
+	MOVB	rmttbl[EDX], #0		;Enabled - disable it
+8$:	MOVB	AH, #TNC_WONT		;Reply with WONT
+	JMP	optrply
+
+10$:	MOVB	rmttbl[EDX], #0
+	JMP	cmddone
+.PAGE
+	.SBTTL	optcmdtfc - Command routine for TNO_TFC option
+
+;Here when have command for TNO_TFC option
+;	c(AH) = Function
+;	CALL	optcmdtfc
+
+optcmdtfc:
+	CMPB	AH, #TNC_DO		;Do nothing if wrong direction (indicate
+	JE	retzclr.S		;  cannot enable)
+	CMPB	AH, #TNC_DONT
+	JE	retzclr.S
+	MOVB	flowctl, #0		;Assume being disabled
+	CMPB	AH, #TNC_WILL		;Right?
+	JNE	4$.S			;Yes
+	INCB	flowctl			;No - enable flow control
+retzset:CLRL	ECX			;Set Z to indicate can enable it
+4$:	RET
+
+retzclr:TESTL	ESP, ESP
+	RET
+.PAGE
+	.SBTTL	optcmdxosm - Command routine for TNO_XOSMODE option
+
+;Here when have command for TNO_XOSMODE option
+
+optcmdxosm:
+	CMPB	lcltbl+TNO_XOSMODE, #-1	;Is XOS mode allowed?
+	JE	retzclr.S		;No - can't do this!
+	CMPB	AH, #TNC_WILL		;Yes - is he trying to enable?
+	JNE	retzset.S		;No - allow it
+	CMPL	scrnsize, #0.B		;Is the display screen already mapped?
+	JNE	retzset.S		;Yes - this is OK
+	PUSHL	EAX			;No
+	PUSHL	trmhndl			;Try to map the screen now
+	PUSHL	DS
+	PUSHL	#scrnbase
+	PUSHL	#10000h
+	PUSHL	#0.B
+	CALLF	svcTrmMapScrn#
+	TESTL	EAX, EAX		;Did it work?
+	JS	4$.S			;No - can't enable XOS mode
+	MOVL	scrnsize, EAX		;Yes - store actual buffer size
+	ADDL	EAX, #scrnbase		;And store top offset
+	MOVL	scrntop, EAX
+	CLRL	EAX			;Set Z to indicate can enable XOS
+4$:	POPL	EAX			;  mode
+	RET
+.PAGE
+	.SBTTL	TNO_TERM subnegotiation
+
+subterm:CMPB	subcnt, #1		;Have exactly one byte?
+	JNE	4$.S			;No - ignore this!
+	CMPB	subbuf+0, #TERM_SEND	;Yes - is it a request for the terminal
+					;  type?
+	JNE	4$.S			;No - ignore it!
+	MOVL	ESI, #trmtypestr	;Yes - send him the terminal type
+	MOVL	ECX, #TRMTYPESTR
+	CALL	puttcpstr
+4$:	JMP	tcplp			;Thats all
+.PAGE
+	.SBTTL	TNO_TFC subnegotiation
+
+subtfc:	CMPB	subcnt, #1		;Have exactly one byte?
+	JNE	4$.S			;No - ignore this!
+	CMPB	subbuf+0, #TFC_OFF	;Yes - want to turn it off?
+	JE	2$.S			;Yes
+	CMPB	subbuf+0, #TFC_ON	;No - want to turn it on?
+	JNE	4$.S			;No - ignore this
+	MOVB	flowctl, #1		;Yes
+	JMP	tcplp
+
+2$:	MOVB	flowctl, #0
+4$:	JMP	tcplp
+.PAGE
+	.SBTTL	TNO_XOSMODE subnegotiation
+
+subxosmd:
+	CMPB	subcnt, #1		;Have at least one byte?
+	JB	4$.S			;No - ignore this!
+	MOVZBL	EAX, subbuf+0		;Yes - get the function byte
+	CMPB	AL, #SUBXOSMAX		;Legal value?
+	JA	4$.S			;No - ignore this
+	JMPIL	subxosdsp[EAX*4]	;Yes - dispatch on the value
+
+	.PSECT	_DATA_p
+
+subxosdsp:
+	.LONG	cmddone		;	     = 0 - Illegal
+	.LONG	cmddone		;XOS_BGNKB   = 1 - Begin XOS mode keyboard
+				;		     encoding
+	.LONG	cmddone		;XOS_ENDKB   = 2 - End XOS mode keyboard
+				;		     encoding
+	.LONG	xosmbgndsp	;XOS_BGNDSP  = 3 - Begin XOS mode display
+				;		     encoding
+	.LONG	xosmenddsp	;XOS_ENDDSP  = 4 - End XOS mode display
+				;		     encoding
+	.LONG	cmddone		;XOS_VIDMODE = 5
+SUBXOSMAX=!{$-subxosdsp}/4-1
+
+	.PSECT	_TEXT_p
+
+;Here for XOS_BGNDSP
+
+xosmbgndsp:
+	MOVB	xosmddsp, #1
+	CMPL	tcpsdsp+TCPS_NORMAL, #normal ;Need to do set up now?
+	JE	4$.S			;No
+	CALL	begintrm		;Yes
+4$:	JMP	cmddone
+
+;Here for XOS_ENDDSP
+
+xosmenddsp:
+	MOVB	xosmddsp, #0
+	JMP	cmddone
+.PAGE
+begintrm:
+	MOVL	tcpsdsp+TCPS_NORMAL, #normal ;Modify the dispatch table
+	CMPB	lcltbl+TNO_XOSMODE, #2	;Using XOS mode?
+	JNE	2$.S			;No
+	CMPB	rmttbl+TNO_XOSMODE, #2	;Maybe
+	JNE	2$.S			;No
+	PUSHL	trmhndl			;Yes - put terminal into full scan code
+	PUSHL	#0.B			;  input mode
+	PUSHL	#0.B
+	PUSHL	#0.B
+	PUSHL	DS
+	PUSHL	#trmxosparms
+	CALLF	svcIoInBlockP#
+	TESTL	EAX, EAX		;Did it work?
+	JS	2$.S			;No - forget it!
+	PUSHL	trmhndl			;Yes - get the display type
+	PUSHL	#DM$RTNDATA
+	PUSHL	DS
+	PUSHL	#trmdata
+	CALLF	svcTrmDspMode#
+	MOVL	EAX, trmdata+dm_disptype ;Get the display type
+	XCHGB	AL, AH			;Fix up the byte order
+	RORL	EAX, #16t
+	XCHGB	AL, AH
+	MOVL	disptype, EAX		;Store it for the next message
+	MOVB	xosmdkb, #1		;Indicate have XOS mode keyboard
+	MOVL	ESI, #xosmwill		;Tell the host we will use XOS mode
+	MOVL	ECX, #XOSMWILL		;  from now on and give him the display
+	CALL	puttcpstr		;  type
+	PUSHL	#xosmmsg
+	JMP	4$.S
+
+2$:	PUSHL	#ansimmsg
+4$:	MOVL	EBX, #conmsg		;Tell him what we are using
+	CALL	outstr
+	MOVL	EBX, #phyname
+	CALL	outstr
+	POPL	EBX
+	CALL	outstr
+	JMP	restarttrm		;Start terminal input
+.PAGE
+;Subroutine to send string to the host
+;	c{ESI} = Offset of string
+;	c{ECX} = Length of string
+;	CALL	puttcpstr
+
+puttcpstr:
+	LODSB	[ESI]			;Get byte
+	CALL	puttcpcmd		;Output it
+	LOOP	ECX, puttcpstr		;Continue if more
+ret010:	RET				;Finished
+
+puttcpcmd:
+	MOVL	EBX, tcpcpnt		;Get command buffer pointer
+	CMPL	EBX, #tcpcbuf+TCPCSIZE	;Is the buffer full?
+	JAE	4$.S			;Yes - serious problem!!
+	MOVB	[EBX], AL		;No - store character
+	INCL	tcpcpnt
+	RET
+
+;Here if the command buffer is full
+
+4$:	MOVL	EBX, #covmsg
+	JMP	failner
+.PAGE
+	.SBTTL	tcpinput - Subroutine to start TCP input
+
+;Subroutine to start TCP input
+
+tcpinput:
+	CMPB	tcpinact, #0		;Is input active now?
+	JNE	ret014.S		;Yes - nothing to do now
+	CLRL	EAX			;No
+	MOVW	tcpiqab+qab_status, AX
+	MOVL	tcpiqab+qab_amount, EAX
+	CMPB	flowstop, #0		;Have we stopped output?
+	JNE	ret014.S		;Yes - don't start TCP input
+	PUSHL	DS			;No - start TCP input
+	PUSHL	#tcpiqab
+	CALLF	svcIoQueue#
+	TESTL	EAX, EAX
+	JS	4$.S			;If error
+	MOVB	tcpinact, #1		;OK - indicate TCP input is active
+ret014:	RET
+
+;Here if error starting TCP input - this is a fatal error
+
+4$:	MOVL	EBX, #tcpier
+	JMP	fail
+.PAGE
+	.SBTTL	trmoutput - Subroutine to do terminal output
+
+;Subroutine to do terminal output
+;	CALL	trmoutput
+
+trmoutput:
+	CMPB	flowstop, #0		;Has output been stopped?
+	JNE	ret014.S		;Yes - don't do any terminal output now
+	MOVL	EAX, trmopnt		;Get amount to output
+	SUBL	EAX, #trmobuf
+	JE	ret014.S		;If nothing to output
+	MOVL	trmocnt, EAX
+	MOVL	trmopnt, #trmobuf
+trmolp:	CMPL	trmocnt, #0.B		;Anything left?
+	JE	8$			;No - finished
+	MOVL	EDI, trmopnt		;Yes
+	MOVL	EAX, trmostate		;Get state
+	JMPIL	trmodsp[EAX*4]		;Dispatch on the state
+
+	.PSECT	_DATA_p
+
+trmodsp:.LONG	trmonorm	;TO_NORMAL = 0  - Normal data is next
+	.LONG	trmofunc	;TO_FUNC   = 1  - DDSP function byte is next
+	.LONG	trmoarg		;TO_12ARG  = 2  - 12 DDSP arguments are next
+	.LONG	trmoarg		;TO_11ARG  = 3  - 11 DDSP arguments are next
+	.LONG	trmoarg		;TO_10ARG  = 4  - 10 DDSP arguments are next
+	.LONG	trmoarg		;TO_9ARG   = 5  - 9 DDSP arguments are next
+	.LONG	trmoarg		;TO_8ARG   = 6  - 8 DDSP arguments are next
+	.LONG	trmoarg		;TO_7ARG   = 7  - 7 DDSP arguments are next
+	.LONG	trmoarg		;TO_6ARG   = 8  - 6 DDSP arguments are next
+	.LONG	trmoarg		;TO_5ARG   = 9  - 5 DDSP arguments are next
+	.LONG	trmoarg		;TO_4ARG   = 10 - 4 DDSP arguments are next
+	.LONG	trmoarg		;TO_3ARG   = 11 - 3 DDSP arguments are next
+	.LONG	trmoarg		;TO_2ARG   = 12 - 2 DDSP arguments are next
+	.LONG	trmolstarg	;TO_1ARG   = 13 - 1 DDSP argument is next
+	.LONG	trmoimgc	;TO_IMGC   = 14 - Outputting image characters
+	.LONG	trmoimgca	;TO_IMGCA  = 15 - Outputting image characters
+				;		    and attributes
+
+	.PSECT	_TEXT_p
+
+;Here to output normal data
+
+trmonorm:
+	CMPB	xosmddsp, #0		;Using XOS mode?
+	JE	6$.S			;No - just output the data	
+	MOVL	ECX, trmocnt		;Yes - see how many non-zero bytes we
+	JREGZ	ECX, 8$			;  have
+	MOVB	AL, #0
+	CLD
+	RNSCASB	[EDI]
+	JNE	6$.S			;If we did not find a zero byte
+	MOVL	EAX, trmocnt		;Calculate now many non-zero bytes we
+	SUBL	EAX, ECX		;  found before the zero byte
+	DECL	EAX
+	JE	4$.S			;If none
+	PUSHL	trmhndl			;Output what we found
+	PUSHL	DS
+	PUSHL	trmopnt
+	PUSHL	EAX
+	ADDL	trmopnt, EAX		;Increment pointer
+	SUBL	trmocnt, EAX		;Reduce count
+	CALLF	svcIoOutBlock#
+4$:	INCL	trmopnt
+	DECL	trmocnt
+	INCL	trmostate		;Advance the state
+	JMP	trmolp.S		;Continue
+
+;Here if we did not find a zero byte
+
+6$:	PUSHL	trmhndl
+	PUSHL	DS
+	PUSHL	trmopnt
+	PUSHL	trmocnt
+	CALLF	svcIoOutBlock#
+8$:	MOVL	trmopnt, #trmobuf	;Initialize pointer
+	RET				;Finished
+.PAGE
+	.SBTTL	Display Data Stream Protocol (DDSP) routines
+
+;Here with a DDSP function byte next
+;	c(AL) = Function byte
+
+trmofunc:
+	MOVB	AL, [EDI]		;Get byte
+	INCL	trmopnt			;Advance pointer
+	DECL	trmocnt			;Reduce count
+	CMPB	AL, #LOWMAX		;Valid low value function?
+	JA	4$.S			;No - check for high value function
+	MOVB	ddspfval, AL		;Yes - store it
+	MOVB	AL, ddspnxts[EAX]	;Get next state for function
+	CMPB	AL, #0			;0 arguments?
+	JE	doddsp.S		;Yes - do the function now
+	MOVB	trmostate, AL		;No - store new state
+	MOVL	ddsppnt, #ddspargs
+	JMP	trmolp			;Continue
+
+;Table which gives initial state for collection arguments
+
+	.PSECT	_DATA_p
+
+ddspnxts:
+	.BYTE	0		;	      = 00 - Reserved
+	.BYTE	TO_12ARG	;DDSF_VIDMODE = 01 - Set video mode
+	.BYTE	TO_2ARG		;DDSF_LDFONT  = 02 - Load font
+	.BYTE	TO_2ARG		;DDSF_LDFONTA = 03 - Load font/adjustment
+	.BYTE	TO_1ARG		;DDSF_SELFONT = 04 - Select font
+	.BYTE	TO_1ARG		;DDSF_DSPPAGE = 05 - Set display page
+	.BYTE	0		;	      = 06 - Reserved
+	.BYTE	0		;	      = 07 - Reserved
+	.BYTE	TO_2ARG		;DDSF_CURPOS  = 08 - Set cursor position on
+				;		       current page
+	.BYTE	TO_3ARG		;DDSF_CURPOSP = 09 - Set cursor position on
+				;		       any page
+	.BYTE	TO_2ARG		;DDSF_CURTYPE = 0A - Set cursor type
+	.BYTE	TO_2ARG		;DDSF_WCHAR   = 0B - Write character at cursor
+				;		       position on current page
+	.BYTE	TO_3ARG		;DDSF_WACHAR  = 0C - Write character and
+				;		       attribute at cursor
+				;		       position on current page
+	.BYTE	0		;	      = 0D - Reserved
+	.BYTE	0		;	      = 0E - Reserved
+	.BYTE	0		;	      = 0F - Reserved
+	.BYTE	TO_6ARG		;DDSF_SWCUP   = 10 - Scroll window up on current
+				;		       page
+	.BYTE	TO_6ARG		;DDSF_SWCDOWN = 11 - Scroll window down on
+				;		       current page
+	.BYTE	TO_6ARG		;DDSF_SWCRHT  = 12 - Scroll window right on
+				;		       current page
+	.BYTE	TO_6ARG		;DDSF_SWCLFT  = 13 - Scroll window left on
+				;		       current page
+	.BYTE	TO_7ARG		;DDSF_SWAUP   = 14 - Scroll window up on any
+				;		       page
+	.BYTE	TO_7ARG		;DDSF_SWADOWN = 15 - Scroll window down on any
+				;		       page
+	.BYTE	TO_7ARG		;DDSF_SWARHT  = 16 - Scroll window right on any
+				;		       page
+	.BYTE	TO_7ARG		;DDSF_SWALFT  = 17 - Scroll window left on any
+				;		       page
+	.BYTE	TO_2ARG		;DDSF_BATTRIB = 18 - Set base text attributes
+	.BYTE	TO_2ARG		;DDSF_CATTRIB = 19 - Set current text attributes
+	.BYTE	0		;	      = 1A - Reserved
+	.BYTE	0		;	      = 1B - Reserved
+	.BYTE	0		;	      = 1C - Reserved
+	.BYTE	0		;	      = 1D - Reserved
+	.BYTE	0		;	      = 1E - Reserved
+	.BYTE	0		;	      = 1F - Reserved
+	.BYTE	TO_3ARG		;DDSF_IMG1C   = 20 - Display image characters
+				;		       with 1 count byte
+	.BYTE	TO_3ARG		;DDSF_IMG1CA  = 21 - Display image characters
+				;		       and attributes with 1
+				;		       count byte
+	.BYTE	TO_4ARG		;DDSF_IMG2C   = 22 - Display image characters
+				;		       with 2 count bytes
+	.BYTE	TO_4ARG		;DDSF_IMG2CA  = 23 - Display image characters
+				;		       and attributes with 2
+				;		       count bytes
+	.BYTE	TO_2ARG		;DDSF_IMGR1C  = 24 - Display image characters
+				;		       relative with 1 count
+				;		       byte
+	.BYTE	TO_2ARG		;DDSF_IMGR1CA = 25 - Display image characters
+				;		       and attributes relative
+				;		       with 1 count byte
+	.BYTE	TO_3ARG		;DDSF_IMGR2C  = 26 - Display image characters
+				;		       relative with 2 count
+				;		       bytes
+	.BYTE	TO_3ARG		;DDSF_IMGR2CA = 27 - Display image characters
+				;		       and attributes relative
+				;		       with 2 count bytes
+
+	.PSECT	_TEXT_p
+
+;Here if don't have a low value function
+
+4$:	MOVZBL	EBX, AL			;Get function part for dispatch
+	SHRL	EBX, #4t
+	ANDB	AL, #0Fh		;Get value part
+	MOVB	ddspargs+0, AL		;Store it
+	JMPIL	highdsp[EBX*4]		;Dispatch on the function
+
+;DDSP high value function dispatch table
+
+	.PSECT	_DATA_p
+
+	.MOD	4
+highdsp:.LONG	trmonxt		;	      = 10 - Illegal
+	.LONG	trmonxt		;	      = 20 - Illegal
+	.LONG	trmonxt		;	      = 30 - Illegal
+	.LONG	trmonxt		;	      = 40 - Illegal
+	.LONG	trmonxt		;	      = 50 - Illegal
+	.LONG	trmonxt		;	      = 60 - Illegal
+	.LONG	trmonxt		;	      = 70 - Illegal
+	.LONG	trmonxt		;	      = 80 - Illegal
+	.LONG	trmonxt		;	      = 90 - Illegal
+	.LONG	trmonxt		;	      = A0 - Illegal
+	.LONG	trmonxt		;	      = B0 - Illegal
+	.LONG	movleft		;DDSF_MVLEFT  = C0 - Move cursor left
+	.LONG	movright	;DDSF_MVRIGHT = D0 - Move cursor right
+	.LONG	movup		;DDSF_MVUP    = E0 - Move cursor up
+	.LONG	movdown		;DDSF_MVDOWN  = F0 - Move cursor down
+
+	.PSECT	_TEXT_p
+
+;Here with a non-final DDSP argument byte
+;	c(AL) = Argument byte
+
+trmoarg:MOVB	AL, [EDI]		;Get argument byte
+	INCL	trmopnt			;Advance pointer
+	DECL	trmocnt			;Reduce count
+	MOVL	EBX, ddsppnt		;Store argument byte
+	INCL	ddsppnt
+	MOVB	[EBX], AL
+	INCB	trmostate		;Advance TCP input state
+	JMP	trmolp			;Continue
+
+;Here with the final DDSP argument byte
+
+trmolstarg:
+	MOVB	AL, [EDI]		;Get argument byte
+	INCL	trmopnt			;Advance pointer
+	DECL	trmocnt			;Reduce count
+	MOVL	EBX, ddsppnt		;Store argument byte
+	MOVB	[EBX], AL
+doddsp:	MOVL	EAX, ddspfval		;Get function value
+	CMPL	EAX, #LOWMAX.B
+	JA	6$.S
+	JMPIL	lowdsp[EAX*4]		;Dispatch on it
+
+;Here if have invalid function
+
+6$:	HLT
+	NOP
+
+;DDSP low value function dispatch table
+
+	.PSECT	_DATA_p
+
+lowdsp:	.LONG	trmonxt		;	      = 00 - Reserved
+	.LONG	vidmode		;DDSF_VIDMODE = 01 - Set video mode
+	.LONG	ldfont		;DDSF_LDFONT  = 02 - Load font
+	.LONG	ldfonta		;DDSF_LDFONTA = 03 - Load font/adjustment
+	.LONG	selfont		;DDSF_SELFONT = 04 - Select font
+	.LONG	dsppage		;DDSF_DSPPAGE = 05 - Set display page
+	.LONG	trmonxt		;	      = 06 - Reserved
+	.LONG	trmonxt		;	      = 07 - Reserved
+	.LONG	curpos		;DDSF_CURPOS  = 08 - Set cursor position on
+				;		       current page
+	.LONG	curposp		;DDSF_CURPOSP = 09 - Set cursor position on
+				;		       any page
+	.LONG	curtype		;DDSF_CURTYPE = 0A - Set cursor type
+	.LONG	wchar		;DDSF_WCHAR   = 0B - Write character at cursor
+				;		       position on current page
+	.LONG	wachar		;DDSF_WACHAR  = 0C - Write character and
+				;		       attribute at cursor
+				;		       position on current page
+	.LONG	trmonxt		;	      = 0D - Reserved
+	.LONG	trmonxt		;	      = 0E - Reserved
+	.LONG	trmonxt		;	      = 0F - Reserved
+	.LONG	scrollcup	;DDSF_SWCUP   = 10 - Scroll window up on current
+				;		       page
+	.LONG	scrollcdown	;DDSF_SWCDOWN = 11 - Scroll window down on
+				;		       current page
+	.LONG	scrollcright	;DDSF_SWCRGH  = 12 - Scroll window right on
+				;		       current page
+	.LONG	scrollcleft	;DDSF_SWCLFT  = 13 - Scroll window left on
+				;		       current page
+
+	.LONG	scrollaup	;DDSF_SWAUP   = 14 - Scroll window up on any
+				;		       page
+	.LONG	scrolladown	;DDSF_SWADOWN = 15 - Scroll window down on any
+				;		       page
+	.LONG	scrollaright	;DDSF_SWARGH  = 16 - Scroll window right on any
+				;		       page
+	.LONG	scrollaleft	;DDSF_SWALFT  = 17 - Scroll window left on any
+				;		       page
+	.LONG	battrib		;DDSF_BATTRIB = 18 - Set base text attributes
+	.LONG	cattrib		;DDSF_CATTRIB = 19 - Set current text attributes
+	.LONG	trmonxt		;	      = 1A - Reserved
+	.LONG	trmonxt		;	      = 1B - Reserved
+	.LONG	trmonxt		;	      = 1C - Reserved
+	.LONG	trmonxt		;	      = 1D - Reserved
+	.LONG	trmonxt		;	      = 1E - Reserved
+	.LONG	trmonxt		;	      = 1F - Reserved
+	.LONG	img1c		;DDSF_IMG1C   = 20 - Display image characters
+				;		       with 1 byte count byte
+	.LONG	img1ca		;DDSF_IMG1CA  = 21 - Display image characters
+				;		       and attributes with 1
+				;		       byte count byte
+	.LONG	img2c		;DDSF_IMG2C   = 22 - Display image characters
+				;		       with 2 byte count bytes
+	.LONG	img2ca		;DDSF_IMG2CA  = 23 - Display image characters
+				;		       and attributes with 2
+				;		       byte count bytes
+	.LONG	imgr1c		;DDSF_IMGR1C  = 24 - Display image characters
+				;		       with 1 byte count byte
+				;		       relative
+	.LONG	imgr1ca		;DDSF_IMGR1CA = 25 - Display image characters
+				;		       and attributes with 1
+				;		       byte count byte
+	.LONG	imgr2c		;DDSF_IMGR2C  = 26 - Display image characters
+				;		       with 2 byte count bytes
+				;		       relative
+	.LONG	imgr2ca		;DDSF_IMGR2CA = 27 - Display image characters
+				;		       and attributes with 2
+				;		       byte count bytes relative
+LOWMAX=!{$-lowdsp}/4-1		;Highest low value function
+
+	.PSECT	_TEXT_p
+.PAGE
+;Here for image output character
+
+trmoimgc:
+	MOVL	EDI, scrnpnt		;Get pointer
+	MOVL	ECX, scrncnt		;Get amount to store on screen
+	CMPL	ECX, trmocnt		;Do we have this much now?
+	JBE	2$.S			;Yes
+	MOVL	ECX, trmocnt		;No - just store what we have now
+2$:	MOVL	ESI, trmopnt		;Point to the data buffer
+	ADDL	scrnpnt, ECX
+	ADDL	scrnpnt, ECX
+	ADDL	trmopnt, ECX
+	SUBL	trmocnt, ECX
+	CLD
+4$:	LODSB	[ESI]			;Get character
+	STOSB	[EDI]			;Store it on the screen
+	INCL	EDI			;Skip attribute byte
+	LOOP	ECX, 4$			;Continue if more to do
+	CMPL	scrncnt, #0.B		;More to do?
+	JNE	trmolp			;Yes
+	JMP	trmonxt			;No - update terminal output state
+
+;Here for image output character or attribute
+
+trmoimgca:
+	MOVL	EDI, scrnpnt		;Get pointer
+	MOVL	EAX, scrncnt		;Get amount to store on screen
+	CMPL	EAX, trmocnt		;Do we have this much now?
+	JBE	6$.S			;Yes
+	MOVL	EAX, trmocnt		;No - just store what we have now
+6$:	MOVL	ESI, trmopnt		;Point to the data buffer
+	SUBL	scrncnt, EAX		;Reduce screen character count
+	ADDL	scrnpnt, EAX		;Bump screen pointer
+	SUBL	trmocnt, EAX		;Reduce terminal output byte count
+	ADDL	trmopnt, EAX		;Bump terminal output byte pointer
+	CLD
+	CMPL	EAX, #6t.B		;6 or fewer bytes?
+	JBE	8$.S			;Yes - don't worry about alignment
+	CLRL	ECX			;No
+	SUBL	ECX, EDI		;Get number of preceeding bytes
+	ANDL	ECX, #03h.B
+	SUBL	EAX, ECX
+	RMOVSB	[EDI], [ESI]		;Copy preceeding bytes - this ensures
+8$:	MOVL	ECX, EAX		;  the destination is long aligned
+	SHRL	ECX, #2t		;Get number of longs
+	RMOVSL	[EDI], [ESI]		;Copy most of the data
+	MOVL	ECX, EAX		;Get number of bytes left over
+	ANDL	ECX, #03h.B
+	RMOVSB	[EDI], [ESI]		;Copy remaining bytes
+	CMPL	scrncnt, #0.B		;More to do?
+	JNE	trmolp			;Yes
+	JMP	trmonxt			;No - update terminal output state
+.PAGE
+	.SBTTL	vidmode - DDSF_VIDMODE = 01 - Set video mode
+
+;Here for the DDSF_VIDMODE function - Set video mode
+
+vidmode:
+
+;;;;	MOVB	AL, ddspargs+4t		;Set up the data block for the
+;;;;	MOVB	viddata+dm_prifont, AL	;  svcTrmDspMode call from the
+;;;;	MOVB	AL, ddspargs+5t		;  argument data
+;;;;	MOVB	viddata+dm_secfont, AL
+
+;;;; NEED TO FIX THIS!!!
+
+
+	MOVZBL	EAX, ddspargs+6t
+	MOVL	viddata+dm_columns, EAX
+	MOVB	AL, ddspargs+7t
+	MOVL	viddata+dm_rows, EAX
+	MOVZWL	EAX, ddspargs+8t
+	XCHGB	AL, AH
+	MOVL	viddata+dm_horiz, EAX
+	MOVZWL	EAX, ddspargs+10t
+	XCHGB	AL, AH
+	MOVL	viddata+dm_vert, EAX
+	MOVL	EAX, ddspargs+0t
+	XCHGB	AL, AH
+	RORL	EAX, #16t
+	XCHGB	AL, AH
+	PUSHL	trmhndl			;Set the display mode (this cannot
+	MOVL	EDX, EAX		;  block) (unless remote)
+	ANDL	EDX, #DM$RTNDATA|DM$BIOSMODE
+	BTSL	EAX, #DM%RTNDATA
+	BTZL	EAX, #DM%BIOSMODE
+	PUSHL	EAX
+	PUSHL	DS
+	PUSHL	#viddata
+	CALLF	svcTrmDspMode#
+	ORL	EAX, EDX
+	MOVL	viddata-4t, EAX		;Store return value
+
+;When get here we have done the display mode set and have the values ready
+;  to send back to the Telnet server.  The data is sent back in a standard
+;  Telnet sub-negotiation sequence, since DDSP is only valid from the server!
+;  This requires an extra 4 bytes, and keeps the server from having to look
+;  for DDSP input messages.
+
+	MOVL	ESI, #xosmvidmd
+	MOVL	ECX, #XOSMVIDMD
+	CALL	puttcpstr
+	MOVB	AL, viddata-1t
+	CALL	puttcpcmd
+	MOVB	AL, viddata-2t
+	CALL	puttcpcmd
+	MOVB	AL, viddata-3t
+	CALL	puttcpcmd
+	MOVB	AL, viddata-4t
+	CALL	puttcpcmd
+vidrsp:	
+
+;;;;	MOVB	AL, viddata+dm_prifont
+	MOVB	AL, #0
+
+	CALL	puttcpcmd
+
+;;;;	MOVB 	AL, viddata+dm_secfont
+	MOVB	AL, #0
+
+	CALL	puttcpcmd
+
+;;;; NEED TO FIX THIS !!!
+
+
+	MOVB	AL, viddata+dm_columns
+	CALL	puttcpcmd
+	MOVB	AL, viddata+dm_rows
+	CALL	puttcpcmd
+	MOVB	AL, viddata+dm_horiz+1
+	CALL	puttcpcmd
+	MOVB	AL, viddata+dm_horiz+0
+	CALL	puttcpcmd
+	MOVB	AL, viddata+dm_vert+1
+	CALL	puttcpcmd
+	MOVB	AL, viddata+dm_vert+0
+	CALL	puttcpcmd
+	MOVL	ESI, #xosmend
+	MOVL	ECX, #XOSMEND
+	CALL	puttcpstr
+trmonxt:MOVL	trmostate, #TO_NORMAL
+	JMP	trmolp
+.PAGE
+	.SBTTL	dsppage - DDSF_DSPPAGE = 05 - Set display page
+
+;Here for the DDSF_DSPPAGE function - Set display page
+
+dsppage:PUSHL	trmhndl
+	MOVZBL	EAX, ddspargs+0		;Get page number
+	MOVL	curpagenum, EAX		;Save it
+	PUSHL	EAX
+	CALLF	svcTrmDspPage#
+	JMP	trmonxt
+
+	.SBTTL	ldfont - DDSF_LDFONT = 02 - Load display font
+
+;Here for the DDSF_LDFONT function - Load display font
+
+ldfont:	CLRL	EAX			;Get function value
+	JMP	2$.S			;Continue
+
+	.SBTTL	ldfonta - DDSF_LDFONTA = 03 - Load display font/adjustment
+
+;Here for the DDSF_LDFONTA function - Load display font with display adjustment
+
+ldfonta:MOVL	EAX, #80h		;Get function value
+2$:	PUSHL	trmhndl
+	ORB	AL, ddspargs+0		;Get block number
+	PUSHL	EAX
+	MOVB	AL, ddspargs+1		;Get font number
+	PUSHL	EAX
+	PUSHL	#0.B			;Offset
+	PUSHL	#256t			;Number of characters to load
+	CALLF	svcTrmLdStdFont##
+	TESTL	EAX, EAX
+	JS	4$.S			;If error
+	PUSHL	trmhndl			;OK - get the new display parameters
+	PUSHL	#DM$RTNDATA
+	PUSHL	DS
+	PUSHL	#viddata
+	CALLF	svcTrmDspMode##
+	TESTL	EAX, EAX
+	JNS	6$.S			;Go on if OK
+4$:	MOVW	viddata+0, #0FFFFh	;Error - store error indication
+	MOVW	viddata+dm_horiz, AX	;Store error code so it will be sent
+	SHRL	EAX, #16t		;  in the 2nd through 5th bytes of
+	MOVB	viddata+dm_columns, AH	;  the resonse
+	MOVB	viddata+dm_rows, AL
+6$:	MOVL	ESI, #xosmvidft
+	MOVL	ECX, #XOSMVIDFT
+	CALL	puttcpstr
+	JMP	vidrsp
+.PAGE
+	.SBTTL	selfont - DDSF_SELFONT = 04 - Select display font
+
+;Here for the DDSF_SELFONT function - Select display font
+
+selfont:PUSHL	trmhndl
+	MOVZBL	EAX, ddspargs+0
+	PUSHL	EAX
+	PUSHL	EAX
+	CALLF	svcTrmSelFont#
+	JMP	trmonxt
+
+	.SBTTL	curpos - DDSF_CURPOS = 08 - Set cursor position on current page
+
+;Here for the DDSF_CURPOS function - Set cursor position on current page
+
+curpos:	PUSHL	trmhndl
+	PUSHL	curpagenum
+	MOVL	EBX, #ddspargs+0
+	JMP	6$.S
+
+	.SBTTL	curposp - DDSF_CURPOSP = 09 - Set cursor position on any page
+
+;Here for the DDSF_CURPOS function - Set cursor position on any page
+
+curposp:PUSHL	trmhndl
+	MOVL	EBX, #ddspargs+1
+	MOVZBL	EAX, -1.B[EBX]		;Get page number
+	PUSHL	EAX
+6$:	MOVZBL	EAX, [EBX]
+	PUSHL	EAX
+	MOVB	AL, 1.B[EBX]
+	PUSHL	EAX
+	CALLF	svcTrmCurPos#
+	JMP	trmonxt
+
+	.SBTTL	curtype	- DDSF_CURTYPE = 0A - Set cursor type
+
+;Here for the DDSF_CURTYPE function - Set cursor type
+
+curtype:PUSHL	trmhndl
+	MOVZWL	EAX, ddspargs+0
+	XCHGB	AL, AH
+	PUSHL	EAX
+	CALLF	svcTrmCurType#
+	JMP	trmonxt
+.PAGE
+	.SBTTL	wchar - DDSF_WCHAR = 0B - Write char at cursor position
+
+;Here for the DDSF_WCHAR function - Write character at cursor position
+
+wchar:	PUSHL	trmhndl
+	PUSHL	curpagenum		;Get page number
+	MOVZBL	EAX, ddspargs+1		;Get character
+	PUSHL	EAX
+	PUSHL	#0.B			;Get color (not used in text modes)
+	MOVB	AL, ddspargs+0		;Get count
+	PUSHL	EAX
+	CALLF	svcTrmSetChr#
+	JMP	trmonxt
+
+	.SBTTL	wachar - DDSF_WACHAR = 0C - Write char and attr at cursor position
+
+;Here for the DDSF_WACHAR function - Write character and attribute at cursor
+;  position
+
+wachar:	PUSHL	trmhndl
+	PUSHL	curpagenum		;Get page number
+	MOVZBL	EAX, ddspargs+1		;Get character
+	PUSHL	EAX
+	MOVB	AL, ddspargs+2		;Get attribute byte
+	PUSHL	EAX
+	MOVB	AL, ddspargs+0		;Get count
+	PUSHL	EAX
+	CALLF	svcTrmSetAtChr#
+	JMP	trmonxt
+.PAGE
+	.SBTTL	scrollcup - DDSF_SWCUP = 10 - Scroll window up on current page
+
+;Here for the DDSF_SWCUP function - Scroll window up on current page
+;  Arguments are:
+;    0:  Number of lines to scroll
+;    1:  Attribute byte for fill 
+;    2:  x coordinate of upper left corner of window
+;    3:  y coordinate of upper left corner of window
+;    4:  x coordinate of lower right corner of window
+;    5:  y coordinate of lower right corner of window
+
+scrollcup:
+	MOVL	EDX, #1t
+	JMP	2$.S
+
+	.SBTTL	scrollcdown - DDSF_SWCDOWN = 11 - Scroll window down on current page
+
+;Here for the DDSF_SWCDOWN function - Scroll window down on current page
+;  Arguments are:
+;    0:  Number of lines to scroll
+;    1:  Attribute byte for fill 
+;    2:  x coordinate of upper left corner of window
+;    3:  y coordinate of upper left corner of window
+;    4:  x coordinate of lower right corner of window
+;    5:  y coordinate of lower right corner of window
+
+scrollcdown:
+	MOVL	EDX, #2t
+	JMP	2$.S
+
+	.SBTTL	scrollcright - DDSF_SWCRIGHT = 12 - Scroll window right on current page
+
+;Here for the DDSF_SWCRIGHT function - Scroll window right on current page
+;  Arguments are:
+;    0:  Number of lines to scroll
+;    1:  Attribute byte for fill 
+;    2:  x coordinate of upper left corner of window
+;    3:  y coordinate of upper left corner of window
+;    4:  x coordinate of lower right corner of window
+;    5:  y coordinate of lower right corner of window
+
+scrollcright:
+	MOVL	EDX, #3t
+	JMP	2$.S
+
+	.SBTTL	scrollcleft - DDSF_SWCLFT = 10 - Scroll window left on current page
+
+;Here for the DDSF_SWCLFT function - Scroll window left on current page
+;  Arguments are:
+;    0:  Number of lines to scroll
+;    1:  Attribute byte for fill 
+;    2:  x coordinate of upper left corner of window
+;    3:  y coordinate of upper left corner of window
+;    4:  x coordinate of lower right corner of window
+;    5:  y coordinate of lower right corner of window
+
+scrollcleft:
+	MOVL	EDX, #4t
+2$:	MOVL	EAX, curpagenum		;Get page number
+	JMP	8$.S
+
+	.SBTTL	scrollaup - DDSF_SWAUP = 14 - Scroll window up on any page
+
+;Here for the DDSF_SWAUP function - Scroll window up on any page
+;  Arguments are:
+;    0:  Number of lines to scroll
+;    1:  Attribute byte for fill 
+;    2:  x coordinate of upper left corner of window
+;    3:  y coordinate of upper left corner of window
+;    4:  x coordinate of lower right corner of window
+;    5:  y coordinate of lower right corner of window
+;    6:  Page number
+
+scrollaup:
+	MOVL	EDX, #1t
+	JMP	4$.S
+
+	.SBTTL	scrolladown - DDSF_SWADOWN = 15 - Scroll window down on any page
+
+;Here for the DDSF_SWADOWN function - Scroll window down on any page
+;  Arguments are:
+;    0:  Number of lines to scroll
+;    1:  Attribute byte for fill 
+;    2:  x coordinate of upper left corner of window
+;    3:  y coordinate of upper left corner of window
+;    4:  x coordinate of lower right corner of window
+;    5:  y coordinate of lower right corner of window
+;    6:  Page number
+
+scrolladown:
+	MOVL	EDX, #2t
+	JMP	4$.S
+
+	.SBTTL	scrollaright - DDSF_SWARIGHT = 16 - Scroll window right on any page
+
+;Here for the DDSF_SWARIGHT function - Scroll window right on any page
+;  Arguments are:
+;    0:  Number of lines to scroll
+;    1:  Attribute byte for fill 
+;    2:  x coordinate of upper left corner of window
+;    3:  y coordinate of upper left corner of window
+;    4:  x coordinate of lower right corner of window
+;    5:  y coordinate of lower right corner of window
+;    6:  Page number
+
+scrollaright:
+	MOVL	EDX, #3t
+	JMP	4$.S
+
+	.SBTTL	scrollaleft - DDSF_SWALFT = 17 - Scroll window left on any page
+
+;Here for the DDSF_SWALFT function - Scroll window left on any page
+;  Arguments are:
+;    0:  Number of lines to scroll
+;    1:  Attribute byte for fill 
+;    2:  x coordinate of upper left corner of window
+;    3:  y coordinate of upper left corner of window
+;    4:  x coordinate of lower right corner of window
+;    5:  y coordinate of lower right corner of window
+;    6:  Page number
+
+scrollaleft:
+	MOVL	EDX, #4t
+4$:	MOVZBL	EAX, ddspargs+6		;Get page number
+8$:	PUSHL	trmhndl
+	PUSHL	EDX			;Push function
+	PUSHL	EAX			;Push page number
+	MOVZBL	EAX, ddspargs+2		;Get upper left corner x coordinate
+	PUSHL	EAX
+	MOVB	AL, ddspargs+3		;Get upper left corner y coordinate
+	PUSHL	EAX
+	MOVB	AL, ddspargs+4		;Get lower right corner x coordinate
+	PUSHL	EAX
+	MOVB	AL, ddspargs+5		;Get lower right corner y coordinate
+	PUSHL	EAX
+	MOVZBL	EAX, ddspargs+0		;Get count
+	PUSHL	EAX
+	MOVB	AL, ddspargs+1		;Get forground color
+	ANDB	AL, #0Fh
+	PUSHL	EAX
+	MOVB	AL, ddspargs+1		;Get background color
+	SHRL	EAX, #4
+	BTZL	EAX, #3
+	JNC	10$.S
+	ORB	AL, #80
+10$:	PUSHL	EAX
+	CALLF	svcTrmScroll#
+	JMP	trmonxt
+.PAGE
+	.SBTTL	battrib - DDSF_BATTRIB = 0E - Set base text attributes
+
+;Here for the DDSF_BATTRIB function - Set base text attributes
+
+battrib:MOVL	EDX, #81h
+	JMP	2$.S
+
+	.SBTTL	cattrib - DDSF_CATTRIB = 0F - Set current text attributes
+
+;Here for the DDSF_CATTRIB function - Set current text attributes
+
+cattrib:MOVL	EDX, #83h
+2$:	MOVB	AL, ddspargs+0		;Get attribute value
+	MOVB	AH, AL
+	ANDB	AL, #0Fh		;Get just forground color
+	MOVB	attrdata+0t, AL
+	SHRB	AH, #4t			;Get just background color
+	MOVB	attrdata+4t, AH
+	MOVB	AL, ddspargs+1		;Get fill value
+	MOVB	AH, AL
+	ANDB	AL, #0Fh		;Get just forground color
+	MOVB	attrdata+8t, AL
+	SHRB	AH, #4t			;Get just background color
+	MOVB	attrdata+12t, AH
+	PUSHL	trmhndl
+	PUSHL	EDX
+	PUSHL	DS
+	PUSHL	#attrdata
+	CALLF	svcTrmAttrib#
+	JMP	trmonxt
+.PAGE
+	.SBTTL	img1c - DDSF_IMG1C = 10 - Display image char/1 byte count
+
+;Here for the DDSF_IMG1C function - Display image characters with 1 count byte
+
+img1c:	MOVZBL	ECX, ddspargs+2		;Get count
+	JMP	4$.S			;Continue
+
+	.SBTTL	img2c - DDSF_IMG2C = 12 - Display image char/2 count bytes
+
+;Here for the DDSF_IMG2C function - Display image characters with 2 count bytes
+
+img2c:	MOVZWL	ECX, ddspargs+2		;Get count
+	XCHGB	CL, CH
+4$:	MOVZWL	EDX, ddspargs+0		;Get offset
+	ADDL	EDX, #scrnbase
+	XCHGB	DL, DH
+	JMP	8$.S			;Continue
+
+	.SBTTL	imgr1c - DDSF_IMGR1C = 14 - Display image char relative/1 count byte
+
+;Here for the DDSF_IMGR1C function - Display image characters relative with 1
+;  count byte
+
+imgr1c:	MOVZBL	ECX, ddspargs+1		;Get count
+	JMP	6$.S
+
+	.SBTTL	imgr2c - DDSF_IMGR2C = 16 - Display image char relative/2 count bytes
+
+;Here for the DDSF_IMGR2C function - Display image characters relative with 2
+;  count bytes
+
+imgr2c:	MOVZWL	ECX, ddspargs+2		;Get count
+	XCHGB	CL, CH
+6$:	MOVZBL	EDX, ddspargs+0		;Get relative offset
+	ADDL	EDX, scrnpnt		;Make it absolute
+8$:	MOVB	trmostate, #TO_IMGC	;Update terminal output state
+	LEAL	EAX, [EDX+ECX*2]	;Get maximum offset needed
+	JMP	20$.S			;Continue
+
+	.SBTTL	img1ca - DDSF_IMG1CA = 11 - Display image char & attr/1 count byte
+
+;Here for the DDSF_IMG1CA function - Display image characters and attributes
+;  with 1 count byte
+
+img1ca:	MOVZBL	ECX, ddspargs+2		;Get count
+	JMP	14$.S			;Continue
+
+	.SBTTL	img2ca - DDSF_IMG2CA = 13 - Display image char & attr/ 2 count bytes
+
+;Here for the DDSF_IMG2CA function - Display image characters and attributes
+;  with 2 count bytes
+
+img2ca:	MOVZWL	ECX, ddspargs+2		;Get count
+	XCHGB	CL, CH
+14$:	MOVZWL	EDX, ddspargs+0		;Get offset
+	XCHGB	DL, DH
+	ADDL	EDX, EDX
+	ADDL	EDX, #scrnbase
+	JMP	18$.S			;Continue
+
+	.SBTTL	imgr1ca - DDSF_IMGR1CA = 15 - Display image char & attr relative/ 1 count byte
+
+;Here for the DDSF_IMGR1CA function - Display image characters and attributes
+;  relative with 1 count byte
+
+imgr1ca:MOVZBL	ECX, ddspargs+1		;Get count
+	JMP	16$.S
+
+	.SBTTL	imgr2ca - DDSF_IMGR2CA = 17 - Display image char & attr relative/2 count bytes
+
+;Here for the DDSF_IMGR2CA function - Display image characters and attributes
+;  relative with 2 count bytes
+
+imgr2ca:MOVZWL	ECX, ddspargs+2		;Get count
+	XCHGB	CL, CH
+16$:	MOVZBL	EDX, ddspargs+0		;Get relative offset
+	ADDL	EDX, EDX
+	ADDL	EDX, scrnpnt		;Make it absolute
+18$:	MOVB	trmostate, #TO_IMGCA	;Update terminal output state
+	ADDL	ECX, ECX		;Adjust the count
+	LEAL	EAX, [EDX+ECX]		;Get maximum offset needed
+20$:	CMPL	EAX, scrntop		;Is it valid?
+	JA	22$.S			;No - fail!
+	MOVL	scrnpnt, EDX		;Yes - store offset
+	MOVL	scrncnt, ECX		;And store count
+	JMP	trmolp			;Finished here
+
+;Here if trying to store image data past end of display buffer
+
+22$:	MOVL	EBX, #ddsper
+	JMP	failner
+.PAGE
+	.SBTTL	movleft - DDSF_MVLEFT = C0 - Move cursor left
+
+;Here for the DDSF_MVLEFT function - Move cursor left
+
+movleft:MOVZBL	ECX, AL
+	NEGL	ECX
+	JMP	2$.S
+
+	.SBTTL	movright - DDSF_MVRIGHT = D0 - Move cursor right
+
+;Here for the DDSF_MVRIGHT function - Move cursor right
+
+movright:
+	MOVZBL	ECX, AL
+2$:	MOVL	EDX, #-1
+	JMP	6$.S
+
+	.SBTTL	movup - DDSF_MVUP = E0 - Move cursor up
+
+;Here for the DDSF_MVUP function - Move cursor up
+
+movup:	MOVZBL	EDX, AL
+	NEGL	EDX
+	JMP	4$.S
+
+	.SBTTL	movdown - DDSF_MVDOWN = F0 - Move cursor down
+
+;Here for the DDSF_MVDOWN function - Move cursor down
+
+movdown:MOVZBL	EDX, AL
+4$:	MOVL	ECX, #-1
+6$:	PUSHL	trmhndl
+	PUSHL	ECX
+	PUSHL	EDX
+	CALLF	svcTrmCurPos#
+	JMP	trmonxt
+.PAGE
+;Subroutine to output CR-LF to the terminal
+;	CALL	outcrlf
+
+outcrlf:MOVL	EBX, #crlfmsg
+
+;Subroutine to output string to the terminal
+;	c{EBX} = String
+;	CALL	outstr
+
+outstr:	PUSHL	trmhndl
+	PUSHL	DS
+	PUSHL	EBX
+	PUSHL	#0.B
+	CALLF	svcIoOutString#
+	RET
+.PAGE
+	.SBTTL	tcpdebug - Subroutine to output debug data
+
+;Subroutine to output debug data
+;	c(AL)  = Initial character to output
+;	c(AH)  = Final character to output
+;	c{ESI} = Offset of buffer
+;	c{ECX} = Number of bytes in buffer
+;	CALL	tcpdebug
+
+tcpdebug:
+	JREGZ	ECX, 8$
+	MOVB	debugstr, AH		;Save final character
+	PUSHL	debughndl		;Output initial character
+	PUSHL	EAX
+	CALLF	svcIoOutSingle#
+	JMP	4$.S
+
+2$:	PUSHL	debughndl		;Output leading space
+	PUSHL	#' '.B
+	CALLF	svcIoOutSingle#
+4$:	MOVB	AL, [ESI]		;Get first digit
+	SHRB	AL, #4
+	CALL	outdigit
+	CLD
+	LODSB	[ESI]			;Get second digit
+	CALL	outdigit
+	LOOP	ECX, 2$
+	MOVL	EBX, #debugstr
+	PUSHL	debughndl
+	PUSHL	DS
+	PUSHL	EBX
+	PUSHL	#0.B
+	CALLF	svcIoOutString#
+8$:	RET
+
+outdigit:
+	ANDB	AL, #0Fh
+	CMPB	AL, #9
+	JBE	10$.S
+	ADDB	AL, #'A'-'0'-10t
+10$:	ADDB	AL, #'0'
+	PUSHL	debughndl
+	PUSHL	EAX
+	CALLF	svcIoOutSingle#
+	RET
+.PAGE
+	.SBTTL	Data
+
+	.PSECT	_DATA_p
+
+	  .MOD   4
+dftname:  .ASCII "TCP0:"	;Default device name
+devname:  .BLKB  128t		;Device name specified
+
+prgname:: .ASCIZ "TELNET"
+nostkmsg: .ASCIZ "Cannot allocate stack space"
+crlfmsg:  .ASCIZ {CR,LF}
+notodomsg:.ASCIZ "No host specified (/H for help)"{CR,LF}
+nottcpmsg:.ASCIZ "Device is not a TCP device"{CR,LF}
+tomnymsg: .ASCIZ "More than one host specified (/H for help)"{CR,LF}
+nomemmsg: .ASCIZ "Not enough memory"{CR,LF}
+debgemsg: .ASCIZ "Cannot open debug output device/file"{CR,LF}
+trmemsg:  .ASCIZ "Cannot open terminal device"{CR,LF}
+sivfmsg:  .ASCIZ "Cannot initialize software interrupt vector"{CR,LF}
+tcperrmsg:.ASCIZ "Cannot open TCP device"{CR,LF}
+trmoutper:.ASCIZ "Cannot set terminal output parameters"{CR,LF}
+trminpper:.ASCIZ "Cannot set terminal input parameters"{CR,LF}
+tcpoer:   .ASCIZ "TCP output error"{CR,LF}
+tcpier:   .ASCIZ "TCP input error"{CR,LF}
+ddsper:   .ASCIZ "Display data stream protocol (DDSP) error"{CR,LF}
+ncclrmsg: .ASCIZ {CR,LF}"% TELNET: Network connection cleared"
+conmsg:   .ASCIZ "Connected to _"
+xosmmsg:  .ASCIZ " using XOS mode (escape is alt-break)"{CR,LF}
+ansimmsg: .ASCIZ " using ANSI mode (escape is ctl-break)"{CR,LF}
+covmsg:   .ASCIZ "Protocol overflow/deadlock - fatal"
+trmmsg:   .ASCIZ {CR,LF}"% TELNET: Terminating"
+fmsg1:    .ASCIZ "? TELNET: "
+fmsg2:    .ASCIZ "          "
+xosmwill: .BYTE	 TNC_IAC, TNC_SB, TNO_XOSMODE, XOS_BGNKB
+disptype: .LONG  0
+xosmend:  .BYTE  TNC_IAC, TNC_SE
+XOSMEND=!$-xosmend
+XOSMWILL=!$-xosmwill
+xosmvidmd:.BYTE	 TNC_IAC, TNC_SB, TNO_XOSMODE, XOS_VIDMODE
+XOSMVIDMD=!$-xosmvidmd
+xosmvidft:.BYTE	 TNC_IAC, TNC_SB, TNO_XOSMODE, XOS_VIDFONT
+XOSMVIDFT=!$-xosmvidft
+
+trmfmsg:  .ASCII "? TELNET: Cannot start terminal input, terminating"{CR,LF}
+
+helpmsg:  .ASCII ""
+	  .ASCII {CR,LF}
+	  .ASCII "TELNET {/option} {-option} {dev:}host{::}"{CR,LF}
+	  .ASCII {CR,LF}
+	  .ASCII "Options are:"{CR,LF}
+	  .ASCII "  Help      - Display this message"{CR,LF}
+	  .ASCII "  ?         - Same as Help"{CR,LF}
+	  .ASCII "  {NO}DEBug - Debug mode (displays all network data)"{CR,LF}
+	  .ASCII "  XOS       - XOS mode (VGA text mode display and PC"
+	  .ASCII " keyboard emulation)"{CR,LF}
+	  .ASCII "  ANSi      - ANSI mode (VT220 emulation)"{CR,LF}
+	  .ASCII {CR,LF}
+	  .ASCII "Note: If XOS mode is specified and the host or user"
+	  .ASCII " terminal does not support"{CR,LF}
+	  .ASCIZ "      it, ANSI mode is used"{CR,LF}
+
+trmtypestr:.BYTE  TNC_IAC, TNC_SB, TNO_TERM, TERM_IS
+	   .ASCII "VT220"
+	   .BYTE  TNC_IAC, TNC_SE
+TRMTYPESTR=!$-trmtypestr
+
+debugstr: .ASCIZ "x"{CR,LF}
+
+phyname:  .BLKB  120t
+initmsg:  .BYTE	TNC_IAC, TNC_DO, TNO_SUPGA, TNC_IAC, TNC_WILL, TNO_TERM
+INITMSG=!$-initmsg
+
+	.MOD	4
+devnamep: .LONG  0
+debughndl:.LONG  DH_STDTRM	;Debug output handle
+havename: .BYTE  0
+havenode: .BYTE  0
+debuglvl: .BYTE  0
+attrdata: .BLKL  4t
+
+	.MOD	4
+trmdata:.BLKB	dm_SIZE
+
+	.MOD	4
+trminpparms:
+	.BYTE	PAR$SET|REP_HEXV, 4
+	.WORD	IOPAR_TRMCINPMODE
+	.LONG	0FFFFFFFEh
+	.BYTE	PAR$SET|REP_HEXV, 4
+	.WORD	IOPAR_TRMSINPMODE
+	.LONG	TIM$IMAGE|TIM$ANSI7
+	.BYTE	0
+
+trmoutparms:
+	.BYTE	PAR$SET|REP_HEXV, 4
+	.WORD	IOPAR_TRMCOUTMODE
+	.LONG	0FFFFFFFEh
+	.BYTE	PAR$SET|REP_HEXV, 4
+	.WORD	IOPAR_TRMSOUTMODE
+	.LONG	TOM$IMAGE|TOM$ANSICM
+	.BYTE	0
+
+trmxosparms:
+	.BYTE	PAR$SET|REP_HEXV, 4
+	.WORD	IOPAR_TRMCINPMODE
+	.LONG	0FFFFFFFEh
+	.BYTE	PAR$SET|REP_HEXV, 4
+	.WORD	IOPAR_TRMSINPMODE
+	.LONG	TIM$IMAGE|TIM$SCNALL
+	.BYTE	PAR$SET|REP_HEXV, 4
+	.WORD	IOPAR_TRMCOUTMODE
+	.LONG	0FFFFFFFEh
+	.BYTE	PAR$SET|REP_HEXV, 4
+	.WORD	IOPAR_TRMSOUTMODE
+	.LONG	TOM$IMAGE
+	.BYTE	0
+
+	  .MOD   4
+trmqab:	  .WORD  QFNC_INBLOCK	;qab_func    = 0.  - Function
+	  .WORD  0		;qab_status  = 2.  - Returned status
+	  .LONG  0		;qab_error   = 4.  - Error code
+	  .LONG  0		;qab_amount  = 8.  - Amount transfered
+trmhndl:  .LONG  DH_STDTRM	;qab_handle  = 12. - Device handle
+	  .BYTE  VECT_TRM		;qab_vector  = 16. - Vector for interrupt
+	  .BYTE  0, 0, 0	;Reserved
+	  .LONG  0		;qab_option  = 20. - Option bits
+	  .LONG  1024t		;qab_count   = 24. - Amount to transfer
+	  .LONG  trmibuf	;qab_buffer1 = 28. - Pointer to data buffer
+	  .LONG  !trmibuf
+	  .LONG  0, 0		;qab_buffer2 = 36. - Not used
+	  .LONG  0, 0		;qab_parm    = 44. - Pointer to parameter list
+
+tcptparm:
+	.BYTE	PAR$SET|REP_DECV, 4
+	.WORD	IOPAR_TIMEOUT
+	.LONG	0FFFFFFFFh
+	.BYTE	0
+
+	.MOD	4
+tcpiqab:  .WORD  QFNC_INBLOCK	;qab_func    = 0.  - Function
+	  .WORD  0		;qab_status  = 2.  - Returned status
+	  .LONG  0		;qab_error   = 4.  - Error code
+	  .LONG  0		;qab_amount  = 8.  - Amount transfered
+tcphndl:  .LONG  0		;qab_handle  = 12. - Device handle
+	  .BYTE  VECT_TCPIN	;qab_vector  = 16. - Vector for interrupt
+	  .BYTE  0, 0, 0	;Reserved
+	  .LONG  0		;qab_option  = 20. - Option bits
+	  .LONG  1024t		;qab_count   = 24. - Amount to transfer
+	  .LONG  tcpibuf	;qab_buffer1 = 28. - Pointer to data buffer
+	  .LONG  !tcpibuf
+	  .LONG  0, 0		;qab_buffer2 = 36. - Not used
+	  .LONG  tcptparm	;qab_parm    = 44. - Pointer to parameter list
+	  .LONG  !tcptparm
+
+	  .MOD   4
+devpparms:.BYTE	 PAR$GET|REP_TEXT, 8 ;Parameters for initial check of TCP device
+	  .WORD	 IOPAR_CLASS
+devclass: .BLKB  8t
+	  .BYTE  PAR$SET|REP_HEXV, 4
+	  .WORD	 IOPAR_FILOPTN
+	  .LONG  FO$NOPREFIX|FO$XOSNAME
+	  .BYTE  PAR$GET|REP_STR, 0
+	  .WORD  IOPAR_FILSPEC
+	  .LONG  phyname
+	  .LONG  !phyname
+	  .WORD  120t, 0
+	  .BYTE  0
+
+openparms:
+	.BYTE	PAR$SET|REP_HEXV, 4
+	.WORD	IOPAR_FILOPTN
+	.LONG	FO$NOPREFIX|FO$XOSNAME|FO$NODENUM
+	.BYTE	PAR$GET|REP_STR, 0
+	.WORD	IOPAR_FILSPEC
+	.LONG	phyname
+	.LONG	!phyname
+	.WORD	120t, 0
+	.BYTE	PAR$GET|REP_HEXV, 2
+	.WORD	IOPAR_NETLCLPORT
+lclport:.WORD	0
+	.BYTE	PAR$GET|REP_HEXV, 4
+	.WORD	IOPAR_NETRMTNETAR
+rmtnode:.LONG	0
+	.BYTE	PAR$SET|REP_HEXV, 2
+	.WORD	IOPAR_NETRMTPORTS
+rmtport:.WORD	TCPP_TELNET
+	.BYTE	0
+
+	   .MOD   4
+sdfparms:  .BYTE  PAR$SET|REP_TEXT, 4
+	   .WORD  IOPAR_CLASS
+	   .LONG  'PCN'
+	   .BYTE  0
+
+	   .MOD   4
+vidmodeqab:.WORD  QFNC$WAIT|QFNC_SPECIAL
+				;qab_func    = 0.  - Function
+	   .WORD  0		;qab_status  = 2.  - Returned status
+	   .LONG  0		;qab_error   = 4.  - Error code
+	   .LONG  0		;qab_amount  = 8.  - Amount transfered
+	   .LONG  0		;qab_handle  = 12. - Device handle
+	   .BYTE  0		;qab_vector  = 16. - Vector for interrupt
+	   .BYTE  0, 0, 0	;Reserved
+	   .LONG  PCSF_MODESET	;qab_option  = 20. - Option bits
+	   .LONG  0		;qab_count   = 24. - Size of buffer
+	   .LONG  viddata-4	;qab_buffer1 = 28. - Pointer to data buffer
+	   .LONG  !viddata
+	   .LONG  0, 0		;qab_buffer2 = 36. - Not used
+	   .LONG  sdfparms	;qab_parm    = 44. - Pointer to parameter list
+	   .LONG  !sdfparms
+
+	   .MOD   4
+	   .LONG  0
+viddata:   .BLKB  dm_SIZE
+tcpipnt:   .LONG  0
+tcpibuf:   .BLKB  1024t
+
+trmipnt:   .LONG  0
+trmibuf:   .BLKB  1024t
+
+trmostate: .LONG  0
+trmocnt:   .LONG  0
+trmopnt:   .LONG  trmobuf
+trmobuf:   .BLKB  TRMBSIZE
+
+tcpstate:  .LONG  TCPS_NORMAL
+
+subopt:	   .LONG  0		;Subnegotiation option value
+subpnt:	   .LONG  0		;Subnegotiation pointer
+subcnt:	   .LONG  0		;Subnetotiation count
+subbuf:	   .BLKB  SUBMAX	;Subnetotiation data buffer
+ddsppnt:   .LONG  0		;DDSP argument pointer
+ddspargs:  .BLKB  16t		;DDSP argument buffer
+ddspfval:  .LONG  0		;DDSP function value
+curpagenum:.LONG  0
+
+scrnsize:  .LONG  0		;Actual screen buffer size
+scrntop:   .LONG  0		;Offset of top of screen buffer + 1
+scrnpnt:   .LONG  scrnbase	;Screen buffer byte pointer
+scrncnt:   .LONG  0		;Screen buffer byte count
+
+xosmdkb:   .BYTE  0		;Non-zero if using XOS mode keyboard
+				;  encoding
+xosmddsp:  .BYTE  0		;Non-zero if using XOS mode display encoding
+tcpinact:  .BYTE  0		;Non-zero if TCP input is active
+flowctl:   .BYTE  0		;Non-zero if output flow control (XON/XOFF is
+				;  enabled
+flowstop:  .BYTE  0		;Non-zero if output has been stopped by XOFF
+
+
+	.MOD	4
+tcpcpnt:.LONG	tcpcbuf
+tcpcbuf:.BLKB	TCPCSIZE
+tcpopnt:.LONG   tcpobuf
+tcpobuf:.BLKB	TCPOSIZE
+
+;Option/command dispatch table - this table is used whenever a DO, DONT, WILL,
+;  or WONT command is received.  The routine is called with the command in
+;  AH.  If the command is DO or WILL, it must return Z set if it is OK to
+;  enable the option or Z clear if it is not OK.  It must preserve EAX.
+
+optcmdtbl:
+	.LONG	retzclr		;TNO_BINARY  = 00 - Binary transmission
+	.LONG	retzset		;TNO_ECHO    = 01 - Echo
+	.LONG	retzclr		;TNO_RCP     = 02 - Reconnection
+	.LONG	retzset		;TNO_SUPGA   = 03 - Suppress go ahead
+	.LONG	retzclr		;TNO_NAMS    = 04 - Approx message size
+				;		      negotiation
+	.LONG	retzset		;TNO_STATUS  = 05 - Status
+	.LONG	retzset		;TNO_MARK    = 06 - Timing mark
+	.LONG	retzset		;TNO_RCTE    = 07 - Remote controlled transmission
+				;		      and echo
+	.LONG	retzset		;TNO_OLW     = 08 - Output line width
+	.LONG	retzset		;TNO_OPS     = 09 - Output page size
+	.LONG	retzclr		;TNO_OCRD    = 0A - Output carriage-return
+				;		      disposition
+	.LONG	retzclr		;TNO_OHTS    = 0B - Output horizontal tab stops
+	.LONG	retzclr		;TNO_OHTD    = 0C - Output horizontal tab
+				;		      disposition
+	.LONG	retzclr		;TNO_OFFD    = 0D - Output form-feed disposition
+	.LONG	retzclr		;TNO_OVTS    = 0E - Output vertical tab stops
+	.LONG	retzclr		;TNO_OVTD    = 0F - Output vertical tab
+				;		      disposition
+	.LONG	retzclr		;TNO_OLFD    = 10 - Output linefeed disposition
+	.LONG	retzclr		;TNO_XASCII  = 11 - Extended ASCI
+	.LONG	ret004		;TNO_LOGOUT  = 12 - Logout
+	.LONG	retzclr		;TNO_BM      = 13 - Byte macro
+	.LONG	retzclr		;TNO_DET     = 14 - Data entry terminal
+	.LONG	retzclr		;            = 15 - Reserved
+	.LONG	retzclr		;TNO_SUPDUP  = 16 - SUPDUP
+	.LONG	retzclr		;TNO_SDOUT   = 17 - SUPDUP output
+	.LONG	retzset		;TNO_TERM    = 18 - Terminal type
+	.LONG	retzset		;TNO_EOR     = 19 - End of record
+	.LONG	retzclr		;TNO_TACACS  = 1A - TACACS user identification
+	.LONG	retzclr		;TNO_OM      = 1B - Output marking
+	.LONG	retzclr		;TNO_TLN     = 1C - Terminal location number
+	.LONG	retzclr		;TNO_3270    = 1D - 3270 terminal mode
+	.LONG	retzclr		;TNO_X3PAD   = 1E - X.3-Pad mode
+	.LONG	retzclr		;TNO_NAWS    = 1F - Negotiate about window size
+	.LONG	retzclr		;TNO_SPEED   = 20 - Terminal speed option
+	.LONG	optcmdtfc	;TNO_TFC     = 21 - Toggle flow control
+	.LONG	retzclr		;TNO_LM      = 22 - Line mode
+	.LONG	retzclr		;TNO_XLOC    = 23 - X-display location
+	.LONG	retzclr		;	     = 24 - Reserved
+	.LONG	retzclr		;	     = 25 - Reserved
+	.LONG	retzclr		;	     = 26 - Reserved
+	.LONG	retzclr		;	     = 27 - Reserved
+	.LONG	retzclr		;	     = 28 - Reserved
+	.LONG	retzclr		;	     = 29 - Reserved
+	.LONG	retzclr		;	     = 2A - Reserved
+	.LONG	retzclr		;	     = 2B - Reserved
+	.LONG	retzclr		;	     = 2C - Reserved
+	.LONG	retzclr		;	     = 2D - Reserved
+	.LONG	retzclr		;	     = 2E - Reserved
+	.LONG	retzclr		;	     = 2F - Reserved
+	.LONG	optcmdxosm	;TNO_XOSMODE = 30 - XOS mode
+
+;Subnegotiation dispatch table
+
+subtbl:	.LONG	cmddone		;TNO_BINARY  = 00 - Binary transmission
+	.LONG	cmddone		;TNO_ECHO    = 01 - Echo
+	.LONG	cmddone		;TNO_RCP     = 02 - Reconnection
+	.LONG	cmddone		;TNO_SUPGA   = 03 - Suppress go ahead
+	.LONG	cmddone		;TNO_NAMS    = 04 - Approx message size
+				;		      negotiation
+	.LONG	cmddone		;TNO_STATUS  = 05 - Status
+	.LONG	cmddone		;TNO_MARK    = 06 - Timing mark
+	.LONG	cmddone		;TNO_RCTE    = 07 - Remote controlled transmission
+				;		      and echo
+	.LONG	cmddone		;TNO_OLW     = 08 - Output line width
+	.LONG	cmddone		;TNO_OPS     = 09 - Output page size
+	.LONG	cmddone		;TNO_OCRD    = 0A - Output carriage-return
+				;		      disposition
+	.LONG	cmddone		;TNO_OHTS    = 0B - Output horizontal tab stops
+	.LONG	cmddone		;TNO_OHTD    = 0C - Output horizontal tab
+				;		      disposition
+	.LONG	cmddone		;TNO_OFFD    = 0D - Output form-feed disposition
+	.LONG	cmddone		;TNO_OVTS    = 0E - Output vertical tab stops
+	.LONG	cmddone		;TNO_OVTD    = 0F - Output vertical tab
+				;		      disposition
+	.LONG	cmddone		;TNO_OLFD    = 10 - Output linefeed disposition
+	.LONG	cmddone		;TNO_XASCII  = 11 - Extended ASCI
+	.LONG	cmddone		;TNO_LOGOUT  = 12 - Logout
+	.LONG	cmddone		;TNO_BM      = 13 - Byte macro
+	.LONG	cmddone		;TNO_DET     = 14 - Data entry terminal
+	.LONG	cmddone		;            = 15 - Reserved
+	.LONG	cmddone		;TNO_SUPDUP  = 16 - SUPDUP
+	.LONG	cmddone		;TNO_SDOUT   = 17 - SUPDUP output
+	.LONG	subterm		;TNO_TERM    = 18 - Terminal type
+	.LONG	cmddone		;TNO_EOR     = 19 - End of record
+	.LONG	cmddone		;TNO_TACACS  = 1A - TACACS user identification
+	.LONG	cmddone		;TNO_OM      = 1B - Output marking
+	.LONG	cmddone		;TNO_TLN     = 1C - Terminal location number
+	.LONG	cmddone		;TNO_3270    = 1D - 3270 terminal mode
+	.LONG	cmddone		;TNO_X3PAD   = 1E - X.3-Pad mode
+	.LONG	cmddone		;TNO_NAWS    = 1F - Negotiate about window size
+	.LONG	cmddone		;TNO_SPEED   = 20 - Terminal speed option
+	.LONG	subtfc		;TNO_TFC     = 21 - Toggle flow control
+	.LONG	cmddone		;TNO_LM      = 22 - Line mode
+	.LONG	cmddone		;TNO_XLOC    = 23 - X-display location
+	.LONG	cmddone		;	     = 24 - Reserved
+	.LONG	cmddone		;	     = 25 - Reserved
+	.LONG	cmddone		;	     = 26 - Reserved
+	.LONG	cmddone		;	     = 27 - Reserved
+	.LONG	cmddone		;	     = 28 - Reserved
+	.LONG	cmddone		;	     = 29 - Reserved
+	.LONG	cmddone		;	     = 2A - Reserved
+	.LONG	cmddone		;	     = 2B - Reserved
+	.LONG	cmddone		;	     = 2C - Reserved
+	.LONG	cmddone		;	     = 2D - Reserved
+	.LONG	cmddone		;	     = 2E - Reserved
+	.LONG	cmddone		;	     = 2F - Reserved
+	.LONG	subxosmd	;TNO_XOSMODE = 30 - XOS mode
+
+;Table of remote option states
+;	-1 = Option not supported (always negated)
+;	 0 = Option negated
+;	 1 = Option assersion requested
+;	 2 = Option asserted
+
+rmttbl:	.BYTE	-1		;TNO_BINARY  = 00 - Binary transmission
+	.BYTE	0		;TNO_ECHO    = 01 - Echo
+	.BYTE	-1		;TNO_RCP     = 02 - Reconnection
+	.BYTE	1		;TNO_SUPGA   = 03 - Suppress go ahead
+	.BYTE	-1		;TNO_NAMS    = 04 - Approx message size
+				;		      negotiation
+	.BYTE	0		;TNO_STATUS  = 05 - Status
+	.BYTE	0		;TNO_MARK    = 06 - Timing mark
+	.BYTE	0		;TNO_RCTE    = 07 - Remote controlled trans and
+				;		      echo
+	.BYTE	0		;TNO_OLW     = 08 - Output line width
+	.BYTE	0		;TNO_OPS     = 09 - Output page size
+	.BYTE	-1		;TNO_OCRD    = 0A - Output carriage-return
+				;		      disposition
+	.BYTE	-1		;TNO_OHTS    = 0B - Output horizontal tab stops
+	.BYTE	-1		;TNO_OHTD    = 0C - Output horizontal tab
+				;		      disposition
+	.BYTE	-1		;TNO_OFFD    = 0D - Output formfeed disposition
+	.BYTE	-1		;TNO_OVTS    = 0E - Output vertical tab stops
+	.BYTE	-1		;TNO_OVTD    = 0F - Output vertical tab
+				;		      disposition
+	.BYTE	-1		;TNO_OLFD    = 10 - Output linefeed disposition
+	.BYTE	-1		;TNO_XASCII  = 11 - Extended ASCII
+	.BYTE	0		;TNO_LOGOUT  = 12 - Logout
+	.BYTE	-1		;TNO_BM      = 13 - Byte macro
+	.BYTE	-1		;TNO_DET     = 14 - Data entry terminal
+	.BYTE	-1		;            = 15 - Reserved
+	.BYTE	-1		;TNO_SUPDUP  = 16 - SUPDUP
+	.BYTE	-1		;TNO_SDOUT   = 17 - SUPDUP output
+	.BYTE	0		;TNO_TERM    = 18 - Terminal type
+	.BYTE	0		;TNO_EOR     = 19 - End of record
+	.BYTE	-1		;TNO_TACACS  = 1A - TACACS user identification
+	.BYTE	-1		;TNO_OM      = 1B - Output marking
+	.BYTE	-1		;TNO_TLN     = 1C - Terminal location number
+	.BYTE	-1		;TNO_3270    = 1D - 3270 terminal mode
+	.BYTE	-1		;TNO_X3PAD   = 1E - X.3-Pad mode
+	.BYTE	-1		;TNO_NAWS    = 1F - Negotiate about window size
+	.BYTE	-1		;TNO_SPEED   = 20 - Terminal speed option
+	.BYTE	-1		;TNO_TFC     = 21 - Toggle flow control
+	.BYTE	-1		;TNO_LM      = 22 - Line mode
+	.BYTE	-1		;TNO_XLOC    = 23 - X-display location
+	.BYTE	-1		;	     = 24 - Reserved
+	.BYTE	-1		;	     = 25 - Reserved
+	.BYTE	-1		;	     = 26 - Reserved
+	.BYTE	-1		;	     = 27 - Reserved
+	.BYTE	-1		;	     = 28 - Reserved
+	.BYTE	-1		;	     = 29 - Reserved
+	.BYTE	-1		;	     = 2A - Reserved
+	.BYTE	-1		;	     = 2B - Reserved
+	.BYTE	-1		;	     = 2C - Reserved
+	.BYTE	-1		;	     = 2D - Reserved
+	.BYTE	-1		;	     = 2E - Reserved
+	.BYTE	-1		;	     = 2F - Reserved
+	.BYTE	0		;TNO_XOSMODE = 30 - XOS mode
+
+;Table of local option states
+;	-1 = Option not supported (always negated)
+;	 0 = Option negated
+;	 1 = Option assersion requested
+;	 2 = Option asserted
+
+lcltbl:	.BYTE	-1		;TNO_BINARY  = 00 - Binary transmission
+	.BYTE	0		;TNO_ECHO    = 01 - Echo
+	.BYTE	-1		;TNO_RCP     = 02 - Reconnection
+	.BYTE	0		;TNO_SUPGA   = 03 - Suppress go ahead
+	.BYTE	-1		;TNO_NAMS    = 04 - Approx message size
+				;		      negotiation
+	.BYTE	0		;TNO_STATUS  = 05 - Status
+	.BYTE	0		;TNO_MARK    = 06 - Timing mark
+	.BYTE	0		;TNO_RCTE    = 07 - Remote controlled transmission
+				;		      and echo
+	.BYTE	0		;TNO_OLW     = 08 - Output line width
+	.BYTE	0		;TNO_OPS     = 09 - Output page size
+	.BYTE	-1		;TNO_OCRD    = 0A - Output carriage-return
+				;		      disposition
+	.BYTE	-1		;TNO_OHTS    = 0B - Output horizontal tab stops
+	.BYTE	-1		;TNO_OHTD    = 0C - Output horizontal tab
+				;		      disposition
+	.BYTE	-1		;TNO_OFFD    = 0D - Output form-feed disposition
+	.BYTE	-1		;TNO_OVTS    = 0E - Output vertical tab stops
+	.BYTE	-1		;TNO_OVTD    = 0F - Output vertical tab
+				;		      disposition
+	.BYTE	-1		;TNO_OLFD    = 10 - Output linefeed disposition
+	.BYTE	-1		;TNO_XASCII  = 11 - Extended ASCII
+	.BYTE	-1		;TNO_LOGOUT  = 12 - Logout
+	.BYTE	-1		;TNO_BM      = 13 - Byte macro
+	.BYTE	-1		;TNO_DET     = 14 - Data entry terminal
+	.BYTE	-1		;            = 15 - Reserved
+	.BYTE	-1		;TNO_SUPDUP  = 16 - SUPDUP
+	.BYTE	-1		;TNO_SDOUT   = 17 - SUPDUP output
+	.BYTE	1		;TNO_TERM    = 18 - Terminal type
+	.BYTE	0		;TNO_EOR     = 19 - End of record
+	.BYTE	-1		;TNO_TACACS  = 1A - TACACS user identification
+	.BYTE	-1		;TNO_OM      = 1B - Output marking
+	.BYTE	-1		;TNO_TLN     = 1C - Terminal location number
+	.BYTE	-1		;TNO_3270    = 1D - 3270 terminal mode
+	.BYTE	-1		;TNO_X3PAD   = 1E - X.3-Pad mode
+	.BYTE	-1		;TNO_NAWS    = 1F - Negotiate about window size
+	.BYTE	-1		;TNO_SPEED   = 20 - Terminal speed option
+	.BYTE	0		;TNO_TFC     = 21 - Toggle flow control
+	.BYTE	-1		;TNO_LM      = 22 - Line mode
+	.BYTE	-1		;TNO_XLOC    = 23 - X-display location
+	.BYTE	-1		;	     = 24 - Reserved
+	.BYTE	-1		;	     = 25 - Reserved
+	.BYTE	-1		;	     = 26 - Reserved
+	.BYTE	-1		;	     = 27 - Reserved
+	.BYTE	-1		;	     = 28 - Reserved
+	.BYTE	-1		;	     = 29 - Reserved
+	.BYTE	-1		;	     = 2A - Reserved
+	.BYTE	-1		;	     = 2B - Reserved
+	.BYTE	-1		;	     = 2C - Reserved
+	.BYTE	-1		;	     = 2D - Reserved
+	.BYTE	-1		;	     = 2E - Reserved
+	.BYTE	-1		;	     = 2F - Reserved
+	.BYTE	0		;TNO_XOSMODE = 30 - XOS mode

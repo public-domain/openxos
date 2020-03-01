@@ -1,0 +1,198 @@
+	.TITLE	_mainalt - Special startup routines for C programs
+	.SBTTL	STDC run-time library for XOS
+
+;++++
+; This software is in the public domain.  It may be freely copied and used
+; for whatever purpose you see fit, including commerical uses.  Anyone
+; modifying this software may claim ownership of the modifications, but not
+; the complete derived code.  It would be appreciated if the authors were
+; told what this software is being used for, but this is not a requirement.
+
+;   THIS SOFTWARE IS PROVIDED BY THE AUTHORS "AS IS" AND ANY EXPRESS OR
+;   IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
+;   OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+;   IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+;   INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+;   BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS
+;   OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+;   ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR
+;   TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
+;   USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+;----
+
+	.INCLUD	XOSINC:\XMAC\XOS.PAR
+	.INCLUD	XOSINC:\XMAC\STDIO.PAR
+
+argmsect=!2000000h	;Offset for argument msect during set up
+
+;This routine contains the first code executed when a C program is started
+;  after it is loaded.
+
+	.STDSEGS
+	.LNKSEG	_TEXT_s, DGROUP_s
+	.PSECT	_BEGIN_p, DGROUP_m
+_clib_begin::
+	.ENTRY	_clib_stack
+	.STACK	_clib_stack
+	.BLKL	128t		;Stack
+_clib_stack::
+
+	.PSECT	_HEAP_p , DGROUP_m
+_clib_heap::
+
+	.PSECT	_DATA_p
+	.ENTRY	_clib_membase
+_clib_membase::			;These 3 items must be in this order!
+	.LONG	_clib_begin	;Offset of start of base msect
+_clib_mempnt::
+	.LONG	_clib_heap	;Memory allocation pointer
+_clib_memtop::
+	.LONG	0		;Top of memory offset
+_argc::	.LONG	0
+_argv::	.LONG	0
+
+maemsg:	.ASCIZ	"? Memory allocation error"{CR,LF}
+strmsg:	.ASCIZ	"? Stream initialization error"{CR,LF}
+
+	.PSECT	_TEXT_p
+
+$$$=!0
+FRM mn_numchr, 4t
+FRM mn_pntadj, 4t
+mn_SIZE=!$$$
+
+;This is the first instruction executed for the process - when get here the
+;  registers are set up as follows:
+;	c{ES:EDI} = Address of argument data
+;	c{SI:0}   = Address of lowest available memory
+
+	.PSECT	_TEXT_p
+
+	.START	_main
+	.ENTRY	_mainalt
+_cstart_::
+_main::
+_mainalt:
+	PUSHL	#!_DATA_p
+	POPL	DS
+	ENTER	mn_SIZE, 0		;Allocate stack frame
+	PUSHL	DS			;Allocate additional memory for our
+	PUSHL	#_STACKBASE		;  stack but make it all virtual
+	PUSHL	#0Bh.B
+	PUSHL	#_clib_begin-_STACKBASE;
+	CALLF	svcMemChange#
+	TESTL	EAX, EAX
+	JS	$mainmb.S		;If can't get more space for the stack!
+	PUSHL	DS			;See how big we are
+	PUSHL	#_clib_begin
+	PUSHL	#0.B
+	PUSHL	#-1.B
+	CALLF	svcMemChange#
+	TESTL	EAX, EAX
+	JNS	2$.S			;This should not fail!
+$mainmb::
+	MOVL	EDI, #maemsg		;Memory allocation failure
+mainfl:	PUSHL	#DH_STDTRM.B
+	PUSHL	DS
+	PUSHL	EDI
+	PUSHL	#0.B
+	CALLF	svcIoOutString#
+	PUSHL	#1.B
+	CALLF	svcSchExit#
+
+strmerr:
+	LEAL	EDI, strmsg		;Stream initialization error
+	JMP	mainfl			;Now exit
+
+;Here with memory allocation determined
+
+2$:	ADDL	EAX, #_clib_begin	;Get offset for top
+	MOVL	_clib_memtop, EAX	;Remember allocated top of memory
+
+;Now we move the argument msect into our base data segment at 32M (which
+;  seems like a safe place to put it!)
+
+	MOVL	EAX, #argmsect		;Fix up the argument data header to
+	ADDL	ES:[EDI], EAX		;  contain real pointers
+	ADDL	ES:8t.B[EDI], EAX
+	PUSHL	EAX			;Push argument for main (offset of
+	PUSHL	DS			;  argumnet msect)
+	PUSHL	EAX			;Move the argument data into our segment
+	PUSHL	ES
+	PUSHL	EDI
+	CALLF	svcMemMove#
+	TESTL	EAX, EAX
+	JS	$mainmb.S		;This should not fail!
+	PUSHL	ES			;Give up the argument segment (which is
+	CALLF	svcMemRemove#		;  now empty)
+
+;Here with the command line arguments set up - now initialize the standard
+;  IO streams
+
+	PUSHL	#_stdin#		;Setup stdin
+	CALL	_fsetup#
+	POPL	EBX			;Dump parameter
+	TESTL	EAX, EAX		;Any error?
+	JS	strmerr			;Yes, error in setting up stream
+
+	PUSHL	#_stdout#		;Setup stdout
+	CALL	_fsetup#
+	POPL	EBX			;Dump parameter
+	TESTL	EAX, EAX		;Any error?
+	JS	strmerr			;Yes, error in setting up stream
+
+	PUSHL	#_stderr#		;Setup stderr
+	CALL	_fsetup#
+	POPL	EBX			;Dump parameter
+	TESTL	EAX, EAX		;Any error?
+	JS	strmerr			;Yes, error in setting up stream
+
+	PUSHL	#_stdtrm#		;Setup stdtrm
+	CALL	_fsetup#
+	POPL	EBX			;Dump parameter
+	TESTL	EAX, EAX		;Any error?
+	JS	strmerr			;Yes, error in setting up stream
+
+;Here with all set up complete - now call the user's program
+
+	CALL	mainalt#		;Call main program
+	PUSHL	EAX			;Return value is exit status
+	CALL	exit#			;Go exit
+.PAGE
+	.SBTTL	Common error returns
+
+;Error return for functions which have a stack frame and have saved both
+;  EDI and ESI and ESI points to the IOB
+
+$errorrtnlvp2x::
+	MOVL	iob_error.B[ESI], EAX
+$errorrtnlvp2::
+	NEGL	EAX			;Make positive for errno
+	MOVL	errno#, EAX
+	MOVL	EAX, #-1
+	LEAVE
+	POPL	EDI
+	POPL	ESI
+	RET	
+
+$errorrtnlv::
+	LEAVE
+$errorrtn::
+	NEGL	EAX			;Make positive for errno
+	MOVL	errno#, EAX
+	MOVL	EAX, #-1
+	RET
+
+;Error return for functions which do not have stack frame and have saved ESI
+;  only
+
+$errorrtnp1x::
+	MOVL	iob_error.B[ESI], EAX
+$errorrtnp1::
+	NEGL	EAX			;Make positive for errno
+	MOVL	errno#, EAX
+	MOVL	EAX, #-1
+	POPL	ESI
+	RET	
+
+	.END

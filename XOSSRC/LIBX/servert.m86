@@ -1,0 +1,961 @@
+	.TITLE	SERVERT
+
+;++++
+; This software is in the public domain.  It may be freely copied and used
+; for whatever purpose you see fit, including commerical uses.  Anyone
+; modifying this software may claim ownership of the modifications, but not
+; the complete derived code.  It would be appreciated if the authors were
+; told what this software is being used for, but this is not a requirement.
+
+;   THIS SOFTWARE IS PROVIDED BY THE AUTHORS "AS IS" AND ANY EXPRESS OR
+;   IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
+;   OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+;   IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+;   INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+;   BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS
+;   OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+;   ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR
+;   TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
+;   USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+;----
+
+	.PROC	80386
+
+	.INCLUD	XOSINC:\XMAC\STDIO.PAR
+	.INCLUD	XOSINC:\XMAC\CTYPE.PAR
+	.INCLUD	XOSINC:\XMAC\PROCARG.PAR
+	.INCLUD	XOSINC:\XMAC\XOS.PAR
+	.INCLUD	XOSINC:\XMAC\XOSERR.PAR
+	.INCLUD	XOSINC:\XMAC\XOSTIME.PAR
+	.INCLUD XOSINC:\XMAC\XOSTHREADS.PAR
+	.INCLUD	SERVERT.INC
+
+	.STDSEGS
+
+	.PSECT	_TEXT_p
+
+argmsect:.LONG	0
+
+kwunit:    .ASCIZ "UNIT"
+kwloglevel:.ASCIZ "LOGLEVEL"
+kwlogfile: .ASCIZ "LOGFILE"
+kwdbglevel:.ASCIZ "DEBUGLEVEL"
+kwdbgfile: .ASCIZ "DEBUGFILE"
+
+	.MOD	4
+keyword:.LONG	kwunit    , ASF$VALREQ|ASF$NVAL , 0, fncunit    , 0
+	.LONG	kwloglevel, ASF$VALREQ|ASF$NVAL , 0, fncloglevel, 0
+	.LONG	kwlogfile , ASF$VALREQ|ASF$LSVAL, 0, fnclogfile , 0
+	.LONG   kwdbglevel, ASF$VALREQ|ASF$NVAL , 0, fncdbglevel, 0
+	.LONG   kwdbgfile , ASF$VALREQ|ASF$LSVAL, 0, fncdbgfile , 0
+	.LONG	0
+
+	.SBTTL	srvInitialize - Function to initialize the server manager
+
+;Function to initialize the server manager
+;	char *args;		// altmain argument string
+;	void *membase;		// Address of data area for command thread
+;	long  vectbase;		// Base vector to use
+;	long  numthrds;		// Number of threads to allow
+
+arg_args    =!16t
+arg_basemem =!20t
+arg_basesize=!24t
+arg_vectbase=!28t
+arg_numthrds=!32t
+arg_majver  =!36t
+arg_minver  =!40t
+arg_editnum =!44t
+
+	.ENTRY	srvInitialize
+
+srvInitialize:
+	PUSHL	EDI
+	PUSHL	ESI
+	PUSHL	EBP
+	MOVL	EBP, ESP
+	MOVL	ESI, arg_args.B[EBP]	;Get offset of argument msect
+	MOVL	argmsect, ESI
+	PUSHL	#srvReqName
+	PUSHL	ESI
+	CALL	getreqname#		;Process requestor name argument
+	ADDL	ESP, #8.B
+	MOVL	argpntr, EAX		;Store argument offset for procarg
+	PUSHL	#0.B			;No default extension for indirect file
+	PUSHL	#0.B			;No next line function
+	PUSHL	#argerr			;Error function
+	PUSHL	#0.B			;Function called for non-keyword args
+	PUSHL	#keyword		;Offset of keyword table
+	PUSHL	#0.B			;Offset of option table
+	PUSHL	#PAF$INDIRECT|PAF$EATQUOTE ;Flag bits
+	PUSHL	#argpntr		;Offset of arg string pointer
+	CALL	procarg#		;Process arguments
+	ADDL	ESP, #32t.B
+	PUSHL	DS			;Give up the argument data
+	PUSHL	argmsect
+	PUSHL	#0.B
+	PUSHL	#0.B
+	CALLF	svcMemChange##
+	SUBL	ESP, #50t.B
+	MOVL	EDI, ESP
+	PUSHL	srvUnitNum
+	PUSHL	srvSrvName
+	PUSHL	#prnmfmt
+	PUSHL	EDI
+	CALL	sprintf
+	PUSHL	DS			;Change our process name
+	PUSHL	EDI
+	CALLF	svcSysSetPName##
+	PUSHL	srvUnitNum		;Put unit number in the IPM device name
+	PUSHL	srvPrgName
+	PUSHL	#ipmnmfmt
+	PUSHL	EDI
+	CALL	sprintf
+	PUSHL	#31t			;Store the IPM destination name for
+	LEAL	EAX, 4.B[EDI]		;  the server's use
+	PUSHL	EAX
+	PUSHL	#srvIpmName
+	CALL	strncpy#
+	ADDL	ESP, #12t.B
+	PUSHL	#O$IN|O$OUT		;Open the message device
+	PUSHL	DS
+	PUSHL	EDI
+	PUSHL	#0.B
+	PUSHL	#0.B
+	CALLF	svcIoOpen##
+	ADDL	ESP, #82t.B
+	TESTL	EAX, EAX
+	JNS	10$.S
+	MOVL	EDX, #opmdfmt
+	CMPL	EAX, #ER_ALDEF
+	JNE	6$.S
+	CLRL	EAX
+	MOVL	EDX, #alrnfmt
+6$:	SUBL	ESP, #100t.B
+	MOVL	ESI, ESP
+	PUSHL	EAX
+	PUSHL	srvUnitNum
+	PUSHL	EDX
+	PUSHL	ESI
+	CALL	sprintf#
+	ADDL	ESP, #12t.B
+	POPL	EAX
+	MOVL	EBX, ESI
+8$:	JMP	fail2
+
+;Here with message device open
+
+10$:	MOVL	msghndl, EAX
+	CMPL	srvDebugLevel, #0	;Debug level specified?
+	JE	cmddone.S		;No - go on
+	CMPL	dbgname, #0.B		;Yes - was a log file specified?
+	JNE	12$.S			;Yes
+	MOVL	srvDebugStream, #_stdout# ;No - use stdout
+	JMP	cmddone.S
+
+;Here if a debug file was specified
+
+12$:	PUSHL	#logmode
+	PUSHL	dbgname
+	CALL	fopen#
+	ADDL	ESP, #8t.B
+	MOVL	srvDebugStream, EAX	;Store stream pointer
+	MOVL	EBX, #nologmsg
+	TESTL	EAX, EAX		;Error?
+	JS	8$.S			;Yes
+					;No - fall into cmddone on next page
+.PAGE
+;Here with all command line processing done
+
+cmddone:MOVL	EAX, arg_majver.B[EBP]
+	MOVL	majver, EAX
+	MOVL	EAX, arg_minver.B[EBP]
+	MOVL	minver, EAX
+	MOVL	EAX, arg_editnum.B[EBP]
+	MOVL	editnum, EAX
+	MOVL	srvMsgDst, #cmdsrcbfr
+
+;Initialize the thread routines
+
+	PUSHL	arg_numthrds.B[EBP]
+	PUSHL	arg_vectbase.B[EBP]
+	MOVL	EAX, arg_basemem.B[EBP]	;Get offset of bottom of the base
+					;  thread's stack + TDB area
+	MOVL	ECX, arg_basesize.B[EBP] ;Get size of the area
+	SUBL	ECX, #tdb_SIZE.B	;Minus size of the TDB give the stack
+	ADDL	EAX, ECX		;  size
+	PUSHL	EAX			;Offset for TDB (at top of area)
+	PUSHL	ECX			;Stack size
+	PUSHL	#tdb_SIZE.B		;Data size (just the TDB)
+	CALLF	thdCtlInitialize#
+
+;	long far thdCtlInitialize(maxnum, vectbase, membase, stksize, datasize);
+
+	TESTL	EAX, EAX
+	MOVL	EBX, #thdemsg
+	JS	fail2			;If error
+
+	CALLI	_srvSetup1
+	PUSHL	srvUnitNum
+	PUSHL	editnum
+	PUSHL	minver
+	PUSHL	majver
+	PUSHL	srvPrgName
+	PUSHL	#finalfmt		;Construct final response message
+	PUSHL	#msgbfr
+	CALL	sprintf#
+	ADDL	ESP, #28t.B
+	MOVL	EDI, #msgbfr
+	MOVL	ECX, EAX
+	CALL	response
+	CALLI	_srvSetup2
+	JMP	mloop
+
+;Function to report general failure during set up
+;	long  code;			// Error code
+;	char *msg1;			// First message text string
+;	char *msg2;			// Second message text string
+;	void srvSetupFail(code, msg1, msg2);
+;  Never returns!
+
+srvSetupFail::
+	MOVL	EAX, 4t.B[ESP]		;Get error code
+	TESTL	EAX, EAX		;Was it specified?
+	JNE	2$.S			;Yes
+	MOVL	EAX, 12t.B[ESP]		;No - get offset of second message line
+2$:	MOVL	EBX, 8t.B[ESP]		;Get offset of first message line
+	JMP	4$.S
+
+srvVectFail::
+	MOVL	EAX, 4t.B[ESP]
+srvVectFailR::
+	MOVL	EBX, #sivfmsg
+	JMP	4$.S
+
+sivfmsg:.ASCIZ 	"Cannot initialize signal vector"
+
+srvAlarmFail::
+	MOVL	EAX, 4t.B[ESP]
+srvAlarmFailR::
+	MOVL	EBX, #safmsg
+4$:	JMP	fail2
+
+safmsg:	.ASCIZ	"Cannot set up for alarm signal"
+.PAGE
+;Here if can't get memory during set up
+
+nema:	MOVL	EBX, #nemamsg
+
+;Here if have fatal error during set up
+;	c{EBX} = Offset of first message string
+;	c{EAX} = Offset of second message string or negative error code
+
+fail1:	CLRL	EAX
+fail2:	SUBL	ESP, #500t		;Allocate a buffer
+	PUSHL	DS
+	POPL	ES
+	MOVL	EDI, ESP
+	TESTL	EAX, EAX		;Need two lines?
+	JNE	2$.S			;Yes
+	PUSHL	EBX
+	PUSHL	srvPrgName
+	PUSHL	#fail1fmt
+	JMP	6$.S
+
+2$:	JNS	4$.S			;If second line is a string
+	SUBL	ESP, #100t.B		;Its an error code - allocate buffer
+	MOVL	ESI, ESP
+	PUSHL	EAX			;Get message
+	PUSHL	#3.B
+	PUSHL	DS
+	PUSHL	ESI
+	CALLF	svcSysErrMsg##
+	MOVL	EAX, ESI
+4$:	PUSHL	EAX
+	PUSHL	#nullstr
+	PUSHL	srvPrgName
+	CALL	strlen#
+	POPL	ECX
+	PUSHL	EAX
+	PUSHL	EBX
+	PUSHL	srvPrgName
+	PUSHL	#fail2fmt
+6$:	PUSHL	EDI
+	CALL	sprintf#
+	MOVL	ECX, EAX
+	CALL	response
+	PUSHL	#1.B
+	CALLF	svcSchExit##
+.PAGE
+	.SBTTL	argerr - Function called by procarg on errors
+
+;Function called by procarg on errors
+
+argerr:	POPL	EAX			;Discard return address
+	POPL	EBX			;Get offset of first message string
+	POPL	EAX			;Get offset of second message string
+	JMP	fail2.S
+.PAGE
+	.SBTTL	fnccommand - Function to process command keyword
+
+;Function to process the ADD, REMOVE, STATUS, ENABLE, and DISABLE keywords
+
+fnccommand:
+	CMPL	srvCmdPnt, #0.B
+	JNE	2$.S
+	MOVL	EBX, 4.B[ESP]		;Get offset of the argument data
+	MOVL	EAX, argdata_data.B[EBX] ;Get offset of routine
+	MOVL	srvCmdPnt, EAX		;Save it
+	CLRL	EAX
+	INCL	EAX
+	RET
+
+;Here if more than one command given
+
+2$:	PUSHL	#mltcmmsg
+	CALL	srvCmdResponse
+	POPL	EAX
+	CLRL	EAX
+	RET
+.PAGE
+	.SBTTL	fncunit - Function to process UNIT keyword
+
+;Function to process the UNIT keyword - this specifies the unit number for
+;  the server
+
+fncunit:MOVL	EBX, 4.B[ESP]		;Get offset of the argument data
+	MOVL	EAX, argdata_value.B[EBX] ;Get value
+	MOVL	srvUnitNum, EAX		;Store it
+4$:	CLRL	EAX
+	INCL	EAX
+	RET
+.PAGE
+	.SBTTL	fnclogfile - Function to process the LOGFILE keyword
+
+;Function to process the LOGFILE keyword - this specifies the logging file
+
+fnclogfile:
+	PUSHL	EDI
+	MOVL	EDI, #srvLogName
+	PUSHL	ESI
+	MOVL	ESI, 12t.B[ESP]
+	MOVL	EAX, argdata_length.B[ESI]
+	ADDL	EAX, #4t.B		;Allocate enough memory to hold the
+	PUSHL	EAX			;  string plus a little more to hold
+	CALL	sbrk#			;  any characters we append to it
+	POPL	ECX
+	CMPL	EAX, #-1.B
+	JE	nema			;If can't allocate the memory
+	MOVL	[EDI], EAX		;OK - store offset of memory allocated
+	MOVL	EDI, EAX
+strit:	MOVL	ECX, argdata_length.B[ESI] ;Get length of string
+	MOVL	ESI, argdata_value.B[ESI] ;Get offset of string
+	PUSHL	DS
+	POPL	ES
+	CLD
+	INCL	ECX			;Include the final null
+	RMOVSB	[EDI], [ESI]		;Copy the string
+	MOVL	EAX, #1
+10$:	POPL	ESI
+	POPL	EDI
+	RET
+.PAGE
+	.SBTTL	fncdbgfile - Function to process the DEBUGFILE keyword
+
+;Function to process the DEBUGFILE keyword - this specifies the logging file
+
+fncdbgfile:
+	PUSHL	EDI
+	MOVL	EDI, #dbgname
+	PUSHL	ESI
+	MOVL	ESI, 12t.B[ESP]
+	MOVL	EAX, argdata_length.B[ESI]
+	ADDL	EAX, #4t.B		;Allocate enough memory to hold the
+	PUSHL	EAX			;  string plus a little more to hold
+	CALL	sbrk#			;  any characters we append to it
+	POPL	ECX
+	CMPL	EAX, #-1.B
+	JE	nema			;If can't allocate the memory
+	MOVL	[EDI], EAX		;OK - store offset of memory allocated
+	MOVL	EDI, EAX
+	MOVL	ECX, argdata_length.B[ESI] ;Get length of string
+	MOVL	ESI, argdata_value.B[ESI] ;Get offset of string
+	PUSHL	DS
+	POPL	ES
+	CLD
+	INCL	ECX			;Include the final null
+	RMOVSB	[EDI], [ESI]		;Copy the string
+	MOVL	EAX, #1
+10$:	POPL	ESI
+	POPL	EDI
+	RET
+.PAGE
+	.SBTTL	fncloglevel - Function to process the LOGLEVEL keyword
+
+;Function to process the LOGLEVEL keyword - this specifies the number logging
+;  level
+
+fncloglevel:
+	MOVL	EBX, #srvLogLevel
+	JMP	4$.S
+
+;Function to process the DEBUGLEVEL keyword - this specifies the number logging
+;  level
+
+fncdbglevel:
+	MOVL	EBX, #srvDebugLevel
+4$:	MOVL	EAX, 4.B[ESP]
+	MOVL	EAX, argdata_value.B[EAX]
+	MOVB	[EBX], AL
+	MOVL	EAX, #1
+	RET
+.PAGE
+	.SBTTL	getimem - Subroutine to allocate memory during set up
+
+;Subroutine to allocate memory during set up
+;	c{EAX} = Amount needed
+;	CALL	getimem
+;	c{EDI} = Offset of memory obtained
+
+getimem:
+	PUSHL	EAX
+	CALL	sbrk#
+	POPL	EDI
+	CMPL	EAX, #-1.B
+	JE	4$.S
+	MOVL	EDI, EAX
+	RET
+
+4$:	MOVL	EBX, #nemamsg
+	JMP	fail1
+.PAGE
+	.SBTTL	response - Subroutine to generate start-up response message
+
+;Subroutine to generate start-up response message
+;	c{EDI} = Offset of message
+;	c{ECX} = Length of message
+;	CALL	response
+
+response:
+	CMPB	srvReqName, #0		;Running from a terminal?
+	JNE	2$.S			;No - go on
+	INCL	EDI			;Yes - output message to the terminal
+	DECL	ECX
+	PUSHL	#DH_STDERR.B
+	PUSHL	DS
+	PUSHL	EDI
+	PUSHL	ECX
+	CALLF	svcIoOutBlock##
+	PUSHL	#DH_STDERR.B
+	PUSHL	DS
+	PUSHL	#crlfmsg
+	PUSHL	#0.B
+	CALLF	svcIoOutString##
+	RET
+
+;Here if not running from a terminal - send response message to requestor
+
+2$:	CMPL	msghndl, #0.B		;Is the message device open?
+	JNE	4$.S			;Yes - us it
+	PUSHL	#O$IN|O$OUT.B		;No - must open it now
+	PUSHL	DS
+	PUSHL	#msgname
+	PUSHL	#0.B
+	PUSHL	#0.B
+	CALLF	svcIoOpen##
+	TESTL	EAX, EAX
+	JS	ret040.S
+	MOVL	msghndl, EAX
+4$:	PUSHL	msghndl
+	PUSHL	DS
+	PUSHL	EDI
+	PUSHL	ECX
+	PUSHL	DS
+	PUSHL	#msgparms
+	CALLF	svcIoOutBlockP##
+ret040:	RET
+.PAGE
+	.SBTTL	Main program loop
+
+mloop:	PUSHL	msghndl			;Read a message
+	PUSHL	DS
+	PUSHL	#cmdmsgbfr
+	PUSHL	#MSGBFRSIZE
+	PUSHL	DS
+	PUSHL	#cmdmsginpparms
+	CALLF	thdIoInBlockP#
+	TESTL	EAX, EAX
+	JNS	4$.S
+	PUSHL	#eqiimsg		;If error - log the error and
+	PUSHL	EAX			;  terminate the thread - it is
+	CALL	srvLogSysLog		;  to just ignore the eror, but this
+	ADDL	ESP, #8t.B		;  would be likely to cause a tight
+	HLT				;  loop!!
+
+;Here if error setting up the thread manager
+
+2$:	HLT
+
+;Here with good message input
+
+4$:	JE	mloop.S
+	MOVL	ESI, #cmdmsgbfr
+	CMPB	[ESI], #MT_SRVCMD	;Is this message a server command?
+	JE	6$.S			;Yes
+	PUSHL	EAX
+	PUSHL	ESI
+	CALLI	_srvMessage		;No - give it directly to the program
+	ADDL	ESP, #8t.B
+	JMP	mloop.S			;Continue
+
+;Here with a server command message
+
+6$:	MOVL	cmdpntr, ESI
+	MOVL	[ESI+EAX], #0
+	MOVL	srvCmdPnt, #0	
+	INCL	ESI
+	CLRL	EAX
+	CLRL	ECX
+	CLD
+8$:	LODSB	[ESI]			;Find end of the command keyword
+	INCL	ECX
+	TESTB	_chrtbl#[EAX], #CT$DIGIT|CT$PUNCT|CT$UPPER|CT$LOWER
+	JNE	8$.S
+	CMPL	ECX, #2
+	JBE	16$
+	MOVB	-1.B[ESI], #0
+	CALLI	_srvSetupCmd		;Call the program's set up routine
+	PUSHL	#0.B			;No default extension for indirect file
+	PUSHL	#0.B			;No next line function
+	PUSHL	#srvCmdError		;Error function
+	PUSHL	#0.B			;Function called for non-keyword args
+	PUSHL	_srvCmdWord		;Offset of keyword table
+	PUSHL	#0.B			;Offset of option table
+	PUSHL	#PAF$INDIRECT|PAF$EATQUOTE ;Flag bits
+	PUSHL	#cmdpntr		;Offset of arg string pointer
+	CALL	procarg#		;Process arguments
+	ADDL	ESP, #32t.B
+	TESTL	EAX, EAX
+	JE	14$.S			;If error
+	MOVL	EDI, srvCmdPnt		;OK - get offset of command routine
+	TESTL	EDI, EDI
+	JE	16$.S			;If none (illegal command)
+	CLRL	EAX
+	CLD
+12$:	LODSB	[ESI]			 ;Skip possible whitespace following the
+	TESTB	_chrtbl#[EAX], #CT$SPACE ;  command keyword
+	JNE	12$.S
+	DECL	ESI
+	PUSHL	ESI
+	CALLI	EDI			;Call the program's command routine
+	POPL	ECX
+14$:	CALLI	_srvFinishCmd		;Call the programs's clean-up routine
+	JMP	mloop			;OK - finished
+	
+;Here if can't find a command keyword in the message
+
+16$:	SUBL	ESP, #100t
+	MOVL	EDI, ESP
+	PUSHL	srvPrgName
+	PUSHL	#nocmfmt
+	PUSHL	EDI
+	CALL	sprintf#
+	PUSHL	EDI
+	CALL	srvCmdResponse
+	ADDL	ESP, #116t.B
+	JMP	mloop
+
+nocmfmt:.ASCIZ	{MT_FINALERR}"? %s: No command specified"
+eqiimsg:.ASCIZ	"? (SRVMAIN) Error queueing IPM input"
+.PAGE
+	.SBTTL	srvFncCommand - Function to process command keyword
+
+;Function to process the command keyword
+
+srvFncCommand::
+	MOVL	EBX, 4.B[ESP]		;Get offset of the argument data
+	MOVL	EAX, argdata_data.B[EBX] ;Get offset of routine
+	MOVL	srvCmdPnt, EAX		;Save it
+	CLRL	EAX
+	INCL	EAX
+	RET
+.PAGE
+	.SBTTL	srvCmdError - Function to process procarg detected errors
+
+;Function to process procarg detected errors
+;	CALL	srvCmdError
+
+srvCmdError::
+	PUSHL	EBP
+	PUSHL	EDI
+	MOVL	EBP, ESP
+	SUBL	ESP, #200t
+	MOVL	EDI, ESP
+	PUSHL	12t.B[EBP]
+	PUSHL	srvPrgName
+	PUSHL	#cer1fmt
+	PUSHL	EDI
+	CALL	sprintf#
+	ADDL	ESP, #16t.B
+	ADDL	EDI, EAX
+	MOVL	EAX, 16t.B[EBP]		;Get offset of second line
+	TESTL	EAX, EAX
+	JE	4$.S			;If no second line
+	PUSHL	EAX
+	PUSHL	#nullstr
+	PUSHL	srvPrgName
+	CALL	strlen#
+	POPL	ECX
+	PUSHL	EAX
+	PUSHL	#cer2fmt
+	PUSHL	EDI
+	CALL	sprintf#
+	ADDL	ESP, #20t.B
+4$:	MOVL	EAX, ESP
+	PUSHL	srvMsgDst
+	PUSHL	EAX
+	CALL	srvCmdResponse
+	MOVL	ESP, EBP
+	POPL	EDI
+	POPL	EBP
+	RET
+
+cer1fmt:.ASCIZ	{MT_FINALERR}"? %s: %s"
+cer2fmt:.ASCIZ	{LF}"%*s    %s"
+.PAGE
+
+srvCmdErrorRespLog::
+	PUSHL	EDI
+	PUSHL	ESI
+	MOVL	ESI, #srvCmdResponseLog
+	JMP	2$.S
+
+;Function to handle command error during use
+;	long  code;		// XOS error code
+;	char *msg1;		// Offset of first message string
+;	char *msg2;		// Offset of second message string (ignored
+;				//   if code is not 0)
+;	char *dst;		// Destination string
+;	void srvCmdErrorResp(code, msg1, msg2, dst);
+
+err_code=!16t
+err_msg1=!20t
+err_msg2=!24t
+err_dst =!28t
+err_list=!32t
+
+$$$=!0
+FRM err_buf0, 200t
+FRM err_buf1, 200t
+FRM err_buf2, 200t
+err_SIZE=!$$$
+
+srvCmdErrorResp::
+	PUSHL	EDI
+	PUSHL	ESI
+	MOVL	ESI, #srvCmdResponse
+2$:	ENTER	err_SIZE, 0
+	LEAL	EAX, err_list.B[EBP]
+	PUSHL	EAX
+	PUSHL	err_msg1.B[EBP]
+	LEAL	EAX, err_buf0[EBP]
+	PUSHL	EAX
+	CALL	vsprintf#
+	ADDL	ESP, #12t.B
+	MOVL	EAX, err_code.B[EBP]	;Need two lines?
+	ORL	EAX, err_msg2.B[EBP]
+	JNE	4$.S			;Yes
+	LEAL	EAX, err_buf0[EBP]	;No
+	PUSHL	EAX
+	PUSHL	srvPrgName
+	PUSHL	#fail1fmt
+	JMP	10$.S
+
+;Here if need 2 lines
+
+4$:	MOVL	EDI, err_msg2.B[EBP]
+	CMPL	err_code.B[EBP], #0.B	;Do we have an error code?
+	JE	8$.S			;No
+	LEAL	EDI, err_buf2[EBP]	;Yes
+	PUSHL	err_code.B[EBP]		;Get message
+	PUSHL	#3.B
+	PUSHL	DS
+	PUSHL	EDI
+	CALLF	svcSysErrMsg##
+8$:	PUSHL	EDI
+	PUSHL	#nullstr
+	PUSHL	srvPrgName
+	CALL	strlen#
+	POPL	ECX
+	PUSHL	EAX
+	LEAL	EAX, err_buf0[EBP]
+	PUSHL	EAX
+	PUSHL	srvPrgName
+	PUSHL	#fail2fmt
+10$:	LEAL	EDI, err_buf1[EBP]
+	PUSHL	EDI
+	CALL	sprintf#
+	PUSHL	err_dst.B[EBP]
+	PUSHL	EDI
+	CALLI	ESI
+	LEAVE
+	POPL	ESI
+	POPL	EDI
+	RET
+
+fail1fmt: .ASCIZ {MT_FINALERR}"? %s: %s"
+fail2fmt: .ASCIZ {MT_FINALERR}"? %s: %s"{CR,LF}"  %*s  %s"
+.PAGE
+	.SBTTL	srvCmdResponseLog - Subroutine to generate and log command response message
+
+;Subroutine to generate and log command response message
+;	char *msg;		// Message string
+;	char *dst;		// Destination string
+;	void srvCmdResponseLog(msg, dst);
+
+srvCmdResponseLog::
+	PUSHL	EDI
+	MOVL	EDI, 8.B[ESP]
+	LEAL	EAX, 1.B[EDI]
+	PUSHL	EAX
+	PUSHL	#0.B
+	CALL	srvLogSysLog
+	ADDL	ESP, #8t.B
+	JMP	2$.S
+
+	.SBTTL	srvCmdResponse - Subroutine to generate command response message
+
+;Subroutine to generate command response message
+;	char *msg;		// Message string
+;	char *dst;		// Destination string
+;	void srvCmdResponse(msg, dst);
+
+srvCmdResponse::
+	PUSHL	EDI
+	MOVL	EDI, 8t.B[ESP]		;Get offset of the message string
+2$:	MOVL	EAX, 12t.B[ESP]		;Get offset of the destination string
+	MOVL	cmdmopsb, EAX
+	CMPB	srvDebugLevel, #0
+	JE	4$.S
+	LEAL	EAX, 1.B[EDI]
+	PUSHL	EAX
+	PUSHL	#respfmt
+	PUSHL	srvDebugStream
+	CALL	fprintf#
+	ADDL	ESP, #12t.B
+4$:	PUSHL	msghndl
+	PUSHL	DS
+	PUSHL	EDI
+	PUSHL	DS
+	POPL	ES
+	CLD
+	MOVL	ECX, #-1                ;Allow for very large string
+	CLRL	EAX                     ;Scan for NUL character
+	RNSCASB	[EDI]			;Scan to end of string
+	NOTL	ECX			;Get length plus one
+	DECL	ECX
+	PUSHL	ECX
+	PUSHL	DS
+	PUSHL	#cmdmsgoutparms
+	CALLF	svcIoOutBlockP##
+	POPL	EDI
+	TESTL	EAX, EAX
+	JS	10$.S
+	RET
+
+10$:	NOP
+	RET
+
+respfmt:.ASCIZ	"%s"{LF}
+.PAGE
+	.SBTTL	srvCheckMsg - Subroutine to check for pending messages
+
+;Subroutine to check for pending messages
+;	int srvCheckMsg(void);
+;  Value returned is 0 (Z is set)if no messages are pending and 1 (Z is clear)
+;  if 1 or more messages are available.
+
+srvCheckMsg::
+
+	HLT
+
+	RET
+
+	.SBTTL	srvSaveState - Subroutine to save message state
+
+;Subroutine to save message state - May be used to allow programs to send
+;  delayed responses to messages.
+;	void srvSaveState(
+;		MSGSTATE *msgstate);
+
+srvSaveState::
+
+	HLT
+
+	RET
+
+	.SBTTL	srvRestoreState - Subroutine to restore message state
+
+;Subroutine to restore message state
+;	void srvRestoreState(
+;		MSGSTATE *msgstate);
+
+srvRestoreState::
+	PUSHL	EDI
+	PUSHL	ESI
+	MOVL	ESI, 12t.B[ESP]		;Get offset of his structure
+;;;;;;	MOVL	EDI, pendqab
+	ADDL	EDI, #qab_SIZE.B
+4$:	PUSHL	DS
+	POPL	ES
+	MOVL	ECX, #16t
+	CLD
+	RMOVSL	[EDI], [ESI]
+	POPL	ESI
+	POPL	EDI
+	RET
+.PAGE
+	.SBTTL	srvLogSysLog - Subroutine to put message in the system log
+
+;Subroutine to put message in the system log
+;	long  code;		// XOS error code
+;	char *msg;		// Message text
+;	void srvLogSysLog(code, msg)
+
+srvLogSysLog::
+	PUSHL	EDI
+	SUBL	ESP, #600t
+	MOVL	EDI, ESP
+	MOVL	[EDI], #'    '
+	LEAL	EDX, 4.B[EDI]
+2$:	MOVL	ECX, #8t
+	MOVL	EBX, #srvname
+4$:	MOVB	AL, [EBX]
+	INCL	EBX
+	CMPB	AL, #0
+	JE	6$.S
+	MOVB	[EDX], AL
+	INCL	EDX
+	LOOP	ECX, 4$
+	JMP	8$.S
+
+6$:	MOVB	[EDX], #' '
+	INCL	EDX
+	LOOP	ECX, 6$
+8$:	MOVL	ECX, #500t
+	MOVL	EBX, 612t[ESP]
+10$:	MOVB	AL, [EBX]
+	INCL	EBX
+	CMPB	AL, #0
+	JE	12$.S
+	MOVB	[EDX], AL
+	INCL	EDX
+	LOOP	ECX, 10$
+12$:	MOVL	ECX, 608t[ESP]
+	TESTL	ECX, ECX
+	JE	14$.S
+	MOVW	[EDX], #': '
+	ADDL	EDX, #2.B
+	PUSHL	ECX
+	PUSHL	#3.B
+	PUSHL	DS
+	PUSHL	EDX
+	CALLF	svcSysErrMsg##
+	ADDL	EDX, EAX
+14$:	SUBL	EDX, EDI
+	PUSHL	DS
+	PUSHL	EDI
+	PUSHL	EDX
+	CALLF	svcSysLog##
+	ADDL	ESP, #600t
+	POPL	EDI
+	RET
+.PAGE
+	.SBTTL	Data
+
+	.PSECT	_DATA_p
+
+	 .MOD   4
+dbgname: .LONG  0		;Debug log file specification
+radix:	 .LONG	10t
+digits:	 .LONG	0
+msghndl: .LONG  0
+majver:  .LONG  0
+minver:  .LONG  0
+editnum: .LONG  0
+devname: .BLKB	16t		;Device name specified
+
+
+ipmnmfmt:.ASCIZ "IPM:SYS^%s^%d"
+prnmfmt: .ASCIZ "%s_%d"
+
+
+msgparms:.BYTE	PAR$SET|REP_STR, 0 ;Parameters list used when sending response
+	 .WORD	IOPAR_MSGRMTADDRS   ;  to the requestor
+	 .LONG	srvReqName, !msgparms
+	 .WORD	64t, 64t
+	 .BYTE
+
+cmdpntr:  .LONG 0, 0
+
+cmdmsgoutparms:
+	.BYTE	PAR$SET|REP_STR, 0
+	.WORD	IOPAR_MSGRMTADDRS
+cmdmopsb:
+	.LONG	0, !cmdsrcbfr
+	.WORD	64t, 0
+	.BYTE	0
+
+	.MOD	4
+cmdmsginpparms:
+	.BYTE	PAR$GET|REP_STR, 0
+	.WORD	IOPAR_MSGRMTADDRR
+	.LONG	cmdsrcbfr, !cmdsrcbfr
+	.WORD	64t, 0
+	.BYTE	0
+
+cmdsrcbfr:.BLKB 64t
+cmdmsgbfr:.BLKB 1024t
+
+	  .MOD   4
+logmsgbfr:.BYTE  0, 0, '#', 0
+	  .ASCII "AFPSRV: "
+msgbfr:   .BLKB  320t
+msgend:
+MSGBFRSIZE = msgend-msgbfr
+
+logmode:  .ASCIZ "a+"
+crlfmsg:  .ASCII {CR,LF}
+nullstr:  .BYTE  0
+
+finalfmt: .ASCII {MT_FINALMSG}"%s: %d.%d.%d - Initialization complete"
+	  .ASCIZ " for unit %d"
+
+msgname:  .ASCIZ "IPM:"
+
+mltcmmsg: .ASCIZ {MT_FINALMSG}"? AFPSRV: More than one command specified"
+
+nologmsg: .ASCIZ "Cannot open log file"
+
+alrnfmt:  .ASCIZ "Server unit %d is already running"
+opmdfmt:  .ASCIZ "Error opening message device for unit %d"
+
+bdspmsg:  .ASCIZ "Bad format device name specified"
+nemamsg:  .ASCIZ "Not enough memory available"
+thdemsg:  .ASCIZ "Error initializing thread routines"
+	  .MOD   4
+cmdpnt:   .LONG  0
+argpntr:  .LONG  0, 0
+
+	.MACRO	SRV  name, size, value
+name::
+.IF EQ size-4
+	.LONG	value
+.IFF
+	.BLKB	size
+.ENDC
+	.ENDM
+
+	SRVDATA
+
+	.END

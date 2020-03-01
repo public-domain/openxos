@@ -1,0 +1,2574 @@
+	.SBTTL	PROTIO  - Character I/O routines using direct physical IO for PC
+
+;++++
+; This software is in the public domain.  It may be freely copied and used
+; for whatever purpose you see fit, including commerical uses.  Anyone
+; modifying this software may claim ownership of the modifications, but not
+; the complete derived code.  It would be appreciated if the authors were
+; told what this software is being used for, but this is not a requirement.
+
+;   THIS SOFTWARE IS PROVIDED BY THE AUTHORS "AS IS" AND ANY EXPRESS OR
+;   IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
+;   OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+;   IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+;   INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+;   BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS
+;   OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+;   ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR
+;   TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
+;   USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+;----
+
+;This version of the IO module uses the CGA (or EGA in CGA modes) only
+
+	.INCLUD	XOSINC:\XMAC\PCAT.PAR
+	.INCLUD	XOSINC:\XMAC\XOSXTRM.PAR
+
+VRTLIN =!0B3h		;Character to use as vertical line in dump output
+KBDSIZE=!50t		;Size of keyboard type-ahead buffer
+
+CBRDATR =!03h		;Attribute value for normal border character
+CIBDATR =!30h		;Attribute value for inverse border character
+CTXTATR =!02h		;Attribute value for normal text character
+CINVATR =!20h		;Attribute value for inverse text character
+CERRATR =!0Ch		;Attribute value for error message text character
+
+SERDIVISOR=!3t		;Serial baud rate divisor (3 = 38400, 12t = 9600)
+
+;Subroutine to set up our IO routines (display and keyboard)
+;	CALL	setdisp
+
+setdisp:MOVB	conok, #1
+	MOVL	EDX, #P_EGACCRTINDX
+	MOVB	AL, #0
+	OUTB	[DX]
+	A2IOP	P_EGAGCINDX-P_EGACCRTINDX
+	MOVB	AL, #0Fh
+	OUTB	[DX]
+	A2IOP	P_EGACCRTINDX-P_EGAGCINDX
+	INB	[DX]
+	CMPB	AL, #0
+	JNE	2$.S
+	MOVB	AL, #0Fh
+	OUTB	[DX]
+	A2IOP	P_EGAGCINDX-P_EGACCRTINDX
+	MOVB	AL, #0Fh
+	OUTB	[DX]
+	A2IOP	P_EGACCRTINDX-P_EGAGCINDX
+	INB	[DX]
+	CMPB	AL, #0Fh
+	JE	4$.S
+2$:	MOVB	conok, #0		;No - say no console
+	MOVB	serterm, #0FFh		;Try to use the serial terminal
+4$:	MOVL	ES:[EDI], EAX		;Restore display memory contents
+	MOVL	ES:4.B[EDI], EDX
+	MOVL	EDX, #P_COM1BASE+P_COMMODMSTS ;Point to modem status register
+	INB	[DX]			;Get modem status
+	TESTB	AL, #20h		;Is DSR set?
+	JE	6$.S			;Yes
+	MOVB	serok, #1		;No - indicate no terminal available
+6$:	CMPB	conok, #0		;Do we have a console display?
+	JE	10$			;No
+	MOVL	EDI, #xdispbf		;Yes - clear GECKO's saved screen image
+	PUSHL	DS
+	POPL	ES
+	MOVL	ECX, #25t*40t
+	CLD
+	MOVB	AH, #CTXTATR
+	MOVB	AL, #' '
+	SHLL	EAX, #16t
+	MOVB	AH, #CTXTATR
+	MOVB	AL, #' '
+	RSTOSL	[EDI]
+	MOVL	EDI, #xdispbf		;Set up our frame
+	MOVL	ESI, #lblmsg		;Top line
+	MOVL	EDX, #LBLSIZE
+	CALL	mline
+	MOVL	EDI, #xdispbf+160t*5	;Middle line
+	CALL	fline
+	MOVL	EDI, #xdispbf+160t*24t	;Bottom line
+	MOVL	ESI, #cprmsg
+	MOVL	EDX, #CPRSIZE
+	CALL	mline
+	MOVL	EDI, #xdispbf+158t	;Left and right sides
+	MOVL	ECX, #24t
+	MOVB	AH, #CBRDATR
+	MOVB	AL, #0B3h
+	SHLL	EAX, #16t
+	MOVB	AH, #CBRDATR
+	MOVB	AL, #0B3h
+diss8:	STOSL	[EDI]
+	ADDL	EDI, #156t
+	LOOP	ECX, diss8
+	MOVB	AL, #CBRDATR		;Get attribute for border
+	MOVB	xdispbf+0, #0DAh	;Corners
+	MOVB	xdispbf+1, AL
+	MOVB	xdispbf+158t, #0BFh
+	MOVB	xdispbf+159t, AL
+	MOVB	xdispbf+800t, #0C3h
+	MOVB	xdispbf+801t, AL
+	MOVB	xdispbf+958t, #0B4h
+	MOVB	xdispbf+959t, AL
+	MOVB	xdispbf+3840t, #0C0h
+	MOVB	xdispbf+3841t, AL
+	MOVB	xdispbf+3998t, #0D9h
+	MOVB	xdispbf+3999t, AL
+	MOVL	kbdsta, #kbdnorm	;Store keyboard state dispatch offset
+	MOVB	AL, #0EDh		;Turn off all keyboard lites
+	CALL	tokeybrd
+	MOVB	AL, #0
+	CALL	tokeybrd
+
+	MOVL	EDX, #P_EGAGCINDX
+	MOVB	AL, #06h
+	OUTB	[DX]
+	IOPAUSE
+	INCL	EDX
+	MOVB	AL, #06h
+	OUTB	[DX]
+
+10$:	CMPB	serok, #0		;Do we have a serial terminal?
+	JNE	setupterm		;Yes - set it up
+	RET
+.PAGE
+;Subroutine to display message in frame border
+;	c[EDX] = Length of message (number of characters)
+;	c[EDI] = Offset for place to start broader in screen save buffer
+;	c[ESI] = Offset for message string in code segment (includes
+;		   attribute bytes)
+;	CALL	mline
+
+mline:	CALL	fline			;Put border line in buffer
+	SUBL	EDI, #80t.B		;Calculate address for message
+	SUBL	EDI, EDX
+	ANDL	EDI, #0FFFFFFFEh.B	;Make sure word address
+	MOVL	ECX, EDX
+4$:	LODSW	CS:[ESI]
+	CMPB	AH, #0
+	MOVB	AH, #CBRDATR
+	JE	6$.S
+	SHLB	AH, #4
+6$:	STOSW	[EDI]			;Put message in buffer
+	LOOP	ECX, 4$
+	RET				;Finished
+
+;Subroutine to store horizontal border line in screen save buffer
+;	c[DI] = Offset for place to start broader in screen save buffer
+;	CALL	fline
+
+fline:	MOVL	ECX, #80t		;Border is 80 characters
+	MOVB	AH, #CBRDATR		;Get attribute byte
+	MOVB	AL, #0C4h		;Get character
+	RSTOSW	[EDI]			;Put border in buffer
+	RET				;Thats all
+.PAGE
+;Subroutine to send command to keyboard and wait for ACK
+;	c(AL) = Command bytae
+;	CALL	tokeybrd
+;	C:clr = Normal
+;	C:set = Error
+
+tokeybrd:
+	OUTB	P_KEYDATA		;Send command byte to keyboard
+	CALL	emp8042			;Wait for keyboard to take it
+2$:	CALL	frmkeybrd
+	JC	4$.S
+	CMPB	AL, #0FAh		;Is this an ACK?
+	JE	4$.S			;Yes
+	CMPB	AL, #0FEh		;Error?
+	JNE	2$.S			;No - try again
+	STC				;Yes - indicate error
+4$:	RET				;Finished
+.PAGE
+;Subroutine to get response from keyboard
+;	CALL	frmkeybrd
+;	C:set = No response
+;	  c(AL) = 0
+;	C:clr = Normal
+;	  c(AL) = Response value
+
+frmkeybrd:
+	CLRL	ECX			;Clear for timeout count
+2$:	INB	P_KEYSTS		;Get 8042 status
+	ANDB	AL, #01h		;Check input buffer full bit
+	LOOPE	CX, 2$			;Loop if empty
+	JNE	6$.S
+	STC				;Indicate no response
+	RET
+
+6$:	INB	P_KEYDATA		;Read the response
+	RET				;Thats all
+
+;Subroutine to check for 8042 input buffer empty
+;	CALL	emp8042
+;	Z:set = Normal
+;	Z:clr = Error
+
+emp8042:MOVL	ECX, #1000h		;Wait a while first!
+10$:	NOP
+	LOOP	ECX, 10$
+12$:	INB	P_KEYSTS		;Get 8042 status
+	ANDB	AL, #02h		;Check input buffer full bit
+	LOOPNE	CX, 12$			;Loop if not empty
+	RET				;Return
+.PAGE
+;Subroutine to set up our vectors
+;	CALL	setvec
+
+setvec:	RET				;Our vectors are already set up by XOS
+
+;Subroutine to initialize the user environment when GECKO is started
+;	CALL	intusr
+
+intusr:	RET
+.PAGE
+	.SBTTL	entgecko - Subroutine to set up for entry to GECKO
+
+;Subroutine to set up for entry to GECKO
+;	CALL	entgecko
+
+entgecko:
+	CLD
+	PUSHL	DS			;Save user DS
+	PUSHL	#!_geckodata_p		;Make our data segment addressable
+	POPL	DS
+	POPL	uregDS			;Save user DS in the right place
+	POPL	entrtn			;Save our return address
+	POPL	uregEIP	 		;Save user IP
+	POPL	uregCS			;Save user CS
+	POPL	uregEFR			;And save user flags
+	TESTB	uregEFR+2, #02		;Trap from V86 mode?
+	JE	4$.S			;No
+	POPL	uregESP			;Yes - save stacked user registers
+	POPL	uregSS
+	POPL	uregES
+	POPL	uregDS
+	POPL	uregFS
+	POPL	uregGS
+	JMP	10$.S
+
+;Here if trap is not from V86 mode
+
+4$:	TESTB	uregCS, #03h		;Trap from lower privilege level
+	JE	6$.S			;No
+	POPL	uregESP			;Yes - save stacked user stack pointer
+	POPL	uregSS
+	JMP	10$.S
+
+;Here if trap is from exec mode
+
+6$:	MOVL	uregESP, ESP		;Save user stack pointer
+	MOV%	uregSS, SS
+10$:	PUSHL	DS			;Set up the GECKO stack pointer
+	POPL	SS
+	MOVL	ESP, xESP
+	MOVL	xESP, #0
+	CALL	savusr
+	CALL	xscreen			;Set up GECKO's screen
+	CALL	xregdmp			;Update register display
+	MOVL	EAX, DR7		;Save current DR7 value
+	MOVL	dr7val, EAX
+	CLRL	EAX			;Disable any watchpoints
+	MOVL	DR7, EAX
+	MOVL	EDI, #bpttbl		;Point to breakpoint table
+	MOVL	ECX, #BPTNUM
+	CLRL	ESI
+12$:	CMPB	[EDI], #0		;Is this entry in use?
+	JE	18$.S			;No - go on
+	MOVL	EBX, bt_ofs.B[EDI]	;Yes - get address
+	MOVL	EDX, bt_seg.B[EDI]
+	INCL	EBX
+	CMPL	EBX, uregEIP		;Now stopped at this breakpoint?
+	JNE	16$.S			;No
+	MOVL	EAX, uregCS		;Maybe
+	BTL	EAX, #16t
+	JC	14$.S
+	ANDB	AL, #0FCh
+14$:	CMPL	EDX, EAX
+	JNE	16$.S			;No
+	MOVL	ESI, EDI		;Yes - remember it
+16$:	DECL	EBX
+	MOVB	AL, bt_ins.B[EDI]	;Get instruction
+	CALL	putmbyte		;Restore instruction
+18$:	ADDL	EDI, #bt_ENSZ
+	LOOP	ECX, 12$
+	MOVL	EAX, oradix		;Reset temporary output radix
+	MOVL	tradix, EAX
+	MOVB	AL, poutmd		;And reset temporary output mode
+	MOVB	toutmd, AL
+	JMPIL	entrtn			;Return from entgecko
+.PAGE
+;Subroutine to save rest of user state
+;	CALL	savusr
+
+savusr:	CLI				;No interrupts now
+	MOVL	uregEAX, EAX		;Save user registers (SS and SP
+	MOVL	uregEBX, EBX		;  have already been saved)
+	MOVL	uregECX, ECX
+	MOVL	uregEDX, EDX
+	MOVL	uregEDI, EDI
+	MOVL	uregESI, ESI
+	MOVL	uregEBP, EBP
+	CLRL	EAX
+	INCL	EAX
+	TESTB	uregEFR+2, #02		;From V86 mode?
+	JNE	4$.S			;Yes - segment registers already saved
+	MOVL	uregES, ES		;No - save rest of the segment registers
+	MOVL	uregFS, FS		;  now
+	MOVL	uregGS, GS
+	DECL	EAX
+4$:	MOVW	uregSS+2, AX
+	MOVW	uregES+2, AX
+	MOVW	uregDS+2, AX
+	MOVW	uregFS+2, AX
+	MOVW	uregGS+2, AX
+	MOVW	uregCS+2, AX
+	MOVB	kbdcnt, #0		;Initialize the keyboard type-ahead
+	MOVL	kbdput, #kbdbfr		;  buffer
+	MOVL	kbdtak, #kbdbfr
+	MOVB	stpflg, #0		;Make sure output not stopped
+retio02:RET
+.PAGE
+;Subroutine to display GECKO's screen
+;	CALL	xscreen
+
+xscreen:CMPB	serterm, #0		;Using console?
+	JNE	retio02			;No - nothing needed here
+	PUSHL	DS
+	POPL	ES			;Save user's screen
+	MOVL	EDI, #udispbf
+	PUSHL	#GS_DISPLAY.B
+	POPL	FS
+	CLRL	ESI
+	MOVL	ECX, #1024t
+	CLD
+	RMOVSL	[EDI], FS:[ESI]
+	MOVL	EDX, #P_EGACCRTINDX	;Save the user's cursor shape and
+	MOVB	AL, #0Ah		;  position
+	OUTB	[DX]
+	IOPAUSE
+	INCL	EDX
+	INB	[DX]
+	IOPAUSE
+	MOVB	ucursor+0, AL
+	DECL	EDX
+	MOVB	AL, #0Bh
+	OUTB	[DX]
+	IOPAUSE
+	INCL	EDX
+	INB	[DX]
+	IOPAUSE
+	MOVB	ucursor+1, AL
+	DECL	EDX
+	MOVB	AL, #0Eh
+	OUTB	[DX]
+	IOPAUSE
+	INCL	EDX
+	INB	[DX]
+	IOPAUSE
+	MOVB	ucursor+2, AL
+	DECL	EDX
+	MOVB	AL, #0Fh
+	OUTB	[DX]
+	IOPAUSE
+	INCL	EDX
+	INB	[DX]
+	IOPAUSE
+	MOVB	ucursor+3, AL
+	DECL	EDX
+	MOVB	AL, #0Ch		;Save user's screen starting position
+	OUTB	[DX]
+	IOPAUSE
+	INCL	EDX
+	INB	[DX]
+	IOPAUSE
+	MOVB	ustart+0, AL
+	DECL	EDX
+	MOVB	AL, #0Dh
+	OUTB	[DX]
+	IOPAUSE
+	INCL	EDX
+	INB	[DX]
+	IOPAUSE
+	MOVB	ustart+1, AL
+	DECL	EDX
+	MOVB	AL, #0Ah		;Make sure have block cursor
+	OUTB	[DX]
+	IOPAUSE
+	MOVB	AL, #0
+	INCL	EDX
+	OUTB	[DX]
+	IOPAUSE
+	MOVB	AL, #0Bh
+	DECL	EDX
+	OUTB	[DX]
+	IOPAUSE
+	MOVB	AL, #0Dh
+	INCL	EDX
+	OUTB	[DX]
+	IOPAUSE
+	DECL	EDX			;Set up GECKO's cursor
+	MOVB	AL, #0Eh		;Set high order byte
+	OUTB	[DX]
+	IOPAUSE
+	MOVB	AL, xcursor+1
+	INCL	EDX
+	OUTB	[DX]
+	IOPAUSE
+	MOVB	AL, #0Fh		;Set low order byte
+	DECL	EDX
+	OUTB	[DX]
+	IOPAUSE
+	MOVB	AL, xcursor+0
+	INCL	EDX
+	OUTB	[DX]
+	PUSHL	#GS_DISPLAY.B		;Set up GECKO's screen
+	POPL	ES
+	CLRL	EDI
+	MOVL	ESI, #xdispbf
+	MOVL	ECX, #1024t
+	RMOVSL	[EDI], [ESI]
+	MOVL	EDX, #P_EGACCRTINDX	;Set to display GECKO screen
+	MOVB	AL, #0Ch
+	OUTB	[DX]
+	IOPAUSE
+	INCL	EDX
+	MOVB	AL, #0
+	OUTB	[DX]
+	IOPAUSE
+	DECL	EDX
+	MOVB	AL, #0Dh
+	OUTB	[DX]
+	IOPAUSE
+	INCL	EDX
+	MOVB	AL, #0
+	OUTB	[DX]
+	IOPAUSE
+	ADDL	EDX, #P_EGACSTS1-P_EGACCRTDATA.B ;Get port for status 1 register
+	INB	[DX]			;Read input status 1 register to reset
+	IOPAUSE				;  attribute port to the index register
+	MOVB	DL, #P_EGAATTRIB&0FFh	;Get attribute controller port
+	MOVB	AL, #20h
+	OUTB	[DX]
+	MOVB	screen, #1		;Remember displaying GECKO's screen
+2$:	RET				;Thats all
+.PAGE
+	.SBTTL	rstusr - Subroutine to restore user state
+
+;Subroutine to restore user state
+;	CALL	rstusr
+
+rstusr:	CMPB	screen, #0		;Need to switch screens?
+	JE	2$.S			;No
+	CALL	uscreen			;Yes - restore user screen
+2$:	MOVL	EAX, dr7val		;Restore watchpoint state
+	MOVL	DR7, EAX
+	TESTB	uregEFR+2, #02		;From V86 mode?
+	JNE	4$.S			;Yes - don't restore segment registers
+	MOVW	ES, uregES		;Restore user segment registers
+	MOVW	FS, uregFS
+	MOVW	GS, uregGS
+4$:	MOVL	EDI, uregEDI		;Restore other user registers
+	MOVL	ESI, uregESI
+	MOVL	EBP, uregEBP
+	MOVL	EDX, uregEDX
+	MOVL	ECX, uregECX
+	MOVL	EBX, uregEBX
+	MOVL	EAX, uregEAX
+retio04:RET				;Finished
+.PAGE
+;Subroutine to save GECKO screen and display user screen
+;	CALL	uscreen
+
+uscreen:CMPB	serterm, #0		;Using console?
+	JNE	retio04.S		;No - nothing to do here
+	PUSHL	DS			;Yes - save GECKO's screen
+	POPL	ES
+	MOVL	EDI, #xdispbf
+	PUSHL	#GS_DISPLAY.B
+	POPL	FS
+	CLRL	ESI
+	MOVL	ECX, #1024t
+	CLD
+	RMOVSL	[EDI], FS:[ESI]
+	MOVL	EDX, #P_EGACCRTINDX	;Save GECKO's cursor position
+	MOVB	AL, #0Eh		;Get high order byte
+	OUTB	[DX]
+	JMP	$+2.S
+	INCL	EDX
+	INB	[DX]
+	JMP	$+2.S
+	MOVB	AH, AL
+	MOVB	AL, #0Fh		;Get low order byte
+	DECL	EDX
+	OUTB	[DX]
+	JMP	$+2.S
+	INCL	EDX
+	INB	[DX]
+	JMP	$+2.S
+	MOVW	xcursor, AX		;Store GECKO cursor location
+	MOVL	EDX, #P_EGACCRTINDX	;Restore the user's cursor shape and
+	MOVB	AL, #0Ah		;  position
+	OUTB	[DX]
+	IOPAUSE
+	INCL	EDX
+	MOVB	AL, ucursor+0
+	OUTB	[DX]
+	IOPAUSE
+	DECL	EDX
+	MOVB	AL, #0Bh
+	OUTB	[DX]
+	IOPAUSE
+	INCL	EDX
+	MOVB	AL, ucursor+1
+	OUTB	[DX]
+	IOPAUSE
+	DECL	EDX
+	MOVB	AL, #0Eh
+	OUTB	[DX]
+	IOPAUSE
+	INCL	EDX
+	MOVB	AL, ucursor+2
+	OUTB	[DX]
+	IOPAUSE
+	DECL	EDX
+	MOVB	AL, #0Fh
+	OUTB	[DX]
+	IOPAUSE
+	INCL	EDX
+	MOVB	AL, ucursor+3
+	OUTB	[DX]
+	IOPAUSE
+	DECL	EDX
+	PUSHL	#GS_DISPLAY.B		;Restore user"s screen contents
+	POPL	ES
+	CLRL	EDI
+	MOVL	ESI, #udispbf
+	MOVL	ECX, #1024t
+	RMOVSL	[EDI], [ESI]
+	MOVB	AL, #0Ch		;Restore user's screen starting
+	OUTB	[DX]			;  position
+	JMP	$+2.S
+	INCL	EDX
+	MOVB	AL, ustart+0
+	OUTB	[DX]
+	IOPAUSE
+	DECL	EDX
+	MOVB	AL, #0Dh
+	OUTB	[DX]
+	IOPAUSE
+	INCL	EDX
+	MOVB	AL, ustart+1
+	OUTB	[DX]
+	MOVB	screen, #0		;Remember displaying user's screen
+	RET				;Thats all
+.PAGE
+;Here for exit command
+
+goexit:	CLRL	EAX
+	MOVL	ES, EAX
+	MOVL	FS, EAX
+	MOVL	GS, EAX			;Just use the XOS kernel reboot
+	PUSHL	#GS_DATA.B
+	POPL	DS
+	JMPF	knlReboot#		;  routine!
+
+;Here for the reset command
+
+goreset:CLI
+	MOVB	AL, #0FEh		;Do hardware reset!
+	OUTB	P_KEYCMD
+4$:	JMP	4$.S			;Wait here until the reset happens
+.PAGE
+;Here to set or clear a watchpoint
+;	c(AL)     = Trap number (0 to 3)
+;	c(CL)     = Type type:
+;		      0 = None (clear trap)
+;		      1 = Instruction
+;		      2 = Data write
+;		      3 = Data access
+;	c(CH)     = Trap size:
+;		      1 = Byte
+;		      2 = Word
+;		      3 = Long
+;	c{DX:EBX} = Address
+;	CALL	wptsetclr
+;	C:set = Error
+;	C:clr = Normal
+
+wptsetclr:
+	CMPB	AL, #3			;Valid register?
+	JA	2$.S			;No - fail
+	PUSHL	EDI
+	MOVZBL	EDI, AL			;Yes
+	CMPB	CL, #0			;Want to clear a trap?
+	JNE	4$.S			;No
+	CLRL	EBX			;Yes
+	MOVL	ECX, dr7val		;Get the debug control register value
+	JMPIL	wptclr[EDI*4]		;Dispatch on register number
+
+2$:	STC
+	RET
+
+;Here to set a watchpoint
+
+4$:	CMPB	CL, #3t
+	JAE	6$.S
+	DECL	ECX
+6$:	CMPB	CH, #3t
+	JAE	8$.S
+	DECB	CH
+8$:	SHLB	CH, #2t
+	ORB	CH, CL
+	MOVZWL	EDX, DX			;Get selector for address
+	PUSHL	#GS_GDT.B
+	POPL	ES
+	PUSHL	ECX			;Save size/type value
+	TESTB	DL, #04			;Local selector?
+	JE	12$.S			;No
+	SLDT	CX			;Yes - get LDTR value
+	ANDL	ECX, #0FFF8h
+	MOVL	EAX, ES:[ECX]		;Copy address and size to our temporary
+	MOVL	ES:GS_GECKOTEMP, EAX	;  segment
+	MOVL	EAX, ES:4.B[ECX]
+	ANDL	EAX, #0FF0F00FFh
+	ANDL	ES:GS_GECKOTEMP+4, #0F0FF00h
+	ORL	ES:GS_GECKOTEMP+4, EAX
+	PUSHL	#GS_GECKOTEMP
+	POPL	ES
+12$:	POPL	EAX			;Restore size/type value
+	ANDB	DL, #0F8h
+	MOVB	CH, ES:7.B[EDX]		;Get base address of segment
+	MOVB	CL, ES:4.B[EDX]
+	SHLL	ECX, #16t
+	MOVW	CX, ES:2.B[EDX]
+	ADDL	EBX, ECX		;Get linear address of our item
+	MOVZBL	EAX, AH			;Get watchpoint type in all of EAX
+	MOVL	ECX, dr7val		;Get the debug control register value
+	JMPIL	wptset[EDI*4]		;Dispatch on the watchpoint number
+.PAGE
+	.PSECT	_geckodata_p
+
+wptclr:	.LONG	wptcr0
+	.LONG	wptcr1
+	.LONG	wptcr2
+	.LONG	wptcr3
+
+	.PSECT	_geckocode_p
+
+;Here to clear watchpoint 0
+
+wptcr0:	MOVL	DR0, EBX
+	ANDB	wptenb, #~1
+	ANDL	ECX, #~0F0003h
+	JMP	10$.S
+
+;Here to clear watchpoint 1
+
+wptcr1:	MOVL	DR1, EBX
+	ANDB	wptenb, #~2
+	ANDL	ECX, #~0F0000Ch
+	JMP	10$.S
+
+;Here to clear watchpoint 2
+
+wptcr2:	MOVL	DR2, EBX
+	ANDB	wptenb, #~4
+	ANDL	ECX, #~0F000030h
+	JMP	10$.S
+
+;Here to clear watchpoint 3
+
+wptcr3:	MOVL	DR3, EBX
+	ANDB	wptenb, #~8
+	ANDL	ECX, #~0F00000C0h
+10$:	TESTL	ECX, #33330000h		;Have any data watchpoints set now?
+	JNE	setdr7.S		;Yes
+	ANDB	CH, #~2			;No - clear exact match state
+setdr7:	MOVL	dr7val, ECX
+	POPL	EDI
+	RET				;Thats all
+.PAGE
+	.PSECT	_geckodata_p
+
+wptset:	.LONG	wptst0
+	.LONG	wptst1
+	.LONG	wptst2
+	.LONG	wptst3
+
+	.PSECT	_geckocode_p
+
+;Here to set watchpoint 0
+
+wptst0:	MOVL	DR0, EBX
+	ORB	wptenb, #1
+	ORL	ECX, #202h
+	ANDL	ECX, #~0F0000h
+	SHLL	EAX, #16t
+	JMP	10$.S
+
+;Here to set watchpoint 1
+
+wptst1:	MOVL	DR1, EBX
+	ORB	wptenb, #2
+	ORL	ECX, #208h
+	ANDL	ECX, #~0F00000h
+	SHLL	EAX, #20t
+	JMP	10$.S
+
+;Here to set watchpoint 2
+
+wptst2:	MOVL	DR2, EBX
+	ORB	wptenb, #4
+	ORL	ECX, #220h
+	ANDL	ECX, #~0F000000h
+	SHLL	EAX, #24t
+	JMP	10$.S
+
+;Here to set watchpoint 3
+
+wptst3:	MOVL	DR3, EBX
+	ORB	wptenb, #8
+	ORL	ECX, #280h
+	ANDL	ECX, #~0F0000000h
+	SHLL	EAX, #28t
+10$:	ORL	ECX, EAX
+	JMP	setdr7.S
+.PAGE
+	.SBTTL	swterm - Routine to switch to/from serial terminal/client
+
+;Here on ST command to switch to/from serial terminal
+
+swterm:	CMPB	screen, #0		;Currently displaying GECKO's screen?
+	JE	6$.S			;No
+	CALL	uscreen			;Yes - restore user's screen
+6$:	CMPB	serterm, #0		;Currently using console?
+	JNE	10$.S			;No
+	MOVB	serterm, #0FFh		;Yes - switch to serial terminal (if we
+					;  are using the serial client, the
+					;  05 (^E) we send will casse it to
+					;  send us a reset command (0,20h) which
+					;  will switch us to serial client mode
+					;  and update the client's register
+					;  display)
+	CMPB	serset, #0		;Is the serial port set up?
+	JNE	8$.S			;Yes
+	CALL	setupterm		;No - set it up now
+8$:	MOVB	AL, #5			;Send a serial client reset (a serial
+	JMP	tosert			;  terminal should ignore this)
+
+;Here if switching to console
+
+10$:	MOVB	serterm, #0
+	MOVL	dheight, #MAXLINES
+	CALL	xscreen
+	JMP	xregdmp
+.PAGE
+;Subroutine to get memory segment type (this routine assumes that the segment
+;  has already been accessed by calling getmbyte, getmword, or getmlong to
+;  verify that the selector is valid)
+;	c{EDX} = Segment selector
+;	CALL	getmtype
+;	c(AL)  = Segment type
+;		    2t = 32 bit data segment
+;		    5t = 32 bit code segment
+;		   10t = 16 bit data segment
+;		   13t = 16 bit code segment
+
+getmtype:
+	PUSHL	EDX
+	BTL	EDX, #16t		;Virtual mode selector?
+	JNC	2$.S			;No
+	MOVL	EDX, #GS_REAL16		;Yes - use right selector
+2$:	PUSHL	#GS_GDT.B
+	POPL	ES
+	TESTB	DL, #04			;Local selector?
+	JE	6$.S			;No
+	PUSHL	EAX
+	PUSHL	ECX			;Yes
+	SLDT	CX			;Get LDTR value
+	ANDL	ECX, #0FFF8h
+	MOVL	EAX, ES:[ECX]		;Copy address and size to our temporary
+	MOVL	ES:GS_GECKOTEMP, EAX	;  segment
+	MOVL	EAX, ES:4.B[ECX]
+	MOVB	AH, #92h
+	MOVL	ES:GS_GECKOTEMP+4, EAX
+	POPL	ECX
+	POPL	EAX
+	PUSHL	#GS_GECKOTEMP
+	POPL	ES
+6$:	ANDL	EDX, #0FFF8h		;Remove extra bits
+	MOVW	DX, ES:5.B[EDX]		;Get access bytes from selector
+	MOVB	AL, #2t			;Assume 32 bit data segment
+	TESTB	DL, #08h		;Is it really a data segment?
+	JE	10$.S			;Yes
+	MOVB	AL, #5t			;No - its a code segment
+10$:	TESTB	DH, #40h		;Is it really a 32 bit segment?
+	JNE	12$.S			;Yes
+	ADDB	AL, #8t			;No - its a 16 bit segment
+12$:	POPL	EDX
+	RET
+.PAGE
+;Subroutine to get byte from memory
+;	c{EDX} = Segment selector
+;	c{EBX} = Segment offset
+;	CALL	getmbyte
+;	c{EAX} = Value (byte zero extended to 32 bits)
+
+getmbyte:
+	PUSHL	DS
+	PUSHL	EDX
+	PUSHL	EBX
+	BTL	EDX, #16t		;Protected mode selector?
+	JNC	2$.S			;Yes
+	MOVZWL	EDX, DX			;No - get address to use
+	SHLL	EDX, #4
+	ADDL	EBX, EDX
+	MOVL	EDX, #GS_REAL16
+2$:	SIDT	idtloc
+	MOVL	EAX, idtloc+2
+	PUSHL	#GS_GDT.B
+	POPL	DS
+	MOVW	GS_IDT+2, AX
+	SHRL	EAX, #16t
+	MOVB	GS_IDT+4, AL
+	MOVB	GS_IDT+7, AH
+	PUSHL	#GS_IDT.B
+	POPL	DS
+	PUSHL	ID_PROT+0
+	PUSHL	ID_PROT+4
+	PUSHL	ID_SEGNP+0
+	PUSHL	ID_SEGNP+4
+	PUSHL	ID_PAGEFLT+0
+	PUSHL	ID_PAGEFLT+4
+	MOVL	EAX, #getfail		;Set up our vectors
+	MOVW	ID_PROT+0, AX
+	MOVW	ID_SEGNP+0, AX
+	MOVW	ID_PAGEFLT+0, AX
+	MOVW	ID_PROT+2, CS
+	MOVW	ID_SEGNP+2, CS
+	MOVW	ID_PAGEFLT+2, CS
+	MOVW	AX, #8E00h
+	MOVL	ID_PROT+4, EAX
+	MOVL	ID_SEGNP+4, EAX
+	MOVL	ID_PAGEFLT+4, EAX
+	ANDB	DL, #0FCh
+	MOVW	DS, DX
+	MOVZBL	EAX, [EBX]
+	CLC				;Indicate no error
+	JMP	memdone
+
+;Here if protection error when reading from memory
+
+getfail:ADDL	ESP, #16t.B		;Remove junk from the stack
+	PUSHL	#1.B
+	PUSHL	CS
+	PUSHL	#memdone		;Stack where we want to go now
+	XORL	EAX, EAX		;Always return 0 (just in case!)
+	IRET				;Continue
+
+;Subroutine to get long from memory
+;	c[DX]  = Segment selector
+;	c{EBX} = Segment offset
+;	CALL	getmword
+;	c{EAX} = Value
+
+getmlong:
+	PUSHL	DS
+	PUSHL	EDX
+	PUSHL	EBX
+	BTL	EDX, #16t		;Protected mode selector?
+	JNC	6$.S			;Yes
+	MOVZWL	EDX, DX			;No - get address to use
+	SHLL	EDX, #4
+	ADDL	EBX, EDX
+	MOVL	EDX, #GS_REAL16
+6$:	SIDT	idtloc
+	MOVL	EAX, idtloc+2
+	PUSHL	#GS_GDT.B
+	POPL	DS
+	MOVW	GS_IDT+2, AX
+	SHRL	EAX, #16t
+	MOVB	GS_IDT+4, AL
+	MOVB	GS_IDT+7, AH
+	PUSHL	#GS_IDT.B
+	POPL	DS
+	PUSHL	ID_PROT+0
+	PUSHL	ID_PROT+4
+	PUSHL	ID_SEGNP+0
+	PUSHL	ID_SEGNP+4
+	PUSHL	ID_PAGEFLT+0
+	PUSHL	ID_PAGEFLT+4
+	MOVL	EAX, #getfail		;Set up our vectors
+	MOVW	ID_PROT+0, AX
+	MOVW	ID_SEGNP+0, AX
+	MOVW	ID_PAGEFLT+0, AX
+	MOVW	ID_PROT+2, CS
+	MOVW	ID_SEGNP+2, CS
+	MOVW	ID_PAGEFLT+2, CS
+	MOVW	AX, #8E00h
+	MOVL	ID_PROT+4, EAX
+	MOVL	ID_SEGNP+4, EAX
+	MOVL	ID_PAGEFLT+4, EAX
+	ANDB	DL, #0FCh
+	MOVW	DS, DX
+	MOVL	EAX, [EBX]
+	CLC				;Indicate no error
+	JMP	memdone
+
+;Subroutine to get word from memory
+;	c[DX]  = Segment selector
+;	c{EBX} = Segment offset
+;	CALL	getmword
+;	c{EAX} = Value (word zero extended to 32 bits)
+
+getmword:
+	PUSHL	DS
+	PUSHL	EDX
+	PUSHL	EBX
+	BTL	EDX, #16t		;Protected mode selector?
+	JNC	8$.S			;Yes
+	MOVZWL	EDX, DX			;No - get address to use
+	SHLL	EDX, #4
+	ADDL	EBX, EDX
+	MOVL	EDX, #GS_REAL16
+8$:	SIDT	idtloc
+	MOVL	EAX, idtloc+2
+	PUSHL	#GS_GDT.B
+	POPL	DS
+	MOVW	GS_IDT+2, AX
+	SHRL	EAX, #16t
+	MOVB	GS_IDT+4, AL
+	MOVB	GS_IDT+7, AH
+	PUSHL	#GS_IDT.B
+	POPL	DS
+	PUSHL	ID_PROT+0
+	PUSHL	ID_PROT+4
+	PUSHL	ID_SEGNP+0
+	PUSHL	ID_SEGNP+4
+	PUSHL	ID_PAGEFLT+0
+	PUSHL	ID_PAGEFLT+4
+	MOVL	EAX, #getfail		;Set up our vectors
+	MOVW	ID_PROT+0, AX
+	MOVW	ID_SEGNP+0, AX
+	MOVW	ID_PAGEFLT+0, AX
+	MOVW	ID_PROT+2, CS
+	MOVW	ID_SEGNP+2, CS
+	MOVW	ID_PAGEFLT+2, CS
+	MOVW	AX, #8E00h
+	MOVL	ID_PROT+4, EAX
+	MOVL	ID_SEGNP+4, EAX
+	MOVL	ID_PAGEFLT+4, EAX
+	ANDB	DL, #0FCh
+	MOVW	DS, DX
+	MOVZWL	EAX, [EBX]
+	CLC				;Indicate no error
+	JMP	memdone
+
+;Subroutine to store byte to memory
+;	c(AL)  = Value
+;	c{EDX} = Segment selector
+;	c{EBX} = Segment offset
+;	CALL	putmbyte
+
+putmbyte:
+	PUSHL	DS			;Save current protection vector
+	PUSHL	EDX
+	PUSHL	EBX
+	BTL	EDX, #16t		;Protected mode selector?
+	JNC	12$.S			;Yes
+	MOVZWL	EDX, DX			;No - get address to use
+	SHLL	EDX, #4
+	ADDL	EBX, EDX
+	MOVL	EDX, #GS_REAL16
+12$:	PUSHL	EAX
+	SIDT	idtloc
+	MOVL	EAX, idtloc+2
+	PUSHL	#GS_GDT.B
+	POPL	DS
+	MOVW	GS_IDT+2, AX
+	SHRL	EAX, #16t
+	MOVB	GS_IDT+4, AL
+	MOVB	GS_IDT+7, AH
+	POPL	EAX
+	PUSHL	#GS_IDT.B
+	POPL	DS
+	PUSHL	ID_PROT+0
+	PUSHL	ID_PROT+4
+	PUSHL	ID_SEGNP+0
+	PUSHL	ID_SEGNP+4
+	PUSHL	ID_PAGEFLT+0
+	PUSHL	ID_PAGEFLT+4
+	PUSHL	EDI			;Free up more registers!
+	PUSHL	ES
+	PUSHL	EAX
+	MOVL	EAX, #putfail		;Set up our vectors
+	MOVW	ID_PROT+0, AX
+	MOVW	ID_SEGNP+0, AX
+	MOVW	ID_PAGEFLT+0, AX
+	MOVW	ID_PROT+2, CS
+	MOVW	ID_SEGNP+2, CS
+	MOVW	ID_PAGEFLT+2, CS
+	MOVW	AX, #8E00h
+	MOVL	ID_PROT+4, EAX
+	MOVL	ID_SEGNP+4, EAX
+	MOVL	ID_PAGEFLT+4, EAX
+	MOVL	EDI, EDX		;Set up to address the selector for
+	ANDL	EDI, #0FFFFFFF8h.B	;  the address we want to write
+	PUSHL	#GS_GDT.B
+	POPL	ES
+	TESTB	DL, #04			;Local selector?
+	JE	14$.S			;No
+	PUSHL	ECX
+	SLDT	CX			;Yes - get LDTR value
+	ANDL	ECX, #0FFF8h
+	MOVL	EAX, ES:[ECX]		;Copy address and size to our temporary
+	MOVL	ES:GS_GECKOTEMP, EAX	;  segment
+	MOVL	EAX, ES:4.B[ECX]
+	MOVB	AH, #92h
+	MOVL	ES:GS_GECKOTEMP+4, EAX
+	POPL	ECX
+	PUSHL	#GS_GECKOTEMP
+	POPL	ES			;Save access byte from selector (this
+14$:	MOVB	AH, ES:5.B[EDI]		;  may trap if selector is invalid!)
+	TESTB	AH, #80			;Is the segment there?
+	JNE	18$			;Yes
+	MOVB	AL, #0			;No - fail
+	STC
+	JMP	putdone
+
+18$:	MOVB	ES:5.B[EDI], #92	;Change to writable data segment (this
+	ANDB	DL, #0FCh		;  should not fail since all selector
+	MOVW	DS, DX			;  tables are assumed to be writable!)
+	MOVB	AL, [ESP]
+	MOVB	[EBX], AL		;Store byte (this may trap if offset is
+					;  beyond end of the segment)
+putdok:	CLC				;Indicate no error
+putdone:MOVB	ES:5.B[EDI], AH		;Restore access bytes
+	POPL	EAX
+	POPL	ES			;Restore registers
+	POPL	EDI
+memdone:PUSHL	#GS_IDT.B
+	POPL	DS
+	POPL	ID_PAGEFLT+4		;Restore vectors
+	POPL	ID_PAGEFLT+0
+	POPL	ID_SEGNP+4
+	POPL	ID_SEGNP+0
+	POPL	ID_PROT+4
+	POPL	ID_PROT+0
+	POPL	EBX			;Restore registers
+	POPL	EDX
+	POPL	DS
+	RET
+
+;Subroutine to store word to memory
+;	c[AX]  = Value
+;	c{EDX} = Segment selector
+;	c{EBX} = Segment offset
+;	CALL	putmbyte
+
+putmword:
+	PUSHL	DS			;Save current protection vector
+	PUSHL	EDX
+	PUSHL	EBX
+	BTL	EDX, #16t		;Protected mode selector?
+	JNC	22$.S			;Yes
+	MOVZWL	EDX, DX			;No - get address to use
+	SHLL	EDX, #4
+	ADDL	EBX, EDX
+	MOVL	EDX, #GS_REAL16
+22$:	PUSHL	EAX
+	SIDT	idtloc
+	MOVL	EAX, idtloc+2
+	PUSHL	#GS_GDT.B
+	POPL	DS
+	MOVW	GS_IDT+2, AX
+	SHRL	EAX, #16t
+	MOVB	GS_IDT+4, AL
+	MOVB	GS_IDT+7, AH
+	POPL	EAX
+	PUSHL	#GS_IDT.B
+	POPL	DS
+	PUSHL	ID_PROT+0
+	PUSHL	ID_PROT+4
+	PUSHL	ID_SEGNP+0
+	PUSHL	ID_SEGNP+4
+	PUSHL	ID_PAGEFLT+0
+	PUSHL	ID_PAGEFLT+4
+	PUSHL	EDI			;Free up more registers!
+	PUSHL	ES
+	PUSHL	EAX
+	MOVL	EAX, #putfail		;Set up our vectors
+	MOVW	ID_PROT+0, AX
+	MOVW	ID_SEGNP+0, AX
+	MOVW	ID_PAGEFLT+0, AX
+	MOVW	ID_PROT+2, CS
+	MOVW	ID_SEGNP+2, CS
+	MOVW	ID_PAGEFLT+2, CS
+	MOVW	AX, #8E00h
+	MOVL	ID_PROT+4, EAX
+	MOVL	ID_SEGNP+4, EAX
+	MOVL	ID_PAGEFLT+4, EAX
+	MOVL	EDI, EDX		;Set up to address the selector for
+	ANDL	EDI, #0FFFFFFF8h.B	;  the address we want to write
+	PUSHL	#GS_GDT.B
+	POPL	ES
+	TESTB	DL, #04			;Local selector?
+	JE	24$.S			;No
+	PUSHL	ECX
+	SLDT	CX			;Yes - get LDTR value
+	ANDL	ECX, #0FFF8h
+	MOVL	EAX, ES:[ECX]		;Copy address and size to our temporary
+	MOVL	ES:GS_GECKOTEMP, EAX	;  segment
+	MOVL	EAX, ES:4.B[ECX]
+	MOVB	AH, #92h
+	MOVL	ES:GS_GECKOTEMP+4, EAX
+	POPL	ECX
+	PUSHL	#GS_GECKOTEMP
+	POPL	ES			;Save access byte from selector (this
+24$:	MOVB	AH, ES:5.B[EDI]		;  may trap if selector is invalid!)
+	TESTB	AH, #80			;Is the segment there?
+	JNE	28$			;Yes
+	MOVB	AL, #0			;No - fail
+	STC
+	JMP	putdone
+
+28$:	MOVB	ES:5.B[EDI], #92	;Change to writable data segment (this
+	ANDB	DL, #0FCh		;  should not fail since all selector
+	MOVW	DS, DX			;  tables are assumed to be writable!)
+	MOVL	EDX, [ESP]
+	MOVW	[EBX], DX		;Store word (this may trap if offset is
+	JMP	putdok			;  beyond end of the segment)
+
+;Subroutine to store long to memory
+;	c{EAX} = Value
+;	c{EDX} = Segment selector
+;	c{EBX} = Segment offset
+;	CALL	putmbyte
+
+putmlong:
+	PUSHL	DS			;Save current protection vector
+	PUSHL	EDX
+	PUSHL	EBX
+	BTL	EDX, #16t		;Protected mode selector?
+	JNC	32$.S			;Yes
+	MOVZWL	EDX, DX			;No - get address to use
+	SHLL	EDX, #4
+	ADDL	EBX, EDX
+	MOVL	EDX, #GS_REAL16
+32$:	PUSHL	EAX
+	SIDT	idtloc
+	MOVL	EAX, idtloc+2
+	PUSHL	#GS_GDT.B
+	POPL	DS
+	MOVW	GS_IDT+2, AX
+	SHRL	EAX, #16t
+	MOVB	GS_IDT+4, AL
+	MOVB	GS_IDT+7, AH
+	POPL	EAX
+	PUSHL	#GS_IDT.B
+	POPL	DS
+	PUSHL	ID_PROT+0
+	PUSHL	ID_PROT+4
+	PUSHL	ID_SEGNP+0
+	PUSHL	ID_SEGNP+4
+	PUSHL	ID_PAGEFLT+0
+	PUSHL	ID_PAGEFLT+4
+	PUSHL	EDI			;Free up more registers!
+	PUSHL	ES
+	PUSHL	EAX
+	MOVL	EAX, #putfail		;Set up our vectors
+	MOVW	ID_PROT+0, AX
+	MOVW	ID_SEGNP+0, AX
+	MOVW	ID_PAGEFLT+0, AX
+	MOVW	ID_PROT+2, CS
+	MOVW	ID_SEGNP+2, CS
+	MOVW	ID_PAGEFLT+2, CS
+	MOVW	AX, #8E00h
+	MOVL	ID_PROT+4, EAX
+	MOVL	ID_SEGNP+4, EAX
+	MOVL	ID_PAGEFLT+4, EAX
+	MOVL	EDI, EDX		;Set up to address the selector for
+	ANDL	EDI, #0FFFFFFF8h.B	;  the address we want to write
+	PUSHL	#GS_GDT.B
+	POPL	ES
+	TESTB	DL, #04			;Local selector?
+	JE	34$.S			;No
+	PUSHL	ECX
+	SLDT	CX			;Yes - get LDTR value
+	ANDL	ECX, #0FFF8h
+	MOVL	EAX, ES:[ECX]		;Copy address and size to our temporary
+	MOVL	ES:GS_GECKOTEMP, EAX	;  segment
+	MOVL	EAX, ES:4.B[ECX]
+	MOVB	AH, #92h
+	MOVL	ES:GS_GECKOTEMP+4, EAX
+	POPL	ECX
+	PUSHL	#GS_GECKOTEMP
+	POPL	ES			;Save access byte from selector (this
+34$:	MOVB	AH, ES:5.B[EDI]		;  may trap if selector is invalid!)
+	TESTB	AH, #80			;Is the segment there?
+	JNE	38$			;Yes
+	MOVB	AL, #0			;No - fail
+	STC
+	JMP	putdone
+
+38$:	MOVB	ES:5.B[EDI], #92	;Change to writable data segment (this
+	ANDB	DL, #0FCh		;  should not fail since all selector
+	MOVW	DS, DX			;  tables are assumed to be writable!)
+	MOVL	EDX, [ESP]
+	MOVL	[EBX], EDX		;Store long (this may trap if offset is
+	JMP	putdok			;  beyond end of the segment)
+
+;Here if protection error when writing to memory
+
+putfail:ADDL	ESP, #16t.B		;Remove junk from the stack
+	PUSHL	#1.B
+	PUSHL	CS
+	PUSHL	#putdone		;Stack where we want to go now
+	IRET				;Continue
+.PAGE
+;Subroutine to set up serial port for use with serial terminal
+;	CALL	setupterm
+
+setupterm:
+	MOVL	EDX, #P_COM1BASE+P_COMLINECON ;Point to line control register
+	MOVB	AL, #0			;Make sure interrupt enable register
+	OUTB	[DX]			;  is available
+	JMP	$+2.S				 ;Point to interrupt enable
+	ADDL	EDX, #P_COMINTENB-P_COMLINECON.B ;  register
+	MOVB	AL, #0			;Disable all interrupts
+	OUTB	[DX]
+	JMP	$+2.S
+	ADDL	EDX, #P_COMMODMCON-P_COMINTENB ;Point to modem control register
+	MOVB	AL, #03h		;Enable DTR and RTS, disable interrupts
+	OUTB	[DX]
+	JMP	$+2.S				  ;Point to line control
+	ADDL	EDX, #P_COMLINECON-P_COMMODMCON.B ;  register
+	MOVB	AL, #83h		;8 bits, 1 stop bit, no parity, enable
+	OUTB	[DX]			;  access to the divisor latch register
+	JMP	$+2.S
+	ADDL	EDX, #P_COMBRLSB-P_COMLINECON.B ;Point to divisor LSB register
+	MOVB	AL, #SERDIVISOR		;Get divisor value for 9600 or 38400
+	OUTB	[DX]			;Output LSB
+	JMP	$+2.S
+	MOVB	AL, #0			;Get high byte
+	INCL	EDX			;Point to divisor MSB register
+	OUTB	[DX]			;Output MSB
+	JMP	$+2.S
+	INCL	EDX			;Point to the line control register
+	INCL	EDX			;  again
+	MOVB	AL, #03h		;Enable access to the data registers now
+	OUTB	[DX]
+	MOVB	serset, #1		;Indicate serial terminal is set up
+	RET				;All done
+.PAGE
+;Subroutine to echo ESC to the terminal
+;	CALL	echoesc
+
+echoesc:MOVB	AL, #0E8h		;Assume should echo as phi
+	CMPB	serterm, #0FFh		;Using serial terminal?
+	JNE	outchx.S		;No
+	MOVB	AL, #'$'		;Yes - echo as $
+					;Fall into outchx
+
+;Internal subroutine to output character to scrolling region
+;	c(AL) = Character to output
+;	CALL	outchx
+
+outchx:	CMPB	serterm, #0FEh		;Using Gecko serial client?
+	JE	tosert			;Yes - just output the character
+	CALL	chkchx			;No - check for keyboard character
+	CMPB	stpflg, #0		;Want to stop output?
+	JNE	outchx.S		;Yes - wait
+	MOVB	nohalt, #1		;No - indicate should not stop now
+	PUSHL	ES			;Save registers
+	PUSHL	EBX
+	PUSHL	EDX
+	CMPB	AL, #' '		;Printing character?
+	JNC	30$			;Yes
+	CMPB	AL, #CR			;No - return?
+	JNE	4$.S			;No
+	MOVB	horpsn, #0		;Yes - reset position
+	JMP	8$.S
+
+4$:	CMPB	AL, #LF			;Line feed?
+	JNE	6$.S			;No
+	CMPB	serterm, #0		;Yes - console?
+	JNE	32$			;No
+	JMP	scrollup		;Yes
+
+;Here if not line feed
+
+6$:	CMPB	AL, #BS			;Backspace?
+	JNE	12$.S			;No
+	CMPB	horpsn, #0		;Yes - at beginning of line?
+	JE	10$.S			;Yes
+	DECB	horpsn			;No - reduce position
+8$:	CMPB	serterm, #0		;Using console?
+	JE	11$.S			;Yes - go display updated cursor
+	JMP	32$			;No - just output the character
+
+10$:	CMPB	serterm, #0		;Using console?
+	JNE	15$.S			;No - do nothing
+	SUBL	verpsn, #80t.B		;Yes - backup to end of previous line
+	DECB	curlin
+	MOVB	horpsn, #77t
+11$:	JMP	dspcur
+
+;Here if not backspace
+
+12$:	CMPB	AL, #HT			;Horizontal tab?
+	JNE	16$.S			;No
+14$:	MOVB	AL, #' '		;Yes - output space
+	INCB	horpsn
+	CALL	onscrn
+	TESTB	horpsn, #7		;At tab stop yet?
+	JNE	14$.S			;No - contin;ue
+15$:	JMP	disdon			;Yes - finished
+
+;Here if not horizontal tab
+
+16$:	CMPB	AL, #ERR		;Change color for error text?
+	JNE	18$.S			;No
+	MOVB	AH, #CERRATR		;Yes
+	JMP	20$.S
+
+18$:	CMPB	AL, #TXT		;Change color for normal text?
+	JNE	22$.S			;No
+	MOVB	AH, #CTXTATR
+20$:	MOVB	attrib, AH
+	JMP	disdon
+
+22$:	CMPB	AL, #INV		;Change to inverse video?
+	JNE	24$.S			;No
+	MOVB	AH, #CINVATR
+	JMP	20$.S
+
+24$:	CMPB	AL, #CLR		;Clear line?
+	JNE	30$.S			;No
+	CMPB	serterm, #0		;Using console?
+	JNE	25$.S			;No - go handle that
+	MOVB	horpsn, #0		;Yes
+	PUSHL	EDI
+	PUSHL	ES
+	CMPB	screen, #0		;Displaying GECKO's screen?
+	JE	26$.S			;No
+	LESL	EDI, sclladdr		;Yes - scroll the real display
+	JMP	28$.S
+
+;Here to clear line for serial terminal
+
+25$:	MOVB	AL, #CR			;Move to beginning of line
+	CALL	tosert
+	MOVB	AL, #ESC		;Clear the line
+	CALL	tosert
+	MOVB	AL, #'['
+	CALL	tosert
+	MOVB	AL, #'K
+	CALL	tosert
+	JMP	disdon
+
+;Here if not displaying GECKO's screen
+
+26$:	LESL	EDI, xscrlbf		;Scroll the saved display
+28$:	ADDL	EDI, verpsn
+	ADDL	EDI, verpsn
+	ADDL	EDI, #2.B
+	MOVB	AH, #CTXTATR
+	MOVB	AL, #' '
+	MOVL	ECX, #78t
+	CLD
+	RSTOSW	[EDI]
+	POPL	ES
+	POPL	EDI
+	JMP	dspcur
+
+;Here with printing character
+
+30$:	INCB	horpsn			;Bump horizontal position
+32$:	CALL	onscrn			;Put character on screen
+
+;Here to update cursor position
+
+dspcur:	CMPB	serterm, #0		;Using console?
+	JNE	36$.S			;No - finished
+	CMPB	screen, #0		;Yes - displaying GECKO's screen?
+	JE	disdon			;No - finished
+	MOVL	EDX, #P_EGACCRTINDX	;Yes
+	MOVL	EBX, horpsn		;Calculate character offset on screen
+	ADDL	EBX, verpsn
+	ADDL	EBX, #80t*6+1
+	MOVB	AL, #15t		;Point to cursor register in CRTC
+	OUTB	[DX]
+	MOVB	AL, BL
+	INCL	EDX
+	OUTB	[DX]
+	MOVB	AL, #14t
+	DECL	EDX
+	OUTB	[DX]
+	MOVB	AL, BH
+	INCL	EDX
+	OUTB	[DX]
+36$:	JMP	disdon			;Thats all
+.PAGE
+;Here to scroll screen up one line
+
+scrollup:
+	CMPB	nonscrl, #0		;Output to nonscrolling region?
+	JNE	2$.S			;Yes
+	MOVB	AL, curlin		;No - on last line now?
+	INCB	AL
+	CMPB	scllsiz, AL
+	JBE	4$.S			;Yes
+	MOVB	curlin, AL		;No - just move down a line
+2$:	ADDL	verpsn, #80t.B
+	JMP	dspcur.S		;And go update cursor
+
+;Here if now on last line of scrolling region
+
+4$:	PUSHL	ESI
+	PUSHL	EDI
+	PUSHL	ECX
+	CMPB	screen, #0		;Displaying GECKO's screen?
+	JE	6$.S			;No
+	LESL	EDI, sclladdr		;Yes - scroll the real display
+	JMP	8$.S
+
+6$:	LESL	EDI, xscrlbf		;Scroll the saved display
+8$:	MOVZBL	ECX, scllsiz		;Get size of scrolling area (lines)
+	DECL	ECX			;Minus one
+	IMULL	ECX, #40t.B		;Change to number of longs
+	LEAL	ESI, 160t[EDI]
+	CLD
+	RMOVSL	[EDI], ES:[ESI]		;Move screen up one line
+	MOVB	AH, #CBRDATR
+	MOVB	AL, #0B3h
+	STOSW	[EDI]
+	MOVB	AH, #CTXTATR		;Fill last line with spaces
+	MOVB	AL, #' '
+	SHLL	EAX, #16t
+	MOVB	AH, #CTXTATR
+	MOVB	AL, #' '
+	MOVL	ECX, #39t
+	RSTOSL	[EDI]
+	MOVB	AH, #CBRDATR
+	MOVB	AL, #0B3h
+	STOSW	[EDI]
+	POPL	ECX
+	POPL	EDI
+	POPL	ESI
+disdon:	POPL	EDX
+	POPL	EBX
+	POPL	ES
+	MOVB	nohalt, #0		;Allow stopping now
+	CMPB	hltflg, #0		;Should we stop now?
+	JE	disdo2.S
+	MOVB	hltflg, #0		;Yes - only once!
+	JMP	ctrlc2
+
+disdo2:	RET
+.PAGE
+;Subroutine to place character on screen
+;	c(AL) = Character
+;	CALL	onscrn
+
+onscrn:	CMPB	horpsn, #78t		;Yes - too far right?
+	JBE	2$.S			;No
+	PUSHL	EAX			;Yes - save character
+	CALL	outcrl			;Go to next line
+	POPL	EAX
+	INCB	horpsn
+2$:	CMPB	nonscrl, #0		;Write to non-scrolling region?
+	JE	6$.S			;No
+	CMPB	serterm, #0		;Yes - using console?
+	JNE	16$.S			;No - ignore this!
+	CMPB	conok, #0		;Yes - really have a console display?
+	JE	16$.S			;No - do nothing here!
+	CMPB	screen, #0		;Yes
+	JE	4$.S
+	LESL	EBX, nscladdr
+	JMP	14$.S
+
+4$:	LESL	EBX, xnsclbf
+	JMP	14$.S
+
+6$:	TESTB	prtflg, #1		;Should we output to the printer too?
+	JE	10$.S			;No
+	PUSHL	EAX			;Yes
+
+;CODE GOES HERE TO OUTPUT TO PRINTER!
+
+	POPL	EAX
+10$:	CMPB	serterm, #0		;Using console?
+	JNE	tosert.S		;No
+	CMPB	conok, #0		;Yes - really have a console display?
+	JE	16$.S			;No - do nothing here!
+	CMPB	screen, #0		;Yes
+	JE	12$.S
+	LESL	EBX, sclladdr
+	JMP	14$.S
+
+12$:	LESL	EBX, xscrlbf
+14$:	MOVB	AH, attrib
+	PUSHL	EAX
+	MOVL	EAX, horpsn
+	ADDL	EAX, verpsn
+	ADDL	EAX, EAX
+	ADDL	EBX, EAX
+	POPL	EAX
+	MOVW	ES:[EBX], AX
+16$:	RET
+
+;Here it doing output to serial terminal
+
+tosert:	CMPB	serok, #0		;Really have a serial terminal?
+	JE	26$.S			;No - do nothing here!
+	PUSHL	EDX			;Yes
+	PUSHL	EAX
+	MOVL	EDX, #P_COM1BASE+P_COMLINESTS ;Point to status register
+22$:	INB	[DX]			;Get status
+	TESTB	AL, #20h		;Wait until output is done
+	JE	22$.S
+	ADDL	EDX, #P_COMMODMSTS-P_COMLINESTS.B
+24$:	INB	[DX]
+	TESTB	AL, #20h
+	JE	24$.S
+	ADDL	EDX, #P_COMXDATA-P_COMMODMSTS.B
+	POPL	EAX
+	OUTB	[DX]			;Output character
+	POPL	EDX
+	CLC
+26$:	RET
+.PAGE
+;Subroutine to display registers when using the serial client
+
+cregdmp:MOVL	ECX, #16t		;We dump 16 values
+	MOVL	EBX, #scrtbl		;Point to register data table
+	MOVL	EDX, #uregbase		;Point to saved register values
+2$:	CMPB	allregs, #0		;Displaying all registers?
+	JNE	6$.S			;Yes
+	MOVL	EAX, [EDX]		;No - has the register's value changed?
+	CMPL	EAX, uregvalue-uregbase[EDX]
+	JE	10$.S			;No - skip it
+6$:	MOVB	AL, CS:[EBX]		;Yes - display it
+	CALL	tosert			;Send the function code (0Bh or 0Ch)
+	CMPB	AL, #0Bh		;16-bit value?
+	JE	8$.S			;Yes
+	MOVB	AL, 3.B[EDX]		;No - full 32-bit value
+	CALL	tosert
+	MOVB	AL, 2.B[EDX]
+	CALL	tosert
+8$:	MOVB	AL, 1.B[EDX]
+	CALL	tosert
+	MOVB	AL, [EDX]
+	CALL	tosert
+	MOVB	AL, CS:1.B[EBX]
+	CALL	tosert
+10$:	MOVL	EAX, [EDX]		;Update saved register value
+	MOVL	uregvalue-uregbase[EDX], EAX
+	ADDL	EBX, #2t.B		;Bump our pointers
+	ADDL	EDX, #4t.B
+	LOOP	ECX, 2$			;Continue if more to do
+	RET				;If finished
+.PAGE
+;Define bits for the keyboard state word keysts
+
+KS$LALT  =!0200h	;Left alt key state
+KS$RALT  =!0100h	;Right alt key state
+KS$LCTRL =!0020h	;Left control key state
+KS$RCTRL =!0010h	;Right control key state
+KS$LSHFT =!0008h	;Left shift key state
+KS$RSHFT =!0004h	;Right shift key state
+
+;Subroutine to get input character from terminal
+;	CALL	inpchx
+;	c(AL) = Character
+
+inpchx:	CMPB	kbdcnt, #0		;Anything in the keyboard buffer?
+	JNE	8$			;Yes
+2$:	CALL	getkchr			;No - get character from keyboard
+	JNC	4$.S
+	CMPL	keyscnt, #0.B
+	JE	2$.S
+	DECL	keyscnt
+	JNE	2$.S
+	MOVB	AL, #XC_G
+	CLC
+4$:	RET
+
+;Here with buffered character
+
+8$:	PUSHL	EBX
+	MOVL	EBX, kbdtak		;Yes - get taker pointer
+	MOVB	AL, [EBX]		;Get character
+	INCL	EBX			;Bump pointer
+	CMPL	EBX, #kbdend		;At end of buffer?
+	JB	inpch2			;No
+	MOVL	EBX, #kbdbfr		;Yes - reset pointer
+inpch2:	MOVL	kbdtak, EBX		;Store pointer
+	POPL	EBX
+	DECB	kbdcnt			;Reduce count
+	RET				;Return with character
+.PAGE
+;Subroutine to check for type-ahead
+
+chkchx:	PUSHL	EAX
+	CALL	getkchr			;See if have character
+	JC	6$.S			;Nope
+	CMPB	kbdcnt, #KBDSIZE-1	;Yes - too many characters?
+	JAE	6$.S			;Yes - forget this one!
+	INCB	kbdcnt			;No - bump count
+	PUSHL	EBX
+	MOVL	EBX, kbdput		;Get putter pointer
+	MOVB	[EBX], AL		;Store character
+	INCL	EBX			;Bump pointer
+	CMPL	EBX, #kbdend		;At end of buffer
+	JB	4$.S			;No
+	MOVL	EBX, #kbdbfr		;Yes - reset pointer
+4$:	MOVL	kbdput, EBX
+	POPL	EBX
+6$:	POPL	EAX
+	RET
+.PAGE
+;Subroutine to get character from keyboard
+
+getkchr:CMPB	serterm, #0		;Using console?
+	JE	kbdinp			;Yes
+	PUSHL	EDX			;No
+2$:	MOVL	EDX, #P_COM1BASE+P_COMLINESTS ;Point to the line status register
+	INB	[DX]			;Get status
+	RCRB	AL, #1			;Have input character?
+	JC	6$.S			;Yes
+	POPL	EDX			;No
+	STC
+	RET
+
+;Here with keyboard character from the serial port
+
+6$:	MOVL	keyscnt, #0		;Clear auto-start counter
+	ADDL	EDX, #P_COMRDATA-P_COMLINESTS.B ;Point to data register
+	INB	[DX]			;Get input character
+	ANDB	AL, #7Fh		;Only use 7 bits
+	MOVL	EDX, scista
+	JMPIL	CS:scitbl[EDX*4]
+
+	.MOD	4
+scitbl:	.LONG	scinrm
+	.LONG	scisp1
+	.LONG	scisp2
+
+scinrm:	CMPB	AL, #0			;Is this the special prefix?
+	JE	10$.S			;Yes
+8$:	POPL	EDX			;No - return with the character
+	CLC
+	RET
+
+;Here with the serial client special prefix
+
+10$:	INCL	scista			;Advance state
+	JMP	2$.S			;Get another character
+
+;Here if previous character was the serial client special prefix, this
+;  character is a function key code as follows:
+;    If bits 5-0 are non-0: (Non-ascii key)
+;	Bit 8    Set if ALT pressed
+;	Bit 7    Set if CTL pressed
+;	Bit 6    Set if SHFT pressed
+;	Bits 5-0 Function key number
+;    If bits 5-0 are 0: (special function)
+;	20h = Serial client reset - sets the screen height and requests all
+;		register values
+
+
+scisp1:	TESTB	AL, #1Fh		;Is it an extended function?
+	JE	14$.S			;Yes
+	CMPB	serterm, #0FEh		;No - using serial client?
+	JNE	16$.S			;No - this is not special!
+	MOVB	AH, AL			;Yes - fix up the value
+	ANDB	AH, #20h
+	ANDB	AL, #0Fh
+	ADDB	AH, AH
+	ORB	AL, AH
+	ORB	AL, #80h
+	MOVB	scista, #0		;Reset our state
+	JMP	8$.S			;Return the non-ascii key code
+
+;Here if have special function
+
+14$:	CMPB	AL, #20h		;Serial client reset?
+	JE	10$.S			;Yes
+16$:	MOVB	scista, #0		;No - all others are invalid
+	JMP	2$.S
+	
+;Here with the data byte for a serial client reset function - this contains
+;  the height of the scrolling area of the screen
+
+scisp2:	MOVB	dheight, AL		;Store the height
+	MOVB	serterm, #0FEh		;Indicate using serial client
+	MOVB	allregs, #1		;Send him all register values
+	CALL	xregdmp
+	MOVB	allregs, #0
+	JMP	16$.S
+.PAGE
+;Here if using console keyboard
+
+kbdinp:	INB	P_KEYSTS		;Have anything from the keyboard?
+	ANDB	AL, #1
+	JNE	4$.S			;Yes
+	STC				;No
+	RET
+
+;Here with a character
+
+4$:	PUSHL	ES			;Yes
+	PUSHL	EBX
+	PUSHL	ESI
+	INB	P_KEYDATA		;Get keyboard scan code
+	MOVZBL	EAX, AL
+	MOVL	EBX, EAX
+	CMPB	AL, #0E0h		;Yes - is this a special prefix?
+	JE	8$.S			;Yes
+	CMPB	AL, #0E1h		;Maybe
+	JNE	10$.S			;No
+	MOVL	kbdsta, #kbdhvE1	;Yes - advance state
+	JMP	kbdin6.S		;Otherwise ignore this key
+
+;Here if have E0 from keyboard
+
+8$:	MOVL	kbdsta, #kbdhvE0	;Advance state
+kbdin6:	STC
+	JMP	22$
+
+10$:	JMPIL	kbdsta			;Dispatch on current keyboard state
+
+;Here if have normal character from keyboard
+
+kbdnorm:MOVL	EBX, #keytbl
+	JMP	12$.S
+
+;Here if have character after E0 from keyboard
+
+kbdhvE0:MOVL	EBX, #keytblE0		;No - get offset of table to use
+	MOVL	kbdsta, #kbdnorm	;Reset keyboard mode
+12$:	ORB	AL, AL			;Break code?
+	JNS	14$.S			;No
+	ANDB	AL, #7Fh		;Yes
+	CMPB	AL, #58h		;Is value in range?
+	JA	20$.S			;No - ignore it!
+	MOVZBL	EAX, CS:[EBX+EAX]	;Get corresponding index
+	ORB	AL, AL			;Special key?
+	JNS	20$.S			;No - ignore normal break code
+	JMPIL	CS:bkytbl-80[EAX]	;Yes - dispatch on the special code
+
+;Here for normal character
+
+14$:	CMPB	AL, #58h		;Is value in range?
+	JA	20$.S			;No - ignore it!
+	MOVL	keyscnt, #0		;Clear auto-start counter
+	MOVZBL	EAX, CS:[EBX+EAX]	;Get corresponding index
+	ORB	AL, AL			;Is this a normal ASCII code?
+	JS	24$.S			;No
+kbdcom:	MOVZBL	EBX, keysts		;Yes - get shift state
+	MOVL	ESI, CS:codtbl[EBX]	;Get current keyboard table
+	MOVB	AL, CS:[EAX+ESI]	;Get code value
+	ORB	AL, AL
+	JNE	22$.S
+20$:	STC
+22$:	POPL	ESI
+	POPL	EBX
+	POPL	ES
+rstflg:	RET
+
+;Here with non-ASCII keyboard code
+
+24$:	JMPIL	CS:mkytbl-80[EAX]	;Dispatch on the special code
+.PAGE
+;Here if have character after E1 from keyboard
+
+kbdhvE1:CMPB	AL, #1Dh		;Make of control key?
+	JE	6$.S
+	CMPB	AL, #9Dh		;Control break?
+	JNE	4$.S			;No - ignore this!
+	MOVL	kbdsta, #4$		;Yes - advance state so will ignore
+2$:	JMP	kbdin6			;  next character
+
+;Here to reset state and ignore character
+
+4$:	MOVL	kbdsta, #kbdnorm
+	JMP	2$.S
+
+;Here if have 1D following E1 from keyboard
+
+6$:	MOVL	kbdsta, #pausmak
+	JMP	2$.S
+
+;Here if have character after E1-1D sequence from keyboard
+
+pausmak:CMPB	AL, #45h		;Is this the right code?
+	JNE	4$.S			;No - ignore it
+	MOVB	AL, #5Eh		;Yes - index for pause
+	MOVL	kbdsta, #kbdnorm	;Reset keyboard mode
+	JMP	kbdcom.S		;Continue
+.PAGE
+;Special key make code dispatch table
+
+mkytbl:	.LONG	kbdin6		;SK_NULL  = 80h - Unused code
+	.LONG	mlshft		;SK_LSHFT = 84h - Left shift key
+	.LONG	mrshft		;SK_RSHFT = 88h - Right shift key
+	.LONG	mlctrl		;SK_LCTRL = 8Ch - Left control key
+	.LONG	mrctrl		;SK_RCTRL = 90h - Right control key
+	.LONG	mlalt		;SK_LALT  = 94h - Left alt key
+	.LONG	mralt		;SK_RALT  = 98h = Right alt key
+	.LONG	ctrls		;SK_CTRLS = 9Ch - Ctrl-S
+	.LONG	ctrlq		;SK_CTRLQ = A0h - Ctrl-Q
+	.LONG	ctrlc		;SK_CTRLC = A4h - Ctrl-C
+	.LONG	delkey1		;SK_DEL1  = A8h - DEL key
+	.LONG	delkey2		;SK_DEL2  = ACh - Keypad DEL key
+
+codtbl:	.LONG	keynrm		;0000 - No shift or control keys pressed
+	.LONG	keyshf		;0001 - Right shift key pressed
+	.LONG	keyshf		;0010 - Left shift key pressed
+	.LONG	keyshf		;0011 - Both shift keys pressed
+	.LONG	keyctl		;0100 - Right control key pressed
+	.LONG	keyctl		;0101
+	.LONG	keyctl		;0110
+	.LONG	keyctl		;0111
+	.LONG	keyctl		;1000 - Left control key pressed
+	.LONG	keyctl		;1001
+	.LONG	keyctl		;1010
+	.LONG	keyctl		;1011
+	.LONG	keyctl		;1100 - Both control keys pressed
+	.LONG	keyctl		;1101
+	.LONG	keyctl		;1110
+	.LONG	keyctl		;1111
+
+;Special key break code dispatch table
+
+bkytbl:	.LONG	kbdin6		;SK_NULL  = 80h - Unused key
+	.LONG	blshft		;SK_LSHFT = 84h - Left shift key
+	.LONG	brshft		;SK_RSHFT = 88h - Right shift key
+	.LONG	blctrl		;SK_LCTRL = 8Ch - Left control key
+	.LONG	brctrl		;SK_RCTRL = 90h - Right control key
+	.LONG	blalt		;SK_LALT  = 94h - Left alt key
+	.LONG	bralt		;SK_RALT  = 98h - Right alt key
+	.LONG	kbdin6		;SK_CTRLS = 9Ch - Ctrl-S
+	.LONG	kbdin6		;SK_CTRLQ = A0h - Ctrl-Q
+	.LONG	kbdin6		;SK_CTRLC = A4h - Ctrl-C
+	.LONG	kbdin6		;SK_DEL1  = A8h - DEL key
+	.LONG	kbdin6		;SK_DEL2  = ACh - Keypad DEL key
+
+;Here for make of left shift key
+
+mlshft:	ORB	keysts, #KS$LSHFT
+	JMP	6$.S
+
+;Here for break of left shift key
+
+blshft:	ANDB	keysts, #~KS$LSHFT
+	JMP	6$.S
+
+;Here for make of right shift key
+
+mrshft:	ORB	keysts, #KS$RSHFT
+	JMP	6$.S
+
+;Here for break of right shift key
+
+brshft:	ANDB	keysts, #~KS$RSHFT
+	JMP	6$.S
+
+;Here for make of left control key
+
+mlctrl:	ORB	keysts, #KS$LCTRL
+	JMP	6$.S
+
+;Here for break of left control key
+
+blctrl:	ANDB	keysts, #~KS$LCTRL
+	JMP	6$.S
+
+;Here for make of right control key
+
+mrctrl:	ORB	keysts, #KS$RCTRL
+	JMP	6$.S
+
+;Here for break of right control key
+
+brctrl:	ANDB	keysts, #~KS$RCTRL
+	JMP	6$.S
+
+;Here for make of left alt key
+
+mlalt:	ORB	keysts+1, #KS$LALT>8
+	JMP	6$.S
+
+;Here for break of left alt key
+
+blalt:	ANDB	keysts+1, #~{KS$LALT>8}
+	JMP	6$.S
+
+;Here for make of right alt key
+
+mralt:	ORB	keysts+1, #KS$RALT>8
+	JMP	6$.S
+
+;Here for break of right alt key
+
+bralt:	ANDB	keysts+1, #~{KS$RALT>8}
+	JMP	6$.S
+
+;Here for make of ctrl-C key
+
+ctrlc:	CMPB	nohalt, #0		;Can we stop now?
+	JE	ctrlc2			;Yes
+	MOVB	hltflg, #1		;No - stop later
+6$:	JMP	kbdin6
+
+ctrlc2:	XORL	EAX, EAX
+	MOVB	kbdcnt, AL		;Initialize the keyboard type-ahead
+	MOVL	kbdput, #kbdbfr		;  buffer
+	MOVL	kbdtak, #kbdbfr
+	MOVL	EBX, #cncech		;Echo the ctrl-C
+	CALL	outstrc
+	MOVB	AL, #20h
+	OUTB	20h
+	JMP	restart
+
+;Here for make of ctrl-S key
+
+ctrls:	MOVB	stpflg, #1		;Indicate should stop output
+	JMP	6$.S
+
+;Here for make of ctrl-Q key
+
+ctrlq:	MOVB	stpflg, #0		;Indicate output is OK
+	JMP	6$.S
+.PAGE
+;Here for make of the DEL key
+
+delkey1:MOVB	AL, #48h
+	JMP	4$.S
+
+;Here for make of the keypad DEL key
+
+delkey2:MOVB	AL, #58h
+4$:	TESTB	keysts+1, #{KS$LALT|KS$RALT}>8 ;Either alt key pressed?
+	JE	6$.S			;No - just normal DEL
+	TESTB	keysts, #KS$LCTRL|KS$RCTRL ;Either control key pressed?
+6$:	JE	kbdcom			;No - just normal DEL
+	JMP	goexit			;Yes - exit!
+.PAGE
+	.SBTTL	keytbl - Master keyboard translation tables
+
+;Define symbols for indexes for special keys
+
+SK_NULL  =!080h		;Unused code
+SK_LSHFT =!084h		;Left shift key
+SK_RSHFT =!088h		;Right shift key
+SK_LCTRL =!08Ch		;Left control key
+SK_RCTRL =!090h		;Right control key
+SK_LALT  =!094h		;Left alt key
+SK_RALT  =!098h		;Right alt key
+SK_CTRLS =!09Ch		;Ctrl-S
+SK_CTRLQ =!0A0h		;Ctrl-Q
+SK_CTRLC =!0A4h		;Ctrl-C or ctrl-BREAK
+SK_DEL1  =!0A8h		;DEL key
+SK_DEL2  =!0ACh		;Keypad DEL key
+
+;Keyboard translation table.  A 0 entry in this table means the key corresponds
+;  to a normal ASCII character, the value of which is found in the keynrm,
+;  keyshf, or keyctl table, depending on the current state of the control and
+;  shift keys.  An entry with the high bit clear means the key corresponds to
+;  an extended character code - the value in this table is the value for the
+;  second byte of that code.  An entry with the high bit set means the key
+;  requires special handling - the value in this table is the index into a
+;  dispatch table for special handling.
+
+keytbl:	.BYTE	SK_NULL		;00
+	.BYTE	35h		;01 - Escape key
+	.BYTE	01h		;02 - 1 or !
+	.BYTE	02h		;03 - 2 or @
+	.BYTE	03h		;04 - 3 or #
+	.BYTE	04h		;05 - 4 or $
+	.BYTE	05h		;06 - 5 or %
+	.BYTE	06h		;07 - 6 or ^
+	.BYTE	07h		;08 - 7 or &
+	.BYTE	08h		;09 - 8 or *
+	.BYTE	09h		;0A - 9 or (
+	.BYTE	0Ah		;0B - 0 or )
+	.BYTE	0Bh		;0C - - or _
+	.BYTE	0Ch		;0D - = or +
+	.BYTE	34h		;0E - Backspace
+	.BYTE	36h		;0F - Tab
+	.BYTE	28h		;10 - Q
+	.BYTE	2Eh		;11 - W
+	.BYTE	1Ch		;12 - E
+	.BYTE	29h		;13 - R
+	.BYTE	2Bh		;14 - T
+	.BYTE	30h		;15 - Y
+	.BYTE	2Ch		;16 - U
+	.BYTE	20h		;17 - I
+	.BYTE	26h		;18 - O
+	.BYTE	27h		;19 - P
+	.BYTE	0Dh		;1A - [ or {
+	.BYTE	0Eh		;1B - ] or }
+	.BYTE	33h		;1C - Return
+	.BYTE	SK_LCTRL	;1D - Left control key
+	.BYTE	18h		;1E - A
+	.BYTE	2Ah		;1F - S
+	.BYTE	1Bh		;20 - D
+	.BYTE	1Dh		;21 - F
+	.BYTE	1Eh		;22 - G
+	.BYTE	1Fh		;23 - H
+	.BYTE	21h		;24 - J
+	.BYTE	22h		;25 - K
+	.BYTE	23h		;26 - L
+	.BYTE	14h		;27 - ;
+	.BYTE	15h		;28 - ' or "
+	.BYTE	10h		;29 - Grave or ~
+	.BYTE	SK_LSHFT	;2A - Left shift key
+	.BYTE	0Fh		;2B - Backslash or |
+	.BYTE	31h		;2C - Z
+	.BYTE	2Fh		;2D - X
+	.BYTE	1Ah		;2E - C
+	.BYTE	2Dh		;2F - V
+	.BYTE	19h		;30 - B
+	.BYTE	25h		;31 - N
+	.BYTE	24h		;32 - M
+	.BYTE	11h		;33 - , or <
+	.BYTE	12h		;34 - . or >
+	.BYTE	13h		;35 - / or ?
+	.BYTE	SK_RSHFT	;36 - Right shift key
+	.BYTE	5Bh		;37 - Keypad *
+	.BYTE	SK_LALT		;38 - Left ALT key
+	.BYTE	32h		;39 - Space
+	.BYTE	SK_NULL		;3A - Caps lock key
+	.BYTE	38h		;3B - F1 key
+	.BYTE	39h		;3C - F2 key
+	.BYTE	3Ah		;3D - F3 key
+	.BYTE	3Bh		;3E - F4 key
+	.BYTE	3Ch		;3F - F5 key
+	.BYTE	3Dh		;40 - F6 key
+	.BYTE	3Eh		;41 - F7 key
+	.BYTE	3Fh		;42 - F8 key
+	.BYTE	40h		;43 - F9 key
+	.BYTE	41h		;44 - F10 key
+	.BYTE	SK_NULL		;45 - NUM LOCK
+	.BYTE	SK_NULL		;46 - SCROLL LOCK
+	.BYTE	54h		;47 - Keypad 7
+	.BYTE	55h		;48 - Keypad 8
+	.BYTE	56h		;49 - Keypad 9
+	.BYTE	5Ch		;4A - Keypad - (!!)
+	.BYTE	51h		;4B - Keypad 4
+	.BYTE	52h		;4C - Keypad 5
+	.BYTE	53h		;4D - Keypad 6
+	.BYTE	5Ah		;4E - Keypad +
+	.BYTE	4Eh		;4F - Keypad 1
+	.BYTE	4Fh		;50 - Keypad 2
+	.BYTE	50h		;51 - Keypad 3
+	.BYTE	57h		;52 - Keypad 0
+	.BYTE	SK_DEL2		;53 - Keypad .
+	.BYTE	SK_NULL		;54
+	.BYTE	SK_NULL		;55
+	.BYTE	SK_NULL		;56
+	.BYTE	42h		;57 - F11 key
+	.BYTE	43h		;58 - F12 key
+
+keytblE0:
+	.BYTE	SK_NULL		;E0-00
+	.BYTE	SK_NULL		;E0-01
+	.BYTE	SK_NULL		;E0-02
+	.BYTE	SK_NULL		;E0-03
+	.BYTE	SK_NULL		;E0-04
+	.BYTE	SK_NULL		;E0-05
+	.BYTE	SK_NULL		;E0-06
+	.BYTE	SK_NULL		;E0-07
+	.BYTE	SK_NULL		;E0-08
+	.BYTE	SK_NULL		;E0-09
+	.BYTE	SK_NULL		;E0-0A
+	.BYTE	SK_NULL		;E0-0B
+	.BYTE	SK_NULL		;E0-0C
+	.BYTE	SK_NULL		;E0-0D
+	.BYTE	SK_NULL		;E0-0E
+	.BYTE	SK_NULL		;E0-0F
+	.BYTE	SK_NULL		;E0-10
+	.BYTE	SK_NULL		;E0-11
+	.BYTE	SK_NULL		;E0-12
+	.BYTE	SK_NULL		;E0-13
+	.BYTE	SK_NULL		;E0-14
+	.BYTE	SK_NULL		;E0-15
+	.BYTE	SK_NULL		;E0-16
+	.BYTE	SK_NULL		;E0-17
+	.BYTE	SK_NULL		;E0-18
+	.BYTE	SK_NULL		;E0-19
+	.BYTE	SK_NULL		;E0-1A
+	.BYTE	SK_NULL		;E0-1B
+	.BYTE	SK_NULL		;E0-1C
+	.BYTE	SK_RCTRL	;E0-1D - Right control key
+	.BYTE	SK_NULL		;E0-1E
+	.BYTE	SK_NULL		;E0-1F
+	.BYTE	SK_NULL		;E0-20
+	.BYTE	SK_NULL		;E0-21
+	.BYTE	SK_NULL		;E0-22
+	.BYTE	SK_NULL		;E0-23
+	.BYTE	SK_NULL		;E0-24
+	.BYTE	SK_NULL		;E0-25
+	.BYTE	SK_NULL		;E0-26
+	.BYTE	SK_NULL		;E0-27
+	.BYTE	SK_NULL		;E0-28
+	.BYTE	SK_NULL		;E0-29
+	.BYTE	SK_NULL		;E0-2A - Shift prefix (ignored)
+	.BYTE	SK_NULL		;E0-2B
+	.BYTE	SK_NULL		;E0-2C
+	.BYTE	SK_NULL		;E0-2D
+	.BYTE	SK_NULL		;E0-2E
+	.BYTE	SK_NULL		;E0-2F
+	.BYTE	SK_NULL		;E0-30
+	.BYTE	SK_NULL		;E0-31
+	.BYTE	SK_NULL		;E0-32
+	.BYTE	SK_NULL		;E0-33
+	.BYTE	SK_NULL		;E0-34
+	.BYTE	59h		;E0-35 - Keypad /
+	.BYTE	SK_NULL		;E0-36
+	.BYTE	SK_NULL		;E0-37 - Print screen
+	.BYTE	SK_RALT		;E0-38 - Right ALT key
+	.BYTE	SK_NULL		;E0-39
+	.BYTE	SK_NULL		;E0-3A
+	.BYTE	SK_NULL		;E0-3B
+	.BYTE	SK_NULL		;E0-3C
+	.BYTE	SK_NULL		;E0-3D
+	.BYTE	SK_NULL		;E0-3E
+	.BYTE	SK_NULL		;E0-3F
+	.BYTE	SK_NULL		;E0-40
+	.BYTE	SK_NULL		;E0-41
+	.BYTE	SK_NULL		;E0-42
+	.BYTE	SK_NULL		;E0-43
+	.BYTE	SK_NULL		;E0-44
+	.BYTE	SK_NULL		;E0-45
+	.BYTE	SK_NULL		;E0-46
+	.BYTE	4Bh		;E0-47 - Home
+	.BYTE	47h		;E0-48 - Up arrow
+	.BYTE	4Dh		;E0-49 - Page up
+	.BYTE	SK_NULL		;E0-4A
+	.BYTE	45h		;E0-4B - Left arrow
+	.BYTE	SK_NULL		;E0-4C
+	.BYTE	46h		;E0-4D - Right arrow
+	.BYTE	SK_NULL		;E0-4E
+	.BYTE	4Ah		;E0-4F - End
+	.BYTE	44h		;E0-50 - Down arrow
+	.BYTE	4Ch		;E0-51 - Page down
+	.BYTE	49h		;E0-52 - Insert
+	.BYTE	SK_DEL1		;E0-53 - Delete
+	.BYTE	SK_NULL		;E0-54
+	.BYTE	SK_NULL		;E0-55
+	.BYTE	SK_NULL		;E0-56
+	.BYTE	SK_NULL		;E0-57
+	.BYTE	SK_NULL		;E0-58
+.PAGE
+	.SBTTL	keynrm - Normal (unshifted) table
+
+keynrm:	.BYTE	0		;00
+	.BYTE	'1'		;01 - 1 or !
+	.BYTE	'2'		;02 - 2 or @
+	.BYTE	'3'		;03 - 3 or #
+	.BYTE	'4'		;04 - 4 or $
+	.BYTE	'5'		;05 - 5 or %
+	.BYTE	'6'		;06 - 6 or ^
+	.BYTE	'7'		;07 - 7 or &
+	.BYTE	'8'		;08 - 8 or *
+	.BYTE	'9'		;09 - 9 or (
+	.BYTE	'0'		;0A - 0 or )
+	.BYTE	'-'		;0B - - or _
+	.BYTE	'='		;0C - = or +
+	.BYTE	'['		;0D - [ or {
+	.BYTE	']'		;0E - ] or }
+	.BYTE	5Ch		;0F - Backslash or |
+	.BYTE	'`'		;10 - Grave or ~
+	.BYTE	','		;11 - , or <
+	.BYTE	'.'		;12 - . or >
+	.BYTE	'/'		;13 - / or ?
+	.BYTE	';'		;14 - ;
+	.BYTE	27h		;15 - ' or "
+	.BYTE	0		;16
+	.BYTE	0		;17
+	.BYTE	'a'		;18 - A
+	.BYTE	'b'		;19 - B
+	.BYTE	'c'		;1A - C
+	.BYTE	'd'		;1B - D
+	.BYTE	'e'		;1C - E
+	.BYTE	'f'		;1D - F
+	.BYTE	'g'		;1E - G
+	.BYTE	'h'		;1F - H
+	.BYTE	'i'		;20 - I
+	.BYTE	'j'		;21 - J
+	.BYTE	'k'		;22 - K
+	.BYTE	'l'		;23 - L
+	.BYTE	'm'		;24 - M
+	.BYTE	'n'		;25 - N
+	.BYTE	'o'		;26 - O
+	.BYTE	'p'		;27 - P
+	.BYTE	'q'		;28 - Q
+	.BYTE	'r'		;29 - R
+	.BYTE	's'		;2A - S
+	.BYTE	't'		;2B - T
+	.BYTE	'u'		;2C - U
+	.BYTE	'v'		;2D - V
+	.BYTE	'w'		;2E - W
+	.BYTE	'x'		;2F - X
+	.BYTE	'y'		;30 - Y
+	.BYTE	'z'		;31 - Z
+	.BYTE	' '		;32 - Space
+	.BYTE	CR		;33 - Return
+	.BYTE	BS		;34 - Backspace
+	.BYTE	ESC		;35 - Escape key
+	.BYTE	HT		;36 - Tab
+	.BYTE	0		;37
+	.BYTE	81h		;38 - F1 key
+	.BYTE	82h		;39 - F2 key
+	.BYTE	83h		;3A - F3 key
+	.BYTE	84h		;3B - F4 key
+	.BYTE	85h		;3C - F5 key
+	.BYTE	86h		;3D - F6 key
+	.BYTE	87h		;3E - F7 key
+	.BYTE	88h		;3F - F8 key
+	.BYTE	89h		;40 - F9 key
+	.BYTE	8Ah		;41 - F10 key
+	.BYTE	8Bh		;42 - F11 key
+	.BYTE	8Ch		;43 - F12 key
+	.BYTE	0		;44 - Down arrow
+	.BYTE	0		;45 - Left arrow
+	.BYTE	0		;46 - Right arrow
+	.BYTE	0		;47 - Up arrow
+	.BYTE	0		;48 - Delete
+	.BYTE	0		;49 - Insert
+	.BYTE	0		;4A - End
+	.BYTE	0		;4B - Home
+	.BYTE	0		;4C - Page down
+	.BYTE	0		;4D - Page up
+	.BYTE	'1'		;4E - Keypad 1
+	.BYTE	'2'		;4F - Keypad 2
+	.BYTE	'3'		;50 - Keypad 3
+	.BYTE	'4'		;51 - Keypad 4
+	.BYTE	'5'		;52 - Keypad 5
+	.BYTE	'6'		;53 - Keypad 6
+	.BYTE	'7'		;54 - Keypad 7
+	.BYTE	'8'		;55 - Keypad 8
+	.BYTE	'9'		;56 - Keypad 9
+	.BYTE	'0'		;57 - Keypad 0
+	.BYTE	'.'		;58 - Keypad .
+	.BYTE	'/'		;59 - Keypad /
+	.BYTE	'+'		;5A - Keypad +
+	.BYTE	'*'		;5B - Keypad *
+	.BYTE	'-'		;5C - Keypad - (!!)
+	.BYTE	CR		;5D - Keypad enter
+	.BYTE	0		;5E - Pause
+.PAGE
+	.SBTTL	keyshf - Keyboard table with shift key pressed
+
+keyshf:	.BYTE	0		;00
+	.BYTE	'!'		;01 - 1 or !
+	.BYTE	'@'		;02 - 2 or @
+	.BYTE	'#'		;03 - 3 or #
+	.BYTE	'$'		;04 - 4 or $
+	.BYTE	'%'		;05 - 5 or %
+	.BYTE	'^'		;06 - 6 or ^
+	.BYTE	'&'		;07 - 7 or &
+	.BYTE	'*'		;08 - 8 or *
+	.BYTE	'('		;09 - 9 or (
+	.BYTE	')'		;0A - 0 or )
+	.BYTE	'_'		;0B - - or _
+	.BYTE	'+'		;0C - = or +
+	.BYTE	'{'		;0D - [ or {
+	.BYTE	'}'		;0E - ] or }
+	.BYTE	'|'		;0F - Backslash or |
+	.BYTE	'~'		;10 - Grave or ~
+	.BYTE	'<'		;11 - , or <
+	.BYTE	'>'		;12 - . or >
+	.BYTE	'?'		;13 - / or ?
+	.BYTE	':'		;14 - ;
+	.BYTE	'"'		;15 - ' or "
+	.BYTE	0		;16
+	.BYTE	0		;17
+	.BYTE	'A'		;18 - A
+	.BYTE	'B'		;19 - B
+	.BYTE	'C'		;1A - C
+	.BYTE	'D'		;1B - D
+	.BYTE	'E'		;1C - E
+	.BYTE	'F'		;1D - F
+	.BYTE	'G'		;1E - G
+	.BYTE	'H'		;1F - H
+	.BYTE	'I'		;20 - I
+	.BYTE	'J'		;21 - J
+	.BYTE	'K'		;22 - K
+	.BYTE	'L'		;23 - L
+	.BYTE	'M'		;24 - M
+	.BYTE	'N'		;25 - N
+	.BYTE	'O'		;26 - O
+	.BYTE	'P'		;27 - P
+	.BYTE	'Q'		;29 - Q
+	.BYTE	'R'		;28 - R
+	.BYTE	'S'		;2A - S
+	.BYTE	'T'		;2B - T
+	.BYTE	'U'		;2C - U
+	.BYTE	'V'		;2D - V
+	.BYTE	'W'		;2E - W
+	.BYTE	'X'		;2F - X
+	.BYTE	'Y'		;30 - Y
+	.BYTE	'Z'		;31 - Z
+	.BYTE	' '		;32 - Space
+	.BYTE	CR		;33 - Return
+	.BYTE	BS		;34 - Backspace
+	.BYTE	ESC		;35 - Escape key
+	.BYTE	HT		;36 - Tab
+	.BYTE	0		;37
+	.BYTE	91h		;38 - F1 key
+	.BYTE	92h		;39 - F2 key
+	.BYTE	93h		;3A - F3 key
+	.BYTE	94h		;3B - F4 key
+	.BYTE	95h		;3C - F5 key
+	.BYTE	96h		;3D - F6 key
+	.BYTE	97h		;3E - F7 key
+	.BYTE	98h		;3F - F8 key
+	.BYTE	99h		;40 - F9 key
+	.BYTE	9AH		;41 - F10 key
+	.BYTE	9Bh		;42 - F11 key
+	.BYTE	9Ch		;43 - F12 key
+	.BYTE	0		;44 - Down arrow
+	.BYTE	0		;45 - Left arrow
+	.BYTE	0		;46 - Right arrow
+	.BYTE	0		;47 - Up arrow
+	.BYTE	0		;48 - Delete
+	.BYTE	0		;49 - Insert
+	.BYTE	0		;4A - End
+	.BYTE	0		;4B - Home
+	.BYTE	0		;4C - Page down
+	.BYTE	0		;4D - Page up
+	.BYTE	'1'		;4E - Keypad 1
+	.BYTE	'2'		;4F - Keypad 2
+	.BYTE	'3'		;50 - Keypad 3
+	.BYTE	'4'		;51 - Keypad 4
+	.BYTE	'5'		;52 - Keypad 5
+	.BYTE	'6'		;53 - Keypad 6
+	.BYTE	'7'		;54 - Keypad 7
+	.BYTE	'8'		;55 - Keypad 8
+	.BYTE	'9'		;56 - Keypad 9
+	.BYTE	'0'		;57 - Keypad 0
+	.BYTE	'.'		;58 - Keypad .
+	.BYTE	'/'		;59 - Keypad /
+	.BYTE	'+'		;5A - Keypad +
+	.BYTE	'*'		;5B - Keypad *
+	.BYTE	'-'		;5C - Keypad - (!!)
+	.BYTE	CR		;5D - Keypad enter
+	.BYTE	0		;5E - Pause
+.PAGE
+	.SBTTL	keyctr - Keyboard table with control key pressed
+
+keyctl:	.BYTE	0		;00
+	.BYTE	'1'		;01 - 1 or !
+	.BYTE	'2'		;02 - 2 or @
+	.BYTE	'3'		;03 - 3 or #
+	.BYTE	'4'		;04 - 4 or $
+	.BYTE	'5'		;05 - 5 or %
+	.BYTE	'6'		;06 - 6 or ^
+	.BYTE	'7'		;07 - 7 or &
+	.BYTE	'8'		;08 - 8 or *
+	.BYTE	'9'		;09 - 9 or (
+	.BYTE	'0'		;0A - 0 or )
+	.BYTE	'-'		;0B - - or _
+	.BYTE	'='		;0C - = or +
+	.BYTE	ESC		;0D - [ or {
+	.BYTE	']'		;0E - ] or }
+	.BYTE	5Ch		;0F - Backslash or |
+	.BYTE	'`'		;10 - Grave or ~
+	.BYTE	','		;11 - , or <
+	.BYTE	'.'		;12 - . or >
+	.BYTE	'/'		;13 - / or ?
+	.BYTE	';'		;14 - ;
+	.BYTE	27h		;15 - ' or "
+	.BYTE	0		;16
+	.BYTE	0		;17
+	.BYTE	'A'-40h		;18 - A
+	.BYTE	'B'-40h		;19 - B
+	.BYTE	'C'-40h		;1A - C
+	.BYTE	'D'-40h		;1B - D
+	.BYTE	'E'-40h		;1C - E
+	.BYTE	'F'-40h		;1D - F
+	.BYTE	'G'-40h		;1E - G
+	.BYTE	'H'-40h		;1F - H
+	.BYTE	'I'-40h		;20 - I
+	.BYTE	'J'-40h		;21 - J
+	.BYTE	'K'-40h		;22 - K
+	.BYTE	'L'-40h		;23 - L
+	.BYTE	'M'-40h		;24 - M
+	.BYTE	'N'-40h		;25 - N
+	.BYTE	'O'-40h		;26 - O
+	.BYTE	'P'-40h		;27 - P
+	.BYTE	'Q'-40h		;29 - Q
+	.BYTE	'R'-40h		;28 - R
+	.BYTE	'S'-40h		;2A - S
+	.BYTE	'T'-40h		;2B - T
+	.BYTE	'U'-40h		;2C - U
+	.BYTE	'V'-40h		;2D - V
+	.BYTE	'W'-40h		;2E - W
+	.BYTE	'X'-40h		;2F - X
+	.BYTE	'Y'-40h		;30 - Y
+	.BYTE	'Z'-40h		;31 - Z
+	.BYTE	' '		;32 - Space
+	.BYTE	CR		;33 - Return
+	.BYTE	BS		;34 - Backspace
+	.BYTE	ESC		;35 - Escape key
+	.BYTE	HT		;36 - Tab
+	.BYTE	0		;37
+	.BYTE	0		;38 - F1 key
+	.BYTE	0		;39 - F2 key
+	.BYTE	0		;3A - F3 key
+	.BYTE	0		;3B - F4 key
+	.BYTE	0		;3C - F5 key
+	.BYTE	0		;3D - F6 key
+	.BYTE	0		;3E - F7 key
+	.BYTE	0		;3F - F8 key
+	.BYTE	0		;40 - F9 key
+	.BYTE	0		;41 - F10 key
+	.BYTE	0		;42 - F11 key
+	.BYTE	0		;43 - F12 key
+	.BYTE	0		;44 - Down arrow
+	.BYTE	0		;45 - Left arrow
+	.BYTE	0		;46 - Right arrow
+	.BYTE	0		;47 - Up arrow
+	.BYTE	0		;48 - Delete
+	.BYTE	0		;49 - Insert
+	.BYTE	0		;4A - End
+	.BYTE	0		;4B - Home
+	.BYTE	0		;4C - Page down
+	.BYTE	0		;4D - Page up
+	.BYTE	'1'		;4E - Keypad 1
+	.BYTE	'2'		;4F - Keypad 2
+	.BYTE	'3'		;50 - Keypad 3
+	.BYTE	'4'		;51 - Keypad 4
+	.BYTE	'5'		;52 - Keypad 5
+	.BYTE	'6'		;53 - Keypad 6
+	.BYTE	'7'		;54 - Keypad 7
+	.BYTE	'8'		;55 - Keypad 8
+	.BYTE	'9'		;56 - Keypad 9
+	.BYTE	'0'		;57 - Keypad 0
+	.BYTE	'.'		;58 - Keypad .
+	.BYTE	'/'		;59 - Keypad /
+	.BYTE	'+'		;5A - Keypad +
+	.BYTE	'*'		;5B - Keypad *
+	.BYTE	'-'		;5C - Keypad - (!!)
+	.BYTE	CR		;5D - Keypad enter
+	.BYTE	0		;5E - Pause
+.PAGE
+	.MACRO	& SCNMSG  attr, string
+	.IRPC	&& qq,{string}
+	.BYTE	'qq', attr
+	.ENDR
+	.ENDM
+
+	.RADIX	10t
+	.IRP	maj, >MAJVER
+	.IRP	min, >MINVER
+	.IRP	& edit, >EDITNUM
+lblmsg:	SCNMSG	1, { GECKO (exec mode) v&maj.&min.&edit }
+	.ENDR
+	.ENDR
+	.ENDR
+LBLSIZE=!{$-lblmsg}/2
+	.RADIX	16t
+
+cprmsg:	SCNMSG	0, {1}
+	SCNMSG	1, {Help}
+	SCNMSG	0, { 2}
+	SCNMSG	1, {SwScrn}
+	SCNMSG	0, { 4}
+	SCNMSG	1, {ExmEIP}
+	SCNMSG	0, { 5}
+	SCNMSG	1, {ExmPrev}
+	SCNMSG	0, { 6}
+	SCNMSG	1, {ExmSame}
+	SCNMSG	0, { 7}
+	SCNMSG	1, {ExmNext}
+	SCNMSG	0, { 8}
+	SCNMSG	1, {Step}
+	SCNMSG	0, { 9}
+	SCNMSG	1, {Trace}
+	SCNMSG	0, {10}
+	SCNMSG	1, {Go}
+CPRSIZE=!{$-cprmsg}/2
+
+cncech:	.ASCIZ	"^C"{CR}{LF} ;Echo for control C
+
+;Table for serial client register display
+
+scrtbl:	.BYTE	0C,  0t	;EAX
+	.BYTE	0C,  1t	;EBX
+	.BYTE	0C,  2t	;ECX
+	.BYTE	0C,  3t	;EDX
+	.BYTE	0C,  7t	;EDI
+	.BYTE	0C,  6t	;ESI
+	.BYTE	0C,  5t	;EBP
+	.BYTE	0C,  4t	;ESP
+	.BYTE	0B, 11t	;ES
+	.BYTE	0B,  8t	;CS
+	.BYTE	0B,  9t	;SS
+	.BYTE	0B, 10t	;DS
+	.BYTE	0B, 12t	;FS
+	.BYTE	0B, 13t	;GS
+	.BYTE	0C, 14t	;EIP
+	.BYTE	0C, 15t	;EFR
+
+	.PSECT	_geckodata_p
+
+nonscrl:.BYTE	0	;Non-zero to output to nonscrolled region
+attrib:	.BYTE	CTXTATR	;Current character attributes
+			;Following 4 item must be in this order!
+
+	.MOD	4
+uregvalue:
+	.BLKL	16t	;Current register values for serial client
+exitstk:.LONG	pdaXStackP#, GS_SCHPDA
+
+curport:.LONG	0	;Port number of display controller cursor register
+
+sclladdr:
+	.LONG	6*160t	;Address of scrolling area
+	.WORD	GS_DISPLAY
+xcursor:.WORD	0	;GECKO cursor location while user screen is displayed
+ucursor:.LONG	0	;User cursor location and shape
+ustart:	.LONG	0	;User display starting position
+nscladdr:
+	.LONG	160t	;Address of nonscrolling area
+	.WORD	GS_DISPLAY
+scllsiz:.WORD	18t	;Size of scrolling area (lines)
+curlin:	.WORD	0	;Current line in scrolling region
+screen:	.WORD	0	;Non-zero when GECKO's screen is displayed
+horpsn:	.LONG	0	;Horizontal position in current line
+verpsn:	.LONG	0	;Vertical position of start of current line
+dr7val: .LONG	0	;Value for the DR7 register
+
+kbdsta: .LONG	kbdnorm	;Keyboard input state dispatch address
+scista:	.LONG	0	;Serial console input state
+hltflg:	.WORD	0	;Non-zero if need to halt GECKO
+nohalt:	.WORD	0	;Non-zero if cannot halt because in critical code
+stpflg:	.WORD	0	;Non-zero to stop output
+kbdcnt:	.WORD	0	;Count of characters in keyboard buffer
+kbdput:	.LONG	0	;Keyboard buffer putter pointer
+kbdtak:	.LONG	0	;Keyboard buffer taker pointer
+idtloc: .LONG	0, 0
+xscrlbf:.ADDRL	xdispbf+6*160t ;Address of scrolling region
+	.WORD	0
+xnsclbf:.ADDRL	xdispbf+160t ;Address of nonscrolling region
+keysts:	.WORD	0	;Keyboard shift status bits
+keybkf:	.BYTE	0	;Keyboard break code flag
+wptenb: .BYTE	0	;Watchpoint enable bits
+allregs:.BYTE	0	;Non-0 if should send all register values to serial
+			;  client
+
+	.MOD	4
+kbdbfr:	.BLKW	KBDSIZE	;The keyboard buffer
+kbdend:
+xdispbf:.BLKW	4*1024t	;GECKO display buffer
+udispbf:.BLKW	4*1024t	;User display buffer
+
+	.PSECT	_geckocode_p
+.PAGE

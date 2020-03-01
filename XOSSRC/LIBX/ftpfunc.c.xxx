@@ -1,0 +1,815 @@
+//--------------------------------------------------------------------------*
+// FTPFUNC.C
+// FTP client fuctions for XOS
+//
+// Written by: John Goltz
+//--------------------------------------------------------------------------*
+
+//++++
+// This software is in the public domain.  It may be freely copied and used
+// for whatever purpose you see fit, including commerical uses.  Anyone
+// modifying this software may claim ownership of the modifications, but not
+// the complete derived code.  It would be appreciated if the authors were
+// told what this software is being used for, but this is not a requirement.
+
+//   THIS SOFTWARE IS PROVIDED BY THE AUTHORS "AS IS" AND ANY EXPRESS OR
+//   IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
+//   OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+//   IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+//   INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+//   BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS
+//   OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+//   ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR
+//   TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
+//   USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+//----
+
+// This module contains functions which allow a program in internally
+//   implement the major FTP client functions. This includes connecting
+//   to a remote system and reading and writing files. All externally
+//   callable functions in this module begin with the 3 letters "ftp".
+//   All other functions are local to this module.
+
+
+
+
+#include <CTYPE.H>
+#include <STDIO.H>
+#include <STDLIB.H>
+#include <STRING.H>
+#include <TIME.H>
+#include <SIGNAL.H>
+#include <XOSERR.H>
+#include <XOSTRM.H>
+#include <XOSRTN.H>
+#include <XOS.H>
+#include <XOSSVC.H>
+#include <XOSTIME.H>
+#include <XOSERRMSG.H>
+#include <XOSNET.H>
+#include <PROGARG.H>
+#include <PROGHELP.H>
+#include <GLOBAL.H>
+#include <XOSSTR.H>
+#include <XOSFTPFUNC.H>
+
+#define VERSION 1
+#define EDITNO  0
+
+#define VECT_OPEN 30
+
+
+#define NAMEMAX  1024
+
+typedef struct filedescp FILEDESCP;
+
+typedef struct cmdtbl CMDTBL;
+
+
+static uchar debug = 0;
+
+static long  openflag;
+
+static int   rspnum;
+static long  cmdhndl = -1;
+
+static long *rsppnt;
+
+static char *typestr = "A N";
+
+static long  tcpavl;
+static char *tcppnt;
+static char  tcpbufr[256];
+
+static char  datadev[32];
+
+static struct
+{   byte4_parm  rmtport;
+    byte4_parm  lclport;
+    text4_parm  lclneta;
+    char        end;
+} cmdopnparms =
+{   {PAR_SET|REP_HEXV, 4, IOPAR_NETRMTPORTS, TCPP_FTPCMD},
+    {PAR_GET|REP_HEXV, 4, IOPAR_NETLCLPORT},
+    {PAR_GET|REP_HEXV, 4, IOPAR_NETLCLNETA}
+};
+
+static struct
+{   byte4_parm  rmtport;
+    byte4_parm  lclport;
+    char        end;
+} dataopnparms =
+{   {PAR_GET|REP_HEXV, 4, IOPAR_NETRMTPORTR},
+    {PAR_SET|PAR_GET|REP_HEXV, 4, IOPAR_NETLCLPORT}
+};
+
+static QAB dataqab =
+{   QFNC_OPEN,					// qab_open
+    0,							// qab_status
+    0,							// qab_error
+    0,							// qab_amount
+    0,							// qab_handle
+    VECT_OPEN,					// qab_vector
+    0,	        				// qab_level    - Signal level for direct I/O
+    0,  						// qab_prvlevel - Previous signal level (int.)
+    0,							// qab_option
+    0,							// qab_count
+    datadev, 0,					// qab_buffer1
+    NULL, 0,					// qab_buffer2
+    &dataopnparms, 0			// qab_parm
+};
+
+static int  datatofile(char *buffer, int size);
+static int  datatouser(char *buffer, int size);
+static long getloop(long (*func)(char *bufr, int size), char *bufr, int size);
+static void opendone(void);
+static long putloop(long (*func)(char *bufr, int size), char *bufr, int size);
+static long sendcmd(char *cmd, char *arg);
+static int  response(void);
+static long xferdata(char *cmd, char *arg, long (*func)(char *bufr, int size),
+	char *bufr, int size, long (*loop)(long (*func)(char *bufr,
+	int size), char *bufr, int size));
+
+
+
+//=========================================================
+// Following functions are used to manage the FTP functions
+//   and to connect to and disconnect from the remote host
+//=========================================================
+
+//********************************************************
+// Function: ftpInit - Initialize the FTP functions
+// Returned: 0 if normal, negative XOS error code if error
+//********************************************************
+
+long ftpInit(
+    long *rspval,
+	long  dataport,
+    int   debugarg)
+
+{
+	rsppnt = rspval;
+
+	dataopnparms.lclport.value = dataport;
+	debug = debugarg;
+	setvector(VECT_OPEN, (VT_XOSS<8)+4, opendone);
+///	svcSchSetLevel(0);			// Enable signals
+	return (0);
+}
+
+//****************************************************
+// Function: ftpDebug - Set or clear DEBUG mode
+// Returned: 0 if OK, negative XOS error code if error
+//****************************************************
+
+long ftpDebug (
+    int arg)
+
+{
+    debug = arg;
+    return (0);
+}
+
+//****************************************************
+// Function: ftpOpen - Establish an FTP connection
+// Returned: 0 if OK, negative XOS error code if error
+//****************************************************
+
+long ftpOpen(
+    char *host)
+
+{
+    char *pnt;
+    int   rtn;
+
+    pnt = host;
+    while (pnt[0] != ':' && pnt[1] != ':')
+		pnt++;
+    if ((rtn = pnt - host) > 28)
+		return (ER_BDSPC);
+    strmov(strnmov(datadev, host, rtn + 2), "*::");
+    if ((cmdhndl = svcIoOpen(O_IN|O_OUT|O_PARTIAL, host, &cmdopnparms)) < 0)
+		return (cmdhndl);
+    if (debug)
+		printf("ftp: Using %s (local port %d) for command connection\n",
+				host, cmdopnparms.lclport.value);
+    return (response());
+}
+
+//****************************************************
+// Function: ftpUser - Process the USER FTP command
+// Returned: 0 if OK, negative XOS error code if error
+//****************************************************
+
+long ftpUser(
+    char *user)
+
+{
+    long rtn;
+
+    if (cmdhndl < 0)
+		return (ER_NNCON);
+    if ((rtn = sendcmd("USER ", user)) != 0)
+		return (rtn);
+    return (response());
+}
+
+//****************************************************
+// Function: ftpPassword - Process the PWD FTP command
+// Returned: 0 if OK, negative XOS error code if error
+//****************************************************
+
+long ftpPassword(
+    char *password)
+
+{
+    long rtn;
+
+    if (cmdhndl < 0)
+		return (ER_NNCON);
+    if ((rtn = sendcmd("PASS ", password)) != 0)
+		return (rtn);
+    return (response());
+}
+
+//***********************************************************
+// Function: ftpClose - Terminate an FTP connection to a host
+// Returned: 0 if OK, negative XOS error code if error
+//***********************************************************
+
+long ftpClose (void)
+
+{
+    return (ER_NIYT);
+}
+
+//=======================================================
+// The following functions set parameters which determine
+//   how files on the remote host are accessed
+//=======================================================
+
+//****************************************************
+// Function: ftpAscii - Set transfer mode to ASCII
+// Returned: 0 if OK, negative XOS error code if error
+//****************************************************
+
+long ftpAscii(void)
+
+{
+    typestr = "A N";					// Remember the type
+    return (sendtype());				// Send type now if connected
+}
+
+//****************************************************
+// Function: ftpBinary - Set transfer mode to BINARY
+// Returned: 0 if OK, negative XOS error code if error
+//****************************************************
+
+long ftpBinary(void)
+
+{
+    typestr = "I";						// Remember the type
+    return (sendtype());				// Send type now if connected
+}
+
+//****************************************************
+// Function: ftpType - Process the TYPE FTP command
+// Returned: 0 if OK, negative XOS error code if error
+//****************************************************
+
+long ftpType(
+    char *arg)
+
+{
+    long rtn;
+
+    if (cmdhndl < 0)
+		return (ER_NNCON);
+    if ((rtn = sendcmd("TYPE ", arg)) != 0)
+		return (rtn);
+    return (response());
+}
+
+//****************************************************
+// Function: ftpCd - Process the CD FTP command
+// Returned: 0 if OK, negative XOS error code if error
+//****************************************************
+
+long ftpCd(
+    char *newdir)
+
+{
+    long rtn;
+
+    if (cmdhndl < 0)
+		return (ER_NNCON);
+    if ((rtn = sendcmd("CWD ", newdir)) != 0)
+		return (rtn);
+    return (response());
+}
+
+//*********************************************************
+// Function: ftpAllFiles - Process the ALLFILES FTP command
+// Returned: 0 if OK, negative XOS error code if error
+//*********************************************************
+
+// This command is XOS specific. It determines if a priviledged
+//   user can access file above his base directory or specify
+//   a device.
+
+long ftpAllFiles(
+    char *arg)
+
+{
+    long rtn;
+
+    if (cmdhndl < 0)
+		return (ER_NNCON);
+    if ((rtn = sendcmd("XAFL ", arg)) != 0)
+		return (rtn);
+    return (response());
+}
+
+//****************************************************
+// Function: ftpLiteral - Send any FTP command
+// Returned: 0 if OK, negative XOS error code if error
+//****************************************************
+
+long ftpLiteral(
+    char *text)
+
+{
+    long rtn;
+
+    if (cmdhndl < 0)
+		return (ER_NNCON);
+    if ((rtn = sendcmd("", text)) != 0)
+		return (rtn);
+    return (response());
+}
+
+//===========================================================
+// The following functions create, delete, or renamd files or
+//   directories on the on the host but do not transfer data.
+//===========================================================
+
+//*****************************************************
+// Function: ftpDelete - Process the DELETE FTP command
+// Returned: 0 if OK, negative XOS error code if error
+//*****************************************************
+
+long ftpDelete(
+    char *file)
+
+{
+    long rtn;
+
+    if (cmdhndl < 0)
+		return (ER_NNCON);
+    if ((rtn = sendcmd("DELE ", file)) != 0)
+		return (rtn);
+    return (response());
+}
+
+//*****************************************************
+// Function: ftpRename - Process the RENAME FTP command
+// Returned: 0 if OK, negative XOS error code if error
+//*****************************************************
+
+long ftpRename(
+    char *oldname,
+    char *newname)
+
+{
+    long  rtn;
+
+    if (cmdhndl < 0)
+		return (ER_NNCON);
+    if ((rtn = sendcmd("RNFR ", oldname)) != 0)
+		return (rtn);
+    if ((rtn = response()) != 0)
+		return (rtn);
+    if ((rtn = sendcmd("RNTO ", newname)) != 0)
+		return (rtn);
+    return (response());
+}
+
+//****************************************************
+// Function: ftpRmDir - Process the RMDIR FTP command
+// Returned: 0 if OK, negative XOS error code if error
+//****************************************************
+
+long ftpRmDir(
+    char *name)
+
+{
+    long rtn;
+
+    if (cmdhndl < 0)
+		return (ER_NNCON);
+    if ((rtn = sendcmd("RMD ", name)) != 0)
+		return (rtn);
+    return (response());
+}
+
+//****************************************************
+// Function: ftpMkDir - Process the MKDIR FTP command
+// Returned: 0 if OK, negative XOS error code if error
+//****************************************************
+
+long ftpMkDir(
+    char *name)
+
+{
+    long rtn;
+
+    if (cmdhndl < 0)
+		return (ER_NNCON);
+    if ((rtn = sendcmd("MKD ", name)) != 0)
+		return (rtn);
+    return (response());
+}
+
+//=================================================================
+// The following functions perform a data transfer to or from the
+//   remote host.
+//=================================================================
+
+//****************************************************
+// Function: ftpLs - Process the LS FTP command
+// Returned: 0 if OK, negative XOS error code if error
+//****************************************************
+
+long ftpLs(
+    long (*func)(char *bufr, int size),
+    char  *bufr,
+    int    size)
+
+{
+    if (cmdhndl < 0)
+		return (ER_NNCON);
+    return (xferdata("NLST ", "", func, bufr, size, getloop));
+}
+
+//****************************************************
+// Function: ftpDir - Process the DIR FTP command
+// Returned: 0 if OK, negative XOS error code if error
+//****************************************************
+
+long ftpDir(
+    long (*func)(char *bufr, int size),
+    char  *bufr,
+    int    size)
+
+{
+    if (cmdhndl < 0)
+		return (ER_NNCON);
+    return (xferdata("LIST ", "", func, bufr, size, getloop));
+}
+
+//****************************************************
+// Function: ftpGet - Process the GET FTP command
+// Returned: 0 if OK, negative XOS error code if error
+//****************************************************
+
+long ftpGet(
+    char  *name,
+    long (*func)(char *bufr, int size),
+    char  *bufr,
+    int    size)
+
+{
+    if (cmdhndl < 0)
+		return (ER_NNCON);
+    return (xferdata("RETR ", name, func, bufr, size, getloop));
+}
+
+//****************************************************
+// Function: ftpPut - Process the PUT FTP command
+// Returned: 0 if OK, negative XOS error code if error
+//****************************************************
+
+long ftpPut(
+    char *name,
+    long (*func)(char *bufr, int size),
+    char  *bufr,
+    int    size)
+
+{
+	long rtn;
+
+    if (cmdhndl < 0)
+		return (ER_NNCON);
+    if ((rtn = xferdata("STOR ", name, func, bufr, size, putloop)) < 0)
+		return (rtn);
+	return (response());
+}
+
+//*****************************************************
+// Function: ftpAppend - Process the APPEND FTP command
+// Returned: 0 if OK, negative XOS error code if error
+//*****************************************************
+
+long ftpAppend(
+    char  *name,
+    long (*func)(char *bufr, int size),
+    char  *bufr,
+    int    size)
+
+{
+    name = name;
+    func = func;
+    bufr = bufr;
+    size = size;
+
+    return (ER_NIYT);
+}
+
+//****************************************************
+// Function: ftpHelp - Process the HELP FTP command
+// Returned: 0 if OK, negative XOS error code if error
+//****************************************************
+
+long ftpHelp(
+    char  *name,
+    long (*func)(char *bufr, int size),
+    char  *bufr,
+    int    size)
+
+{
+    if (cmdhndl < 0)
+		return (ER_NNCON);
+    return (xferdata("HELP ", name, func, bufr, size, getloop));
+}
+
+//****************************************************
+// Function: ftpQuit - Process the QUIT FTP command
+// Returned: 0 if OK, negative XOS error code if error
+//****************************************************
+
+long ftpQuit(void)
+
+{
+	long rtn;
+
+	if (dataqab.qab_handle > 0)
+	{
+		svcIoClose(dataqab.qab_handle, 0);
+		dataqab.qab_handle = 0;
+	}
+    if (cmdhndl > 0)
+	{
+		sendcmd("QUIT", "");
+		if ((rtn = response()) < 0)
+			return (rtn);
+		svcIoClose(cmdhndl, 0);
+		cmdhndl = 0;
+	}
+	return (0);
+}
+
+int sendtype(void)
+
+{
+    sendcmd("TYPE ", typestr);
+    return (response());
+}
+
+
+//**************************************************
+// Function: response - Get response from FTP server
+// Returned: TRUE if OK, FALSE if error
+//**************************************************
+
+static int response(void)
+
+{
+    char *pnt;
+    long  temp;
+    long  rtn;
+    char  chr;
+    char  rspbufr[256];
+
+    if ((rtn = getrsp(rspbufr)) < 0)
+		return (rtn);
+    rspnum = 0;
+    pnt = rspbufr;
+    while ((chr = *pnt++) != 0 && isdigit(chr))
+	rspnum = rspnum * 10 + (chr & 0x0F);
+    if (chr == '-')			// Multi-line reply?
+    {
+		do
+		{
+			if ((rtn = getrsp(rspbufr)) < 0)
+				return (rtn);
+			temp = 0;
+			pnt = rspbufr;
+			while ((chr = *pnt++) != 0 && isdigit(chr))
+				temp = temp * 10 + (chr & 0x0F);
+		} while (temp != rspnum);
+    }
+    *rsppnt = rspnum;
+	if (rspnum >= 400)
+	{
+		char text[256];
+
+		svcSysLog(text, sprintf(text, "xxxxFTP CLNTIncorrect response from "
+				"FTP server: %d: %s", rspnum, rspbufr));
+		return (ER_NAPER);
+	}
+	return (0);
+}
+
+
+int getrsp(
+    char *bufr)
+
+{
+    char *pnt;
+    char  chr;
+
+    pnt = bufr;
+    for (;;)
+    {
+
+		if (--tcpavl < 0)
+		{
+			if ((tcpavl = svcIoInBlock(cmdhndl, tcpbufr, sizeof(tcpbufr))) < 0)
+				return (tcpavl);
+			tcppnt = tcpbufr;
+			continue;
+		}
+		if ((chr = *tcppnt++) == '\n')
+		{
+			*pnt = 0;
+			if (debug)
+				printf("ftp: rsp: \"%s<CR><LF>\"\n", bufr);
+			return (pnt - bufr);
+		}
+		if ((pnt - bufr) > 253)
+		{
+			char text[400];
+
+			svcSysLog(text, sprintf(text, "xxxxFTP CLNTResponse from FTP "
+				"server is too long: %s.252", bufr));
+		    return (ER_NAPER);
+		}
+		if (chr != '\r')
+	    	*pnt++ = chr;
+    }
+}
+
+//****************************************************
+// Function: sendcmd - send command to remote system
+// Returned: 0 if OK, negative XOS error code if error
+//****************************************************
+
+static long sendcmd(
+    char *cmd,
+    char *arg)
+
+{
+    char *pnt;
+    long  rtn;
+
+    pnt = strmov(strmov(tcpbufr, cmd), arg);
+    if (debug)
+		printf("ftp: cmd: \"%s<CR><LF>\"\n", tcpbufr);
+    rtn = strmov(pnt, "\r\n") - tcpbufr;
+    if ((rtn = svcIoOutBlock(cmdhndl, tcpbufr, rtn)) < 0)
+		return (rtn);
+    return (0);
+}
+
+//**************************************************************
+// Function: xferdata - Set up for function which transfers data
+// Returned: 0 if OK, negative XOS error code if error
+//**************************************************************
+
+static long xferdata(
+    char  *cmd,
+    char  *arg,
+    long (*func)(char *bufr, int size),
+    char  *bufr,
+    int    size,
+    long (*loop)(long (*func)(char *bufr, int size), char *bufr, int size))
+
+{
+
+    int  rtn;
+    char portarg[32];
+
+    openflag = 1;
+    if (debug)
+		printf("ftp: Opening data connection using %s\n", datadev);
+    dataopnparms.lclport.value = ++(dataopnparms.lclport.value) | 0x80000000;
+    dataqab.qab_option = O_IN|O_OUT|O_PARTIAL;
+    if ((rtn = svcIoQueue(&dataqab)) < 0)
+		return (rtn);
+    sprintf(portarg, "%d,%d,%d,%d,%d,%d",
+			(uchar)(cmdopnparms.lclneta.value[0]),
+			(uchar)(cmdopnparms.lclneta.value[1]),
+			(uchar)(cmdopnparms.lclneta.value[2]),
+			(uchar)(cmdopnparms.lclneta.value[3]),
+			(uchar)(dataopnparms.lclport.value >> 8),
+			(uchar)(dataopnparms.lclport.value));
+    if ((rtn = sendcmd("PORT ", portarg)) != 0)
+		return (rtn);
+    if ((rtn = response()) != 0)
+		return (rtn);
+    if ((rtn = sendcmd(cmd, arg)) != 0)
+		return (rtn);
+    if ((rtn = response()) != 0)
+		return (rtn);
+    if (rspnum != 125 && rspnum != 150)
+	{
+		char text[128];
+
+		svcSysLog(text, sprintf(text, "xxxxFTP CLNTIncorrect response to "
+				"data xfer command: %d", rspnum));
+		return (ER_NAPER);
+	}
+    svcSchSuspend(&openflag, -1);	// Wait until open is done
+    if (dataqab.qab_error < 0)
+		return (dataqab.qab_error);
+    if (debug)
+		printf("ftp: Using local port %d and remote port %d for data "
+				"connection\n",	dataopnparms.lclport.value,
+				dataopnparms.rmtport.value);
+    return (loop(func, bufr, size));
+}
+
+
+static long getloop(
+    long (*func)(char *bufr, int size),
+    char  *bufr,
+    int    size)
+
+{
+	long  amount;
+	long  limit;
+    long  rtn;
+
+	amount = 0;
+	limit = (size < 256) ? size : (size - 128);
+    while (TRUE)
+    {
+		if ((rtn = svcIoInBlock(dataqab.qab_handle, bufr + amount,
+				size - amount)) <= 0)
+		{
+			if (amount > 0)
+				func(bufr, amount);
+			svcIoClose(dataqab.qab_handle, 0);
+			dataqab.qab_handle = 0;
+			return ((rtn == ER_NCCLR) ? response() : rtn);
+		}
+		amount += rtn;
+		if (amount > limit)
+		{
+			if ((rtn = func(bufr, amount)) < 0)
+			{
+				svcIoClose(dataqab.qab_handle, 0);
+				dataqab.qab_handle = 0;
+				return (rtn);
+			}
+			amount = 0;
+		}
+    }
+}
+
+static long putloop(
+    long (*func)(char *bufr, int size),
+    char  *bufr,
+    int    size)
+
+{
+    long rtn;
+
+    while (TRUE)
+    {
+		if ((rtn = func(bufr, size)) <= 0)
+		{
+			svcIoClose(dataqab.qab_handle, 0);
+			dataqab.qab_handle = 0;
+			return (rtn);
+		}
+		if ((rtn = svcIoOutBlock(dataqab.qab_handle, bufr, rtn)) <= 0)
+		{
+			svcIoClose(dataqab.qab_handle, 0);
+			dataqab.qab_handle = 0;
+			return ((rtn == ER_NCCLR) ? response() : rtn);
+		}
+    }
+}
+
+//******************************************************
+// Function: opendone - Signal function called when data
+//		connection open if complete
+// Returned: Nothing
+//******************************************************
+
+static void opendone(void)
+
+{
+    openflag = 0;
+}

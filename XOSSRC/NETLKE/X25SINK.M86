@@ -1,0 +1,297 @@
+	.TITLE	X25SINK - X.25 data sink server
+
+;++++
+; This software is in the public domain.  It may be freely copied and used
+; for whatever purpose you see fit, including commerical uses.  Anyone
+; modifying this software may claim ownership of the modifications, but not
+; the complete derived code.  It would be appreciated if the authors were
+; told what this software is being used for, but this is not a requirement.
+
+;   THIS SOFTWARE IS PROVIDED BY THE AUTHORS "AS IS" AND ANY EXPRESS OR
+;   IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
+;   OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+;   IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+;   INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+;   BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS
+;   OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+;   ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR
+;   TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
+;   USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+;----
+
+	.PROC	80386
+
+	.INCLUD	XOSINC:\XMAC\STDIO.PAR
+	.INCLUD	XOSINC:\XMAC\CTYPE.PAR
+	.INCLUD	XOSINC:\XMAC\XOS.PAR
+	.INCLUD	XOSINC:\XMAC\XOSERR.PAR
+	.INCLUD	XOSINC:\XMAC\XOSTIME.PAR
+	.INCLUD	XOSINC:\XMAC\XOSNET.PAR
+
+	.STDSEGS
+
+VERSION==!1t		;Version number
+EDITNUM==!0t		;Edit number
+
+BUFRSIZE=!512t
+
+;Define signal vectors
+
+VECT_MESSAGE=!70t		;Message ready signal
+VECT_X25MSG =!71t		;X.25 new call message ready signal
+VECT_X25INP =!72t		;X.25 input available signal
+
+;Define CDB offsets
+
+$$$=!0
+BLK cdb_name  , 16t
+BLK cdb_inpqab, qab_SIZE
+BLK cdb_buffer, BUFRSIZE
+cdb_SIZE=!$$$
+.PAGE
+	.LNKSEG	_TEXT_s, DGROUP_s
+
+	.EXTERN	_main
+
+	.SBTTL	Start of program
+
+	.PSECT	_TEXT_p
+
+main::	PUSHL	#VECT_X25MSG.B		;Set the message available vector
+	PUSHL	#84h+{VT_XOSS<8}
+	PUSHL	CS
+	PUSHL	#x25msg
+	CALLF	svcSchSetVector##
+	ORL	EAX, EAX
+	JS	vfail.S
+	PUSHL	#VECT_X25INP.B		;Set the X.25 input ready vector
+	PUSHL	#84h+{VT_XOSS<8}
+	PUSHL	CS
+	PUSHL	#x25inp
+	CALLF	svcSchSetVector##
+	ORL	EAX, EAX
+	JS	vfail.S
+	PUSHL	#O$IN|O$OUT.B		;Open the message device
+	PUSHL	DS
+	PUSHL	#msgname
+	PUSHL	#0.B
+	PUSHL	#0.B
+	CALLF	svcIoOpen##
+	ORL	EAX, EAX
+	JS	mfail.S			;If error
+	MOVL	msgqab+qab_handle, EAX	;OK - store handle
+	PUSHL	DS
+	PUSHL	#msgqab
+	CALLF	svcIoQueue##		;Queue initial message input
+	ORL	EAX, EAX
+	JS	ifail
+	PUSHL	#0.B
+	CALLF	svcSchSetLevel##
+loop:	PUSHL	#0.B
+	PUSHL	#-1.B
+	CALLF	svcSchSuspend##
+	JMP	loop.S
+
+vfail:	HLT
+
+mfail:	HLT
+
+ifail:	HLT
+
+finishcmd::
+setup2::RET
+.PAGE
+	.SBTTL	x25msg - Signal routine for message available
+
+;Signal routine for message available - When get here we have a message from
+;  the kernel informing us of of an incoming X.25 call request which we care
+;  about.
+; Format of the X.25 incomming call message:
+;  Offset    Use
+;     0    Message type (MT_TERMDATA)
+;     1    Reason:
+;	     20h = Network connection
+;     2    Unused
+;     3    Unused
+;     4    First byte of X.25 device name
+
+x25msg:	PUSHAL				;Save registers
+	TESTB	msgqab+qab_status+1, #QSTS$DONE>8t
+	JE	x25mdsm
+	CMPB	msgbfr+0, #MT_TERMDATA	;Is the message type right?
+	JNE	x25mfn			;No - ignore it!
+	MOVL	EAX, msgqab+qab_amount	;Get message length
+	CMPL	EAX, #20t.B		;Is it reasonable?
+	JA	x25mfn			;No
+	MOVW	msgbfr[EAX], #':'	;Yes - fix up the X.25 device name
+	PUSHL	#O$IN|O$OUT.B
+	PUSHL	DS
+	PUSHL	#msgbfr+4
+	PUSHL	DS
+	PUSHL	#x25opnparms
+	CALLF	svcIoOpen##
+	ORL	EAX, EAX
+	JS	cntotrm
+	PUSHL	EAX
+	PUSHL	#cdb_SIZE
+	CALL	malloc#
+	POPL	ECX
+	POPL	ECX
+	ORL	EAX, EAX
+	JE	nomem
+	MOVL	EDI, EAX
+	CLRL	EAX
+	MOVW	cdb_inpqab+qab_func.B[EDI], #QFNC_INBLOCK
+	MOVL	cdb_inpqab+qab_handle.B[EDI], ECX
+	MOVL	cdb_inpqab+qab_count.B[EDI], #BUFRSIZE
+	LEAL	EBX, cdb_buffer.B[EDI]
+	MOVL	cdb_inpqab+qab_buffer1+0.B[EDI], EBX
+	MOVL	cdb_inpqab+qab_buffer1+4.B[EDI], DS
+	MOVL	cdb_inpqab+qab_parm+0.B[EDI], EAX
+	MOVL	cdb_inpqab+qab_parm+4.B[EDI], EAX
+	MOVL	cdb_inpqab+qab_vector.B[EDI], #VECT_X25INP
+	MOVL	EAX, msgbfr+4
+	MOVL	cdb_name+0.B[EDI], EAX
+	MOVL	EAX, msgbfr+8
+	MOVL	cdb_name+4.B[EDI], EAX
+	MOVL	EAX, msgbfr+12t
+	MOVL	cdb_name+8.B[EDI], EAX
+	MOVL	EAX, msgbfr+16t
+	MOVL	cdb_name+12t.B[EDI], EAX
+	MOVL	EBX, #constr
+	MOVL	EDX, #nullstr
+	CALL	dsp
+	PUSHL	DS			;Queue the initial input
+	LEAL	EAX, cdb_inpqab.B[EDI]
+	PUSHL	EAX
+	CALLF	svcIoQueue##
+	ORL	EAX, EAX
+	JS	inperr
+x25mfn:	PUSHL	DS
+	PUSHL	#msgqab
+	CALLF	svcIoQueue##
+	ORL	EAX, EAX
+	JS	18$.S
+x25mdsm:POPAL				;Restore registers
+	CALLF	svcSchDismiss##		;And dismiss
+
+;Here to give up the X.25 device after an error
+
+14$:	PUSHL	EDI
+	CALL	free#
+	POPL	ECX
+
+x25mcls:
+	HLT
+
+	JMP	x25mfn.S
+
+;Here if can't allocate memory
+
+nomem:	HLT
+
+
+;Here if can't open the X.25 device
+
+cntotrm:HLT
+
+	JMP	x25mfn.S
+
+;Here if can't allocate memory for a CDB
+
+16$:	MOVL	EBX, #nmasmsg
+	JMP	x25mcls.S
+
+;Here if have error queueing a new IPM input
+
+18$:	MOVL	EBX, #eqiimsg
+	JMP	x25mdsm.S
+
+constr:  .ASCIZ	"CON"
+nmasmsg: .ASCIZ "No memory available for CDB"
+eqiimsg: .ASCIZ "Error queueing IPM input"
+msgname: .ASCIZ "IPM:SYS^X25ECHO"
+.PAGE
+	.SBTTL	x25inp - Signal routine for X.25 input available
+
+;Signal routine for X.25 input available 
+
+x25inp:	PUSHAL
+	MOVL	EDI, 64t.B[ESP]		;Get offset of the CDB
+	SUBL	EDI, #cdb_inpqab.B
+	MOVL	EAX, cdb_inpqab+qab_error.B[EDI]
+	ORL	EAX, EAX
+	JS	inperr.S
+	PUSHL	DS
+	LEAL	EAX, cdb_inpqab.B[EDI]
+	PUSHL	EAX
+	CALLF	svcIoQueue##
+	ORL	EAX, EAX
+	JNS	8$.S
+inperr:	PUSHL	#inpstr
+	PUSHL	EAX
+	PUSHL	#03h.B
+	PUSHL	DS
+	MOVL	EDX, #errmsg
+	PUSHL	EDX
+	CALLF	svcSysErrMsg##
+	POPL	EBX
+	CALL	dsp
+	PUSHL	cdb_inpqab+qab_handle.B[EDI]
+	PUSHL	#0.B
+	CALLF	svcIoClose##
+	PUSHL	EDI
+	CALL	free#
+	POPL	ECX
+8$:	POPAL
+	CALLF	svcSchDismiss##
+
+inpstr:.ASCIZ	"IER"
+.PAGE
+;Subroutine to display message
+;	c{EBX} = Offset of initial string
+;	c{EDX} = Offset of final string
+;	CALL	dsp
+
+dsp:	PUSHL	EDX
+	PUSHL	EDI
+	PUSHL	EBX
+	PUSHL	#dspfmt
+	CALL	printf#
+	ADDL	ESP, #16t
+	RET
+
+dspfmt:	.ASCII	"%s (%9.9s) %s"{LF}
+nullstr:.BYTE	0
+.PAGE
+	.SBTTL	Data
+
+	.PSECT	_DATA_p
+
+	.MOD	4
+x25hndl:.LONG	0
+
+	.MOD	4
+x25opnparms:
+	.BYTE	PAR$SET|REP_TEXT, 4
+	.WORD	IOPAR_CLASS
+	.ASCII	'X25A'
+	.BYTE	0
+
+	.MOD	4
+msgqab:	.WORD	QFNC_INBLOCK	;qab_func    = 0.  - Function
+	.WORD	0		;qab_status  = 2.  - Returned status
+	.LONG	0		;qab_error   = 4.  - Error code
+	.LONG	0		;qab_amount  = 8.  - Amount transfered
+	.LONG	0		;qab_handle  = 12. - Device handle
+	.WORD	VECT_X25MSG, 0	;qab_vector  = 16. - Vector for interrupt
+	.LONG	0		;qab_option  = 20. - Option bits
+	.LONG	300t		;qab_count   = 24. - Amount to transfer
+	.LONG	msgbfr, !msgbfr	;qab_buffer1 = 28. - Pointer to data buffer
+	.LONG	0, 0		;qab_buffer2 = 36. - Not used
+	.LONG	0, 0		;qab_parm    = 44. - Pointer to parameter list
+
+msgbfr:	.BLKB	300t
+errmsg:	.BLKB	120t
+
+	.END

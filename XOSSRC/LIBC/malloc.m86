@@ -1,0 +1,687 @@
+	.TITLE	malloc - ANSI C memory allocation functions
+	.SBTTL	STDC run-time library for XOS
+
+;++++
+; This software is in the public domain.  It may be freely copied and used
+; for whatever purpose you see fit, including commerical uses.  Anyone
+; modifying this software may claim ownership of the modifications, but not
+; the complete derived code.  It would be appreciated if the authors were
+; told what this software is being used for, but this is not a requirement.
+
+;   THIS SOFTWARE IS PROVIDED BY THE AUTHORS "AS IS" AND ANY EXPRESS OR
+;   IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
+;   OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+;   IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+;   INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+;   BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS
+;   OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+;   ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR
+;   TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
+;   USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+;----
+
+;+
+; Edit history:
+;
+;  Date    Who  Description
+; -------  ---  -----------
+; 20Nov94  FPJ  Fixed code to check for proper error after sbrk call.
+; 29Nov94  FPJ  Added code for calloc and realloc.
+;-
+
+	.INCLUD	XOSINC:\XMAC\XOS.PAR
+	.INCLUD	XOSINC:\XMAC\STDIO.PAR
+
+	.STDSEGS
+
+;;;;;$$DEBUG=!1
+
+; malloc uses a linked list of memory blocks, each of which has a 24 byte
+; header. Each block begins on a long boundry.  The format of the header is
+; as follows:
+;
+;    +-------------------------------+
+;    |m m m m m m m m m m m m m m m m|  mb_magic Magic number
+;    |m m m m m m m m m m m m m m m m|
+;    +-------------------------------+
+;    |b b b b b b b b b b b b b b b b|  mb_mprev Backward memory pointer
+;    |b b b b b b b b b b b b b b b b|
+;    +-------------------------------+
+;    |f f f f f f f f f f f f f f f f|  mb_mnext Forward memory pointer
+;    |f f f f f f f f f f f f f f f f|
+;    +-------------------------------+
+;    |b b b b b b b b b b b b b b b b|  mb_pfree Backward free list pointer
+;    |b b b b b b b b b b b b b b b b|
+;    +-------------------------------+
+;    |f f f f f f f f f f f f f f f f|  mb_nfree Forward free list pointer
+;    |f f f f f f f f f f f f f f f f|
+;    +-------------------------------+
+;    |s s s s s s s s s s s s s s s s|  mb_size  Size of block
+;    |s s s s s s s s s s s s s s s s|
+;    +-------------------------------+
+;
+;  All pointers are offsets which point to the first allocated byte in the
+;  block, which immediately follows the header.  The size is the number of
+;  bytes in the block, rounded up to a multiple of 4.  Note that the memory
+;  list (which links all blocks managed by malloc) is maintained in memory
+;  offset order.  The free list, which links only free blocks, is not kept
+;  in any order.  Blocks are always freed by being linked to the end of the
+;  list.
+
+mb_magic=!-24t
+mb_mprev=!-20t
+mb_mnext=!-16t
+mb_pfree=!-12t
+mb_nfree=!-8t
+mb_size =!-4t
+
+MB_MAGIC=!52525252h  	;Value for mb_magic
+HDRSIZE =!24t		;Size of the memory block header
+
+	.PSECT	_DATA_p
+
+memerr:
+	.ASCIZ	"? Memory allocation error"{CR,LF}
+
+	.PSECT	_BSS_p
+
+_malloc_mhead::				;Head of memory list
+	.BLKL  1		
+_malloc_mtail::				;Tail of memory list
+	.BLKL  1
+_malloc_fhead::				;Head of free list
+	.BLKL  1
+_malloc_ftail::				;Tail of free list
+	.BLKL  1
+_malloc_amount::			;No. of bytes currently allocated
+	.BLKL  1
+
+	.PSECT	_TEXT_p
+.PAGE
+	.SBTTL	calloc - ANSI C function to allocate memory and initialize it
+
+;ANSI C function to allocate memory and initialize it
+;	void *calloc(
+;	    long num,		// Number of items
+;	    long size)		// Size of each item
+;  Value returned is address of memory allocated or NULL if error (errno is
+;    set on error)
+
+arg_num =!4t
+arg_size=!8t
+
+	.ENTRY	calloc
+calloc:	MOVL	EAX, arg_num.B[ESP]	;Get the no. of items
+	MOVL	EBX, arg_size.B[ESP]	;Get the size of each item
+	MULL	EBX			;Multiply to get total bytes
+	JNO	10$.S			;No overflow, so continue
+	CLRL	EAX			;Return a NULL pointer
+	JMP	20$.S			;Now exit
+
+;Here if the total number of bytes is okay
+
+10$:	PUSHL	EAX			;Save the total number of bytes
+	CALL	malloc			;Allocate it
+	POPL	EBX			;Dump passed parameter
+	TESTL	EAX, EAX		;Did we get anything?
+	JE	20$.S			;No, so quit
+	PUSHL	EBX			;Push the count
+	PUSHL	#0.B			;Zero out the memory
+	PUSHL	EAX			;Starting address
+	CALL	memset#			;Initialize it to all zeroes
+					;(memset returns address in EAX)
+	ADDL	ESP, #12t.B		;Dump the stack parameters
+20$:	RET				;Return pointer or NULL
+.PAGE
+	.SBTTL	malloc - ANSI C function to allocate memory
+
+;ANSI C function to allocate memory
+;	void *malloc(
+;	    long size);		// Size of block to allocate
+;  Value returned is address of block allocated if normal or NULL if error
+;    (errno is set if error)
+
+arg_size=!4t
+
+	.ENTRY	malloc
+malloc:
+
+.IF DEF $$DEBUG
+	CALL	memchk
+.ENDC
+
+	MOVL	ECX, arg_size.B[ESP]	;Get size requested
+	TESTL	ECX, ECX		;Make sure not 0
+	JE	nomemory
+	ADDL	ECX, #{4 - 1}.B		;Round up to multiple of 4
+	ANDL	ECX, #-4.B
+	MOVL	EDX, _malloc_fhead	;Get head of our free list
+	JMP	20$.S			;Start checking
+
+;Here to run through all memory blocks until we find one big enough
+
+10$:	MOVL	EDX, mb_nfree.B[EDX]	;Step to next block in free list
+20$:	TESTL	EDX, EDX		;Anything more to check?
+	JE	getmemory		;No - go allocate more
+
+;Here with another block to check
+
+	CMPL	mb_magic.B[EDX], #MB_MAGIC ;Is it a valid block?
+	JE	22$.S
+	CALL	badmemory		;No, so die horrible death
+	HLT
+
+22$:	CMPL	mb_size.B[EDX], ECX	;Is this block big enough?
+	JB	10$.S			;No, keep checking
+
+;Here with a block which is big enough to use
+
+	CALL	removefree		;Remove block from free list
+	CALL	splitmem		;Split the block
+	JMP	30$.S			;Now exit
+
+;Here if we cannot satisfy the memory request
+
+nomemory:
+	CLRL	EAX			;Return NULL pointer
+	JMP	40$.S			;Now exit
+
+;Here if something is wrong with the memory list
+
+badmemory:
+	PUSHL   #memerr                 ;Pass address of string
+	CALL    _assert#                ;Output this as assertion failure
+	HLT
+
+;Here if must allocate a new block to satisify this request
+
+getmemory:
+	PUSHL	ECX			;Save size we want
+	ADDL	ECX, #HDRSIZE+3.B	;Need space for header & round up
+	ANDL	ECX, #-4.B		; to a longword boundary
+	PUSHL	ECX			;Tell sbrk how much we want
+	CALL	sbrk#			;Get the memory
+	POPL	ECX			;Dump the parameter we passed
+	POPL	ECX			;Get the size of our block
+	TESTL	EAX, EAX		;Did sbrk fail?
+	JLE	nomemory		;Yes
+	LEAL	EDX, HDRSIZE.B[EAX]	;No - point to start of block
+	CALL	initmem			;Initialize the memory
+	CALL	addmem			;Add it to tail of memory list
+30$:	MOVL	ECX, mb_size.B[EDX]	;Get the size of the new block
+	ADDL	_malloc_amount, ECX	;Adjust current allocation
+	MOVL	EAX, EDX		;Return pointer to block
+
+.IF DEF $$DEBUG
+	CALL	memchk
+.ENDC
+
+40$:	RET
+.PAGE
+	.SBTTL	realloc - ANSI C function to reallocate memory
+
+;ANSI C function to reallocate memory
+;	void *realloc(
+;	    void *oldmem,
+;	    long size)
+;  Value returned is the new address of the memory block (it may be the same
+;    or different from the old block)
+
+arg_oldmem=!4t
+arg_size  =!8t
+
+	.ENTRY	realloc
+realloc:MOVL	EDX, arg_oldmem.B[ESP]	;Get pointer to old block
+	MOVL	ECX, arg_size.B[ESP]	;Get new size
+	TESTL	EDX, EDX		;Does the user have a block already?
+	JNE	10$.S			;Yes
+	PUSHL	ECX			;No, we need to allocate a block
+	CALL	malloc			; by passing the new size to malloc
+	POPL	ECX			;Discard the size
+	JMP	40$.S			;Exit with EAX = new block or NULL
+
+;Here to see if the user wants to free up an allocated block
+
+10$:	TESTL	ECX, ECX		;Is the size zero?
+	JNE	20$.S			;No
+	PUSHL	EDX			;Yes, gotta free the memory
+	CALL	free			;So free it up already
+	POPL	EDX			;Discard the parameter
+	JMP	40$.S			;Now exit with EAX = NULL
+
+;Here to see if the user wants to make the block smaller
+
+20$:	CMPL	ECX, mb_size.B[EDX]	;Making block larger or smaller?
+	JE	40$.S			;Neither, so just exit
+	JA	30$.S			;Larger
+	ADDL	ECX, #{4 - 1}.B		;Smaller - first round up to
+	ANDL	ECX, #-4.B		; longword multiple
+	CALL	splitmem		;Split the block if we can
+	MOVL	EAX, EDX		;Return pointer in right register
+	JMP	40$.S			;Now exit
+
+;Here if the user is trying to make the block larger
+
+30$:	PUSHL	EDX			;Save the old block
+	PUSHL	ECX			;Pass the new size
+	CALL	malloc			;Now try to allocate it
+	POPL	ECX			;Get the new size again
+	POPL	EDX			;Get the old block back
+	TESTL	EAX, EAX		;Did we get a new block?
+	JE	40$.S			;No
+	PUSHL	ECX			;Pass the new size
+	PUSHL	EDX			;And the old block
+	PUSHL	EAX			;And the new block
+	CALL	memcpy#			;Now copy old to new
+	PUSHL	EDX			;Pass the old block
+	CALL	free			;Now free it up
+	MOVL	EAX, 4.B[ESP]		;Get pointer to new block
+	ADDL	ESP, #{4 * 4}.B		;Dump stack parameters
+40$:	RET
+.PAGE
+	.SBTTL	free - ANSI C function to deallocate memory
+
+;ANSI C function to deallocate memory
+;	void free(
+;	    void *mem);		// Address of memory block to free
+
+;NOTE:	Even though this function "officially" returns null, it really
+;	returns with c{EAX} = 0 (mostly for realloc)
+
+arg_mem=!4t
+
+	.ENTRY	free
+free:
+
+.IF DEF $$DEBUG
+	CALL	memchk
+.ENDC
+
+	MOVL	EDX, arg_mem.B[ESP]	;Get offset
+	TESTL	EDX, EDX		;Null pointer?
+	JE	30$.S			;Yes, just exit
+	CMPL	mb_magic.B[EDX], #MB_MAGIC ;Valid memory block?
+	JNE	10$.S			;No!
+	CMPL	mb_nfree.B[EDX], #-1.B	;Yes - is it in use?
+	JE	20$.S			;Yes
+10$:	CALL	badmemory               ;We have bad memory, so die
+	HLT
+
+;Here if have a valid memory block which is allocated
+
+20$:	MOVL	EAX, mb_size.B[EDX]	;Get size of the block
+	SUBL	_malloc_amount, EAX	;Reduce total amount allocated
+	CALL	freemem			;Give up the block
+30$:	CLRL	EAX			;Ensure we return a NULL pointer
+	RET
+.PAGE
+	.SBTTL	addfree - Add block to tail of free list
+
+;Subroutine to add a block to the tail of the free list
+;	c{EDX} = Memory block to add
+;	CALL 	addfree
+
+addfree:MOVL	EAX, _malloc_ftail	;Link this block onto the end of
+	MOVL	_malloc_ftail, EDX	;  the free list
+	MOVL	mb_pfree.B[EDX], EAX    ;Previous ptr points to old tail
+	MOVL	mb_nfree.B[EDX], #0.B   ;Next ptr points to NULL
+	TESTL	EAX, EAX		;Was the free list empty?
+	JE	4$.S			;Yes
+	MOVL	mb_nfree.B[EAX], EDX	;No
+	JMP     8$.S
+
+; Here if free list is empty - add block to head
+
+4$:	MOVL	_malloc_fhead, EDX      ;Free list head points to our block
+8$:	RET
+.PAGE
+	.SBTTL	addmem - Add block to tail of memory list
+
+;Subroutine to add a block to the tail of the memory list
+;	c{EDX} = Memory block to add
+;	CALL 	addmem
+
+addmem:	MOVL	mb_mnext.B[EDX], #0.B	;Next pointer is NULL
+	MOVL	EAX, _malloc_mtail	;Link into memory list
+	MOVL	_malloc_mtail, EDX	;This becomes the new tail
+	MOVL	mb_mprev.B[EDX], EAX	;Point our block to the old tail
+	TESTL	EAX, EAX		;Anything in the memory list?
+	JE	10$.S			;No
+	MOVL	mb_mnext.B[EAX], EDX	;Yes, old tail must point to us
+	JMP	12$.S			;Now exit
+
+; Here if there is nothing in the memory list
+
+10$:	MOVL	_malloc_mhead, EDX	;Update the head pointer
+12$:	RET
+.PAGE
+	.SBTTL	combine - Combine two memory blocks
+
+;Subroutine To combine two memory blocks
+;	c{EBX} = Second (higher) memory block
+;	c{EDX} = First (lower) memory block
+;	CALL 	combine
+;	c{EDX} = Resulting block
+
+combine:
+	MOVL	EAX, mb_size.B[EBX]	;Get size of second block
+	ADDL	EAX, #HDRSIZE.B
+	MOVL	ECX, mb_mnext.B[EBX]	;Get next block in memory
+	MOVL	mb_magic.B[EBX], #0.B	;Make sure this is no longer a header
+	ADDL	mb_size.B[EDX], EAX	;Adjust size
+	MOVL	mb_mnext.B[EDX], ECX
+	TESTL	ECX, ECX		;Is this last block in memory?
+	JE	10$.S			;Yes
+	MOVL	mb_mprev.B[ECX], EDX	;No - fix up back pointer
+	JMP	20$.S			;Now exit
+
+; Here if the second block was the last block in memory
+
+10$:	MOVL	_malloc_mtail, EDX	;Update the tail
+20$:	RET				;All done here
+
+	.PAGE
+	.SBTTL	freemem - Free memory block
+
+;Subroutine to free a memory block
+;	c{EDX} = Offset of memory block to free
+;	CALL 	freemem
+
+freemem:MOVL	EBX, mb_mnext.B[EDX]	;Point to next block in memory
+	LEAL	EAX, HDRSIZE.B[EDX]	;See if next block is contiguous
+	ADDL	EAX, mb_size.B[EDX]
+	CMPL	EAX, EBX
+	JNE	20$.S			;Not contiguous
+	CMPL	mb_magic.B[EBX], #MB_MAGIC ;Yes - is it valid?
+	JE	10$.S			;Yes
+	CALL	badmemory               ;We have bad memory, so die
+	HLT
+
+;Here if there is a block following ours and it is okay
+
+10$:	CMPL	mb_nfree.B[EBX], #-1.B	;Is it free?
+	JE	20$.S			;No
+	PUSHL	EDX
+	MOVL	EDX, EBX
+	CALL	removefree		;Yes, so remove it from the free list
+	POPL	EDX
+	CALL	combine			;And combine it with ours
+20$:	MOVL	EBX, mb_mprev.B[EDX]	;Point to previous block in memory
+	TESTL	EBX, EBX
+	JE	40$.S			;If none
+	LEAL	EAX, HDRSIZE.B[EBX]	;See if previous block is contiguous
+	ADDL	EAX, mb_size.B[EBX]
+	CMPL	EAX, EDX
+	JNE	40$.S			;Not contiguous
+	CMPL	mb_magic.B[EAX], #MB_MAGIC ;Is it valid?
+	JE	30$.S			;Yes
+	CALL	badmemory               ;We have bad memory, so die
+	HLT
+
+;Here if there is a block preceding ours and it is okay
+
+30$:	CMPL	mb_nfree.B[EBX], #-1.B	;Is it free?
+	JE	40$.S			;No
+	XCHGL	EDX, EBX
+	CALL	removefree		;Yes, remove it from the free list
+	CALL	combine			;And combine it with ours
+40$:	CMPL	mb_mnext.B[EDX], #0.B	;Is this the last block in memory?
+	JNE	addfree			;No - go put it on the free list
+	LEAL	EAX, HDRSIZE.B[EDX]
+	ADDL	EAX, mb_size.B[EDX]	;Maybe
+	CMPL	_clib_mempnt#, EAX
+	JNE	addfree			;Not last
+	MOVL	EAX, mb_mprev.B[EDX]	;Last in memory, unlink this block from
+	MOVL	_malloc_mtail, EAX	;  the memory list
+	TESTL	EAX, EAX
+	JE	50$.S
+	MOVL	mb_mnext.B[EAX], #0.B
+	JMP	60$.S
+
+50$:	MOVL	_malloc_mhead, EAX
+60$:	SUBL	EDX, #HDRSIZE.B		;Give up the memory containing this
+	PUSHL	EDX			;  block
+	CALL	brk#
+	POPL	ECX
+	TESTL	EAX, EAX
+	JNS	70$.S                   ;Success
+	CALL	badmemory               ;We have bad memory, so die
+	HLT
+
+70$:	RET                             ;Now exit
+.PAGE
+	.SBTTL	initmem - Initialize memory block
+
+;Subroutine to initialize memory block
+;	c{ECX} = Size of block
+;	c{EDX} = Offset of memory block to initialize
+;	CALL 	initmem
+
+initmem:MOVL	mb_magic.B[EDX], #MB_MAGIC
+	MOVL	mb_size.B[EDX], ECX	;Store size
+	MOVL	mb_mnext.B[EDX], #-1.B  ;Indicate not in memory list
+	MOVL	mb_mprev.B[EDX], #-1.B
+	MOVL	mb_pfree.B[EDX], #-1.B  ;Indicate not in free list
+	MOVL	mb_nfree.B[EDX], #-1.B
+	RET
+.PAGE
+	.SBTTL	removefree - Remove memory block from free list
+
+;Subroutine to remove a memory block from the free list
+;	c{EDX} = Offset of memory block to remove
+;	CALL 	removefree
+
+removefree:
+	PUSHL	EBX			;Get a scratch register
+	MOVL	EAX, mb_pfree.B[EDX]	;Get pointer to previous
+	MOVL	EBX, mb_nfree.B[EDX]    ;Get pointer to next
+	MOVL	mb_pfree.B[EDX], #-1.B  ;Mark this block as not free
+	MOVL	mb_nfree.B[EDX], #-1.B
+	TESTL	EAX, EAX		;Is it the first?
+	JE	10$.S			;Yes
+	MOVL	mb_nfree.B[EAX], EBX	;No
+	JMP	20$.S                   ;Continue with common code
+
+;Here if the block we are removing is the first in the free list
+
+10$:	MOVL	_malloc_fhead, EBX      ;Update the free list head pointer
+20$:	TESTL	EBX, EBX		;Is it the last?
+	JE	30$.S			;Yes
+	MOVL	mb_pfree.B[EBX], EAX	;No
+	JMP	40$.S                   ;Continue with common code
+
+;Here if the block we are removing is the last in the free list
+
+30$:	MOVL	_malloc_ftail, EAX	;Update the free list tail
+40$:	POPL	EBX			;Restore scratch register
+	RET
+
+	.PAGE
+	.SBTTL	splitmem - Split memory block into 2 pieces if possible
+
+;Subroutine to split a memory block into 2 pieces if possible
+;	c{ECX} = Size of block we want
+;	c{EDX} = Offset ot memory block to split
+;	CALL 	splitmem
+
+;  This function takes the current memory block and sees if we can split it
+;    into two pieces. For example, if the user wants a 400 byte block and we
+;    presently have a 1000 byte block, we split off the last 600 bytes and
+;    add it to both the memory list and the free list. If we can't split the
+;    block, then we just exit.
+
+splitmem:
+	MOVL	EAX, mb_size.B[EDX]	;Get current size
+	LEAL	EBX, HDRSIZE.B[ECX]	;Get requested size plus header size
+	SUBL	EAX, EBX		;Subtract current size
+	JLE	30$.S			;If can't split it
+	PUSHL	EAX			;Save the new block size
+	MOVL	mb_size.B[EDX], ECX	;We can split it - store new size
+	MOVL	EAX, EDX		;Calculate offset for new block
+	ADDL	EAX, EBX		;Add in block and header sizes
+	MOVL	EBX, mb_mnext.B[EDX]	;Get current forward pointer
+	MOVL	mb_mnext.B[EDX], EAX
+	MOVL	mb_mprev.B[EAX], EDX	;Link new block to memory list
+	MOVL	mb_mnext.B[EAX], EBX
+	POPL	mb_size.B[EAX]		;Store size of new block
+	MOVL	mb_magic.B[EAX], #MB_MAGIC
+	TESTL	EBX, EBX		;Is there a next block?
+	JE	10$.S			;No
+	MOVL	mb_mprev.B[EBX], EAX	;Yes - fix up its back-pointer
+	JMP	20$.S
+
+;Here if we are adding a new block to the memory list tail
+
+10$:	MOVL	_malloc_mtail, EAX	;Change the tail pointer
+20$:	PUSHL	EDX
+	MOVL	EDX, EAX		;Point to block we are freeing
+	CALL	addfree 		;Give up the second block
+	POPL	EDX			;Restore offset of first block
+30$:	RET				;And return
+.PAGE
+	.SBTTL	memchk - Check memory list for consistency
+
+;Subroutine to check memory list for consistancy
+;	CALL	memchk
+
+.IF DEF $$DEBUG
+memchk:	PUSHL	EAX
+	PUSHL	EDX
+	PUSHL	ECX
+	PUSHL	EDI
+	PUSHL	ESI
+	CLRL	ESI			;Clear the free block count
+	MOVL	EAX, _malloc_mhead	;Point to first block
+	TESTL	EAX, EAX		;Anything there?
+	JNE	10$.S			;Yes
+	CMPL	_malloc_mtail, #0.B	;No, is the tail NULL also?
+	JE	40$.S			;Yes, just exit
+	CALL	badmemory               ;We have bad memory, so die
+	HLT
+
+;Here with first block on memory list
+
+10$:	CMPL	mb_mprev.B[EAX], #0.B	;Is the previous pointer NULL?
+	JE	20$.S			;Yes, it's okay
+	CALL	badmemory               ;We have bad memory, so die
+	HLT
+
+;Here if first block has valid mprev pointer
+
+20$:	CMPL	mb_magic.B[EAX], #MB_MAGIC
+	JE	22$.S
+	CALL	badmemory
+	HLT
+
+;Here if the magic number is correct
+
+22$:	MOVL	EBX, EAX		;Copy pointer to block
+	MOVL	ECX, EBX		;Get top of block
+	ADDL	ECX, mb_size.B[EBX]
+	MOVL	EAX, mb_mnext.B[EAX]	;Get next block
+	TESTL	EAX, EAX		;Have another?
+	JE	30$.S			;No
+	CMPL	EAX, ECX		;Is it above the previous block?
+	JAE	24$.S			;Yes - go on
+	CALL	badmemory
+	HLT
+
+;Here if block is above the previous block
+
+24$:	CMPL	mb_mprev.B[EAX], EBX	;Is the back-pointer correct?
+	JE	26$.S			;Yes
+	CALL	badmemory               ;No
+	HLT
+
+;Here if the back-pointer is correct
+
+26$:	CMPL	mb_nfree.B[EAX], #-1.B	;Is it on the free list?
+	JNE	28$.S			;Yes
+	CMPL	mb_pfree.B[EAX], #-1.B	;No - make sure both pointer are OK
+	JE	20$.S
+	CALL	badmemory
+	HLT
+
+;Here if block is on the free list
+
+28$:	CMPL	mb_pfree.B[EAX], #-1.B
+	JNE	29$.S
+	CALL	badmemory
+	HLT
+
+29$:	INCL	ESI
+	JMP	20$.S
+
+;Here when all done scanning the in-use memory list
+
+30$:	CMPL	_malloc_mtail, EBX	;Make sure tail pointer is OK
+	JE	40$.S			;Just dandy, so quit
+	CALL	badmemory               ;We have bad memory, so die
+	HLT
+
+;Here if the tail pointer matches our last block - now check the free list
+
+40$:	CLRL	EDI
+	MOVL	EAX, _malloc_fhead	;Point to first block
+	TESTL	EAX, EAX		;Anything there?
+	JNE	44$.S			;Yes
+	CMPL	_malloc_ftail, #0.B	;No, is the tail NULL also?
+	JE	42$.S			;Yes
+	CALL	badmemory               ;We have bad memory, so die
+	HLT
+
+;Here if the free list is empty
+
+42$:	TESTL	ESI, ESI		;Did we find any free blocks?
+	JE	60$.S			;No - OK
+	CALL	badmemory
+	HLT
+
+;Here with first block on the free list
+
+44$:	CMPL	mb_pfree.B[EAX], #0.B	;Is the previous pointer NULL?
+	JE	50$.S			;Yes, it's okay
+	CALL	badmemory               ;We have bad memory, so die
+	HLT
+
+;Here if first block has valid fprev pointer
+
+50$:	CMPL	mb_magic.B[EAX], #MB_MAGIC
+	JE	52$.S
+	CALL	badmemory
+	HLT
+
+;Here if the magic number is correct
+
+52$:	INCL	EDI			;Count the free block
+	MOVL	EBX, EAX		;Copy pointer to block
+	MOVL	EAX, mb_nfree.B[EAX]	;Get next block
+	TESTL	EAX, EAX		;Have another?
+	JE	56$.S			;No
+	CMPL	mb_pfree.B[EAX], EBX	;Is the back-pointer correct?
+	JE	52$.S			;Yes
+	CALL	badmemory               ;No
+	HLT
+
+;Here when all done scanning the free list
+
+56$:	CMPL	_malloc_ftail, EBX	;Make sure tail pointer is OK
+	JE	58$.S			;Just dandy, so quit
+	CALL	badmemory               ;We have bad memory, so die
+	HLT
+
+;Here if the tail pointer matches our last block
+
+58$:	CMPL	ESI, EDI		;Is the number of free block correct?
+	JE	60$.S
+	CALL	badmemory
+	HLT
+
+60$:	POPL	ESI
+	POPL	EDI
+	POPL	ECX
+	POPL	EDX
+	POPL	EAX
+	RET
+.ENDC
+	.END

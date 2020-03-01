@@ -1,0 +1,1169 @@
+	.TITLE	UDFSRV - PARLEY user information server for XOS
+
+;++++
+; This software is in the public domain.  It may be freely copied and used
+; for whatever purpose you see fit, including commerical uses.  Anyone
+; modifying this software may claim ownership of the modifications, but not
+; the complete derived code.  It would be appreciated if the authors were
+; told what this software is being used for, but this is not a requirement.
+
+;   THIS SOFTWARE IS PROVIDED BY THE AUTHORS "AS IS" AND ANY EXPRESS OR
+;   IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
+;   OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+;   IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+;   INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+;   BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS
+;   OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+;   ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR
+;   TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
+;   USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+;----
+
+	.PROC	80386
+
+	.INCLUD	XOSINC:\XMAC\STDIO.PAR
+	.INCLUD	XOSINC:\XMAC\CTYPE.PAR
+	.INCLUD	XOSINC:\XMAC\PROCARG.PAR
+	.INCLUD	XOSINC:\XMAC\XOS.PAR
+	.INCLUD	XOSINC:\XMAC\XOSX.PAR
+	.INCLUD	XOSINC:\XMAC\XOSERR.PAR
+	.INCLUD	XOSINC:\XMAC\XOSTIME.PAR
+	.INCLUD	XOSINC:\XMAC\XOSTRM.PAR
+	.INCLUD	XOSINC:\XMAC\XOSNET.PAR
+	.INCLUD	XOSINC:\XMAC\XOSXNET.PAR
+	.INCLUD XOSINC:\XMAC\XOSTHREADS.PAR
+	.INCLUD	XOSINC:\XMAC\XOSUDF.PAR
+	.INCLUD	UDFSRV.PAR
+
+	.STDSEGS
+
+MAJVER ==!4t		;Major version number
+MINVER ==!0t		;Minor version number
+EDITNUM==!0t		;Edit number
+
+;This program is the PARLEY user information server.  It is initialized as a
+;  symbiont with the following command:
+
+;	SYMBIONT UDFSRV UNIT=n
+;	  Where:
+;		UNIT     = Server unit number (default = 1)
+
+;v 1.0
+;	Initial version
+;v 1.1 19-Jul-95
+;	Added support for delete, activate, and inactivate functions.
+;v 1.2 31-Jul-95
+;	Fixed bug which did not allow CREATE | UPDATE on existing record;
+;	fixed several bugs having to do with funny update request formats
+;	which UDFMERGE can generate when merging in a real UDF file.
+;v 2.0 20-Dec-95
+;	Changed to "C6" UDF format; significantly enhanced error recovery
+;	and reporting.
+;v 2.1 5-Jan-96
+;	Fixed problem which caused page fault when deleting records.
+;v 3.0 22-Aug-96
+;	Modified to correctly handle hashed passwords (removed password
+;	checking, fixed to handle prefix bytes correctly).
+;v 4.0.0 30-Aug-96
+;	Modified to use the THREADS package.
+
+;Each copy of UDFSRV running on a system must have a unique unit number.
+
+;Description of data structures used:
+
+;  The server can support up to 31 server instances.  Each instance is
+;  associated with a UDP unit/local port number pair and a single user
+;  description file (UDF).  Each instance uses three threads.  The first,
+;  the UDP thread is created when the instance is created and exists as long
+;  as the instance does.  It reads UDP datagrams, and processes the requests
+;  from the datagrams.  It handles all requests directly except for the
+;  bill data request, which it spawns another thread to handle.  This billing
+;  thread is terminated as soon as the billing request is complete.  A third
+;  thread, the compress thread, is spawned to handle the COMPRESS SERVER
+;  command.  It terminates when the COMPRESS command is complete.
+
+;  For each instance an IDB is allocated.  This IDB contains all data for
+;  the instance, including the TDBs for the three instance threads.
+;  Each IDB is allocated 32KB of address space which is used as follows:
+;	Offset   Size    Use
+;	0x0000  0x1000  TDB and other data associated with the UDP thread
+;	0x1000  0x1000  Not allocated
+;	0x2000  0x1000  TDB and other data associated with the billing thread
+;	0x3000  0x1000  Not allocated
+;	0x4000  0x1000  TDB and other data associated with the compression
+;			  thread
+;	0x5000  0x3000  Not allocated
+
+;  Each TDB is positioned 0x800 bytes from the beginning of its memory page.
+;  The thread's stack uses the 0x800 bytes below the TDB.  Other data
+;  associated with the thread is allocated above the TDB.
+
+;  Five major functions are handled by the server:
+;	1) User verification, getting user information
+;	2) UDF updates
+;	3) UDF compression
+;	4) Nightly billing management
+;	5) Active program notifications
+
+; Record types and formats:
+;	UDF_USERNAME = 1  - User name
+;				Entire record is ASCII user name.
+;	UDF_USERDESC = 3  - User description
+;				Entire record is ASCII user description.
+;	UDF_PROGRAM  = 4  - Initial program
+;				Entire record is ASCII file specficiation.
+;	UDF_HOMEDIR  = 5  - Home directory
+;				Entire record is ASCII file specficiation.
+;	UDF_AVLPRIV  = 6  - Available privileges
+;				Entire record is a list of Parley 16-bit
+;				radix-40 privilege names.  Each name is null
+;				terminated and null filled to an even number
+;				of characters.
+;	UDF_INLPRIV  = 7  - Initial active privileges
+;				Entire record is a list of Parley 16-bit
+;				radix-40 privilege names.  Each name is null
+;				terminated and null filled to an even number
+;				of characters.
+;	UDF_AVLMEM   = 8  - Available memory limits
+;				Entire record is a list of Parley variable
+;				length values.
+;	UDF_INLMEM   = 9  - Initial active memory limits
+;				Entire record is a list of Parley variable
+;				length values.
+;	UDF_AVLCPU   = 10 - Available CPU limits
+;				Entire record is a list of Parley variable
+;				length values.
+;	UDF_INLCPU   = 11 - Initial active CPU limits
+;				Entire record is a list of Parley variable
+;				length values.
+;	UDF_PSWDEXP  = 12 - Password expiration
+;				Record contains only an 8 byte XOS
+;				date/time value stored high order byte first.
+;	UDF_USEREXP  = 13 - User expiration
+;				Record contains only an 8 byte XOS
+;				date/time value stored high order byte first.
+;	UDF_HISTORY  = 15 - Login history
+;				Record format is TBD
+;	UDF_USERID   = 32 - User ID
+;				Entire record is ASCII user ID string.
+;	UDF_MAILNAME = 33 - Mailing name
+;				Entire record is ASCII mailing name.
+;	UDF_COMPANY  = 34 - Company name
+;				Entire record is ASCII company name.
+;	UDF_ADDR1    = 35 - Address - line 1
+;				Entire record is ASCII address line.
+;	UDF_ADDR2    = 36 - Address - line 2
+;				Entire record is ASCII address line.
+;	UDF_ADDR3    = 37 - Address - line 3
+;				Entire record is ASCII address line.
+;	UDF_ADDR4    = 38 - Address - line 4
+;				Entire record is ASCII address line.
+;	UDF_CITY     = 39 - City
+;				Entire record is ASCII city name.
+;	UDF_STATE    = 40 - State
+;				Entire record is ASCII state name (for US
+;				states this is the 2 letter state abriv.).
+;	UDF_ZIP      = 41 - Postal (ZIP) code
+;				Entire record is ASCII postal code.
+;	UDF_COUNTRY  = 42 - Country
+;				Entire record is ASCII country name.
+;	UDF_PHONE    = 43 - Phone number
+;				Entire record is ASCII phone number.
+
+	.PSECT	_DATA_p
+
+kwadd:      .ASCIZ "ADD"
+kwmodify:   .ASCIZ "MODIFY"
+kwmod:      .ASCIZ "MOD"
+kwremove:   .ASCIZ "REMOVE"
+kwrem:	    .ASCIZ "REM"
+kwstatus:   .ASCIZ "STATUS"
+kwsta:	    .ASCIZ "STA"
+kwcompress: .ASCIZ "COMPRESS"
+kwcom:	    .ASCIZ "COM"
+kwinstance::.ASCIZ "INSTANCE"
+kwins::     .ASCIZ "INS"
+
+	.MOD	4
+srvCmdWord::
+	.LONG	kwadd     , 0, 0, srvFncCommand#, cmdadd#
+	.LONG	kwmodify  , 0, 0, srvFncCommand#, cmdmodify#
+	.LONG	kwmod     , 0, 0, srvFncCommand#, cmdmodify#
+	.LONG	kwremove  , 0, 0, srvFncCommand#, cmdremove#
+	.LONG	kwrem     , 0, 0, srvFncCommand#, cmdremove#
+	.LONG	kwstatus  , 0, 0, srvFncCommand#, cmdstatus#
+	.LONG	kwsta     , 0, 0, srvFncCommand#, cmdstatus#
+	.LONG	kwcompress, 0, 0, srvFncCommand#, cmdcompress#
+	.LONG	kwcom     , 0, 0, srvFncCommand#, cmdcompress#
+	.LONG	0
+	.LONG	0
+.PAGE
+	.SBTTL	Start of program
+
+	.PSECT	_TEXT_p
+
+mainalt::
+	PUSHL	#EDITNUM
+	PUSHL	#MINVER.B
+	PUSHL	#MAJVER.B
+	PUSHL	#40t.B			;Maximum number of threads
+	PUSHL	#50t.B			;Base signal vector
+	PUSHL	#tdb_SIZE.B		;Size of the base thread data area
+	PUSHL	#CMDTDB			;Address of data area for base thread
+	MOVL	EAX, 32t.B[ESP]		;Address of argument area
+	PUSHL	EAX
+	CALL	srvInitialize#
+	ADDL	ESP, #28t.B
+	RET
+
+srvSetup1::
+	RET
+
+srvSetup2::
+	RET
+
+	.SBTTL	setupcmd - Subroutine to set up for command processing
+
+;Subroutine to set up for command processing
+;	CALL	srvSetupCmd
+
+srvSetupCmd::
+	CLRL	EAX
+	MOVL	instance, EAX
+	RET
+
+srvFinishCmd::
+	RET
+
+srvMessage::
+	RET
+.PAGE
+	.SBTTL	fncinstance - Function to process the INSTANCE keyword
+
+;Function to process the INSTANCE keyword - this specifies the instance number
+
+fncinstance::
+	MOVL	EBX, 4.B[ESP]		;Get offset of the argument data
+	MOVL	EAX, argdata_value.B[EBX] ;Get value
+	TESTL	EAX, EAX
+	JE	10$.S
+	CMPL	EAX, #INSTMAX.B		;Valid?
+	JA	10$.S			;No
+	MOVL	instance, EAX		;Yes - store it
+rtnone4:CLRL	EAX
+	INCL	EAX
+	RET
+
+;Here if the instance number is not valid
+
+10$:	PUSHL	ESI
+	PUSHL	EDI
+	MOVL	ESI, #bdimsg
+12$:	PUSHL	srvMsgDst#
+	PUSHL	#0.B
+	PUSHL	ESI
+	PUSHL	EAX
+	CALL	srvCmdErrorResp#
+	ADDL	ESP, #16t.B
+	POPL	EDI
+	POPL	ESI
+	CLRL	EAX
+	RET
+
+bdimsg:	.ASCIZ	"Invalid instance number"
+.PAGE
+	.SBTTL	requireinst
+
+;Subroutine to do initial command processing when an instance must be specified
+;	c{EAX} = Offset of command tail
+;	c{EDI} = Offset of command keyword table
+;	CALL	requireinst
+;	C:set = Error (complete response already sent)
+;	C:clr = Normal
+;	  c{ESI} = Offset of IDB for instance
+
+requireinst::
+	MOVL	cmdpntr, EAX
+	PUSHL	srvMsgDst#
+	PUSHL	#0.B			;No default extension for indirect file
+	PUSHL	#0.B			;No next line function
+	PUSHL	#srvCmdError#		;Error function
+	PUSHL	#0.B			;Function called for non-keyword args
+	PUSHL	EDI			;Offset of keyword table
+	PUSHL	#0.B			;Offset of option table
+	PUSHL	#PAF$INDIRECT|PAF$EATQUOTE ;Flag bits
+	PUSHL	#cmdpntr		;Offset of arg string pointer
+	CALL	procarg#		;Process arguments
+	ADDL	ESP, #36t.B
+	ORL	EAX, EAX
+	JE	6$.S
+	CALL	banner
+	MOVL	ESI, instance		;Was an instance specified?
+	TESTL	ESI, ESI
+	JE	2$.S			;No - fail
+	BTL	instx, ESI		;Yes - does the instance exist?
+	JNC	8$.S			;No - fail
+	SHLL	ESI, #26t.B		;Yes - get offset of the IDB
+	ADDL	ESI, #THDSTKSIZE
+	RET
+
+;Here if no instance specified
+
+2$:	PUSHL	srvMsgDst#
+	PUSHL	#noismsg
+4$:	CALL	srvCmdResponse#
+	ADDL	ESP, #8t.B
+6$:	STC
+	RET
+
+8$:	PUSHL	#noixmsg
+	JMP	4$.S
+
+banner::MOVL	EAX, #banfmt1
+	CMPL	instance, #0.B
+	JE	10$.S
+	ADDL	EAX, #banfmt2-banfmt1.B
+10$:	PUSHL	instance
+	PUSHL	srvUnitNum#
+	PUSHL	EAX
+	PUSHL	#msgbufr
+	CALL	sprintf#
+	PUSHL	srvMsgDst#
+	PUSHL	#msgbufr
+	CALL	srvCmdResponse#
+	ADDL	ESP, #24t.B
+	RET
+
+	.MACRO	BAN MAJVER, MINVER, EDIT
+	.ASCII	{MT_INTRMDMSG}"UDFSRV: Version MAJVER"".""MINVER"".""EDIT"
+	.ENDM
+banfmt1:BAN	>MAJVER, >MINVER, >EDITNUM	
+	.ASCIZ	", Unit %d"
+
+banfmt2:BAN	>MAJVER, >MINVER, >EDITNUM	
+	.ASCIZ	", Unit %d, Instance %d"
+
+noismsg::.ASCIZ	{MT_FINALERR}"? UDFSRV: No instance specified"
+noixmsg: .ASCIZ	{MT_FINALERR}"? UDFSRV: Instance does not exist"
+
+	.SBTTL	End of command processing
+.PAGE
+message::
+	CLRL	EAX
+	INCL	EAX
+	RET
+.PAGE
+	.SBTTL	logerror - Subroutine to log error in the system log
+
+;Subroutine to log error in the system log
+;	c{EAX} = XOS error code
+;	c{EBX} = Offset of message string
+;	CALL	logerror
+
+logerror::
+	SUBL	ESP, #200t
+	MOVL	EDX, ESP
+	PUSHL	EAX
+	MOVL	[EDX], #'    '
+	MOVL	4.B[EDX], #'UDFS'
+	MOVL	8.B[EDX], #'RV  '
+	MOVL	12t.B[EDX], #'? '
+	LEAL	ECX, 14t.B[EDX]
+4$:	MOVB	AL, [EBX]
+	CMPB	AL, #0
+	JE	6$.S
+	INCL	EBX
+	MOVB	[ECX], AL
+	INCL	ECX
+	JMP	4$.S
+
+6$:	POPL	EAX			;Restore error code
+	ORL	EAX, EAX		;Do we have an error code?
+	JE	8$.S			;No
+	MOVW	[ECX], #': '		;Yes - add the message for the code
+	ADDL	ECX, #2t.B
+	PUSHL	EAX
+	PUSHL	#3.B
+	PUSHL	DS
+	PUSHL	ECX
+	CALLF	svcSysErrMsg##
+	ADDL	ECX, EAX
+8$:	PUSHL	DS
+	PUSHL	EDX
+	SUBL	ECX, EDX
+	PUSHL	ECX
+	CALLF	svcSysLog##
+	ADDL	ESP, #200t
+	RET
+.PAGE
+;Subroutine to set up to start reading from the UDF
+;	c{EAX} = Offset in file
+;	CALL	readbegin
+;	C:set = Error
+;	C:clr = Normal
+
+readbegin::
+	MOVL	EDX, EAX
+	ANDL	EAX, #~1FFh		;Get offset of start of block
+	CMPL	idb_comppos[ESI], EDX	;Are we compressing past this point?
+	JBE	2$.S
+	MOVL	ECX, idb_comphndl[ESI]	;Yes - use the compressed file
+	CMPB	idb_compfile[ESI], #0	;Have the compressed file in the buffer?
+	JNE	4$.S			;Yes - only read if we need to
+	MOVB	idb_compfile[ESI], #1	;No - but we soon will
+	JMP	6$.S			;Always read the file
+
+2$:	MOVL	ECX, idb_udfhndl[ESI]	;No - use the original file
+	CMPB	idb_compfile[ESI], #0	;Have the compressed file in the buffer?
+	JE	4$.S			;No - only read if we need to
+	MOVB	idb_compfile[ESI], #0	;Yes - but not for long
+	JMP	6$.S			;Always read the file
+
+4$:	CMPL	idb_blkpos[ESI], EAX	;Do we have this location now?
+	JE	10$.S			;Yes
+6$:	MOVL	idb_blkpos[ESI], EAX
+	MOVL	iopos, EAX
+	PUSHL	ECX			;Read the file
+	PUSHL	DS
+	LEAL	EAX, idb_blkbufr[ESI]
+	PUSHL	EAX
+	PUSHL	#512t
+	PUSHL	DS
+	PUSHL	#ioparms
+	CALLF	svcIoInBlockP##
+	TESTL	EAX, EAX
+	JS	12$.S			;If error
+	SETE	idb_blkeof[ESI]		;OK - indicate if at EOF now
+	ANDL	EDX, #1FFh		;Get offset in block
+	SUBL	EAX, EDX		;Get amount available here
+	MOVL	idb_blkleft[ESI], EAX
+	LEAL	EAX, idb_blkbufr[ESI+EDX]
+	MOVL	idb_blkpnt[ESI], EAX
+	RET
+
+;Here if we already have the initial data in our buffer
+
+10$:	ANDL	EDX, #1FFh
+	LEAL	ECX, idb_blkbufr[ESI]
+	MOVL	EAX, idb_blkpnt[ESI]
+	SUBL	EAX, ECX		;This gives the total amount in the
+	ADDL	EAX, idb_blkleft[ESI]	;  buffer
+	SUBL	EAX, EDX
+	MOVL	idb_blkleft[ESI], EAX	;Store new amount left
+	ADDL	ECX, EDX		;Store new pointer
+	MOVL	idb_blkpnt[ESI], ECX
+	CLC
+	RET
+
+;Here if error reading the disk
+
+12$:	CMPL	EAX, #ER_EOF.B
+	JNE	14$.S
+	CLRL	EAX
+	MOVL	idb_blkleft[ESI], EAX
+	MOVB	idb_blkeof[ESI], #1
+14$:	CLRL	EDX
+	MOVL	idb_blkpos[ESI], EDX
+	STC
+	RET
+.PAGE
+	.SBTTL	calindex - Subroutine to calculate hash index for name
+
+calindexx::
+	PUSHL	EDI
+	PUSHL	DS
+	POPL	ES
+	MOVL	ECX, #16t
+	CLD
+	MOVB	AL, #0
+	RNSCASB	[EDI]
+	JE	2$.S
+	DECL	ECX
+2$:	SUBL	ECX, #16t.B
+	NOTL	ECX
+	POPL	EDI
+
+;Subroutine to calculate hash index for name
+;	c{EDI} = Offset of name string
+;	c{ECX} = Length of name string
+;	CALL	calindex
+;	c{EDX} = Hash index value
+
+calindex::
+	PUSHL	EDI
+	PUSHL	ECX
+	CLRL	EDX
+4$:	RCLW	DX, #1
+	XORB	DL, [EDI]
+	INCL	EDI
+	LOOP	ECX, 4$
+6$:	ANDB	DH, #03h
+	POPL	ECX
+	POPL	EDI
+	RET
+.PAGE
+	.SBTTL	allocindex - Subroutine to allocate index block
+
+;Subroutine to allocate index block
+;	CALL	allocindex
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  c{EBX} = Offset of index block
+
+allocindex::
+	MOVL	EBX, idb_indxfree[ESI]	;Get a block from the free list
+	TESTL	EBX, EBX
+	JE	4$.S			;If free list is empty
+	MOVL	EAX, [EBX]		;OK - remove block from the free list
+	MOVL	idb_indxfree[ESI], EAX
+	DECL	idb_indxfcnt[ESI]
+2$:	CLRL	EAX
+	MOVL	[EBX], EAX
+	MOVL	inx_nextid.B[EBX], EAX
+	MOVL	inx_usernm.B[EBX], EAX
+	MOVL	inx_userid.B[EBX], EAX
+	RET
+
+;Here if the free list is empty
+
+4$:	INCL	idb_indxtcnt[ESI]
+	MOVL	EBX, idb_free[ESI]	;Allocate a new block
+	LEAL	EAX, inx_SIZE.B[EBX]
+	MOVL	idb_free[ESI], EAX
+	CMPL	idb_top[ESI], EAX	;Need more memory?
+	JAE	2$.S			;No - finished
+	PUSHL	DS			;Yes - get it
+	LEAL	EDX, idb_udpbegin[ESI]
+	PUSHL	EDX
+	PUSHL	#PG$READ|PG$WRITE.B
+	SUBL	EAX, EDX
+	PUSHL	EAX
+	CALLF	svcMemChange#
+	TESTL	EAX, EAX
+	JS	6$.S			;If error
+	LEAL	EAX, idb_udpbegin[ESI+EAX] ;OK - update top of memory value
+	MOVL	idb_top[ESI], EAX
+	JMP	2$.S			;Go finish up
+
+;Here if error allocating memory
+
+6$:	SUBL	idb_free[ESI], #inx_SIZE.B ;Fix up the available memory pointer
+	DECL	idb_indxtcnt[ESI]	;Fix up the index block count
+	STC				;Indicate failure
+	RET
+
+;Subroutine to free an index block
+;	c{EBX} = Offset of index block
+;	CALL	freeindex
+
+freeindex::
+	MOVL	EAX, idb_indxfree[ESI]
+	MOVL	[EBX], EAX
+	MOVL	idb_indxfree[ESI], EBX
+	INCL	idb_indxfcnt[ESI]
+	RET
+.PAGE
+;Subroutine to find entry in the user name index
+;	c{ECX} = Length of user name string
+;	c{EDX} = Hash index
+;	c{EDI} = Offset of user name string
+;	CALL	findname
+;	c{EBX} = Offset of index block
+;	c{EDX} = Offset of pointer to the index block
+
+findname::
+	CALL	setupkey
+	LEAL	EDX, idb_usnmhash[ESI+EDX*4]
+4$:	MOVL	EBX, [EDX]
+	TESTL	EBX, EBX
+	JE	8$.S
+	MOVL	EAX, key+0t
+	CMPL	inx_usernm+0t.B[EBX], EAX
+	JNE	6$.S
+	MOVL	EAX, key+4t
+	CMPL	inx_usernm+4t.B[EBX], EAX
+	JNE	6$.S
+	MOVL	EAX, key+8t
+	CMPL	inx_usernm+8t.B[EBX], EAX
+	JNE	6$.S
+	MOVL	EAX, key+12t
+	CMPL	inx_usernm+12t.B[EBX], EAX
+	JE	10$.S
+6$:	MOVL	EDX, EBX
+	JMP	4$.S
+
+8$:	STC
+10$:	RET
+
+;Subroutine to find entry in the user ID index
+;	c{ECX} = Length of user ID string
+;	c{EDX} = Hash index
+;	c{EDI} = Offset of user ID string
+;	CALL	findname
+;	c{EBX} = Offset of index block
+;	c{EDX} = Offset of pointer to the index block
+
+findid::CALL	setupkey
+	LEAL	EDX, idb_usidhash[ESI+EDX*4]
+14$:	MOVL	EBX, [EDX]
+	TESTL	EBX, EBX
+	JE	8$.S
+	MOVL	EAX, key+0t
+	CMPL	inx_userid+0t.B[EBX], EAX
+	JNE	16$.S
+	MOVL	EAX, key+4t
+	CMPL	inx_userid+4t.B[EBX], EAX
+	JNE	16$.S
+	MOVL	EAX, key+8t
+	CMPL	inx_userid+8t.B[EBX], EAX
+	JNE	16$.S
+	MOVL	EAX, key+12t
+	CMPL	inx_userid+12t.B[EBX], EAX
+	JE	10$.S
+16$:	LEAL	EDX, inx_nextid.B[EBX]
+	JMP	14$.S
+
+setupkey:
+	CLRL	EAX
+	MOVL	EBX, #key
+	MOVL	[EBX], EAX
+	MOVL	4t.B[EBX], EAX
+	MOVL	8t.B[EBX], EAX
+	MOVL	12t.B[EBX], EAX
+	PUSHL	ECX
+	PUSHL	EDI
+20$:	MOVB	AL, [EDI]		;Copy the key string
+	INCL	EDI
+	CMPB	AL, #'a'		;Force to upper case
+	JB	22$.S
+	ADDB	AL, #'A'-'a'
+22$:	MOVB	[EBX], AL
+	INCL	EBX
+	LOOP	ECX, 20$
+	POPL	EDI
+	POPL	ECX
+	RET
+.PAGE
+;Subroutine to place user name in the user name index
+;	c{ECX} = Length of user name string
+;	c{EDX} = Hash index
+;	c{EDI} = Offset of user name string
+;	c{EBX} = Offset of index block
+;	CALL	indexname
+
+indexname::
+	INCL	idb_usnmcnt[ESI]	     ;Link index block tothe user
+	MOVL	EAX, idb_usnmhash[ESI+EDX*4] ;  name hash list
+	MOVL	[EBX], EAX
+	MOVL	idb_usnmhash[ESI+EDX*4], EBX
+	PUSHL	EBX
+	ADDL	EBX, #inx_usernm.B	;Point to the user name field
+	JMP	6$.S			;Continue
+
+;Subroutine to place user ID in the user ID index
+;	c{ECX} = Length of user name string
+;	c{EDX} = Hash index
+;	c{EDI} = Offset of user name string
+;	c{EBX} = Offset of index block
+;	CALL	indexid
+
+indexid::
+	INCL	idb_usidcnt[ESI]	     ;Link index block to the user ID
+	MOVL	EAX, idb_usidhash[ESI+EDX*4] ;  hash list
+	MOVL	inx_nextid.B[EBX], EAX
+	MOVL	idb_usidhash[ESI+EDX*4], EBX
+	PUSHL	EBX
+	ADDL	EBX, #inx_userid.B	;Point to the user ID field
+6$:	CLRL	EAX			;Clear the name or ID field
+	MOVL	[EBX], EAX
+	MOVL	4t.B[EBX], EAX
+	MOVL	8t.B[EBX], EAX
+	MOVL	12t.B[EBX], EAX
+8$:	MOVB	AL, [EDI]		;Copy the name or ID to the index
+	INCL	EDI			;  block
+	MOVB	[EBX], AL
+	INCL	EBX
+	LOOP	ECX, 8$
+	POPL	EBX
+	RET
+.PAGE
+;Subroutine to force a string to upper case
+;	c{ECX} = Length of string
+;	c{EDI} = Offset of string
+;	CALL	forceupper
+
+forceupper::
+	JREGZ	ECX, 6$
+	PUSHL	EDI
+	PUSHL	ECX
+2$:	CMPB	[EDI], #'a'
+	JB	4$.S
+	ADDB	[EDI], #'A'-'a'
+4$:	INCL	EDI
+	LOOP	ECX, 2$
+	POPL	ECX
+	POPL	EDI
+6$:	RET
+.PAGE
+;Subroutine to get variable length value from a level 1 block in the UDF
+;	c{EDI} = Offset of next byte
+;	CALL	getl1varval
+;	C:set = Abnormal condition
+;	  c(AL) = Condition code:
+;			0 = Normal end of block
+;			1 = End of file
+;			2 = Illegal format (prefix byte followed by illegal
+;				value)
+;	C:clr = Normal
+;	  c{EAX} = Value
+
+getl1varval::
+	CALL	getl1byte
+	JC	4$.S
+	BTZL	EAX, #7t		;Is it an 8-bit value?
+	JNC	4$.S			;Yes
+	MOVL	EDX, EAX
+	SHLL	EDX, #8t
+	CALL	getl1byte
+	JC	4$.S
+	ORL	EAX, EDX
+	BTZL	EAX, #14t		;Is it a 16-bit value?
+	JNC	4$.S			;Yes
+	MOVL	EDX, EAX		;No
+	SHLL	EDX, #8t
+	CALL	getl1byte
+	JC	4$.S
+	ORL	EAX, EDX
+	BTZL	EAX, #21t		;Is it a 24-bit value?
+	JNC	4$.S			;Yes
+	MOVL	EDX, EAX		;No
+	SHLL	EDX, #8t
+	CALL	getl1byte
+	JC	4$.S
+	ORL	EAX, EDX
+	ANDL	EAX, #1FFFFFFFh
+4$:	RET
+.PAGE
+;Subroutine to get byte from a level 1 block
+;	CALL	getl1byte
+;	C:set = Abnormal condition
+;	  c(AL) = Condition code:
+;			0 = Normal end of block
+;			1 = End of file
+;			2 = Illegal format (prefix byte followed by illegal
+;				value)
+;	C:clr = Normal
+;	  c(AL) = Byte value
+
+getl1byte::
+	CALL	getbyte			;Get byte from file
+	JC	14$.S
+	CMPB	AL, #0AAh		;Beginning of record
+	JE	2$.S			;Yes
+	CMPB	AL, #0ABh		;No - prefix byte?
+	JE	6$.S			;Yes
+	CLC
+	RET
+
+;Here if have a beginning of record byte
+
+2$:	DECL	idb_blkpnt[ESI]		;Put the byte back
+	INCL	idb_blkleft[ESI]
+	CLRL	EAX			;Indicate normal end of record
+	STC
+	RET
+
+;Here if have a prefix byte
+
+6$:	CALL	getbyte			;Yes - get it
+	JC	14$.S
+	CMPB	AL, #0AAh		;Beginning of record?
+	JE	2$.S			;Yes
+	DECL	EAX			;No
+	JE	10$.S			;If 1
+	DECL	EAX
+	JE	12$.S			;If 2
+8$:	MOVL	EAX, #2			;Not 1 or 2, indicate illegal format
+	STC
+	RET
+
+;Here if have a prefix byte followed by 1
+
+10$:	MOVB	AL, #0AAh		;Get value
+	CLC
+	RET
+
+;Here if have a prefix byte followed by 2
+
+12$:	MOVB	AL, #0ABh		;Get value
+	CLC
+	RET
+
+;Here if have EOF
+
+14$:	ORL	EAX, EAX
+	JNE	16$.S
+	INCL	EAX
+16$:	STC
+	RET
+.PAGE
+;Subroutine to get variable length value from a level 2 block in the UDF
+;	c{EDI} = Offset of next byte
+;	CALL	getl2varval
+;	C:set = Abnormal condition
+;	  c(AL) = Condition code:
+;			0 = Normal end of block
+;			1 = Early end of block
+;			2 = Illegal format (prefix byte followed by illegal
+;				value)
+;	C:clr = Normal
+;	  c{EAX} = Value
+
+getl2varval::
+	CALL	getl2byte
+	JC	4$.S
+	BTZL	EAX, #7t		;Is it an 8-bit value?
+	JNC	4$.S			;Yes
+	MOVL	EDX, EAX
+	SHLL	EDX, #8t
+	CALL	getl2byte
+	JC	4$.S
+	ORL	EAX, EDX
+	BTZL	EAX, #14t		;Is it a 16-bit value?
+	JNC	4$.S			;Yes
+	MOVL	EDX, EAX		;No
+	SHLL	EDX, #8t
+	CALL	getl2byte
+	JC	4$.S
+	ORL	EAX, EDX
+	BTZL	EAX, #21t		;Is it a 24-bit value?
+	JNC	4$.S			;Yes
+	MOVL	EDX, EAX		;No
+	SHLL	EDX, #8t
+	CALL	getl2byte
+	JC	4$.S
+	ORL	EAX, EDX
+	ANDL	EAX, #1FFFFFFFh
+4$:	RET
+.PAGE
+;Subroutine to get byte from a level 2 block
+;	CALL	getl2byte
+;	C:set = Abnormal condition
+;	  c(AL) = Condition code:
+;			0 = Normal end of block
+;			1 = Early end of block
+;			2 = Illegal format (prefix byte followed by illegal
+;				value)
+;	C:clr = Normal
+;	  c(AL) = Byte value
+;  All registers except EAX are preserved
+
+getl2byte::
+	DECL	idb_lvl2left[ESI]
+	JS	2$.S
+	CALL	getbyte			;Get byte from file
+	JC	16$.S
+	CMPB	AL, #0AAh		;Beginning of record
+	JE	4$.S			;Yes - serious problem!
+	CMPB	AL, #0ABh		;No - prefix byte?
+	JE	8$.S			;Yes
+	CLC
+	RET
+
+;Here if the count ran out
+
+2$:	CLRL	EAX			;Indicate normal end of record
+	STC
+	RET
+
+;Here if have a beginning of record byte
+
+4$:	DECL	idb_blkpnt[ESI]		;Put the byte back
+	INCL	idb_blkleft[ESI]
+	MOVB	AL, #1			;Indicate early end of record
+	STC
+	RET
+
+;Here if have a prefix byte
+
+8$:	CALL	getbyte			;Get next byte
+	JC	16$.S
+	DECL	EAX
+	JE	12$.S			;If 1
+	DECL	EAX
+	JE	14$.S			;If 2
+10$:	MOVL	EAX, #2			;Not 1 or 2, indicate illegal format
+	STC
+	RET
+
+;Here if have a prefix byte followed by 1
+
+12$:	MOVB	AL, #0AAh		;Get value
+	RET
+
+;Here if have a prefix byte followed by 2
+
+14$:	MOVB	AL, #0ABh		;Get value
+	RET
+
+;Here if error indicated by getbyte
+
+16$:	TESTL	EAX, EAX
+	JNE	18$.S
+	INCL	EAX
+18$:	STC
+	RET
+.PAGE
+	.SBTTL	getbyte - Subroutine to get byte from the UDF
+
+;Subroutine to get byte from the UDF
+;	CALL	getbyte
+;	C:clr = Normal
+;	  c{EAX} = Value of byte (0 extended)
+;	C:set = Error
+;	  c{EAX} = Error code (0 = EOF)
+;  All registers except EAX are preserved
+
+getbyte::
+	DECL	idb_blkleft[ESI]	;Anything left in current block?
+	JNS	2$.S			;Yes
+	CMPB	idb_blkeof[ESI], #0	;No - at EOF now?
+	JNE	8$.S			;Yes
+	MOVL	EAX, idb_blkpos[ESI]	;No
+	ADDL	EAX, #512t
+	MOVL	iopos, EAX
+	PUSHL	idb_udfhndl[ESI]	;Read the next 512 bytes
+	PUSHL	DS
+	LEAL	EAX, idb_blkbufr[ESI]
+	PUSHL	EAX
+	PUSHL	#512t
+	PUSHL	DS
+	PUSHL	#ioparms
+	CALLF	svcIoInBlockP##
+	CMPL	EAX, #0.B
+	JLE	4$.S
+	DECL	EAX
+	MOVL	idb_blkleft[ESI], EAX
+	LEAL	EAX, idb_blkbufr[ESI]
+	MOVL	idb_blkpnt[ESI], EAX
+	ADDL	idb_blkpos[ESI], #512t
+2$:	MOVL	EAX, idb_blkpnt[ESI]
+	MOVZBL	EAX, [EAX]
+	INCL	idb_blkpnt[ESI]
+	CLC
+	RET
+
+;Here if error reading from the file
+
+4$:	JE	6$.S			;EOF if not data available
+	CMPL	EAX, #ER_EOF.B		;Real EOF error?
+	JNE	10$.S			;No - just return the error
+6$:	MOVB	idb_blkeof[ESI], #1	;Yes - remember at eof
+8$:	CLRL	EAX
+	MOVL	idb_blkleft[ESI], EAX
+10$:	STC
+	RET
+.PAGE
+;Subroutine to log a text string for debugging
+;	c{EBX} = Offset of initial string
+;	c{EDX} = Offset of final string
+;	CALL	logstr
+
+$$$=!0
+FRM log_fmt    , 4t
+FRM log_size   , 4t
+FRM log_datbfr , 4t
+FRM log_count  , 4t
+FRM log_begin  , 4t
+FRM log_curtime, 8t
+FRM log_hours  , 4t
+FRM log_mins   , 4t
+FRM log_secs   , 4t
+FRM log_buffer , 200t
+log_SIZE=!$$$
+
+lognull::
+	MOVL	EDX, #nullstr
+logstr::PUSHL	ESI
+	ENTER	log_SIZE, 0
+	MOVL	log_fmt.B[EBP], #msgfmt
+	CLRL	EAX
+	MOVL	log_size.B[EBP], EAX
+	PUSHL	EDX
+	JMP	2$.S
+
+;Subroutine to log a message for debugging
+;	c{EBX} = Offset of initial string
+;	c{ECX} = Number of bytes in buffer
+;	c{EDX} = Offset of buffer
+;	CALL	logmsg
+
+logmsg::PUSHL	ESI
+	ENTER	log_SIZE, 0
+	MOVL	log_fmt.B[EBP], #log1fmt
+	MOVL	log_datbfr.B[EBP], EDX
+	MOVL	log_size.B[EBP], ECX
+	PUSHL	ECX
+2$:	PUSHL	idb_instance[ESI]
+	PUSHL	EBX
+	PUSHL	#11t.B
+	PUSHL	DS
+	LEAL	EAX, log_curtime.B[EBP]
+	PUSHL	EAX
+	CALLF	svcSysDateTime##
+	MOVL	EAX, log_curtime.B[EBP]
+	MOVL	ECX, #24t
+	MULL	ECX			;Get hours
+	MOVL	log_hours.B[EBP], EDX
+	SHLL	EBX, #6
+	MOVB	CL, #60t		;Get minutes
+	MULL	ECX
+	MOVL	log_mins.B[EBP], EDX
+	SHLL	EBX, #5
+	MOVB	CL, #60t		;Get seconds
+	MULL	ECX
+	MOVL	log_secs.B[EBP], EDX
+	MOVL	ECX, #1000t		;Get milliseconds
+	MULL	ECX
+	PUSHL	EDX
+	PUSHL	log_secs.B[EBP]
+	PUSHL	log_mins.B[EBP]
+	PUSHL	log_hours.B[EBP]
+	PUSHL	log_fmt.B[EBP]
+	PUSHL	srvDebugStream#
+	CALL	fprintf#
+	ADDL	ESP, #32t.B
+	CMPL	log_size.B[EBP], #0.B	;Have 0 length message?
+	JE	24$			;Yes - finished
+	CMPB	srvDebugLevel#, #2	;Want short form?
+	JA	6$.S			;No
+	CMPL	log_size.B[EBP], #16t.B	;Yes - is message too long?
+	JBE	6$.S			;No
+	MOVL	log_size.B[EBP], #16t	;Yes - only display 16 bytes
+6$:	MOVL	EBX, log_datbfr.B[EBP]	;Point to the buffer
+8$:	MOVL	log_begin.B[EBP], EBX
+	PUSHL	EBX
+	LEAL	ESI, log_buffer[EBP]
+	PUSHL	#strnl
+	PUSHL	ESI
+	CALL	strmov#
+	ADDL	ESP, #8t.B
+	MOVL	ESI, EAX
+	POPL	EBX
+	MOVB	log_count.B[EBP], #0
+10$:	MOVZBL	EAX, [EBX]
+	INCL	EBX
+	PUSHL	EBX
+	PUSHL	EAX
+	PUSHL	#log3fmt
+	PUSHL	ESI
+	CALL	sprintf#
+	ADDL	ESP, #12t.B
+	ADDL	ESI, EAX
+	POPL	EBX
+	INCL	log_count.B[EBP]	;Count the item
+	DECL	log_size.B[EBP]		;More to display?
+	JE	12$.S			;No
+	CMPB	log_count.B[EBP], #16t	;Yes - need new line?
+	JB	10$.S			;No
+12$:	LEAL	ECX, log_buffer+62t[EBP] ;Fill current line with spaces to the
+14$:	CMPL	ESI, ECX		 ;  position for the text part
+	JAE	16$.S
+	MOVB	[ESI], #' '
+	INCL	ESI
+	JMP	14$.S
+
+16$:	MOVL	EBX, log_begin.B[EBP]
+	CLRL	ECX
+18$:	MOVB	AL, [EBX]
+	INCL	EBX
+	CMPB	AL, #' '
+	JB	20$.S
+	CMPB	AL, #0FFh
+	JNE	22$.S
+20$:	MOVB	AL, #'.'
+22$:	MOVB	[ESI], AL
+	INCL	ESI
+	INCL	ECX
+	CMPB	CL, log_count.B[EBP]
+	JB	18$.S
+	MOVW	[ESI], #LF
+	PUSHL	EBX
+	PUSHL	srvDebugStream#
+	LEAL	EAX, log_buffer[EBP]
+	PUSHL	EAX
+	CALL	fputs#
+	ADDL	ESP, #8t.B
+	POPL	EBX
+	CMPL	log_size.B[EBP], #0.B
+	JNE	8$
+24$:	LEAVE
+	POPL	ESI
+	RET
+.PAGE
+	.SBTTL	Data
+
+msgfmt:   .ASCIZ "%2d:%02.2d:%02.2d.%03.3d %-6.6S:%3d %s"{LF}
+log1fmt:  .ASCIZ "%2d:%02.2d:%02.2d.%03.3d %-6.6S:%3d %d bytes"{LF}
+log3fmt:  .ASCIZ " %02.2X"
+strnl:	  .ASCII "            "
+nullstr:  .BYTE	 0
+srvname::
+prgname:: .ASCIZ "UDFSRV"
+qinmsg:	  .ASCIZ "Error queueing UDP input"
+cnomsg:   .ASCIZ "Cannot open RCP device"
+nmfsfmt:  .ASCII "Cannot allocate memory for file specification for "
+	  .ASCIZ "instance %d"
+notudpmsg:.ASCIZ "Device is not a UDP class device"
+
+	.PSECT	_DATA_p
+	.MOD	4
+
+filename: .LONG  0
+instance::.LONG  0
+cmdpntr:: .LONG  0, 0
+instx::	  .LONG  0		;Instance existance bit table
+udphndl:: .LONG  0
+
+firstidb::.LONG  0
+lastidb:: .LONG  firstidb-idb_next
+compidb:: .LONG  0		;Offset of IDB which is doing compression
+billidb:: .LONG  0		;Offset of IDB which is doing billing
+
+group::   .BLKB  20t
+key::	  .BLKB  20t
+udpname:: .BLKB  12t
+udpport:: .LONG  0
+
+	.MOD	4
+udfoparms::
+	.BYTE	PAR$GET+REP_DECV, 4
+	.WORD	IOPAR_LENGTH
+udflen::.LONG	0
+	.BYTE	0
+
+	.MOD	4
+filespec:.BLKB	514t
+
+	.MOD	4
+ioparms::.BYTE	PAR$SET|REP_HEXV, 4
+	 .WORD	IOPAR_ABSPOS
+iopos::	 .LONG	0
+	 .BYTE	0
+
+rspparms::
+	.BYTE	PAR$SET|REP_HEXV, 4
+	.WORD	IOPAR_NETRMTNETAS
+rspipa::.LONG	0
+	.BYTE	PAR$SET|REP_HEXV, 4
+	.WORD	IOPAR_NETRMTPORTS
+rspport::
+	.LONG	0
+	.BYTE	0
+
+	.MOD	4
+
+msgbufr::.BLKB	160t
+
+	.END

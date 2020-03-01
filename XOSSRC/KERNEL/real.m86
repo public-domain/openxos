@@ -1,0 +1,1973 @@
+	.TITLE	REAL - Real mode routines for XOS
+
+;++++
+; This software is in the public domain.  It may be freely copied and used
+; for whatever purpose you see fit, including commerical uses.  Anyone
+; modifying this software may claim ownership of the modifications, but not
+; the complete derived code.  It would be appreciated if the authors were
+; told what this software is being used for, but this is not a requirement.
+
+;   THIS SOFTWARE IS PROVIDED BY THE AUTHORS "AS IS" AND ANY EXPRESS OR
+;   IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
+;   OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+;   IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+;   INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+;   BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS
+;   OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+;   ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR
+;   TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
+;   USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+;----
+
+	.PROC	80486
+	.INCLUD	XOSINC:\XMAC\XOS.PAR
+	.INCLUD	XOSINC:\XMAC\XOSX.PAR
+	.INCLUD	XOSINC:\XMAC\XOSDOS.PAR
+	.INCLUD	XOSINC:\XMAC\XOSERR.PAR
+	.INCLUD	XOSINC:\XMAC\XOSXTRM.PAR
+
+	.SBTTL	initvmd - Real mode once-only initialization routine
+
+;Real mode once-only initializataion routine
+
+	INITSUB	initrm
+	
+initrm:	MOVL	ESI, #rmootbl		;Point to the table
+	MOVL	ECX, #RMOOSIZE		;Get number of entires
+4$:	MOVL	EBX, CS:[ESI]		;Get offset of routine
+	MOVZBL	EAX, CS:4.B[ESI]	;Get vector number
+	PUSHL	ESI
+	PUSHL	ECX
+	CLRL	ECX			;Use standard real mode routine
+	CALL	knlNewRealInt		;Set up the vector
+	POPL	ECX
+	POPL	ESI
+	ADDL	ESI, #5.B		;Bump pointer
+	LOOP	ECX, 4$			;Continue if more to do
+	JMP	initdos#		;Initialize DOS specific stuff
+
+;Table of real mode interrupt routines to set up at once-only time
+
+	.MACRO	OOTBL  routine, vector
+	.LONG	routine
+	.BYTE	vector
+	.ENDM
+
+rmootbl:OOTBL rmintdone, 02h	;Non-maskable hardware interrupt
+	OOTBL rmtmrdone, 08h	;Timer hardware interrupt
+	OOTBL rmkeyint , 09h	;Keyboard data ready hardware interrupt
+	OOTBL rintv10# , 10h	;BIOS call - video functions
+	OOTBL rintv11# , 11h	;BIOS call - equipment determination
+	OOTBL rintv12# , 12h	;BIOS call - memory size determination
+	OOTBL rintv13# , 13h	;BIOS call - floppy/hard disk functions
+	OOTBL rintv14# , 14h	;BIOS call - serial communication functions
+	OOTBL rintv15# , 15h	;BIOS call - system service functions
+	OOTBL rintv16# , 16h	;BIOS call - keyboard functions
+	OOTBL rintv17# , 17h	;BIOS call - parallel printer functions
+	OOTBL rintv1A# , 1Ah	;BIOS call - system timer functions
+	OOTBL rmintdone, 1Ch	;System timer user tick routine
+	OOTBL rintv20# , 20h	;DOS program terminate
+	OOTBL rintv21# , 21h	;DOS function call
+	OOTBL rintv25# , 25h	;DOS read absolute disk sectors
+	OOTBL rintv26# , 26h	;DOS write absolute disk sectors
+	OOTBL rintv27# , 27h	;DOS terminate and stay resident
+	OOTBL rintv28# , 28h	;DOS keyboard busy loop
+	OOTBL rintv29# , 29h	;DOS fast putchar
+	OOTBL rintv2A# , 2Ah	;DOS Microsoft/Lantastic network installation
+				;  check
+	OOTBL rintv2F# , 2Fh	;DOS multiplex functions
+	OOTBL rintv33# , 33h	;DOS MS mouse functions
+RMOOSIZE=!{$-rmootbl}/5
+
+	CODE
+.PAGE
+	.SBTTL	knlNewRealInt - Subroutine to register real mode interrupt routine
+
+;Subroutine to register new real mode interrupt routine - must be called with
+;  the exec memory resource
+;	c{EAX}    = Vector number (bit 31 set if should put at end of chain)
+;	c{EBX}    = Offset of routine
+;	c{ECX}    = Number of bytes for real mode routine (0 for standard 4
+;		      byte routine)
+;	c{ES:EDX} = Address of data for real mode
+;	CALL	knlNewRealInt
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;  Any number of routines can be chained on each real mode interrupt, but only
+;    one routine for each interrupt can use a non-standard real mode routine
+;    - attempting to add a second routine with a non-standard real mode
+;    routine will fail with an ER_ALDEF (already defined) error
+;  This routine constructs two data blocks.  The first is 8 bytes long and is
+;    refered to as the "interrupt routine block".  It is linked to a chain of
+;    such blocks for each possible real mode interrupt.  The head pointer for
+;    each list is the entry in the vinttbl table for the interrupt.  The
+;    format of the block is:
+;	Offset    Size           Use
+;	   0        4    Offset of next block for interrupt
+;	   4        4    Offset (in code space) of routine to call for interrupt
+;  The second block is 6 or more bytes long and is refered to as the "interrupt
+;    set up block".  These blocks are linked into a single list with rmintset
+;    as the head pointer.  These blocks are used to set up a new real mode
+;    segment.  The format of each is:
+;	Offset    Size           Use
+;	   0        4    Offset of next block for interrupt
+;	   4        1    Vector number
+;	   5        1    Number of data bytes which follow
+;	   6        n    Data to load as real mode routine for interrupt
+;    If 0 data bytes are specified, a standard 4 byte routine is used:
+;	HLT
+;	HLT
+;	.WORD	intnumber
+;    If -1 data bytes are specified, a standard null routine is used:
+;	IRETW
+
+$$$=!0
+FRM nvi_vector , 4	;Vector number
+FRM nvi_rmspcr , 8	;Address of real mode routine
+FRM nvi_rmsize , 4	;Size of real mode routine
+FRM nvi_subprv , 4	;Pointer to previous set up block
+FRM nvi_subthis, 4	;Pointer to this set up block
+FRM nvi_code   , 4	;Offset of code for interrupt
+nvi_SIZE=!$$$
+
+knlNewRealInt::
+	ENTER	nvi_SIZE, 0		;Set up our stack frame
+	MOVL	nvi_vector.B[EBP], EAX	;Store arguments
+	MOVL	nvi_rmspcr+0.B[EBP], EDX
+	MOVL	nvi_rmspcr+4.B[EBP], ES
+	MOVL	nvi_rmsize.B[EBP], ECX
+	MOVL	nvi_code.B[EBP], EBX
+	MOVL	ESI, #rmintset		;Find possible existing set up block for
+2$:	MOVL	EDI, [ESI]		;  this interrupt
+	TESTL	EDI, EDI
+	JE	4$.S
+	CMPB	4.B[EDI], AL		;For this interrupt?
+	JE	4$.S			;Yes
+	MOVL	ESI, EDI		;No - go on
+	JMP	2$.S
+
+4$:	TESTL	ECX, ECX		;Need non-standard real mode routine?
+	JLE	12$.S			;No
+	TESTL	EDI, EDI		;Yes - already have a set up block?
+	JE	13$.S			;No - OK
+	CMPB	5.B[EDI], #0		;Yes - is it non-standard?
+	JNE	8$.S			;Yes - fail!
+	JMP	16$.S			;OK
+
+;Here if trying to set up a non-standard real mode routine and already have
+;  one for the vector
+
+8$:	MOVL	EAX, #ER_ALDEF
+10$:	LEAVE
+	STC
+	RET
+
+;Here if don't need non-standard real mode routine
+
+12$:	TESTL	EDI, EDI		;Already have a set up block?
+	JNE	14$.S			;Yes
+13$:	ADDL	ECX, #14t.B		;No - we must make a minimum block
+	JMP	16$.S
+
+;Here if already have a set up block
+
+14$:	CLRL	ESI			;Indicate don't need set up block
+	ADDL	ECX, #8.B		;Add space for routine block
+16$:	MOVL	nvi_subprv.B[EBP], ESI
+	MOVL	nvi_subthis.B[EBP], EDI
+	CALL	knlGetXMem#
+	JC	10$.S			;If error
+	PUSHL	DS			;OK - set up to store into the space
+	POPL	ES			;  we just allocated
+	CLD
+	MOVL	EAX, nvi_vector.B[EBP]
+	BTZL	EAX, #31t		;Want to link to end of chain?
+	LEAL	EDX, vinttbl[EAX*4]
+	JNC	20$.S			;No
+18$:	MOVL	EAX, [EDX]		;Yes - find end of chain
+	TESTL	EAX, EAX
+	JE	22$.S
+	MOVL	EDX, EAX
+	JMP	18$.S
+
+;Here to link to beginning of chain
+
+20$:	MOVL	EAX, [EDX]
+22$:	MOVL	[EDX], EDI
+	STOSL	[EDI]
+	MOVL	EAX, nvi_code.B[EBP]
+	STOSL	[EDI]
+	MOVL	ESI, nvi_subprv.B[EBP]
+	TESTL	ESI, ESI		;Do we need a new set up block?
+	JE	28$.S			;No
+	MOVL	EBX, nvi_subthis.B[EBP]	;Yes
+	TESTL	EBX, EBX		;Do we have an existing block?
+	JE	24$.S			;No
+	MOVL	EAX, [EBX]		;Yes - replace it
+	JMP	26$.S
+
+;Here if do not have an existing set up block
+
+24$:	MOVL	EAX, [ESI]		;Link in the new block
+26$:	MOVL	[ESI], EDI
+	STOSL	[EDI]
+	MOVL	ECX, nvi_rmsize.B[EBP]	;Get size of real mode routine
+	MOVB	AL, nvi_vector.B[EBP]	;Get vector number
+	MOVB	AH, CL
+	STOSW	[EDI]			;Store vector number and size
+	TESTL	ECX, ECX		;Need a non-standard real mode routine?
+	JLE	28$.S			;No
+	LFSL	ESI, nvi_rmspcr.B[EBP]	;Yes - copy it to the set up block
+	RMOVSB	[EDI], FS:[ESI]
+28$:	LEAVE
+	RET				;Finished
+.PAGE
+	.SBTTL	voptbl - Real mode protection error dispatch table
+
+;Real mode protection error dispatch table - index is by opcode byte of
+;  instruction which caused the protection error
+
+	DATA
+
+	.MACRO	dindex x, n
+x=!$$$
+$$$=!$$$+4
+	.LONG	n
+	.ENDM
+$$$=!0
+
+voptbld::
+	DINDEX	RMFPE  , knlRealFPErr#	;Instructions which give real mode
+					;  protection error
+	DINDEX	V2BYTE , v2byte 	;2-byte instruction
+	DINDEX	VDATSZ , vdatsz		;Data size prefix
+	DINDEX	VADRSZ , vadrsz		;Address size prefix
+	DINDEX	VINSB  , vinsb		;INSB
+	DINDEX	VINS   , vins		;INSW and INSL
+	DINDEX	VOUTSB , voutsb		;OUTSB
+	DINDEX	VOUTS  , vouts		;OUTSW and OUTSL
+	DINDEX	VPUSHF , vpushf		;PUSHF
+	DINDEX	VPOPF  , vpopf		;POPF
+	DINDEX	VINT   , vint		;INT
+	DINDEX	VIRET  , viret		;IRET
+	DINDEX	VINPB  , vinpb		;INB port
+	DINDEX	VINP   , vinp		;INW port and INL port
+	DINDEX	VOUTPB , voutpb		;OUTB port
+	DINDEX	VOUTP  , voutp		;OUTW port and OUTL port
+	DINDEX	VINDXB , vindxb		;INB [DX]
+	DINDEX	VINDX  , vindx		;INW [DX] and INL [DX]
+	DINDEX	VOUTDXB, voutdxb	;OUTB [DX]
+	DINDEX	VOUTDX , voutdx		;OUTW [DX] and OUTL [DX]
+	DINDEX	VLOCK  , vlock		;LOCK
+	DINDEX	VCALL  , vcall		;HLT HLT arg
+	DINDEX	VCLI   , vcli		;CLI
+	DINDEX	VSTI   , vsti		;STI
+
+voptblx::
+	.BYTE	RMFPE		; 00 - ADD
+	.BYTE	RMFPE		; 01 - ADD
+	.BYTE	RMFPE		; 02 - ADD
+	.BYTE	RMFPE		; 03 - ADD
+	.BYTE	RMFPE		; 04 - ADD
+	.BYTE	RMFPE		; 05 - ADD
+	.BYTE	RMFPE		; 06 - PUSH ES
+	.BYTE	RMFPE		; 07 - POP ES
+	.BYTE	RMFPE		; 08 - OR
+	.BYTE	RMFPE		; 09 - OR
+	.BYTE	RMFPE		; 0A - OR
+	.BYTE	RMFPE		; 0B - OR
+	.BYTE	RMFPE		; 0C - OR
+	.BYTE	RMFPE		; 0D - OR
+	.BYTE	RMFPE		; 0E - PUSH CS
+	.BYTE	V2BYTE		; 0F - 2-byte escape
+	.BYTE	RMFPE		; 10 - ADC
+	.BYTE	RMFPE		; 11 - ADC
+	.BYTE	RMFPE		; 12 - ADC
+	.BYTE	RMFPE		; 13 - ADC
+	.BYTE	RMFPE		; 14 - ADC
+	.BYTE	RMFPE		; 15 - ADC
+	.BYTE	RMFPE		; 16 - PUSH SS
+	.BYTE	RMFPE		; 17 - POP SS
+	.BYTE	RMFPE		; 18 - SBB
+	.BYTE	RMFPE		; 19 - SBB
+	.BYTE	RMFPE		; 1A - SBB
+	.BYTE	RMFPE		; 1B - SBB
+	.BYTE	RMFPE		; 1C - SBB
+	.BYTE	RMFPE		; 1D - SBB
+	.BYTE	RMFPE		; 1E - PUSH DS
+	.BYTE	RMFPE		; 1F - POP DS
+	.BYTE	RMFPE		; 20 - AND
+	.BYTE	RMFPE		; 21 - AND
+	.BYTE	RMFPE		; 22 - AND
+	.BYTE	RMFPE		; 23 - AND
+	.BYTE	RMFPE		; 24 - AND
+	.BYTE	RMFPE		; 25 - AND
+	.BYTE	RMFPE		; 26 - ES prefix
+	.BYTE	RMFPE		; 27 - DAA
+	.BYTE	RMFPE		; 28 - SUB
+	.BYTE	RMFPE		; 29 - SUB
+	.BYTE	RMFPE		; 2A - SUB
+	.BYTE	RMFPE		; 2B - SUB
+	.BYTE	RMFPE		; 2C - SUB
+	.BYTE	RMFPE		; 2D - SUB
+	.BYTE	RMFPE		; 2E - CS prefix
+	.BYTE	RMFPE		; 2F - DAS
+	.BYTE	RMFPE		; 30 - XOR
+	.BYTE	RMFPE		; 31 - XOR
+	.BYTE	RMFPE		; 32 - XOR
+	.BYTE	RMFPE		; 33 - XOR
+	.BYTE	RMFPE		; 34 - XOR
+	.BYTE	RMFPE		; 35 - XOR
+	.BYTE	RMFPE		; 36 - SS prefix
+	.BYTE	RMFPE		; 37 - AAA
+	.BYTE	RMFPE		; 38 - CMP
+	.BYTE	RMFPE		; 39 - CMP
+	.BYTE	RMFPE		; 3A - CMP
+	.BYTE	RMFPE		; 3B - CMP
+	.BYTE	RMFPE		; 3C - CMP
+	.BYTE	RMFPE		; 3D - CMP
+	.BYTE	RMFPE		; 3E - DS prefix
+	.BYTE	RMFPE		; 3F - AAS
+	.BYTE	RMFPE		; 40 - INC
+	.BYTE	RMFPE		; 41 - INC
+	.BYTE	RMFPE		; 42 - INC
+	.BYTE	RMFPE		; 43 - INC
+	.BYTE	RMFPE		; 44 - INC
+	.BYTE	RMFPE		; 45 - INC
+	.BYTE	RMFPE		; 46 - INC
+	.BYTE	RMFPE		; 47 - INC
+	.BYTE	RMFPE		; 48 - DEC
+	.BYTE	RMFPE		; 49 - DEC
+	.BYTE	RMFPE		; 4A - DEC
+	.BYTE	RMFPE		; 4B - DEC
+	.BYTE	RMFPE		; 4C - DEC
+	.BYTE	RMFPE		; 4D - DEC
+	.BYTE	RMFPE		; 4E - DEC
+	.BYTE	RMFPE		; 4F - DEC
+	.BYTE	RMFPE		; 50 - PUSH
+	.BYTE	RMFPE		; 51 - PUSH
+	.BYTE	RMFPE		; 52 - PUSH
+	.BYTE	RMFPE		; 53 - PUSH
+	.BYTE	RMFPE		; 54 - PUSH
+	.BYTE	RMFPE		; 55 - PUSH
+	.BYTE	RMFPE		; 56 - PUSH
+	.BYTE	RMFPE		; 57 - PUSH
+	.BYTE	RMFPE		; 58 - POP
+	.BYTE	RMFPE		; 59 - POP
+	.BYTE	RMFPE		; 5A - POP
+	.BYTE	RMFPE		; 5B - POP
+	.BYTE	RMFPE		; 5C - POP
+	.BYTE	RMFPE		; 5D - POP
+	.BYTE	RMFPE		; 5E - POP
+	.BYTE	RMFPE		; 5F - POP
+	.BYTE	RMFPE		; 60 - PUSHA
+	.BYTE	RMFPE		; 61 - POPA
+	.BYTE	RMFPE		; 62 - BOUND
+	.BYTE	RMFPE		; 63 - ARPL
+	.BYTE	RMFPE		; 64 - FS prefix
+	.BYTE	RMFPE		; 65 - GS prefix
+	.BYTE	VDATSZ		; 66 - Operand size prefix
+	.BYTE	VADRSZ		; 67 - Address size prefix
+	.BYTE	RMFPE		; 68 - PUSH #
+	.BYTE	RMFPE		; 69 - IMUL
+	.BYTE	RMFPE		; 6A - PUSH
+	.BYTE	RMFPE		; 6B - IMUL
+	.BYTE	VINSB		; 6C - INSB
+	.BYTE	VINS		; 6D - INSW/L
+	.BYTE	VOUTSB		; 6E - OUTSB
+	.BYTE	VOUTS		; 6F - OUTSW/L
+	.BYTE	RMFPE		; 70 - JO
+	.BYTE	RMFPE		; 71 - JNO
+	.BYTE	RMFPE		; 72 - JB
+	.BYTE	RMFPE		; 73 - JNB
+	.BYTE	RMFPE		; 74 - JZ
+	.BYTE	RMFPE		; 75 - JNZ
+	.BYTE	RMFPE		; 76 - JBE
+	.BYTE	RMFPE		; 77 - JA
+	.BYTE	RMFPE		; 78 - JS
+	.BYTE	RMFPE		; 79 - JNS
+	.BYTE	RMFPE		; 7A - JP
+	.BYTE	RMFPE		; 7B - JNP
+	.BYTE	RMFPE		; 7C - JL
+	.BYTE	RMFPE		; 7D - JGE
+	.BYTE	RMFPE		; 7E - JLE
+	.BYTE	RMFPE		; 7F - JG
+	.BYTE	RMFPE		; 80 - Immediate group
+	.BYTE	RMFPE		; 81 - Immediate group
+	.BYTE	RMFPE		; 82 - Illegal
+	.BYTE	RMFPE		; 83 - Group
+	.BYTE	RMFPE		; 84 - TEST
+	.BYTE	RMFPE		; 85 - TEST
+	.BYTE	RMFPE		; 86 - XCHG
+	.BYTE	RMFPE		; 87 - XCHG
+	.BYTE	RMFPE		; 88 - MOV
+	.BYTE	RMFPE		; 89 - MOV
+	.BYTE	RMFPE		; 8A - MOV
+	.BYTE	RMFPE		; 8B - MOV
+	.BYTE	RMFPE		; 8C - MOV
+	.BYTE	RMFPE		; 8D - LEA
+	.BYTE	RMFPE		; 8E - MOV
+	.BYTE	RMFPE		; 8F - POP
+	.BYTE	RMFPE		; 90 - NOP
+	.BYTE	RMFPE		; 91 - XCHG
+	.BYTE	RMFPE		; 92 - XCHG
+	.BYTE	RMFPE		; 93 - XCHG
+	.BYTE	RMFPE		; 94 - XCHG
+	.BYTE	RMFPE		; 95 - XCHG
+	.BYTE	RMFPE		; 96 - XCHG
+	.BYTE	RMFPE		; 97 - XCHG
+	.BYTE	RMFPE		; 98 - CBW
+	.BYTE	RMFPE		; 99 - CWL
+	.BYTE	RMFPE		; 9A - CALL
+	.BYTE	RMFPE		; 9B - WAIT
+	.BYTE	VPUSHF		; 9C - PUSHF
+	.BYTE	VPOPF		; 9D - POPF
+	.BYTE	RMFPE		; 9E - SAHF
+	.BYTE	RMFPE		; 9F - LAHF
+	.BYTE	RMFPE		; A0 - MOV
+	.BYTE	RMFPE		; A1 - MOV
+	.BYTE	RMFPE		; A2 - MOV
+	.BYTE	RMFPE		; A3 - MOV
+	.BYTE	RMFPE		; A4 - MOVSB
+	.BYTE	RMFPE		; A5 - MOVSW/L
+	.BYTE	RMFPE		; A6 - CMPSB
+	.BYTE	RMFPE		; A7 - CMPSW/L
+	.BYTE	RMFPE		; A8 - TEST
+	.BYTE	RMFPE		; A9 - TEST
+	.BYTE	RMFPE		; AA - STOSB
+	.BYTE	RMFPE		; AB - STOSW/L
+	.BYTE	RMFPE		; AC - LODSB
+	.BYTE	RMFPE		; AD - LODSW/L
+	.BYTE	RMFPE		; AE - SCASB
+	.BYTE	RMFPE		; AF - SCASW/L
+	.BYTE	RMFPE		; B0 - MOV
+	.BYTE	RMFPE		; B1 - MOV
+	.BYTE	RMFPE		; B2 - MOV
+	.BYTE	RMFPE		; B3 - MOV
+	.BYTE	RMFPE		; B4 - MOV
+	.BYTE	RMFPE		; B5 - MOV
+	.BYTE	RMFPE		; B6 - MOV
+	.BYTE	RMFPE		; B7 - MOV
+	.BYTE	RMFPE		; B8 - MOV
+	.BYTE	RMFPE		; B9 - MOV
+	.BYTE	RMFPE		; BA - MOV
+	.BYTE	RMFPE		; BB - MOV
+	.BYTE	RMFPE		; BC - MOV
+	.BYTE	RMFPE		; BD - MOV
+	.BYTE	RMFPE		; BE - MOV
+	.BYTE	RMFPE		; BF - MOV
+	.BYTE	RMFPE		; C0 - Shift group
+	.BYTE	RMFPE		; C1 - Shift group
+	.BYTE	RMFPE		; C2 - RET
+	.BYTE	RMFPE		; C3 - RET
+	.BYTE	RMFPE		; C4 - LES
+	.BYTE	RMFPE		; C5 - LDS
+	.BYTE	RMFPE		; C6 - MOV
+	.BYTE	RMFPE		; C7 - MOV
+	.BYTE	RMFPE		; C8 - ENTER
+	.BYTE	RMFPE		; C9 - LEAVE
+	.BYTE	RMFPE		; CA - RETF
+	.BYTE	RMFPE		; CB - RETF
+	.BYTE	RMFPE		; CC - INT3
+	.BYTE	VINT		; CD - INT
+	.BYTE	RMFPE		; CE - INTO
+	.BYTE	VIRET		; CF - IRET
+	.BYTE	RMFPE		; D0 - Shift group
+	.BYTE	RMFPE		; D1 - Shift group
+	.BYTE	RMFPE		; D2 - Shift group
+	.BYTE	RMFPE		; D3 - Shift group
+	.BYTE	RMFPE		; D4 - AAM
+	.BYTE	RMFPE		; D5 - AAD
+	.BYTE	RMFPE		; D6 - Illegal
+	.BYTE	RMFPE		; D7 - XLAT
+	.BYTE	RMFPE		; D8 - ESC
+	.BYTE	RMFPE		; D9 - ESC
+	.BYTE	RMFPE		; DA - ESC
+	.BYTE	RMFPE		; DB - ESC
+	.BYTE	RMFPE		; DC - ESC
+	.BYTE	RMFPE		; DD - ESC
+	.BYTE	RMFPE		; DE - ESC
+	.BYTE	RMFPE		; DF - ESC
+	.BYTE	RMFPE		; E0 - LOOPNE
+	.BYTE	RMFPE		; E1 - LOOPE
+	.BYTE	RMFPE		; E2 - LOOP
+	.BYTE	RMFPE		; E3 - JCXZ
+	.BYTE	VINPB		; E4 - INB port
+	.BYTE	VINP		; E5 - INW/L port
+	.BYTE	VOUTPB		; E6 - OUTB port
+	.BYTE	VOUTP		; E7 - OUTW/L port
+	.BYTE	RMFPE		; E8 - CALL
+	.BYTE	RMFPE		; E9 - JMP
+	.BYTE	RMFPE		; EA - JMP
+	.BYTE	RMFPE		; EB - JMP
+	.BYTE	VINDXB		; EC - INB [DX]
+	.BYTE	VINDX		; ED - INW/L [DX]
+	.BYTE	VOUTDXB		; EE - OUTB [DX]
+	.BYTE	VOUTDX		; EF - OUTW/L [DX]
+	.BYTE	VLOCK		; F0 - LOCK
+	.BYTE	RMFPE		; F1 - Illegal
+	.BYTE	RMFPE		; F2 - REPNE
+	.BYTE	RMFPE		; F3 - REP/REPE
+	.BYTE	VCALL		; F4 - HLT
+	.BYTE	RMFPE		; F5 - CMC
+	.BYTE	RMFPE		; F6 - Unary group
+	.BYTE	RMFPE		; F7 - Unary group
+	.BYTE	RMFPE		; F8 - CLC
+	.BYTE	RMFPE		; F9 - STC
+	.BYTE	VCLI		; FA - CLI
+	.BYTE	VSTI		; FB - STI
+	.BYTE	RMFPE		; FC - CLD
+	.BYTE	RMFPE		; FD - STD
+	.BYTE	RMFPE		; FE - INC/DEC
+	.BYTE	RMFPE		; FF - Indirect group
+
+	CODE
+
+vlock:	JMP	knlTrapDone#
+.PAGE
+;Here on HLT instruction from real mode - this instruction is used as the entry
+;  to Allegor.  It must always be followed by another HLT instruction (this is
+;  so a real HLT instruction in a program will not normally be taken as an
+;  XOS entry).  The word following the two HLT instructions contains a function
+;  code as follows:
+;	  0h - 0FFh = DOS INT entries (code is INT number)
+;	100h - 1FFh = DOS INT redo entries (code is INT number + 100h)
+;	200h - 2FFh = Reserved
+;	300h - 3FFh = XOS supervisor call
+
+vcall:	IFFAULT	knlRealFPErr#
+	CMPB	GS:1.B[ESI], #0F4h	;Next byte must be HLT also!
+	JNE	knlRealFPErr#
+	MOVZWL	EAX, GS:2.B[ESI]	;Get function number
+	CMPL	EAX, #300h		;Is this a protected mode entry?
+	JA	rmsvc#			;Yes - go handle that
+	CMPL	EAX, #200h
+	JAE	knlRealFPErr#
+	CMPL	EAX, #100h		;No - is this a real mode INT re-do
+					;  entry?
+	JAE	vintredo		;Yes - go handle that
+
+;Here for DOS entires - these can only occur when a program jumps to the
+;  address which one of the real mode vectors points to.  This is normally
+;  done when the real mode program has intercepted an interrupt and has decided
+;  to let the normal interrupt routine handle it.  Some programs do this
+;  instead of executing an INT instruction (usually when the INT number is
+;  passed as a parameter - since the number must be in the code segment, it
+;  sometimes seems better to simply use it as an index and pick up the vector.
+
+	MOVZWL	EDX, SS:pdaURegESP#	;The user must have jumped directly to
+	MOVZWL	ECX, SS:pdaURegSS#	;  the address pointed to by the user's
+	SHLL	ECX, #4			;  vector - get user's stack pointer
+	ADDL	ECX, EDX
+	IFFCALL	badusrstk#
+	MOVZWL	EBX, GS:[ECX]		;Copy return address from the user's
+	MOVL	SS:pdaURegEIP#, EBX	;  stack to our exec stack
+	IFFCALL	badusrstk#
+	MOVW	BX, GS:2.B[ECX]
+	MOVL	SS:pdaURegCS#, EBX
+	IFFCALL	badusrstk#
+	MOVW	BX, GS:4.B[ECX]		;Also copy his EFR value
+	ORB	BH, #02h
+	ANDB	BH, #0Fh
+	MOVW	SS:pdaURegEFR#, BX
+	ADDL	SS:pdaURegESP#, #6.B	;Adjust his stack pointer
+	JMP	8$.S
+
+;Here on INT instruction from real mode
+
+	IFFAULT	knlRealFPErr#
+vint:	CMPB	SS:pdaRealIO#, #0
+	JNE	4$.S
+	ANDB	SS:pdaURegEFR#+1, #~02h	;Assume interrupts disabled
+	TESTB	SS:pdaSigLvl#, #04h	;Right?
+	JNE	4$.S			;Yes
+	ORB	SS:pdaURegEFR#+1, #02h	;No - they are enabled
+4$:	MOVZBL	EAX, GS:1.B[ESI]	;Get vector number
+	IFFAULT	knlRealFPErr#
+	MOVZWL	EBX, GS:2[EAX*4]	;Get selector part of vector
+	CMPL	EBX, #100h		;Does the user want this one?
+	JAE	16$.S			;Yes
+	CMPL	EBX, #7Fh		;Maybe
+	JBE	16$.S			;Yes
+	ADDL	48t.B[ESP], #2.B	;No - bump user EIP to next byte
+	MOVZWL	EAX, GS:0[EAX*4]	;Get offset part of vector
+	SHLL	EBX, #4			;Calculate real mode segment offset
+	ADDL	EBX, EAX		;Get actual vector number - need to do
+	IFFAULT	knlRealFPErr#		;  this in case the user program has
+	MOVZBL	EAX, GS:-2.B[EBX]	;  "redirected" the interrupt
+8$:	MOVB	SS:pdaURegEAX#+3, #0	;Indicate not continuation
+vint2:	MOVL	EBX, vinttbl[EAX*4]	;Get offset of first block
+	TESTL	EBX, EBX		;Do we have at least one routine?
+	JE	12$.S			;No - fail
+10$:	PUSHL	EBX			;Yes - call the routine
+	CALLI	4.B[EBX]
+	POPL	EBX
+	JNC	14$.S			;If normal return
+	MOVL	EBX, [EBX]		;Get next block
+	TESTL	EBX, EBX
+	JNE	10$.S			;Continue if have another one
+12$:	JMP	vbadint			;No more - fail
+
+;Here when finished with the INT
+
+14$:	ANDB	SS:pdaSigLvl#, #~04h	;Assume interrupts should be enabled
+	TESTB	SS:pdaURegEFR#+1, #02	;Right?
+	JNE	20$			;Yes
+	ORB	SS:pdaSigLvl#, #04h	;No - disable them
+	JMP	20$
+
+;Here if real mode program wants to handle an INT
+
+16$:	CMPL	GS:0[EAX*4], #0.B	;Is it initialized
+	JE	vbadint2		;No - fail
+	MOVZWL	EDX, SS:pdaURegESP#	;Yes - get user's stack pointer
+	MOVZWL	ECX, SS:pdaURegSS#
+	SHLL	ECX, #4
+	ADDL	ECX, EDX
+	MOVL	EBX, SS:pdaURegEIP#	;Put return address on the user stack
+	ADDL	EBX, #2.B
+	IFFCALL	badusrstk#
+	MOVW	GS:-6.B[ECX], BX
+	MOVL	EBX, SS:pdaURegCS#
+	IFFCALL	badusrstk#
+	MOVW	GS:-4.B[ECX], BX
+	MOVL	EBX, SS:pdaURegEFR#
+	IFFCALL	badusrstk#
+	MOVW	GS:-2.B[ECX], BX
+	SUBL	SS:pdaURegESP#, #6.B	
+	IFFAULT	knlRealFPErr#
+	MOVZWL	EBX, GS:0[EAX*4]	;Get offset part of address
+	IFFAULT	knlRealFPErr#
+	MOVZWL	EAX, GS:2[EAX*4]	;Get segment part of address
+	MOVL	SS:pdaURegEIP#, EBX
+	MOVL	SS:pdaURegCS#, EAX
+20$:	ANDB	SS:pdaURegEFR#+1, #0Eh
+	CMPB	SS:pdaRealIO#, #0
+	JNE	22$.S
+	ORB	SS:pdaURegEFR#+1, #02h
+22$:	MOVW	SS:pdaURegEFR#+2, #0002h
+	JMP	knlTrapDone#
+.PAGE
+	.SBTTL	vintredo - Here for a real mode INT re-do entry
+
+;Here for a real mode INT re-do entry - indexes in the range of 100-1FF
+;  indicate main program continuation and in the range of 200-2FF indicate
+;  queued IO continuation
+
+vintredo:
+	MOVB	SS:pdaURegEAX#+3, AH	;Store indication
+	MOVZBL	EAX, AL
+	MOVZWL	ECX, SS:pdaURegESP#	;Get user's stack pointer
+	MOVZWL	EDX, SS:pdaURegSS#
+	SHLL	EDX, #4
+	ADDL	EDX, ECX
+	IFFAULT	knlRealFPErr#		;Copy user's return address to our
+	MOVZWL	ECX, GS:[EDX]		;  stack (discard the call address
+	MOVL	SS:pdaURegEIP#, ECX	;  and ignore the user's FR value)
+	IFFAULT	knlRealFPErr#
+	MOVZWL	ECX, GS:2.B[EDX]
+	MOVL	SS:pdaURegCS#, ECX
+	ADDL	SS:pdaURegESP#, #6.B	;Adjust user's stack pointer
+	JMP	vint2
+.PAGE
+;Here on illegal real mode INT
+
+vbadint:SUBL	48t.B[ESP], #2.B	;Point to the bad INT
+vbadint2:
+	ANDB	SS:pdaURegEFR#+1, #0Eh
+	ORB	SS:pdaURegEFR#+1, #02h
+	MOVW	SS:pdaURegEFR#+2, #0002h
+	MOVL	ECX, SS:pdaURegEAX#	;Get AL and AH
+	SHLL	ECX, #16t		; in high order word of ECX
+	MOVB	CL, #0CDh		;Indicate INT instruction
+	MOVB	CH, GS:1.B[ESI]		;Get vector number !!!!!!!
+	CALL	knlUnimOp#		;Go kill process
+
+;Here on address size prefix from real mode
+
+vadrsz:	XORB	useradrsz#, #6
+	JMP	4$.S
+
+;Here on data size prefix from real mode
+
+vdatsz:	XORB	userdatsz#, #6
+4$:	INCL	ESI
+	INCL	SS:pdaURegEIP#
+	JMP	rmgetop#
+.PAGE
+;Here on first byte of a two byte instruction
+
+	IFFAULT	knlRealFPErr#
+v2byte:	MOVB	AL, GS:1.B[ESI]		;Get next byte
+	CMPB	AL, #06h		;CLTS instruction?
+	JE	vclts.S			;Yes
+	CMPB	AL, #20h		;MOV xxx,CR0 instruction?
+	JE	vmovcr0.S		;Yes
+4$:	JMP	knlRealFPErr#		;No - fail
+
+;Here for CLTS instruction
+
+vclts:	ADDL	48t.B[ESP], #2t.B	;Bump user's EIP past instruction
+	JMP	knlTrapDone#		;Thats all
+
+;Here for MOV xxx,CR0 instruction
+
+	IFFAULT	knlRealFPErr#
+vmovcr0:MOVZBL	EAX, GS:2.B[ESI]	;Get 3rd byte
+	TESTL	EAX, #34h.B		;Does he want CR0?
+	JNE	4$.S			;No - fail!
+	ANDL	EAX, #07h.B		;Yes - get his register number
+	NEGL	EAX
+	MOVL	ECX, CR0		;Get the CR0 value
+	MOVL	SS:pdaURegEAX#[EAX*4], ECX ;Give it to him
+	JMP	knlTrapDone#		;Thats all
+.PAGE
+;Here when the timer interrupt (08) routine is executed by a DOS program - we
+;  must check to see if he also wants to handle the 1C interrupt (the BIOS 08
+;  routine normally executes an INT 1Ch) - if he has set the 1C vector we
+;  fake executing an INT 1Ch (if the 1C vector only is set (08 not set), the
+;  1C interrupt is granted directly by the code in SCHED1 - this code is only
+;  used in the unlikely case of a program setting both the 08 and 1C vectors!
+
+rmtmrdone:
+	ANDB	SS:pdaRMISrvReg#, #0FEh	;Indicate interrupt not in service now
+	CMPW	GS:1Ch*4+2, #100h	;Does he want a 1C interrupt too?
+	JB	rmintdone		;No - nothing needed here
+	MOVZWL	EDX, SS:pdaURegESP#	;Yes - get user's stack pointer
+	MOVZWL	ECX, SS:pdaURegSS#
+	SHLL	ECX, #4
+	ADDL	ECX, EDX
+	MOVL	EBX, SS:pdaURegEIP#	;Put return address on the user stack
+	ADDL	EBX, #2.B
+	IFFAULT	knlRealFPErr#
+	MOVW	GS:-6.B[ECX], BX
+	MOVL	EBX, SS:pdaURegCS#
+	IFFAULT	knlRealFPErr#
+	MOVW	GS:-4.B[ECX], BX
+	MOVL	EBX, SS:pdaURegEFR#
+	ORB	BH, #02h		;Assume emulated interrupts enabled
+	TESTB	SS:pdaSigLvl#, #04h	;Right?
+	JE	2$.S			;Yes
+	ANDB	BH, #~02h		;No
+2$:	IFFAULT	knlRealFPErr#
+	MOVW	GS:-2.B[ECX], BX
+	ORB	SS:pdaSigLvl#, #04h	;Disable emulated interrupts
+	MOVZBL	EBX, SS:pdaSigLvl#
+	MOVB	BL, masktbl#[EBX]
+	MOVB	SS:pdaSigMask#, BL
+	SUBL	SS:pdaURegESP#, #6.B	
+	IFFAULT	knlRealFPErr#
+	MOVZWL	EBX, GS:1Ch*4+0		;Get offset part of address
+	IFFAULT	knlRealFPErr#
+	MOVZWL	EAX, GS:1Ch*4+2		;Get segment part of address
+	MOVL	SS:pdaURegEIP#, EBX
+	MOVL	SS:pdaURegCS#, EAX
+	JMP	rmintdone.S
+.PAGE
+;Here when keyboard interrupt routine is executed by a DOS program
+
+rmkeyint:
+	ANDB	SS:pdaRMISrvReg#, #0FDh	;Indicate interrupt not in service now
+	CALL	knlGetTrm#		;Get DCB for his terminal
+	JC	rmintdone.S		;If none
+	CMPL	dcb_ccb.B[EDI], #knlTrmCcb# ;Is it really a terminal?
+	JNE	rmintdone.S		;No
+	MOVL	ESI, dcb_trtdb.B[EDI]	;Yes - get address of TDB
+	TESTL	ESI, ESI		;Do we have one?
+	JE	rmintdone.S		;No
+	MOVL	EAX, tdb_kdisp.B[ESI]	;Yes - dispatch to terminal driver
+	CALLI	CS:kf_keyint.B[EAX]
+
+;Here when emulated real mode hardware interrupt is complete
+
+rmintdone:
+	TOFORK
+	PUSHL	SS
+	POPL	ES
+	CALL	vintdo			;Process any pending simulated hardware
+	FROMFORK			;  interrupts
+	CLC
+	RET				;Thats all
+.PAGE
+;Here on IRET instruction from real mode
+
+viret:	MOVZWL	EAX, SS:pdaURegSS#	;Get user stack address
+	SHLL	EAX, #4
+	MOVZWL	EBX, SS:pdaURegESP#
+	ADDL	EBX, EAX
+	CMPB	userdatsz#, #2		;Is this a 16-bit operation?
+	JA	4$.S			;No
+	IFFAULT	knlRealFPErr#		;Yes
+	MOVZWL	ECX, GS:[EBX]		;Get return EIP
+	IFFAULT	knlRealFPErr#
+	MOVZWL	EDX, GS:2.B[EBX]	;Get return CS
+	IFFAULT	knlRealFPErr#
+	MOVL	EAX, SS:pdaURegEFR#
+	MOVW	AX, GS:4.B[EBX]		;Get return EFR (preserve high half)
+	ADDL	SS:pdaURegESP#, #6t.B	;Adjust his stack poiner
+	JMP	8$.S
+
+;Here if have a 32-bit operation
+
+	IFFAULT	knlRealFPErr#
+4$:	MOVL	ECX, GS:[EBX]		;Get return EIP
+	IFFAULT	knlRealFPErr#
+	MOVZWL	EDX, GS:4.B[EBX]	;Get return CS
+	IFFAULT	knlRealFPErr#
+	MOVL	EAX, GS:8.B[EBX]	;Get return EFR
+	ANDL	EAX, #77FD7h
+	BTSL	EAX, #17t		;Always set the real mode bit
+	ADDL	SS:pdaURegESP#, #12t.B	;Adjust his stack poiner
+8$:	MOVL	SS:pdaVRegEFR#, EAX	;Save the value he gave us
+	MOVL	SS:pdaURegEIP#, ECX	;Store new EIP value
+	MOVL	SS:pdaURegCS#, EDX	;Store new CS value
+	CMPB	SS:pdaRealIO#, #0
+	JNE	10$.S
+	MOVZBL	EDX, AH			;Save interrupt enable bit
+	ANDB	AH, #0Fh		;Clear bits which must be clear
+	ORB	AH, #02h		;And set bit which must be set
+	MOVL	SS:pdaURegEFR#, EAX
+	JMP	vsetlv1			;Go set software interrupt level and
+					;  return
+
+10$:	ORL	EAX, #20000h		;Make sure VM bit is set
+	MOVL	SS:pdaURegEFR#, EAX	;Store as actual FR
+	IFFCALL	badusrstk#
+	POPL	GS			;Restore segment registers
+	IFFCALL	badusrstk#
+	POPL	FS
+	IFFCALL	badusrstk#
+	POPL	ES
+	IFFCALL	badusrstk#
+	POPL	DS
+	POPAL				;Restore registers
+	MOVL	ESP, #pdaURegEIP#
+	IFFCALL	badusrstk#
+	IRET				;Return to user
+.PAGE
+;Here on PUSHF instruction from real mode
+
+vpushf:	INCL	48t.B[ESP]		;Bump user EIP to next byte
+	MOVL	EAX, userdatsz#		;Adjust user's stack pointer
+	SUBL	SS:pdaURegESP#, EAX
+	MOVZWL	EAX, SS:pdaURegSS#	;Get user stack address
+	SHLL	EAX, #4
+	MOVZWL	EBX, SS:pdaURegESP#
+	ADDL	EBX, EAX
+	MOVL	EAX, SS:pdaURegEFR#	;Get user's flag register
+	CMPB	SS:pdaRealIO#, #0
+	JNE	vstrwl.S
+	ANDL	EAX, #70DD7h		;Remove some bits
+	MOVL	EDX, SS:pdaVRegEFR#	;Get the last value he set
+	ANDL	EDX, #7000h		;Just the NT and IOPL bits
+	ORL	EAX, EDX
+	CMPB	SS:pdaSigLvl#, #4	;Are interrupts enabled?
+	JAE	vstrwl.S		;No
+	ORB	AH, #02h		;Yes
+vstrwl:	CMPB	userdatsz#, #2		;16-bit operation?
+	JBE	2$.S			;Yes
+	IFFAULT	knlRealFPErr#		;No - its 32-bit
+	MOVL	GS:[EBX], EAX
+	JMP	knlTrapDone#
+
+	IFFAULT	knlRealFPErr#
+2$:	MOVW	GS:[EBX], AX		;Put flag register on user's stack
+	JMP	knlTrapDone#		;Return to user
+
+;Here on POPF instruction from real mode
+
+vpopf:	INCL	48t.B[ESP]		;Bump user EIP to next byte
+	MOVZWL	EAX, SS:pdaURegSS#	;Get user stack address
+	SHLL	EAX, #4
+	MOVZWL	EBX, SS:pdaURegESP#
+	ADDL	EBX, EAX
+	CMPB	userdatsz#, #2		;16-bit operation?
+	JA	4$.S			;No
+	MOVL	EAX, SS:pdaURegEFR	;Yes - preserve the high half of the
+	IFFCALL	badusrstk#		;  EFR value
+	MOVW	AX, GS:[EBX]
+	JMP	6$.S
+
+;Here if have a 32-bit operation
+
+	IFFCALL	badusrstk#
+4$:	MOVL	EAX, GS:[EBX]		;Get all 32 bits
+	BTSL	EAX, #17t		;Make sure VM bit is set
+6$:	MOVL	SS:pdaVRegEFR#, EAX	;Save the value he gave us
+	CMPB	SS:pdaRealIO#, #0
+	JNE	9$.S
+	MOVZBL	EDX, AH			;Save his interrupt enable bit
+	ANDL	EAX, #70FD7h		;Remove some bits
+	ORB	AH, #02h		;And set bit which must be set
+	MOVL	SS:pdaURegEFR#, EAX	;Store as actual FR
+	MOVL	EAX, userdatsz#		;Adjust his stack pointer
+	ADDL	SS:pdaURegESP#, EAX
+vsetlv1:TESTB	DL, #02			;Should interrupts be enabled?
+	MOVZBL	EDX, SS:pdaSigLvl#
+	JNE	8$.S			;Yes
+	ORB	DL, #04h		;No
+	JMP	vsetlv2.S
+
+8$:	ANDB	DL, #~04h
+vsetlv2:MOVB	SS:pdaSigLvl#, DL	;Make this his new level
+	MOVB	AL, masktbl#[EDX]	;Get new mask value
+	MOVB	SS:pdaSigMask#, AL
+	JMP	10$.S
+
+9$:	ORL	EAX, #20000h		;Make sure VM bit is set
+	MOVL	SS:pdaURegEFR#, EAX	;Store as actual FR
+	MOVL	EAX, userdatsz#		;Adjust his stack pointer
+	ADDL	SS:pdaURegESP#, EAX
+	IFFCALL	badusrstk#
+	POPL	GS			;Restore segment registers
+	IFFCALL	badusrstk#
+	POPL	FS
+	IFFCALL	badusrstk#
+	POPL	ES
+	IFFCALL	badusrstk#
+	POPL	DS
+	POPAL				;Restore registers
+	MOVL	ESP, #pdaURegEIP#
+	IFFCALL	badusrstk#
+	IRET				;Return to user
+
+10$:	CLI				;No interrupts now
+
+;;;	TESTB	SS:pdaURegEFR#+1, #02
+;;;	JE	14$.S
+
+	ANDB	AL, SS:pdaSigReq#	;Need to schedule now?
+	ORB	AL, knlSchedReq#
+	IFFCALL	badusrstk#
+	POPL	GS			;Restore segment registers
+	IFFCALL	badusrstk#
+	POPL	FS
+	IFFCALL	badusrstk#
+	POPL	ES
+	IFFCALL	badusrstk#
+	POPL	DS
+	TESTB	AL, AL
+	POPAL				;Restore registers
+	MOVL	ESP, #pdaURegEIP#
+	JE	12$.S			;Yes
+	CALLF	schedule		;No - call the scheduler
+	IFFCALL	badusrstk#
+12$:	IRET				;Return to user
+
+14$:	CRASH	INTD
+
+;Here on CLI instruction from real mode
+
+vcli:	CMPB	SS:pdaRealIO#, #0
+	JNE	18$.S
+	MOVZBL	EDX, SS:pdaSigLvl#	;Set software interrupt level to
+	ORB	DL, #04h		;  disable emulated interrupts
+16$:	INCL	48t.B[ESP]		;Bump user EIP to next byte
+	JMP	vsetlv2
+
+18$:	ANDB	SS:pdaURegEFR#+1, #~02h
+	INCL	48t.B[ESP]		;Bump user EIP to next byte
+	jmp	10$.S
+
+;Here on STI instruction from real mode
+
+vsti:	CMPB	SS:pdaRealIO#, #0
+	JNE	20$.S
+	MOVZBL	EDX, SS:pdaSigLvl#	;Set software interrupt level to
+	ANDB	DL, #~04h.B		;  enable emulated interrupts
+	JMP	16$.S
+
+20$:	ORB	SS:pdaURegEFR#+1, #02h
+	INCL	48t.B[ESP]		;Bump user EIP to next byte
+	JMP	10$
+.PAGE
+;Here on INB port instruction from real mode
+
+vinpb:	MOVZBL	EDX, GS:1.B[ESI]	;Get port number
+
+;;;	INT3
+
+	CALL	checkioreg		;Should it have worked?
+	JC	2$.S			;No - go on
+	INB	[DX]			;Yes - just do it!
+	JMP	4$.S
+
+;Here if really should have trapped on this
+
+2$:	MOVZBL	EAX, ioporttbl[EDX]	;Get dispatch index
+	CLC
+	CALLI	ioinbdsp[EAX]		;And dispatch to routine for device
+	JC	10$.S
+4$:	ADDL	SS:pdaURegEIP#, #2.B
+	JMP	14$.S
+
+;Here on INB [DX] instruction from real mode
+
+vindxb:	MOVZWL	EDX, DX			;Get port number
+
+;;;	INT3
+
+	CALL	checkioreg		;Should it have worked?
+	JC	6$.S			;No - go on
+	INB	[DX]			;Yes - just do it!
+	JMP	14$.S
+
+;Here if really should have trapped on this
+
+6$:	CMPL	EDX, #400h		;Is it one we know about?
+	JB	8$.S			;Yes
+	CLRL	EDX			;No
+8$:	MOVZBL	EAX, ioporttbl[EDX]	;Get dispatch index
+	CLC
+	CALLI	ioinbdsp[EAX]		;And dispatch to routine for device
+10$:	JC	knlRealFPErr#
+12$:	INCL	48t.B[ESP]		;Bump user EIP
+14$:	MOVB	SS:pdaURegEAX#+0, AL	;Store data in user's register
+	JMP	knlTrapDone#
+
+;Dispatch table for INB instructions
+
+	DATA
+
+ioinbdsp:
+	.LONG	vinbbad		;BAD =  4. - Invalid port
+	.LONG	vinbint		;IN1 =  8. - First interupt controller
+	.LONG	knlRtnZero#	;IN2 = 12. - Second interrupt controller
+	.LONG	vinbdsp		;DSP = 16. - Console display
+	.LONG	vinbbad		;FLP = 20. - Floppy disk
+	.LONG	vinbkey		;KEY = 24. - Keyboard
+	.LONG	vinbcom1	;CM1 = 28. - Serial port 1
+	.LONG	vinbcom2	;CM2 = 32. - Serial port 2
+	.LONG	vinbbad		;PRT = 36. - Printer
+	.LONG	vinbbad		;GAM = 40. - Game port
+	.LONG	vinbclk		;CLK = 44. - Clock
+	.LONG	knlRtnZero#	;IGN = 48. - Port to ignore
+
+	CODE
+.PAGE
+;Here for illegal IO port - it always reads 0FFh
+
+vinbbad:MOVB	AL, #0FFh
+	RET
+
+;Here for INB instruction for the display
+
+vinbdsp::
+	CALL	knlGetTrm#		;Get DCB for his terminal
+	JC	4$.S			;If none
+	CMPL	dcb_ccb.B[EDI], #knlTrmCcb# ;Is it really a terminal?
+	JNE	rtncs2.S		;No
+	MOVL	ESI, dcb_trtdb.B[EDI]	;Get address of TDB
+	ORL	ESI, ESI		;Do we have one?
+	JE	rtncs2.S		;Also fail if no TDB
+	MOVL	EAX, tdb_ddisp.B[ESI]	;OK - dispatch to terminal driver
+	JMPIL	CS:tf_vdinb.B[EAX]
+	
+rtncs2:	STC
+4$:	RET
+
+;Here for INB instruction for the keyboard
+
+vinbkey::
+	CALL	knlGetTrm#		;Get DCB for his terminal
+	JC	4$.S			;If none
+	CMPL	dcb_ccb.B[EDI], #knlTrmCcb# ;Is it really a terminal?
+	JNE	rtncs2.S		;No
+	MOVL	ESI, dcb_trtdb.B[EDI]	;Get address of TDB
+	TESTL	ESI, ESI		;Do we have one?
+	JE	rtncs2.S		;Also fail if no TDB
+	MOVL	EAX, tdb_kdisp.B[ESI]	;OK - dispatch to terminal driver
+	JMPIL	CS:kf_vkinb.B[EAX]
+.PAGE
+;Here for INB instruction for COM1
+
+vinbcom1::
+	MOVB	AL, #0FFh
+	RET
+
+;Here for INB instruciton for COM2
+
+vinbcom2::
+	MOVB	AL, #0FFh
+	RET
+.PAGE
+;Here for INB instruction for 8254 timer
+
+vinbclk::
+	CMPL	EDX, #43h.B		;Ignore reference to port 43
+	JE	knlRtnZero#
+	ANDB	DL, #3
+	MOVZWL	EAX, SS:pdaRMLTmrCnt#+0[EDX*4] ;Get counter state
+	JMPIL	vclkdsp[EAX*4]		;Dispatch on the state
+
+;Counter state dispatch table
+
+	DATA
+
+vclkdsp:.LONG	knlRtnZero#	; 0 - Idle
+	.LONG	vinbclk1	; 1 - First reference after latch
+	.LONG	vinbclk2	; 2 - Second reference after latch
+	.LONG	knlRtnZero#	; 3 - Not used
+
+	CODE
+
+;Here on first reference after latch command - return high order byte of
+;  latched value
+
+vinbclk1:
+	MOVB	AL, SS:pdaRMLTmrCnt#+3[EDX*4]
+	INCB	SS:pdaRMLTmrCnt#+0[EDX*4] ;Bump state
+	CLC
+	RET
+
+;Here on second reference after latch command - return low order byte of
+;  latched value
+
+vinbclk2:
+	MOVB	AL, SS:pdaRMLTmrCnt#+2[EDX*4]
+	MOVB	SS:pdaRMLTmrCnt#+0[EDX*4], #0 ;Reset state
+	CLC
+	RET
+.PAGE
+;Here for INB instruction for an interrupt controller
+
+vinbint::
+	CMPB	DL, #20h		;Want the mask register?
+	JNE	4$.S			;Yes
+	TESTB	SS:pdaRMIStatus#, #IS$RIS ;No - should we give him the ISR?
+	JE	2$.S			;No
+	MOVB	AL, SS:pdaRMISrvReg#	;Yes
+	RET
+
+2$:	MOVB	AL, SS:pdaRMIReqReg#
+	RET
+
+;Here for INB instruction to port 21h
+
+4$:	MOVB	AL, SS:pdaRMIMskReg#	;Get mask register
+	NOTB	AL
+	CLC
+	RET
+.PAGE
+;Here on INSB instruction from real mode
+
+vinsb:	UNIMOP	06Ch, 00h, 00h, 00h
+.PAGE
+;Here on INW/L port instruction from real mode
+
+vinp:	MOVZBL	EDX, GS:1.B[ESI]	;Get port number
+
+;;;	INT3
+
+	CALL	checkioreg		;Should it have worked?
+	JC	4$.S			;No - go on
+	CMPB	userdatsz#, #2		;Is this a 16-bit operation?
+	JA	2$.S			;No
+	INW	[DX]			;Yes
+	JMP	6$.S
+
+2$:	INL	[DX]
+	JMP	6$.S
+
+4$:	MOVZBL	EAX, ioporttbl[EDX]	;Get dispatch index
+	CLC
+	CALLI	ioinwldsp[EAX]		;And dispatch to routine for device
+	JC	16$.S
+6$:	ADDL	SS:pdaURegEIP#, #2.B
+	JMP	vstreaxwl
+
+;Here on INW/L [DX] instruction from real mode
+
+vindx:	MOVZWL	EDX, DX			;Get port number
+
+;;;	INT3
+
+	CALL	checkioreg		;Should it have worked?
+	JC	12$.S			;No - go on
+	CMPB	userdatsz#, #2		;Is this a 16-bit operation?
+	JA	10$.S			;No
+	INW	[DX]			;Yes
+	JMP	18$.S
+
+10$:	INL	[DX]
+	JMP	18$.S
+
+12$:	CMPL	EDX, #400h		;Is it one we know about?
+	JB	14$.S			;Yes
+	CLRL	EDX			;No
+14$:	MOVZBL	EAX, ioporttbl[EDX]	;Get dispatch index
+	CLC
+	CALLI	ioinwldsp[EAX]		;And dispatch to routine for device
+16$:	JC	knlRealFPErr#
+18$:	INCL	48t.B[ESP]		;Bump user EIP
+vstreaxwl:
+	CMPB	userdatsz#, #2		;16-bit operation?
+	JBE	20$.S			;Yes
+	MOVL	SS:pdaURegEAX#, EAX
+	JMP	knlTrapDone#
+
+20$:	MOVW	SS:pdaURegEAX, AX	;Put flag register on user's stack
+	JMP	knlTrapDone#		;Return to user
+
+;Dispatch table for INW/L instructions
+
+	DATA
+
+ioinwldsp:
+	.LONG	vinwlbad	;BAD =  4. - Invalid port
+	.LONG	vinwlbad	;IN1 =  8. - First interupt controller
+	.LONG	vinwlbad	;IN2 = 12. - Second interrupt controller
+	.LONG	vinwlbad	;DSP = 16. = Console display
+	.LONG	vinwlbad	;FLP = 20. - Floppy disk
+	.LONG	vinwlbad	;KEY = 24. - Keyboard
+	.LONG	vinwlbad	;CM1 = 28. - Serial port 1
+	.LONG	vinwlbad	;CM2 = 32. - Serial port 2
+	.LONG	vinwlbad	;PRT = 36. - Printer
+	.LONG	vinwlbad	;GAM = 40. - Game port
+	.LONG	vinwlbad	;CLK = 44. - Clock
+	.LONG	vinwlbad	;IGN = 48. - Port to ignore
+
+	CODE
+
+vinwlbad:
+	MOVL	EAX, #0FFFFFFFFh
+	RET
+
+;Here on INSW/L instruction from real mode
+
+vins:	UNIMOP	0EEh, 00h, 00h, 00h
+.PAGE
+;Here on OUTB port instruction from real mode
+
+voutpb:	IFFAULT	knlRealFPErr#
+	MOVZBL	EDX, GS:1.B[ESI]	;Get port number
+
+;;;	INT3
+
+	CALL	checkioreg		;Should it have worked?
+	JC	2$.S			;No - go on
+	MOVB	AL, SS:pdaURegEAX#+0	;Yes - get data to output
+	OUTB	[DX]			;Just do it!
+	JMP	4$.S
+
+;Here if really should have trapped on this
+
+2$:	MOVB	AL, SS:pdaURegEAX#+0	;Get data to output
+	MOVZBL	EBX, ioporttbl[EDX]	;Get dispatch index
+	CALLI	iooutbdsp[EBX]		;And dispatch to routine for device
+	JC	12$.S
+4$:	ADDL	SS:pdaURegEIP#, #2.B
+	JMP	knlTrapDone#
+
+;Here on OUTB [DX] instruction from real mode
+
+voutdxb:MOVZWL	EDX, SS:pdaURegEDX#	;Get port number
+
+;;;	INT3
+
+	CALL	checkioreg		;Should it have worked?
+	JC	10$.S			;No - go on
+	MOVB	AL, SS:pdaURegEAX#+0	;Yes - get data to output
+	OUTB	[DX]			;Just do it!
+	JMP	14$.S
+
+;Here if really should have trapped on this
+
+	CMPL	EDX, #400h		;Is it one we know about?
+	JB	10$.S			;Yes
+	CLRL	EDX			;No
+10$:	MOVB	AL, SS:pdaURegEAX#+0	;Get data to output
+	MOVZBL	EBX, ioporttbl[EDX]	;Get dispatch index
+	CALLI	iooutbdsp[EBX]		;And dispatch to routine for device
+12$:	JC	knlRealFPErr#
+14$:	INCL	SS:pdaURegEIP#		;Bump user EIP
+	JMP	knlTrapDone#
+
+;Dispatch table for OUTB instructions
+
+	DATA
+
+iooutbdsp:
+	.LONG	rtncs4		;BAD =  4. - Invalid port
+	.LONG	voutbint	;IN1 =  8. - First interupt controller
+	.LONG	rtncc4		;IN2 = 12. - Second interrupt controller
+	.LONG	voutbdsp	;DSP = 16. - Console display
+	.LONG	rtncs4		;FLP = 20. - Floppy disk
+	.LONG	voutbkey	;KEY = 24. - Keyboard
+	.LONG	voutbcom1	;CM1 = 28. - Serial port 1
+	.LONG	voutbcom2	;CM2 = 32. - Serial port 2
+	.LONG	rtncs4		;PRT = 36. - Printer
+	.LONG	rtncs4		;GAM = 40. - Game port
+	.LONG	voutbclk	;CLK = 44. - Clock
+	.LONG	rtncc4		;IGN = 48. - Port to ignore
+
+	CODE
+.PAGE
+;Here for OUTB instruction for the primary interrupt controller
+
+voutbint::
+	CMPB	DL, #20h		;Change enable mask?
+	JE	2$.S			;No
+	NOTB	AL			;Yes - store new mask bits
+	MOVB	SS:pdaRMIMskReg#, AL
+	JMP	12$.S			;And go queue new interrupt if need to
+
+;Here for OUTB to port 20h
+
+2$:	TESTB	AL, #08h		;OCW3?
+	JE	6$.S			;No
+	TESTB	AL, #02h		;Yes - want to select register to read?
+	JE	4$.S			;No
+	ANDB	SS:pdaRMIStatus#, #~IS$RIS ;Yes - assume wants the IRR
+	TESTB	AL, #01h		;Right?
+	JE	4$.S			;Yes
+	ORB	SS:pdaRMIStatus#, #IS$RIS ;No - he wants the ISR
+4$:	RET
+
+;Here to write OCW2
+
+6$:	TESTB	AL, #20h		;EOI command?
+	JE	4$.S			;No - ignore it!
+	TESTB	AL, #80h		;Yes - specific or non-specific EOI?
+	JNE	4$.S			;No - ignore it!
+	TESTB	AL, #40h		;Specific EOI
+	JE	8$.S			;No
+	ANDL	EAX, #07h.B		;Yes - get level
+	MOVZBL	ECX, intreqmap[EAX]	;Get corresponding bit number
+	JMP	10$.S			;Continue
+
+;Here if have non-specific EOI command
+
+8$:	MOVZWL	EAX, SS:pdaRMISrvReg#	;Find highest priority interrupt that
+	ANDL	EAX, #0F803h		;  is in service now
+	BSFL	ECX, EAX
+	JE	12$.S
+10$:	BTZL	SS:pdaRMISrvReg#, ECX	;Clear it
+	CMPB	CL, #1			;Did we clear the keyboard interrupt?
+	JNE	12$.S			;No
+	CALL	knlGetTrm#		;Get DCB for his terminal
+	JC	12$.S			;If none
+	CMPL	dcb_ccb.B[EDI], #knlTrmCcb# ;Is it really a terminal?
+	JNE	12$.S			;No
+	MOVL	ESI, dcb_trtdb.B[EDI]	;Get address of TDB
+	TESTL	ESI, ESI		;Do we have one?
+	JE	12$.S			;If no TDB
+	MOVL	EDX, tdb_kdisp.B[ESI]
+	CALLI	CS:kf_enable.B[EDX]
+12$:	MOVL	EDX, SS
+	MOVL	ES, EDX
+	TOFORK
+	CALL	vintdo			;And queue interrupt if need to
+	FROMFORK
+rtncc4:	CLC
+	RET
+.PAGE
+;Here for OUTB instruction for the display
+
+voutbdsp::
+	CALL	knlGetTrm#		;Get DCB for his terminal
+	JC	4$.S			;If error
+	CMPL	dcb_ccb.B[EDI], #knlTrmCcb# ;Is it really a terminal?
+	JNE	rtncs4.S		;No
+	MOVL	ESI, dcb_trtdb.B[EDI]	;Get address of TDB
+	ORL	ESI, ESI		;Do we have one?
+	JE	rtncs4.S		;Also fail if no TDB
+	MOVL	EBX, tdb_ddisp.B[ESI]	;OK - dispatch to terminal driver
+	JMPIL	CS:tf_vdoutb.B[EBX]
+
+rtncs4:	STC
+4$:	RET
+
+;Here for OUTB instruction for the keyboard
+
+voutbkey::
+	CALL	knlGetTrm#		;Get DCB for his terminal
+	JC	4$.S			;If none
+	CMPL	dcb_ccb.B[EDI], #knlTrmCcb# ;Is it really a terminal?
+	JNE	rtncs4.S		;No
+	MOVL	ESI, dcb_trtdb.B[EDI]	;Get address of TDB
+	TESTL	ESI, ESI		;Do we have one?
+	JE	rtncs4.S		;Also fail if no TDB
+	MOVL	EBX, tdb_kdisp.B[ESI]	;OK - dispatch to terminal driver
+	JMPIL	CS:kf_vkoutb.B[EBX]
+.PAGE
+;Here on OUTB instruction for COM1
+
+voutbcom1::
+	CLC
+	RET
+
+;Here on OUTB instruction for COM2
+
+voutbcom2::
+	CLC
+	RET
+
+;Here on OUTB instruction for the 8254 timer
+
+voutbclk::
+	CMPL	EDX, #43h.B		;Changing the control register?
+	JNE	2$.S			;No - ignore it for now
+	TESTB	AL, #30h		;Counter latch command?
+	JNE	2$.S			;No - ignore it for now!
+	ANDB	AL, #0F0h		;Yes - remove unused bits
+	CMPB	AL, #0F0h		;Read-back command?
+	JE	4$.S			;Yes - go handle that
+	CLI				;No - no interrupts now
+	OUTB	43h			;Latch current count
+	JMP	$+2.S
+	MOVB	DL, AL			;Get counter number
+	SHRB	DL, #6
+	ADDB	DL, #40
+	INB	[DX]			;Get high byte of value
+	JMP	$+2.S
+	MOVB	SS:pdaRMLTmrCnt#+3-100h[EDX*4], AL ;Save it
+	INB	[DX]			;Get low byte of value
+	STI				;Interrupts OK now
+	MOVB	SS:pdaRMLTmrCnt#+2-100h[EDX*4], AL ;Save low byte
+	MOVB	SS:pdaRMLTmrCnt#+0-100h[EDX*4], #1 ;Set state
+2$:	CLC
+	RET
+
+;Here for read-back command
+
+4$:	CRASH	NIYT
+.PAGE
+;Here on OUTSB instruction from real mode
+
+voutsb:	UNIMOP	6Eh, 00h, 00h, 00h
+
+;Here on OUTW/L port instruction from real mode
+
+voutp:	IFFAULT	knlRealFPErr#
+	MOVZBL	EDX, GS:1.B[ESI]	;Get port number
+
+;;;	INT3
+
+	CALL	checkioreg		;Should it have worked?
+	JC	4$.S			;No - go on
+	CMPB	userdatsz#, #2		;Is this a 16-bit operation?
+	JA	2$.S			;No
+	MOVW	AX, SS:pdaURegEAX#+0	;Yes - get data to output
+	OUTW	[DX]			;Just do it!
+	JMP	8$.S
+
+2$:	MOVL	EAX, SS:pdaURegEAX#+0
+	OUTL	[DX]
+	JMP	8$.S
+
+;Here if really should have trapped on this
+
+4$:	CMPL	EDX, #400h		;Is it one we know about?
+	JB	6$.S			;Yes
+	CLRL	EDX
+6$:	MOVB	AL, SS:pdaURegEAX#+0	;Get data to output
+	MOVZBL	EBX, ioporttbl[EDX]	;Get dispatch index
+	CALLI	iooutwldsp[EBX]		;And dispatch to routine for device
+	JC	16$.S
+8$:	ADDL	SS:pdaURegEIP#, #2.B
+	JMP	knlTrapDone#
+
+;Here on OUTW/L [DX] instruction from real mode
+
+voutdx:	MOVZWL	EDX, SS:pdaURegEDX#	;Get port number
+
+;;;	INT3
+
+	CALL	checkioreg		;Should it have worked?
+	JC	12$.S			;No - go on
+	CMPB	userdatsz#, #2		;Is this a 16-bit operation?
+	JA	10$.S			;No
+	MOVW	AX, SS:pdaURegEAX#+0	;Yes - get data to output
+	OUTW	[DX]			;Just do it!
+	JMP	18$.S
+
+10$:	MOVL	EAX, SS:pdaURegEAX#+0
+	OUTL	[DX]
+	JMP	18$.S
+
+;Here if really should have trapped on this
+
+12$:	CMPL	EDX, #400h		;Is it one we know about?
+	JB	14$.S			;Yes
+	CLRL	EDX			;No
+14$:	MOVB	AL, SS:pdaURegEAX#+0	;Get data to output
+	MOVZBL	EBX, ioporttbl[EDX]	;Get dispatch index
+	CALLI	iooutwldsp[EBX]		;And dispatch to routine for device
+16$:	JC	knlRealFPErr#
+18$:	INCL	SS:pdaURegEIP#		;Bump user EIP
+	JMP	knlTrapDone#
+
+;Dispatch table for OUTW/L instructions
+
+	DATA
+
+iooutwldsp:
+	.LONG	rtncc4		;BAD =  4. - Invalid port
+	.LONG	rtncc4		;IN1 =  8. - First interupt controller
+	.LONG	rtncc4		;IN2 = 12. - Second interrupt controller
+	.LONG	rtncc4		;DSP = 16. = Console display
+	.LONG	rtncs4		;FLP = 20. - Floppy disk
+	.LONG	rtncc4		;KEY = 24. - Keyboard
+	.LONG	rtncc4		;CM1 = 28. - Serial port 1
+	.LONG	rtncc4		;CM2 = 32. - Serial port 2
+	.LONG	rtncc4		;PRT = 36. - Printer
+	.LONG	rtncc4		;GAM = 40. - Game port
+	.LONG	rtncc4		;CLK = 44. - Clock
+	.LONG	rtncc4		;IGN = 48. - Port to ignore
+
+	CODE
+
+;Here on OUTSW/L instruction from real mode
+
+vouts:	UNIMOP	6Fh, 00h, 00h, 00h
+.PAGE
+;Subroutine to request real mode virtual hardware interrupt - must be called
+;  from fork level
+;  Note: this routine will only queue a single request for each hardware
+;	 interrupt level - additional requests are ignored
+;	c{EAX} = Interrupt level (0 - 0Fh - this corresponds to the IRQ
+;		   number, not the INT number)
+;	c[ES] = Selector for PDA for process
+;	CALL	knlRMIntReq
+
+knlRMIntReq::
+	MOVB	AL, intreqmap[EAX]	;Get the mapped interrupt level
+	BTSL	ES:pdaRMIReqReg#, EAX	;Set bit for requested level
+vintdo:	REQUIREFORK
+	TESTB	ES:pdaStatus1#, #P1$DOSSEG|P1$BIOSSEG ;Have a real mode
+						      ;   environment?
+	JE	10$.S			;No
+	MOVZWL	EAX, ES:pdaRMIReqReg#	;Yes - get current request bits
+	ANDW	AX, ES:pdaRMIMskReg#	;Masked by the enable bits
+	BSFL	EBX, EAX		;Find first bit which is set
+	JE	12$.S			;If no enabled interrupts requested now
+	BTZL	ES:pdaRMISrvReg#, EBX	;Is this level being serviced now?
+	JC	12$.S			;Yes - nothing to do this time
+	BTZL	ES:pdaRMIReqReg#, EBX	;No - clear this request
+	BTSL	ES:pdaRMISrvReg#, EBX	;Indicate being serviced
+	TESTL	EBX, EBX		;Is this IRQ 0?
+	JNE	4$.S			;No
+	CMPW	ES:pdaRMPage0#+08h*4+2, #100h ;Yes - want an INT 08 interrupt?
+	JB	4$.S			;No
+	MOVL	EAX, #208h		;Yes - use it
+	JMP	6$.S
+
+4$:	MOVZWL	EAX, vintnum[EBX*2]	;Get vector to use
+6$:
+
+;;;;; NEED CODE HERE TO LIMIT REQUESTS PER INTERRUPT !!!!!
+
+	MOVB	BL, #SIGT_NORMAL	;Get interrupt type
+	CLRL	ECX			;No interrupt data
+	CALL	knlGetQel#			;Get interrupt link block
+	JC	12$.S			;Forget it if error!
+	MOVB	slb_szindx.B[ESI], #0
+	CLRL	EDX
+	JMP	knlReqSignal#		;Request software interrupt and return
+
+;Here if no longer have a real mode segment
+
+10$:	MOVW	ES:pdaRMIReqReg#, #0
+12$:	RET
+
+	DATA
+
+;Table which gives INT number corresponding to a mapped IRQ number
+
+	.MOD	2
+vintnum:.WORD	21Ch		; 0  (IRQ 0)
+	.WORD	209h		; 1  (IRQ 1)
+	.WORD	0		; 2  not used
+	.WORD	270h		; 3  (IRQ 8)
+	.WORD	271h		; 4  (IRQ 2 and 9)
+	.WORD	272h		; 5  (IRQ 10)
+	.WORD	273h		; 6  (IRQ 11)
+	.WORD	274h		; 7  (IRQ 12)
+	.WORD	275h		; 8  (IRQ 13)
+	.WORD	276h		; 9  (IRQ 14)
+	.WORD	277h		; 10 (IRQ 15)
+	.WORD	20Bh		; 11 (IRQ 3)
+	.WORD	20Ch		; 12 (IRQ 4)
+	.WORD	20Dh		; 13 (IRQ 5)
+	.WORD	20Eh		; 14 (IRQ 6)
+	.WORD	20Fh		; 15 (IRQ 7)
+
+;Table which maps IRQ values to reflect actual hardware priorities
+
+intreqmap::
+	.BYTE	0t		; IRQ 0
+	.BYTE	1t		; IRQ 1
+	.BYTE	4t		; IRQ 2
+	.BYTE	11t		; IRQ 3
+	.BYTE	12t		; IRQ 4
+	.BYTE	13t		; IRQ 5
+	.BYTE	14t		; IRQ 6
+	.BYTE	15t		; IRQ 7
+	.BYTE	3t		; IRQ 8
+	.BYTE	4t		; IRQ 9
+	.BYTE	5t		; IRQ 10
+	.BYTE	6t		; IRQ 11
+	.BYTE	7t		; IRQ 12
+	.BYTE	8t		; IRQ 13
+	.BYTE	9t		; IRQ 14
+	.BYTE	10t		; IRQ 15
+
+	CODE
+.PAGE
+;Subroutine to determine if access to an IO port is allowed. This should not
+;  be needed but we have observed that the hardware (K6-2 for sure) sometimes
+;  traps on IO when it shouldn't!
+;	c(EDX) = IO port
+;	CALL	checkioreg
+;	C:set = IO is not allowed
+;	C:clr = IO is allowed
+
+checkioreg:
+	MOVZWL	EAX, SS:pdaTssSel#
+	MOVZWL	EAX, gdtable+st_limit[EAX]
+	SUBW	AX, SS:pdaTss+tss_bmofs
+	SHLL	EAX, #3
+	SUBL	EAX, #11h
+	CMPL	EAX, EDX
+	JB	4$.S
+	MOVZWL	EAX, SS:pdaTss+tss_bmofs
+	BTL	SS:pdaTss[EAX], EDX
+4$:	RET
+.PAGE
+;Here for the svcIoRun SVC from real mode - this function is implemented as
+;  a protected user mode routine only.  This code sets up the user stack
+;  so we can use the svcSchDismiss call to return back to real mode when
+;  complete.  It then executes the usvcIoRun routine.
+
+rsvcIoRun::
+	MOVL	ECX, #2			;Copy two argument items
+	MOVL	EAX, #usvcIoRun#	;Get offset of routine
+					;Fall into protsvc
+
+;Routine to set up a real mode SVC to execute in protected user mode
+;	c{EAX} = Offset of protected mode routine to execute
+;	c{ECX} = Number of stack items to copy
+;	JMP	rmprotsvc
+
+rmprotsvc::
+	PUSHL	EAX			;Save offset of routine to execute
+	IFFCALL	badusrstk#
+	MOVL	EDI, FS:dda_dpmicurpESP
+	IFFCALL	badusrstk#
+	MOVL	ES, FS:dda_dpmicurpSS
+	SUBL	EDI, #4t.B
+	MOVZWL	EAX, SS:pdaURegSS#	;Point to the user's current real mode
+	PUSHL	EAX			;  stack
+	SHLL	EAX, #4t
+	MOVZWL	EBX, SS:pdaURegESP#
+	MOVL	ESI, EBX
+	ADDL	EBX, EAX
+	STD
+	POPL	EAX			;Store real mode SS
+	IFFCALL	badusrstk#
+	STOSL	[EDI]
+	LEAL	EAX, [ESI+ECX*4]	;Store real mode SP
+	IFFCALL	badusrstk#
+	STOSL	[EDI]
+	CLRL	EAX			;Store 0
+	IFFCALL	badusrstk#
+	STOSL	[EDI]
+	MOVL	EAX, #01020000h		;Store real mode EFR
+	IFFCALL	badusrstk#
+	STOSL	[EDI]
+	MOVZWL	EAX, 60t.B[ESP]		;Store real mode CS
+	IFFCALL	badusrstk#
+	STOSL	[EDI]
+	MOVL	EAX, 56t.B[ESP]		;Store real mode IP
+	IFFCALL	badusrstk#
+	STOSL	[EDI]
+	MOVZWL	EAX, SS:pdaVRegDS#	;Store real mode DS
+	IFFCALL	badusrstk#
+	STOSL	[EDI]
+	MOVZWL	EAX, SS:pdaVRegES#	;Store real mode ES
+	IFFCALL	badusrstk#
+	STOSL	[EDI]
+	MOVZWL	EAX, SS:pdaVRegFS#	;Store real mode FS
+	IFFCALL	badusrstk#
+	STOSL	[EDI]
+	MOVZWL	EAX, SS:pdaVRegGS#	;Store real mode GS
+	IFFCALL	badusrstk#
+	STOSL	[EDI]
+	LEAL	ESI, -4.B[EBX+ECX*4]	;Copy the user's arguments
+	IFFCALL	badusrstk#
+	RMOVSL	[EDI], FS:[ESI]
+	MOVL	EAX, #GS_USERCODE|03	;Store protected mode return selector
+	IFFCALL	badusrstk#
+	STOSL	[EDI]
+	IFFCALL	badusrstk#		;Store protected mode return offset
+	MOVL	ES:[EDI], #uvsvcdone#
+	POPL	EAX
+	MOVL	56t.B[ESP], #GS_USERCODE|03 ;Store protected mode CS:EIP
+	MOVL	52t.B[ESP], EAX
+	MOVL	EAX, SS:pdaURegSS#	;Update saved real mode stack pointer
+	SHLL	EAX, #16t
+	MOVW	AX, SS:pdaURegESP#
+	MOVL	FS:dda_dpmicurrSSSP, EAX
+	MOVL	SS:pdaURegSS#, ES	;Store protected mode stack pointer
+	MOVL	SS:pdaURegESP#, EDI
+	MOVL	SS:pdaTss#+tss_stk0, #pdaXStackP#
+	MOVL	SS:pdaXRegEFR#, #200h
+	RET				;"Return" to the protected mode routine
+.PAGE
+	.SBTTL	rmchnguser - Subroutine to do common set up for real mode routine
+
+;Subroutine to do common set up for real mode routines which execute in
+;  protected user mode.
+;  Calling sequence from exec mode:
+;	c{ECX} = Offset of user mode routine (bit 30 is set is need to set or
+;		   clear C on return)
+;	CALL	rmchnguser
+;  The user mode routine is entered as follows: (note that the stack set up is
+;    such as to allow the routine to terminate using the svcSchDismiss call)
+
+;	Stack frame:
+;	c{{EBP}+68} = (dff_SS)   Saved user SS (high 16 bits are 0)
+;	c{{EBP}+64} = (dff_ESP)  Saved user SP (high 16 bits are 0)
+;	c{{EBP}+60} = (dff_x)    0
+;	c{{EBP}+56} = (dff_EFR)  Saved user EFR
+;	c{{EBP}+52} = (dff_CS)   Saved user CS (high 16 bits are 0)
+;	c{{EBP}+48} = (dff_EIP)  Saved user IP (high 16 bits are 0)
+;	c{{EBP}+44} = (dff_DS)   Saved caller's DS (high 16 bits undefined)
+;	c{{EBP}+40} = (dff_ES)   Saved caller's ES (high 16 bits undefined)
+;	c{{EBP}+36} = (dff_FS)   Saved caller's FS (high 16 bits undefined)
+;	c{{EBP}+32} = (dff_GS)   Saved caller's GS (high 16 bits undefined)
+;	c{{EBP}+28} = (dff_EAX)  Saved caller's EAX
+;	c{{EBP}+24} = (dff_EDX)  Saved caller's EDX
+;	c{{EBP}+20} = (dff_ECX)  Saved caller's ECX
+;	c{{EBP}+16} = (dff_EBX)  Saved caller's EBX
+;	c{{EBP}+12} =            Not used (contents undefined)
+;	c{{EBP}+8}  = (dff_EBP)  Saved caller's EBP
+;	c{{EBP}+4}  = (dff_ESI)  Saved caller's ESI
+;	c{{EBP}+0}  = (dff_EDI)  Saved caller's EDI
+
+rmchnguser::
+	PUSHL	#GS_REAL16|03h.B
+	POPL	GS
+	MOVZWL	EAX, SS:pdaURegSS#	;Get user's stack pointer
+	MOVZWL	EDX, SS:pdaURegESP#
+	PUSHL	#GS_REAL32|03h.B	;Switch to our internal stack
+	POPL	ES
+	MOVL	EDI, #rmda_stack-4t
+	IFFCALL	badusrstk#
+	STD
+	IFFCALL	badusrstk#		;Stack user's SS
+	STOSL	[EDI]
+	MOVL	EAX, EDX		;Stack user's SP
+	IFFCALL	badusrstk#
+	STOSL	[EDI]
+	CLRL	EAX			;Stack a 0
+	IFFCALL	badusrstk#
+	STOSL	[EDI]
+	MOVZBL	EBX, SS:pdaSigLvl#	;Get his current signal level
+	SHLL	EBX, #12t
+	BTZL	EBX, #15t
+	JC	6$.S
+	ORB	BH, #02h
+6$:	MOVL	EAX, SS:pdaURegEFR#	;Stack user's EFR
+	ANDL	EAX, #0F0DFFh
+	ORL	EAX, EBX
+	ORL	EAX, #02000200h
+	IFFCALL	badusrstk#
+	STOSL	[EDI]
+	ORB	SS:pdaSigLvl#, #08h	;Don't allow any signals now
+	MOVB	SS:pdaSigMask#, #01h
+	MOVZWL	EAX, SS:pdaURegCS#	;Stack user's CS:IP
+	IFFCALL	badusrstk#
+	STOSL	[EDI]
+	MOVZWL	EAX, SS:pdaURegEIP#
+	IFFCALL	badusrstk#
+	STOSL	[EDI]
+	MOVL	SS:pdaURegEIP#, ECX	;Store address of user mode routine
+	MOVL	SS:pdaURegCS#, #GS_USERCODE|03h
+	MOVL	SS:pdaURegEFR#, #0h
+	MOVZWL	EAX, SS:pdaVRegDS#	;Stack user's segment register values
+	IFFCALL	badusrstk#
+	STOSL	[EDI]
+	MOVZWL	EAX, SS:pdaVRegES#
+	IFFCALL	badusrstk#
+	STOSL	[EDI]
+	MOVZWL	EAX, SS:pdaVRegFS#
+	IFFCALL	badusrstk#
+	STOSL	[EDI]
+	MOVZWL	EAX, SS:pdaVRegGS#
+	IFFCALL	badusrstk#
+	STOSL	[EDI]
+	MOVL	ESI, #pdaURegEAX#
+	MOVL	ECX, #8t
+	IFFCALL	badusrstk#
+	RMOVSL	[EDI], SS:[ESI]		;Stack user's general register values
+	ADDL	EDI, #4t.B
+	MOVL	SS:pdaURegSS#, ES	;Set up new user stack pointer
+	MOVL	SS:pdaURegESP#, EDI
+	MOVL	SS:pdaURegEBP#, EDI
+	MOVL	SS:pdaURegDS#, #GS_REAL32|03h
+	MOVL	SS:pdaTss#+tss_stk0, #pdaXStackP#
+	MOVL	ESP, #pdaURegEIP-48t
+	JMP	knlTrapDone#
+.PAGE
+	.SBTTL	Data
+
+	DATA
+
+rmintset::			;Offset of first real mode interrupt set up
+	.LONG			;  block
+
+;Real mode interrupt vector table
+
+vinttbl::
+	.BLKL	256t
+.PAGE
+	.SBTTL	IO port table
+
+$$$=!0
+BLK BAD, 4t	;Invalid port
+BLK IN1, 4t	;First interupt controller
+BLK IN2, 4t	;Second interrupt controller
+BLK DSP, 4t	;Console display
+BLK FLP, 4t	;Floppy disk
+BLK KEY, 4t	;Keyboard
+BLK CM1, 4t	;Serial port 1
+BLK CM2, 4t	;Serial port 2
+BLK PRT, 4t	;Printer
+BLK GAM, 4t	;Game port
+BLK CLK, 4t	;Clock
+BLK IGN, 4t	;Port to ignore (returns 0 on IN)
+
+ioporttbl::
+ .BYTE BAD, BAD, BAD, BAD, BAD, BAD, BAD, BAD  ;000 001 002 003 004 005 006 007
+ .BYTE BAD, BAD, BAD, BAD, BAD, BAD, BAD, BAD  ;008 009 00A 00B 00C 00D 00E 00F
+ .BYTE BAD, BAD, BAD, BAD, BAD, BAD, BAD, BAD  ;010 011 012 013 014 015 016 017
+ .BYTE BAD, BAD, BAD, BAD, BAD, BAD, BAD, BAD  ;018 019 01A 01B 01C 01D 01E 01F
+ .BYTE IN1, IN1, BAD, BAD, BAD, BAD, BAD, BAD  ;020 021 022 023 024 025 026 027
+ .BYTE BAD, BAD, BAD, BAD, BAD, BAD, BAD, BAD  ;028 029 02A 02B 02C 02D 02E 02F
+ .BYTE BAD, BAD, BAD, BAD, BAD, BAD, BAD, BAD  ;030 031 032 033 034 035 036 037
+ .BYTE BAD, BAD, BAD, BAD, BAD, BAD, BAD, BAD  ;038 039 03A 03B 03C 03D 03E 03F
+ .BYTE CLK, CLK, CLK, CLK, BAD, BAD, BAD, BAD  ;040 041 042 043 044 045 046 047
+ .BYTE BAD, BAD, BAD, BAD, BAD, BAD, BAD, BAD  ;048 049 04A 04B 04C 04D 04E 04F
+ .BYTE BAD, BAD, BAD, BAD, BAD, BAD, BAD, BAD  ;050 051 052 053 054 055 056 057
+ .BYTE BAD, BAD, BAD, BAD, BAD, BAD, BAD, BAD  ;058 059 05A 05B 05C 05D 05E 05F
+ .BYTE KEY, IGN, BAD, BAD, KEY, BAD, BAD, BAD  ;060 061 062 063 064 065 066 067
+ .BYTE BAD, BAD, BAD, BAD, BAD, BAD, BAD, BAD  ;068 069 06A 06B 06C 06D 06E 06F
+ .BYTE BAD, BAD, BAD, BAD, BAD, BAD, BAD, BAD  ;070 071 072 073 074 075 076 077
+ .BYTE BAD, BAD, BAD, BAD, BAD, BAD, BAD, BAD  ;078 079 07A 07B 07C 07D 07E 07F
+ .BYTE BAD, BAD, BAD, BAD, BAD, BAD, BAD, BAD  ;080 081 082 083 084 085 086 087
+ .BYTE BAD, BAD, BAD, BAD, BAD, BAD, BAD, BAD  ;088 089 08A 08B 08C 08D 08E 08F
+ .BYTE BAD, BAD, BAD, BAD, BAD, BAD, BAD, BAD  ;090 091 092 093 094 095 096 097
+ .BYTE BAD, BAD, BAD, BAD, BAD, BAD, BAD, BAD  ;098 099 09A 09B 09C 09D 09E 09F
+ .BYTE IN2, IN2, BAD, BAD, BAD, BAD, BAD, BAD  ;0A0 0A1 0A2 0A3 0A4 0A5 0A6 0A7
+ .BYTE BAD, BAD, BAD, BAD, BAD, BAD, BAD, BAD  ;0A8 0A9 0AA 0AB 0AC 0AD 0AE 0AF
+ .BYTE BAD, BAD, BAD, BAD, BAD, BAD, BAD, BAD  ;0B0 0B1 0B2 0B3 0B4 0B5 0B6 0B7
+ .BYTE BAD, BAD, BAD, BAD, BAD, BAD, BAD, BAD  ;0B8 0B9 0BA 0BB 0BC 0BD 0BE 0BF
+ .BYTE BAD, BAD, BAD, BAD, BAD, BAD, BAD, BAD  ;0C0 0C1 0C2 0C3 0C4 0C5 0C6 0C7
+ .BYTE BAD, BAD, BAD, BAD, BAD, BAD, BAD, BAD  ;0C8 0C9 0CA 0CB 0CC 0CD 0CE 0CF
+ .BYTE BAD, BAD, BAD, BAD, BAD, BAD, BAD, BAD  ;0D0 0D1 0D2 0D3 0D4 0D5 0D6 0D7
+ .BYTE BAD, BAD, BAD, BAD, BAD, BAD, BAD, BAD  ;0D8 0D9 0DA 0DB 0DC 0DD 0DE 0DF
+ .BYTE BAD, BAD, BAD, BAD, BAD, BAD, BAD, BAD  ;0E0 0E1 0E2 0E3 0E4 0E5 0E6 0E7
+ .BYTE BAD, BAD, BAD, BAD, BAD, BAD, BAD, BAD  ;0E8 0E9 0EA 0EB 0EC 0ED 0EE 0EF
+ .BYTE IGN, IGN, IGN, IGN, IGN, IGN, IGN, IGN  ;0F0 0F1 0F2 0F3 0F4 0F5 0F6 0F7
+ .BYTE IGN, IGN, IGN, IGN, IGN, IGN, IGN, IGN  ;0F8 0F9 0FA 0FB 0FC 0FD 0FE 0FF
+ .BYTE BAD, BAD, BAD, BAD, BAD, BAD, BAD, BAD  ;100 101 102 103 104 105 106 107
+ .BYTE BAD, BAD, BAD, BAD, BAD, BAD, BAD, BAD  ;108 109 10A 10B 10C 10D 10E 10F
+ .BYTE BAD, BAD, BAD, BAD, BAD, BAD, BAD, BAD  ;110 111 112 113 114 115 116 117
+ .BYTE BAD, BAD, BAD, BAD, BAD, BAD, BAD, BAD  ;118 119 11A 11B 11C 11D 11E 11F
+ .BYTE BAD, BAD, BAD, BAD, BAD, BAD, BAD, BAD  ;120 121 122 123 124 125 126 127
+ .BYTE BAD, BAD, BAD, BAD, BAD, BAD, BAD, BAD  ;128 129 12A 12B 12C 12D 12E 12F
+ .BYTE BAD, BAD, BAD, BAD, BAD, BAD, BAD, BAD  ;130 131 132 133 134 135 136 137
+ .BYTE BAD, BAD, BAD, BAD, BAD, BAD, BAD, BAD  ;138 139 13A 13B 13C 13D 13E 13F
+ .BYTE BAD, BAD, BAD, BAD, BAD, BAD, BAD, BAD  ;140 141 142 143 144 145 146 147
+ .BYTE BAD, BAD, BAD, BAD, BAD, BAD, BAD, BAD  ;148 149 14A 14B 14C 14D 14E 14F
+ .BYTE BAD, BAD, BAD, BAD, BAD, BAD, BAD, BAD  ;150 151 152 153 154 155 156 157
+ .BYTE BAD, BAD, BAD, BAD, BAD, BAD, BAD, BAD  ;158 159 15A 15B 15C 15D 15E 15F
+ .BYTE BAD, BAD, BAD, BAD, BAD, BAD, BAD, BAD  ;160 161 162 163 164 165 166 167
+ .BYTE BAD, BAD, BAD, BAD, BAD, BAD, BAD, BAD  ;168 169 16A 16B 16C 16D 16E 16F
+ .BYTE BAD, BAD, BAD, BAD, BAD, BAD, BAD, BAD  ;170 171 172 173 174 175 176 177
+ .BYTE BAD, BAD, BAD, BAD, BAD, BAD, BAD, BAD  ;178 179 17A 17B 17C 17D 17E 17F
+ .BYTE BAD, BAD, BAD, BAD, BAD, BAD, BAD, BAD  ;180 181 182 183 184 185 186 187
+ .BYTE BAD, BAD, BAD, BAD, BAD, BAD, BAD, BAD  ;188 189 18A 18B 18C 18D 18E 18F
+ .BYTE BAD, BAD, BAD, BAD, BAD, BAD, BAD, BAD  ;190 191 192 193 194 195 196 197
+ .BYTE BAD, BAD, BAD, BAD, BAD, BAD, BAD, BAD  ;198 199 19A 19B 19C 19D 19E 19F
+ .BYTE BAD, BAD, BAD, BAD, BAD, BAD, BAD, BAD  ;1A0 1A1 1A2 1A3 1A4 1A5 1A6 1A7
+ .BYTE BAD, BAD, BAD, BAD, BAD, BAD, BAD, BAD  ;1A8 1A9 1AA 1AB 1AC 1AD 1AE 1AF
+ .BYTE BAD, BAD, BAD, BAD, BAD, BAD, BAD, BAD  ;1B0 1B1 1B2 1B3 1B4 1B5 1B6 1B7
+ .BYTE BAD, BAD, BAD, BAD, BAD, BAD, BAD, BAD  ;1B8 1B9 1BA 1BB 1BC 1BD 1BE 1BF
+ .BYTE BAD, BAD, BAD, BAD, BAD, BAD, BAD, BAD  ;1C0 1C1 1C2 1C3 1C4 1C5 1C6 1C7
+ .BYTE BAD, BAD, BAD, BAD, BAD, BAD, BAD, BAD  ;1C8 1C9 1CA 1CB 1CC 1CD 1CE 1CF
+ .BYTE BAD, BAD, BAD, BAD, BAD, BAD, BAD, BAD  ;1D0 1D1 1D2 1D3 1D4 1D5 1D6 1D7
+ .BYTE BAD, BAD, BAD, BAD, BAD, BAD, BAD, BAD  ;1D8 1D9 1DA 1DB 1DC 1DD 1DE 1DF
+ .BYTE BAD, BAD, BAD, BAD, BAD, BAD, BAD, BAD  ;1E0 1E1 1E2 1E3 1E4 1E5 1E6 1E7
+ .BYTE BAD, BAD, BAD, BAD, BAD, BAD, BAD, BAD  ;1E8 1E9 1EA 1EB 1EC 1ED 1EE 1EF
+ .BYTE BAD, BAD, BAD, BAD, BAD, BAD, BAD, BAD  ;1F0 1F1 1F2 1F3 1F4 1F5 1F6 1F7
+ .BYTE BAD, BAD, BAD, BAD, BAD, BAD, BAD, BAD  ;1F8 1F9 1FA 1FB 1FC 1FD 1FE 1FF
+ .BYTE GAM, GAM, GAM, GAM, GAM, GAM, GAM, GAM  ;200 201 202 203 204 205 206 207
+ .BYTE BAD, BAD, BAD, BAD, BAD, BAD, BAD, BAD  ;208 209 20A 20B 20C 20D 20E 20F
+ .BYTE BAD, BAD, BAD, BAD, BAD, BAD, BAD, BAD  ;210 211 212 213 214 215 216 217
+ .BYTE BAD, BAD, BAD, BAD, BAD, BAD, BAD, BAD  ;218 219 21A 21B 21C 21D 21E 21F
+ .BYTE BAD, BAD, BAD, BAD, BAD, BAD, BAD, BAD  ;220 221 222 223 224 225 226 227
+ .BYTE BAD, BAD, BAD, BAD, BAD, BAD, BAD, BAD  ;228 229 22A 22B 22C 22D 22E 22F
+ .BYTE BAD, BAD, BAD, BAD, BAD, BAD, BAD, BAD  ;230 231 232 233 234 235 236 237
+ .BYTE BAD, BAD, BAD, BAD, BAD, BAD, BAD, BAD  ;238 239 23A 23B 23C 23D 23E 23F
+ .BYTE BAD, BAD, BAD, BAD, BAD, BAD, BAD, BAD  ;240 241 242 243 244 245 246 247
+ .BYTE BAD, BAD, BAD, BAD, BAD, BAD, BAD, BAD  ;248 249 24A 24B 24C 24D 24E 24F
+ .BYTE BAD, BAD, BAD, BAD, BAD, BAD, BAD, BAD  ;250 251 252 253 254 255 256 257
+ .BYTE BAD, BAD, BAD, BAD, BAD, BAD, BAD, BAD  ;258 259 25A 25B 25C 25D 25E 25F
+ .BYTE BAD, BAD, BAD, BAD, BAD, BAD, BAD, BAD  ;260 261 262 263 264 265 266 267
+ .BYTE BAD, BAD, BAD, BAD, BAD, BAD, BAD, BAD  ;268 269 26A 26B 26C 26D 26E 26F
+ .BYTE BAD, BAD, BAD, BAD, BAD, BAD, BAD, BAD  ;270 271 272 273 274 275 276 277
+ .BYTE BAD, BAD, BAD, BAD, BAD, BAD, BAD, BAD  ;278 279 27A 27B 27C 27D 27E 27F
+ .BYTE BAD, BAD, BAD, BAD, BAD, BAD, BAD, BAD  ;280 281 282 283 284 285 286 287
+ .BYTE BAD, BAD, BAD, BAD, BAD, BAD, BAD, BAD  ;288 289 28A 28B 28C 28D 28E 28F
+ .BYTE BAD, BAD, BAD, BAD, BAD, BAD, BAD, BAD  ;290 291 292 293 294 295 296 297
+ .BYTE BAD, BAD, BAD, BAD, BAD, BAD, BAD, BAD  ;298 299 29A 29B 29C 29D 29E 29F
+ .BYTE BAD, BAD, BAD, BAD, BAD, BAD, BAD, BAD  ;2A0 2A1 2A2 2A3 2A4 2A5 2A6 2A7
+ .BYTE BAD, BAD, BAD, BAD, BAD, BAD, BAD, BAD  ;2A8 2A9 2AA 2AB 2AC 2AD 2AE 2AF
+ .BYTE BAD, BAD, BAD, BAD, BAD, BAD, BAD, BAD  ;2B0 2B1 2B2 2B3 2B4 2B5 2B6 2B7
+ .BYTE BAD, BAD, BAD, BAD, BAD, BAD, BAD, BAD  ;2B8 2B9 2BA 2BB 2BC 2BD 2BE 2BF
+ .BYTE BAD, BAD, BAD, BAD, BAD, BAD, BAD, BAD  ;2C0 2C1 2C2 2C3 2C4 2C5 2C6 2C7
+ .BYTE BAD, BAD, BAD, BAD, BAD, BAD, BAD, BAD  ;2C8 2C9 2CA 2CB 2CC 2CD 2CE 2CF
+ .BYTE BAD, BAD, BAD, BAD, BAD, BAD, BAD, BAD  ;2D0 2D1 2D2 2D3 2D4 2D5 2D6 2D7
+ .BYTE BAD, BAD, BAD, BAD, BAD, BAD, BAD, BAD  ;2D8 2D9 2DA 2DB 2DC 2DD 2DE 2DF
+ .BYTE BAD, BAD, BAD, BAD, BAD, BAD, BAD, BAD  ;2E0 2E1 2E2 2E3 2E4 2E5 2E6 2E7
+ .BYTE BAD, BAD, BAD, BAD, BAD, BAD, BAD, BAD  ;2E8 2E9 2EA 2EB 2EC 2ED 2EE 2EF
+ .BYTE BAD, BAD, BAD, BAD, BAD, BAD, BAD, BAD  ;2F0 2F1 2F2 2F3 2F4 2F5 2F6 2F7
+ .BYTE CM2, CM2, CM2, CM2, CM2, CM2, CM2, CM2  ;2F8 2F9 2FA 2FB 2FC 2FD 2FE 2FF
+ .BYTE BAD, BAD, BAD, BAD, BAD, BAD, BAD, BAD  ;300 301 302 303 304 305 306 307
+ .BYTE BAD, BAD, BAD, BAD, BAD, BAD, BAD, BAD  ;308 309 30A 30B 30C 30D 30E 30F
+ .BYTE BAD, BAD, BAD, BAD, BAD, BAD, BAD, BAD  ;310 311 312 313 314 315 316 317
+ .BYTE BAD, BAD, BAD, BAD, BAD, BAD, BAD, BAD  ;318 319 31A 31B 31C 31D 31E 31F
+ .BYTE BAD, BAD, BAD, BAD, BAD, BAD, BAD, BAD  ;320 321 322 323 324 325 326 327
+ .BYTE BAD, BAD, BAD, BAD, BAD, BAD, BAD, BAD  ;328 329 32A 32B 32C 32D 32E 32F
+ .BYTE BAD, BAD, BAD, BAD, BAD, BAD, BAD, BAD  ;330 331 332 333 334 335 336 337
+ .BYTE BAD, BAD, BAD, BAD, BAD, BAD, BAD, BAD  ;338 339 33A 33B 33C 33D 33E 33F
+ .BYTE BAD, BAD, BAD, BAD, BAD, BAD, BAD, BAD  ;340 341 342 343 344 345 346 347
+ .BYTE BAD, BAD, BAD, BAD, BAD, BAD, BAD, BAD  ;348 349 34A 34B 34C 34D 34E 34F
+ .BYTE BAD, BAD, BAD, BAD, BAD, BAD, BAD, BAD  ;350 351 352 353 354 355 356 357
+ .BYTE BAD, BAD, BAD, BAD, BAD, BAD, BAD, BAD  ;358 359 35A 35B 35C 35D 35E 35F
+ .BYTE BAD, BAD, BAD, BAD, BAD, BAD, BAD, BAD  ;360 361 362 363 364 365 366 367
+ .BYTE BAD, BAD, BAD, BAD, BAD, BAD, BAD, BAD  ;368 369 36A 36B 36C 36D 36E 36F
+ .BYTE BAD, BAD, BAD, BAD, BAD, BAD, BAD, BAD  ;370 371 372 373 374 375 376 377
+ .BYTE PRT, PRT, PRT, PRT, PRT, PRT, PRT, PRT  ;378 379 37A 37B 37C 37D 37E 37F
+ .BYTE BAD, BAD, BAD, BAD, BAD, BAD, BAD, BAD  ;380 381 382 383 384 385 386 387
+ .BYTE BAD, BAD, BAD, BAD, BAD, BAD, BAD, BAD  ;388 389 38A 38B 38C 38D 38E 38F
+ .BYTE BAD, BAD, BAD, BAD, BAD, BAD, BAD, BAD  ;390 391 392 393 394 395 396 397
+ .BYTE BAD, BAD, BAD, BAD, BAD, BAD, BAD, BAD  ;398 399 39A 39B 39C 39D 39E 39F
+ .BYTE BAD, BAD, BAD, BAD, BAD, BAD, BAD, BAD  ;3A0 3A1 3A2 3A3 3A4 3A5 3A6 3A7
+ .BYTE BAD, BAD, BAD, BAD, BAD, BAD, BAD, BAD  ;3A8 3A9 3AA 3AB 3AC 3AD 3AE 3AF
+ .BYTE DSP, DSP, DSP, DSP, DSP, DSP, DSP, DSP  ;3B0 3B1 3B2 3B3 3B4 3B5 3B6 3B7
+ .BYTE DSP, DSP, DSP, DSP, DSP, DSP, DSP, DSP  ;3B8 3B9 3BA 3BB 3BC 3BD 3BE 3BF
+ .BYTE DSP, DSP, DSP, DSP, DSP, DSP, DSP, DSP  ;3C0 3C1 3C2 3C3 3C4 3C5 3C6 3C7
+ .BYTE DSP, DSP, DSP, DSP, DSP, DSP, DSP, DSP  ;3C8 3C9 3CA 3CB 3CC 3CD 3CE 3CF
+ .BYTE DSP, DSP, DSP, DSP, DSP, DSP, DSP, DSP  ;3D0 3D1 3D2 3D3 3D4 3D5 3D6 3D7
+ .BYTE DSP, DSP, DSP, DSP, DSP, DSP, DSP, DSP  ;3D8 3D9 3DA 3DB 3DC 3DD 3DE 3DF
+ .BYTE BAD, BAD, BAD, BAD, BAD, BAD, BAD, BAD  ;3E0 3E1 3E2 3E3 3E4 3E5 3E6 3E7
+ .BYTE BAD, BAD, BAD, BAD, BAD, BAD, BAD, BAD  ;3E8 3E9 3EA 3EB 3EC 3ED 3EE 3EF
+ .BYTE FLP, FLP, FLP, FLP, FLP, FLP, FLP, FLP  ;3F0 3F1 3F2 3F3 3F4 3F5 3F6 3F7
+ .BYTE CM1, CM1, CM1, CM1, CM1, CM1, CM1, CM1  ;3F8 3F9 3FA 3FB 3FC 3FD 3FE 3FF
+
+	END

@@ -1,0 +1,740 @@
+	.TITLE	PPRCLS - Parallel printer (PPR) class driver for XOS
+
+;*--------------------------------------------------------------------------*
+;* PPRCLS.M86
+;*
+;* Written by: John R. Goltz
+;*
+;* Edit History:
+;* 02/26/90(brn) - Added comment box and TOUT 'time out' parameter for
+;*			addunit
+;* 29-Apr-91 JRG - Rewrote for XOS 1.6
+;*
+;*--------------------------------------------------------------------------*
+
+;++++
+; This software is in the public domain.  It may be freely copied and used
+; for whatever purpose you see fit, including commerical uses.  Anyone
+; modifying this software may claim ownership of the modifications, but not
+; the complete derived code.  It would be appreciated if the authors were
+; told what this software is being used for, but this is not a requirement.
+
+;   THIS SOFTWARE IS PROVIDED BY THE AUTHORS "AS IS" AND ANY EXPRESS OR
+;   IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
+;   OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+;   IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+;   INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+;   BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS
+;   OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+;   ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR
+;   TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
+;   USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+;----
+
+	.PROC	80486
+	.INCLUD	XOSINC:\XMAC\XOS.PAR
+	.INCLUD	XOSINC:\XMAC\XOSX.PAR
+	.INCLUD	XOSINC:\XMAC\XOSERR.PAR
+	.INCLUD	XOSINC:\XMAC\XOSDOS.PAR
+	.INCLUD	XOSINC:\XMAC\PCAT.PAR
+	.INCLUD	XOSINC:\XMAC\XOSLKE.PAR
+	.INCLUD	XOSINC:\XMAC\XOSXLKE.PAR
+
+MAJV   =!1t
+MINV   =!1t
+EDITNUM=!1t
+
+PPRRNGSIZE=!256t		;Size of the PPR ring buffer
+PPRTIMEOUT=!-1			;Initial default time-out value
+
+;Define offsets in the PPR DCB
+
+$$$=!4
+BLK dcb_ppintlvl , 4t		;Printer hardware interrupt level
+BLK dcb_pptimeout, 4t		;Default time-out interval
+BLK dcb_ppioreg  , 4t		;Base IO register for printer interface
+BLK dcb_ppstatus , 1t		;Status byte
+BLK              , 3t
+BLK dcb_pprngcnt , 4t		;Ring buffer byte count
+BLK dcb_pprngput , 4t		;Ring buffer putter pointer
+BLK dcb_pprngtak , 4t		;Ring buffer taker pointer
+BLK dcb_pprngbfr , PPRRNGSIZE	;The ring buffer
+dcb_ppSIZE=!$$$
+
+;Define values for dcb_ppstatus
+
+LPS$ACTIVE=!40h		;Printer output is active
+.PAGE
+	LKEHEAD	PPRCLS, MAJV, MINV, EDITNUM, LKETYPE_CLASS
+
+	CODE
+
+	.SBTTL	SVC dispatch table for printer class devices
+
+;SVC dispatch table for printer class devices
+
+pprdsp: .LONG	knlRtnZero##	;sd_mount	=  0. - Mount
+	.LONG	knlRtnZero##	;sd_cleardev	=  4. - Clear device
+	.LONG	knlRtnZero##	;sd_cleardcb	=  8. - Clear DCB
+	.LONG	knlRtnZero##	;sd_commit	= 12. - Commit data to disk
+	.LONG	knlRtnZero##	;sd_transold    = 16. - Transfer device/old
+	.LONG	knlRtnZero##	;sd_transnew    = 20. - Transfer device/new
+	.LONG	knlNullQio##	;sd_opena	= 24. - Open additional
+	.LONG	ppropen		;sd_open1	= 28. - Open device/file
+	.LONG	ppropen		;sd_devparm     = 32. - Device parameters
+	.LONG	knlIFnDev##	;sd_delete	= 36. - Delete file
+	.LONG	knlIFnDev##	;sd_rename	= 40. - Rename file
+	.LONG	knlIllInpGQ##	;sd_inblock	= 44. - Input block
+	.LONG	pproutblk	;sd_outblock	= 48. - Output block
+	.LONG	pproutblk1	;sd_outblockq	= 52. - Output block (XFF)
+	.LONG	pproutstr	;sd_outstring	= 56. - Output string
+	.LONG	knlRtnMOne##	;sd_getiosts	= 60. - Get input/output status
+	.LONG	knlIFnDevGQ##	;sd_special     = 64. - Special device function
+	.LONG	knlNullClose##	;sd_close	= 68. - Close file
+	.LONG	knlNullLabel##	;sd_label       = 72. - Get device label
+	.LONG	knlNullQioGQ##	;sd_commitfunc	= 76. - Commit data to disk
+	.LONG	knlInfoNone##	;sd_devinfo     = 80. - Get device info
+PPRDSPSZ=!{$-pprdsp}/4
+
+;Class function dispatch table for printer class devices
+
+	.LONG	CLSFMX
+pprcls:	.LONG	ppraddunit	;CF_ADDUNIT = 1. - Add unit
+	.LONG	pprunitinfo	;CF_PUNITS  = 2. - Get information about
+				;		     physical units
+	.LONG	knlIFnDev##	;CF_AUNITS  = 3. - Get information about active
+				;		     units
+CLSFMX=!{$-pprcls}/4
+
+;Class characteristics table for the PPR device class
+
+	DATA
+
+pprcctbl:
+ DCHARBGN  1, knlDCharValCom##
+.PAGE
+;Device parameter table for printer IO operations
+
+	CODE
+
+	.MOD	4
+	.LONG	PARMMAX
+pprioparms:
+	.LONG	ppriogenparms	 ;IOPAR_xxxxxx = 00xx - Generic IO parameters
+	.LONG	knlNullFilParms##;IOPAR_FILxxx = 01xx - File system IO
+				 ;			  parameters
+	.LONG	knlNullTrmParms##;IOPAR_TRMxxx = 02xx - Terminal IO parameters
+PARMMAX=!{$-pprioparms}/4
+
+	.LONG	PARMGENMAX
+ppriogenparms:
+	.LONG	0		;		   = 0000h
+	.LONG	knlIopFilOptn##	;IOPAR_FILOPTN     = 0001h
+	.LONG	knlIopFilSpec##	;IOPAR_FILSPEC     = 0002h
+	.LONG	knlIopDevSts##	;IOPAR_DEVSTS      = 0003h
+	.LONG	knlIopUnitNum##	;IOPAR_UNITNUM     = 0004h
+	.LONG	knlIopGlbId##	;IOPAR_GLBID       = 0005h
+	.LONG	knlIopDelay##	;IOPAR_DELAY       = 0006h
+	.LONG	knlIopTimeOut##	;IOPAR_TIMEOUT     = 0007h
+	.LONG	0		;IOPAR_INPSTS      = 0008h
+	.LONG	outsts		;IOPAR_OUTSTS	   = 0009h
+	.LONG	knlIopInpQLmt##	;IOPAR_INPQLMT	   = 000Ah
+	.LONG	knlIopOutQLmt##	;IOPAR_OUTQLMT	   = 000Bh
+	.LONG	0		;IOPAR_SIVECT1     = 000Ch
+	.LONG	0		;IOPAR_SIVECT2     = 000Dh
+	.LONG	0		;IOPAR_SIDATA      = 000Eh
+	.LONG	knlIopNumOpen##	;IOPAR_NUMOPEN     = 000Fh
+	.LONG	0		;IOPAR_BUFRLMT	   = 0010h
+PARMGENMAX=!{$-ppriogenparms}/4
+.PAGE
+;Device characteristics for printer devices
+
+	DATA
+
+	.MOD	4
+pprdctbl:
+ DCHARBGN  2, knlDCharValCom##
+ DCHARENT  CLASS  , TEXT, , 8, knlDcMsgClass##  , knlDcGetClass##, knlDcSetClass##, 0
+ DCHARENT  IOREG  , HEXV, , 4, knlDcMsgIoReg##  , knlDcGet4Byte##, 0             , dcb_ppioreg
+ DCHARENT  INT    , DECV, , 1, knlDcMsgInt##    , knlDcGet1Byte##, 0             , dcb_ppintlvl
+ DCHARENT  TIMEOUT, TIME, , 4, knlDcMsgTimeOut##, knlDcGet4Byte##, knlDcSet4Byte##, dcb_pptimeout
+
+	CODE
+.PAGE
+	.SBTTL	Initialization routine
+
+	INITSUB	pprinit
+
+pprinit:MOVL	EDI, #pprchk		;Install our class
+	MOVL	EBX, #pprcls		;Offset of class function dispatch table
+	MOVL	EAX, #'PPR'
+	CLRL	EDX
+	MOVL	ECX, #pprcctbl
+	MOVL	ESI, #pprccb
+	CALL	knlNewClass##
+4$:	JC	10$.S			;This should not fail!
+	MOVL	ECX, #codetop
+	CLRL	EDX
+	CLRL	EAX
+10$:	MOVL	EBX, #QSTS$DONE
+	RET
+
+	CODE
+.PAGE
+	.SBTTL	ppraddunit - Class function to add unit
+
+;Here for the CL_ADDUNIT function
+;	c{EBX} = Offset of CCB
+;	c{ESI} = Offset of IORB
+;	CALL	ppraddunit
+;	c{EAX} = Error code
+;	c{EBX} = Status bits
+;	c{ECX} = Item count (number of units added)
+
+$$$=!0
+FRM au_irout  , 4	;Offset of interrupt service routine
+FRM au_ioreg  , 4	;Base IO register number
+FRM au_unit   , 4	;Unit number
+FRM au_int    , 4	;Interrupt level
+au_SIZE=!$$$
+
+;Description block for addunitchar
+
+	DATA
+
+	.MOD	4
+ppraublk:
+ DCHARBGN  3, knlDCharValCom##
+ DCHARENT  UNIT , DECV, , 1, 0, 0, pprauunit , 0
+ DCHARENT  IOREG, HEXV, , 4, 0, 0, pprauioreg, 0
+ DCHARENT  INT  , DECV, , 1, 0, 0, pprauint  , 0
+
+	CODE
+
+ppraddunit:
+	ENTER	au_SIZE, 0		;Set up and initialize our stack frame
+	CLRL	EAX
+	DECL	EAX
+	MOVL	au_unit.B[EBP], EAX
+	MOVL	au_ioreg.B[EBP], EAX
+	MOVL	au_int.B[EBP], EAX
+	IFFAULT	6$
+	LFSL	EDX, iorb_buffer2.B[ESI] ;Get address of add-unit
+					 ;  characteristics
+	CALL	knlGiveQel##		;Give up the IORB
+	MOVL	EBX, #ppraublk		;Process the characteristics
+	MOVB	AL, #0			;Fail on bad names here
+	CALL	knlAddUnitChar##
+	JNC	8$.S			;If no error
+4$:	CLRL	ECX
+	MOVL	EBX, #QSTS$DONE
+	LEAVE				;Fail
+	TOFORK
+	STC
+	RET
+
+;Here if address error with IORB
+
+	FAULTHDR
+6$:	CALL	knlGiveQel##
+7$:	MOVL	EAX, #ER_ADRER
+	JMP	4$.S
+
+;Here with all parameters processed - make sure we got everything we need
+
+8$:	MOVL	EAX, au_unit.B[EBP]
+	ORL	EAX, au_ioreg.B[EBP]
+	ORL	EAX, au_int.B[EBP]
+	JNS	16$.S			;If have everything
+	MOVL	EAX, #ER_CHARM
+	JMP	4$.S
+
+;Here if printer unit is already defined
+
+12$:	MOVL	EAX, #ER_DUADF
+	JMP	4$.S
+
+;Here if requested physical device is already in use
+
+14$:	MOVL	EAX, #ER_PDADF
+	JMP	4$.S
+
+;Here with all needed characteristics found
+
+16$:	MOVB	AL, au_unit.B[EBP]	;Get unit number
+	MOVL	EDX, au_ioreg.B[EBP]	;And get IO register number
+	MOVL	EDI, pprccb+ccb_dcbhead	;Point to first printer DCB
+18$:	TESTL	EDI, EDI
+	JE	22$.S			;If no more DCBs
+	CMPB	dcb_punit.B[EDI], AL	;Same unit?
+	JE	12$.S			;Yes - fail
+	CMPL	dcb_ppioreg.B[EDI], EDX	;No - same device?
+	JE	14$.S			;Yes - fail
+20$:	MOVL	EDI, [EDI]		;Not this one - try next
+	JMP	18$.S			;Continue
+
+;Here if unit and device are not defined now
+
+22$:	MOVB	AL, #55h		;Get a pattern
+	OUTB	[DX]			;Output it
+	JMP	$+2.S
+	INB	[DX]			;Read it back
+	CMPB	AL, #55h		;Same?
+	JNE	24$.S			;No - printer not there
+	MOVB	AL, #0			;Yes - now try 0
+	OUTB	[DX]
+	JMP	$+2.S
+	INB	[DX]
+	TESTB	AL, AL
+	JE	30$.S
+24$:	MOVL	EAX, #ER_PDNAV		;If device does not exist
+25$:	JMP	4$
+
+;Here if error when have exec memory resource
+
+26$:	CLRL	EAX			;Clear name in DCB so device can not
+	MOVL	dcb_name.B[EDI], EAX	;  be used!
+28$:	CALL	knlGiveXRes##		;Give up the exec memory resource
+	JMP	25$.S
+
+;Here if interface exists
+
+30$:	CALL	knlGetXRes##		;Get exec memory resource
+	MOVL	ECX, au_int.B[EBP]	;Get interrupt number
+	CALL	knlChkIRqAvl##		;See if its available
+	JC	28$.S			;If not available
+	MOVL	EDX, au_ioreg.B[EBP]	;See if our IO registers are available
+	LEAL	ECX, 3.B[EDX]
+	CALL	knlChkIORegs##
+	JC	28$.S			;If not available
+	MOVL	ECX, #dcb_ppSIZE+dcb_cSIZE ;OK - create a DCB
+	MOVL	EBX, #DS$PHYS|DS$QOUT
+	MOVL	EDI, #pprdsp
+	CALL	knlMakeDcb##
+32$:	JC	28$.S
+	MOVL	ESI, #pprccb
+	CALL	knlLinkDcb##
+	JC	26$.S
+	MOVL	dcb_name+0.B[EDI], #'PPR' ;Setup device name
+	MOVL	dcb_devchar.B[EDI], #pprdctbl ;Store offset of devchar table
+	MOVZBL	EAX, au_unit.B[EBP]	;Put in unit number
+	MOVB	dcb_punit.B[EDI], AL
+	LEAL	EBX, dcb_name+3.B[EDI]
+	CALL	knlPutDecNmbr##
+	MOVL	dcb_pptimeout.B[EDI], #PPRTIMEOUT ;Store default time-out value
+	MOVL	dcb_fdisp.B[EDI], #pprfork ;Store offset of our fork routine
+	MOVB	CL, au_int.B[EBP]
+	MOVB	dcb_ppintlvl.B[EDI], CL	;Store interrupt number
+	MOVL	EDX, au_ioreg.B[EBP]	;Get base IO register number
+	MOVL	dcb_ppioreg.B[EDI], EDX	;Store it
+	ADDL	EDX, #2.B		;Point to control register
+	MOVB	AL, #0Ch		;Select printer, disable interrupt
+	OUTB	[DX]
+	PUSHL	EDI
+	MOVL	ECX, #PPRINTSZ		;Get space for interrupt code
+	CALL	knlGetXCode##
+	JC	32$.S
+	MOVL	au_irout.B[EBP], EDI	;Remember where code is going
+	MOVL	ESI, #pprint		;Copy prototype
+	SHRL	ECX, #2
+	MOVB	gdtable+GS_CODEALS+5, #DT_RWDATA+PL_0 ;Enable aliased code space
+	MOVW	AX, #GS_CODEALS
+	MOVL	ES, EAX
+	CLD
+	RMOVSL	[EDI], ES:[ESI]
+	POPL	EDI
+	MOVL	EBX, au_irout.B[EBP]	;Fix up the interrupt code
+	MOVL	ES:{fix1-pprint}+1.B[EBX], EDI
+	MOVL	EAX, EBX
+	SUBL	EAX, #pprint
+	SUBL	ES:{fix2-pprint}+1.B[EBX], EAX
+	CLRL	EAX
+	MOVL	ES, EAX
+	MOVB	gdtable+GS_CODEALS+5, AL ;Disable the aliased code space
+	LEAL	EDX, dcb_name.B[EDI]	;Get device name
+	MOVL	EBX, au_irout.B[EBP]	;Get offset of interrupt routine
+	MOVL	ECX, au_int.B[EBP]	;Get interrupt number
+	MOVB	dcb_ppintlvl.B[EDI], CL	;Remember it
+	MOVB	CH, #DT_INT+PL_0	;Set up our interrupt vector
+	CALL	knlSetIRq##
+	JC	40$.S			;This cannot fail!
+	LEAL	EBX, dcb_name.B[EDI]
+	MOVL	EDX, dcb_ppioreg.B[EDI]
+	LEAL	ECX, 3.B[EDX]
+	CALL	knlRegIORegs##
+	JC	40$.S
+	CALL	knlGiveXRes##		;Give up the exec memory resource
+	MOVL	ECX, au_int.B[EBP]	;Enable our interrupt
+	CALL	knlEnableInt##
+	MOVL	EDX, dcb_ppioreg.B[EDI]	;Point to the control register
+	ADDL	EDX, #2.B
+	MOVB	AL, #08h		;Reset the printer
+	OUTB	[DX]
+	MOVL	ECX, #10t		;Wait for a short while (about 100us
+	CALL	knlSDelay##		;  - the printer wants at least 50us)
+	MOVB	AL, #1Ch		;Remove reset, enable interrupt
+	OUTB	[DX]
+	CLRL	EAX			;Get our return value
+	MOVL	ECX, #1
+	MOVL	EBX, #QSTS$DONE
+	LEAVE
+	TOFORK
+	RET
+
+40$:	CRASH	IVCT
+.PAGE
+;Subroutine called by adduchars when "UNIT" characteristic found
+
+pprauunit:
+	CMPL	EAX, #99t
+	JAE	4$.S
+	MOVL	au_unit.B[EBP], EAX
+	CLC
+	RET
+
+;Subroutine called by adduchars when "INT" characteristic found
+
+pprauint:
+	CMPL	EAX, #15t.B		;Valid interrupt level?
+	JA	4$.S			;No - fail
+	CMPB	AL, #2			;Maybe
+	JB	4$.S			;No - fail
+	JNE	2$.S
+	MOVB	AL, #9
+2$:	MOVL	au_int.B[EBP], EAX	;Yes - store it
+	CLC
+	RET
+
+;Here if bad characteristic value
+
+4$:	MOVL	EAX, #ER_CHARV		;Get error code
+	STC				;Fail
+	RET
+
+;Subroutine called by adduchars when "IOREG" characteristic found
+
+pprauioreg:
+	MOVL	au_ioreg.B[EBP], EAX
+	RET
+.PAGE
+	.SBTTL	pprchk - Device check routine for printers
+
+;Device check routine for printers
+;	c{SS:EBX} = Address of device name (16 bytes)
+;	CALL	pprchk
+;	C:set = Error (match found)
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  Z:set = Match found
+;	    c{EDI} = Offset of DCB
+;	  Z:clr = Not found
+;  EBX and ESI are preserved
+
+pprchk:	MOVL	EAX, SS:[EBX]		;Is this PPR*?
+	ANDL	EAX, #0FFFFFFh
+	CMPL	EAX, #'PPR'
+	JNE	10$.S			;No
+	MOVL	EDI, pprccb+ccb_dcbhead	;Yes - point to first printer DCB
+	TESTL	EDI, EDI
+	JE	8$.S
+4$:	MOVL	EAX, dcb_name+0.B[EDI]	;Does name match?
+	CMPL	SS:[EBX], EAX
+	JNE	6$.S			;No
+	MOVL	EAX, dcb_name+4.B[EDI]
+	CMPL	SS:4.B[EBX], EAX
+	JNE	6$.S			;No
+	MOVL	EAX, dcb_name+8.B[EDI]
+	CMPL	SS:8.B[EBX], EAX
+	JNE	6$.S			;No
+	MOVL	EAX, dcb_name+12t.B[EDI]
+	CMPL	SS:12t.B[EBX], EAX
+	JE	12$.S			;Yes - this is it!
+6$:	MOVL	EDI, dcb_next.B[EDI]	;Not this one - try next
+	TESTL	EDI, EDI
+	JNE	4$.S			;Continue if another
+8$:	INCL	EDI			;No more - clear Z
+10$:	CLC
+12$:	RET
+.PAGE
+	.SBTTL	sd_open - Open device
+
+;Here for the open device entry
+;	c{EDI} = Offset of DCB
+
+ppropen:BTL	SS:xffCmd##, #O%ODF
+	JNC	2$.S			;If no illegal options
+	MOVL	EAX, #ER_NTFIL
+2$:	RET
+.PAGE
+	.SBTTL	CF_PUNITS - Get device unit information
+
+;Here for the get device information entry
+;	c{EDI}    = Offset of DCB
+
+pprunitinfo:
+	MOVL	EAX, #ER_NIYT
+	STC
+	RET
+.PAGE
+	.SBTTL	sd_outstring - Output string
+
+;Here for the write null terminated string entry
+;	c{ECX}    = Byte count
+;	c{ES:EBX} = Buffer address
+;	c{EDI}    = Offset of DCB
+;	CALL	pproutstr
+;	c{EAX} = Error code
+;	c{EBX} = Status bits
+;	c{ECX} = Number bytes output
+
+pproutstr:
+	CALL	knlIoQabLock##		;Lock the QAB
+	JC	4$.S			;If error
+	CALL	knlIoStringLock##	;Lock the sting pages
+	JNC	6$.S			;Go on if OK
+4$:	TOFORK
+5$:	RET
+
+	.SBTTL	sd_outblock - Write block
+
+;Here for the write block entry
+;	c{ECX}    = Byte count
+;	c{ES:EBX} = Buffer address
+;	c{EDI}    = Offset of DCB
+;	CALL	pproutblk
+;	c{EAX} = Error code
+;	c{EBX} = Status bits
+;	c{ECX} = Number bytes output
+
+pproutblk:
+	CALL	knlIoQabLock##		;Lock the QAB
+	JC	4$.S			;If error
+	CALL	knlIoWriteLock##	;Lock the buffer pages
+	JC	4$.S			;If error
+6$:	MOVB	iorb_queue.B[ESI], #dcb_outframe
+	MOVL	iorb_routine.B[ESI], #pproutblk1
+	JMP	knlXfQueue##		;Switch to extended fork context
+
+;Here in extended fork context
+
+pproutblk1:
+	BTL	SS:xffCmd##, #O%OUT	;Is output allowed?
+	JC	8$.S			;Yes - go on
+	CMPL	SS:xffCount##, #0.B	;No - really doing output?
+	JE	8$.S
+	JMP	knlIllOut##
+
+8$:	MOVL	EAX, dcb_pptimeout.B[EDI] ;Get default time-out value
+	MOVL	SS:xffTimeOut##, EAX
+	CMPL	SS:xffParm##, #0.B	;Do we have a parameter list?
+	JE	10$.S			;No
+	IFFAULT	knlQAdrErr0##
+	LFSL	EDX, SS:xffParm##	;Yes - get address of parameter list
+	MOVL	EBX, #pprioparms	;Process parameters
+	MOVL	ECX, #knlComDPParms##
+	CALL	knlProcDevParm##
+	JC	5$.S			;If error
+10$:	CLRL	EAX			;Clear total amount output
+	MOVL	SS:xffOption##, EAX
+12$:	MOVL	EAX, #PPRRNGSIZE	;Get number of bytes we can take now
+	MOVL	ECX, EAX
+	SUBL	ECX, dcb_pprngput.B[EDI] ;Get number to end of buffer
+	SUBL	EAX, dcb_pprngcnt.B[EDI] ;Get number available
+	CMPL	ECX, EAX		;Take the smaller of these
+	JB	13$.S
+	MOVL	ECX, EAX
+13$:	CMPL	ECX, SS:xffCount##	;Do we have this many?
+	JBE	14$.S			;Yes
+	MOVL	ECX, SS:xffCount##	;No - just take what we have
+14$:	JREGZ	ECX, 20$		;If nothing we can do now
+	MOVL	EDX, dcb_ppioreg.B[EDI]	;Point to the status register
+	INCL	EDX
+	INB	[DX]			;Get status bits
+	XORB	AL, #08h
+	TESTB	AL, #28h		;Is the printer available?
+	JNE	30$			;No - fail
+	IFFAULT	38$
+	LFSL	ESI, SS:xffBuffer1##	;Get buffer pointer
+	MOVL	EAX, ECX
+	SUBL	SS:xffCount##, EAX
+	ADDL	SS:xffBuffer1##, EAX
+	PUSHL	EDI
+	ADDL	EDI, dcb_pprngput.B[EDI]
+	ADDL	EDI, #dcb_pprngbfr.B
+	PUSHL	DS
+	POPL	ES
+	CLD
+	IFFAULT	36$
+	RMOVSB	[EDI], FS:[ESI]		;Copy data to our ring buffer
+	POPL	EDI
+	ADDL	SS:xffOption##, EAX	;Increase total amount output
+	ADDL	dcb_pprngcnt.B[EDI], EAX ;Update buffer count
+	ADDL	EAX, dcb_pprngput.B[EDI] ;Update putter pointer
+	CMPL	EAX, #PPRRNGSIZE	;Check for end of buffer
+	JB	18$.S
+	CLRL	EAX
+18$:	MOVL	dcb_pprngput.B[EDI], EAX
+	CMPL	dcb_pprngcnt.B[EDI], #PPRRNGSIZE-32t ;Should we continue?
+	JBE	12$			;Yes
+20$:	CLI				;No interrupts here
+	CMPL	dcb_pprngcnt.B[EDI], #0.B ;Have anything more to output?
+	JE	26$.S			;No
+	TESTB	dcb_ppstatus.B[EDI], #LPS$ACTIVE ;Yes - is printer active now?
+	JNE	24$.S			;Yes - nothing more needed
+	STI				;No - interrupts OK now
+	ORB	dcb_ppstatus.B[EDI], #LPS$ACTIVE ;Indicate active
+	MOVL	EDX, dcb_ppioreg.B[EDI]	;Point to the status register
+	INCL	EDX
+	INB	[DX]			;Get status bits
+	XORB	AL, #08h
+	TESTB	AL, #28h		;Is the printer available?
+	JNE	30$.S			;No - fail
+	TESTB	AL, #80h		;Yes - is the printer busy?
+	JE	32$.S			;Yes - must be broken!
+	DECL	EDX			;Point to data register
+	MOVL	EBX, dcb_pprngtak.B[EDI] ;Yes - start up the printer
+	MOVB	AL, dcb_pprngbfr.B[EDI+EBX] ;Get first character
+	CLI				;No interrupts here
+	OUTB	[DX]			;Output the data byte
+	INCL	EDX			;Point to the control register
+	INCL	EDX
+	MOVB	AL, #1Dh		;Strobe the data
+	OUTB	[DX]
+	INCL	EBX			;Bump pointer
+	CMPL	EBX, #PPRRNGSIZE	;Past end of buffer?
+	JB	22$.S			;No
+	CLRL	EBX			;Yes - reset pointer
+22$:	MOVL	dcb_pprngtak.B[EDI], EBX
+	DECL	dcb_pprngcnt.B[EDI]	;Reduce byte count
+	MOVL	ECX, #3t
+	CALL	knlSDelay##
+	MOVB	AL, #1Ch		;Terminate the strobe
+	OUTB	[DX]
+24$:	STI				;Allow interrupts now
+	CMPL	SS:xffCount##, #0.B	;All finished now?
+	JE	27$.S			;Yes
+	MOVL	EAX, SS:xffTimeOut##	;No - wait until printer available
+	CALL	knlXfWait##
+	JC	34$.S			;If error (must be time-out or abort)
+26$:	STI
+	CMPL	SS:xffCount##, #0.B	;Have any more to output
+	JNE	12$			;Yes - continue
+27$:	CLRL	EAX
+28$:	MOVL	ECX, SS:xffOption##	;Get total amount output
+	MOVL	EBX, #QSTS$DONE
+	RET
+
+;Here if printer is not available
+
+30$:	TESTB	AL, #20h		;Is the printer out of paper?
+	MOVL	EAX, #ER_NTRDY		;Assume its not ready
+	JE	34$.S			;No
+	MOVL	EAX, #ER_NOPAP		;Yes
+	JMP	34$.S
+
+;Here if printer is still busy
+
+32$:	MOVL	EAX, #ER_DEVER
+
+;Here if error indicated by xfwait - must be a time-out or abort
+
+34$:	ANDB	dcb_ppstatus.B[EDI], #~LPS$ACTIVE ;Indicate not active now
+	CLRL	ECX			;Reset the buffer
+	MOVL	dcb_pprngcnt.B[EDI], ECX
+	MOVL	dcb_pprngput.B[EDI], ECX
+	MOVL	dcb_pprngtak.B[EDI], ECX
+	JMP	28$.S
+
+;Here if address error
+
+	FAULTHDR
+36$:	POPL	EDI
+	FAULTHDR
+38$:	MOVL	EAX, #ER_ADRER
+	JMP	28$.S
+.PAGE
+	.SBTTL	outsts - Here for the IOPAR_OUTSTS parameter
+
+;Here for the IOPAR_OUTSTS parameter - Get output ready status
+
+	DPARMHDR  GET, HEXV
+outsts:	CLRL	EAX			;Assume not ready
+	CMPL	dcb_pprngcnt.B[EDI], #PPRRNGSIZE-8 ;Is the ring almost full?
+	JAE	4$.S			;Yes
+	MOVB	AL, #0FFh		;No - say ready
+4$:	JMP	knlStrParm4##		;Store value and return
+.PAGE
+	.SBTTL	Fork level routines
+
+;Here at fork level after interrupt
+
+pprfork:CLRL	EAX			;Indicate no error
+	JMP	knlResumeOutput##	;Resume output
+.PAGE
+	.SBTTL	Interrupt routine
+
+;Interrupt routine for printer (the first part of this routine is copied to
+;  create a seperate interrupt entry for each printer in the system)
+
+pprint:	PUSHAL				;Save registers
+	PUSHL	DS
+	PUSHL	ES
+	PUSHL	FS
+	PUSHL	GS
+	PUSHL	#GS_DATA.B		;Make normal data addressable
+	POPL	DS
+fix1:	MOVL	EDI, #0			;Point to our DCB
+fix2:	JMP	pprintcom		;Continue in common code
+PPRINTSZ=!{{$-pprint}+3}&0FFFFFFFCh
+
+pprintcom:
+	TESTB	dcb_ppstatus.B[EDI], #LPS$ACTIVE ;Are we expecting this?
+	JE	6$.S			;No - ignore the interrupt
+	CMPL	dcb_pprngcnt.B[EDI], #0.B ;Yes - more to output?
+	JLE	10$.S			;No
+	MOVL	EBX, dcb_pprngtak.B[EDI] ;Yes - get taker pointer
+	MOVL	EDX, dcb_ppioreg.B[EDI]	;Point to the status register
+	INCL	EDX
+	INB	[DX]			;Get status bits
+	XORB	AL, #88h
+	TESTB	AL, #0A8h		;Is the printer available?
+	JNE	10$.S			;No - stop for now
+	MOVB	AL, dcb_pprngbfr.B[EDI+EBX] ;Yes - get data byte
+	DECL	EDX			;Point to data register
+	OUTB	[DX]			;Output the data byte
+	INCL	EDX			;Point to the control register
+	INCL	EDX
+	MOVB	AL, #1Dh		;Strobe the data
+	OUTB	[DX]
+	INCL	EBX			;Bump pointer
+	CMPL	EBX, #PPRRNGSIZE	;Past end of buffer?
+	JB	4$.S			;No
+	CLRL	EBX			;Yes - reset pointer
+4$:	MOVL	dcb_pprngtak.B[EDI], EBX
+	DECL	dcb_pprngcnt.B[EDI]	;Decrement count
+	MOVL	ECX, #10t
+	CALL	knlSDelay##
+	MOVB	AL, #1Ch		;Terminate the strobe
+	OUTB	[DX]
+6$:	MOVB	AL, #INT_EOI
+	CMPB	dcb_ppintlvl.B[EDI], #7	;High interrupt?
+	CLI
+	JBE	8$.S			;No
+	OUTB	P_INC2P0		;Yes - release 2nd interrupt controller
+8$:	OUTB	P_INC1P0		;Release first interrupt controller
+	JMP	knlDismissInt2##	;Check for scheduling and dismiss
+
+;Here if should stop output - either we are out of characters to output or
+;  something is wrong with the printer
+
+10$:	ANDB	dcb_ppstatus.B[EDI], #~LPS$ACTIVE ;Indicate not active now
+	CALL	knlReqFork##		;Request fork
+	JMP	6$.S			;Thats all
+.PAGE
+	.SBTTL	Printer class driver data
+
+	DATA
+
+pprccb:.BLKB	ccb_SIZE	;PPR CCB
+
+	LKEEND

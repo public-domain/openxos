@@ -1,0 +1,2 @@
+echo %BCC% abcd
+

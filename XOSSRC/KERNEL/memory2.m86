@@ -1,0 +1,3590 @@
+	.TITLE	MEMORY2 - Memory allocation routine for XOS
+
+;++++
+; This software is in the public domain.  It may be freely copied and used
+; for whatever purpose you see fit, including commerical uses.  Anyone
+; modifying this software may claim ownership of the modifications, but not
+; the complete derived code.  It would be appreciated if the authors were
+; told what this software is being used for, but this is not a requirement.
+
+;   THIS SOFTWARE IS PROVIDED BY THE AUTHORS "AS IS" AND ANY EXPRESS OR
+;   IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
+;   OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+;   IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+;   INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+;   BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS
+;   OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+;   ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR
+;   TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
+;   USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+;----
+
+	.PROC	80486
+	.INCLUD	XOSINC:\XMAC\XOS.PAR
+	.INCLUD	XOSINC:\XMAC\XOSX.PAR
+	.INCLUD	XOSINC:\XMAC\XOSERR.PAR
+	.INCLUD	XOSINC:\XMAC\PCAT.PAR
+
+$$DEBUGXMB=!1			;Set to 1 to enable special XMB debug checks
+$$FILLXMB =!1			;Set to 1 to fill XMBs with data pattern
+$$DEBUGPDA=!1			;Set to 1 to enable special PDA debug checks
+
+	CODE
+
+	.SBTTL	pgfvirtpg - Routine to handle reference to virtual page
+
+;Here if at fork level
+
+2$:	CRASH	PFFL			;[Page Fault at Fork Level]
+
+;Here if at interrupt level
+
+4$:	CRASH	PFIL			;[Page Fault at Interrupt Level]
+
+;Here on page failure when attempting to reference virtual page - DS contains
+;  GS_DATA and the stack is setup as follows:
+;	c{{ESP}+0}  = Saved DS
+;	c{{ESP}+4}  = Saved EAX
+;	c{{ESP}+8}  = CR2
+;	c{{ESP}+12} = Trap error code
+;	c{{ESP}+16} = Trap EIP
+;	c{{ESP}+20} = Trap CS
+;	c{{ESP}+24} = Trap EFR
+
+pgfvirtpg::
+	CMPB	knlForkLvl#, #FORK_MAIN	;At main progralm level
+	JNE	2$.S			;No - serious problem
+	POPL	DS			;Yes - Restore registers
+	POPL	EAX
+	POPL	SS:pdaURegCR2#		;Save the CR2 value
+	CLI
+	POPL	SS:pdaTrapErr#		;Save the error code value
+	PUSHAL				;Save all registers the right way
+	STI
+	PUSHL	DS
+	PUSHL	ES
+	PUSHL	FS
+	PUSHL	GS
+	MOVL	EAX, #GS_DATA
+	MOVL	DS, EAX
+	MOVL	ES, EAX
+	CLI
+	MOVB	AL, #0Bh		;Get interrupt in service bits
+	OUTB	P_INC1P0
+	IOPAUSE
+	INB	P_INC1P0
+	STI
+	TESTB	AL, AL			;At interrupt level?
+	JNE	4$.S			;Yes - fail big!
+	MOVL	EDX, SS:pdaURegCR2#	;No - get linear address
+	SHRL	EDX, #12t		;Change to page table index
+	CMPL	EDX, #110h		;Is this a real mode warp-around page?
+	JAE	6$.S			;No
+	CMPL	EDX, #100h		;Maybe
+	JB	6$.S			;No
+	SUBL	EDX, #100h		;Yes - look at the real page
+6$:	TESTB	pgtable[EDX*4], #1	;Is a page allocated here?
+	JNE	12$			;Yes - just give page fail trap (must
+					;  be trying to write read-only page!)
+	MOVL	ECX, pgtable[EDX*4]	;No - get offset of MDB for page
+	SHRL	ECX, #8
+	CMPB	mdb_tasknum.B[ECX], #0	;Is this a DPMI memory block?
+	JNE	12$			;Yes - always give a page fault trap!
+	PUSHL	EDX			;No
+	SHLL	EDX, #12t		;Calculate offset in MDB
+	SUBL	EDX, mdb_la.B[ECX]
+	SHRL	EDX, #12t		;Change to page in MDB
+	XCHGL	EDX, ECX		;Get in right registers for getmp
+	ORL	ECX, #MT_PUSER<20t	;Merge in page type
+	CALL	getmp			;Get a memory page
+	POPL	EDX
+	JC	nomemfail		;If none available
+	ORB	AL, #65h		;Got one - set bits for page table entry
+	CLI
+	ANDL	pgtable[EDX*4], #02h.B	;Save the write bit
+	ORL	pgtable[EDX*4], EAX	;Store in page table
+	CMPL	EDX, #10h.B		;Is this a real mode warp-around page?
+	JAE	8$.S			;No
+	ANDL	pgtable+400h[EDX*4], #02h.B ;Yes
+	ORL	pgtable+400h[EDX*4], EAX
+8$:	INCL	SS:pdaWSPages#		;Increase count of real pages
+	MOVL	pgtable+{{la_data+ramaccess}>10t}.L, EAX
+	MOVL	EAX, CR3		;Also map it where we can get at it
+	MOVL	CR3, EAX		;Clear the page cache
+	STI
+	MOVL	EDI, #ramaccess		;Zero the page
+	MOVL	ECX, #1000h/4
+	CLRL	EAX
+	CLD
+	RSTOSL	[EDI]
+	TESTB	56t+2.B[ESP], #02h	;Called from real mode mode?
+	JNE	knlTrapDone#		;Yes - return to user
+	TESTB	52t.B[ESP], #03h	;Called from user mode?
+	JNE	knlTrapDone#		;Yes - return to user
+pgfvird:POPL	GS			;No - restore registers
+	POPL	FS
+	POPL	ES
+	POPL	DS
+	POPAL
+	IRET				;And return
+
+;Here if page is already allocated - must be trying to write a read-only
+;  page
+
+12$:	POPL	GS			;Restore registers
+	POPL	FS
+	POPL	ES
+	POPL	DS
+	POPAL
+	PUSHL	SS:pdaTrapErr#
+	PUSHL	SS:pdaURegCR2#
+	JMP	pgfuna2#		;Go handle this case
+.PAGE
+;Here if no more memory is available.  If the faulting instruction is preceeded
+;  with an IFFAULT pseudo-instruction with the $X bit set we go to the error
+;  routine specified with c{EAX} = ER_NEMA.  Otherwise, for now, we just kill
+;  the process - should give a critical error alert here and let the user
+;  decide what to do!
+
+nomemfail:
+	CMPW	52t.B[ESP], #GS_CODE	;Was it from our code segment?
+	JNE	nomemkill.S		;No - fatal error
+	MOVL	EBX, 48t.B[ESP]		;Yes - get offset of instruction
+	CMPL	EBX, #1002h		;Possible value?
+	JB	nomemkill.S		;No
+	CMPL	EBX, knlXCodePnt#	;Maybe
+	JAE	nomemkill.S		;No
+	CMPB	CS:-5.B[EBX], #0A9h	;Yes - have FAULT instruction?
+	JNE	nomemkill.S		;No
+	MOVL	EAX, CS:-4.B[EBX]	;Maybe - get offset
+	CMPL	EAX, #1002h		;Possible value?
+	JB	nomemkill.S		;No
+	CMPL	EAX, knlXCodePnt#	;Maybe
+	JAE	nomemkill.S		;No
+	CMPB	CS:-1.B[EAX], #0FEh	;Have right header value?
+	JNE	nomemkill.S		;No
+	MOVL	48t.B[ESP], EAX		;Store error handler offset as return
+					;  offset
+	MOVL	44t.B[ESP], #ER_NEMA	;Store error code in his EAX
+	JMP	pgfvird.S
+
+;Here if should kill the process
+
+nomemkill::
+	ADDL	ESP, #48t
+	POPL	EDI
+	POPL	EDX
+	POPL	EBP
+nomemkil2::
+	PUSHL	SS
+	POPL	ES
+	CLRL	EBX
+	CLRL	ESI
+	CLRL	ECX
+	MOVL	EAX, #TC_NOMEM<24t	;Get termination status
+	JMP	reqkill2#		;Go kill the process
+.PAGE
+	.SBTTL	unlockmem - Subroutine to unlock a memory page
+
+2$:	CRASH	TMPU			;[Too Many Pages to Unlock]
+
+;Subroutine to unlock memory pages - may be called at main program level or
+;  in extended fork context
+;	c{EDX}    = Offset of page table entry for first page to unlock
+;	c{ECX}    = Number of pages to unlock
+;	c{ES:ESI} = Address of per-request locked pages count
+;	c[GS]     = Selector for PDA
+;	CALL	unlockmem
+
+unlockmem::
+	CMPL	ECX, #MAXXFER/4096t+1	;Is the number of pages reasonable?
+	JA	2$.S			;No!!
+8$:	CALL	knlGetMTE		;Yes - get memory table entry
+	JE	16$.S
+	CMPB	3.B[EAX], #0		;Is the page locked?
+	JE	16$.S			;No!
+	DECB	3.B[EAX]		;Yes - reduce the lock count
+	DECL	memlockcnt		;Reduce system-wide locked page count
+	JS	18$.S
+	DECL	GS:pdaMLckCnt#		;Reduce per-process locked page count
+	JS	18$.S
+	DECL	ES:[ESI]		;Reduce per-request locked page count
+	JS	18$.S
+	TESTB	2.B[EAX], #80h		;User page?
+	JE	22$.S			;No
+	TESTB	2.B[EAX], #10h		;Shared page?
+	JE	22$.S			;No
+	PUSHL	ECX			;Yes - save registers we need here
+	PUSHL	EDX
+	MOVL	FS, 4.B[EAX]		;Get selector for the section's SDA
+	MOVL	EBX, FS:sdaMdbHead#	;Get offset of first mdb
+	SHLL	EDX, #10t		;Get linear address of page
+10$:	MOVL	ECX, SS			;Assume at main program level
+	CMPB	knlForkLvl#, #FORK_XFF	;Right?
+	JNE	12$.S			;Yes
+	MOVL	ECX, SS:xffPda#		;No - get right selector
+12$:	CMPW	CX, mdb_pda.B[EBX]	;Does this section belong to the right
+					;  process?
+	JNE	14$.S			;No - go on
+	CMPL	EDX, mdb_la.B[EBX]	;Yes - is address in this section?
+	JB	14$.S			;No
+	MOVL	ECX, mdb_size.B[EBX]	;Maybe
+	SHLL	ECX, #12t
+	ADDL	ECX, mdb_la.B[EBX]
+	CMPL	EDX, ECX
+	JB	20$.S			;Yes
+14$:	MOVL	EBX, mdb_segnext.B[EBX]	;No - advance to next MDB
+	TESTL	EBX, EBX
+	JNE	10$.S
+	CRASH	CFSS			;[Can't Find Shared Section]
+
+16$:	CRASH	MPNL			;[Memory Page Not Locked]
+
+18$:	CRASH	BMLC			;[Bad Memory Lock Count]
+
+;Here with MDB for the shared section
+
+20$:	DECL	mdb_lockcnt.B[EBX]	;Reduce lock count for shared section
+	JS	24$.S
+	POPL	EDX
+	POPL	ECX
+22$:	ADDL	EDX, #4.B		;Bump page table pointer
+	DECL	ECX			;Continue if more to unlock
+	JNE	8$
+	RET				;Finished
+
+24$:	CRASH	BSLC			;[Bad Shared section Lock Count]
+.PAGE
+	.SBTTL	knlGetPTE - Subroutine to get page table entry for address
+
+;Subroutine to get page table entry for address - the caller must verify that
+;  the address is valid before calling this routine - make be called at main
+;  program level or in extended fork context
+;	c{ES:EBX} = Address
+;	c[FS]     = PDA selector
+;	CALL	knlGetPTE
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  c{EDX} = Offset of page table entry
+;  All other registers are respected
+
+knlGetPTE::
+	MOVL	EAX, ES
+	ANDL	EAX, #0FFFCh
+	TESTB	AL, #04h		;Global address?
+	JE	8$.S			;Yes - go handle that case
+	ADDL	EAX, FS:pdaLdtPnt#
+	MOVB	DH, FS:mb_data-4+st_baseh.B[EAX]  ;Yes - get base address for
+	MOVB	DL, FS:mb_data-4+st_base+2.B[EAX] ;  segment
+	SHLL	EDX, #16t
+	MOVW	DX, FS:mb_data-4+st_base+0.B[EAX]
+	SUBL	EAX, FS:pdaLdtPnt#
+2$:	ADDL	EDX, EBX		;Get linear address
+	SHRL	EDX, #12t		;Change to page table index
+	LEAL	EDX, pgtable[EDX*4]	;Point to page table entry
+	CLC				;Make sure C is clear
+	RET
+
+;Here if have global segment
+
+8$:	MOVB	DH, gdtable+st_baseh[EAX]  ;Get base address for segment
+	MOVB	DL, gdtable+st_base+2[EAX]
+	SHLL	EDX, #16t
+	MOVW	DX, gdtable+st_base+0[EAX]
+	JMP	2$.S
+.PAGE
+	.SBTTL	knlGetMTE - Subroutine to get memory table entry given page table entry
+
+;Subroutine to get memory table entry given page table entry
+;	c{EDX} = Offset of page table entry
+;	CALL	knlGetMTE
+;	Z:set = No corresponding memory table entry
+;	Z:clr = Normal
+;	  c{EAX} = Offset of memory table entry
+;  All other registers are respected
+
+knlGetMTE::
+	MOVL	EAX, [EDX]		;Get page table entry
+knlGetMTE2::				;Enter here with page table entry in EAX
+	TESTB	AL, #01h		;Is page mapped?
+	JE	12$.S			;No, thus no corresponding knlMemTable
+	PUSHL	EDX			;  entry
+	MOVL	EDX, EAX		;Yes
+	SHRL	EAX, #7			;Get knlMemTable index
+	ANDL	EAX, #1Ch.B
+	JE	10$.S			;If no corresponding knlMemTable entry
+
+	CMPL	knlMemTable-4[EAX], #0
+	JE	2$.S
+	CMPL	knlMemTable-4[EAX], #toptable
+	JNE	4$.S
+2$:
+	INT3
+
+;;;	CRASH	MTER			;[Memory Table ERror]
+
+4$:	MOVL	EAX, knlMemTable-4[EAX]	;Get offset of memory area table
+	SUBL	EDX, -4.B[EAX]		;Subtract base address of memory area
+	SHRL	EDX, #12t		;Get index for area table
+	LEAL	EAX, [EAX+EDX*8]	;Get offset of area table entry
+	TESTL	EAX, EAX		;Make sure Z is clear
+10$:	POPL	EDX
+12$:	RET
+.PAGE
+	.SBTTL	knlForceLowMem - Subroutine to force page to low memory
+
+;Subroutine to force page to low memory - called by the DMA setup routine to
+;  ensure that a page is usable for DMA transfers since some machines can't
+;  do DMA transfers into memory mapped at the very top of their physical
+;  address spaces
+;	c{EAX}    = Physical address of page
+;	c{ES:EBX} = Virtual buffer address
+;	c{EDX}    = Page table index for page
+;	c[FS]     = Selector for PDA for process doing IO
+;	CALL	knlForceLowMem
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  c{EAX} = New physical address of page
+
+$$$=!0
+FRM flm_optx  , 4	;Page table index for old page
+FRM flm_vaddr , 8	;Virtual address of page
+FRM flm_paddr , 4	;Physical address of page
+FRM flm_oldpa , 4	;Old physical address of page
+flm_SIZE=!$$$
+
+2$:	RET
+
+	FAULTHDR
+knlForceLowMem::
+	CMPL	hidmalmt#, EAX		;Is this physical address too high?
+	JAE	2$.S			;No - nothing needed here
+	ENTER	flm_SIZE, 0		;Yes
+	PUSHAL
+	MOVL	flm_oldpa.B[EBP], EAX	;First try to find a free page below
+	MOVL	flm_optx.B[EBP], EDX	;  the DMA limit
+	MOVL	flm_vaddr+0.B[EBP], EBX
+	MOVL	flm_vaddr+4.B[EBP], ES
+	MOVL	ECX, #knlMemFree	;Point to first page on the free list
+4$:	MOVL	EBX, [ECX]
+	TESTL	EBX, EBX		;Have another free page to check?
+	JE	frclowna		;No - go do it the hard way!
+	MOVL	EBX, knlMemTable-4[EBX*4] ;Get physical address of this page
+	MOVL	EAX, 4.B[ECX]
+	MOVL	EDX, EAX
+	SHLL	EDX, #12t
+	ADDL	EDX, -4.B[EBX]
+	CMPL	EDX, hidmalmt#		;Is this page OK?
+	JB	8$.S			;Yes - go use it
+	LEAL	ECX, [EBX+EAX*8]	;No - point to this page's free list
+					;  entry
+	JMP	4$.S			;Continue
+
+;Here with free page we can use
+;	c{EAX} = Page table pointer for page
+;	c{EDX} = Physical address of page
+
+8$:	MOVL	flm_paddr.B[EBP], EDX	;Store physical address
+	PUSHL	EAX
+	MOVZWL	EAX, AX
+	LEAL	EDX, [EBX+EAX*8]
+	MOVL	EAX, [EDX]		;Remove this page from the free list
+	MOVL	[ECX], EAX
+	MOVL	EAX, 4.B[EDX]
+	MOVL	[ECX], EAX
+	DECL	knlMemAvail#		;Adjust amount free
+	MOVL	EAX, flm_optx.B[EBP]	;Find memory table entry for the old
+	MOVL	EAX, pgtable[EAX*4]	;  page
+	MOVL	ECX, EAX
+	SHRL	EAX, #7
+	ANDL	EAX, #1Ch.B
+	MOVL	EBX, knlMemTable-4[EAX]
+	SUBL	ECX, -4.B[EBX]
+	SHRL	ECX, #12t
+	MOVL	EAX, [EBX+ECX*8]	;Copy memory table entry for the old
+	MOVL	[EDX], EAX		;  page to the entry for the new page
+	MOVL	EAX, 4.B[EBX+ECX*8]
+	MOVL	4.B[EDX], EAX
+	POPL	EDX			;Restore memory table pointer for new
+	SHRL	EDX, #7			;  page
+	ANDL	EDX, #0E00h		;Get page table index in bits 9-11
+	ORL	EDX, flm_paddr.B[EBP]	;Merge in physical page address
+	MOVL	EAX, flm_optx.B[EBP]	;Get pointer to page table entry for
+	MOVL	ECX, pgtable[EAX*4]	;  old page
+	MOVL	EAX, ECX		;Get page table entry
+	ANDL	ECX, #01FFh		;Just save the page state bits
+	ORL	EDX, ECX		;Merge in page state bits
+	MOVL	pgtable+{{la_data+ramaccess}>10t}.L, EDX
+	MOVL	ECX, CR3		;Map it where we can get at it
+	MOVL	CR3, ECX		;Clear the page cache
+	CALL	givemp			;Put old page on the free list
+
+;At this point we have placed the old page on the free list but have not yet
+;  cleared its page table entry so we can still access it - we have removed
+;  the new page from the free list and have mapped it at ramaccess - now
+;  we must copy the contents of the old page to the new page
+
+	PUSHL	ES
+	PUSHL	GS
+	IFFAULT	frclowme
+	LGSL	ESI, flm_vaddr.B[EBP]	;Get address of original page
+	ANDL	ESI, #0FFFFF000h
+	PUSHL	DS
+	POPL	ES
+	MOVL	EDI, #ramaccess
+	MOVL	ECX, #400h
+	CLD
+	IFFAULT	frclowmep
+	RMOVSL	[EDI], GS:[ESI]		;Copy the page
+	POPL	GS
+	POPL	ES
+	MOVL	EDX, flm_optx.B[EBP]	;Update page table index
+	MOVL	EAX, pgtable+{{la_data+ramaccess}>10t}.L
+	MOVL	pgtable[EDX*4], EAX
+	MOVL	ECX, CR3		;Clear the page cache
+	MOVL	CR3, ECX
+	ANDL	flm_oldpa.B[EBP], #0FFFh ;Get new physical address
+	ANDL	EAX, #0FFFFF000h
+	ORL	flm_oldpa.B[EBP], EAX
+	POPAL
+	MOVL	EAX, flm_oldpa.B[EBP]
+	LEAVE
+	RET
+.PAGE
+;Here if there are no free memory pages below the DMA limit - we search for
+;  an allocated page which we can exchange with the our page
+
+frclowna:
+	CRASH	NLPA			;[No Low Page Available]
+
+	CLRL	EDI			;Start with the base table
+	MOVL	EDX, firstuser		;Start with first possible user page
+	MOVL	ECX, basetable-8
+	SUBL	ECX, EDX
+	MOVL	EBX, #basetable
+2$:	MOVB	AL, 2.B[EBX+EDX*8]	;Get page type
+	ANDB	AL, #0F0h		;Remove junk
+	CMPB	AL, #MT_PUSER<4t	;Is this a user page?
+	JAE	10$.S			;Yes - go use it
+4$:	INCL	EDX			;No - advance to next page
+	LOOP	ECX, 2$			;Continue if more in this table
+	INCL	EDI			;Advance to next table
+	MOVL	EBX, knlMemTable[EDI*4]	;Get offset of table
+	CLRL	EDX
+	MOVL	ECX, -8.B[EBX]		;Get size of table
+	TESTL	ECX, ECX
+	JNE	2$.S			;Continue if more to check
+	POPL	EAX			;No more - return failure!
+	LEAVE
+	MOVL	EAX, #ER_NEMA
+	STC
+	RET
+
+;Here with a page which we can use
+;CONSIDERATIONS:
+;	VIRTUAL PAGE 0 (DOUBLELY MAPPED)!
+;	SHARED PAGE
+
+10$:
+	CRASH	NLPA			;[No Low Page Available]
+
+;Here if have memory error
+
+frclowmep:
+	POPL	GS
+	POPL	ES
+frclowme:
+	POPAL
+	LEAVE
+	MOVL	EAX, #ER_ADRER
+	STC
+	RET
+.PAGE
+	.SBTTL	resetmem - Subroutine to give up all memory for process
+
+;Subroutine to give up all memory for process
+;	CALL	resetmem
+;	C:set = Error (page is locked)
+;	  c{EAX} = Error code
+;	C:clr = Normal
+
+resetmem::
+	ANDB	SS:pdaStatus1#, #{~{P1$DOSSEG|P1$BIOSSEG}}&0FFh
+					;Indicate no real mode environment
+	MOVL	EAX, SS:pdaLAddr#	;Clear secondary mapping for page 0
+	SHRL	EAX, #10t
+	CLRL	EBX
+	MOVL	pgtable+{{pda_TSIZE-2000}>10t}[EAX], EBX
+2$:	MOVL	EDI, SS:pdaDpmiFMdb#	;Have any DPMI memory allocated?
+	TESTL	EDI, EDI
+	JE	4$.S			;No
+	MOVL	EDX, mdb_la.B[EDI]	;Yes - get its linear address
+	CLRL	ECX
+	MOVL	EBP, #0FFFFh
+	CALL	knlChngMsect#		;Give up the DPMI msect
+	JNC	2$.S			;Continue if OK
+	RET				;Error - give up!
+
+;Here with all DPMI memory given up
+
+4$:	MOVL	EDX, SS:pdaSegTbl#
+	CMPW	SS:sd_lnksel-8.B[EDX], #0.B ;Is the real mode segment in use?
+	JE	6$.S			;No
+	MOVL	EBP, #0FFFFFFF8h	;Yes - give it up
+	CALL	removeseg#
+	JC	ret004.S		;If error
+	MOVL	EDX, SS:pdaSegTbl#
+6$:	MOVL	EBP, #0004h		;Get first local segment selector
+8$:	CMPW	sd_lnksel-4.B[EBP+EDX], #0.B ;Is this segment in use?
+	JE	10$.S			;No
+	PUSHL	EBP			;Yes
+	CALL	removeseg#		;Give up the segment
+	POPL	EBP
+	JC	ret004.S		;If error
+	MOVL	EDX, SS:pdaSegTbl#
+10$:	ADDL	EBP, #8t.B		;OK - bump to next selector
+	CMPL	EBP, SS:pdaSegMax#	;Done?
+	JB	8$.S			;No - continue
+ret004:	RET				;Yes
+.PAGE
+	.SBTTL	resetpda - Subroutine to give up all temporary PDA memory
+
+;Subroutine to give up all temporary PDA memory
+;	CALL	resetpda
+
+resetpda::				;Currently, this does nothing!!
+	RET
+.PAGE
+	.SBTTL	setldtpos - Subroutine to set the LDT position
+
+;Subroutine to set the LDT positon for a process - Called whenever the LDT
+;  is moved in the PDA.  This will only happen when the size of the IO
+;  permission bitmap is changed.
+
+;All registers except EAX and EDX are preserved
+
+setldtpos::
+	MOVZWL	EDX, SS:pdaTss#+tss_LDT	;Get selector for the LDT
+	MOVL	EAX, SS:pdaLdtPnt#	;Get linear address of the LDT
+	ADDL	EAX, #mb_data.B
+	ADDL	EAX, SS:pdaLAddr#
+	CLI				;No interrupts now
+	MOVW	gdtable+st_base[EDX], AX ;Store the offset in the selector
+	SHRL	EAX, #16t
+	MOVB	gdtable+st_base+2[EDX], AL
+	MOVB	gdtable+st_baseh[EDX], AH
+	LLDT	DX
+	STI				;Interrupts are OK now
+	MOVL	EAX, SS:pdaLdtPnt#	;Also update the segment table pointer
+	MOVL	EDX, SS:[EAX]
+	SUBL	EDX, #mb_data+8.B
+	SHRL	EDX, #1
+	LEAL	EAX, mb_data+8.B[EAX+EDX]
+	MOVL	SS:pdaSegTbl#, EAX
+	RET
+.PAGE
+	.SBTTL	knlGetPages - Subroutine to allocate memory pages
+
+;Subroutine to allocate memory pages - this routine is called to allocate
+;  both system and user pages, both real and virtual
+;	c{EAX} = Attribute bits for each page
+;	c{EBX} = Linear address for first page
+;	c{ECX} = Number of pages to allocate
+;	c{EDX} = Data for memory table
+;	c[SS]  = Selector for PDA for process
+;	CALL	knlGetPages
+;	C:set = Failure, no pages allocated at all
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;  All registers except EAX are preserved
+
+knlGetPages::
+	PUSHL	EBP
+	PUSHL	ESI
+	PUSHL	ECX
+	PUSHL	EBX
+	CLRL	ESI
+	MOVL	EBP, EAX
+	SHRL	EBX, #10t		;Get page table index
+	ANDB	BL, #0FCh
+	TESTB	AL, #1			;Want virtual only allocation?
+	JE	getvir			;Yes
+	CMPL	ECX, knlMemAvail#	;No - is there enough memory available?
+	JA	pagnota			;No - fail
+	IFFAULT	28$			;Probably - try to allocate it and see
+					;  what happens!
+2$:	CMPB	pgtable[EBX], #0	;Is this linear page in use?
+
+	JNE	$$$$con.S
+
+;;;;	JNE	conflct			;Yes - fail
+
+	PUSHL	ECX
+	CMPL	EBX, #la_pda>10t	;No - system area?
+	JB	14$.S			;No
+	CMPL	EBX, #la_xfork>10t	;Yes - is it a PDA page?
+	JAE	8$.S			;No
+	MOVL	ECX, EBX		;Yes - get page number in PDA
+	SHRL	ECX, #2
+	ANDL	ECX, #0Fh.B
+	ORL	ECX, #MT_PDA<20t	;Get page type
+	CMPB	CL, #0Fh		;Is it really the page directory page?
+	JNE	4$.S			;No
+	MOVL	ECX, #MT_PDIR<20t	;Yes - get right page type
+4$:	MOVL	EAX, SS:pdaOMPages#	;Can we have another overhead page?
+	CMPL	EAX, SS:pdaOMLimit#
+	JAE	6$.S			;No - fail!
+	CMPL	EAX, omlimit		;Also check system limit
+	JAE	6$.S
+	CALL	getmp			;OK - get a memory page
+	JC	10$.S			;If none available
+	INCL	SS:pdaOMPages#		;Got the page - count it
+	JMP	22$			;Continue
+
+$$$$con::JMP	conflct
+
+;Here if memory limit has been reached
+
+6$:	MOVL	EAX, #ER_MEMLX
+	JMP	12$.S
+
+;Here to allocate system page
+
+8$:	MOVL	ECX, #MT_SYS<20t
+	CALL	getmp			;Get memory page
+	JNC	22$			;If OK
+10$:	MOVL	EAX, #ER_NEMA		;Error = Not Enough Memory Available
+12$:	POPL	ECX
+	JMP	pagfail
+
+;Here to allocate private user page (EDX contains offset of MDB for msect which
+;  contains this page)
+
+14$:	MOVL	ECX, EBX		;Calculate offset in msect
+	SHLL	ECX, #10t
+	SUBL	ECX, mdb_la.B[EDX]
+	SHRL	ECX, #12t		;Change to page number in msect
+	ORL	ECX, #MT_PUSER<20t	;Get type value
+	CMPL	EBX, #110000h>10t	;Is this a real mode segment page?
+	JAE	18$.S			;No
+	MOVL	EAX, SS:pdaRMPages#	;Yes - can we have another one?
+	CMPL	EAX, SS:pdaRMLimit#
+	JAE	6$.S			;No
+	CMPL	EAX, rmlimit		;Also check system-wide limit
+	JAE	6$.S
+	ADDL	EAX, SS:pdaPMPages#	;Maybe
+	CMPL	EAX, SS:pdaTMLimit#
+	JAE	6$.S			;No
+	CMPL	EAX, tmlimit		;Also check system-wide limit
+16$:	JAE	6$.S
+	CALL	getmp			;OK - get a memory page
+17$:	JC	10$.S			;If none available
+	INCL	SS:pdaRMPages#
+	JMP	20$.S
+
+;Here if page is not in the real mode segment
+
+18$:	MOVL	EAX, SS:pdaPMPages#	;Can we have another page?
+	CMPL	EAX, SS:pdaPMLimit#
+	JAE	16$.S			;No
+	CMPL	EAX, pmlimit		;Also check system-wide limit
+	JAE	16$.S
+	ADDL	EAX, SS:pdaRMPages#	;Maybe
+	CMPL	EAX, SS:pdaTMLimit#
+	JAE	16$.S			;No
+	CMPL	EAX, tmlimit		;Also check system-wide limit
+	JAE	16$.S
+	CALL	getmp			;OK - get a memory page
+	JC	17$.S			;If none available
+	INCL	SS:pdaPMPages#
+20$:	INCL	SS:pdaWSPages#
+22$:	POPL	ECX
+	INCL	ESI			;Count page in case of failure
+	ORL	EAX, EBP		;Add in page attributes
+	MOVL	pgtable[EBX], EAX	;Store in page table
+	CMPL	EBX, #40h.B		;One of the first 16 pages?
+	JAE	24$.S			;No
+	MOVL	pgtable+400h[EBX], EAX	;Yes - map it above 1M too
+24$:	ADDL	EBX, #4.B		;Bump page table pointer
+	DECL	ECX			;More to do?
+	JNE	2$			;Yes - continue
+getpdn:	MOVL	EBX, CR3		;Clear the translation cache
+	MOVL	CR3, EBX
+.IF NE $$MEMDEBUG
+	CALL	chkmfl
+.ENDC
+getpd2:	POPL	EBX
+	POPL	ECX
+	POPL	ESI
+	POPL	EBP
+	CLC
+	RET				;And return
+
+;Here if have page fault when referencing the page table - must not have
+;  a page table allocated for these pages
+
+	FAULTHDR
+28$:	CALL	knlGetPgTbl		;Get page table
+	JNC	2$			;If OK
+	JMP	pagfail			;If error
+.PAGE
+;Here if want virtual only allocation
+
+getvir:	ANDL	EBP, #02h.B		;Only keep the read bit
+	ORL	EBP, #PT_VIRT<2.B	;Add in the page type
+	SHLL	EDX, #8			;Get MDB offset in the right position
+	ORL	EBP, EDX		;Merge it in
+4$:	CMPL	EBX, #110000h>10t	;Real mode page?
+	JAE	6$.S			;No
+	MOVL	EAX, SS:pdaRMPages#	;Yes - can we have another one?
+	CMPL	EAX, SS:pdaRMLimit#
+	JAE	8$.S
+	CMPL	EAX, rmlimit
+	JAE	8$.S
+	ADDL	EAX, SS:pdaPMPages#
+	JMP	10$.S
+
+;Here if allocated protected mode pages
+
+6$:	MOVL	EAX, SS:pdaPMPages#	;Can we have another page?
+	CMPL	EAX, SS:pdaPMLimit#
+8$:	JAE	20$.S
+	CMPL	EAX, pmlimit
+	JAE	20$.S
+	ADDL	EAX, SS:pdaRMPages#
+10$:	CMPL	EAX, SS:pdaTMLimit#
+	JAE	20$.S
+	CMPL	EAX, tmlimit
+	JAE	20$.S
+	IFFAULT	22$
+	CMPB	pgtable[EBX], #0	;Is this linear page in use?
+	JNE	18$.S			;Yes - fail
+	MOVL	pgtable[EBX], EBP	;No - store in page table
+	CMPL	EBX, #40h.B		;One of the first 16 pages?
+	JAE	12$.S			;No
+	MOVL	pgtable+400h[EBX], EBP	;Yes - map it above 1M too
+12$:	CMPL	EBX, #110000h>10t	;Real mode page?
+	JAE	14$.S			;No
+	INCL	SS:pdaRMPages#		;Yes
+	JMP	16$.S
+
+14$:	INCL	SS:pdaPMPages#
+16$:	ADDL	EBX, #4.B		;Bump page table pointer
+	INCL	ESI
+	DECL	ECX
+	JNE	4$
+	JMP	getpd2			;All done
+
+;Here if have address conflict
+
+18$:	MOVL	EDX, #-1
+	JMP	conflct
+
+;Here if we are over our limit
+
+20$:	MOVL	EAX, #ER_MEMLX
+	JMP	24$.S
+
+;Here if have page fault when referencing the page table - must not have
+;  a page table allocated for these pages
+
+	FAULTHDR
+22$:	CALL	knlGetPgTbl		;Get page table
+	JNC	4$
+24$:	MOVL	EDX, #-1
+	JMP	pagfail
+.PAGE
+	.SBTTL	knlMapPhyTemp - Subroutine to temporarily map physical location
+
+;Subroutine to temporarily map physical location - this routine is intended
+;  for strictly temporary use when initializing devices which use shared
+;  memory.  The mapped area is one page only and MUST be given up by calling
+;  knlMapPhyClr before ANY other memory allocation or IO is done.  It must be
+;  called from main program level only.
+;	c{EBX} = Physical address
+;	CALL	knlMapPhyTemp
+;	c{EBX} = Data segment offset corresponding to physical address
+;  All registers except EBX are preserved
+
+knlMapPhyTemp::
+	PUSHL	EBX
+	ANDL	EBX, #0FFFFF000h	;Clear the mapping control bits
+	ORB	BL, #1Bh		;Set the bits we need (including the
+					;  80486 cache disable bits)
+	MOVL	pgtable+{{la_data+ramaccess}>10t}.L, EBX
+	MOVL	EBX, CR3		;Clear the page cache
+	MOVL	CR3, EBX
+	POPL	EBX
+	ANDL	EBX, #0FFFh
+	ORL	EBX, #ramaccess		;Return the corresponding offset
+	RET
+
+;Subroutine to unmap temporarily mapped physical location which was mapped by
+;  knlMapPhyTemp
+;	CALL	knlMapPhyClr
+;  All registers are preserved
+
+knlMapPhyClr::
+	MOVL	pgtable+{{la_data+ramaccess}>10t}, #0 ;Clear the map
+	PUSHL	EAX
+	MOVL	EAX, CR3		;Clear the page cache
+	MOVL	CR3, EAX
+	POPL	EAX
+	RET
+.PAGE
+	.SBTTL	knlMapPhyPages - Subroutine to map physical pages
+
+;Subroutine to map physical pages
+;	c{EAX} = Attribute bits for each page
+;	c{ECX} = Number of pages to map
+;	c{EBX} = Linear address for first page
+;	c{EDX} = Physical address for first page
+;	c{EDI} = Bit mask for incrementable bits
+;	c[SS]  = Selector for PDA for process
+;	CALL	knlMapPhyPages
+;	C:set = Failure, no pages mapped at all
+;	  c{EAX} = Error code
+;	C:clr = Normal
+
+knlMapPhyPages::
+	PUSHL	EBP
+	PUSHL	ESI
+	PUSHL	ECX
+	PUSHL	EBX
+	ORL	EDX, EAX
+	SHRL	EBX, #10t		;Get page table index
+	ANDB	BL, #0FCh
+	CLRL	ESI
+	MOVL	EAX, EDI		;Get constant physical address bits
+	NOTL	EAX
+	ANDL	EAX, EDX
+	IFFAULT	8$
+2$:	CMPB	pgtable[EBX], #0	;Is this linear page in use?
+	JNE	6$.S			;Yes - fail
+	MOVL	pgtable[EBX], EDX	;Store in page table
+	CMPL	EBX, #40h.B
+	JAE	4$.S
+	MOVL	pgtable+400h[EBX], EDX
+4$:	INCL	ESI
+	ADDL	EBX, #4.B		;Bump page table pointer
+	ADDL	EDX, #1000h		;Bump physical address
+	ANDL	EDX, EDI
+	ORL	EDX, EAX
+	LOOP	ECX, 2$
+	JMP	getpdn			;Go finish up
+
+6$:	MOVL	EDX, #-1
+	JMP	conflct.S
+
+;Here if have page fault when referencing the page table - must not have
+;  a page table allocated for these pages
+
+	FAULTHDR
+8$:	CALL	knlGetPgTbl		;Get page table
+	JNC	2$.S
+	MOVL	EDX, #-1
+	JMP	pagfail.S
+
+;Here if do not have enough pages available for request
+
+pagnota:MOVL	EAX, #ER_NEMA
+	JMP	16$.S
+
+;Here if a needed page is already allocated
+;	c{EDX} = Value for F2 field in knlMemTable
+
+conflct:MOVL	EAX, #ER_MACFT
+pagfail:MOVL	EBX, [ESP]		;Restore first page
+	TESTL	ESI, ESI		;Did we get any pages at all?
+	JE	14$.S			;No
+	PUSHL	EAX			;Yes - save error code
+	MOVL	EAX, EDX		;Get F2 value in right register
+	MOVL	ECX, ESI		;Get number of pages to give up
+	CALL	knlGivePages		;Give up what we got
+	POPL	EAX			;Restore error code
+	JC	20$.S			;This should not fail!
+14$:	MOVL	ECX, CR3		;Clear the translation cache
+	MOVL	CR3, ECX
+.IF NE $$MEMDEBUG
+	CALL	chkmfl
+.ENDC
+16$:	POPL	EBX
+	POPL	ECX
+	POPL	ESI
+	POPL	EBP
+	STC				;Indicate error
+	RET				;And return
+
+;Here if error when giving up pages just allocated - this should not happen
+;  since the only possible error here is due to a lock page and there is no
+;  way these pages can be locked!
+
+20$:	CRASH	MPLK			;[Memory Page is LocKed]
+.PAGE
+	.SBTTL	knlGetPgTbl - Subroutine to get page table for page
+
+;Subroutine to get page table for page
+;	c{EBX} = Page table index
+;	CALL	knlGetPgTbl
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;  All registers are preserved
+
+2$:	CRASH	PTAE			;[Page Table Allocation Error]
+
+3$:	POPL	EAX
+	MOVL	EAX, #ER_MEMLX
+	STC
+	RET
+
+knlGetPgTbl::
+	PUSHL	EAX
+	MOVL	EAX, SS:pdaOMPages#	;Can he have another overhead page?
+	CMPL	EAX, SS:pdaOMLimit#
+	JAE	3$.S			;No - fail!
+	CMPL	EAX, omlimit		;Maybe - check system-wide limit too
+	JAE	3$.S			;No
+	PUSHL	ECX			;Yes
+	PUSHL	EBX
+	SHRL	EBX, #10t		;Get page directory index
+	ANDB	BL, #0FCh
+	CMPB	SS:pdaPageDir#[EBX], #0	;Do we have a page table for this
+					;  region?
+	JNE	2$.S			;Yes - something is very wrong!
+	CMPL	knlMemAvail#, #1.B	;No - at least two pages available?
+	JBE	12$			;No
+	PUSHL	EDX
+	MOVL	ECX, EBX		;Yes - get data for page table entry
+	SHRL	ECX, #2
+	ORL	ECX, #MT_PTBL<20t
+	CLRL	EDX
+	MOVW	DX, SS
+;;;;;;;	MOVZWL	EDX, SS:pdaPid#
+	CALL	getmp2			;Get a page
+	POPL	EDX
+	MOVB	AL, #67h		;Add in page attributes
+	CMPL	EBX, #la_system>20t	;Is this a system page?
+	JB	8$.S			;No - go on
+	DECL	knlMemUser#		;Yes - adjust number of user pages
+	PUSHL	EDI
+	PUSHL	ES
+	MOVL	ECX, #MAXPROCS+1	;Get number of processes
+	MOVL	EDI, #knlProcTable#	;Point to start of PDA table
+4$:	CMPW	[EDI], #0.B		;Is this slot in use?
+	JE	6$.S			;No
+	MOVW	ES, [EDI]		;Yes - get PDA selector
+	IFFAULT	6$
+	MOVL	ES:pdaPageDir#[EBX], EAX ;Store new page directory entry
+	FAULTHDR
+6$:	ADDL	EDI, #2.B
+	LOOP	ECX, 4$
+	PUSHL	#GS_SCHPDA		;Also store in scheduler map
+	POPL	ES
+	MOVL	ES:pdaPageDir#[EBX], EAX
+	POPL	ES
+	POPL	EDI
+	JMP	10$.S
+
+;Here if not a system page
+
+8$:	MOVL	SS:pdaPageDir#[EBX], EAX ;Store in page directory
+	INCL	SS:pdaOMPages#		;Charge the page to him
+10$:	POPL	EBX			;Restore page table offset
+	PUSHL	EDI
+	PUSHL	ES
+	PUSHL	DS
+	POPL	ES
+	LEAL	EDI, pgtable[EBX]	;Clear the new page table
+	ANDL	EDI, #0FFFFF000h
+	MOVL	ECX, #1024t
+	CLD
+	CLRL	EAX
+	RSTOSL	[EDI]
+	POPL	ES
+	POPL	EDI
+	POPL	ECX
+	POPL	EAX
+	RET
+
+;Here if don't have enough pages to map a map page
+
+12$:	POPL	EBX
+	POPL	ECX
+	POPL	EAX
+	MOVL	EAX, #ER_NEMA
+	STC
+	RET
+.PAGE
+	.SBTTL	knlGivePages - Subroutine to deallocate memory pages
+
+;Subroutine to deallocate memory pages
+;	c{EAX} = Value expected in F2 in memory table (-1 if pages are not to
+;		   be checked or given up)
+;	c{EBX} = Linear address for first page to give up
+;	c{ECX} = Maximum number of pages to give up
+;	CALL	givepages
+;	C:set = Error (no pages given up)
+;	  c{EAX} = Error code
+;	C:clr = Normal (all pages given up)
+;	  c{EAX} = Number of allocated pages given up
+;	  c{ECX} = Number of virtual + allocated pages given up
+
+2$:	MOVL	mpilmte, EAX		;Save offsets of memory table and page
+	MOVL	mpilpte, EDX		;  table entries for debugging!
+	POPL	EDX			;Here if trying to give up a locked page
+	POPL	EAX
+	MOVL	EAX, #ER_MPILK
+	STC
+	RET
+
+4$:	CRASH	BPLA			;[Bad Page Linear Address]
+
+6$:	CRASH	BMTE			;[Bad Memory Table Entry]
+
+knlGivePages::
+	SHRL	EBX, #10t		;Get offset of page table entry for
+knlGivePages2::				;  first page to give up
+	PUSHL	EAX
+	TESTB	BL, #03h
+	JNE	4$.S
+	LEAL	EDX, pgtable[EBX]	;Point to page table entry
+	PUSHL	ECX
+
+;Following loop verifies that all of the requested pages can be given up and
+;  are vaild
+
+8$:	CALL	knlGetMTE		;Get corresponding memory table entry
+	JE	14$.S			;If physical page
+	CMPL	4.B[ESP], #-1.B		;Want to check this page?
+	JE	12$.S			;No
+	PUSHL	EDX			;Yes
+	MOVL	EDX, 4.B[EAX]
+	CMPL	EDX, 8.B[ESP]
+	JNE	6$.S
+	POPL	EDX
+12$:	CMPB	3.B[EAX], #0		;Is this page locked?
+	JNE	2$.S			;Yes - fail!
+14$:	ADDL	EDX, #4.B		;No - bump pointer
+	LOOP	ECX, 8$			;Continue if more to check
+
+;Now we are ready to actuall give up the pages
+
+	POPL	ECX
+16$:	MOVL	EAX, pgtable[EBX]	;Get physical address of page
+	TESTL	EAX, EAX		;Have another page to give up?
+	JE	32$			;No - all done here
+	MOVL	pgtable[EBX], #0	;Yes - clear page table entry
+	CMPL	EBX, #40h.B		;One of the first 16 pages?
+	JAE	18$.S			;No
+	MOVL	pgtable+400h[EBX], #0	;Yes - unmap it above 1M too
+18$:	CMPL	[ESP], #-1.B		;Should we deallocate this page
+	JE	24$.S			;No - (device page)
+	TESTB	AL, #01h		;Need to deallocate the page?
+	JE	24$.S			;No (virtual page)
+	TESTB	AH, #0Eh		;Maybe
+	JE	28$.S			;No (physical page)
+	CALL	givemp			;Yes - give up the memory page
+	CMPL	EBX, #la_pda>10t	;System area?
+	JB	22$.S			;No
+	CMPL	EBX, #la_code>10t	;Yes - did we charge this process?
+	JAE	20$.S			;No
+	DECL	SS:pdaOMPages#		;Yes
+	JMP	28$.S
+
+;Here if giving up system page which was not changed to a process
+
+20$:	INCL	knlMemUser#
+	JMP	28$.S
+
+;Here if giving up user page
+
+22$:	DECL	SS:pdaWSPages#
+24$:	CMPL	EBX, #110000h>10t	;Real mode page?
+	JAE	26$.S			;No
+	DECL	SS:pdaRMPages#		;Yes
+	JMP	28$.S
+
+26$:	DECL	SS:pdaPMPages#
+28$:	ADDL	EBX, #4.B		;Bump page table pointer
+	TESTL	EBX, #0FFFh		;At end of directory page?
+	JNE	30$.S			;No
+	CALL	givepgtbl		;Yes - see if should give up this page
+	DECL	ECX
+	JNE	16$			;Continue if more to give up
+	JMP	34$.S			;If finished
+
+;Here if not at end of directory page
+
+30$:	DECL	ECX
+	JNE	16$			;Continue if more to give up
+32$:	CALL	givepgtbl		;Finished - give up last directory page
+					;  if its empty now
+34$:	ADDL	ESP, #4t.B
+	MOVL	EAX, CR3		;Clear the translation cache
+	MOVL	CR3, EAX
+.IF NE $$MEMDEBUG
+	CALL	chkmfl
+.ENDC
+	CLC
+	RET				;And return
+.PAGE
+;Subroutine to give up directory page if it is empty
+;	c{EBX} = Offset from start of page table to first entry for next
+;		   directory page
+;	CALL	givepgtbl
+
+givepgtbl::
+	CMPL	EBX, #la_pda>10t	;Is this for a system mapped page
+	JAE	10$.S			;Yes - don't ever give up the directory
+	PUSHL	ECX			;  page
+	PUSHL	EBX			;No
+	PUSHL	EDI
+	SUBL	EBX, #4h.B		;Get offset of start of page
+	ANDL	EBX, #0FFFFF000h
+	LEAL	EDI, pgtable[EBX]	;Point to start of page table page
+	MOVL	ECX, #400h		;Check all entries
+	PUSHL	DS
+	POPL	ES
+	CLRL	EAX
+	CLD
+	RESCASL	[EDI]
+	JNE	6$.S			;If page not empty
+	SHRL	EBX, #12t		;Get offset in page directory for this
+					;  entry
+	MOVL	EAX, SS:pdaPageDir#[EBX*4] ;Get physical page
+	MOVL	SS:pdaPageDir#[EBX*4], #0 ;Clear page directory entry
+	CALL	givemp			;Put page on the free list
+	MOVL	EAX, SS:pdaCR3#	;Clear the page cache
+	MOVL	CR3, EAX
+	DECL	SS:pdaOMPages#
+	JS	12$.S
+6$:	POPL	EDI
+	POPL	EBX
+	POPL	ECX
+10$:	RET				;All done
+
+12$:	CRASH	BSPC			;[Bad System Page Count]
+.PAGE
+	.SBTTL	chkmfl - Debug subroutine to check memory free list
+
+;This subroutine scans the memory free list, counts the entries, and compares
+;  the count to the expected value
+
+.IF NE $$MEMDEBUG
+
+chkmfl::PUSHL	ECX
+	PUSHL	EAX
+	PUSHL	EBX
+	CLRL	ECX
+	MOVZWL	EAX, knlMemFree+0
+	MOVZWL	EBX, knlMemFree+2
+2$:	TESTL	EBX, EBX
+	JE	4$.S
+	INCL	ECX
+	PUSHL	lstfree2
+	POPL	lstfree3
+	PUSHL	lstfree1
+	POPL	lstfree2
+	MOVL	lstfree1, EAX
+	MOVW	lstfree1+2, BX
+	MOVL	EBX, knlMemTable-4[EBX*4]
+	MOVL	EBX, [EBX+EAX*8]
+	MOVZWL	EAX, BX
+	SHRL	EBX, #16t
+	MOVB	BH, #0
+	JMP	2$.S
+
+4$:	CMPL	knlMemAvail#, ECX
+	JNE	10$.S
+	POPL	EBX
+	POPL	EAX
+	POPL	ECX
+	RET
+
+10$:	CRASH	BMFL			;[Bad Memory Free List]
+
+	DATA
+lstfree3::.LONG	0
+lstfree2::.LONG	0
+lstfree1::.LONG	0
+	CODE
+
+.ENDC
+.PAGE
+	.SBTTL	getmp - Subroutine to get memory page from the memory free list
+
+;Subroutine to get memory page from the memory free list
+;	c{ECX} = Data for type + F1 field in memory table
+;	c{EDX} = Data for F2 field in memory table
+;	CALL	getmp
+;	C:set = None available
+;	C:clr = Normal
+;	  c{EAX} = Physical address of page obtained (includes memory section
+;		     table index in bits 9-11)
+
+getmp:	CMPL	knlMemAvail#, #0.B	;No - do we have a page available?
+	JE	retcs4.S		;No!
+getmp2::				;Yes
+.IF NE $$MEMDEBUG
+	CALL	chkmfl
+.ENDC
+	DECL	knlMemAvail#		;Get a memory page
+	PUSHL	EBX
+	PUSHL	ECX
+	MOVL	EAX, knlMemFree+4	;Get page index for first free page
+	MOVL	ECX, knlMemFree+0	;Get table index
+	MOVL	EBX, knlMemTable-4[ECX*4] ;Get offset of page table
+	PUSHL	[EBX+EAX*8]		;Remove page from the free list
+	PUSHL	4.B[EBX+EAX*8]
+	POPL	knlMemFree+4
+	POPL	knlMemFree+0
+	POPL	[EBX+EAX*8]		;Store type and F1 values
+	MOVL	4.B[EBX+EAX*8], EDX	;Store F2 value
+	SHLL	EAX, #12t		;Change page index to memory offset
+	ADDL	EAX, -4.B[EBX]		;Get complete physical address
+	POPL	EBX
+	SHLL	ECX, #9			;Get table section in right bits
+	ORL	EAX, ECX		;Merge in the table section
+	RET				;Finished
+
+;Here if no more pages are available
+
+retcs4:	STC
+	RET
+.PAGE
+	.SBTTL	knlGetCMP - Subroutine to get contiguous memory pages from the memory free list
+
+;Subroutine to get contiguous memory page from the memory free list
+;	c{EAX} = Data for type + F1 field in memory table
+;	c{ECX} = Number of contiguous pages to allocate
+;	c{EDX} = Data for F2 field in memory table
+;	CALL	getcmp
+;	C:set = None available
+;	C:clr = Normal
+;	  c{EAX} = Physical address of first page obtained (includes memory
+;	             section table index in bits 9-11)
+
+;This function is intended to be used to allocate dedicated device buffers
+;  of more than 4KB which must be contiguous.  It should not be called as a
+;  part of normal IO operations but should be called once to allocate a
+;  dedicated buffer when the device is originally set up.  Because of the way
+;  memory is managed, the cost of allocating contiguous pages is relatively
+;  high!
+
+$$$=!0
+FRM gcmp_f1   , 4t
+FRM gcmp_f2   , 4t
+FRM gcmp_cnt  , 4t
+FRM gcmp_first, 4t
+FRM gcmp_last , 4t
+FRM gcmp_table, 4t
+FRM gcmp_prev , 4t
+gcmp_SIZE=!$$$
+
+getcmp::CMPL	ECX, knlMemAvail#	;Do we have enough pages available?
+	JG	retcs4.S		;No!
+
+.IF NE $$MEMDEBUG
+	CALL	chkmfl
+.ENDC
+
+	DECL	ECX
+	JE	getmp.S			;If only want one page!
+	ENTER	0, gcmp_SIZE
+	MOVL	gcmp_f1.B[EBP], EAX
+	MOVL	gcmp_f2.B[EBP], EDX
+	MOVL	gcmp_cnt.B[EBP], ECX
+
+;First, we scan through the memory free-list and find a page which has N - 1
+;  free pages following it
+
+	MOVL	EAX, #knlMemFree
+	MOVL	gcmp_prev.B[EBP], EAX
+4$:	MOVL	ECX, [EAX]
+	MOVL	EAX, 4.B[EAX]
+	MOVL	EBX, knlMemTable-4[ECX*4] ;Get offset of page table
+	MOVL	EDX, -8.B[EBX]		;Get number of entires in this table
+	SUBL	EDX, EAX		;Minus the offset of this page give the
+					;  number of pages available after this
+					;  one
+	MOVL	ECX, gcmp_cnt.B[EBP]	;get number of additional pages needed
+	CMPL	EDX, ECX		;Is this enough?
+	JL	10$.S			;No - go on
+8$:	INCL	EAX
+	TESTB	2.B[EBX+EAX*8], #0F0h	;Is this page free?
+	LOOPE	ECX, 8$			;Continue if so and need more
+	JE	12$.S			;If we found enough free pages
+
+;Here if don't have enought free pages starting with this free page - advance
+;  to the next page in the free list
+
+10$:	MOVL	EAX, gcmp_prev.B[EBP]
+	MOVL	ECX, [EAX]
+	MOVL	EAX, 4.B[EAX]
+	MOVL	EBX, knlMemTable-4[ECX*4] ;Get offset of page table
+	ORL	ECX, EAX		;Have another page?
+	JE	retcs4.S		;No - fail!
+	LEAL	EAX, [EBX+EAX*8]	;Yes - continue
+	MOVL	gcmp_prev.B[EBP], EAX
+	JMP	4$.S
+
+;Here with the requested number of contiguous pages - now we have to remove them
+;  from the free-list.  This is difficult since its a singlely linked list which
+;  is NOT ordered by address.  This means we have to the entire free-list
+;  looking for each page.  Actually, it's not quite that bad since it's fairly
+;  easy to check for any of the pages we want (since they are contiguous) so we
+;  only have to make one pass through the free-list.  Also, when the system is
+;  started the free-list IS ordered by address, so if the system has not been
+;  running for too long (which will usually be the case when devices are
+;  installed), this should be fairly quick.
+
+12$:	MOVL	EAX, gcmp_cnt.B[EBP]	;Reduce the number of pages available
+	INCL	EAX
+	SUBL	knlMemAvail#, EAX
+	MOVL	EDX, gcmp_prev.B[EBP]
+	MOVL	ECX, [EDX]
+	MOVL	EAX, 4.B[EDX]
+
+;Since we already know the predecessor for the first page we found, remove it
+;  from the free-list first.
+
+	MOVL	gcmp_table.B[EBP], ECX
+	MOVL	EBX, knlMemTable-4[ECX*4] ;Get offset of page table
+	PUSHL	[EBX+EAX*8]		;Remove page from the free list
+	PUSHL	4.B[EBX+EAX*8]
+	POPL	4.B[EDX]
+	POPL	[EDX]
+	MOVL	ECX, gcmp_f1.B[EBP]
+	MOVL	[EBX+EAX*8], ECX
+	MOVL	ECX, gcmp_f2.B[EBP]
+	MOVL	4.B[EBX+EAX*8], ECX
+	MOVL	gcmp_first.B[EBP], EAX
+	ADDL	EAX, gcmp_cnt.B[EBP]
+	MOVL	gcmp_last.B[EBP], EAX
+	MOVL	EDX, #knlMemFree
+14$:	MOVL	ECX, [EDX]
+	MOVL	EAX, 4.B[EDX]
+	TESTL	ECX, ECX		;Make sure have another entry
+	JE	24$.S			;This should not be possible!
+	CMPL	ECX, gcmp_table.B[EBP]
+	JNE	20$.S			;No
+	CMPL	EAX, gcmp_first.B[EBP]
+	JLE	20$.S			;No
+	CMPL	EAX, gcmp_last.B[EBP]
+	JG	20$.S			;No
+	PUSHL	[EBX+EAX*8]		;Yes - remove page from the free list
+	PUSHL	4.B[EBX+EAX*8]
+	POPL	4.B[EDX]
+	POPL	[EDX]
+	MOVL	ECX, gcmp_f1.B[EBP]
+	MOVL	[EBX+EAX*8], ECX
+	MOVL	ECX, gcmp_f2.B[EBP]
+	MOVL	4.B[EBX+EAX*8], ECX
+	DECL	gcmp_cnt.B[EBP]		;More to remove?
+	JNE	14$.S			;Yes - continue
+	MOVL	EAX, gcmp_first.B[EBP]
+	MOVL	ECX, gcmp_table.B[EBP]
+	MOVL	EBX, knlMemTable-4[ECX*4]
+	SHLL	EAX, #12t		;Change page index to memory offset
+	ADDL	EAX, -4.B[EBX]		;Get complete physical address
+	POPL	EBX
+	SHLL	ECX, #9			;Get table section in right bits
+	ORL	EAX, ECX		;Merge in the table section
+	LEAVE
+	RET
+
+;Here if this is not one of our pages - advance to next free list page
+
+20$:	MOVL	EBX, knlMemTable-4[ECX*4]
+	LEAL	EDX, [EBX+EAX*8]
+	JMP	14$.S
+
+;Here if we didn't find all of our pages on the free-list. This should not be
+;  possible!
+
+24$:	CRASH	NOFL			;[Not On Free-List]
+.PAGE
+	.SBTTL	givemp - Subroutine to give up memory page
+
+;Subroutine to give up memory page
+;	c{EAX} = Page table entry for page to give up
+;	CALL	givemp
+;  All registers except EAX are preserved
+
+givemp::
+.IF NE $$MEMDEBUG
+	CALL	chkmfl
+.ENDC
+	PUSHL	EBX
+	PUSHL	EDX
+	MOVL	EBX, EAX		;Copy map entry
+	SHRL	EAX, #9			;Get section table number
+	ANDL	EAX, #7.B
+	JE	10$.S			;If physical page!
+	MOVL	EDX, knlMemTable-4[EAX*4] ;Get offset of section table
+	SUBL	EBX, -4.B[EDX]		;Subtract offset of start of section
+	SHRL	EBX, #12t		;Get page number in section
+.IF NE $$MEMDEBUG
+
+THIS CODE NEEDS TO BE MODIFIED TO WORK WITH THE 32-32 free list format!
+
+	PUSHL	EAX
+	PUSHL	EBX
+	PUSHL	EDX
+	SHLL	EAX, #16t
+	ORL	EAX, EBX
+	CMPL	knlMemFree, EAX
+	JE	4$.S
+	MOVL	EDX, knlMemFree+0
+	MOVL	EBX, knlMemFree+4
+2$:	TESTL	EBX, EBX
+	JE	6$.S
+	MOVL	EBX, knlMemTable-4[EBX*4]
+
+
+	MOVL	EBX, [EBX+EDX*8]
+	CMPL	EBX, EAX
+	JE	4$.S
+	MOVZWL	EDX, BX
+	SHRL	EBX, #16t
+	MOVB	BH, #0
+	JMP	2$.S
+
+4$:	CRASH	GUFP			;[Giving Up Free Page]
+
+6$:	POPL	EDX
+	POPL	EBX
+	POPL	EAX
+.ENDC
+	PUSHL	knlMemFree+0		;Link into free list
+	PUSHL	knlMemFree+4
+	POPL	4.B[EDX+EBX*8]
+	POPL	[EDX+EBX*8]
+	MOVL	knlMemFree+4, EBX
+	MOVL	knlMemFree+0, EAX
+
+;;;	CLRL	EAX
+;;;	MOVL	4.B[EDX+EBX*8], EAX
+
+	INCL	knlMemAvail#		;Increase amount free
+	POPL	EDX
+	POPL	EBX
+	RET
+
+10$:	CRASH	DAPP			;[Deallocating Physical Page]
+.PAGE
+	.SBTTL	knlGetPdaMem - Subroutine to allocate PDA memory block
+
+;Format of PDA memory block:
+;  0.> (long)  mb_size  - Size of this block (in bytes, including all header
+;			    bytes)
+;  4.> (long)  mb_next  - Offset of next block in list
+;  8.> (long)  mb_pnt1  - Offset of first pointer to this block
+; 12.> (long)  mb_pnt2  - Offset of second pointer to this block
+; 16.>		        - First data item in this block
+
+;Subroutine to allocate PDA memory for current process
+;	c{ECX} = Size of block to allocate in bytes (does not include 16
+;		   header bytes)
+;	c[SS]  = Selector for the PDA
+;	CALL	knlGetPdaMem
+;	C:clr = Normal
+;	  c{ESI} = Offset of memory block allocated
+;	C:set = Error
+;	  c{EAX} = Error code
+
+knlGetPdaMem::
+	PUSHL	ES
+	PUSHL	SS
+	POPL	ES
+	CALL	knlGetPdaMemP
+	POPL	ES
+	RET
+
+	.SBTTL	knlGetPdaMemP - Subroutine to allocate PDA memory block for any process
+
+;Subroutine to allocate PDA memory for any process
+;	c{ECX} = Size of block to allocate in bytes (does not include 8
+;		   header bytes)
+;	c[ES]  = Selector for the PDA
+;	CALL	knlGetPdaMemP
+;	C:clr = Normal
+;	  c{ESI} = Offset of memory block allocated
+;	C:set = Error
+;	  c{EAX} = Error code
+
+knlGetPdaMemP::
+	PUSHL	EAX
+	PUSHL	ECX
+	ADDL	ECX, #mb_data+3.B	;Get actual number of bytes needed
+	ANDL	ECX, #0FFFFFFFCh.B	;Round up to longs
+	PUSHL	ES:pdaFree#
+	CALL	pdaincr			;Increase the size of the PDA
+	POPL	ESI
+	JC	4$.S			;If error
+	MOVL	ES:[ESI], ECX		;Store size in block
+	CLRL	EAX			;Clear pointers
+	MOVL	ES:mb_next.B[ESI], EAX
+	MOVL	ES:mb_pnt1.B[ESI], EAX
+	MOVL	ES:mb_pnt2.B[ESI], EAX
+	POPL	ECX
+	POPL	EAX
+.IF NE $$DEBUGPDA
+	CALL	pdacheck
+.ENDC
+	RET				;Finished
+
+;Here if do not have room for more PDA memory for this process
+
+4$:	POPL	ECX
+	POPL	EAX
+.IF NE $$DEBUGPDA
+	CALL	pdacheck
+.ENDC
+	MOVL	EAX, #ER_NEMA
+	STC
+	RET
+.PAGE
+;Subroutine to increase size of the PDA
+;	c{ECX} = Amount to increase size in bytes
+;	CALL	pdaincr
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  c{ECX} = Unchanged
+
+pdaincr:PUSHL	EBX
+	MOVL	EBX, ES:pdaFree#	;Get number of additional pages needed
+	PUSHL	ECX
+	ADDL	ECX, EBX
+	ADDL	ECX, #0FFFh
+	SHRL	ECX, #12t
+	ADDL	EBX, #0FFFh
+	SHRL	EBX, #12t
+	SUBL	ECX, EBX
+	JE	4$.S			;If no more needed
+
+;;;;;qqqqqqq need to check limits here!!!!
+
+
+	CMPB	knlForkLvl#, #FORK_MFORK ;Can we allocate memory now?
+	JA	6$.S			;No - fail!
+	SHLL	EBX, #12t		;Yes - get offset of next page
+	CMPL	EBX, #pda_TSIZE-2000h	;Can we get more?
+	JA	8$.S			;No - fail
+	ADDL	EBX, ES:pdaLAddr#	;Yes - get linear address for first
+	PUSHL	EDX			;  new page
+	CLRL	EDX
+	MOVW	DX, ES
+	MOVL	EAX, #27h
+	CALL	knlGetPages		;Allocate more pages
+	JC	8$.S			;If error
+	SUBL	SS:pdaOMPages#, ECX	;OK - fix up the block counts
+	JS	10$.S
+	ADDL	ES:pdaOMPages#, ECX
+	MOVL	EAX, ECX
+	POPL	EDX
+4$:	POPL	ECX
+	POPL	EBX
+	ADDL	ES:pdaFree#, ECX	;Bump top of PDA
+	RET				;Finished
+
+;Here if need to allocate memory but can't because not at main program level
+
+6$:	POPL	ECX			;Restore registers
+	POPL	EBX
+	MOVL	EAX, #ER_FUNCM		;Get error code
+	STC
+	RET
+
+;Here if error (Always give ER_NEMA as the error, even if knlGetPages reported
+;  something else, since we may get an ER_MACFT if trying to allocate a block
+;  bigger than 4K at the very top and there is not enough address space for it!
+;  No other error should be possible.)
+
+8$:	POPL	EDX
+	POPL	ECX
+	POPL	EBX
+	MOVL	EAX, #ER_NEMA
+	RET
+
+10$:	CRASH	BSPC			;[Bad System Page Count]
+.PAGE
+	.SBTTL	knlClrPdaMem - Subroutine to clear PDA memory block
+
+;Subroutine to clear PDA memory block
+;	c{ECX} = Size of block to clear (not including 16 byte header)
+;	c{ESI} = Offset of block to clear
+;	c[SS]  = Selector for PDA
+;	CALL	knlClrPdaMem
+;	C:clr always
+;  All registers are preserved
+
+knlClrPdaMem::
+	PUSHL	EAX			;Save registers we need
+	PUSHL	ECX
+	PUSHL	EDI
+	PUSHL	ES
+	LEAL	EDI, mb_data.B[ESI]	;Point to first data word
+	MOVL	EAX, SS
+	MOVL	ES, EAX
+	CLRL	EAX			;Clear data area
+	ADDL	ECX, #3.B
+	SHRL	ECX, #2
+	CLD
+	CLRL	EAX
+	RSTOSL	[EDI]
+	POPL	ES			;Restore registers
+	POPL	EDI
+	POPL	ECX
+	POPL	EAX
+	RET
+.PAGE
+	.SBTTL	knlChngPdaMem - Subroutine to change size of PDA memory block for current process
+
+;Subroutine to change size of PDA memory block for current process
+;	c{ECX} = New size of block in bytes (does not include 16 header bytes)
+;	c{ESI} = Offset of block
+;	c[SS]  = Selector for the PDA
+;	CALL	knlChngPdaMem
+;	C:clr = Normal
+;	  c{ESI} = Offset of block (unchanged)
+;	C:set = Error
+;	  c{EAX} = Error code
+
+knlChngPdaMem::
+	PUSHL	ES
+	PUSHL	SS
+	POPL	ES
+	CALL	knlChngPdaMemP
+	POPL	ES
+	RET
+
+	.SBTTL	knlChngPdaMemP - Subroutine to change size of PDA memory block for any process
+
+;Subroutine to change size of PDA memory block for any process
+;	c{ECX} = New size of block in bytes (does not include 16 header bytes)
+;	c{ESI} = Offset of block
+;	c[ES]  = Selector for the PDA
+;	CALL	knlChngPdaMemP
+;	C:clr = Normal
+;	  c{ESI} = Offset of block (unchanged)
+;	C:set = Error
+;	  c{EAX} = Error code
+
+knlChngPdaMemP::
+	ADDL	ECX, #mb_data+3t.B	;Adjust size
+	ANDL	ECX, #0FFFFFFFCh.B
+	SUBL	ECX, ES:[ESI]		;Get amount changed
+	JE	2$.S			;Nothing to do if no change
+	PUSHL	ESI
+	PUSHL	ECX
+	CALL	pdamove			;Move everything above this block up
+	POPL	ECX			;  or down
+	POPL	ESI
+	JC	4$.S			;If error
+	ADDL	ES:[ESI], ECX		;OK - adjust size of block
+.IF NE $$DEBUGPDA
+2$:	CALL	pdacheck
+	CLC
+	RET
+
+4$:	CALL	pdacheck
+	STC
+	RET
+.IFF
+	CLC				;Make sure C is clear
+2$:
+4$:	RET				;Finished
+.ENDC
+.PAGE
+	.SBTTL	knlRmvPdaMem - Subroutine to unlink and give up PDA memory block
+
+;Subroutine to unlink and give up PDA memory block for current process
+;	c{ESI} = Offset of block to give up
+;	c[ES]  = Selector for PDA
+;	CALL	knlRmvPdaMem
+;	C:clr always
+
+knlRmvPdaMem::
+	PUSHL	ES
+	PUSHL	SS
+	POPL	ES
+	CALL	knlRmvPdaMemP
+	POPL	ES
+	RET
+
+;Subroutine to unlink and give up PDA memory block for any process
+;	c{ESI} = Offset of block to give up
+;	c[ES]  = Selector for PDA
+;	CALL	knlRmvPdaMemP
+;	C:clr always
+
+knlRmvPdaMemP::
+	PUSHAL				;Save all registers
+	MOVL	EAX, ES:mb_pnt1.B[ESI]	;Get offset of pointer to this block
+	MOVL	EBX, ES:mb_next.B[ESI]	;Get offset of next block
+	TESTL	EAX, EAX		;Is it a pointer to data space?
+	JNS	4$.S			;No
+	MOVL	80000000h[EAX], EBX	;Yes - update pointer
+	JMP	6$.S
+
+;Here if pointer is in the PDA
+
+4$:	MOVL	ES:[EAX], EBX		;Update PDA pointer
+6$:	TESTL	EBX, EBX		;Is there a next block?
+	JE	8$.S			;No
+	MOVL	ES:mb_pnt1.B[EBX], EAX	;Yes - fix it up
+8$:	CMPL	ES:mb_pnt2.B[ESI], #0.B	;Is there a second pointer to the block?
+	JE	givpda2.S		;No
+	MOVL	EBX, ES:mb_pnt2.B[ESI]	;Yes
+	TESTL	EAX, EAX		;Is there a real previous block?
+	JS	10$.S			;No
+	CMPL	EAX, #pdaTop#		;Maybe
+	JGE	12$.S			;Yes
+10$:	CLRL	EAX			;No - clear this pointer
+	JMP	14$.S
+
+;Here if really have a previous block
+
+12$:	SUBL	EAX, #mb_next.B		;Get offset of previous block
+14$:	BTZL	EBX, #31t		;Is it a pointer to data space?
+	JNC	16$.S			;No
+	MOVL	[EBX], EAX		;Yes - update pointer
+	JMP	givpda2.S
+
+;Here if pointer is in the PDA
+
+16$:	MOVL	ES:[EBX], EAX		;Update PDA pointer
+	JMP	givpda2.S		;Go give up the block
+.PAGE
+	.SBTTL	knlGivePdaMem - Subroutine to give up PDA memory block
+
+;Subroutine to give up PDA memory block
+;	c{ESI} = Offset of block to give up
+;	c[SS]  = Selector for PDA
+;	CALL	knlGivePdaMem
+;	C:clr always
+
+knlGivePdaMem::
+	PUSHL	ES
+	PUSHL	SS
+	POPL	ES
+	CALL	knlGivePdaMemP
+	POPL	ES
+	RET
+
+	.SBTTL	knlGivePdaMemP - Subroutine to give up PDA memory block for any process
+
+;Subroutine to give up PDA memory block for any process
+;	c{ESI} = Offset of block to give up
+;	c[ES]  = Selector for PDA
+;	CALL	knlGivePdaMemP
+;	C:clr always
+
+knlGivePdaMemP::
+	PUSHAL				;Save all registers
+givpda2:MOVL	ECX, ES:[ESI]		;Get length of block to give up
+	NEGL	ECX
+	CALL	pdamove			;Move everything above the block down
+	POPAL
+.IF NE $$DEBUGPDA
+	CALL	pdacheck
+.ENDC
+	RET
+.PAGE
+;Subroutine to adjust all PDA memory blocks above the current block to change
+;  the size of the current block
+;	c{ECX} = Amount to change size of current block (+ increases,
+;		   - decreases size)
+;	c{ESI} = Offset of current block
+;	c{ES}  = Selector for PDA
+;	CALL	pdamove
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+
+pdamove:PUSHL	ESI			;Save offset of this block
+	ADDL	ESI, ES:[ESI]		;Point to first block to move
+	MOVL	EDX, ESI		;Copy offset of this block
+
+;First we see if we need to allocate more memory
+
+	TESTL	ECX, ECX		;Are we increasing the size?
+	JS	2$.S			;No
+	CALL	pdaincr			;Yes - allocate the memory
+	JC	8$.S			;If error
+
+;First we scan all blocks above the current block and adjust all back-pointers
+;  in blocks which will not be moved (we must do this in a separate pass to
+;  prevent confussion with pointers to a block which is being removed!)
+
+2$:	MOVL	EAX, ES:pdaFree#
+	TESTL	ECX, ECX
+	JS	4$.S
+	SUBL	EAX, ECX
+4$:	CMPL	EDX, EAX		;At old top of segment yet?
+	JAE	pdamov2.S		;Yes - finished with this part
+	MOVL	EDI, ES:mb_next.B[EDX]	;Get block which this one points to
+	TESTL	EDI, EDI		;Is there one?
+	JE	6$.S			;No
+	CMPL	EDI, ESI		;Yes - is it being moved?
+	JAE	6$.S			;Yes - its pointer will be adjusted
+					;  below
+	ADDL	ES:mb_pnt1.B[EDI], ECX	;No - must adjust its back-pointer here
+6$:	ADDL	EDX, ES:[EDX]		;Bump to next block
+	JMP	4$.S			;Continue
+
+;Here if error increasing size of the PDA
+
+8$:	POPL	ESI
+	RET
+.PAGE
+;Now we scan all blocks above the current block (which will be moved) and
+;  adjust their pointers
+
+pdamov2:MOVL	EDX, ESI
+2$:	CMPL	EDX, EAX		;At top of segment yet?
+	JAE	pdamov4.S		;Yes - finished with the pointers
+	MOVL	EDI, ES:mb_pnt1.B[EDX]	;No - get offset to first pointer to
+					;  this block
+	TESTL	EDI, EDI		;Is this pointer in use?
+	JE	6$.S			;No
+	JNS	4$.S			;Yes - if not pointer to data space
+	ADDL	80000000h[EDI], ECX	;Yes - adjust the pointer
+	JMP	6$.S
+
+4$:	ADDL	ES:[EDI], ECX		;Adjust the pointer
+	CMPL	EDI, ESI		;Is the pointer to this block in a
+					;  block which is being moved?
+	JB	6$.S			;No
+	ADDL	ES:mb_pnt1.B[EDX], ECX	;Yes - adjust back-pointer in this block
+6$:	MOVL	EDI, ES:mb_pnt2.B[EDX]	;Get offset of second pointer to this
+					;  block
+	TESTL	EDI, EDI		;Is there a second pointer?
+	JE	10$.S			;No
+	JNS	8$.S			;If not pointer to the data space
+	ADDL	80000000h[EDI], ECX
+	JMP	10$.S
+
+8$:	ADDL	ES:[EDI], ECX		;Yes - adjust it
+	CMPL	EDI, ESI		;Is the pointer to this block in a
+					;  block which is being moved?
+	JB	10$.S			;No
+	ADDL	ES:mb_pnt2.B[EDX], ECX	;Yes - adjust back-pointer in this block
+10$:	ADDL	EDX, ES:[EDX]		;Bump to next block
+	JMP	2$.S			;Continue
+.PAGE
+;Here after adjusting all pointers
+
+pdamov4:POPL	ESI			;Restore offset of block being changed
+	TESTL	ECX, ECX		;Are we increasing the size?
+	JS	6$.S			;No
+	MOVL	EDX, ESI		;Yes
+	MOVL	ESI, ES:pdaFree#
+	SUBL	ESI, ECX
+	SUBL	ESI, #4t.B		;Set up pointer to move up
+	LEAL	EDI, [ESI+ECX]
+	MOVL	ECX, ESI
+	SUBL	ECX, EDX
+	SUBL	ECX, ES:[EDX]
+	SARL	ECX, #2
+	INCL	ECX
+	STD
+	RMOVSL	[EDI], ES:[ESI]		;Move data up
+	CLC
+	RET
+
+;Here if reducing the size of the PDA
+
+6$:	ADDL	ESI, ES:[ESI]		;Set up pointers to move down
+	LEAL	EDI, [ESI+ECX]
+	MOVL	EAX, ECX
+	MOVL	ECX, ES:pdaFree#
+	SUBL	ECX, ESI
+	SHRL	ECX, #2
+	CLD
+	RMOVSL	[EDI], ES:[ESI]		;Move the data down
+	MOVL	ECX, ES:pdaFree#	;Calculate number of excess pages
+	ADDL	ECX, #0FFFh
+	SHRL	ECX, #12t
+	ADDL	ES:pdaFree#, EAX
+	MOVL	EBX, ES:pdaFree#
+	ADDL	EBX, #0FFFh
+	SHRL	EBX, #12t
+	SUBL	ECX, EBX
+	JE	8$.S			;If no excess pages
+	SHLL	EBX, #12t		;Get linear address of first page to
+	ADDL	EBX, ES:pdaLAddr#	;  give up
+	CLRL	EAX
+	MOVW	AX, SS
+	CALL	knlGivePages		;Give up the extra pages
+	JC	10$.S			;If error (should not fail here!)
+8$:	RET				;Finished
+
+;Here if error giving up PDA pages - this should never happen since the only
+;  possible error is due to a locked page and PDA pages are never locked!
+
+10$:	CRASH	MPLK			;[Memory Page is Locked]
+.PAGE
+	.SBTTL	knlGetPdaMemXf - Subroutine to allocate PDA memory block in exteneded fork context
+
+;Subroutine to allocate PDA memory in extended fork context
+;	c{ECX} = Size of block to allocate in bytes (does not include 8
+;		   header bytes)
+;	c[ES]  = Selector for the PDA
+;	CALL	knlGetPdaMemXf
+;	C:clr = Normal
+;	  c{ESI} = Offset of memory block allocated
+;	C:set = Error
+;	  c{EAX} = Error code
+
+knlGetPdaMemXf::
+	MOVL	EBX, #getpdamxi
+	JMP	gpdam2.S
+
+;Exec software interrupt routine to allocate PDA memory for getpdamemxf
+
+getpdamxi:
+	PUSHL	EDI			;Save XFF selector
+	MOVL	ES, EDX			;Get PDA selector
+	CALL	knlGetPdaMemP		;Allocate PDA memory
+	POPL	ES
+	MOVL	ES:xffTss#+tss_ESI, ESI ;Give the fork the offset
+	JMP	gpdam4.S		;Continue
+.PAGE
+	.SBTTL	knlGivePdaMemXf - Subroutine to give up PDA memory block in extended fork context
+
+;Subroutine to give up PDA memory block in extended fork context
+;	c{ESI} = Offset of block to give up
+;	c[ES]  = Selector for PDA for memory block
+;	CALL	knlGivePdaMemXf
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+
+knlGivePdaMemXf::
+	MOVL	ECX, ESI
+	MOVL	EBX, #givepdamxi
+gpdam2:	MOVL	EDX, ES
+	PUSHL	EDI
+	MOVL	EDI, SS
+	MOVL	ES, SS:xffPda#
+	CALL	knlReqXSig#		;Request exec software interrupt
+	POPL	EDI
+	JNC	knlXfWaitNTO#
+	RET
+
+;Exec software interrupt routine to give up PDA memory for givepdamemxf
+
+givepdamxi:
+	PUSHL	EDI			;Save XFF selector
+	MOVL	ES, EDX			;Get PDA selector
+	MOVL	ESI, ECX		;Get offset of PDA memory block
+	CALL	knlGivePdaMemP		;Give up the PDA memory block
+10$:	POPL	ES
+gpdam4::JC	12$.S			;If error
+	CLRL	EAX			;Indicate OK
+12$:	TOFORK				;Wake up the fork
+	CALL	knlResumeXf#
+	FROMFORK
+	RET
+
+	.SBTTL	knlRmvPdaMemXf - Subroutine to unlink and give up PDA memory block in extended fork context
+
+;Subroutine to unlink and give up PDA memory block in extended fork context
+;	c{ESI} = Offset of block to give up
+;	c[ES]  = Selector for PDA for memory block
+;	CALL	knlRmvPdaMemXf
+;	C:clr always
+
+knlRmvPdaMemXf::
+	MOVL	ECX, ESI
+	MOVL	EBX, #rmvpdamxi
+	JMP	gpdam2
+
+;Exec software interrupt routine to unlink and give up PDA memory for
+;  rmvpdamemxf
+
+rmvpdamxi:
+	PUSHL	EDI			;Save XFF selector
+	MOVL	ES, EDX			;Get PDA selector
+	MOVL	ESI, ECX		;Get offset of PDA memory block
+	CALL	knlRmvPdaMemP		;Unlink and give up the PDA memory block
+	JMP	10$.S
+
+	.SBTTL	knlChngPdaMemXf - Subroutine to change size of PDA memory block in extended fork context
+
+;Subroutine to change size of a PDA memory block in extended fork context
+;	c{ECX} = New size of block in bytes (does not include 16 header bytes)
+;	c{ESI} = Offset of block to give up
+;	c[ES]  = Selector for PDA for memory block
+;	CALL	knlChngPdaMemXf
+;	C:clr always
+
+knlChngPdaMemXf::
+	MOVL	EAX, ESI
+	MOVL	EBX, #chngpdamxi
+	JMP	gpdam2
+
+;Exec software interrupt routine to unlink and give up PDA memory for
+;  rmvpdamemxf
+
+chngpdamxi:
+	PUSHL	EDI			;Save XFF selector
+	MOVL	ES, EDX			;Get PDA selector
+	MOVL	ESI, EAX		;Get offset of PDA memory block
+	CALL	knlChngPdaMemP		;Unlink and give up the PDA memory block
+	POPL	ES
+	MOVL	ES:xffTss#+tss_ESI, ESI ;Give the fork the new offset
+	JMP	gpdam4.S		;Continue
+.PAGE
+	.SBTTL	pdacheck - Subroutine to check validity of PDA memory
+
+;Subroutine to check validity of PDA memory
+;	c[ES] = Selector for PDA to check
+;	CALL	pdacheck
+;  All registers are preserved
+
+.IF NE $$DEBUGPDA
+pdacheck:
+	PUSHAL				;Save all registers
+	MOVL	ESI, #pdaTop#		;Point to start of allocated space
+	TESTL	ESI, ESI		;Make sure have at least one block
+	JE	12$.S
+2$:	MOVL	EDX, ES:mb_pnt1.B[ESI]	;Get offset of first pointer to block
+	TESTL	EDX, EDX
+	JE	6$.S			;If no pointer
+	JNS	4$.S			;If PDA pointer
+	CMPL	80000000h[EDX], ESI	;Memory pointer - is it right?
+	JE	6$.S			;Yes
+	CRASH	PDAE
+
+4$:	CMPL	ES:[EDX], ESI		;Is the PDA pointer right?
+	JE	6$.S			;Yes
+	CRASH	PDAE
+
+6$:	MOVL	EDX, ES:mb_pnt2.B[ESI]	;Get offset of second pointer to block
+	TESTL	EDX, EDX
+	JE	10$.S			;If no pointer
+	JNS	8$.S			;If PDA pointer
+	CMPL	80000000h[EDX], ESI	;Memory pointer - is it right?
+	JE	10$.S			;Yes
+	CRASH	PDAE
+
+8$:	CMPL	ES:[EDX], ESI		;Is the PDA pointer right?
+	JE	10$.S			;Yes
+	CRASH	PDAE
+
+10$:	LEAL	EAX, mb_next.B[ESI]	;Get offset of thepointer
+	MOVL	EDX, ES:[EAX]		;Get block which this one points to
+	TESTL	EDX, EDX
+	JE	12$.S			;If none
+	CMPL	ES:mb_pnt1.B[EDX], EAX	;Does first back-pointer point to
+					;  this pointer?
+	JE	12$.S			;Yes
+	CMPL	ES:mb_pnt2.B[EDX], EAX	;No - does second back-pointer point to
+					;  this pointer?
+	JE	12$.S			;Yes
+	CRASH	PDAE
+
+12$:	ADDL	ESI, ES:[ESI]		;Bump pointer to next block
+	CMPL	ESI, ES:pdaFree#	;Finished?
+	JB	2$.S			;No - continue
+	JE	20$.S			;Yes
+	CRASH	PDAE
+
+20$:	POPAL				;Finished - restore registers
+	RET
+.ENDC
+.PAGE
+	.SBTTL	xferseg - Subrouitne to transfer segment to another process
+
+;Subroutine to transfer segment to another process
+;	c{EBX} = Selector for source segment
+;	c{EAX} = Selector for destination segment (0 means to allocate, bit
+;		   31 set means to allocate from top down)
+;	c[ES]  = Selector for destination PDA
+;	CALL	xferseg
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  c{EAX} = Actual destination selector used
+
+;The routine works by constructing a list of the pages in the segment, clearing
+;  all of the map entries for those pages, and then passing the page list and
+;  the MDB chain to an exec software interrupt executing in the context of the
+;  destination process.  This routine allocates linear address space and
+;  reconstructs the segment in its own address space using the page list and
+;  the MDB chain.  This is somewhat convoluted, but it does solve two major
+;  problems:
+;	Trying to allocate memory resources for another process (knl has no
+;	  good provisions for this)
+;	Copying entries between two unrelated page maps (either we make an
+;	  intermediate copy in globally mapped memory or we do a LOT of map
+;	  switching (twice per page!))
+;  If something goes wrong after the memory has been passed to the destination
+;  process, all of the memory being transfered is discarded.  This is unlikely,
+;  the only possible causes being lack of memory to allocate additional page
+;  tables, or a segment conflict (either a specified segment already exists
+;  or an additional segment cannot be created for the process).  Errors
+;  detected before the memory is transfered have no effect on the memory in
+;  question.
+
+$$$=!0
+FRM xfm_fmdb    , 4t		;Offset of first MDB for segment
+FRM xfm_lmdb    , 4t		;Offset of last MDB for segment
+FRM xfm_segla   , 4t		;Linear address for segment
+FRM xfm_pagecnt , 4t		;Page count (used for error recovery)
+FRM xfm_pagelist, 4t		;Offset of page list buffer
+FRM xfm_srcsel  , 4t		;Source selector
+FRM xfm_dstsel  , 4t		;Destination selector
+FRM xfm_dstpda  , 4t		;Selector for destination PDA
+xfm_SIZE=!$$$
+
+;Define offsets in the memory page list buffer
+
+mpl_index  =!0t			;Size index for buffer
+mpl_dsttype=!4t			;Destination segment type
+mpl_dstsel =!8t			;Destination segment selector
+mpl_lmdb   =!12t		;Offset of last MDB
+mpl_fpage  =!16t		;First page list entry
+
+2$:	CLRL	EAX
+	RET
+
+4$:	MOVL	EAX, #ER_INVST
+	STC
+	RET
+
+xferseg::
+	ANDL	EBX, #0FFF8h		;Remove junk
+	CMPL	EBX, #0FFF8h		;Trying to move the real mode segment?
+	JE	4$.S			;Yes - can't do that!
+	CMPL	EBX, SS:pdaSegMax#
+	JAE	4$.S
+	MOVL	EDX, SS:pdaSegTbl#
+	MOVL	EDI, SS:sd_fmdb.B[EBX+EDX] ;No - get offset of first MDB
+	ANDL	EDI, #0FFFFFFh
+	JE	2$.S			;Nothing to do if no MDBs
+	MOVL	ECX, EBX
+	ORB	CL, #04h
+	CMPW	SS:sd_lnksel.B[EBX+EDX], CX ;Anything linked to this segment?
+	JNE	4$.S			;Yes - can't move it!
+	ENTER	xfm_SIZE, 0		;No
+	MOVL	xfm_fmdb.B[EBP], EDI	;Store offset of first MDB for segment
+	MOVL	xfm_srcsel.B[EBP], EBX	;Store source selector
+	MOVL	xfm_dstsel.B[EBP], EAX	;Store destination selector
+	MOVL	xfm_dstpda.B[EBP], ES	;Store destination PDA selector
+	CLRL	EDX
+	MOVL	xfm_pagecnt.B[EBP], EDX
+	MOVL	FS, EDX			;Clear selectors in case point to the
+	MOVL	GS, EDX			;  segment we are moving
+6$:	CMPB	mdb_devtype.B[EDI], #0	;Simple msect?
+	JNE	xfsgmpl			;No - fail
+	ADDL	EDX, mdb_size.B[EDI]	;Yes - add in its size
+	MOVL	EDI, [EDI]		;Advance to next MDB for segment
+	TESTL	EDI, EDI		;Have another?
+	JNE	6$.S			;Yes - continue
+	ADDL	EDX, #2.B
+	SHLL	EDX, #2
+	CALL	knlGetIndex		;Get XMB index
+	JC	8$.S			;If error
+	CALL	knlGetXmb		;Get an exec buffer
+8$:	JC	xfsgerr			;If error
+	MOVL	xfm_pagelist.B[EBP], ESI
+	MOVL	[ESI], ECX		;Store size index in the buffer
+	ADDL	ESI, #mpl_fpage.B
+	ADDL	EBX, SS:pdaLdtPnt#
+	MOVB	AL, SS:mb_data+st_base+2.B[EBX] ;Get linear address of segment
+	MOVB	AH, SS:mb_data+st_baseh.B[EBX]
+	SHLL	EAX, #16t
+	MOVW	AX, SS:mb_data+st_base.B[EBX]
+	MOVL	xfm_segla.B[EBP], EAX
+					;Fall into next page
+.PAGE
+;When get here, we have determined that all msects in the segment are simple
+;  msects, have calculated the number of pages in the segment, and have
+;  allocated an exec buffer to hold the page list.  We now scan our memory
+;  map and copy each entry to the page list and clear the entry.  If we
+;  encounter a locked page, we stop and put back everything we cleared (this
+;  is generally quicker than doing two separate passes with the first one
+;  checking for locked pages, since we don't expect to find locked pages
+;  very often).
+
+	MOVL	EDI, xfm_fmdb.B[EBP]	;Point to first MDB
+2$:	MOVL	xfm_lmdb.B[EBP], EDI
+	MOVL	ECX, mdb_size.B[EDI]	;Get number of pages in the msect
+	MOVL	EDX, mdb_base.B[EDI]	;Get linear address for the msect
+	ADDL	EDX, xfm_segla.B[EBP]
+	SHRL	EDX, #10t		;Change to page table offset
+	ADDL	EDX, #pgtable
+4$:	CALL	knlGetMTE		;Get the memory table entry
+	CMPB	3.B[EAX], #0		;Is the page locked?
+	JNE	mpsgmpl			;Yes - fail
+	MOVL	EAX, [EDX]		;Get page table entry
+	MOVL	[ESI], EAX		;Store it in the page list
+	MOVL	[EDX], #0		;Clear out the page table entry
+	INCL	xfm_pagecnt.B[EBP]	;Count the page (for error recovery)
+	ADDL	ESI, #4.B		;No
+	ADDL	EDX, #4.B		;Bump page table pointer
+	TESTL	EDX, #3FFh		;Did we just leave a page table page?
+	JNE	6$.S			;No
+	LEAL	EBX, -pgtable[EDX]	;Yes - see if we should give up the page
+	CALL	givepgtbl		;  table page
+6$:	LOOP	ECX, 4$			;Loop if more pages in this msect
+	TESTL	EDX, #3FFh		;Did we just check this page?
+	JE	8$.S			;Yes - don't check it again
+	LEAL	EBX, -pgtable[EDX]	;No - see if we should give up the page
+	CALL	givepgtbl		;  table page
+8$:	MOVL	EDI, [EDI]		;Advance to next msect
+	TESTL	EDI, EDI		;Have another one?
+	JNE	2$.S			;Yes - continue
+					;No - fall into next page
+.PAGE
+;When get here we have the page list complete and are ready to send it to
+;  the destination process
+;  Format of the page list:
+;	Offset  Size       Use
+;	   0      4    Size index to use when giving up the buffer
+;	   4      4    Destination segment type
+;	   8      4    Destination segment selector
+;	  12      4    Offset of last MDB
+;	  16      4    First page table entry
+;  Note that msect boundries are not indicated in the page list.  The code
+;  at xfersegrcv uses the counts in the MDBs to determine where each msect
+;  ends.
+
+	PUSHL	EBP
+	MOVL	EBP, xfm_srcsel.B[EBP]	;Unlink the MDBs from the segment
+	MOVL	EDX, SS:pdaSegTbl#
+	ANDL	sd_fmdb.B[EBP+EDX], #0FF000000h
+	CALL	getsegtype		;Get the segment type
+	PUSHL	EAX
+	ORL	EBP, #07h.B
+	CALL	removeseg#		;Give up the segment
+	POPL	EDX			;Restore segment type
+	POPL	EBP
+	MOVL	EAX, xfm_pagecnt.B[EBP]	;Reduce our memory statistics
+	SUBL	SS:pdaWSPages#, EAX
+	SUBL	SS:pdaPMPages#, EAX
+	MOVL	EDI, xfm_fmdb.B[EBP]	;Restore offset of the first MDB
+	ANDL	EDI, #0FFFFFFh
+	MOVL	ECX, xfm_pagelist.B[EBP] ;Restore offset of the page list
+	MOVL	EAX, xfm_dstsel.B[EBP]	;Store destination selector in the
+	BTZL	EAX, #31t		;  page list buffer
+	JNC	4$.S
+	BTSL	EDX, #31t
+4$:	MOVL	mpl_dstsel.B[ECX], EAX
+	MOVL	mpl_dsttype.B[ECX], EDX
+	MOVL	EAX, xfm_lmdb.B[EBP]	;Store offset of the last MDB in the
+	MOVL	mpl_lmdb.B[ECX], EAX	;  page list buffer
+	MOVL	EDX, SS
+	MOVL	ES, xfm_dstpda.B[EBP]	;Get PDA selector for destination
+	MOVL	EBX, #xfersegrcv	;  process
+	CLRL	EAX
+	MOVL	SS:pdaResponse#, EAX	;Indicate no response now
+	TOFORK
+	CALL	knlReqXSig#		;Interrupt the destination process
+	JC	xfsgerr.S
+8$:	PUSHL	SS
+	POPL	ES
+	MOVB	AL, #knlQX_SPND#
+	CALL	knlWRequeue#		;Requeue to the suspend queue
+	FROMFORK
+	CALLF	schedule		;Call the scheduler (this is an
+					;  uninterruptable wait!)
+	MOVL	EAX, SS:pdaResponse#	;Do we have a response?
+	TESTL	EAX, EAX
+	JE	10$.S			;No - go wait some more
+	BTL	EAX, #31t		;Yes - set C if error
+	LEAVE
+	RET				;Finished
+
+10$:	TOFORK
+	JMP	8$.S
+
+;Here if have a locked page
+
+mpsgmpl:MOVL	EAX, #ER_MPILK
+	JMP	xfsgerr.S
+
+;Here if have a non-private msect (shared or device mapped)
+
+xfsgmpl:MOVL	EAX, #ER_MSNPR
+xfsgerr:PUSHL	EAX
+
+	CRASH	????
+.PAGE
+;Exec software interrupt routine executed to receive a segment
+;	c{EDI} = Offset of first MDB for segment
+;	c{ECX} = Offset of page list buffer
+;	c{EDX} = Selector for PDA of source process
+;	CALL	xfersegrcv
+
+$$$=!0
+FRM xmr_srcpda  , 4t
+FRM xmr_pagelist, 4t
+FRM xmr_fmdb    , 4t
+FRM xmr_dstsel  , 4t
+FRM xmr_segla   , 4t
+xmr_SIZE=!$$$
+
+xfersegrcv:
+	ENTER	xmr_SIZE, 0		;Set up our stack frame
+	MOVL	xmr_srcpda.B[EBP], EDX	;Save PDA selector for source process
+	MOVL	xmr_pagelist.B[EBP], ECX ;Save offset of the page list buffer
+	MOVL	xmr_fmdb.B[EBP], EDI	;Save offset of first MDB for segment
+	PUSHL	EBP
+	MOVL	EBX, mpl_dsttype.B[ECX]	;Get segment type and search direction
+	MOVL	EBP, mpl_dstsel.B[ECX]	;Get selector
+	MOVB	AL, #SK_USER		;Get segment kind
+	CALL	makeseg#		;Create the segment
+	POPL	EBP
+	JC	2$.S
+	ANDL	EAX, #0FFFFFFF8h.B
+	MOVL	xmr_dstsel.B[EBP], EAX
+	MOVL	ECX, xmr_pagelist.B[EBP]
+	MOVL	ECX, mpl_lmdb.B[ECX]	;Get offset of last MDB
+	MOVL	EDX, mdb_base.B[ECX]	;Get its offset
+	MOVL	ECX, mdb_size.B[ECX]	;Get its size
+	SHLL	ECX, #12t		;Change to number of bytes
+	PUSHL	EBP
+	MOVL	EBP, EAX
+	CALL	checkla#		;Allocate linear address space
+	POPL	EBP
+2$:	JC	xfsgdme
+	MOVL	EBX, xmr_dstsel.B[EBP]
+	ADDL	EBX, SS:pdaLdtPnt#
+	MOVB	AL, SS:mb_data+st_base+2.B[EBX] ;Get linear address of segment
+	MOVB	AH, SS:mb_data+st_baseh.B[EBX]
+	SHLL	EAX, #16t
+	MOVW	AX, SS:mb_data+st_base.B[EBX]
+	SUBL	EBX, SS:pdaLdtPnt#
+	MOVL	xmr_segla.B[EBP], EAX
+	MOVL	EDX, xmr_fmdb.B[EBP]
+	MOVL	ESI, xmr_pagelist.B[EBP]
+	ADDL	ESI, #mpl_fpage.B
+4$:	MOVL	ECX, mdb_size.B[EDX]	;Get size of the msect
+	ADDL	SS:pdaWSPages#, ECX	;Add into memory statistics for process
+	ADDL	SS:pdaPMPages#, ECX
+	MOVL	EDI, mdb_base.B[EDX]	;Get linear address of the msect
+	ADDL	EDI, xmr_segla.B[EBP]
+	SHRL	EDI, #10t		;Change to page table offset
+	ADDL	EDI, #pgtable
+	PUSHL	DS
+	POPL	ES
+	CLD
+	IFFAULT	xfsgpf
+xfsgcp:	RMOVSL	[EDI], [ESI]		;Copy the page table entries
+	MOVL	EDX, [EDX]		;Advance to next MDB
+	TESTL	EDX, EDX		;Have another?
+	JNE	4$.S			;Yes - continue
+	MOVL	EDX, SS:pdaSegTbl#	;No
+	MOVL	EAX, xmr_fmdb.B[EBP]	;Link the MDB list to the segment
+	ANDL	SS:sd_fmdb.B[EBX+EDX], #0FF000000h
+	ORL	SS:sd_fmdb.B[EBX+EDX], EAX
+	MOVL	EAX, xmr_dstsel.B[EBP]	;Return the selector used
+	ORB	AL, #07h
+xfsgdn:	MOVL	ESI, xmr_pagelist.B[EBP] ;Give up the page list buffer
+	MOVL	ECX, [ESI]
+	CALL	knlGiveXmb
+	MOVL	ES, xmr_srcpda.B[EBP]
+	MOVL	ES:pdaResponse#, EAX
+	TOFORK
+	CALL	knlRRequeue#
+	FROMFORK
+	LEAVE
+	RET
+.PAGE
+;Here if have memory trap while copying page table entries - this must have
+;  happended because we do not have a page table allocated
+
+	FAULTHDR
+xfsgpf:	PUSHL	EBX
+	LEAL	EBX, -pgtable[EDI]	;Get page table index
+	CALL	knlGetPgTbl		;Allocate a page table
+	POPL	EBX
+	JNC	xfsgcp.S		;Continue if OK
+
+;If get we here did not have enough memory to create a page table page.  This
+;  is very unlikely but it is possible (it is also a mess to get out of!).  We
+;  must scan the MDBs up through the one we were working on here and undo
+;  everything we have done.
+
+	PUSHL	EAX			;Save error code
+	MOVL	ESI, xmr_fmdb.B[EBP]
+2$:	MOVL	ECX, mdb_size.B[ESI]
+	SUBL	SS:pdaWSPages#, ECX
+	SUBL	SS:pdaPMPages#, ECX
+	MOVL	EDI, mdb_base.B[EDX]	;Get linear address of the msect
+	ADDL	EDI, xmr_segla.B[EBP]
+	SHRL	EDI, #10t		;Change to page table offset
+	ADDL	EDI, #pgtable
+	PUSHL	DS
+	POPL	ES
+	CLD
+	CLRL	EAX
+	STOSL	[EDI]			;Clear the page table entries
+	CMPL	ESI, EDX		;Finished here?
+	JE	4$.S			;Yes
+	MOVL	ESI, [ESI]		;No - advance to next MDB
+	JMP	2$.S
+
+;Here if error setting up the destination memory - discard all of the memory
+;  pages and the MDBs
+
+xfsgdme:PUSHL	EAX			;Save the error code
+4$:	MOVL	ESI, xmr_fmdb.B[EBP]	;Point to first MDB
+	CLRL	ECX			;Clear the page count
+6$:	ADDL	ECX, mdb_size.B[EDX]	;Add in number of pages in msect
+	PUSHL	[ESI]			;Save offset of next MDB
+	CALL	knlGiveQel			;Give up this MDB
+	POPL	ESI			;Restore offset of next MDB
+	TESTL	ESI, ESI		;Have another?
+	JNE	6$.S			;Yes - continue
+	MOVL	ESI, xmr_pagelist.B[EBP] ;No - point to first page in the
+	ADDL	ESI, #mpl_fpage.B	 ;  page list
+	CLD
+8$:	LODSL	[ESI]			;Get a page
+	CALL	givemp			;Give it up
+	LOOP	ECX, 8$			;Continue if more to give up
+	POPL	EAX			;Restore error code
+	JMP	xfsgdn
+.PAGE
+	.SBTTL	getsegtype - Subroutine to get type of a segment
+
+;Subroutine to get type of a segment
+;	c{EBP} = Selector for segment
+;	CALL	getsegtype
+;	C{EAX} = Type value
+;		   ST_32RODATA  = 1  - 32 bit read only data segment
+;		   ST_32RWDATA  = 2  - 32 bit read/write data segment
+;		   ST_32STACK   = 3  - 32 bit stack segment
+;		   ST_32NXOCODE = 4  - 32 bit execute only normal code segment
+;		   ST_32NXRCODE = 5  - 32 bit execute/read normal code segment
+;		   ST_32CXOCODE = 6  - 32 bit execute only conformable code
+;					 segment
+;		   ST_32CXRCODE = 7  - 32 bit execute/read conformable code
+;					 segment
+;		   ST_16RODATA  = 9  - 16 bit read only data segment
+;		   ST_16RWDATA  = 10 - 16 bit read/write data segment
+;		   ST_16STACK   = 11 - 16 bit stack space
+;		   ST_16NXOCODE = 12 - 16 bit execute only normal code segment
+;		   ST_16NXRCODE = 13 - 16 bit execute/read normal code segment
+;		   ST_16CXOCODE = 14 - 16 bit execute only conformable code
+;					 segment
+;		   ST_16CXRCODE = 15 - 16 bit execute/read conformable
+;					 segment
+
+getsegtype::
+	PUSHL	EBP
+	ADDL	EBP, SS:pdaLdtPnt#
+	CLRL	EAX			;Assume 32 bit data segment
+	TESTB	mb_data+6.B[EBP], #40h	;Really 32 bit segment?
+	JNE	4$.S			;Yes
+	ORB	AL, #08h		;No - its a 16 bit segment
+4$:	PUSHL	EDX
+	MOVB	DL, mb_data+5.B[EBP]	;Get type bits from the descriptor
+	TESTB	DL, #08h		;Really a data segment?
+	JE	10$.S			;Yes
+	ORB	AL, #04h		;No - its a code segment
+	TESTB	DL, #04h		;Conformable?
+	JE	6$.S			;No
+	ORB	AL, #02h		;Yes
+6$:	TESTB	DL, #02h		;Readable?
+	JE	8$.S			;No
+	ORB	AL, #01h		;Yes
+8$:	POPL	EDX
+	POPL	EBP
+	RET
+
+;Here if data segment
+
+10$:	TESTB	DL, #04h		;Stack segment?
+	JE	12$.S			;No
+	ORB	AL, #03h		;Yes
+	POPL	EDX
+	POPL	EBP
+	RET
+
+12$:	INCL	EAX			;Assume read/only
+	TESTB	DL, #02h		;Writable?
+	JE	14$.S			;No
+	XORB	AL, #03h		;Yes
+14$:	POPL	EDX
+	POPL	EBP
+ret008:	RET
+.PAGE
+	.SBTTL	createmsect - Subroutine to create memory section
+
+;Subroutine to create memory section
+;	c(AL)     = Page type bits
+;	c{ES:EBX} = Address of pointer to MDB to create
+;	c{ECX}    = Size of initial msect in bytes
+;	c{EBP}    = Selector for segment
+;	c{EDX}    = Virtual address of base of msect
+;	c{EDI}    = LAD index (only if DPMI msect)
+;	CALL	createmsect
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  c{EAX} = Low byte for page table entries (high 24 bits 0)
+;	  c{EBX} = Linear address for allocation
+;	  c{EDI} = Offset of MDB for msect
+;	  c{EBP} = Selector for segment
+
+createmsect::
+	PUSHL	EDX
+	MOVL	EDX, SS:pdaSegTbl#
+	CMPL	EBP, #0FFFFFFFFh.B
+	JE	2$.S
+	MOVL	EDX, sd_fmdb.B[EBP+EDX] ;Can we create an msect here?
+	ANDL	EDX, #0FFFFFFh
+	JE	2$.S			;Yes
+	CMPL	EDX, #10000		;Maybe
+	JB	14$			;No
+2$:	POPL	EDX			;Yes
+	ANDL	EDX, #0FFFFF000h	;Round offset down to start of page
+	CALL	knlGetQel		;Get a new MDB
+	JC	ret008.S		;If error
+	MOVL	mdb_lad.B[ESI], EDI	;Store LAD index if DPMI msect
+	MOVL	EDI, ESI
+	MOVB	mdb_tasknum.B[EDI], #0
+	MOVL	mdb_label.B[EDI], #'MDB*' ;Store block label for debugging
+	CALL	checkla#		;Check linear address space allocation
+	JC	20$			;If error
+	MOVL	ESI, ES:[EBX]		;OK - link the MDB into the list for
+	ANDL	ESI, #0FFFFFFh		;  the segment
+	MOVL	[EDI], ESI
+	ANDL	ES:[EBX], #0FF000000h
+	ORL	ES:[EBX], EDI
+	MOVL	mdb_pda.B[EDI], SS	;Store PDA selector in the MDB
+	MOVL	mdb_remove.B[EDI], #12$	;No memory remove routine
+	MOVL	mdb_fault.B[EDI], #12$	;No memory fault routine
+	MOVB	mdb_sts.B[EDI], #0
+	MOVB	mdb_devtype.B[EDI], #0	;Assume no device associated with msect
+	CLRL	EBX			;Assume real mode segment
+	MOVL	mdb_devpnt.B[EDI], EBX
+	MOVL	mdb_devnext.B[EDI], EBX
+	CMPL	EBP, #0FFFFFFF8h.B	;DPMI or real mode segment?
+	JB	4$.S			;No
+	JE	6$.S			;If real mode segment
+	MOVZWL	EBX, mdb_lad.B[EDI]	;If DPMI
+	SHLL	EBX, #4
+	ADDL	EBX, SS:pdaLATable#
+	MOVL	EBX, SS:lad_base.B[EBX]
+	MOVL	mdb_base.B[EDI], EBX
+	JMP	8$.S
+
+4$:	ADDL	EBP, SS:pdaLdtPnt#
+	MOVB	BL, mb_data+st_base+2.B[EBP] ;No - get linear address of segment
+	MOVB	BH, mb_data+st_baseh.B[EBP]
+	SHLL	EBX, #16t
+	MOVW	BX, mb_data+st_base.B[EBP]
+	SUBL	EBP, SS:pdaLdtPnt#
+6$:	ADDL	EBX, EDX		;Get linear address of msect
+	MOVL	mdb_base.B[EDI], EDX	;Store msect offset in the MDB
+8$:	MOVL	mdb_la.B[EDI], EBX	;Store it in the MDB
+	MOVL	EDX, EAX
+	CLRL	EAX
+	MOVB	AL, #27h		;Assume want read/write pages
+	TESTB	DL, #PG$WRITE		;Right?
+	JNE	10$.S			;Yes
+	MOVB	AL, #25h		;No - write only (very strange!)
+10$:	TESTB	DL, #PG$VIRTUAL		;Want virtual pages?
+	JE	12$.S			;No
+	DECL	EAX			;Yes - clear low bit (P bit)
+12$:	CLC
+	RET
+
+;Here if can't create an msect in this segment
+
+14$:	POPL	EDX
+	MOVL	EAX, #ER_MACFT
+	STC
+	RET
+
+;Here if error after MDB allocated
+
+20$:	CALL	knlGiveQel
+	STC
+	RET
+.PAGE
+	.SBTTL	knlFindMsect - Subroutine to find requested msect
+
+;Subroutine to find requested existing msect
+;	c{EBP} = LDT index for segment
+;	c{EDX} = Base offset for msect
+;	CALL	knlFindMsect
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  Z:clr = Msect does not exist
+;	  Z:set = Msect does exist
+;	  c{ES:EBX} = Address of pointer to MDB for this msect (previous MDB
+;			or pdaSegTbl table slot)
+;	  c{EBP}    = LDT table index or -1 if DPMI msect
+;	  c{EDI}    = Offset of MDB for msect if it exists or of MDB of next
+;			msect if it does not
+
+knlFindMsect::
+	CALL	findoldseg		;Find slot for segment
+	JC	12$.S			;If error
+	PUSHL	SS			;Point to the slot
+	POPL	ES
+	CMPL	EBP, #0FFFFFFFFh.B	;DPMI msect?
+	JNE	2$.S			;No
+	MOVL	EBX, #pdaDpmiFMdb#	;Yes - get offset of the DPMI pointer
+	JMP	4$.S
+
+2$:	MOVL	EBX, SS:pdaSegTbl#
+	ADDL	EBX, EBP
+4$:	MOVL	EDI, ES:[EBX]		;Point the to first MDB
+6$:	ANDL	EDI, #0FFFFFFh		;Have another MDB?
+	JE	10$.S			;No
+	CMPL	mdb_base.B[EDI], EDX	;Yes - should the new one go here?
+	JAE	12$.S			;Yes
+	MOVL	EBX, EDI		;No - advance to next MDB
+	PUSHL	DS
+	POPL	ES
+	MOVL	EDI, [EDI]
+	JMP	6$.S
+
+;Here if msect not found
+
+10$:	TESTL	ESP, ESP		;Clear Z
+12$:	RET
+.PAGE
+	.SBTTL	findoldseg - Subroutine to find selector of existing segment
+
+;Subroutine to find selector of existing segment
+;	c{EBP} = Selector (0FFF8h means real mode segment, 0FFFFh means DPMI,
+;		   otherwise must be local selector with bit 2 set)
+;	CALL	findoldseg
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  c{EBP} = Slot index
+
+findoldseg::
+	CMPW	BP, #0FFFFFFF8h.B	;Is this DPMI or the real mode segment?
+	JB	4$.S			;No
+	JA	2$.S			;If DPMI
+	MOVL	EBP, #0FFFFFFF8h	;If real mode segment
+	JMP	6$.S
+
+;Here if DPMI
+
+2$:	CLRL	EBP
+	DECL	EBP
+	RET
+
+4$:	CMPL	EBP, #3.B		;Was a selector specified?
+	JBE	fndspbp.S		;No - error
+	TESTL	EBP, #4			;No - local segment?
+	JE	fndspbp.S		;No - error
+	ANDL	EBP, #0FFFFFFF8h.B	;Yes - ignore low three bits
+	CMPL	EBP, SS:pdaSegMax#	;Valid selector?
+	JAE	fndspbp.S		;No - fail
+6$:	MOVL	EAX, SS:pdaSegTbl#	;Yes
+	CMPW	sd_lnksel.B[EBP+EAX], #0.B ;Is this one idle?
+	JE	fndspbp.S		;Yes - error
+	RET				;No - OK
+.PAGE
+	.SBTTL	findnewseg - Subroutine to find selector for new segment
+
+;Subroutine to find selector for new segment
+;	c{EBX} = Search mode:
+;		   Bit 31: 0 = forwards, 1 = backwards)
+;		   Bit 30: 0 = Require specified selector, 1 = Search starting
+;				 with specified selector
+;	c{EBP} = Selector to use
+;	CALL	findnewseg
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  c{EBP} = Slot index
+
+findnewseg::
+	MOVL	EAX, SS:pdaSegTbl#
+	CMPB	BL, #ST_MAX		;Valid segment type value?
+	JA	4$.S			;No
+	CMPL	EBP, #03h.B		;Yes - was a selector specified?
+	JA	14$.S			;Yes - go try to use it
+	MOVL	ECX, SS:pdaSegMax#	;No - search for available selector
+	SHRL	ECX, #3t
+	DECL	ECX
+	TESTL	EBX, EBX		;Want backwards search?
+	JS	8$.S			;Yes
+	MOVL	EBP, #-8t		;No - start at bottom
+2$:	ADDL	EBP, #8t.B		;Bump selector
+	CMPW	sd_lnksel.B[EBP+EAX], #0.B ;Is this one idle?
+	LOOPNE	ECX, 2$			;No - continue if more to check
+	JE	12$.S			;Finished if found one to use
+	ADDL	EBP, #8t.B		;No more to check - point to next one
+	JMP	expandsegtbl		;And go expand the table
+
+;Here if do not have valid segment type - this is an error unless specifying
+;  the real mode segment
+
+4$:	CMPL	EBP, #0FFF8h		;Real mode selector?
+	JAE	16$.S			;Yes
+fndspbp:JMP	knlBadValue#		;No - error!
+
+;Here to do backwards search
+
+6$:	MOVL	EAX, SS:pdaSegTbl#	;Restore offset of segment table
+8$:	MOVL	EBP, SS:pdaSegMax#	;Start at current top
+10$:	SUBL	EBP, #8.B		;Bump selector
+	CMPW	sd_lnksel.B[EBP+EAX], #0.B ;Is this one idle?
+	LOOPNE	ECX, 10$		;No - continue if more to check
+	JE	24$.S			;Did we find one free?
+	CALL	expandsegtbl		;No - try to expand the table
+	JNC	6$.S			;If OK
+12$:	RET				;If error
+
+;Here if selector was specified
+
+14$:	CMPW	BP, #0FFFFFFF8h.B	;DPMI or real mode segment?
+	JB	22$.S			;No
+	JA	18$.S			;If DPMI
+16$:	MOVL	EBP, #0FFFFFFF8h	;If real mode segment
+	MOVB	BL, #0
+	JMP	24$.S
+
+18$:	CLRL	EBP
+	DECL	EBP
+20$:	RET
+
+;Here if not the real mode "selector"
+
+22$:	TESTL	EBP, #04h		;Local selector?
+	JE	fndspbp.S		;No - error
+	ANDL	EBP, #0FFFFFFF8h.B	;Yes - ignore low three bits
+	CMPL	EBP, SS:pdaSegMax#	;Valid selector?
+	JB	24$.S			;Yes
+	PUSHL	EBX
+	MOVL	EAX, EBP		;Not now
+	CALL	expandseg2		;Try to expand the table
+	POPL	EBX
+	JC	20$.S			;If error
+	MOVL	EAX, SS:pdaSegTbl#
+24$:	CMPW	sd_lnksel.B[EBP+EAX], #0.B ;Is the selector idle?
+	JE	20$.S			;Yes - finished now
+	BTL	EBX, #30t		;No - want to search from here?
+	JNC	fndspbp.S		;No - fail
+	MOVL	ECX, SS:pdaSegMax#	;Yes - calculate number left to search
+	SUBL	ECX, EBP
+	SHRL	ECX, #3t
+	DECL	ECX
+	JMP	2$
+.PAGE
+	.SBTTL	expandsegtbl - Subroutine to expand the segment table
+
+;Subroutine to expand the segment table
+;	CALL	expandsegtbl
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;  ESI is preserved
+
+$$$=!0
+FRM xsg_segtbl, 4t		;New segment table offset
+FRM xsg_segmax, 4t		;New maximum segment selector
+xsg_SIZE=!$$$
+
+2$:	MOVL	EAX, #ER_NSEGA		;Error = No segment available
+	STC
+4$:	POPL	ESI
+	LEAVE
+	RET
+
+expandsegtbl:
+	MOVL	EAX, SS:pdaSegMax#	;Get current maximum selector
+expandseg2:
+	ADDL	EAX, #16t*8		;Allocate 16 more
+	ENTER	xsg_SIZE, 0		;Set up our stack frame
+	PUSHL	ESI
+	ADDL	EAX, #7Fh.B		;Round up to multiple of 16
+	ANDL	EAX, #0FFFFFF80h.B
+	CMPL	EAX, #MAXSEGS*8		;Can we make it this big?
+	JA	2$.S			;No - fail
+	MOVL	xsg_segmax.B[EBP], EAX	;Yes - save new segmax value
+	LEAL	ECX, 8t.B[EAX+EAX]	;Get total size needed for LDT and
+	MOVL	ESI, SS:pdaLdtPnt#	;  segment table
+	LEAL	EAX, mb_data+8.B[ESI+EAX] ;Calculate new segment table offset
+	MOVL	xsg_segtbl.B[EBP], EAX
+	CALL	knlChngPdaMem		;Change the size of the block
+	JC	4$.S			;If error
+
+;Here with the PDA block which contains the LDT and segment table enlarged.
+;  Now we must move the segment table to its new position, clear the new
+;  segment table space, and clear the new LDT space.  Since the new and old
+;  tables almost always will overlap, we must copy backwards.
+
+	MOVL	ESI, SS:pdaSegMax#	;Point to previous segment table top
+	LEAL	ECX, 8t.B[ESI]		;Get length (include real mode entry)
+	SUBL	ESI, #4.B
+	ADDL	ESI, SS:pdaSegTbl#
+	MOVL	EAX, xsg_segtbl.B[EBP]	;Point to new position for the segment
+	MOVL	EDI, EAX		;  table top
+	ADDL	EDI, SS:pdaSegMax#
+	MOVL	SS:pdaSegTbl#, EAX
+	PUSHL	EDI
+	SUBL	EDI, #4.B
+	PUSHL	SS
+	POPL	ES			;Copy the current segment table contents
+	SHRL	ECX, #2			;  to the new position
+	TOFORK				;Can't have any fork activity while we
+	STD				;  are moving things around
+	RMOVSL	[EDI], SS:[ESI]
+	MOVL	EAX, xsg_segmax.B[EBP]	;Get the amount we expanded it
+	MOVL	ECX, EAX
+	SUBL	ECX, SS:pdaSegMax#
+	SHRL	ECX, #2
+	MOVL	SS:pdaSegMax#, EAX
+	DECL	EAX			;Update the LDT size in the LDT selector
+	MOVL	EDX, SS:pdaTss#+tss_LDT
+	MOVW	gdtable[EDX], AX
+	LLDT	DX			;Make sure the hardware has the new
+	PUSHL	ECX			;  value
+	CLRL	EAX			;Clear the new LDT space
+	RSTOSL	[EDI]
+	POPL	ECX
+	POPL	EDI
+	CLD				;Clear the new segment table space
+	RSTOSL	[EDI]
+	FROMFORK
+	POPL	ESI
+	LEAVE
+	RET
+.PAGE
+	.SBTTL	knlGetIndex - Subroutine to get XMB size index value given size
+
+;Subroutine to get XMB size index value given block size
+;	c{EDX} = Size of block (in bytes)
+;	CALL	knlGetIndex
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  c{ECX} = Size index value
+;  All registers except ECX are preserved
+
+knlGetIndex::
+	BSRL	ECX, EDX
+	JE	6$.S			;Fail if zero
+	SUBL	ECX, #5.B
+	JC	4$.S			;If smaller than 32t
+	CMPL	ECX, #6.B		;Is it too big?
+	JA	6$.S			;Probably - go make sure
+2$:	CMPL	EDX, xmbval[ECX*4]	;OK - correct for even power of 2 if
+	SBBL	ECX, #0.B		;  need to (this leaves C clear)
+	RET
+
+;Here for small block - return 0
+
+4$:	CLRL	ECX
+	RET
+
+;Here if illegal size
+
+6$:	CMPL	EDX, #1000h		;Does he want a maximum size block?
+	JE	2$.S			;Yes - thats OK!
+	MOVL	EAX, #ER_VALUE		;No - fail
+	STC
+	RET
+.PAGE
+knlGetQelClr::
+	PUSHL	ECX
+	CLRL	ECX
+	CALL	knlGetXmb
+	JC	4$.S
+	PUSHL	EAX
+	PUSHL	EDI
+	PUSHL	DS			;Clear the QEL
+	POPL	ES
+	MOVL	EDI, ESI
+	MOVL	ECX, #16t
+	CLRL	EAX
+	CLD
+	RSTOSL	[EDI]
+	POPL	EDI
+	POPL	EAX
+4$:	POPL	ECX
+	RET
+.PAGE
+
+	.SBTTL	knlGetQel - Subroutine to allocate a queue element
+
+;Subroutine to allocate a queue element - may be called at all fork levels.
+;  Note that when called at main program level raised to fork level, scheduler
+;  level raised to fork level, or device fork level, extra memory cannot be
+;  allocated if the reserve amount is exhausted.  Also, a call in extended
+;  fork context MAY reschedule before returning.
+;	CALL	knlGetQel
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  c{ESI} = Offset of queue element allocated
+;  All registers not indicated above are preserved
+
+knlGetQel::
+	PUSHL	ECX
+	CLRL	ECX
+	CALL	knlGetXmb
+	POPL	ECX
+	RET
+.PAGE
+	.SBTTL	knlGetXmbClr - Subroutine to get exec memory buffer and clear it
+
+;Subroutine to get exec memory buffer and clear it - may be called at all fork
+;  levels.  Note that when called at main program level raised to fork level,
+;  scheduler level raised to fork level, or device fork level, extra memory
+;  cannot be allocated if the reserve amount is exhausted.  Also, a call in
+;  extended fork context MAY reschedule before returning.
+;	c{ECX} = Size index
+;	CALL	knlGetXmbClr
+;	C:set = Error
+;	  c{EAX} = Error code
+;	  c{ESI} = 0
+;	C:clr = Normal
+;	  c{ESI} = Offset of buffer allocated
+;  All other registers are preserved
+
+knlGetXmbClr::
+	CALL	getxmb2			;Get the buffer
+	JC	4$.S			;If error
+	PUSHL	EAX			;OK - save registers we need here
+
+	CMPL	ECX, #1.B
+	JNE	3$.S
+
+	MOVL	EAX, xmbrngpnt
+	MOVL	[EAX], ESI
+	MOVL	4.B[EAX], ECX
+	ADDL	EAX, #8t.B
+	CMPL	EAX, #xmbrngend
+	JB	2$.S
+	MOVL	EAX, #xmbrng
+2$:	MOVL	xmbrngpnt, EAX
+3$:
+
+	PUSHL	ECX
+	PUSHL	EDI
+	MOVL	ECX, knlXmbSize-8[ECX*4] ;Get size of the buffer in longs
+	MOVL	EDI, ESI
+	PUSHL	DS
+	POPL	ES
+	CLRL	EAX
+	CLD
+	RSTOSL	[EDI]			;Clear the buffer
+	POPL	EDI			;Restore registers
+	POPL	ECX
+	POPL	EAX
+	CLC
+4$:	RET				;Finished
+.PAGE
+	.SBTTL	knlGetXmb - Subroutine to get exec memory buffer
+
+;Subroutine to get exec memory buffer - may be called at all fork levels.
+;  Note that when called at main program level raised to fork level, scheduler
+;  level raised to fork level, or device fork level, extra memory cannot be
+;  allocated if the reserve amount is exhausted.  Also, a call in extended
+;  fork context MAY reschedule before returning.
+;	c{ECX} = Size index
+;	CALL	knlGetXmb
+;	C:set = Error
+;	  c{EAX} = Error code
+;	  c{ESI} = 0
+;	C:clr = Normal
+;	  c{ESI} = Offset of buffer allocated
+;  All other registers are preserved
+
+knlGetXmb::
+
+.IF NE $$FILLXMB
+	CALL	getxmb2
+	JC	6$.S
+	PUSHL	EAX			;Save registers we need here
+
+	CMPL	ECX, #1.B
+	JNE	4$.S
+	MOVL	EAX, xmbrngpnt
+	MOVL	[EAX], ESI
+	MOVL	4.B[EAX], ECX
+	ADDL	EAX, #8t.B
+	CMPL	EAX, #xmbrngend
+	JB	2$.S
+	MOVL	EAX, #xmbrng
+2$:	MOVL	xmbrngpnt, EAX
+
+4$:	PUSHL	ECX
+	PUSHL	EDI
+	PUSHL	ES
+	MOVL	ECX, knlXmbSize-8t[ECX*4] ;Get number of longs to set
+	MOVL	EDI, ESI
+	PUSHL	DS
+	POPL	ES
+	MOVL	EAX, #66666666h		;Get data pattern
+	CLD
+	RSTOSL	[EDI]			;Store the pattern
+	POPL	ES
+	POPL	EDI			;Restore registers
+	POPL	ECX
+	POPL	EAX
+	CLC
+6$:	RET
+
+.ENDC
+getxmb2:CMPL	ECX, #6.B		;Valid index value?
+	JA	20$.S			;No - fail big!
+	CMPB	knlForkLvl#, #FORK_MFORK ;Yes - what level?
+	JA	getxmf.S		;If scheduler raised to fork level,
+					;  device fork level or extended fork
+					;  context
+	JE	28$.S			;If main program level raised to fork
+					;  level
+
+;Here if at main program level
+
+	MOVB	knlForkLvl#, #FORK_MFORK ;Raise to fork level
+	CALL	getxm0
+	JC	16$.S
+	FROMFORK
+	PUSHL	EAX
+12$:	MOVL	EAX, xmbcnt4096		;Do we have enough 4096 byte pages
+	CMPL	EAX, xmbreserve		;  now?
+	JA	14$.S			;Yes - finished now
+	CALL	newxmb			;No - try to allocate another big buffer
+	JNC	12$.S			;Keep checking if got one
+	CLC
+14$:	POPL	EAX			;Error - give up!
+	RET
+
+;Here if error allocating exec memory block at main program level - there is no
+;  need to check for allocating more reserve blocks here since we have already
+;  failed to allocate memory!
+
+16$:	FROMFORK
+	STC
+	RET
+
+20$:	CRASH	BXBI			;[Bad eXec Buffer Index]
+
+;Here if at main program level raised to fork level - we make this look like
+;  scheduler level raised to fork level to avoid possible scheduling problems
+;  if we were to try to drop back to main program level to allocate more
+;  memory!
+
+28$:	MOVB	knlForkLvl#, #FORK_SFORK
+	CALL	getxmf
+	MOVB	knlForkLvl#, #FORK_MFORK
+	RET
+
+;Here if at device fork level or extended fork context - we try to allocate
+;  the requested block first.  Then we always queue an exec software
+;  interrupt to allocate reserve blocks if we don't have enough.
+
+getxmf:	CALL	getxm0			;Allocate memory block
+	PUSHL	EAX
+	MOVL	EAX, xmbcnt4096
+	JC	34$.S			;If error
+	CMPL	EAX, xmbreserve		;Do we have enough 4096 byte pages now?
+	JA	32$.S			;Yes
+	CALL	newxmbq			;No - put in request to allocate more
+32$:	POPL	EAX
+	CLC
+	RET
+
+;Here if error
+
+34$:	CMPL	EAX, xmbreserve		;Do we have enough 4096 byte pages now?
+	JA	36$.S			;Yes
+	CALL	newxmbq			;No - put in request to allocate more
+36$:	POPL	EAX
+	STC
+	RET
+.PAGE
+;Subroutine to request exec signal to allocate reserve blocks - the signal
+;  routine is executed in the context of the INIT process
+
+newxmbq:CMPB	xmbqel2bsy, #0		;Already doing this for someone else?
+	JNE	2$.S			;Yes - forget it
+	PUSHAL				;No - save registers
+	PUSHL	ES
+	MOVL	EBX, #newxmba
+	MOVL	ES, knlProcTable#+2
+	MOVB	xmbqel2bsy, #1
+	MOVL	ESI, #xmbqel2		;Use our special link block!
+	CALL	knlReqXSig2#		;Request exec software interrupt
+	POPL	ES
+	POPAL
+2$:	RET
+
+;Exec software interrupt routine to allocate reserve blocks.  Executed in the
+;  context of the INIT process.  This routine always allocates at least one
+;  additional page, even if its not needed.  This subroutine is only called
+;  if a fork level routine finds it needs another buffer.  The only way we
+;  would not need one here was if someone else gave up space in the meantime.
+;  Since the fork level routine did find a need for another page, it seems
+;  like a good idea to allocate at least one here!
+
+newxmba:CALL	newxmb			;Try to allocate another big buffer
+	JC	4$.S			;Give up if error
+	MOVL	EAX, xmbcnt4096		;Do we have enough 4096 byte pages
+	CMPL	EAX, xmbreserve		;  now?
+	JBE	newxmba.S		;No - continue
+4$:	MOVB	xmbqel2bsy, #0
+	RET				;Finished
+.PAGE
+;Local subroutine to allocate exec memory block - must be called at fork level
+;  of some kind
+
+getxm0:	PUSHL	ECX			;Save requested size
+2$:	MOVL	ESI, xmbfree[ECX*4]	;Get buffer from the free list
+	TESTL	ESI, ESI		;Do we have a buffer
+	JNE	getxm2			;Yes - go use it
+	INCL	ECX			;No - bump size
+	CMPL	ECX, #XMBMAX.B		;At maximum size yet?
+	JBE	2$.S			;No - continue
+	CMPB	knlForkLvl#, #FORK_MFORK ;At main program level rasied to fork
+					;  level?
+	JA	6$.S			;No - can't do anything here!
+	FROMFORK			;Yes - go back to main program level
+	CALL	newxmb			;Allocate another memory page
+	JC	8$.S			;If error
+	TOFORK				;OK - try again (start at the bottom
+	MOVL	ECX, [ESP]		;  again since someone may have snuck
+	JMP	2$.S			;  in and given up a page while we have
+					;  been doing this)
+
+;Here if no buffers available and are at fork level - must fail!
+
+6$:	POPL	ECX
+	MOVL	EAX, #ER_NOBUF
+	JMP	10$.S
+
+;Here if can't allocate page at main program level - this means there is really
+;  no memory available, so we just give up
+
+8$:	TOFORK
+10$:	POPL	ECX
+	CLRL	ESI
+	STC
+	RET
+.PAGE
+;Here with a buffer we can use (it may be bigger than we want)
+
+getxm2:	PUSHL	EAX
+	MOVL	EAX, xmf_next.B[ESI]	;Remove buffer from its free list
+
+.IF NE $$DEBUGXMB
+	CMPL	[ESI], #XMF_MAGIC
+	JNE	2$.S
+	CMPL	xmf_size.B[ESI], ECX
+	JNE	2$.S
+	TESTL	EAX, EAX
+	JE	4$.S
+	CMPL	EAX, #xmbbase
+	JB	2$.S
+	CMPL	EAX, #xmbbase+1000000h
+	JB	4$.S
+2$:	CRASH	BXMB
+.ENDC
+
+4$:	MOVL	xmbfree[ECX*4], EAX
+	TESTL	EAX, EAX
+	JE	6$.S
+	MOVL	xmf_prev.B[EAX], #0
+6$:	DECL	xmbcnt[ECX*4]
+8$:	CMPL	ECX, 4.B[ESP]		;Is it the right size?
+	JE	14$.S			;Yes - almost done!
+	DECL	ECX			;No - put buffer on next smaller list
+	MOVL	EAX, xmbfree[ECX*4]
+	MOVL	xmf_next.B[ESI], EAX
+	MOVL	xmbfree[ECX*4], ESI
+	TESTL	EAX, EAX
+	JE	10$.S
+	MOVL	xmf_prev.B[EAX], ESI
+10$:	MOVL	xmf_prev.B[ESI], #0
+	MOVL	xmf_size.B[ESI], ECX
+	MOVL	[ESI], #XMF_MAGIC	;Store magic number
+	INCL	xmbcnt[ECX*4]
+	MOVL	EAX, xmbcnt[ECX*4]
+	CMPL	EAX, xmbchwm[ECX*4]
+	JBE	12$.S
+	MOVL	xmbchwm[ECX*4], EAX
+12$:	ADDL	ESI, knlXmbSize[ECX*4]	;Point to second half of buffer
+	JMP	8$.S
+
+;Here with buffer to return
+
+14$:	MOVL	[ESI], #0		;Clear the magic number
+	INCL	xmbinuse[ECX*4]		;Increase in-use count
+	MOVL	EAX, xmbinuse[ECX*4]	;Is it a new maximum?
+	CMPL	EAX, xmbiuhwm[ECX*4]
+	JBE	16$.S			;No
+	MOVL	xmbiuhwm[ECX*4], EAX	;Yes
+16$:	CLC
+	POPL	EAX			;Restore registers
+	POPL	ECX
+	RET				;And return
+.PAGE
+;Exec software interrupt routine to allocate additional exec memory buffers
+;  when needed by extended fork context routines - since there are no buffers
+;  available when this routine is needed, the usual exec software interrupt
+;  routine cannot be used (since it needs a buffer).  Instead we use a special
+;  dedicated buffer as a link block - this means that we cannot count on
+;  passing any data at all to this routine, so we use a separate list of
+;  XFFs to wake up when we are finished.  If several XFFs try this at the
+;  same time, we just ignore additional requests and wait until the first one
+;  completes.
+
+newxmbx:CALL	newxmb
+	TOFORK
+2$:	CMPL	xmbwakexff, #0.B	;Get first fork to wake up
+	JE	4$.S			;If finished
+	MOVL	ES, xmbwakexff		;Remove it from the wake list
+	MOVL	EDX, ES:xffWaitList#
+	MOVL	xmbwakexff, EDX
+	PUSHL	EAX
+	CALL	knlResumeXf#		;Wake it up
+	POPL	EAX
+	JMP	2$.S			;Continue
+
+;Here with everyone waken up
+
+4$:	MOVB	xmbqel1bsy, #0		;Indicate not busy now
+	FROMFORK
+	RET
+.PAGE
+;Here (from below) if no address space page is avialable (very unlikely!)
+
+2$:	POPL	EBX
+	MOVL	EAX, #ER_NOBUF
+	STC
+	RET
+
+;Subroutine to create additional exec memory buffers - a single memory page is
+;  allocated and placed on the 4096 byte free list - must be called at main
+;  program level
+;	CALL	newxmb
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;  All registers are preserved (except EAX if error)
+
+newxmb:	PUSHL	EBX
+	MOVZWL	EBX, xpagefree+2	;Get address space page from the free
+	SUBL	EBX, #4.B		;  list
+	JS	2$.S
+	PUSHL	EAX
+	PUSHL	ECX
+	PUSHL	EDX
+	MOVL	EAX, xpagelist[EBX]
+	MOVL	xpagefree, EAX
+	MOVL	xpagelist[EBX], #0
+	SHLL	EBX, #10t
+	ADDL	EBX, #la_xmbbase	;Allocate a memory page
+	MOVL	ECX, #1
+	MOVL	EAX, #27h
+	CLRL	EDX
+	CALL	knlGetPages
+	POPL	EDX
+	POPL	ECX
+	JC	10$.S			;If none available
+	SUBL	EBX, #la_data		;OK - get exec data offset for page
+	MOVL	xmf_size.B[EBX], #XMBMAX ;Put the page on the 4096 byte free
+	MOVL	[EBX], #XMF_MAGIC	 ;  list
+	CLRL	EAX
+	MOVL	xmf_prev.B[EBX], EAX
+	TOFORK
+	MOVL	EAX, xmbfree4096
+	MOVL	xmbfree4096, EBX
+	MOVL	xmf_next.B[EBX], EAX
+	TESTL	EAX, EAX
+	JE	6$.S
+	MOVL	xmf_prev.B[EAX], EBX
+6$:	INCL	xmbcnt4096
+	MOVL	EAX, xmbcnt4096
+	CMPL	EAX, xmbchwm4096
+	JBE	8$.S
+	MOVL	xmbchwm4096, EAX
+8$:	FROMFORK
+	CLC
+	POPL	EAX
+	POPL	EBX
+	RET
+
+;Here if can't allocate memory page
+
+10$:	POPL	EBX
+	POPL	EBX
+	RET
+.PAGE
+	.SBTTL	knlGiveQel - Subroutine to give up queue element
+
+;Subroutine to give up queue element
+;	c{ESI} = Offset of queue element to give up
+;	CALL	knlGiveQel
+;  All registers are preserved
+
+knlGiveQel::
+	PUSHL	ECX
+	CLRL	ECX
+	CALL	knlGiveXmb
+	POPL	ECX
+	RET
+.PAGE
+	.SBTTL	knlGiveXmb - Subroutine to give up exec memory buffer
+
+;Subroutine to give up exec memory buffer
+;	c{ECX} = Size index
+;	c{ESI} = Offset of buffer
+;	CALL	knlGiveXmb
+;  All registers except ECX and ESI are preserved
+
+knlGiveXmb::
+	CMPL	ECX, #6.B		;Valid index value?
+	JA	1$.S			;No - fail big!
+	TOFORK	2$
+	CALL	2$
+	FROMFORK
+	RET
+
+1$:	CRASH	BXBI			;[Bad eXec Buffer Index]
+
+2$:
+.IF NE $$DEBUGXMB
+	CMPL	ESI, #xmbbase		;Make sure offset is in right range
+	JB	4$.S
+	CMPL	ESI, #xmbbase+1000000h
+	JB	6$.S
+4$:	CRASH	BXMB
+
+6$:	TESTL	ESI, xmbchkm[ECX*4]	;Make sure valid offset of buffer size
+	JNE	4$.S
+.ENDC
+	PUSHL	EAX
+	DECL	xmbinuse[ECX*4]		;Reduce in-use count
+.IF NE $$DEBUGXMB
+	JNS	7$.S
+	CRASH	BXMC
+.ENDC
+
+7$:	CMPL	ECX, #1.B
+	JNE	77$.S
+
+	MOVL	EAX, xmbrngpnt
+	MOVL	[EAX], ESI
+	MOVL	4.B[EAX], ECX
+	MOVB	7.B[EAX], #0FFh
+	ADDL	EAX, #8t.B
+	CMPL	EAX, #xmbrngend
+	JB	75$.S
+	MOVL	EAX, #xmbrng
+75$:	MOVL	xmbrngpnt, EAX
+77$:
+
+8$:	CMPL	ECX, #XMBMAX.B		;Maximum size buffer?
+	JAE	22$			;Yes - just put it on its free list
+	MOVL	EAX, ESI		;No - get offset of buddy
+	XORL	EAX, knlXmbSize[ECX*4]
+	CMPL	[EAX], #XMF_MAGIC	;Is the buddy free?
+	JNE	22$			;No - can't merge here
+	CMPL	xmf_size.B[EAX], ECX	;Maybe
+	JNE	22$			;No
+	PUSHL	EDX			;Yes
+	PUSHL	EBX
+	MOVL	EDX, xmf_next.B[EAX]	;Remove buddy from its free list
+	MOVL	EBX, xmf_prev.B[EAX]
+
+.IF NE $$DEBUGXMB
+	TESTL	EDX, EDX
+	JE	10$.S
+	CMPL	[EDX], #XMF_MAGIC
+	JNE	12$.S
+	CMPL	xmf_size.B[EDX], ECX
+	JNE	12$.S
+	CMPL	EDX, #xmbbase
+	JB	12$.S
+	CMPL	EDX, #xmbbase+1000000h
+	JAE	12$.S
+10$:	TESTL	EBX, EBX
+	JE	14$.S
+	CMPL	[EBX], #XMF_MAGIC
+	JNE	12$.S
+	CMPL	xmf_size.B[EBX], ECX
+	JNE	12$.S
+	CMPL	EBX, #xmbbase
+	JB	12$.S
+	CMPL	EBX, #xmbbase+1000000h
+	JB	14$.S
+12$:	CRASH	BXMB
+.ENDC
+
+14$:	TESTL	EBX, EBX
+	JE	16$.S
+	MOVL	xmf_next.B[EBX], EDX
+	JMP	18$.S
+
+16$:	MOVL	xmbfree[ECX*4], EDX
+18$:	TESTL	EDX, EDX
+	JE	20$.S
+	MOVL	xmf_prev.B[EDX], EBX
+20$:	DECL	xmbcnt[ECX*4]
+	CLRL	EDX
+	MOVL	[EAX], EDX		;Clear magic numbers
+	MOVL	[ESI], EDX
+	POPL	EBX
+	POPL	EDX
+	INCL	ECX			;Bump size index
+	ANDL	ESI, xmbmask[ECX*4]	;Get address of merged buffer
+	JMP	8$			;Continue
+
+;Here with buffer to place on a free list
+
+22$:	MOVL	EAX, xmbfree[ECX*4]
+
+.IF NE $$DEBUGXMB
+	TESTL	EAX, EAX
+	JE	26$.S
+	CMPL	EAX, #xmbbase
+	JB	24$.S
+	CMPL	EAX, #xmbbase+1000000h
+	JB	26$.S
+24$:	CRASH	BXMB
+
+26$:	CMPL	ESI, #xmbbase
+	JB	28$.S
+	CMPL	ESI, #xmbbase+1000000h
+	JB	30$.S
+28$:	CRASH	BXMB
+.ENDC
+
+30$:	MOVL	xmbfree[ECX*4], ESI
+	MOVL	xmf_next.B[ESI], EAX
+	TESTL	EAX, EAX
+	JE	32$.S
+	MOVL	xmf_prev.B[EAX], ESI
+32$:	MOVL	xmf_prev.B[ESI], #0
+	MOVL	xmf_size.B[ESI], ECX
+	MOVL	[ESI], #XMF_MAGIC
+	INCL	xmbcnt[ECX*4]
+	MOVL	EAX, xmbcnt[ECX*4]
+	CMPL	EAX, xmbchwm[ECX*4]
+	JBE	34$.S
+	MOVL	xmbchwm[ECX*4], EAX
+34$:	CLRL	ESI
+	POPL	EAX
+	RET
+.PAGE
+	.SBTTL	Data
+
+	DATA
+
+;Segment type table
+
+	.MOD	4
+
+segttbl::
+	.BYTE	0              , 0	     ; 0. - Illegal or default
+	.BYTE	DT_RODATA+PL_3 , DC_PG+DC_32 ; 1. - 32 bit read only data
+					     ;	      segment
+	.BYTE	DT_RWDATA+PL_3 , DC_PG+DC_32 ; 2. - 32 bit writable data segment
+	.BYTE	DT_STACK+PL_3  , DC_PG+DC_32 ; 3. - 32 bit stack segment
+	.BYTE	DT_NXOCODE+PL_3, DC_PG+DC_32 ; 4. - 32 bit normal execute only
+					     ;	      code segment
+	.BYTE	DT_NXRCODE+PL_3, DC_PG+DC_32 ; 5. - 32 bit normal readable code
+					     ;        segment
+	.BYTE	DT_CXOCODE+PL_3, DC_PG+DC_32 ; 6. - 32 bit conformable execute
+					     ;	      only code segment
+	.BYTE	DT_CXRCODE+PL_3, DC_PG+DC_32 ; 7. - 32 bit conformable readable
+					     ;        code segment
+	.BYTE	0              , 0	     ; 8. - Illegal or default
+	.BYTE	DT_RODATA+PL_3 , DC_PG+DC_16 ; 9. - 16 bit read only data
+					     ;        segment
+	.BYTE	DT_RWDATA+PL_3 , DC_PG+DC_16 ;10. - 16 bit writable data segment
+	.BYTE	DT_STACK+PL_3  , DC_PG+DC_16 ;11. - 16 bit stack segment
+	.BYTE	DT_NXOCODE+PL_3, DC_PG+DC_16 ;12. - 16 bit normal execute only
+					     ;	      code segment
+	.BYTE	DT_NXRCODE+PL_3, DC_PG+DC_16 ;10. - 16 bit normal readable code
+					     ;        segment
+	.BYTE	DT_CXOCODE+PL_3, DC_PG+DC_16 ;11. - 16 bit conformable execute
+					     ;	      only code segment
+	.BYTE	DT_CXRCODE+PL_3, DC_PG+DC_16 ;12. - 16 bit conformable readable
+					     ;         code segment
+
+	.MOD	4
+knlMemTable::.LONG basetable
+	     .LONG toptable
+	     .BLKL 6
+knlMemFree:: .LONG 0, 0
+	     .LONG 0
+	     .LONG 0
+basetable::  .BLKL 160t*2
+	     .LONG 0
+	     .LONG 0FFFFFFFFh
+toptable::   .LONG 0
+memlockcnt:: .LONG 0		;Memory lock count
+
+				;Following 2 items are used for debugging only!
+mpilmte::    .LONG 0		;Offset of last locked memory table entry which
+				;  caused ER_MPILK to be returned
+mpilpte::    .LONG 0		;Offset of page table entry corresponding to
+				;  value stored in mpilmte
+firstuser::  .LONG 0		;First physical page allocated to a user
+firstsda::   .LONG 0		;Selector for first SDA in system
+xpagefree::  .LONG 0		;Head pointer for exec memory pool page free
+				;  list
+xmbreserve:: .LONG 3		;Number of XMB reserve pages
+xmbfree:     .BLKL XMBMAX	;Exec memory pool free list pointer array
+xmbfree4096: .LONG 0
+xmbcnt::     .BLKL XMBMAX	;Exec memory pool free list count array
+xmbcnt4096:  .LONG 0
+xmbchwm::    .BLKL XMBMAX
+xmbchwm4096: .LONG 0
+xmbinuse::   .BLKL XMBMAX+1	;Number of in use exec memory buffers
+xmbiuhwm::   .BLKL XMBMAX+1	;High water mark for in use exec memory buffers
+xmbmask:     .LONG ~3Fh, ~7Fh, ~0FFh, ~1FFh, ~3FFh, ~7FFh, ~0FFFh
+xmbval:      .LONG 0, 41h, 81h, 101h, 201h, 401h, 801h, 1001h
+.IF NE $$DEBUGXMB
+ xmbchkm:    .LONG 3Fh, 7Fh, 0FFh, 1FFh, 3FFh, 7FFh, 0FFFh
+.ENDC
+xmbwakexff:: .LONG 0		;Head pointer for list of XFFs to wake up
+				;  after additional exec memory buffers made
+xmbqel1:     .BLKB slb_SIZE	;Special QELs used as signal link blocks
+xmbqel2:     .BLKB slb_SIZE	;  when requesting exec signal to allocate
+				;  more exec memory buffers from fork level
+xmbqel1bsy:  .BYTE 0		;Non-zero when xmbqel1 is in use
+xmbqel2bsy:  .BYTE 0		;Non-zero when xmbqel2 is in use
+
+knlSvCodePnt:: .LONG 0		;Saved knlXCodePnt
+knlSvDataPnt:: .LONG 0		;Saved knlXDataPnt
+knlSvSpacePnt::.LONG 0
+
+	     .LONG 16t
+	     .LONG 32t
+knlXmbSize:: .LONG 64t		;Exec memory buffer size table
+	     .LONG 128t
+	     .LONG 256t
+	     .LONG 512t
+	     .LONG 1024t
+	     .LONG 2048t
+xmbsize4096::.LONG 4096t
+
+wslimit::    .LONG 0FFFFFFFFh
+tmlimit::    .LONG 0FFFFFFFFh
+pmlimit::    .LONG 0FFFFFFFFh
+rmlimit::    .LONG 0FFFFFFFFh
+omlimit::    .LONG 0FFFFFFFFh
+
+xmbrngpnt::.LONG  xmbrng
+xmbrng::   .BLKL  512t*2
+xmbrngend::.LONG  0FFFFFFFFh
+
+	END

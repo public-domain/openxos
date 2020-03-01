@@ -1,0 +1,470 @@
+	.TITLE	ONCEPROT - XOS once-only protected mode code
+
+;++++
+; This software is in the public domain.  It may be freely copied and used
+; for whatever purpose you see fit, including commerical uses.  Anyone
+; modifying this software may claim ownership of the modifications, but not
+; the complete derived code.  It would be appreciated if the authors were
+; told what this software is being used for, but this is not a requirement.
+
+;   THIS SOFTWARE IS PROVIDED BY THE AUTHORS "AS IS" AND ANY EXPRESS OR
+;   IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
+;   OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+;   IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+;   INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+;   BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS
+;   OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+;   ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR
+;   TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
+;   USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+;----
+
+	.PROC	80486
+	.INCLUD	XOSINC:\XMAC\XOS.PAR
+	.INCLUD	XOSINC:\XMAC\XOSX.PAR
+	.INCLUD	XOSINC:\XMAC\PCAT.PAR
+
+DEBUG_INIT=!0			;Do not include code for debugging INIT process
+
+	ONCE
+
+$$$=!0
+FRM once_unavail, 4t	;First unavailable paragraph in base memory area
+FRM once_avail  , 4t	;First available paragraph in base memory area
+FRM once_boot   , 4t	;Boot disk data
+FRM once_ramdisk, 4t	;Size of the once-only RAM-disk
+FRM once_curpos , 4t	;Cursor position
+once_SIZE=!$$$
+
+;First do the minimum setup needed to let the debugger run
+;	c{EAX} = First unavailable paragraph in base memory area
+;	c{EBX} = First available address in base memory area
+;	c(DL)  = Boot disk unit
+;	c(DH)  = Boot disk type (high bit set indicates that units 0 and 1
+;		   are swapped):
+;		   0 = First floppy disk controller
+;		   1 = Second floppy disk controller
+;		   2 = First hard disk controller
+;		   3 = Second hard disk controller
+;	c{ESI} = Size of the once-only RAM-disk
+;	c{EDI} = Cursor position on screen (row * 100h + column)
+
+oncep::!CLI				;Make sure no interrupts here
+	LSSL	ESP, CS:ESPval		;Setup our stack pointer
+	MOVL	ECX, #GS_DATA		;Initialize normal data segment register
+	MOVL	DS, ECX			;  and make sure all segment registers
+	MOVL	FS, ECX			;  are valid
+	MOVL	GS, ECX
+	LGDTL	gdtval#			;Reload the GDT to be safe (possible
+					;  B1 problem!)
+	LIDTL	idtval#			;Load the IDT
+	ENTER	once_SIZE, 0
+	MOVL	once_unavail.B[EBP], EAX ;Save data from real mode
+	MOVL	once_avail.B[EBP], EBX
+	MOVL	once_boot.B[EBP], EDX
+	MOVL	once_ramdisk.B[EBP], ESI
+	MOVL	once_curpos.B[EBP], EDI
+	MOVB	AL, #04h		;Enable IO-CHK NMI interrupts, disable
+	OUTB	61h			;  failsafe NMI interrupts
+	IOPAUSE
+	MOVB	AL, #1Ah		;Set NMI master enable
+	OUTB	P_CLKADDR
+	CLRL	EAX			;Clear the page 0 mapping we used to
+	MOVL	SS:pdaPageDir#, EAX	;  switch to protected mode
+	MOVL	pgtable+{{la_data+pgtable}>10t}, EAX
+	MOVB	AL, #11h		;Initialize first interrupt controller
+	OUTB	P_INC1P0		;ICW1 - edge, master, ICW4 present
+	IOPAUSE
+	MOVB	AL, #ID_HBASE/8		;ICW2 - vector base
+	OUTB	P_INC1P1
+	IOPAUSE
+	MOVB	AL, #04h		;ICW3 - master level 2
+	OUTB	P_INC1P1
+	IOPAUSE
+	MOVB	AL, #01h		;ICW4 - non-buffered, master, 8086 mode
+	OUTB	P_INC1P1
+	IOPAUSE
+	MOVB	AL, #0FFh		;Mask off all levels
+	OUTB	P_INC1P1
+	IOPAUSE
+	MOVB	AL, #11h		;Initialize second interrupt controller
+	OUTB	P_INC2P0		;ICW1 - edge, slave, ICW4 present
+	IOPAUSE
+	MOVB	AL, #ID_HBASE/8+8	;ICW2 - vector base
+	OUTB	P_INC2P1
+	IOPAUSE
+	MOVB	AL, #02h		;ICW3 - slave level 2
+	OUTB	P_INC2P1
+	IOPAUSE
+	MOVB	AL, #01h		;ICW4 - non-buffered, slave, 8086 mode
+	OUTB	P_INC2P1
+	IOPAUSE
+	MOVB	AL, #0FFh		;Mask off all levels
+	OUTB	P_INC2P1
+	CALL	vectorinit#		;Initialize error vectors
+	MOVL	EAX, #geckoctop#-2000h	;Get length of GECKO code segment
+	TESTL	EAX, EAX		;Was GECKO loaded?
+	JS	oncep2.S		;No - go on
+	PUSHL	#0.B			;Yes - setup stack to call GECKO
+	CALLF	geckodispatch#+0	;Go to GECKO
+	MOVL	knlGeckoSig#+0, #'GECK'	;Set GECKO signature to indicate have
+	MOVL	knlGeckoSig#+4, #'O$'	;  GECKO available
+	CALL	vectorinit#		;Setup the error vectors again to undo
+					;  the values GECKO left in some of them!
+oncep2:!MOVB	AL, #0D1h		;8042 command to write output port
+	OUTB	P_KEYCMD		;  to enable memory above 1MB
+	CALL	oemp8042		;Wait for 8042 to accept command
+	MOVB	AL, #0DFh		;Value for output port
+	OUTB	P_KEYDATA
+	CALL	oemp8042		;Wait until 8042 takes it
+	MOVB	AL, #0FFh		;Follow it with a null command to
+	OUTB	P_KEYCMD		;  wait until it is done
+	CALL	oemp8042
+	MOVL	EDI, #oorddata		;Clear the once-only data area
+	PUSHL	DS
+	POPL	ES
+	CLRL	EAX
+	MOVL	ECX, #1024t
+	CLD
+	RSTOSL	[EDI]
+	MOVL	EAX, once_curpos.B[EBP]	;Initialize the once-only console
+	CALL	oocdinit#		;  routine
+	MOVL	EBX, #pmimsg		;Display initial protected mode message
+	CALL	dispmsg
+
+;We assume that the BIOS has correctly inialized the DMA controllers.  Since
+;  both DMA controllers must be functioning correctly for RAM refresh to work,
+;  we would not get this far if they were not set up right!  We do set the mask
+;  bits for the 6 available DMA channels to make sure that the BIOS has not
+;  left a channel enabled (this has been observed on some machines!)
+
+	MOVB	AL, #05			;Set mask bit for channel 1, on
+	OUTB	P_DMA1WSMB		;  DMA controller 1
+	IOPAUSE
+	MOVB	AL, #06			;Set mask bit for channel 2, on
+	OUTB	P_DMA1WSMB		;  DMA controller 1
+	IOPAUSE
+	MOVB	AL, #07			;Set mask bit for channel 3, on
+	OUTB	P_DMA1WSMB		;  DMA controller 1
+	IOPAUSE
+	MOVB	AL, #05			;Set mask bit for channel 1, on
+	OUTB	P_DMA2WSMB		;  DMA controller 2
+	IOPAUSE
+	MOVB	AL, #06			;Set mask bit for channel 2, on
+	OUTB	P_DMA2WSMB		;  DMA controller 2
+	IOPAUSE
+	MOVB	AL, #07			;Set mask bit for channel 3, on
+	OUTB	P_DMA2WSMB		;  DMA controller 2
+
+;The following code checks for the B1 stepping mutliplication bug (taken from
+;  Advanced 80386 Programming Techniques by James L. Turley)
+
+	CLRL	ECX
+	MOVB	CL, #41h
+	MOVL	EAX, #42E8h		;Test 32-bit multiply
+	MULL	ECX
+	CMPL	EAX, #10FCE8h
+	JNE	2$.S
+	TESTL	EDX, EDX
+	JNE	2$.S
+	MOVL	EAX, #85D00h
+	MULL	ECX
+	CMPL	EAX, #21F9D00h
+	JNE	2$.S
+	TESTL	EDX, EDX
+	JNE	2$.S
+	MOVL	EAX, #42E80000h
+	MULL	ECX
+	CMPL	EAX, #0FCE80000h
+	JNE	2$.S
+	CMPL	EDX, #10h.B
+	JNE	2$.S
+	MOVL	EAX, #417A000h
+	MOVB	CL, #81h
+	MULL	ECX
+	CMPL	EAX, #0FE7A000h
+2$:	JNE	4$.S
+	CMPL	EDX, #2h.B
+	JNE	4$.S			;If wrong!
+	MOVW	DX, #0AB66h		;OK, now test 16-bit multiply
+	MOVW	AX, #9AE8h
+	MULW	DX
+	CMPW	AX, #0B070h
+	JNE	4$.S
+	MOVW	DX, #0FDF3h
+	MOVW	AX, #9AE8h
+	MULW	DX
+	CMPW	AX, #5238h
+	JNE	4$.S
+	MOVW	DX, #0B554h
+	MOVW	AX, #0E8EAh
+	MULW	DX
+	CMPW	DX, #0A4F9h
+	JNE	4$.S
+	MOVW	DX, #0B4C6h
+	MOVW	AX, #0E8EAh
+	MULW	DX
+	CMPW	AX, #0ACFCh
+	JNE	4$.S
+	CMPW	DX, #0A478h
+	JNE	4$.S
+	MOVW	DX, #0B318h
+	MOVW	AX, #0E8EAh
+	MULW	DX
+	CMPW	DX, #0A2F1h
+	JNE	4$.S
+	MOVW	DX, #0B438h
+	MOVW	AX, #0E8EAh
+	MULW	DX
+	CMPW	DX, #0A3F7h
+	JE	5$.S			;If OK
+4$:	INCB	intmulbug#		;If wrong
+
+;The following code checks for the Pentium floating point multiply bug
+
+5$:	CMPB	fputype#, #FPU_NONE	;Do we have an FPU?
+	JNE	6$.S			;Yes
+	DECB	fpudivbug#		;No
+	JMP	7$.S
+
+6$:	PUSHL	#0.B
+	FLDL	CS:val1
+	FDIVL	CS:val2
+	FMULL	CS:val2
+	FSUBL	CS:val1
+	FSTL	[ESP]
+	POPL	ECX
+	JREGZ	ECX, 7$
+	INCB	fpudivbug#
+7$:	MOVB	AL, #34h		;Initialize timer 0 to interrupt
+	OUTB	P_TMRCWR		;  50 times a second
+	IOPAUSE
+	MOVB	AL, #CNTSPERTICK&0FFh
+	OUTB	P_TMRCNT0
+	IOPAUSE
+	MOVB	AL, #CNTSPERTICK>8
+	OUTB	P_TMRCNT0
+	PUSHL	#GS_DATA.B		;Set DS to normal exec data segment
+	POPL	DS
+	MOVL	EBX, #status1		;Display first status character
+	CALL	dispmsg
+	CLRL	EAX			;Set LDT for scheduler task
+	LLDT	AX
+	MOVL	EAX, #GS_SCHTSS		;Set TR for scheduler task
+	LTR	AX
+	STI				;Allow interrupts now
+	MOVL	EBX, #status2		;Display second status character
+	CALL	dispmsg
+	MOVL	EAX, once_unavail.B[EBP] ;Restore memory data from real mode
+	MOVL	EBX, once_avail.B[EBP]	 ;  once-only
+	MOVL	ECX, once_ramdisk.B[EBP]
+	CALL	meminit#		;Initialize memory routines
+	MOVL	EBX, #status3		;Display third status character
+	CALL	dispmsg
+	CALL	ioinit#			;Initialize the IO routines
+	MOVL	EBX, #status4		;Display fourth status character
+	CALL	dispmsg
+	CALL	schedinit#		;Initialize the scheduler
+	MOVL	EBX, #status5		;Display fifth status character
+	CALL	dispmsg
+	MOVL	EDI, #oocddcb#		;Assign a global ID for the once-only
+	CALL	knlGetDcbId#		;  console device (Can't do this until
+					;  we have called initsched!)
+	CALL	datetimeinit#		;Get date and time from the RTC
+	MOVB	AL, once_boot+1.B[EBP]	;Get the unit swap bit
+	ANDB	AL, #80h
+	MOVB	flopswap#, AL		;Store it
+	MOVL	knlXResPda#, SS		;Get the exec memory resource
+	CALL	initsystem#		;Initialize the SYSTEM device class
+	MOVL	EBX, #status6		;Display sixth status character
+	CALL	dispmsg
+	MOVL	EAX, knlTickCnt#	;Get time of day in ticks / 2
+	SHRL	EAX, #1t
+	MOVL	fileseqnum#+0, EAX
+	MOVL	EDX, knlSysDate#	;Get low 10 bits of the date
+	ANDL	EAX, #3FFh
+	MOVL	fileseqnum#+4, EAX
+	CALL	doinit#			;Initialize devices
+	MOVL	EBX, #status7		;Display seventh status character
+	CALL	dispmsg
+	CLRL	EAX
+	MOVL	knlXResPda#, EAX	;Give up exec memory resource
+	CALL	initprocs#		;Create initial processes
+	MOVL	EDX, once_boot.B[EBP]	;Get boot disk type and unit
+	ANDB	DH, #7Fh
+	CALL	lognameinit#		;Initialize logical names
+	INB	P_INC1P1		;Enable timer 0 interrupts (also
+	IOPAUSE				;  enables interrupt controller 2
+	ANDB	AL, #~05h		;  interrupts) (IRQ0 and IRQ2)
+	OUTB	P_INC1P1
+	MOVL	EBX, #status8		;Display eight status character
+	CALL	dispmsg
+	CMPB	fputype#, #FPU_NONE	;Do we have an FPU?
+	JE	14$			;No
+	CLTS				;Yes
+	FNINIT				;Initialize the FPU
+	MOVL	ECX, #20t
+8$:	IOPAUSE
+	LOOP	ECX, 8$
+	MOVB	AL, #0			;Make sure don't have a pending
+	OUTB	P_MATHCBSY		;  interrupt
+	IOPAUSE
+	INB	P_INC2P1		;Enable the FPU interrupt (IRQ13)
+	IOPAUSE
+	ANDB	AL, #~20h
+	OUTB	P_INC2P1
+
+;The following code determines now numeric exceptions are handled on this
+;  system.  There are two possibilities: 
+;	1.  Numeric exceptions are reported on the next non-control FPU
+;	    operation. (This is what all of the books say!)
+;	2.  Numeric exceptions are reported immediately. (This is the case
+;	    with at least some 80387s which use an external interrupt to
+;	    report exceptions!)
+
+	PUSHL	SS:pdaIdt#+ID_FPUERR+0
+	PUSHL	SS:pdaIdt#+ID_FPUERR+4
+	PUSHL	SS:pdaIdt#+ID_FPUINT+0
+	PUSHL	SS:pdaIdt#+ID_FPUINT+4
+	MOVL	EAX, #ofpuerr
+	MOVW	SS:pdaIdt#+ID_FPUERR+0, AX
+	SHRL	EAX, #16t
+	MOVW	SS:pdaIdt#+ID_FPUERR+6, AX
+	MOVL	EAX, #ofpuint
+	MOVW	SS:pdaIdt#+ID_FPUINT+0, AX
+	SHRL	EAX, #16t
+	MOVW	SS:pdaIdt#+ID_FPUINT+6, AX
+	FLDCW	CS:fcw			;Enable divide by zero exceptions
+	FLD1
+	FLDZ
+	FDIVP
+	MOVL	ECX, #10000h
+10$:	JMP	$+2.S
+	LOOP	ECX, 10$
+	NOP
+	FWAIT
+	POPL	SS:pdaIdt#+ID_FPUINT+4
+	POPL	SS:pdaIdt#+ID_FPUINT+0
+	POPL	SS:pdaIdt#+ID_FPUERR+4
+	POPL	SS:pdaIdt#+ID_FPUERR+0
+	JREGZ	ECX, 12$		;Did we interrupt at the FWAIT?
+	MOVB	gdtable+GS_CODEALS+5, #DT_RWDATA+PL_0 ;Yes - enable alaised code
+	PUSHL	#GS_CODEALS.B			      ;  segment
+	POPL	ES
+	MOVB	ES:fpufx1#, #90h	;Change FWAIT instructions to NOP
+	MOVB	ES:fpufx2#, #90h
+	CLRL	EAX
+	MOVL	ES, EAX
+	MOVB	gdtable+GS_CODEALS+5, AL ;Disable the allaised code space
+12$:	FNINIT				;Reset the FPU
+14$:	CALL	knlGetTime#
+	PUSHL	EAX
+	PUSHL	EDX
+	MOVL	ECX, #83822t		;Calibrate our short delay routine
+	CALL	knlSDelay#		;  so that one count is about ten
+	CALL	knlGetTime#		;  microseconds
+	POPL	ECX
+	POPL	EBX
+	SUBL	EAX, EBX
+	SBBL	EDX, ECX
+	MOVL	ECX, EAX
+	MOVL	EAX, #1000000t
+	CLRL	EDX
+	DIVL	ECX
+	MOVL	knlDelFactor#, EAX	;Store delay factor
+	CLD
+	MOVL	ESP, #pdaXStk#		;Reset our stack
+
+.IF NE 0
+	CLRL	EBX
+	PUSHL	#GS_BIOSCODE.B
+	POPL	ES
+	MOVL	ECX, #8000h
+20$:	CMPL	ES:[EBX], #'PMID'
+	JE	22$.S
+	INCL	EBX
+	LOOP	ECX, 20$
+
+22$:	INT3
+.ENDC
+
+	MOVL	EBX, #strtmsg		;Display starting system message
+	CALL	dispmsg
+	PUSHL	#4200h			;Go to the scheduler
+	PUSHL	#!scheduler#.B
+	PUSHL	#scheduler#
+	IRET
+
+;Trap routine for testing FPU exception handling
+
+ofpuint:FNCLEX				;The the FPU exception
+	MOVB	AL, #0
+	OUTB	P_MATHCBSY
+	MOVB	AL, #INT_EOI		;Release the interrupt controllers
+	OUTB	P_INC1P0
+	IOPAUSE
+	OUTB	P_INC2P0
+ofpuerr:MOVL	ECX, #1
+	IRET
+.PAGE
+;Subroutine to output message to the console
+;	c{EBX} = Offset of message in code segment
+;	CALL	dispmsg
+
+dispmsg:MOVL	EDI, #oocddcb#
+	PUSHL	#GS_DISPLAY.B
+	POPL	ES
+4$:	MOVB	AL, CS:[EBX]
+	CMPB	AL, #0
+	JE	ret010.S
+	INCL	EBX
+	PUSHL	EBX
+	CALL	oocddispchr#
+	POPL	EBX
+	JMP	4$.S
+
+ret010:	RET
+.PAGE
+;Subroutine to check for 8042 input buffer empty during initialization
+;	CALL	oemp8042
+;	Z:set = Normal
+;	Z:clr = Error
+
+oemp8042:
+	MOVL	ECX, #1000h
+2$:	NOP
+	LOOP	ECX, 2$
+4$:	INB	P_KEYDATA		;Make sure no input data left
+	IOPAUSE
+	INB	P_KEYSTS		;Get 8042 status
+	IOPAUSE
+	ANDB	AL, #02h		;Check input buffer full bit
+	LOOPNE	CX, 4$			;Loop if not empty
+	JE	ret010.S
+	CRASH	KBIE
+.PAGE
+	.MOD	4
+ESPval:!.LONG	pdaXStk#
+	.WORD	GS_SCHPDA
+
+fcw:!	.WORD	37Bh		;FPU CW which enables divide by 0 exception
+
+val1:	.LONG	4195835t	;Data for Pentium divide bug check
+val2:	.LONG	3145727t
+
+pmimsg:	.ASCIZ	"Protected mode initialization: "
+status1:.ASCIZ	"1"
+status2:.ASCIZ	"2"
+status3:.ASCIZ	"3"
+status4:.ASCIZ	"4"
+status5:.ASCIZ	"5"
+status6:.ASCIZ	"6"
+status7:.ASCIZ	"7"
+status8:.ASCIZ	"8"{CR,LF}
+strtmsg:.ASCIZ	"Starting system"{CR,LF}
+
+.IF NE DEBUG_INIT
+conname:!.ASCIZ	"TRM0S1:"
+.ENDC
+
+	END

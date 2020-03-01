@@ -1,0 +1,664 @@
+	.TITLE	PATH - File system path routines for XOS
+
+;++++
+; This software is in the public domain.  It may be freely copied and used
+; for whatever purpose you see fit, including commerical uses.  Anyone
+; modifying this software may claim ownership of the modifications, but not
+; the complete derived code.  It would be appreciated if the authors were
+; told what this software is being used for, but this is not a requirement.
+
+;   THIS SOFTWARE IS PROVIDED BY THE AUTHORS "AS IS" AND ANY EXPRESS OR
+;   IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
+;   OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+;   IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+;   INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+;   BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS
+;   OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+;   ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR
+;   TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
+;   USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+;----
+
+	.PROC	80486
+	.INCLUD	XOSINC:\XMAC\XOS.PAR
+	.INCLUD	XOSINC:\XMAC\XOSX.PAR
+	.INCLUD	XOSINC:\XMAC\XOSERR.PAR
+	.INCLUD	XOSINC:\XMAC\XOSDISK.PAR
+	.INCLUD	XOSINC:\XMAC\XOSXDISK.PAR
+
+	CODE
+
+;Device parameter table for path function
+
+	.LONG	PARMMAX
+pathparms:
+	.LONG	pathgenparms	;IOPAR_xxxxxx = 00xx - Generic IO parameters
+PARMMAX=!{$-pathparms}/4
+
+	.LONG	PARMGENMAX
+pathgenparms:
+	.LONG	0		;		= 0000h  - Reserved
+	.LONG	knlIopFilOptn#	;IOPAR_FILOPTN  = 0001h  - File option bits
+	.LONG	knlIopFilSpec#	;IOPAR_FILSPEC  = 0002h  - File spec. string
+PARMGENMAX=!{$-pathgenparms}/4
+
+	.SBTTL	pathfunc - Path function
+
+;Here for the queued IO path function
+;	c{ESI} = Offset of IORB
+;	CALL	pathfunc
+;	c{EAX} = Error code (0 if normal)
+;	c{EBX} = Queued IO status bits
+;	c{ECX} = 0 (if error) or 1 (if normal)
+
+pathfunc::
+	MOVL	iorb_routine.B[ESI], #path1
+	JMP	opnfnc2#
+
+;Here in extended fork context
+
+path1:	MOVL	EBX, #pathparms		;Do initial setup
+	CALL	knlOpenSetup#
+	JC	2$.S
+	IFFAULT	knlQAdrErr0#
+	LESL	EBX, SS:xffBuffer1#	;Get address of the name
+	MOVL	ECX, #32t
+	LEAL	EDI, lns_xbufr#[EBP]
+	CLRL	EAX
+	MOVL	lns_xbufr#+1[EBP], EAX
+	MOVL	lns_xbufr#+5[EBP], EAX
+	MOVL	SS:xffRtdName#+0, EAX
+	MOVL	SS:xffRtdName#+4, EAX
+	PUSHL	SS
+	POPL	FS
+	MOVW	GS, SS:xffPda#		;Get our PDA selector
+	MOVB	AL, #TNB$FLAG
+	CALL	transname#		;Translate the name
+2$:	JC	12$.S			;If error
+	PUSHL	ESI			;OK - copy possible definition string
+	PUSHL	FS			;  to a buffer
+	LEAL	EDI, opn_namebfr[EBP]
+	CALL	copyname#
+	POPL	FS
+	JC	10$.S
+	LEAL	ESI, opn_namebfr[EBP]	;Scan the path name to see if it
+	CLD				;  contains any wild-card characters
+4$:	LODSB	SS:[ESI]		;  - fail if it does
+	CMPB	AL, #'*'
+	JE	8$.S
+	CMPB	AL, #'?'
+	JNE	14$.S
+8$:	MOVL	EAX, #ER_BDSPC
+10$:	POPL	ESI
+12$:	CLRL	ECX
+	JMP	open6#
+
+;Here if don't have a wild-card character
+
+14$:	CMPB	AL, #0			;More to check?
+	JNE	4$.S			;Yes
+	POPL	ESI			;No
+	CMPB	lns_xbufr#[EBP], #'!'	;Have substituted logical name?
+	JE	sublog			;Yes
+	LEAL	EBX, lns_xbufr#+1[EBP]	;No - have physical device
+	PUSHL	SS
+	POPL	ES
+	CALL	knlSetName#		;Set up its name
+	JC	12$.S			;This should not fail!
+	CALL	knlFindDcb#		;Find DCB for the device
+	JC	12$.S			;If error
+	CALL	knlStoreHndl#		;Store DCB offset in the handle table
+	JC	doopn10#		;If error
+	CLRL	ECX
+	MOVL	EAX, dcb_sdisp.B[EDI]
+	CALLI	CS:sd_mount.B[EAX]
+	JC	16$.S
+	TESTL	SS:xffPVFilOpt#, #FO$PHYNAME|FO$DOSNAME|FO$VOLNAME|FO$XOSNAME
+					;Does he want the device name?
+	JE	18$.S			;No
+	CALL	knlGivUDevName#		;Yes - give it to him
+16$:	JC	path8			;If error
+18$:	BTL	dcb_dsp.B[EDI], #DS%LCLDISK ;Is this really a disk?
+	JNC	notdisk.S		;No
+	CMPB	opn_namebfr[EBP], #0	;Yes - want to change path?
+	JNE	setpath			;Yes
+	JMP	path4			;No
+.PAGE
+;Here if device is not a disk
+
+notdisk:LEAL	EBX, opn_namebfr[EBP]
+	CMPB	SS:[EBX], #0		;Does he want to change the path?
+	JE	4$.S			;No
+2$:	INCL	EBX			;Maybe - scan to end of string
+	CMPB	SS:[EBX], #0
+	JNE	2$.S
+	CMPW	SS:-2.B[EBX], #'::'	;Network address?
+	JE	4$.S			;Yes - not changing the path
+	MOVL	EAX, #ER_NTDSK		;No - fail
+	JMP	path8
+
+;Here if device is not a disk and not changing the path
+
+4$:	BTL	SS:xffPVFilOpt#, #FO%PATHNAME ;Does he want the path?
+	JNC	path6			;No
+	BTL	SS:xffPVFilOpt#, #FO%NOPREFIX ;Yes - want prefix characters?
+	JC	6$.S			;No
+	MOVB	AL, #FS_PATHNAME	;Yes - indicate this is a path
+	CALL	knlGivUChr#
+6$:	MOVB	AL, #'\'
+	CALL	knlGivUChr#
+	JMP	path6
+.PAGE
+;Here if have substituted logical name
+
+sublog:	TESTL	SS:xffPVFilOpt#, #FO$PHYNAME|FO$DOSNAME|FO$VOLNAME|FO$XOSNAME
+					;Does he want the device name?
+	JE	6$.S			;No
+	PUSHL	ESI			;Yes
+	BTL	SS:xffPVFilOpt#, #FO%NOPREFIX ;Want prefix byte?
+	JC	2$.S			;No
+	MOVB	AL, #FS_XOSNAME		;Yes
+	CALL	knlGivUChr#		;Give it to him
+2$:	LEAL	ESI, lns_xbufr#+1[EBP]	;Point to definition
+4$:	LODSB	SS:[ESI]		;Copy the name
+	CALL	knlGivUChr#
+	CMPB	AL, #':'
+	JNE	4$.S
+	POPL	ESI
+6$:	CMPB	opn_namebfr[EBP], #0	;Want to change the path?
+	JE	sublo8			;No
+	CMPW	opn_namebfr[EBP], #'\'.B ;Yes - is the new path \?
+	JNE	sublo4.S		;No
+	CMPW	FS:ln_path.B[ESI], #0.B	;New path is null - is old path null?
+	JE	sublo8			;Yes - nothing needed here!
+	MOVZWL	ECX, FS:ln_path.B[ESI]	;No - remove it
+	SUBL	ECX, #mb_data.B
+	MOVW	FS:ln_path.B[ESI], #0
+	CLRL	EDI
+	MOVL	SS:xffDcb#, EDI
+	PUSHL	FS
+	POPL	ES
+	CALL	knlChngPdaMemXf#	;Reduce the size of the PDA block
+	JMP	sublo8			;Go finish up
+.PAGE
+;Here if new path string is not null
+
+sublo4:	LEAL	EDI, opn_namebfr[EBP]	;First remove any . or .. names
+	PUSHL	ESI
+	MOVL	ESI, EDI
+	MOVL	ECX, EDI
+	PUSHL	SS
+	POPL	ES
+	CLD
+	CLRL	EDX
+2$:	LODSB	SS:[ESI]		;Get first character in name
+	CMPB	AL, #0			;Finished?
+	JE	22$.S			;Yes
+	CMPB	AL, #'\'		;Null name?
+	JE	6$.S			;Yes
+	CMPB	AL, #'.'		;Does the name start with .?
+	JNE	18$.S			;No
+	CMPB	SS:[ESI], #0		;Yes - is it just .?
+	JE	20$.S			;Yes
+	CMPB	SS:[ESI], #'\'		;Maybe
+	JNE	8$.S			;No
+4$:	INCL	ESI			;Yes - skip the .\
+	JMP	20$.S
+
+;Here if have null name
+
+6$:	CMPL	EDI, ECX		;At beginning of string?
+	JNE	2$.S			;No - ignore the character
+	JMP	22$.S			;Yes - no really null - store character
+
+;Here with name which begins with . which is not just .
+
+8$:	CMPB	SS:[ESI], #'.'		;Is it ..?
+	JNE	18$.S			;No
+	CMPB	SS:1.B[ESI], #0		;Yes - anything else
+	JE	10$.S			;No - have ..
+	CMPB	SS:1.B[ESI], #'\'	;Maybe
+	JNE	18$.S			;Yes - not ..
+10$:	CMPL	EDI, ECX		;No - have .. - at beginning of string?
+	JNE	14$.S			;No
+	INCL	EDX			;Yes - count this
+12$:	ADDL	ESI, #2.B		;Skip the ..
+	JMP	2$.S			;Continue
+
+;Here if .. is not at the beginning
+
+14$:	DECL	EDI
+	CMPL	EDI, ECX		;Was \.. at the beginning?
+	JE	27$			;Yes - fail
+16$:	CMPL	EDI, ECX
+	JE	12$.S
+	DECL	EDI
+	CMPB	SS:[EDI], #'\'		;Find previous \
+	JNE	16$.S
+	INCL	ESI
+	JMP	20$.S
+
+18$:	STOSB	[EDI]
+20$:	LODSB	SS:[ESI]
+22$:	STOSB	[EDI]
+	CMPB	AL, #'\'		;Start of name?
+	JE	2$.S			;Yes
+	CMPB	AL, #0
+	JNE	20$.S
+	POPL	ESI
+
+;Here with string scanned and . and .. names removed
+;	c{EDX} = Number of names to ignore before beginning of string
+
+	LEAL	EDI, opn_namebfr[EBP]	;Now get length of the path string,
+	MOVL	ECX, #-1		;  including the final null
+	CLRL	EAX
+	RNSCASB	[EDI]
+	NOTL	ECX
+	CMPL	ECX, #1.B		;Is the string null now?
+	JE	24$.S			;Yes
+	MOVB	AL, SS:-2.B[EDI]	;No
+	CMPB	AL, #'\'		;Did it end with \?
+	JE	24$.S			;Yes
+	CMPB	AL, #':'		;Or :?
+	JE	24$.S			;Yes
+	CMPB	AL, #']'		;Or ]?
+	JE	24$.S			;Yes
+	INCL	ECX			;No
+	CMPL	ECX, #FILESPCSIZE
+	JA	30$.S
+	MOVW	SS:-1.B[EDI], #'\'	;Add \ to end of string
+24$:	MOVZWL	EDI, FS:ln_path.B[ESI]	;See how big we need to make it
+	TESTL	EDI, EDI		;Was previous path string null?
+	JNE	26$.S			;No
+	MOVL	EDI, FS:[ESI]		;Yes - get right value
+26$:	MOVL	EAX, EDX
+	MOVL	EDX, EDI
+	ADDL	EDI, ESI
+	CMPB	opn_namebfr+0[EBP], #'\' ;Did the new path begin with \?
+	JE	42$.S			;Yes
+	PUSHL	ECX			;No
+	CMPW	FS:ln_path.B[ESI], #0.B	;Do we have an old path string?
+	JNE	34$.S			;Yes
+	TESTL	EAX, EAX		;No - have any dangling ..s?
+	JNE	28$.S			;Yes - fail
+	INCL	[ESP]			;No - increase length to account for \
+	CLRL	ECX
+	JMP	40$.S
+
+;Here if trying to backup before beginning of the string
+
+27$:	POPL	ESI
+28$:	MOVL	EAX, #ER_DIRNF
+	JMP	32$.S
+
+;Here if have bad logical name
+
+30$:	MOVL	EAX, #ER_BDLNM
+32$:	CLRL	ECX
+	JMP	open6#
+
+;Here if have an old path string and new path string did not begin with \
+
+34$:	PUSHL	EAX			;Save number of dangling ..s
+	PUSHL	FS			;Get length of old path string and
+	POPL	ES			;  leave EDI pointing to the null byte
+	MOVL	ECX, #-1		;  after the string
+	CLD
+	CLRL	EAX
+	RNSCASB	[EDI]
+	NOTL	ECX
+	DECL	ECX
+	DECL	EDI
+	POPL	EBX			;Get number of dangling ..s
+36$:	DECL	EBX
+	JS	40$.S
+38$:	DECL	ECX
+	JE	28$.S
+	DECL	EDI
+	CMPB	ES:-1.B[EDI], #'\'
+	JNE	38$.S
+	JMP	36$.S
+
+;Here with old path string ready (we have removed any names that are indicated
+;  by leading ..s in the new path string)
+
+40$:	ADDL	ECX, [ESP]		;Is the total too big?
+	CMPL	ECX, #FILESPCSIZE
+	POPL	ECX
+	JA	30$.S			;Yes - fail
+
+;Here with new string ready - now we move the new string up to make room for
+;  the old string before it if the new string did not begin with \.
+;	c{ECX}    = Length of new string + 1
+;	c{EDX}    = Offset in definition block of start of path string
+;	c{EDI}    = Offset of end of old path string
+;	c{FS:ESI} = Address of definition block
+
+42$:	LEAL	EAX, [ESI+EDX]		;Get beginning of current path string
+	SUBL	EAX, EDI		;Get length of current path string
+	NEGL	EAX
+	PUSHL	ESI
+	LEAL	ESI, opn_namebfr-1[EBP+ECX]
+	LEAL	EDI, [ESI+EAX]
+	LEAL	EBX, [EAX+ECX]
+	PUSHL	SS			;Move new path string up to make room
+	POPL	ES			;  for current path string
+	STD
+	RMOVSB	[EDI], SS:[ESI]
+	MOVL	ESI, [ESP]
+	ADDL	ESI, EDX
+	LEAL	EDI, opn_namebfr+0[EBP]
+	MOVL	ECX, EAX
+	CLD
+	RMOVSB	[EDI], FS:[ESI]		;Copy current path string
+	POPL	ESI
+	PUSHL	EDX
+	PUSHL	EBX
+	LEAL	ECX, [EDX+EBX]
+	PUSHL	FS
+	PUSHL	ECX
+	PUSHL	ESI
+	MOVL	SS:xffCmd#, #O$ODF
+	MOVL	opn_opendisp.B[EBP], #parm4#
+	CALL	doopen2#		;See if directory exists
+	JC	49$.S
+	CALL	opner2#			;OK - do clean-up
+	POPL	ESI
+	POPL	ECX
+	CLRL	EDI
+	MOVL	SS:xffDcb#, EDI
+	MOVL	ES, [ESP]
+	CALL	knlChngPdaMemXf#	;Adjust size of the PDA block
+	POPL	FS
+	POPL	ECX
+	POPL	EDX
+	JC	32$			;If error
+	MOVW	FS:ln_path.B[ESI], DX	;Store offset of path string
+	LEAL	EDI, [ESI+EDX]
+	PUSHL	FS
+	POPL	ES
+	PUSHL	ESI
+	LEAL	ESI, opn_namebfr[EBP]
+	CLD
+	RMOVSB	[EDI], SS:[ESI]		;Copy the path string to the PDA block
+	POPL	ESI
+sublo8:	BTL	SS:xffPVFilOpt#, #FO%PATHNAME ;Does he want the path returned?
+	JNC	52$.S			;No - finished now
+	BTL	SS:xffPVFilOpt#, #FO%NOPREFIX ;Yes - want prefix characters?
+	JC	46$.S			;No
+	MOVB	AL, #FS_PATHNAME	;Yes - indicate this is a path
+	CALL	knlGivUChr#
+46$:	MOVZWL	EAX, FS:ln_path.B[ESI]	;Get position of path definition
+	TESTL	EAX, EAX		;Do we have one?
+	JE	50$.S			;No
+	ADDL	ESI, EAX		;Yes - get its offset
+48$:	LODSB	FS:[ESI]		;Get path character
+	TESTB	AL, AL
+	JE	52$.S
+	CALL	knlGivUChr#		;Give it to him
+	JMP	48$.S			;Continue
+
+;Here if error when check for existance of directory for path
+
+49$:	ADDL	ESP, #20t.B
+	JMP	56$.S
+
+;Here with null path
+
+50$:	MOVB	AL, #'\'		;Give him a back-slash
+	CALL	knlGivUChr#
+52$:	CLRL	EAX
+	MOVL	ECX, #1
+56$:	JMP	open6#
+.PAGE
+;Here if changing the path for a disk device
+
+setpath:SUBL	ESP, #260t		;Get space for path string and length
+	MOVL	EBX, ESP		;  item
+	PUSHL	SS:xffPPFilSpc#+0	;Save address and count for user buffer
+	PUSHL	SS:xffPPFilSpc#+4
+	PUSHL	SS:xffPSFilSpc#
+	PUSHL	SS:xffPCFilSpc#
+	PUSHL	SS:xffPLFilSpc#+0
+	PUSHL	SS:xffPLFilSpc#+4
+	PUSHL	SS:xffParm#+0		;Save address of user's parameter list
+	PUSHL	SS:xffParm#+4
+	PUSHL	SS:xffPVFilOpt#		;Save user's file option bits
+	PUSHL	SS:xffCmd#		;Save user's open command bits
+	CLRL	EAX
+	MOVL	SS:xffParm#+0, EAX
+	MOVL	SS:xffPLFilSpc#+0, EAX
+	MOVL	SS:xffPLFilSpc#+4, EAX
+	MOVL	SS:xffPCFilSpc#, EAX
+	MOVL	SS:xffPSFilSpc#, #256t
+	MOVL	SS:xffPPFilSpc#+0, EBX ;Store address of path string buffer
+	MOVL	SS:xffPPFilSpc#+4, SS
+	MOVL	SS:xffPVFilOpt#, #FO$PATHNAME
+	MOVL	SS:xffCmd#, #O$ODF
+	LEAL	EDX, opn_namebfr[EBP]	;Get offset of path string
+	MOVL	EBX, dcb_sdisp.B[EDI]	;Open the last directory
+	CALLI	CS:sd_open1.B[EBX]
+	JC	6$.S			;If error
+
+;Here with the directory for the new path open - now see if we already have
+;  a path for the device and give it up if we do
+
+	MOVW	ES, SS:xffPda#
+	MOVZBL	EAX, ES:pdaSesProc#
+	MOVW	ES, knlProcTable#[EAX*2]
+	MOVL	ESI, ES:pdaPath#	;Get offset to first path block
+	TESTL	ESI, ESI
+	JE	strpath.S		;If none there
+	MOVL	EAX, [EDI]		;Get offset of UCB
+	CLRL	EBX
+2$:	CMPL	ES:pn_ucb.B[ESI], EAX	;This one?
+	JE	8$.S			;Yes
+	MOVL	EBX, ESI		;No
+	MOVL	ESI, ES:pn_next.B[ESI]	;Advance to next
+	TESTL	ESI, ESI
+	JNE	2$.S			;Continue if more to check
+	JMP	strpath.S		;Not there
+
+;Here if error opening directory
+
+6$:	ADDL	ESP, #260t+40t		;Remove junk from the stack
+	CALL	opner2#			;Do clean-up
+	CLRL	ECX
+	JMP	open6#
+
+;Here if found entry for path for this device
+
+8$:	MOVL	EAX, ES:pn_next.B[ESI]	;Give up the current path block
+	TESTL	EBX, EBX		;First entry?
+	JNE	10$.S			;No
+	MOVL	ES:pdaPath#, EAX	;Yes - update head pointer
+	TESTL	EAX, EAX
+	JE	12$.S			;If also last (list is empty now)
+	MOVL	ES:pn_pntr.B[EAX], #pdaPath# ;Not last - update back pointer
+	JMP	12$.S			     ;  in new first block
+
+;Here if this was not first entry in list
+
+10$:	MOVL	ES:pn_next.B[EBX], EAX	;Update forward pointer in previous
+	TESTL	EAX, EAX		;  block
+	JE	12$.S			;If this is now last block
+	ADDL	EBX, #pn_next.B		;Not last - update back pointer in next
+	MOVL	ES:pn_pntr.B[EAX], EBX	;  block
+12$:	MOVL	EAX, dcb_sdisp.B[EDI]
+	CALLI	CS:dd_clrpath.B[EAX]
+	CALL	knlGivePdaMemXf#	;Give up the memory block
+					;Fall into strpath on next page
+.PAGE
+;Here when ready to store new path
+
+strpath:MOVL	EAX, dcb_dkfilepnt.B[EDI] ;Get selector for base FIB for final
+	MOVL	EBX, [EDI]		;  directory
+	CMPL	EAX, ucb_rootpnt.B[EBX]	;Is he setting the path to the root?
+	JE	12$			;Yes - thats really no path at all!
+	MOVL	ECX, SS:xffPCFilSpc#	;Get length of path string
+	ADDL	ECX, #pn_string-mb_data.B ;Calculate amount of memory needed
+	MOVL	ES, SS:xffPda#
+	MOVZBL	EAX, ES:pdaSesProc#
+	MOVW	ES, knlProcTable#[EAX*2]
+	PUSHL	ES
+	CALL	knlGetPdaMemXf#		;Allocate system memory block
+	POPL	ES
+	JC	path7			;If error
+	MOVL	EBX, ES:pdaPath#	;Link into path list
+	MOVL	ES:pdaPath#, ESI
+	MOVL	ES:pn_pntr.B[ESI], #pdaPath#
+	MOVL	ES:pn_next.B[ESI], EBX
+	TESTL	EBX, EBX
+	JE	2$.S
+	LEAL	EAX, pn_next.B[ESI]
+	MOVL	ES:pn_pntr.B[EBX], EAX
+2$:	MOVL	EAX, [EDI]		;Store offset of UCB
+	MOVL	ES:pn_ucb.B[ESI], EAX
+	MOVL	EAX, dcb_sdisp.B[EDI]
+	CALLI	CS:dd_setpath.B[EAX]
+	JNC	8$.S			;Go on if OK
+	PUSHL	EAX			;Error
+	CALL	knlGivePdaMemXf#	;Give up the path name block
+	POPL	EAX
+	CLRL	ECX
+	JMP	parmdn#
+
+;Here with file system data stored in the path name block
+
+8$:	MOVL	ECX, SS:xffPCFilSpc#	;No - get length of path string
+	DECL	ECX
+	PUSHL	EDI
+	LEAL	EDI, pn_string.B[ESI]
+	LEAL	ESI, 45t.B[ESP]
+	CLD
+	RMOVSB	[EDI], SS:[ESI]		;Copy string to path block
+	CLRL	EAX
+10$:	STOSB	[EDI]			;Fill with nulls to the end of a long
+	TESTL	EDI, #3
+	JNE	10$.S
+	POPL	EDI			;Restore offset of DCB
+12$:	CALL	pathfin
+path4:	BTL	SS:xffPVFilOpt#, #FO%PATHNAME ;Does he want the path returned?
+	JNC	path6.S			;No
+	BTL	SS:xffPVFilOpt#, #FO%NOPREFIX ;Want prefix characters?
+	JC	14$.S			;No
+	MOVB	AL, #FS_PATHNAME	;Yes - indicate this is a path
+	CALL	knlGivUChr#
+14$:	CALL	knlFindPath		;Find the current path
+	JC	path8.S			;If error
+	JE	18$.S			;If no path specified
+	ADDL	ESI, #pn_string.B	;Point to start of string
+16$:	LODSB	FS:[ESI]		;Get path character
+	TESTB	AL, AL
+	JE	path6.S
+	CALL	knlGivUChr#		;Give it to him
+	JMP	16$.S			;Continue
+
+;Here with null path
+
+18$:	MOVB	AL, #'\'		;Put back-slash at end
+	CALL	knlGivUChr#		;And return
+path6:	CLRL	EAX			;OK - return 0
+	MOVL	ECX, #1
+	JMP	parmdn#
+
+;Here if error with directory open
+
+path7:	CALL	pathfin
+path8:	CALL	opner2#			;Do DCB clean-up
+	CLRL	ECX
+	JMP	open6#
+.PAGE
+;Subroutine to do final clean-up for strpath
+;	CALL	pathfin
+;  c{EAX} is preserved, 300t bytes are removed from the stack!
+
+pathfin:PUSHL	EAX			;Save EAX
+	CLRL	EAX			;No close options
+	MOVL	SS:xffOption#, EAX
+	ORB	SS:xffStatus1#, #XF1$CLOSE ;Indicate closing device
+	MOVL	EAX, dcb_sdisp.B[EDI]	;Dispatch to device driver
+	CALLI	CS:dd_close.B[EAX]
+	POPL	EAX			;Restore EAX
+	POPL	EBX			;Get return offset
+	POPL	SS:xffCmd#		;Restore user's open command bits
+	POPL	SS:xffPVFilOpt#		;Restore user's file option bits
+	POPL	ECX			;Restore address of user's parameter
+	MOVW	SS:xffParm#+4, CX	;  list
+	POPL	SS:xffParm#+0
+	POPL	SS:xffPLFilSpc#+4
+	POPL	SS:xffPLFilSpc#+0
+	POPL	SS:xffPCFilSpc#		;Restore address and counts for user's
+	POPL	SS:xffPSFilSpc#		;  path string buffer
+	POPL	SS:xffPPFilSpc#+4
+	POPL	SS:xffPPFilSpc#+0
+	ADDL	ESP, #260t		;Remove buffer
+	JMPIL	EBX			;Return
+.PAGE
+	.SBTTL	knlFindPath - Subroutine to find path for disk
+
+;Subroutine to find path for disk - must be called in extended fork context
+;	c{EDI} = Offset of DCB
+;	CALL	knlFindPath
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  Z:set = Path not found
+;	  Z:clr = Path found
+;	    c{FS:ESI} = Address of path block
+
+knlFindPath::
+	REQUIREXFF
+	MOVW	FS, SS:xffPda#
+	MOVZBL	EAX, FS:pdaSesProc#
+	MOVW	FS, knlProcTable#[EAX*2]
+	MOVL	ESI, FS:pdaPath#	;Get offset to first path block
+	TESTL	ESI, ESI
+	JE	4$.S			;If none there
+	MOVL	EAX, [EDI]		;Get offset of UCB
+2$:	CMPL	FS:pn_ucb.B[ESI], EAX	;This one?
+	JE	6$.S			;Yes
+	MOVL	ESI, FS:pn_next.B[ESI]	;No - advance to next
+	TESTL	ESI, ESI
+	JNE	2$.S			;Continue if more to check
+4$:	RET				;Not found - return with Z set
+
+;Here with correct path block
+
+6$:	MOVL	EAX, dcb_sdisp.B[EDI]
+	CALLI	CS:dd_chkpath.B[EAX]
+	TESTL	ESP, ESP		;Clear Z
+	RET				;And return
+.PAGE
+	.SBTTL	givepath - Subroutine to give up all paths for process
+
+;Subroutine to give up all paths for a process - called as a process is being
+;  killed to free up disk buffers containing path FIBs
+;  WARNING:  THIS ROUTINE ASSUMES THE PDA WILL BE DEALLOCATED IMMEDIATELY!  IT
+;	     DOES NOT DEALLOCATE THE PDA MEMORY USED BY THE PATH BLOCKS.
+;	c[SS] = Selector for PDA
+;	CALL	givepath
+
+givepath::
+	MOVL	ESI, SS:pdaPath#	;Get first path offset
+	TESTL	ESI, ESI
+	JE	6$.S			;If no paths defined
+	CLRL	EAX
+	MOVL	SS:pdaPath#, EAX
+	PUSHL	SS
+	POPL	ES
+2$:	TOFORK
+	MOVL	EDX, SS:pn_ucb.B[ESI]
+	TESTL	EDX, EDX
+	JE	4$.S
+	CLRL	EDI			;Make sure no funny DCB pointers
+	MOVL	EAX, ucb_sdisp.B[EDX]
+	CALLI	CS:dd_clrpath.B[EAX]
+4$:	FROMFORK			;Don't hog fork level!
+	MOVL	ESI, SS:pn_next.B[ESI]	;Get offset of next block
+	TESTL	EDX, EDX
+	JNE	2$.S			;Continue if another
+6$:	RET				;All done
+
+	END

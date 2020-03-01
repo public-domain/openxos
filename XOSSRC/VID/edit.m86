@@ -1,0 +1,1267 @@
+	.TITLE	EDIT
+
+;++++
+; This software is in the public domain.  It may be freely copied and used
+; for whatever purpose you see fit, including commerical uses.  Anyone
+; modifying this software may claim ownership of the modifications, but not
+; the complete derived code.  It would be appreciated if the authors were
+; told what this software is being used for, but this is not a requirement.
+
+;   THIS SOFTWARE IS PROVIDED BY THE AUTHORS "AS IS" AND ANY EXPRESS OR
+;   IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
+;   OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+;   IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+;   INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+;   BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS
+;   OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+;   ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR
+;   TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
+;   USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+;----
+
+	.PROC	80386
+	.INCLUD XOSINC:\XMAC\DEFINES.PAR
+	.INCLUD	XOSINC:\XMAC\XOS.PAR
+	.INCLUD XOSINC:\XMAC\XOSERR.PAR
+	.INCLUD	XOSINC:\XMAC\XOSTRM.PAR
+	.INCLUD XOSINC:\XMAC\CLIBX.PAR
+	.INCLUD XOSINC:\XMAC\PROCARG.PAR
+	.INCLUD	VID.PAR
+
+	.STDSEGS
+
+	.PSECT	_TEXT_p
+
+	.SBTTL	edtscn - Subroutine to edit screen
+
+;Subroutine to edit screen - when called in input mode, it returns when the
+;  command mode switch is typed.  When called in command mode, it returns
+;  when return is typed.  In this case, input is restricted to a single line.
+;	CALL	edtscn
+
+edtscn::CALL	getkey#			;Get input character
+	ORB	AL, AL			;Function?
+	JNE	txtchr.S		;No - just normal character
+	JMPIL	CS:dsptbl-200h[EBX*4]	;Yes - dispatch on function
+
+	.SBTTL	litchr - Insert literal character
+
+;Here to insert a literal character
+
+litchr::CALL	dsplit#			;Indicate in literal mode now
+	MOVB	litflg#, #1
+	JMP	edtscn.S
+.PAGE
+	.SBTTL	txtchr - Normal text character
+
+;Here for normal text character
+
+txtchr::CMPB	w_curlincnt.B[ESI], #0	;Have dummy line in the buffer?
+	JNE	2$.S			;No
+	INCB	w_curlincnt.B[ESI]	;Yes - make it real
+	ADDL	f_numchr.B[EDI], #2.B
+	INCL	f_numlin.B[EDI]		;Also bump number of lines
+	PUSHL	EAX
+	CALL	dspcln#			;Update current line number display
+	CALL	dspnln#			;And update number of lines display
+	POPL	EAX
+2$:	CMPB	insflg#, #0		;In insert mode?
+	JNE	4$.S			;Yes
+	MOVZBL	EBX, w_cursorinb.B[ESI]	;No - at end of line?
+	INCL	EBX
+	CMPB	BL, w_curlincnt.B[ESI]
+	JE	4$.S			;Yes - same as insert mode
+	ADDL	EBX, w_curlinbuf.B[ESI]	;No - just put new character over
+	MOVB	-1.B[EBX], AL		;  current character
+	JMP	18$
+
+;Here if in insert mode or if at end of line
+
+4$:	CMPB	w_curlincnt.B[ESI], #250t ;Is the line full now?
+	JA	edtscn			;Yes - ignore this character
+	PUSHL	EAX			;No
+	CMPL	ESI, #wdb0#		;In command mode now?
+	JE	12$.S			;Yes
+	INCL	f_numchr.B[EDI]		;No - increase total character count
+	CALL	dspnch#			;Update display of number of
+					;  characters in file
+12$:	MOVZBL	ECX, w_curlincnt.B[ESI]	;Calculate number of bytes to move
+	SUBB	CL, w_cursorinb.B[ESI]
+	DECB	CL
+	JE	14$.S			;If nothing to move (at end of line)
+	PUSHL	DS
+	POPL	ES
+	PUSHL	EDI
+	PUSHL	ESI
+	MOVZBL	EDI, w_curlincnt.B[ESI]	;Calculate pointer
+	ADDL	EDI, w_curlinbuf.B[ESI]
+	DECL	EDI
+	MOVL	ESI, EDI
+	DECL	ESI
+	STD				;Transfer backwards
+	RMOVSB	[EDI], [ESI]		;Make a hole
+	POPL	ESI
+	POPL	EDI
+14$:	POPL	EAX			;Restore character
+	INCB	w_curlincnt.B[ESI]	;Increase the count
+	MOVZBL	EBX, w_cursorinb.B[ESI]	;Get current position
+	ADDL	EBX, w_curlinbuf.B[ESI]
+	MOVB	[EBX], AL		;Store new character
+18$:	INCB	w_cursorinb.B[ESI]	;Bump position
+txtc20:	CALL	updcurline#		;Update this line
+	MOVL	EAX, w_cursorinv.B[ESI]	;Bind cursor
+	MOVL	w_cursorbind.B[ESI], EAX
+	JMP	edtscn			;Done now
+.PAGE
+	.SBTTL	curlft - Move cursor left
+
+;Here for cursor-left (character) character
+
+curlft::MOVB	AL, w_cursorinb.B[ESI]	;Get position of cursor in line
+	ORB	AL, AL			;  buffer
+	JE	sampos.S		;Do nothing if at beginning
+	DECB	AL			;Move left
+	JMP	newpos.S
+
+	.SBTTL	currht - Move cursor right
+
+;Here for cursor-right (character) character
+
+currht::MOVB	AL, w_cursorinb.B[ESI]	;Get position of cursor in line
+	INCB	AL			;  buffer
+	CMPB	AL, w_curlincnt.B[ESI]	;Past end of buffer?
+	JNC	2$.S			;Yes - ignore this
+newpos:	MOVB	w_cursorinb.B[ESI], AL	;Update position
+sampos:	CALL	cursorset#
+	MOVL	EAX, w_cursorinv.B[ESI]	;Bind cursor
+	MOVL	w_cursorbind.B[ESI], EAX
+2$:	JMP	edtscn			;Thats all
+.PAGE
+	.SBTTL	casecg - Change case and move one character right
+
+;Here on cntl-T to change case of character under the cursor and move cursor
+;  right one position
+
+casecg::MOVZBL	EBX, w_cursorinb.B[ESI]	;Get position of the cursor
+	INCL	EBX
+	CMPB	BL, w_curlincnt.B[ESI]	;Past end of buffer?
+	JNC	sampos.S		;Yes - ignore this 
+	ADDL	EBX, w_curlinbuf.B[ESI]	;Calculate the current position
+	DECL	EBX
+	MOVB	AL, [EBX]		;Get the character
+	CMPB	AL, #'A'		;Is character too low
+	JC	currht.S		;Yes - just move right
+	CMPB	AL, #'{'		;Is the character too high
+	JNC	currht.S		;Yes
+	CMPB	AL, #'a'		;Is character lower case?
+	JNC	10$.S			;Yes - change case
+	CMPB	AL, #'['		;Is character upper case?
+	JNC	currht.S		;No - move right
+10$:	XORB	AL, #'a'-'A'		;Change the case bit
+	MOVB	[EBX], AL		;Put the character back
+	CALL	updcurline#		;Update the screen
+	JMP	currht.S		;Move to next position
+.PAGE
+	.SBTTL	curlwd - Move cursor left a word
+
+;Here for cursor-left (word) character
+
+curlwd::CALL	wordlt			;Move a word to the left
+	JMP	newpos.S		;Put the cursor at the new position
+
+	.SBTTL	currwd - Move cursor right a word
+
+;Here for cursor-right (word) character
+
+currwd::CALL	wordrt			;Find the next word to the right
+	JMP	newpos.S		;Put the cursor at the new postion
+.PAGE
+	.SBTTL	curend - Move cursor to end of line
+
+;Here for cursor-end-of-line character
+
+curend::MOVB	AL, w_curlincnt.B[ESI]	;Get position of end of line
+	ORB	AL, AL
+	JE	2$.S			;If empty line at end of file
+	DECB	AL
+	JE	2$.S			;If empty line within file
+	MOVB	w_cursorinb.B[ESI], AL	;Update position
+	CALL	cursorset#		;Update cursor on screen
+2$:	MOVL	w_cursorbind.B[ESI], #252t ;Bind cursor to end of line
+	JMP	edtscn			;Thats all
+.PAGE
+	.SBTTL	curup - Move cursor up
+
+;Here for cursor-up character
+
+curup::	CALL	lvcmdm			;Leave command mode for a while
+	CALL	putlinef
+	CLRL	ECX			;Move up one line
+	DECL	ECX
+	JMP	curvrt.S
+
+	.SBTTL	pageup - Move up one page
+
+;Here for the page-up character
+
+pageup::CALL	lvcmdm			;Leave command mode for a while
+	CALL	putlinef
+	MOVL	ECX, w_height.B[ESI]
+	SUBL	ECX, #4.B
+	NEGL	ECX
+	JMP	curvrt.S
+.PAGE
+	.SBTTL	curdwn - Move cursor down
+
+;Here for cursor-down character
+
+curdwn::CALL	lvcmdm			;Leave command for a while
+	CALL	putlinef
+	CLRL	ECX			;Move down one line
+	INCL	ECX
+curvrt:	CALL	movvrt			;Move vertical
+curvr2:	CALL	updwindow#		;Update the screen if nessary
+curvr4:	CALL	bkcmdm			;Return to command mode if need to
+	JMP	edtscn
+
+	.SBTTL	pageup - Move down one page
+
+;Here for the page-down character
+
+pagedw::CALL	lvcmdm
+	CALL	putlinef
+	MOVL	ECX, w_height.B[ESI]	;Move down one "page"
+	SUBL	ECX, #4.B
+	JMP	curvrt.S
+.PAGE
+	.SBTTL	gtotop - Go to top of file
+
+;Here for go to top of file character
+
+gtotop::CALL	lvcmdm
+	CALL	putlinef
+	CALL	gototop			;Reset pointers
+	CALL	scroll#
+	CALL	chkbind#
+	JMP	curvr2.S
+
+	.SBTTL	gtobtn - Go to bottom of file
+
+;Here for go to bottom of file character
+
+gtobtm::CALL	lvcmdm
+	CALL	putlinef
+	CLRL	EAX
+	MOVB	w_cursorinb.B[ESI], AL	;Force cursor to first column
+	MOVL	w_cursorinv.B[ESI], EAX
+	MOVL	w_cursorbind.B[ESI], EAX
+	MOVL	ECX, #7FFFFFFFh		;Get very large positive number
+	JMP	curvrt.S	
+.PAGE
+	.SBTTL	changewin - Change windows
+
+;Here for a change windows character (ALT-digit)
+;	c{ECX} = Number of new window
+
+changewin:
+	CMPL	ECX, #WINMAX		;Valid window number?
+	JA	edtscn			;No - ignore this
+	PUSHL	ECX
+	CALL	putlinef
+	POPL	ECX
+	IMULL	ECX, #w_SIZE		;Yes - get offset of WDB
+	ADDL	ECX, #wdb0#
+	PUSHL	ECX
+	CALL	lvcmdm
+	POPL	ECX
+	CALL	chngwindow#		;Change windows
+	CALL	getline			;Get the current line
+	JMP	curvr4
+.PAGE
+	.SBTTL	fndfnx - Find next forwards
+
+;Here for the find next forwards character
+
+fndfnx::CALL	lvcmdm
+	CALL	findprv#		;Do find previous search
+	JMP	2$.S
+
+	.SBTTL	locfnx - Locate next forwards
+
+;Here for the locate next forwards character
+
+locfnx::CALL	lvcmdm
+	CALL	locprv#			;Do locate previous search
+2$:	JC	4$.S			;If error
+	MOVB	w_cursorinb.B[ESI], AL	;Store cursor position
+	MOVL	w_cursorbind.B[ESI], #-1 ;Indicate no cursor now
+	CALL	movvrt
+	CALL	updwindow#		;Update window
+	CALL	cursorset#
+	MOVL	EAX, w_cursorinv.B[ESI]	;Bind cursor
+	MOVL	w_cursorbind.B[ESI], EAX
+4$:	JMP	curvr4
+
+	.SBTTL	frpfnx - Find and replace next forwards
+
+;Here for the find and replace next forwards character
+
+frpfnx::CMPB	repcnt#, #-1		;Do we have a previous string?
+	JE	6$.S			;No - complain
+	CALL	lvcmdm
+	CALL	findprv#		;Yes
+	JMP	10$.S
+
+6$:	CALL	getrns#			;No - complain
+	JMP	edtscn
+
+	.SBTTL	lrpfnx - Locate and replace next forwards
+
+;Here for the locate and replace next forwards character
+
+lrpfnx::CMPB	repcnt#, #-1		;Do we have a previous string?
+	JE	6$.S			;No - complain
+	CALL	lvcmdm
+	CALL	locprv#
+10$:	JC	4$.S			;If error
+	MOVB	w_cursorinb.B[ESI], AL	;Store cursor position
+	MOVL	w_cursorbind.B[ESI], #-1 ;Indicate no cursor now
+	CALL	movvrt
+	CALL	repstr#			;Do the replacement
+	MOVL	EAX, w_cursorinv.B[ESI]	;Bind cursor
+	MOVL	w_cursorbind.B[ESI], EAX
+	JMP	curvr2
+.PAGE
+	.SBTTL	inslin - Insert blank line
+
+;Here for line-insert character
+
+inslin::CMPL	ESI, #wdb0#		;In command mode?
+	JE	edtscn			;Yes - ignore this
+	CALL	inslsb			;Insert a line
+	MOVL	EDX, w_curlin.B[ESI]
+	DECL	EDX
+	MOVL	ECX, #1
+	CALL	fixwindow#
+	CALL	updwinfrc#		;Update the window
+
+	.SBTTL	rstcur - Move cursor to beginning of line
+
+;Here on cntl-A to move cursor to beginning of current line
+
+rstcur::MOVB	AL, #0			;Put cursor at start of line
+	JMP	newpos			;Continue
+.PAGE
+	.SBTTL	rstlin - Restore line
+
+;Here on cntl-Y to restore previous contents of a line
+
+rstlin::CMPL	ESI, #wdb0#		;In command mode?
+	JE	edtscn			;Yes - ignore this
+	MOVL	EBX, w_curpnt.B[ESI]	;No
+	CMPB	[EBX], #0		;At end of file now?
+	JNE	6$.S			;No
+	CMPB	w_curlincnt.B[ESI], #0	;Yes - anything in the line?
+	JE	6$.S			;No
+	DECL	f_numlin.B[EDI]		;Yes - fix up the line count
+	CALL	dspnln#			;Update number of lines display
+	CALL	dspcln#			;And update current line number
+	MOVL	EBX, w_curpnt.B[ESI]	;Restore pointer to line
+6$:	MOVB	AL, [EBX]		;Calculate change in size of the file
+	SUBB	AL, w_curlincnt.B[ESI]
+	CBW
+	CWL
+	ADDL	f_numchr.B[EDI], EAX	;Adjust file size
+	CALL	getline			;Read line in from text buffer
+rstl10:	MOVB	w_cursorinb.B[ESI], #0	;Put the cursor at start of line
+	CALL	updcurline#		;Update the screen
+	CALL	dspnch#			;Update character count display
+	JMP	edtscn			;Get the next command
+.PAGE
+	.SBTTL	joinline - Join current line with the next line
+
+;Here on cntl-B to join current line with the next line
+
+joinline::
+	CMPL	ESI, #wdb0#		;In command mode
+	JE	edtscn			;Yes - nothing to do here
+	CALL	putline			;No - update file buffer
+	CMPB	w_cursorinb.B[ESI], #0	;At the begining of the line now?
+	JNE	10$.S			;No - continue
+	CLRL	ECX			;Yes - backup one line
+	DECL	ECX
+	CALL	movvrt
+10$:	MOVL	EBX, w_curpnt.B[ESI]	;Point to current line
+	MOVZBL	EDX, [EBX]		;Get the length of this line
+	MOVZBL	EAX, 1.B[EBX+EDX]	;Get length of next line
+	ADDL	EAX, EDX		;Get sum of the two lines
+	DECL	EAX
+	CMPL	EAX, #250t		;Too long for a single line?
+	JA	brkl30			;Yes - don't do anything!
+	MOVB	[EBX], AL		;Update 1st count byte
+	PUSHL	EAX
+	PUSHL	EDX			;Save original length of 1st line
+	LEAL	EBX, 2.B[EBX+EDX]	;Point to second line
+	MOVL	EDX, #-2		;Move up rest of buffer 2 bytes
+	CALL	movbuf
+	DECL	f_numlin.B[EDI]		;Fix up line and character counts
+	SUBL	f_numchr.B[EDI], #2.B
+	CALL	dspnln#
+	CALL	dspnch#
+	POPL	EAX			;Restore original length of 1st line
+	DECL	EAX			;Change to new cursor position
+	MOVB	w_cursorinb.B[ESI], AL	;Store new cursor position
+	POPL	EAX
+	MOVL	EBX, w_curlinbuf.B[ESI]
+	MOVB	[EBX+EAX], AL
+	MOVL	EDX, w_curlin.B[ESI]	;Fix up any other windows
+	MOVL	ECX, #-1
+	CALL	fixwindow#
+	CALL	getline			;Get current line into line buffer
+	CALL	dspmfg#			;Indicate file has been changed
+	CALL	scroll#
+	CALL	updwinfrc#		;Update the window
+	MOVL	EAX, w_cursorinv.B[ESI]	;Bind cursor
+	MOVL	w_cursorbind.B[ESI], EAX
+	JMP	edtscn			;Finished here
+.PAGE
+	.SBTTL	cretrn - Break line at cursor position
+
+;Here for carriage return character
+
+cretrn::CMPL	ESI, #wdb0#		;In command mode?
+	JNE	2$.S			;No
+	MOVZBL	EBX, w_curlincnt.B[ESI]	;Yes - put a null at the end of the line
+	MOVL	EAX, w_curlinbuf.B[ESI]
+	MOVB	-1.B[EBX+EAX], #0
+	MOVL	cmdpnt#, EAX		;Reset the command pointer
+	RET				;Finished here - return with command
+					;  line
+
+;Here if not in command mode
+
+2$:	MOVB	AL, w_cursorinb.B[ESI]	;Get position in line
+	CMPB	AL, #0			;At begining of line?
+	JNE	4$.S			;No
+	CALL	inslsb			;Yes - insert a line
+	CLRL	ECX			;Move down one line
+	INCL	ECX
+	CALL	movvrt
+	JMP	12$			;Update everything
+
+;Here if not at beginning of line
+
+4$:	INCB	AL			;At end of line?
+	CMPB	AL, w_curlincnt.B[ESI]
+	JC	10$.S			;No - break the line
+	CALL	putline			;Update the line
+	CLRL	ECX			;Move down one line
+	INCL	ECX
+	CALL	movvrt
+	CMPB	w_curlincnt.B[ESI], #0	;At EOF now?
+	JE	12$.S			;Yes - update the screen and counters
+	JMP	inslin			;No - add a line
+
+;Here to really break a line
+
+10$:	CALL	putline			;Update the line
+	MOVL	EBX, w_curpnt.B[ESI]	;Get offset of current line
+	MOVZBL	EDX, w_cursorinb.B[ESI]	;Get cursor position
+	MOVZBL	EAX, w_curlincnt.B[ESI]	;Get current line length
+	SUBL	EAX, EDX		;Calculate length of 2nd line
+	PUSHL	EAX			;Save it
+	INCL	EDX			;Calculate length of 1st line
+	MOVB	[EBX], DL		;Store it
+	LEAL	EBX, 1.B[EBX+EDX]	;Get first address to move
+	MOVL	w_curpnt.B[ESI], EBX	;Which becomes new current line
+	INCL	w_curlin.B[ESI]
+	DECL	EBX
+	PUSHL	EDX
+	MOVL	EDX, #2			;Move rest of buffer down 2 bytes
+	CALL	movbuf
+	POPL	EDX
+	POPL	EAX			;Restore length of 2nd line
+	JC	14$.S			;If not enough memory
+	MOVL	EBX, w_curpnt.B[ESI]	;Store 2nd count for first line
+	MOVB	-1.B[EBX], DL		;Store 1st count for second line
+	MOVB	[EBX], AL
+	MOVB	[EBX+EAX], AL		;Store 2nd count for second line
+	INCL	f_numlin.B[EDI]
+	ADDL	f_numchr.B[EDI], #2.B
+	CALL	getline			;Load this line
+	CALL	dspmfg#			;Indicate file has been changed
+	CALL	scroll#
+	CALL	chkbind#
+12$:	MOVL	EDX, w_curlin.B[ESI]
+	DECL	EDX
+	MOVL	ECX, #1
+	CALL	fixwindow#
+brkl30:	CALL	dspnln#			;Display updated counts
+	CALL	dspcln#
+	CALL	dspnch#
+	CALL	updwinfrc#		;Update entire window
+	JMP	rstcur
+
+;Here if out of memory
+
+14$:	MOVL	EDX, #memmsg#		;Display error message on response line
+	JMP	dsprsp#
+.PAGE
+	.SBTTL	delbeg - Delete to beginning of line
+
+;Here on cntl-S to delete to beginning of current line
+
+delbeg::MOVB	CL, w_cursorinb.B[ESI]	;Get the cursor position
+	ORB	CL, CL			;Begining of the line?
+	JE	edtscn			;Yes - nothing to do
+	INCB	CL			;No - at end of line?
+	CMPB	CL, w_curlincnt.B[ESI]
+	JNC	cntrlu			;Yes - delete the whole line
+	MOVZBL	EAX, CL			;No - save the cursor position + 1
+	SUBB	CL, w_curlincnt.B[ESI]	;Get number of characters left in
+					;  line
+	NEGB	CL			;Make the number positive
+	MOVB	w_curlincnt.B[ESI], CL	;Store the count for the line
+	INCB	w_curlincnt.B[ESI]
+	DECL	EAX			;Adjust total character count
+	SUBL	f_numchr.B[EDI], EAX
+	PUSHL	DS
+	POPL	ES
+	PUSHL	EDI
+	PUSHL	ESI
+	MOVL	EDI, w_curlinbuf.B[ESI]	;Get the beginning of the buffer
+	LEAL	ESI, [EDI+EAX]
+	MOVZBL	ECX, CL
+	CLD
+	RMOVSB	[EDI], [ESI]		;Move the buffer
+	POPL	ESI
+	POPL	EDI
+	JMP	rstl10			;Put the cursor at left
+.PAGE
+	.SBTTL	delend - Delete to end of line
+
+;Here on cntl-F to delete to end of current line
+
+delend::MOVB	AL, w_cursorinb.B[ESI]	;Get the cursor position
+	ORB	AL, AL			;Begining of line?
+	JE	cntrlu.S		;Yes - delete text on the line
+	INCB	AL			;No - check for the end of the line
+	CMPB	AL, w_curlincnt.B[ESI]	;End of line?
+	JNC	edtscn			;Yes - nothing to do
+	MOVB	CL, w_curlincnt.B[ESI]	;No - save previous size of line
+	MOVB	w_curlincnt.B[ESI], AL	;Set new size
+	SUBB	CL, AL			;Calculate amount changed
+	MOVZBL	ECX, CL
+	SUBL	f_numchr.B[EDI], ECX	;Adjust total character count
+	CALL	updcurline#		;Update the screen
+	CALL	dspnch#			;Update character count
+	JMP	edtscn			;Go back for more commands
+.PAGE
+	.SBTTL	dellin - Delete line
+
+;Here for line-delete character
+
+dellin::CMPL	ESI, #wdb0#		;In command mode?
+	JE	cntrlu.S		;Yes - this makes it different!
+	CALL	putline			;No - update file buffer
+	MOVL	EDX, #1			;Delete one line
+	CALL	dellns
+	MOVL	EDX, w_curlin.B[ESI]
+	MOVL	ECX, #-1
+	CALL	fixwindow#
+	CALL	updwinfrc#
+	JMP	rstcur			;Put cursor at left of next line
+
+	.SBTTL	cntrlu - Clear line
+
+;Here for the line-clear character
+
+cntrlu::MOVZBL	EAX, w_curlincnt.B[ESI]	;Reduce size of file by length of line
+	DECL	EAX
+	SUBL	f_numchr.B[EDI], EAX
+	MOVB	w_curlincnt.B[ESI], #1	;Clear line buffer
+	CALL	updcurline#		;Update current line
+	CALL	dspnch#			;Update number of characters display
+	JMP	rstcur			;Put cursor at left
+
+	.SBTTL	gocmdm -  Escape to command mode
+
+;Here for the escape-to-command-mode character
+
+gocmdm::CMPL	ESI, #wdb0#		;In command mode now?
+	JE	cntrlu.S		;Yes - this is the same as cntl-X
+	JMP	putlinef		;Update file buffer and return from
+					;  edtscn
+
+	.SBTTL	delwrd - Delete word
+
+;Here for the delete word character
+
+delwrd::MOVZBL	EBX, w_cursorinb.B[ESI]	;Get the cursor position
+	INCL	EBX			;Increment to include line count byte
+	CMPB	BL, w_curlincnt.B[ESI]	;Is this the end of the line
+	JNC	edtscn			;Yes - ignore this command
+	ADDL	EBX, w_curlinbuf.B[ESI]	;No
+	MOVB	AL, -1.B[EBX]		;Get the character
+	CALL	inword			;Is character in a word?
+	JE	delchf.S		;No - just delete 1 character
+	MOVZBL	EAX, w_cursorinb.B[ESI]	;Yes - save current position
+	PUSHL	EAX
+4$:	INCB	w_cursorinb.B[ESI]	;Advance one character
+	MOVZBL	EBX, w_cursorinb.B[ESI]	;At end of line?
+	INCL	EBX
+	CMPB	BL, w_curlincnt.B[ESI]
+	JE	6$.S			;Yes
+	ADDL	EBX, w_curlinbuf.B[ESI]
+	MOVB	AL, -1.B[EBX]		;No - get next character
+	CALL	inword			;Still in word?
+	JNE	4$.S			;Yes - continue
+6$:	MOVZBL	EDX, w_cursorinb.B[ESI]	;Calculate number of characters to
+	POPL	EAX			;  delete
+	SUBL	EDX, EAX
+	INCL	EDX
+	MOVB	w_cursorinb.B[ESI], AL	;Restore initial cursor position
+	CALL	delchrs			;Delete the characters
+	CALL	dspnch#			;Update character count on screen
+	CALL	updcurline#		;Update the current line
+	JMP	edtscn			;Get the next command
+.PAGE
+	.SBTTL	delchb - Delete previous character
+
+;Here for character-delete-backwards character
+
+delchb::MOVB	AL, w_cursorinb.B[ESI]	;Get cursor position
+	ORB	AL, AL			;At start of line now?
+	JE	edtscn			;Yes
+	DECB	AL			;No - back up one position
+	MOVB	w_cursorinb.B[ESI], AL	;And fall into normal delete routine
+
+	.SBTTL	delchf - Delete character under cursor
+
+;Here for character-delete-forwards character
+
+delchf::MOVL	EDX, #1			;Delete 1 character
+	CALL	delchrs
+	CALL	dspnch#			;Update total character count display
+	JMP	txtc20			;Go update line on screen
+.PAGE
+	.SBTTL	scrlup - Scroll screen up
+
+;Here for scroll screen up character
+
+scrlup::CALL	lvcmdm
+	CALL	putlinef
+	CLRL	EBX
+	INCL	EBX
+	CALL	shiftu#
+	JMP	scrlcm.S
+
+	.SBTTL	scrldw - Scroll screen down
+
+;Here for scroll screen down character
+
+scrldw::CALL	lvcmdm
+	CALL	putlinef
+	CLRL	EBX
+	INCL	EBX
+	CALL	shiftd#
+scrlcm:	JMP	curvr2
+
+	.SBTTL	togins - Toggle insert mode
+
+togins::XORB	insflg#, #1		;Toggle the flag
+	CALL	dspins#			;Display flag on screen
+	JMP	edtscn
+.PAGE
+	.SBTTL	bkcmdm - Subroutine to switch back to command mode if need to
+
+;Subroutine to switch back to command mode if need to after single command
+;	CALL	bkcmdm
+
+bkcmdm:	CMPL	prevwin#, #wdb0#	;Need to switch back to command mode?
+	JNE	ret010.S		;No
+	CMPB	w_haveline.B[ESI], #0	;Yes - need to save current line?
+	JE	2$.S			;No
+	CALL	updcurline#		;Yes - update screen
+	CALL	putlinef		;And save current line
+	JMP	4$.S
+
+2$:	CALL	getline			;Load line into line buffer so can
+					;  figure out where to put second cursor
+4$:	MOVB	AL, cmcattrb#
+	CALL	cmdcuron#		;Put second cursor on screen
+	MOVB	w_haveline.B[ESI], #0	;Don't really want line in the buffer!
+	MOVL	ESI, #wdb0#		;Switch to the command window
+	JMP	cursorset#
+
+	.SBTTL	tocmdm - Subroutine to switch to command mode
+
+;Subroutine to switch to command mode
+;	CALL	tocmdm
+
+tocmdm::MOVL	ESI, #wdb0#		;Switch to the command window
+	MOVB	w_curlincnt.B[ESI], #1	;Clear line buffer
+	MOVB	w_cursorinb.B[ESI], #0	;Put cursor at beginning of line
+	JMP	cursorset#
+.PAGE
+	.SBTTL	lvcmdm - Subroutine to leave command mode for one command
+
+;Subroutine to leave command mode for one command
+;	CALL	lvcmdm
+
+lvcmdm:	CALL	rspclr#			;Clear response line
+	MOVL	prevwin#, ESI		;Remember current window
+	CMPL	ESI, #wdb0#		;In command mode now?
+	JNE	ret010.S		;No - nothing needed here
+	CALL	toinpm			;Yes - switch to input mode
+	JMP	cmdcuroff#		;Remove second cursor from screen
+
+	.SBTTL	toinpm - Subroutine to switch to input mode
+
+;Subroutine to switch to input mode
+;	CALL	toinpm
+
+toinpm::MOVL	ESI, curwin#		;Switch to current window
+ret010:	RET
+.PAGE
+	.SBTTL	dellns - Subroutine to delete lines
+
+;Subroutine to delete lines from the file buffer
+;	c{EDX} = Number of lines to delete
+;	CALL	dellns
+
+dellns::MOVL	EBX, w_curpnt.B[ESI]	;Point to current line
+	CMPB	[EBX], #0		;Anything at all to delete?
+	JE	getline			;No - just "fill" the line buffer
+2$:	MOVZBL	EAX, [EBX]		;Get length of line
+	ORB	AL, AL			;At end of file?
+	JE	4$.S			;Yes - finished
+	DECL	f_numlin.B[EDI]		;No - reduce number of lines
+	SUBL	f_numchr.B[EDI], EAX	;Reduce number of characters
+	DECL	f_numchr.B[EDI]
+	LEAL	EBX, 1.B[EBX+EAX]	;Point to next line
+	DECL	EDX			;More to delete?
+	JNE	2$.S			;Yes
+4$:	PUSHL	EBX			;No
+	CALL	dspmfg#			;Indicate file has been modified
+	POPL	EBX
+	MOVL	EDX, w_curpnt.B[ESI]	;Calculate amount to move rest
+	SUBL	EDX, EBX		;  of the buffer
+	JE	ret010.S		;Finished if nothing to move
+	CALL	movbuf			;Move up rest of buffer
+	CALL	getline			;Update line buffer from file buffer
+	CALL	dspnln#			;Update number of lines display
+	CALL	dspcln#			;And update current line number (this
+					;  will change when he deletes the last
+					;  line of the file!)
+	CALL	dspnch#			;Update number of characters display
+	CALL	scroll#
+	JMP	chkbind#
+.PAGE
+	.SBTTL	delchrs - Subroutine to delete characters from the line buffer
+
+;Subroutine to delete characters from the line buffer
+;	c{EDX} = Number of characters to delete
+;	CALL	delchrs
+;  The number of characters specified are deleted starting at the current
+;  cursor position in the line.
+
+delchrs:MOVZBL	EAX, w_cursorinb.B[ESI]	;Get current cursor position
+	MOVL	EBX, EAX		;Copy it for later
+	INCL	EAX			;Plus 1
+	CMPB	w_curlincnt.B[ESI], AL	;At end of line?
+	JE	ret011.S		;Yes - nothing to do here!
+	MOVL	ECX, w_cursorinv.B[ESI]	;No - bind cursor to this position
+	MOVL	w_cursorbind.B[ESI], ECX
+	ADDL	EAX, EDX		;Calculate number to move
+	MOVZBL	ECX, w_curlincnt.B[ESI]
+	SUBL	EAX, ECX
+	JB	2$.S			;If not deleting past end of line
+	MOVZBL	EAX, w_cursorinb.B[ESI]	;Deleting to end of line - reduce
+	INCL	EAX			;  length of line
+	MOVZBL	EDX, w_curlincnt.B[ESI]
+	MOVB	w_curlincnt.B[ESI], AL
+	SUBL	EDX, EAX		;Calculate amount really deleted
+	JMP	6$.S			;Go update count if need to
+
+;Here if not deleting to end of line
+
+2$:	SUBB	w_curlincnt.B[ESI], DL	;Reduce length of line
+	NEGL	EAX			;Make count positive
+	JE	6$.S			;If nothing to move
+	MOVL	ECX, EAX		;Get count in right register
+	PUSHL	DS			;Calculate pointers
+	POPL	ES
+	PUSHL	ESI
+	PUSHL	EDI
+	MOVL	EDI, w_curlinbuf.B[ESI]
+	ADDL	EDI, EBX
+	MOVL	ESI, EDI
+	ADDL	ESI, EDX
+	CLD
+	RMOVSB	[EDI], [ESI]		;Move rest of line back 1 space
+	POPL	EDI
+	POPL	ESI
+6$:	CMPL	ESI, #wdb0#		;In command mode now?
+	JE	ret011.S		;Yes
+	SUBL	f_numchr.B[EDI], EDX	;No - reduce total character count
+ret011:	RET
+.PAGE
+	.SBTTL	gototop - Subroutine to position to beginning of file
+
+;Subroutine to position to beginning of file
+;	CALL	gototop
+
+gototop::
+	LEAL	EAX, f_filbfr.B[EDI]	;Point to first line
+	MOVL	w_curpnt.B[ESI], EAX
+	CLRL	EAX
+	MOVL	w_curlin.B[ESI], EAX	;Vertical position = top of text area
+	MOVB	w_cursorinb.B[ESI], AL	;Force cursor to first column
+	MOVL	w_cursorinv.B[ESI], EAX
+	MOVL	w_cursorbind.B[ESI], EAX
+	RET
+.PAGE
+	.SBTTL	movvrt - Subroutine to move cursor vertically
+
+;Subroutine to move cursor vertically - screen is also shifted if necessary
+;	c{ECX} = Number of lines to move (+ is towards EOF)
+;	CALL	movvrt
+
+movvrt::MOVL	EAX, w_curlin.B[ESI]	;Get the current line number
+	ORL	ECX, ECX		;Which way are we moving?
+	JE	ret012.S		;If not moving at all!
+	JNS	2$.S			;Toward EOF
+	ADDL	EAX, ECX		;Toward beginning of file - adjust
+					;  line number
+	JNS	4$.S			;If not too far back
+	CLRL	EAX			;Too much - put at first line in file
+	JMP	4$.S
+
+;Here if moving toward end of file
+
+2$:	ADDL	EAX, ECX		;Get new line number
+	CMPL	EAX, f_numlin.B[EDI]	;This line past end of file?
+	JB	4$.S			;No
+	MOVL	EAX, f_numlin.B[EDI]	;Yes - go to end
+4$:	MOVL	w_curlin.B[ESI], EAX	;Update number of current line
+	CALL	scroll#			;Scroll the screen if nessery
+	JMP	chkbind#
+.PAGE
+	.SBTTL	advance - Subroutine to advance pointer toward EOF
+
+;Subroutine to advance pointer toward EOF
+;	c{EBX} = Offset of line in file buffer
+;	c{ECX} = Number of lines to advance
+;	CALL	advance
+;	c{EBX} = Updated pointer
+
+advance::
+	JREGZ	ECX, 4$
+2$:	MOVZBL	EAX, [EBX]		;Get count for line
+	LEAL	EBX, 1.B[EBX+EAX]	;Advance to next line
+	LOOP	ECX, 2$			;Continue if more to do
+4$:	RET
+.PAGE
+	.SBTTL	getline - Subroutine to get current line into the line buffer
+
+;Subroutine to get current line into the line buffer
+;	c{w_curpnt} = Offset of current line in file buffer
+;	CALL	getline
+
+getline::
+	MOVB	w_haveline.B[ESI], #1	;Indicate have line in buffer
+	MOVL	EAX, w_curpnt.B[ESI]
+	MOVZBL	ECX, [EAX]		;Get byte count
+	MOVB	w_curlincnt.B[ESI], CL
+	DECL	ECX
+	JLE	ret012.S		;If this is an empty line or the
+	PUSHL	EDI			;  dummy line after EOF
+	PUSHL	ESI
+	MOVL	EDI, w_curlinbuf.B[ESI]	;Point to line buffer
+	LEAL	ESI, 1.B[EAX]		;Get address of start of current line
+	PUSHL	DS			;  in file buffer
+	POPL	ES
+	CLD
+	RMOVSB	[EDI], [ESI]		;Copy the line
+	POPL	ESI
+	POPL	EDI
+ret012:	RET				;Thats all
+
+	.SBTTL	putlinef - Subroutine to update current line in the file buffer
+
+;Subroutine to update current line in the file buffer from the line buffer and
+;  fix up and other windows if this is needed
+;	c{curpnt} = Offset of current line in file buffer
+;	CALL	putlinef
+;	Z:set = Size of file buffer not changed
+;	Z:clr = File buffer expanded or reduced
+
+putlinef::
+	CALL	putline
+	JE	ret012.S
+	MOVL	EDX, w_curlin.B[ESI]
+	CLRL	ECX
+	JMP	fixwindow#
+
+	.SBTTL	putline - Subroutine to update current line in the file buffer
+
+;Subroutine to update current line in the file buffer from the line buffer
+;	c{curpnt} = Offset of current line in file buffer
+;	CALL	putline
+;	Z:set = Size of file buffer not changed
+;	Z:clr = File buffer expanded or reduced
+
+putline::
+	CMPB	w_haveline.B[ESI], #0	;Is there a line in the buffer?
+	JE	10$.S			;No
+	MOVB	w_haveline.B[ESI], #0	;Yes - but not any more
+	MOVZBL	EDX, w_curlincnt.B[ESI]	;Get length of line buffer
+	ORL	EDX, EDX		;Is the line buffer empty?
+	JE	10$.S			;Yes - go on
+	MOVL	EBX, w_curpnt.B[ESI]	;No - point to line in file buffer
+	MOVZBL	ECX, [EBX]		;Get length of line
+	SUBL	EDX, ECX		;Do we need to adjust things?
+	JNE	2$.S			;Yes - go do that
+	CMPB	f_modified.B[EDI], #0	;No - has the file been changed yet?
+	JNE	8$.S			;Yes - don't bother checking here
+	DECL	ECX
+	JE	8$.S
+	PUSHL	EDI
+	PUSHL	ESI
+	PUSHL	DS			;No - is this line still the same?
+	POPL	ES
+	MOVL	EDI, w_curlinbuf.B[ESI]
+	LEAL	ESI, 1.B[EBX]
+	CLD
+	RECMPSB	[EDI], [ESI]
+	POPL	ESI
+	POPL	EDI
+	JNE	6$.S			;Different
+	RET				;Still the same
+
+;Here if need to change length of line
+
+2$:	ADDL	EBX, ECX		;Point to next line
+	ORL	ECX, ECX		;At EOF?
+	JNE	4$.S			;No
+	INCL	EDX			;Yes - adjust count
+4$:	CALL	movbuf			;Shift buffer
+	JC	12$.S			;If out of memory
+	CALL	6$
+	ORL	ESP, ESP		;Clear Z
+	RET
+
+;Here to copy line to the file buffer
+
+6$:	CALL	dspmfg#			;Indicate changed now
+8$:	PUSHL	DS
+	POPL	ES
+	PUSHL	EDI
+	PUSHL	ESI
+	MOVL	EDI, w_curpnt.B[ESI]	;Point to file buffer
+	MOVZBL	ECX, w_curlincnt.B[ESI]	;Get count
+	MOVB	[EDI], CL
+	MOVB	[EDI+ECX], CL
+	INCL	EDI
+	DECL	ECX
+	MOVL	ESI, w_curlinbuf.B[ESI]	;Point to line buffer
+	CLD
+	RMOVSB	[EDI], [ESI]		;Copy the line
+	POPL	ESI
+	POPL	EDI
+10$:	CLRL	EAX			;Return with Z set
+	RET				;Finished
+
+;Here if out of memory
+
+12$:	MOVL	EDX, #memmsg#		;Display error message on response line
+	JMP	dsprsp#
+.PAGE
+	.SBTTL	movbuf - Subroutine to move last part of buffer in memory
+
+;Subroutine to move last part of file buffer up or down in memory
+;	c{EDX} = Distance to move (+ makes hole in buffer, - closes existing
+;		  hole
+;	c{EBX} = Offset of first byte to move
+;	CALL	movbuf
+;	C:set = Error, not enough memory
+;	C:clr = Normal
+
+movbuf:	MOVL	ECX, f_endpnt.B[EDI]	;Calculate number of bytes to move
+	SUBL	ECX, EBX
+	INCL	ECX
+	PUSHL	EBX
+	PUSHL	EDX
+	ORL	EDX, EDX		;Which way are we moving?
+	JNS	4$.S			;If making hole in buffer
+	ADDL	EDX, EBX		;If closing existing hole
+	PUSHL	DS	
+	POPL	ES
+	PUSHL	EDI
+	PUSHL	ESI
+	MOVL	ESI, EBX
+	MOVL	EDI, EDX
+	CLD
+	RMOVSB	[EDI], [ESI]		;Move the buffer
+	MOVL	EDX, EDI
+	POPL	ESI
+	POPL	EDI
+	MOVL	f_endpnt.B[EDI], EDX	;Update pointer to EOF
+	MOVL	EAX, f_memtop.B[EDI]
+	SUBL	EAX, #1000h		;Can we give up any memory now?
+	CMPL	EDX, EAX
+	JA	6$.S			;No
+	SUBL	EDX, EDI		;Yes - calculate new amount
+	PUSHL	DS
+	PUSHL	EDI
+	PUSHL	#PG$WRITE|PG$READ.B
+	PUSHL	EDX
+	CALLF	svcMemChange##
+	ORL	EAX, EAX		;This should not fail!!
+	JS	6$.S
+	ADDL	EAX, EDI
+	DECL	EAX
+	MOVL	f_memtop.B[EDI], EAX	;Update amount we have
+	JMP	6$.S
+
+;Here if making hole in buffer
+
+4$:	MOVL	EBX, f_endpnt.B[EDI]	;Determine pointers for the move
+	ADDL	EDX, EBX
+	MOVL	f_endpnt.B[EDI], EDX	;Update pointer to EOF
+	PUSHL	DS
+	POPL	ES
+	CALL	chkmem#			;Make sure have enough memory
+	JC	6$.S
+	PUSHL	EDI
+	PUSHL	ESI
+	MOVL	ESI, EBX
+	MOVL	EDI, EDX
+	STD
+	RMOVSB	[EDI], [ESI]		;Move the buffer
+	POPL	ESI
+	POPL	EDI
+6$:	POPL	EDX			;Restore pointer and distance
+	POPL	EBX
+	RET
+.PAGE
+	.SBTTL	movcpyn - Subroutine to do work for MN and CN commands
+
+;Subroutine to do work for MN and CN commands
+;	CALL	movcpyn
+;	c{EDX} = Number of lines output
+;	C:clr = Normal
+;	C:set = Bad command
+
+movcpyn::
+	CALL	getnum#			;Get count
+	JC	4$.S			;If error
+	ORL	EBX, EBX
+	JNE	2$.S
+	INCL	EBX
+2$:	MOVL	ECX, EBX		;Get in right register
+	JMP	10$.S			;Continue
+
+4$:	MOVL	EDX, #bdnmsg#		;If bad number
+	JMP	6$.S
+
+;Here if syntax error
+
+mvcpse:	MOVL	EDX, #synmsg#
+6$:	CALL	dsprsp#			;Display error message on response line
+	STC				;Indicate error
+ret016:	RET				;And return
+
+	.SBTTL	movcpyf - Subroutine to do work for MF and CF commands
+
+;Subroutine to do work for MF and CF commands
+;	CALL	movcpyf
+;	c{EDX} = Number of lines output
+;	C:clr = Normal
+;	C:set = Bad command
+
+movcpyf::
+	CALL	find#			;Do "Find" type search
+	JMP	8$.S			;Continue
+
+	.SBTTL	movcpyl - Subroutine to do work for ML and CL commands
+
+;Subroutine to do work for ML and CL commands
+;	CALL	movcpyl
+;	C:clr = Normal
+;	  c{EDX} = Number of lines output
+;	C:set = Bad command
+
+movcpyl::
+	CALL	locate#			;Do "Locate" type search
+8$:	JC	ret016.S		;If not found
+	JREGZ	ECX, 12$
+10$:	PUSHL	ECX			;Save count
+	MOVL	EDX, #extmsg#		;Tell him to wait for a while
+	CALL	dsprsp#
+	MOVL	EDX, #bfrnam#
+	MOVL	EBX, w_curpnt.B[ESI]	;Start output with current line
+	MOVL	ECX, [ESP]
+	CALL	outfile#		;Do output
+	JC	14$.S			;If error
+	CALL	rspclr#			;OK - erase the wait message
+	POPL	EDX			;Get count to return
+	CLC				;Make sure C is clear
+	RET				;And return
+
+;Here if match found on current line
+
+12$:	MOVL	EDX, #emnomc#
+	JMP	6$.S
+
+;Here if error doing output
+
+14$:	POPL	EAX			;Discard count
+	CALL	dsprsp#			;Display the error message
+	STC				;Indicate error
+	RET
+.PAGE
+	.SBTTL	inslsb - Subroutine to insert line
+
+;Subroutine to insert line
+;	CALL	inslsb
+
+inslsb:	CALL	putline			;Update file buffer
+	MOVL	EBX, w_curpnt.B[ESI]	;Point to current line in file buffer
+	MOVL	EDX, #2			;Move it all down 2 bytes
+	CALL	movbuf
+	JC	4$.S			;If out of memory
+	MOVL	EBX, w_curpnt.B[ESI]	;Point to place for new line
+	MOVW	[EBX], #101h		;Make this a blank line
+	CALL	getline			;Update line buffer (this will clear
+					;  it!)
+	CALL	dspmfg#			;Indicate file has been modified
+	INCL	f_numlin.B[EDI]		;Increase line count
+	ADDL	f_numchr.B[EDI], #2.B	;Increase character count
+	CALL	dspnln#			;Display updated counts
+	CALL	dspcln#
+	JMP	dspnch#
+
+;Here if out of memory
+
+4$:	MOVL	EDX, #memmsg#		;Display error message on response line
+	JMP	dsprsp#
+.PAGE
+	.SBTTL	wordlt - Subroutine to move left one word
+
+;Subroutine to move left one word
+;	CALL	wordlt
+;	c(AL) = New cursor position
+
+wordlt:	MOVZBL	EDX, w_cursorinb.B[ESI]	;Get current cursor position
+	MOVL	EBX, w_curlinbuf.B[ESI]
+	ORL	EDX, EDX		;At beginning of buffer?
+	JE	20$.S			;Yes - stop here!
+	DECL	EDX			;Back up one character
+	JE	20$.S			;If at beginning of line now
+	MOVB	AL, [EBX+EDX]		;Get character
+	CALL	inword			;Is character a delimiter
+	JNE	12$.S			;No
+10$:	DECL	EDX			;Yes - backup to first non-delimiter
+	JE	20$.S
+	MOVB	AL, [EBX+EDX]
+	CALL	inword
+	JE	10$.S
+12$:	DECL	EDX			;Now backup to first delimiter
+	JS	14$.S
+	MOVB	AL, [EBX+EDX]
+	CALL	inword
+	JNE	12$.S
+14$:	INCL	EDX			;Move forward to first character in
+					;  word
+20$:	MOVL	EAX, EDX	;Get position in right register
+	RET
+.PAGE
+	.SBTTL	wordrt - Subroutine to find next word to the right
+
+;Subroutine to find next word to the right
+;	CALL	wordrt
+;	c(AL) = New cursor position
+
+wordrt:	MOVZBL	EDX, w_cursorinb.B[ESI]	;Get position in buffer
+	MOVL	EBX, w_curlinbuf.B[ESI]
+2$:	INCL	EDX			;Past end of buffer?
+	CMPB	DL, w_curlincnt.B[ESI]
+	JNC	8$.S			;Yes - stop here
+	MOVB	AL, -1.B[EBX+EDX]	;No - get character
+	CALL	inword			;Is character a delimiter?
+	JNE	2$.S			;No - continue
+
+;Here on delimiter when scanning right - now must scan to first different
+;  character
+
+4$:	INCL	EDX			;Bump position
+	CMPB	DL, w_curlincnt.B[ESI]	;Past end of buffer?
+	JNC	8$.S			;Yes - stop here
+	MOVB	AL, -1.B[EBX+EDX]	;No - get character
+	CALL	inword			;Is it a delimiter?
+	JE	4$.S			;Yes - continue
+8$:	MOVL	EAX, EDX		;No - get in right register
+	DECL	EAX			;Fix up the position
+	RET
+.PAGE
+	.SBTTL	inword - Subroutine to test for word delimiters
+
+;Subroutine to test for word delimiters
+;	c(AL) = Character
+;	CALL	inword
+;	Z:set = Character is a delimiter
+;	Z:clr = Character not a delimiter
+
+inword:	PUSHL	ECX			;Save registers
+	PUSHL	EDI
+	MOVL	ECX, #WDSLEN#		;Get the delimiter string counter
+	PUSHL	DS
+	POPL	ES
+	MOVL	EDI, #wdstrg#		;Get the address of delimiter string
+	CLD				;Is character a delimiter?
+	RNSCASB	[EDI]
+	POPL	EDI
+	POPL	ECX			;Restore register
+	RET				;Return with condition bits set
+.PAGE
+	.SBTTL	dsptbl - Command dispatch table
+
+	.MOD	4
+dsptbl::.LONG	edtscn		;VS_NOP = 80 - No operation
+	.LONG	gocmdm		;VS_CMD = 81 - Go to command mode
+	.LONG	curup		;VS_CUP = 82 - Cursor up
+	.LONG	curdwn		;VS_CDW = 83 - Cursor down
+	.LONG	curlft		;VS_CLT = 84 - Cursor left
+	.LONG	currht		;VS_CRT = 85 - Cursor right
+	.LONG	curlwd		;VS_WLT = 86 - Cursor left word
+	.LONG	currwd		;VS_WRT = 87 - Cursor right word
+	.LONG	rstcur		;VS_MLT = 88 - Cursor begining of line
+	.LONG	curend		;VS_MRT = 89 - Cursor end of line
+	.LONG	delchb		;VS_DLT = 8A - Delete character backward
+	.LONG	delchf		;VS_DRT = 8B - Delete character forward
+	.LONG	delend		;VS_DEN = 8C - Delete to end of line
+	.LONG	delbeg		;VS_DBG = 8D - Delete to begining of line
+	.LONG	delwrd		;VS_DWD = 8E - Delete word
+	.LONG	inslin		;VS_ILN = 8F - Insert line
+	.LONG	dellin		;VS_DLN = 90 - Delete line
+	.LONG	joinline	;VS_JOI = 91 - Join two lines
+	.LONG	cretrn		;VS_RTN = 92 - Break the current line at
+				;		 cursor
+	.LONG	cntrlu		;VS_ELN = 93 - Erase text on current line
+	.LONG	casecg		;VS_CAS = 94 - Toggle case of characters
+	.LONG	rstlin		;VS_RST = 95 - Restore the line
+	.LONG	litchr		;VS_LIT = 96 - Get literal character
+	.LONG	scrlup		;VS_SUP = 97 - Scroll up
+	.LONG	scrldw		;VS_SDW = 98 - Scroll down
+	.LONG	pageup		;VS_PUP = 99 - Page up
+	.LONG	pagedw		;VS_PDW = 9A - Page down
+	.LONG	togins		;VS_TIM = 9B - Toggle insert mode
+	.LONG	gtotop		;VS_TOP = 9C - Go to top of file
+	.LONG	gtobtm		;VS_BTM = 9D - Go to bottom of file
+	.LONG	fndfnx		;VS_FFN = 9E - Find forward next
+	.LONG	locfnx		;VS_LFN = 9F - Locate forward next
+	.LONG	frpfnx		;VS_FRF = A0 - Find and replace forward next
+	.LONG	lrpfnx		;VS_LRF = A1 - Locate and replace forward next
+	.LONG	changewin	;VS_CWN = A2 - Change windows

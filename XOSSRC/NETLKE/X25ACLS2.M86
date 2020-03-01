@@ -1,0 +1,1334 @@
+	.TITLE	X25ACLS2 - X.25 packet level routines for XOS (part 2)
+
+;++++
+; This software is in the public domain.  It may be freely copied and used
+; for whatever purpose you see fit, including commerical uses.  Anyone
+; modifying this software may claim ownership of the modifications, but not
+; the complete derived code.  It would be appreciated if the authors were
+; told what this software is being used for, but this is not a requirement.
+
+;   THIS SOFTWARE IS PROVIDED BY THE AUTHORS "AS IS" AND ANY EXPRESS OR
+;   IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
+;   OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+;   IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+;   INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+;   BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS
+;   OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+;   ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR
+;   TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
+;   USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+;----
+
+	.PROC	80486
+	.INCLUD	XOSINC:\XMAC\XOS.PAR
+	.INCLUD	XOSINC:\XMAC\XOSX.PAR
+	.INCLUD	XOSINC:\XMAC\XOSTIME.PAR
+	.INCLUD	XOSINC:\XMAC\XOSERR.PAR
+	.INCLUD	XOSINC:\XMAC\XOSNET.PAR
+	.INCLUD	XOSINC:\XMAC\XOSXNET.PAR
+	.INCLUD	XOSINC:\XMAC\XOSLKE.PAR
+	.INCLUD	XOSINC:\XMAC\XOSXLKE.PAR
+	.INCLUD	LAPBA.PAR
+	.INCLUD	X25A.PAR
+
+	LKECONT
+
+;This file contains routines for receiving packets
+
+	CODE
+
+	.SBTTL	x25rcvpkt - Subroutine to process received X.25 packet
+
+;Subroutine to process received X.25 packet
+;	c{EAX} = Offset of IDB
+;	c{EBX} = Offset of packet buffer
+;	c{ECX} = X.25 length
+;	c{EDX} = Offset of start of X.25 header
+;	c{ESI} = Offset of X.25 PDB
+;	CALL	x25rcvpkt
+
+$$$=!0
+FRM rcv_pkt   , 4t
+FRM rcv_x25hdr, 4t
+FRM rcv_x25len, 4t
+FRM rcv_pdb   , 4t
+FRM rcv_cnt   , 4t
+rcv_SIZE=!$$$
+
+x25rcvpkt::
+	CMPB	pdb_x25state.B[ESI], #X25S_NORMAL ;Is the link operational?
+	JNE	10$.S			;No - go handle that case
+	ENTER	rcv_SIZE, 0		;Yes - set up our stack frame
+	MOVL	rcv_pkt.B[EBP], EBX
+	MOVL	rcv_x25hdr.B[EBP], EDX
+	SUBL	ECX, #x25_data.B
+	MOVL	rcv_x25len.B[EBP], ECX	;Store length of data part of packet
+	MOVZWL	EAX, [EDX]		;Get the channel number
+	ANDB	AL, #0Fh
+	XCHGB	AL, AH
+	CMPL	pdb_x25maxchnl.B[ESI], EAX ;Possible value?
+	JB	6$.S			;No - serious error!
+	MOVL	EDI, pdb_x25chnltbl[ESI+EAX*4] ;Yes - get offset of DCB
+	TESTL	EDI, EDI		;Is there one?
+	JE	newcall.S		;No - go check for call request
+	ANDB	dcb_x25sts1.B[EDI], #~X25S1$OPENED ;Yes
+	MOVZBL	EAX, dcb_x25state.B[EDI] ;Get connection state
+	CALLI	CS:rcvdsp[EAX*4]	;Dispatch on the state
+	LEAVE				;Give up the rcv_ frame
+	TESTL	EDI, EDI		;Still have a DCB?
+	JE	8$.S			;No - finished now
+	TESTB	dcb_x25sts1.B[EDI], #X25S1$OPENED
+					;Yes - did we change the window?
+	JE	8$.S			;No
+	CMPB	dcb_x25sndwinavl[EDI], #0.B ;Yes - is the window open at all?
+	JLE	8$.S			;No - all finished here
+	CLRL	EAX			;Yes
+	JMP	xosnetSndDone##		;Wake up application to send more data
+
+;Here with invalid channel number - this is considered a serious error
+
+6$:	CALL	xosnetGiveBufr##	;Give up the packet
+	PUSHL	ESI
+	MOVL	ESI, pdb_sdb.B[ESI]	;Take the link down!
+	CALL	xoslpaLinkDown##
+	POPL	ESI
+	LEAVE
+8$:	RET
+
+;Here if the link is not operational
+
+10$:	CMPB	pdb_x25state.B[ESI], #X25S_RESTART ;Are we restarting?
+	JNE	16$.S			;No
+	CMPB	x25_type.B[EDX], #X25P_RESCON ;Yes - restart confirmation?
+	JE	12$.S			;Yes
+	CMPB	x25_type.B[EDX], #X25P_RESREQ ;No - restart request?
+	JNE	14$.S			;No - ignore it
+12$:	MOVB	pdb_x25state.B[ESI], #X25S_NORMAL ;Yes - update state
+14$:	JMP	xosnetGiveBufr##	;Discard the packet
+
+;Here if not restarting
+
+16$:	CMPB	x25_type.B[EDX], #X25P_RESREQ ;Restart request?
+	JNE	14$.S			;No - ignore it
+	JMP	restrt2			;Yes - go handle it
+.PAGE
+;X25 connection state dispatch table for received packets
+
+	.MOD	4
+rcvdsp:	.LONG	unxtype		;X25S_IDLE    = 0 - Idle
+	.LONG	rcvcallsnt	;X25S_CALLSNT = 1 - Call request sent
+	.LONG	rcvestab	;X25S_ESTAB   = 2 - Connection established
+	.LONG	rcvclrsnt	;X25S_CLRSNT  = 3 - Clear request sent
+.PAGE
+;Here with an input packet which does not have a matching DCB - this should be
+;  an in-coming call request packet
+;	c{EAX} = Logical channel number
+;	c{EBX} = Offset of packet buffer
+;	c{EDX} = Offset of X.25 packet header
+;	c{ESI} = Offset of X.25 PDB
+
+newcall:MOVB	CL, x25_type.B[EDX]
+	CMPB	CL, #X25P_CALLREQ	;Is this a call request?
+	JE	2$.S			;Yes
+	CMPB	CL, #X25P_RESREQ	;No - is this a restart request?
+	JE	restart			;Yes
+	CMPB	CL, #X25P_CLRREQ	;No - is this a clear request?
+	JE	clrreq			;Yes
+	MOVB	AL, #20t		;No - indicate invalid packet
+	JMP	illpkt
+
+;Here for a call request
+
+2$:	MOVL	EDI, ESI
+	PUSHL	EBX
+	PUSHL	EAX
+	MOVL	EBX, #txtbfr+2		;Construct the device name of the form:
+	MOVL	-2.B[EBX], #'XA'	;    XAnCccc
+	CLRL	EAX			;  where "n" is the unit number
+	MOVL	2.B[EBX], EAX		;    (decimal) and "ccc" is the logical
+	MOVB	AL, pdb_unit.B[ESI]	;    channel number (hex).
+	CALL	knlPutDecNmbr##
+	MOVB	[EBX], #'C'
+	INCL	EBX
+	MOVL	EAX, [ESP]
+	CALL	knlPutHex3Nmbr##
+	PUSHL	txtbfr+12t
+	PUSHL	txtbfr+8t
+	PUSHL	txtbfr+4t
+	PUSHL	txtbfr+0t
+	MOVL	EBX, ESP
+	CALL	x25makedcb#		;Create a DCB
+	JC	12$			;If error
+	ADDL	ESP, #16t.B
+	POPL	EDX
+	POPL	EBX
+	MOVL	dcb_x25channel.B[EDI], EDX ;OK - store channel number
+	MOVL	pdb_x25chnltbl[ESI+EDX*4], EDI
+	MOVB	AL, pdb_x25rcvwinsz.B[ESI] ;Initialize the windows
+	MOVB	dcb_x25rcvwinsz.B[EDI], AL
+	MOVB	dcb_x25rcvwinavl.B[EDI], AL
+	MOVB	AL, pdb_x25rcvwinlvl.B[ESI]
+	MOVB	dcb_x25rcvwinlvl.B[EDI], AL
+	MOVL	EAX, pdb_x25rcvwindly.B[ESI]
+	MOVL	dcb_x25rcvwindly.B[EDI], EAX
+	MOVB	AL, pdb_x25sndwinsz.B[ESI]
+	MOVB	dcb_x25sndwinsz.B[EDI], AL
+	MOVB	dcb_x25sndwinavl.B[EDI], AL
+	MOVL	EDX, rcv_x25hdr.B[EBP]	;Point to start of the X.25 data
+	ADDL	EDX, #x25_data.B
+	DECL	rcv_x25len.B[EBP]	;Do we have an address block?
+	JS	8$.S			;No!
+	MOVZBL	ECX, [EDX]		;Yes - get address lengths
+	INCL	EDX
+	MOVL	EAX, ECX
+	SHRL	EAX, #4t		;Get calling address length
+	PUSHL	EAX			;Save it
+	ANDL	ECX, #0Fh.B		;Get called address length
+	ADDL	EAX, ECX		;Get total
+	INCL	EAX
+	SHRL	EAX, #1t		;Divided by 2
+	SUBL	rcv_x25len.B[EBP], EAX	;Does it fit?
+	JS	8$.S			;No - fail
+	MOVB	AH, #0			;Yes
+	MOVL	EBX, #txtbfr		;Get the called address
+	CALL	decodeaddr
+	POPL	ECX
+	LEAL	EBX, dcb_x25rmtaddr.B[EDI]
+	CALL	decodeaddr
+	BTL	EAX, #8t
+	ADCL	EDX, #0.B
+	DECL	rcv_x25len.B[EBP]	;Have any facilities?
+	JS	cfdone.S		;No
+	MOVZBL	ECX, [EDX]		;Yes - get count
+	INCL	EDX
+	JREGZ	ECX, cfdone		;If zero
+	SUBL	rcv_x25len.B[EBP], ECX	;Have this much left?
+	JS	8$.S			;No - fail!
+	MOVL	rcv_cnt.B[EBP], ECX	;Yes - save count
+4$:	CMPL	rcv_cnt.B[EBP], #0.B
+	JE	cfdone.S
+	DECL	rcv_cnt.B[EBP]
+	MOVZBL	EAX, [EDX]		;Get facility byte
+	INCL	EDX
+	MOVL	ECX, EAX
+	ANDL	EAX, #3Fh		;Get low 6 bits
+	SHRL	ECX, #6t		;Get high two bits
+	MOVL	ECX, CS:cfcls[ECX*4]	;Get offset of table for class
+	CMPL	CS:-4.B[ECX], EAX	;Valid value?
+	JB	6$.S			;No - fail
+	CALLI	CS:[ECX+EAX*4]		;Yes - call routine for the facility
+	JNC	4$.S			;Continue if OK
+	JMP	12$.S			;If error detected
+
+;Here if have invalid call facility
+
+6$:	MOVB	AL, #77t
+	JMP	10$.S
+
+;Here if the packet is too short
+
+8$:	MOVB	AL, #38t
+10$:	JMP	illpkt
+
+;Here if error creating the DCB
+
+12$:	CRASH	????
+.PAGE
+;Here with all call facilities processed
+
+cfdone:	MOVL	EBX, rcv_pkt.B[EBP]	;Give up the input packet
+	CALL	xosnetGiveBufr##
+	MOVB	dcb_x25rcvsnum[EDI], #0
+	MOVB	dcb_x25sndsnum[EDI], #0
+	MOVB	dcb_x25state.B[EDI], #X25S_ESTAB ;Set connection state
+	CLRL	EAX
+
+$$$$addr::
+
+	CMPB	txtbfr, #14t		;Have exactly 14 digits in the address?
+	JNE	2$.S			;No - sub-address is 0
+	MOVB	AL, txtbfr+7		;Yes - get sub-address digits
+	MOVZBL	ECX, AL
+	SHRL	ECX, #4t
+	ANDL	EAX, #0Fh.B
+	IMULL	ECX, #10t.B
+	ADDL	EAX, ECX
+2$:	MOVL	ESI, dcb_netpdb.B[EDI]	      ;Get offset of first message
+	MOVL	ESI, pdb_x25condsthead.B[ESI] ;  destination block
+4$:	ORL	ESI, ESI
+	JE	8$.S			;If not found, no message
+	CMPL	dct_x25subaddr.B[ESI], EAX ;This one?
+	JE	6$.S			;Yes
+	MOVL	ESI, dct_lnknext.B[ESI]	;No - advance to next
+	JMP	4$.S
+
+;Here message destination block for the sub-address
+
+6$:	ADDL	ESI, #dct_x25msgdst.B	;Point to the destination name
+	CMPL	[ESI], #0		;Really have one?
+	JE	8$.S			;No
+	MOVB	DL, #0			;Yes
+	MOVB	DH, #20h
+	LEAL	EBX, dcb_name+0.B[EDI]	;Get name for message
+	MOVB	CL, #0
+	PUSHL	EDI
+	MOVL	EDI, #x25msgsrc		;Get offset of the source name
+	CALL	knlSendLogInMsg##	;Send the message
+	POPL	EDI
+	JC	20$.S			;If error
+8$:	MOVL	ESI, dcb_netpdb.B[EDI]
+	MOVB	AL, #X25P_CALLACP	;Make a call accepted/connected packet
+	CLRL	ECX
+	CALL	x25getpkt
+	JC	14$.S			;If error
+	MOVB	npb_seqnum+1.B[EBX], #0
+	INCL	pdb_x25cntpktout.B[ESI] ;Count the packet
+	MOVL	ESI, pdb_sdb.B[ESI]
+	CALL	xoslpaSendInfo##	;Send the packet
+	JC	12$.S			;If error
+	MOVL	ESI, dcb_netpdb.B[EDI]
+	MOVL	EAX, pdb_x25nctoval.B[ESI]
+	TESTL	EAX, EAX
+	JE	10$.S
+	MOVL	EBX, #newcallto
+	CALL	knlWakeRequest#
+	JC	18$.S
+	MOVL	dcb_x25callwake.B[EDI], ESI
+10$:	LEAVE
+	RET
+
+;Here if error allocating buffer for the call connected packet or sending the
+;  packet - This probably means we are out of memory or that the link interface
+;  is messed up.  In either case there is not much we can do!  We try to take
+;  the link down after giving up the DCB, but this probably will not work
+;  either!!
+
+12$:	CALL	x25givedcb#		;Get rid of the DCB
+
+;Here if error creating the X.25 DCB - This also probably means we are out of
+;  memory -- see directly above!
+
+14$:	CALL	x25linkdown
+	LEAVE
+	RET
+
+;Here if have error starting the timer for killing the connection if its not
+;  opened soon.  This should not happen unless memory is very low, in which
+;  case the attempt we make to clear the call will probably not work either!
+
+18$:	MOVB	AL, #3t
+	JMP	24$.S
+
+;Here if have error notifying someone of the new connection.  This probably
+;  is because the program we should notify is not running.  In this case we
+;  clear the call immediately indicating an "incompatable destination".
+
+20$:	MOVB	AL, #33t		;Clear the call
+24$:	CALL	x25clear#
+	LEAVE
+	RET
+.PAGE
+;Tables for decoding call facilities
+
+	.MOD	4
+cfcls:	.LONG	cfclsa		;00xxxxxx - Class A facility
+	.LONG	cfclsb		;01xxxxxx - Class B facility
+	.LONG	cfclsc		;10xxxxxx - Class C facility
+	.LONG	cfclsd		;11xxxxxx - Class D facility
+
+	.LONG	CLSAMAX
+cfclsa:	.LONG	cfmarker	;00 - Marker
+	.LONG	cfrevchrg	;01 - Reverse charging
+	.LONG	cfthrput	;02 - Throughput class negotiation
+	.LONG	cfcugb		;03 - Closed user group (basic)
+	.LONG	cfcireq		;04 - Charging info (requesting service)
+	.LONG	cfbad		;05 - Illegal
+	.LONG	cfbad		;06 - Illegal
+	.LONG	cfbad		;07 - Illegal
+	.LONG	cfbad		;08 - Illegal
+	.LONG	cfcugob		;09 - Closed user group/outgoing (basic)
+CLSAMAX=!{$-cfclsa}/4-1
+
+	.LONG	CLSBMAX
+cfclsb:	.LONG	cfbad		;40 - Illegal
+	.LONG	cfbcug		;41 - Bilateral closed user group
+	.LONG	cfpktsize	;42 - Packet size negotiation
+	.LONG	cfwinsize	;43 - Window size negotiation
+	.LONG	cfrpoab		;44 - RPOA selection (basic)
+	.LONG	cfbad		;45 - Illegal
+	.LONG	cfbad		;46 - Illegal
+	.LONG	cfcugx		;47 - Closed user group (extended)
+	.LONG	cfcugox		;48 - Closed user group/outgoing (extended)
+	.LONG	cftrandly	;49 - Transit delay
+CLSBMAX=!{$-cfclsb}/4-1
+
+	.LONG	CLSCMAX
+cfclsc:	.LONG	cfbad		;80 - Illegal
+CLSCMAX=!{$-cfclsc}/4-1
+
+	.LONG	CLSDMAX
+cfclsd:	.LONG	cfbad		;C0 - Illegal
+	.LONG	cfcicdur	;C1 - Charging info - call duration
+	.LONG	cfcisegcnt	;C2 - Charging info - segment count
+	.LONG	cfciredir	;C3 - Call redirection/deflection notification
+	.LONG	cfrpoax		;C4 - RPOA selection (extended)
+	.LONG	cfciunit	;C5 - Charging info - monetary unit
+	.LONG	cfnuisel	;C6 - NUI selection
+CLSDMAX=!{$-cfclsd}/4-1
+.PAGE
+
+;Here for illegal call facility
+
+cfbad:	MOVB	AL, #77t	;Get diagnostic value (invalid facility)
+	STC			;Indicate error
+	RET
+
+;Here for call facility 0x00 - Marker
+
+cfmarker:
+	JMP	cfbad
+
+;Here for call facility 0x01 - Reverse charging/fast select
+
+cfrevchrg:
+	INCL	EDX		;For now, just skip this one!
+	DECL	rcv_cnt.B[EBP]
+	JS	cfbadval.S
+	CLC
+	RET
+
+;Here for call facility 0x02 - Throughput class negotiation
+
+cfthrput:
+	INCL	EDX		;For now, just skip this one!
+	DECL	rcv_cnt.B[EBP]
+	JS	cfbadval.S
+	CLC
+	RET
+
+;Here for call facility 0x03 - Closed user group (basic)
+
+cfcugb:
+	JMP	cfbad
+
+;Here for call facility 0x04 - Charging info (requesting service)
+
+cfcireq:
+	JMP	cfbad
+
+;Here for call facility 0x09 - Closed user group/outgoing (basic)
+
+cfcugob:
+	JMP	cfbad
+
+;Here for call facility 0x41 - Bilateral closed user group
+
+cfbcug:
+	JMP	cfbad
+
+;Here for call facility 0x42 - Packet size negotiation
+
+cfpktsize:
+	CALL	getpktsize	;Get the from called DTE maximum size
+	JC	6$.S
+	PUSHL	EAX
+	CALL	getpktsize	;Get the to called DTE maximum size
+	POPL	ECX
+	JC	6$.S
+	MOVL	ESI, dcb_netsdb.B[EDI]
+	CMPB	sdb_lapbcmdaddr.B[ESI], #01 ;Are we a DTE?
+	JE	4$.S			;Yes
+	XCHGL	ECX, EAX		;No - swap values
+4$:	MOVL	dcb_x25rcvpktmax.B[EDI], EAX
+	MOVL	dcb_x25sndpktmax.B[EDI], ECX
+	CLC
+6$:	RET
+
+getpktsize:
+	DECL	rcv_cnt.B[EBP]
+	JS	cfbadval.S
+	MOVB	CL, [EDX]
+	INCL	EDX
+	CMPB	CL, #4t
+	JB	cfbadval.S
+	CMPB	CL, #12t
+	JA	cfbadval.S
+	MOVL	EAX, #1
+	SHLL	EAX, CL
+	RET
+
+;Here with illegal value
+
+cfbadval:
+	MOVB	AL, #65t
+	STC
+	RET
+.PAGE
+;Here for call facility 0x43 - Window size negotiation
+
+cfwinsize:
+	CALL	getwinsize	;Get the from called DTE maximum size
+	JC	6$.S
+	PUSHL	EAX
+	CALL	getwinsize	;Get the to called DTE maximum size
+	POPL	ECX
+	JC	6$.S
+	MOVL	ESI, dcb_netsdb.B[EDI]
+	CMPB	sdb_lapbcmdaddr.B[ESI], #01 ;Are we a DTE?
+	JE	4$.S			;Yes
+	XCHGL	ECX, EAX		;No - swap values
+4$:	MOVB	dcb_x25rcvwinsz.B[EDI], AL
+	MOVB	dcb_x25rcvwinavl.B[EDI], AL
+	MOVB	dcb_x25sndwinsz.B[EDI], CL
+	MOVB	dcb_x25sndwinavl.B[EDI], CL
+	CLC
+6$:	RET
+
+getwinsize:
+	DECL	rcv_cnt.B[EBP]
+	JS	cfbadval.S
+	MOVZBL	EAX, [EDX]
+	INCL	EDX
+	CMPL	EAX, #7t.B
+	JA	cfbadval.S
+	TESTL	EAX, EAX
+	JE	cfbadval.S
+	RET
+
+;Here for call facility 0x44 - RPOA selection (basic)
+
+cfrpoab:
+	JMP	cfbad
+
+;Here for call facility 0x47 - Closed user group (extended format)
+
+cfcugx:
+	JMP	cfbad
+
+;Here for call facility 0x48 - Closed user group with outgoing access (extended
+;  format)
+
+cfcugox:
+	JMP	cfbad
+
+;Here for call facility 0x49 - Transit delay
+
+cftrandly:
+	JMP	cfbad
+
+;Here for call facility 0xC1 - Charging information - call duration
+
+cfcicdur:
+	JMP	cfbad
+
+;Here for call facility 0xC2 - Charging information - segment count
+
+cfcisegcnt:
+	JMP	cfbad
+
+;Here for call facility 0xC3 - Call redirection/deflection notification
+
+cfciredir:
+	JMP	cfbad
+
+;Here for call facility 0xC4 - RPOA selection (extended)
+
+cfrpoax:
+	JMP	cfbad
+
+;Here for call facility 0xC5 - Charging info - monetary unit
+
+cfciunit:
+	JMP	cfbad
+
+;Here for call facility 0xC6 - NUI selection
+
+cfnuisel:
+	JMP	cfbad
+.PAGE
+;Here with a restart request on an idle channel or when link is idle
+
+restart:LEAVE
+restrt2:TESTL	EAX, EAX		;For channel 0?
+	JNE	2$.S			;No!
+	CALL	xosnetGiveBufr##	;Yes - give up the received packet
+	CALL	x25linkdown		;Reset the link
+	CLRL	EDX
+	MOVB	AL, #X25P_RESCON
+sendemp:CLRL	ECX
+	CALL	getspr
+	JC	ret010.S
+	MOVL	ESI, pdb_sdb.B[ESI]
+	JMP	xoslpaSendInfo##	;Send the RESCON packet
+
+;Subroutine to allocate and set up a supervisory packet
+;	c{EDX} = Logical channel number (with bytes swapped)
+;	CALL	getspr
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  c{EBX} = Offset of packet buffer
+;	  c{EDX} = Offset of X.25 header in packet
+
+getspr:	PUSHL	EAX
+	PUSHL	EDX
+	ADDL	ECX, #x25_data.B
+	MOVL	EAX, pdb_idb.B[ESI]	;Get total size needed for the packet
+	ADDL	ECX, idb_hwhdrsz.B[EAX]
+	MOVL	EAX, pdb_sdb.B[ESI]
+	ADDL	ECX, sdb_hdrsz.B[EAX]
+	CLRL	EDI
+	CALL	xosnetGetBufr##		;Allocate a packet buffer
+	JC	6$.S			;If error
+	MOVL	EDI, pdb_sdb.B[ESI]
+	CALL	xoslpaSetPkt2##		;Set up the LAPB header
+	JC	4$.S			;If error
+	POPL	EAX
+	ORB	AL, #10h
+	MOVW	[EDX], AX		;Store logical channel number
+	POPL	EAX
+	MOVB	x25_type.B[EDX], AL	;Store packet type
+	ADDL	npb_count.B[EBX], #x25_data.B
+	RET
+
+;Here if the restart request does not indicate channel 0
+
+2$:	CRASH	????
+
+;Here if error setting up the RESCON packet
+
+4$:	CALL	xosnetGiveBufr##
+6$:	ADDL	ESP, #8t.B
+	;;;; COUNT THE ERROR HERE!!!
+
+ret010:	RET
+.PAGE
+;Here with a clear request on an idle channel - This may happen if there is
+;  confusion when clearing a call.  To keep the other end happy, we just send
+;  back a clear confirmation!
+
+clrreq:	MOVW	DX, [EDX]		;Get logical channel number
+	ANDB	DL, #0Fh
+	CALL	xosnetGiveBufr##	;Give up the input packet
+	MOVB	AL, #X25P_CLRCON	;Send a clear confirmation packet
+	JMP	sendemp
+.PAGE
+;Time-out routine called if device for new connection is not opened within the
+;  time-out interval
+
+newcallto:
+	MOVL	dcb_x25callwake.B[EDI], #0
+	CMPL	dcb_opencnt.B[EDI], #0.B ;Is the device still not open?
+	JNE	ret010.S		;No - false alarm!
+	MOVB	AL, #33t		;Yes - clear the X.25 connection
+	JMP	x25clear#
+.PAGE
+;Subroutine to get X.25 address from the address block
+;	c(AH)  = Initial digit number
+;	c{EBX} = Offset of 12-byte buffer to receive address
+;	c{ECX} = Number of digits
+;	c{EDX} = Offset of first byte
+;	CALL	decodeaddr
+
+decodeaddr:
+	PUSHL	ESI
+	CLRL	ESI
+	MOVL	[EBX], ESI		;Clear the buffer
+	MOVL	4.B[EBX], ESI
+	MOVL	8.B[EBX], ESI
+	JREGZ	ECX, 14$		;Nothing to do if length is 0
+	MOVL	ESI, EBX
+	INCL	EBX
+4$:	MOVB	AL, [EDX]		;Get byte
+	TESTB	AH, #01			;Odd digit?
+	JNE	6$.S
+	SHRB	AL, #4t			;No - even digit
+	JMP	8$.S
+
+6$:	ANDB	AL, #0Fh
+	INCL	EDX
+8$:	INCB	AH
+	SHLB	AL, #4t
+	MOVB	[EBX], AL
+	INCB	[ESI]
+	DECL	ECX
+	JE	14$.S
+	MOVB	AL, [EDX]		;Get byte
+	TESTB	AH, #01			;Odd digit?
+	JNE	10$.S			;Yes
+	SHRB	AL, #4t			;No - even digit
+	JMP	12$.S
+
+10$:	ANDB	AL, #0Fh
+	INCL	EDX
+12$:	INCB	AH
+	ORB	[EBX], AL
+	INCL	EBX
+	INCB	[ESI]
+	LOOP	ECX, 4$
+
+14$:	POPL	ESI
+	RET
+.PAGE
+;Here with a packet when the state is X25S_CALLSNT.  We have just sent an
+;  X25P_CALLREQ packet.  This should be an X25P_CALLACP packet.
+
+rcvcallsnt:
+	CMPB	x25_type.B[EDX], #X25P_CALLACP ;Is this a call accepted packet?
+	JNE	4$.S			;No
+	MOVL	dcb_x25rcvhead.B[EDI], EBX ;Yes - put in on the receive list
+	MOVL	dcb_x25rcvtail.B[EDI], EBX
+	MOVB	dcb_x25state.B[EDI], #X25S_ESTAB ;Update our state
+	CLRL	EAX			;Wake up the extended fork
+	CALL	xosnetRspDone##
+	LEAVE				;Thats all
+	RET
+
+;Here with illegal packet type for this state - send a DIAG packet
+
+4$:	MOVB	AL, #21t		;Illegal packet, state = p2
+illpkt:	INCL	pdb_x25cntunxtype[ESI]	;Count the unexpected packet
+	CALL	x25senddiagbp
+	LEAVE
+	RET
+.PAGE
+;Here with packet when in the connected (X25S_ESTAB) state
+
+rcvestab:
+	MOVZBL	EAX, x25_type.B[EDX]	;Get packet type
+	TESTB	AL, #01h		;Is this a data packet?
+	JE	estdata.S		;Yes
+	TESTB	AL, #02h		;No - is it an RR?
+	JE	estrr			;Probably
+	CMPB	AL, #23h		;Valid low-numbered packet?
+	JA	4$.S
+	JMPIL	CS:estdspl-3[EAX]	;Yes - dispatch on the packet type
+
+;Here if don't have a valid low-numbered packet
+
+4$:	CMPB	AL, #0F3h
+	JB	6$.S
+	JMPIL	CS:estdsph-0F3h[EAX]
+
+;Here if packet type is invalid
+
+6$:	MOVB	AL, #23t
+	JMP	illpkt.S
+
+	.MOD	4
+estdspl:.LONG	unxtype		;	      = 00000011 - Illegal
+	.LONG	unxtype		;	      = 00000111 - Illegal
+	.LONG	unxtype		;X25P_CALLREQ = 00001011 - Call request
+	.LONG	unxtype		;X25P_CALLCON = 00001111 - Call connected
+	.LONG	estclrreq	;X25P_CLRREQ  = 00010011 - Clear request
+	.LONG	unxtype		;X25P_CLRCON  = 00010111 - Clear confirmation
+	.LONG	estrstreq	;X25P_RSTREQ  = 00011011 - Reset request
+	.LONG	estrstcon	;X25P_RSTCON  = 00011111 - Reset confirmation
+	.LONG	estint		;X25P_INT     = 00100011 - Interrupt
+	.LONG	estintcon	;X25P_INTCON  = 00100111 - Interrupt
+				;			     confirmation
+
+estdsph:.LONG	estregreq	;X25P_REGREQ  = 11110011 - Registration request
+	.LONG	estregcon	;X25P_REGCON  = 11110111 - Registration
+				;			     confirmation
+	.LONG	estresreq	;X25P_RESREQ  = 11111011 - Restart request
+	.LONG	estrescon	;X25P_RESCON  = 11111111 - Restart confirmation
+
+;Here with unexpected packet type when state is X25S_ESTAB
+
+unxtype:INCL	pdb_x25cntunxtype[ESI]	;Count the unexpected packet
+	MOVB	AL, #23t		;Illegal packet, state = p4
+	CALL	x25senddiagbp
+	LEAVE
+	RET
+.PAGE
+;Here to process an X25P_DATA packet when connection state is X25S_ESTAB
+
+estdata:CALL	procack			;Process the ACK in the packet
+	JC	8$.S			;If error
+	MOVL	EAX, dcb_x25rcvtail.B[EDI]
+	TESTL	EAX, EAX
+	JNE	4$.S
+	MOVL	dcb_x25rcvhead.B[EDI], EBX
+	JMP	6$.S
+
+4$:	MOVL	npb_next.B[EAX], EBX
+	CLRL	EAX
+6$:	MOVL	npb_next.B[EBX], EAX
+	MOVL	dcb_x25rcvtail.B[EDI], EBX
+	MOVL	EAX, rcv_x25hdr.B[EBP]
+	SUBL	EAX, EBX
+	MOVB	npb_tpofs.B[EBX], AL
+	MOVL	EAX, rcv_x25len.B[EBP]
+	MOVL	npb_count.B[EBX], EAX
+	DECB	dcb_x25rcvwinavl.B[EDI]	;Reduce receive window size
+
+;;;;;;;;;
+	JNS	102$.S
+	CRASH	x25w
+102$:
+;;;;;;;;;
+
+	LEAVE
+	CLRL	EAX			;Wake up anyone who is waiting
+	JMP	xosnetRspDone##
+
+;Here to process an RR packet when connection state is X25S_ESTAB
+
+estrr:	CALL	procack
+	JC	8$.S
+	CALL	xosnetGiveBufr##
+8$:	LEAVE
+	RET
+.PAGE
+;Here to process an X25P_INT packet when connection state is X25S_ESTAB
+
+estint:
+
+	CRASH	????
+
+;Here to process an X25P_INTCON packet when connection state is X25S_ESTAB
+
+estintcon:
+
+	CRASH	????
+.PAGE
+;Here to process an X25P_CLRREQ packet when connection state is X25S_ESTAB
+
+estclrreq:
+	LEAVE
+	MOVB	dcb_x25state.B[EDI], #X25S_IDLE ;Update state
+	MOVB	dcb_x25rmtaddr.B[EDI], #0
+	CALL	xosnetGiveBufr##	;Give up the input packet
+	MOVB	AL, #X25P_CLRCON	;Get a clear confirmation packet
+	CLRL	ECX
+	CALL	x25getpkt
+	JC	4$.S			;If error
+	MOVL	ESI, dcb_netsdb.B[EDI]
+	CALL	xoslpaSendInfo##	;Send it
+	JC	4$.S			;If error
+	CALL	x25giveall
+	CALL	x25givechnl		;Give up the logical channel
+	MOVL	EAX, #ER_NCCLR		;Wake up anyone waiting for anything
+	JMP	xosnetAllDone##
+
+;Here if error sending the clear confirmation packet in response to a clear
+;  request
+
+4$:	CRASH	????
+
+;Here to process an X25P_RSTREQ packet when connection state is X25S_ESTAB
+
+estrstreq:
+
+	CRASH	????
+
+;Here to process an X25P_RSTCON packet when connection state is X25S_ESTAB
+
+estrstcon:
+
+	CRASH	????
+
+;Here to process an X25P_RESREQ packet when connection state is X25S_ESTAB
+
+estresreq:
+
+	CRASH	????
+
+;Here to process an X25P_RESCON packet when connection state is X25S_ESTAB
+
+estrescon:
+
+	CRASH	????
+.PAGE
+;Here to process an X25P_REGREQ packet when connection state is X25S_ESTAB
+
+estregreq:
+
+	CRASH	????
+
+;Here to process an X25P_REGCON packet when connection state is X25S_ESTAB
+
+estregcon:
+
+	CRASH	????
+.PAGE
+;Here with received packet when the state is X25S_CLRSNT.  We have sent a
+;  X25P_CLRREQ packet and are waiting for the X25P_CLRCON reply.
+
+rcvclrsnt:
+	MOVB	DL, x25_type.B[EDX]	;Get packet type
+	CMPB	DL, #X25P_CLRREQ	;Is this a clear request packet?
+	JE	estclrreq		;Yes - this can happen if the other
+					;  does not like our clear request
+					;  packet for some reason - we just
+					;  process the clear request normally
+	LEAVE				;No - don't need the stack frame here
+	CALL	xosnetGiveBufr##	;Give up the packet
+	CMPB	DL, #X25P_CLRCON	;Is this a clear confirmation packet?
+	JNE	ret020.S		;No - ignore it!
+	MOVB	dcb_x25state.B[EDI], #X25S_IDLE ;Yes - update our state
+	MOVB	dcb_x25rmtaddr.B[EDI], #0
+	CALL	x25giveall
+	CALL	x25givechnl
+	CMPL	dcb_opencnt.B[EDI], #0.B ;Is this device open?
+	JE	xosnetGiveDcb##		;No - just give up the DCB here
+	MOVL	EAX, #ER_NCCLR		;Wake up anyone who might be waiting
+	JMP	xosnetAllDone##
+.PAGE
+	.SBTTL	procack - Subroutine to process the acknowlegement in a data or RR packet
+
+;Subroutine to process the acknowlegement in a data or RR packet
+;	c{EBX} = Offset of packet buffer
+;	c{EDX} = Offset of X.25 header in packet
+;	CALL	procack
+;	C:set = Error (packet already given up)
+;	C:clr = Normal
+
+;Note that the sequence number is used to manage the flow control window only.
+
+procack:MOVB	AH, x25_type.B[EDX]	;Get the P(R) value
+	SHRB	AH, #5
+	MOVB	AL, dcb_x25sndsnum.B[EDI] ;Get our current P(S) value
+	SUBB	AL, AH			;Get number outstanding
+	ANDB	AL, #07h
+	MOVB	AH, dcb_x25sndwinsz.B[EDI] ;Get window size
+	SUBB	AH, AL			;Calculate amount available
+	JS	4$.S			;It must not be negative!
+	MOVB	dcb_x25sndwinavl.B[EDI], AH ;Store new value
+	JE	ret020.S		;If window closed now
+	CLRL	EAX			;WIndow is open - wake him up if need
+	CALL	xosnetSndDone##		;  to
+	CLC
+ret020:	RET
+
+;Here if the new window is negative!
+
+4$:	CRASH	????
+.PAGE
+	.SBTTL	x25getpkt - Subroutine to allocate an X.25 packet
+
+;Subroutine to allocate an X.25 packet
+;	c(AL)  = Packet type
+;	c{ECX} = Length of data area
+;	c{EDI} = Offset of DCB
+;	CALL	x25getpkt
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  c{EBX} = Offset of packet buffer
+;	  c{EDX} = Offset of start of X.25 data
+
+x25getpkt::
+	CMPL	dcb_x25channel.B[ESI], #0.B ;Do we have a channel?
+	JS	4$.S			;No - fail
+	PUSHL	EAX			;Yes - save the packet type
+	ADDL	ECX, #x25_data.B
+	PUSHL	ECX
+	MOVL	EAX, dcb_netidb.B[EDI]	;Get total size needed
+	ADDL	ECX, idb_hwhdrsz.B[EAX]
+	MOVL	EAX, dcb_netsdb.B[EDI]
+	ADDL	ECX, sdb_hdrsz.B[EAX]
+	CALL	xosnetGetBufr##		;Allocate a packet buffer
+	POPL	ECX
+	JC	8$.S			;If error
+	CALL	xoslpaSetPkt##		;Set up the LAPB header
+	JC	6$.S			;If error
+	MOVL	EAX, dcb_x25channel.B[EDI] ;Get the channel number
+	CMPL	EAX, #0.B		;Still have a channel?
+	JS	2$.S			;No - fail
+	XCHGB	AL, AH
+	ORB	AL, #10h		;Put in the general format identifier
+	MOVW	[EDX], AX
+	POPL	EAX
+	MOVB	x25_type.B[EDX], AL	;Store packet type
+	ADDL	EDX, #x25_data.B
+	ADDL	npb_count.B[EBX], #x25_data.B
+	RET
+
+;Here if don't have a channel
+
+2$:	CALL	xosnetGiveBufr##
+	POPL	EAX
+4$:	MOVL	EAX, #ER_NCLST
+	STC
+	RET
+
+;Here if error
+
+6$:	PUSHL	EAX
+	CALL	xosnetGiveBufr##
+	POPL	EAX
+8$:	POPL	EDX
+ret026:	RET
+.PAGE
+	.SBTTL	x25chkwin - Subroutine to wait until window is open
+
+;Subroutine to wait until send window is open
+;	c{EAX} = Time-out value (fractional days)
+;	c{EDI} = Offset of DCB
+;	CALL	x25chkwin
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+
+x25chkwin::
+	CMPB	dcb_x25state.B[EDI], #X25S_ESTAB ;Do we have a connection?
+	JE	4$.S			;Yes
+	MOVL	EAX, #ER_NCLST		;No - assume have had fatal error
+	TESTB	dcb_x25sts1.B[EDI], #X25S1$FATAL ;Right?
+	JNE	2$.S			;Yes
+	MOVB	AL, #ER_NCCLR&0FFh	;No - return right error code
+2$:	STC
+	RET
+
+;Here if have a connection
+
+4$:	CMPB	dcb_x25sndwinavl.B[EDI], #0.B ;Is the window open now?
+	JNE	ret026.S		;Yes
+	PUSHL	EAX			;No - wait until it is
+	CALL	xosnetSndWait##
+	JC	6$.S			;If error
+	POPL	EAX			;Restore time-out value
+	JMP	x25chkwin.S		;Do it again
+
+;Here if error while waiting
+
+6$:	ADDL	ESP, #4.B		;Discard time-out value
+	STC
+	RET
+.PAGE
+;Subroutine to send an X.25 data packet - must be called in extended fork
+;  context
+;	c{EBX} = Offset of packet buffer
+;	c{EDI} = Offset of DCB
+;	CALL	x25senddata
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+
+x25senddata::
+	REQUIREXFF
+	DECB	dcb_x25sndwinavl.B[EDI]	;Reduce the send window
+
+;;;;;;;;;
+	JNS	102$.S
+	CRASH	x25w
+102$:
+;;;;;;;;;
+
+	MOVB	AL, dcb_x25sndsnum.B[EDI] ;Get next send sequence number to use
+	MOVB	npb_seqnum+1.B[EBX], AL	;Store it in the header
+	INCB	dcb_x25sndsnum.B[EDI]	;Increment the send sequence number
+	ANDB	dcb_x25sndsnum.B[EDI], #07h
+	MOVZBL	ECX, npb_tpofs.B[EBX]	;Get size of the X.25 part of the packet
+	NEGL	ECX
+	ADDL	ECX, npb_count.B[EBX]
+	MOVL	EAX, dcb_netpdb.B[EDI]
+	ADDL	pdb_x25cntbyteout[EAX], ECX ;Add into the total output
+	INCL	pdb_x25cntpktout.B[EAX] ;Also count the packet
+	CALL	x25setack		;Store ACK number
+	MOVL	ESI, dcb_netsdb.B[EDI]	;Make sure have SDB offset
+	JMP	xoslpaSendInfo##	;Output the packet and return
+.PAGE
+	.SBTTL	x25senddiagbp - Subroutine to send DIAG packet when have bad packet type
+
+;Subroutine to send DIAG packet when have bad packet type or other packet
+;  related error
+;	c(AL)  = DIAG code
+;	c{EBX} = Offset of offending packet
+;	c{ESI} = Offset of PDB
+;	CALL	x25senddiagbp
+
+x25senddiagbp:
+	MOVL	EDX, pdb_sdb.B[ESI]
+	CMPB	sdb_lapbcmdaddr.B[EDX], #03h ;Are we a DCE?
+	JNE	4$.S			;No
+	CRASH	????			;Yes
+
+;Here if not a DCE - since DTEs can't send diagnostic packets, the only thing
+;  we can do is take the link down!
+
+4$:	CALL	xosnetGiveBufr##
+6$:	PUSHL	ESI
+	MOVL	ESI, EDX
+	CALL	xoslpaLinkDown##
+	POPL	ESI
+	RET
+
+	.SBTTL	x25senddiagto - Subroutine to send DIAG packet when have time-out
+
+;Subroutine to send DIAG packet when have time-out
+;	c(AL)  = DIAG code
+;	c{ESI} = Offset of PDB
+;	CALL	x25senddiagbp
+
+x25senddiagto:
+	MOVL	EDX, pdb_sdb.B[ESI]
+	CMPB	sdb_lapbcmdaddr.B[EDX], #03h ;Are we a DCE?
+	JNE	6$.S			;No
+	CRASH	????			;Yes
+.PAGE
+	.SBTTL	x25giveall - Subroutine to give up all packet buffers
+
+;Subroutine to give up all packet buffers
+;	c{EDI} = Offset of DCB
+;	CALL	x25giveall
+;  c{EAX} is respected
+
+x25giveall::
+	PUSHL	EAX
+	PUSHL	ESI
+	MOVL	ESI, dcb_x25rrwake[EDI] ;Is the ACK timer running?
+	TESTL	ESI, ESI
+	JE	2$.S			;No
+	CLRL	EAX			;Yes - stop it
+	MOVL	dcb_x25rrwake[EDI], EAX
+	CALL	knlWakeRemove##
+2$:	MOVL	ESI, dcb_x25callwake[EDI] ;Is the call timer running?
+	TESTL	ESI, ESI
+	JE	4$.S			;No
+	CLRL	EAX			;Yes - stop it
+	MOVL	dcb_x25callwake[EDI], EAX
+	CALL	knlWakeRemove##
+4$:	POPL	ESI
+	MOVL	EBX, dcb_x25rcvhead.B[EDI] ;Do we have any receive packets?
+	TESTL	EBX, EBX
+	JE	6$.S			;No
+	CLRL	EAX			;Yes
+	MOVL	dcb_x25rcvhead.B[EDI], EAX
+	MOVL	dcb_x25rcvtail.B[EDI], EAX
+	CALL	xosnetGiveList##
+6$:	POPL	EAX
+	RET
+.PAGE
+	.SBTTL	x25openwindow - Subroutine to open the receive window
+
+;Subroutine to open the receive window when an input packet has been processed
+;	CALL	x25openwindow
+;	C:clr always
+;  EAX and ECX are preserved
+
+x25openwindow::
+	INCB	dcb_x25rcvsnum.B[EDI]	;Increment the receive sequence number
+	ANDB	dcb_x25rcvsnum.B[EDI], #07h
+	INCB	dcb_x25rcvwinavl.B[EDI]	;Increase the available receive window
+	MOVB	AL, dcb_x25rcvwinavl.B[EDI]
+
+;;;;;;;;;
+	CMPB	AL, dcb_x25rcvwinsz.B[EDI]
+	JBE	102$.S
+	CRASH	x25w
+102$:
+;;;;;;;;;
+
+	CMPB	AL, dcb_x25rcvwinlvl.B[EDI] ;Should we delay this?
+	JB	sendrr.S		;No
+	CMPL	dcb_x25rrwake[EDI], #0.B ;Yes - is the RR timer running now?
+	JNE	2$.S			;Yes - nothing needed now
+	MOVL	EBX, #x25rrto		;No - start the timer
+	MOVL	EAX, dcb_x25rcvwindly.B[EDI]
+	PUSHL	ESI
+	CALL	knlWakeRequest##
+	JC	4$.S			;If error starting timer
+	MOVL	dcb_x25rrwake[EDI], ESI	;OK - finished for now
+	POPL	ESI
+2$:	RET
+
+;Here when the delayed RR timer runs out
+
+x25rrto:MOVB	AL, dcb_x25rcvsnum.B[EDI] ;Do we really need to do this?
+	CMPB	dcb_x25rcvtnum.B[EDI], AL
+	JE	2$.S			;No
+	CLRL	EAX
+	MOVL	dcb_x25rrwake[EDI], EAX
+	CALL	sendrr
+	CLC
+	RET
+
+;Here if can't enter timer request (should not happen!) - just send the
+;  RR now
+
+4$:	POPL	ESI			;Fix up the stack
+
+;Here to send an RR
+
+sendrr:	CLRL	ECX			;Get an empty packet
+	MOVB	AL, #01h
+	CALL	x25getpkt
+	JC	2$.S			;Forget it if can't get one
+	MOVB	npb_seqnum+1.B[EBX], #0
+	CALL	x25setack		;Store ACK number in packet
+	MOVL	EAX, dcb_netpdb.B[EDI]
+	INCL	pdb_x25cntpktout.B[EAX]
+	ADDL	pdb_x25cntbyteout[EAX], #x25_data.B
+	MOVL	ESI, dcb_netsdb.B[EDI]
+	JMP	xoslpaSendInfo##	;Send the packet and return
+.PAGE
+	.SBTTL	x25setack - Subroutine to set up ACK number and window value
+
+;Subroutine to set up ACK number and window value in X.25 header and to
+;  calculate and store the checksum for the X.25 packet
+;	c{EBX} = Offset of packet
+;	c{EDI} = Offset of DCB
+;	CALL	x25setack
+
+x25setack::
+	CMPL	dcb_x25rrwake[EDI], #0.B ;Is the RR timer running now?
+	JE	2$.S			;No
+	PUSHL	ESI			;Yes - stop it
+	MOVL	ESI, dcb_x25rrwake[EDI]
+	CLRL	EAX
+	MOVL	dcb_x25rrwake[EDI], EAX
+	CALL	knlWakeRemove##
+	POPL	ESI
+2$:	MOVB	AL, dcb_x25rcvsnum.B[EDI] ;Get receive sequence number
+	MOVB	dcb_x25rcvtnum.B[EDI], AL ;Remember we have sent an RR for it
+	SHLB	AL, #4t
+	ORB	AL, npb_seqnum+1.B[EBX]
+	SHLB	AL, #1t
+	MOVZBL	ECX, npb_tpofs.B[EBX]
+	ORB	x25_type.B[EBX+ECX], AL	;Store in the packet
+	RET
+.PAGE
+	.SBTTL	xosrspwait - Subroutine to wait for X.25 response
+
+;Subroutine to wait for X.25 response
+;	CALL	x25rspwait
+
+x25rspwait::
+
+;;;;  NEED TO GET TIME-OUT VALUE HERE
+
+	CRASH	????
+
+	JMP	xosnetRspWait##
+.PAGE
+	.SBTTL	x25getchnl - Subroutine to allocate an X.25 channel
+
+;Subroutine to allocate an X.25 channel
+;	c{EDI} = Offset of DCB
+;	CALL	x25getchnl
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  c{ECX} = X.25 channel number allocated
+
+x25getchnl::
+	MOVL	ESI, dcb_netpdb.B[EDI]	;Get offset of our PDB
+	LEAL	EDX, pdb_x25chnltbl[ESI] ;Get offset of our channel table
+	TESTB	pdb_x25config.B[ESI], #X25C$ACDOWN ;Want to allocate from top?
+	JNE	6$.S			;Yes
+	MOVL	ECX, #1			;No - start at bottom
+4$:	CMPL	pdb_x25chnltbl[ESI+ECX*4], #0.B ;This one available?
+	JE	12$.S			;Yes
+	INCL	ECX			;No - increment channel number
+	CMPL	ECX, pdb_x25maxchnl.B[ESI] ;Any more to check?
+	JBE	4$.S			;Yes - continue
+	JMP	10$.S			;No - fail
+
+;Here to allocate channel from the top
+
+6$:	MOVL	ECX, pdb_x25maxchnl.B[ESI] ;Get maximum channel number
+8$:	CMPL	pdb_x25chnltbl[ESI+ECX*4], #0.B ;This one available?
+	JE	12$.S			;Yes
+	DECL	ECX			;No - decrement channel number
+	JNE	8$.S			;Continue if more to check
+10$:	MOVL	EAX, #ER_NNPA		;If no free port found
+	STC
+	RET
+
+;Here with an available port
+
+12$:	MOVL	pdb_x25chnltbl[ESI+ECX*4], EDI
+	MOVL	dcb_x25channel.B[EDI], ECX
+	RET
+.PAGE
+	.SBTTL	x25givechnl - Subroutine to give up an X.25 channel
+
+;Subroutine to give up an X.25 channel
+;	c{EDI} = Offset of DCB
+;	CALL	x25givechnl
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+
+x25givechnl::
+	CMPL	dcb_x25channel.B[EDI], #-1.B ;Do we have a channel?
+	JE	4$.S			;No - nothing needed here
+	MOVL	EAX, dcb_x25channel.B[EDI] ;Yes
+	MOVL	EBX, dcb_netpdb.B[EDI]
+	CMPL	pdb_x25chnltbl[EBX+EAX*4], EDI
+	JNE	10$.S
+	CLRL	EDX
+	MOVL	pdb_x25chnltbl[EBX+EAX*4], EDX
+	DECL	EDX
+	MOVL	dcb_x25channel.B[EDI], EDX
+4$:	RET
+
+10$:	CRASH	BCTE			;[Bad Channel Table Entry]
+.PAGE
+	.SBTTL	x25linkfail - Subroutine called to indicate link failure
+
+;Subroutine called to indicate link failure
+
+x25linkfail::
+	CRASH	????
+.PAGE
+	.SBTTL	x25linkup - Subroutine called when link comes up
+
+;SUbroutine called when the underlying LAPB link comes up
+;	c{ESI} = Offset of PDB
+;	CALL	x25linkup
+
+x25linkup::
+	CLRL	EDX			;Get a restart request packet
+	MOVL	ECX, #2
+	MOVB	AL, #X25P_RESREQ
+	CALL	getspr
+	JC	6$.S
+	ADDL	npb_count.B[EBX], #2.B
+	MOVW	x25_data.B[EDX], #0
+	MOVB	pdb_x25state.B[ESI], #X25S_RESTART ;Update state
+	MOVL	ESI, pdb_sdb.B[ESI]
+	JMP	xoslpaSendInfo##	;Send the RESREQ packet
+
+6$:	RET
+.PAGE
+	.SBTTL	x25linkdown - Subroutine called when link goes down
+
+;Subroutine called when the underlying LAPB link goes down
+;	c{ESI} = Offset of PDB
+;	CALL	x25linkdown
+
+x25linkdown::
+	MOVB	pdb_x25state.B[ESI], #X25S_IDLE ;Update state
+	MOVL	ECX, pdb_x25maxchnl.B[ESI]
+4$:	MOVL	EDI, pdb_x25chnltbl[ESI+ECX*4]
+	TESTL	EDI, EDI
+	JE	6$.S
+	PUSHL	ECX
+	CALL	x25giveall
+	CALL	x25givechnl
+	MOVB	dcb_x25state.B[EDI], #X25S_IDLE ;Indicate idle
+	MOVB	dcb_x25rmtaddr.B[EDI], #0
+	MOVL	EAX, #ER_NCLST
+	CALL	xosnetAllDone##		;Wake up anyone waiting
+	POPL	ECX
+6$:	LOOP	ECX, 4$
+	RET
+
+	.MOD	4
+xcodetop::
+.PAGE
+	.SBTTL	Data
+
+	DATA
+
+txtbfr:   .BLKB  20t		;Called X.25 address
+x25msgsrc:.ASCIZ "DEV^X25"
+
+	.MOD	4
+xdatatop::
+
+	LKEEND

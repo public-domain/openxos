@@ -1,0 +1,128 @@
+The HDLCA device class (HDLCACLS driver) implements a primary station for
+an HDLC multi-drop data link using NRM (normal response mode) as specified
+in the HDLC specification (ISO-3309, ISO-4335, and Foxboro DFS-0916).
+
+It is assumed that the reader is at least somewhat familiar with the above
+mentioned standards.
+
+A seperate XOS device is used for each secondary station on the link.  Thus
+if there are 3 secondary stations, the HDLCAn device must be opened three
+times, obtaining 3 different device handles.  Each open should specify the
+HDLC node address as the value for the IOPAR_NETRMTNETAS device parameter.
+It is the responsibility of the user program to ensure that no output is done
+to any device associated with a link after a POLL packet has been sent on one
+of the devices and before a FINAL packet has been received on that same
+device. (See below for a discussion of POLL and FINAL packets.)
+
+Establishment of a link connected state and sequencing of data packets is
+handled by the driver.  The user program is allowed to transmit arbitrary
+unnumbered packets.  Received unnumbered packets other than UA, FRMR, and
+DM are always passed to the user program.  UA and DM are passed to the
+user program unless the system is connecting (UA) or disconnecting (DM)
+the link.
+
+Retransmission of data packets is handled by the driver.  The device
+characteristics RETRYCNT and RETRYTIM control retransmission.  RETRYCNT
+specifies the number of times a data packet is retransmitted.  RETRYTIM
+specifies the amount of time (in milliseconds) between retransmissions.
+Note that to be compatable with the Foxboro PIO specificiation, RETRYCNT
+must be set to 1.
+
+When output is done, the operation is considered complete after the initial
+transmission of the packet is complete.  It does NOT wait for an ACK.  This
+is necessary because the link is half duplex and the output cannot be ACKed
+until the secondary station is allowed to transmit.  If the retransmit count
+is exceeded without getting an ACK, the NEXT IO operation for the link (either
+input or output) will return an ER_NOACK error.  If an input operation is
+active at this time, it will be terminated with an ER_NOACK error.
+
+Saved errors are cleared whenever a valid special device function is
+executed.  It will almost always be necessary to do a connect command (special
+device function 1) to restablish message number synchronization with the
+secondary after such errors.
+
+Sequenced packets can only be input or output after the link is connected,
+i.e., after a successful special device function 2 has been done.  Unnumbered
+packets can be output or input at any time.
+
+The driver does not check the header byte of an unnumbered packet to ensure
+that the user is not attempting to send an illegal packet type or a packet
+type normally used by the driver to manage the link (SNRM or DISC).  Directly
+outputting illegal or reserved packet types will usually result in a serious
+protocol error at the secondary station.
+
+All IO is done using standard XOS system calls.  All normal output operations
+result in a sequenced data packet being generated.  The POLL bit is controlled
+with the QFNC$POLL (QFNC_POLL in C) bit in the qab_func item in the QAB.
+Note that once this bit is set for an output operation (causing a packet with
+the POLL bit set to be generated), no more output may be done until an input
+packet is received with the FINAL bit set or until a special device function
+1 is executed.  Unnumbered packets are generated when the QFNC$OOBD (QFNC_OOBD
+in C) bit is set in qab_func.
+
+When a sequenced data packet is output, the data buffer pointed to by
+qab_buffer1 contains the data part of the packet only.  The 2 byte HDLC packet
+header is not included in the buffer.  It is added by the driver before the
+data is output.
+
+When an unnumbered packet is output, the data buffer pointed to by qab_buffer1
+contains the second byte of the HDLC header, followed by the data for the
+packet.  The POLL bit (bit 4) in the second header byte taken from the buffer
+is not used.  This bit is set according to the value of the QFNC$POLL bit in
+qab_func.  The low order two bits of this byte (bits 0 and 1) are forced to 1,
+indicating an unnumbered packet.  The first header byte, containing the
+address of the secondary station, is inserted by the driver.
+
+Any packet can be sent as a broadcast packet by setting the NMODE$BRDCST bit
+(NMODE_BRDCST in C) in the network mode value using the IOPAR_NETSMODE IO
+parameter.  This is a one-shot bit which is cleared by the system when a
+broadcast packet is sent.  It may be set in the same system call which outputs
+the broadcast packet.  It should be noted that while sequenced data packets
+can be sent as broadcast packets in this way, this has no meaning in the HDLC
+protocol and will almost certainly result in a serious protocol error at the
+secondary.  Generally, only unnumbered packets should be broadcast.
+Specifically, DFS-0916 specifies that only XID and UI packets can be broadcast.
+Broadcast XID packets must have the POLL bit set and are used only to initially
+set the HDLC address of an instrument before connecting to it.  Broadcast UI
+packets must NOT have the POLL bit set and are used only for unacknowleged
+broadcast packets.  There is no provision for acknowleged broadcast packets.
+
+An input function will obtain the next packet received from the secondary,
+either sequenced or unnumbered.  If an unnumbered packet is received, the
+QSTS$OOBD (QSTS_OOBD in C) bit is set in the qab_status item in the QAB.
+If the FINAL bit is set in the received packet, the QSTS$FINAL (QSTS_FINAL in
+C) bit is set in qab_status.
+
+Note that the use of the QFNC$POLL, QFNC$OOBD, QSTS$FINAL, and QSTS$OOBD bits
+in the QAB require the use of the svcIoQueue function.  These bits cannot be
+accessed with the svcIoInBlock, svcIoInBlockP, svcIoOutBlock, or
+svcIoOutBlockP functions.
+
+Special device functions used by the HDCLA class devices:
+
+ Function    Use
+    1      Enable output.  Used after outputting a packet with the POLL bit
+           (QFNC$POLL set in qab_func) when no reply is received with the
+           FINAL bit set.  This function should be used for error recovery
+           only, such as when no response is received to a broadcast XID
+           packet.  It will generally be necessary to reconnect the link to
+           an instrument (using special device function 2) if no reponse is
+           received when outputting a sequenced packet.
+    2      Connect.  Used to establish a connection with a secondary station.
+           The value in qab_count specifies the number of times to retry.
+           the retry interval is specified by the value of the IOPAR_TIMEOUT
+           parameter.  Default values are 4 retries at an interval of 2
+           seconds.  The default values are used if a value of zero is
+           specified or if the IOPAR_TIMEOUT parameter is not specifed.  Note
+           that the values of the RETRYCNT and RETRYTIM device characteristics
+           are not used here.  The link is left in the output state.
+    3      Disconnect.  Used to break the connection with the secondary
+           station.   Retry values are the same as for the connect function.
+           This function always results in the state of the link being set
+           to disconnected, even if the correct response is not received.
+           The link is left in the output state.
+
+All special device functions clear the saved error indication.
+
+The program \JRG\NETLKE\HDLCCHK.C contains examples of most of what is
+described above.

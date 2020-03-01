@@ -1,0 +1,1895 @@
+	.TITLE	SERCDRV - Serial port device driver for GTEK (terminal class device)
+
+;++++
+; This software is in the public domain.  It may be freely copied and used
+; for whatever purpose you see fit, including commerical uses.  Anyone
+; modifying this software may claim ownership of the modifications, but not
+; the complete derived code.  It would be appreciated if the authors were
+; told what this software is being used for, but this is not a requirement.
+
+;   THIS SOFTWARE IS PROVIDED BY THE AUTHORS "AS IS" AND ANY EXPRESS OR
+;   IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
+;   OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+;   IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+;   INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+;   BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS
+;   OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+;   ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR
+;   TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
+;   USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+;----
+
+	.PROC	80486
+	.INCLUD	XOSINC:\XMAC\XOS.PAR
+	.INCLUD	XOSINC:\XMAC\XOSX.PAR
+	.INCLUD	XOSINC:\XMAC\XOSTIME.PAR
+	.INCLUD	XOSINC:\XMAC\XOSERR.PAR
+	.INCLUD	XOSINC:\XMAC\XOSTRM.PAR
+	.INCLUD	XOSINC:\XMAC\XOSXTRM.PAR
+	.INCLUD	XOSINC:\XMAC\PCAT.PAR
+	.INCLUD	XOSINC:\XMAC\XOSLKE.PAR
+	.INCLUD	XOSINC:\XMAC\XOSXLKE.PAR
+
+MAJV   =!1t
+MINV   =!2t
+EDITNUM=!3t
+
+;v1.1.0  10-Sep-91
+;	Modified for XOS v1.6
+;v1.1.1  9-Nov-91 (Penang)
+;	Fixed bug so will clear TS4$FRCXOFF correctly
+;v1.1.2 18-Mar-92 (Penang)
+;	Fixed bug in code to add additional ports to board with even numbered
+;	interrupt
+;v1.1.3 29-Sep-92 (Penang)
+;	Updated for XOS 1.7.56
+;v1.2.0 30-Jul-94
+;	Updated for XOS 1.9.18
+;v1.2.1  25-May-95
+;	Updated to match new hung output time-out method; moved tdb_ offset
+;	definitions into this file.
+;v1.2.2  28-July-95 (brn)
+;	Fixed setoflow by removing spurious SHLB
+;v1.2.3  28-July-95 (brn)
+;	Fixed setoflow by clearing carry before exit
+
+	LKEHEAD	SERCDRV, MAJV, MINV, EDITNUM, LKETYPE_DEVICE
+
+;Define fork function codes
+
+FF_RDATA  =!0t		;Received data
+FF_LINESTS=!4t		;Line status report
+FF_MODMSTS=!8t		;Modem status report
+
+;Define offsets for device dependent part of the TDB for serial ports
+
+$$$=!tdb_SIZE
+BLK tdb_scoutrtak , 4t		;Output ring buffer taker pointer
+BLK tdb_scoutrput , 4t		;Output ring buffer putter pointer
+BLK tdb_scoutrsize, 4t		;Size of the output ring buffer
+BLK tdb_scoutring , 4t		;Offset of start of output ring buffer
+BLK tdb_sclncon   , 1t		;Bits for line control register
+BLK tdb_scmdcon   , 1t		;Bits for modem control registesr
+BLK tdb_scintenb  , 1t		;Bits for interrupt enable register
+BLK tdb_scouttoc  , 1t		;Output time-out counter
+BLK tdb_schungcnt , 4t		;Hung output count
+BLK tdb_scintrbsl , 4t		;Interrupt ring buffer stop level
+BLK tdb_scintrbpl , 4t		;Interrupt ring buffer panic level
+BLK tdb_scintrheld, 4t		;Interrupt ring buffer held character count
+BLK tdb_scintrlost, 4t		;Interrupt ring buffer lost character count
+BLK tdb_scintrcnt , 4t		;Interrupt ring buffer item count
+BLK tdb_scintrtak , 4t		;Interrupt ring buffer taker pointer
+BLK tdb_scintrput , 4t		;Interrupt ring buffer putter pointer
+BLK tdb_scintrsize, 4t		;Size of the interrupt ring buffer
+BLK tdb_scbdb     , 4t		;Offset of board control block
+BLK tdb_scport    , 1t		;Port on board
+BLK               , 3t
+BLK tdb_scintring , 0t		;The interrupt level input ring buffer
+tdb_scSIZE=!{$$$+3}&0FFFCh
+
+;Define offsets in the board data block (BDB)
+
+$$$=!0
+BLK bdb_next  , 4t	;Offset of next BDB
+BLK bdb_stsreg, 4t	;Register number for interrupt status register
+BLK bdb_intlvl, 1t	;Hardware interrupt level
+BLK           , 3t
+BLK bdb_tdb   , 32t*4	;TDB table
+bdb_SIZE=!$$$
+
+	CODE
+
+sercfix:
+	.LONG	knlIFnDev##	;tf_virtacs   = -44.
+	.LONG	knlIFnDev##	;tf_enable    = -40.
+	.LONG	knlIFnDev##	;tf_disable   = -36.
+	.LONG	knlIFnDev##	;tf_curtyp    = -32. - Get/set cursor type
+	.LONG	knlIFnDev##	;tf_curpos    = -28. - Get/set cursor position
+	.LONG	knlIFnDev##	;tf_dsppag    = -24. - Set display page
+	.LONG	knlIFnDev##	;tf_scroll    = -20. - Scroll window
+	.LONG	knlIFnDev##	;tf_getatc    = -16. - Get attribute and char.
+	.LONG	knlIFnDev##	;tf_setatc    = -12. - Set attribute and char.
+	.LONG	knlIFnDev##	;tf_setchr    =  -8. - Set character only
+	.LONG	knlIFnDev##	;tf_attrib    =  -4. - Get or set attributes
+sercdsp:.LONG	knlRtnZero##	;tf_trans     =   0. - Transfer device
+	.LONG	knlRtnZero##	;tf_opena     =   4. - Open additional
+	.LONG	seropen		;tf_open1     =   8. - Open first time
+	.LONG	knlRtnZero##	;tf_stop      =  12. - Stop output
+	.LONG	serclrout	;tf_clrout    =  16. - Clear output buffer
+	.LONG	serechchr	;tf_echchr    =  20. - Echo character
+	.LONG	serdoutchr	;tf_doutchr   =  24. - Direct output character
+	.LONG	serdoutblk	;tf_doutblk   =  28. - Direct output block
+	.LONG	serdoutstr	;tf_doutstr   =  32. - Direct output string
+	.LONG	knlIFnDev##	;tf_qoutchr   =  36. - Queued output character
+	.LONG	serqoutblk	;tf_qoutblk   =  40. - Queued output block
+	.LONG	serqoutstr	;tf_qoutstr   =  44. - Queued output string
+	.LONG	seridle		;tf_idle      =  48. - Set to idle state
+	.LONG	serresume	;tf_resume    =  52. - Resume output
+	.LONG	knlIFnDev##	;tf_mapscn    =  56. - Map screen buffer
+	.LONG	notmapped	;tf_dosset    =  60. - Setup terminal for DOS
+	.LONG	knlRtnZero##	;tf_dosupd    =  64. - Update page 0 for DOS
+	.LONG	ret006		;tf_dosuse    =  68. - Use DOS page 0 data
+	.LONG	serdspmode	;tf_dspmode   =  72. - Get or set display mode
+	.LONG	sercaddunit	;tf_addunit   =  76. - Add unit
+	.LONG	knlIFnDev##	;tf_ssread    =  80. - Screen symbiont read
+	.LONG	knlIFnDev##	;tf_sswrite   =  84. - Screen symbiont write
+	.LONG	knlIFnDev##	;tf_sswitch   =  88. - Screen symbiont switch
+	.LONG	knlIFnDev##	;tf_ssdone    =  92. - Screen symbiont done
+	.LONG	knlIFnDev##	;tf_ssopnal   =  96. - Open alarm window
+	.LONG	knlIFnDev##	;tf_sswrtalm  = 100. - Write to alarm window
+	.LONG	knlIFnDev##	;tf_ssclsalm  = 104. - Close alarm window
+	.LONG	knlRtnZero##	;tf_ssstatus  = 108. - Report screen status to
+				;			 screen symbiont
+	.LONG	knlIFnDev##	;tf_ssgetmod  = 112. - Get display page modified
+				;			 bits
+	.LONG	knlIFnDev##	;tf_dspcur    = 116. - Low level display cursor
+				;			 routine
+	.LONG	knlRtnZero##	;tf_updpbms   = 120. - Update page changed bits
+				;			 for single msect
+	.LONG	sersetdtr	;tf_setdtr    = 124. - Set or clear DTR output
+	.LONG	sersetrts	;tf_setrts    = 128. - Set or clear RTS output
+	.LONG	sergetdsb	;tf_getdsb    = 132. - Get data set bits
+	.LONG	serfinout	;tr_finout    = 136. - Ensure output is finished
+	.LONG	ret006		;tf_imodechng = 140. - Input mode change
+	.LONG	ret006		;tf_omodechng = 144. - Output mode change
+	.LONG	knlIFnDev##	;tf_mapphys   = 148. - Map physical display
+SERCDSPSZ=!{$-sercfix}/4
+
+serckdsp:
+	.LONG	knlIFnDev##	;kf_vdinb   =  0. - INB instruction for
+				;		      keyboad in real mode
+	.LONG	knlIFnDev##	;kf_vdoutb  =  4. - OUTB instruction for
+				;		      keyboard in real mode
+	.LONG	knlIFnDev##	;kf_keyint  =  8. - Attempt to execut keyboard
+				;		      interrupt routine in real
+				;		      mode
+	.LONG	knlIFnDev##	;kf_clrkeyi = 12. - Clear keyboard interrupt
+SERCKDSPSZ=!{$-serckdsp}/4
+
+;Device characteristics for SERC devices
+
+	DATA
+
+	.MOD	4
+sercdctbl:
+ DCHARBGN  1, knlDCharValCom##
+ DCHARENT  CLASS   , TEXT, ,  8, knlDcMsgClass##    , knlDcGetClass##   , knlDcSetClass##   , 0
+ DCHARENT  TYPE    , TEXT, ,  4, knlDcMsgType##     , knlDcGet4Byte##   , 0                 , dcb_type
+ DCHARENT  SESSION , TEXT, ,  8, knlTrmMsgSession## , knlTrmGetSession##, knlTrmSetSession##, 0
+ DCHARENT  MSGDST  , STR , , 16, knlTrmMsgMsgDst##  , knlTrmGetText##   , knlTrmSetText##   , tdb_msgdst
+ DCHARENT  PROGRAM , STR , , 16, knlTrmMsgProgram## , knlTrmGetText##   , knlTrmSetText##   , tdb_program
+ DCHARENT  ACCESS  , TEXT, ,  4, knlDcMsgAccess##   , knlTrmGet4Byte##  , knlTrmSetAccess## , tdb_access
+ DCHARENT  PASSWORD, STR , ,  8, knlTrmMsgPWrd##    , knlTrmGetText##   , knlTrmSetText##   , tdb_password
+ DCHARENT  RATEDET , DECV, ,  1, msgbrd             , knlTrmGet1Byte##  , setbrd            , tdb_auto
+ DCHARENT  IOUTFLOW, TEXT, ,  8, knlTrmMsgIOFlow##  , knlTrmGetOFlow##  , setoflow          , tdb_iflow
+ DCHARENT  IINFLOW , TEXT, ,  8, knlTrmMsgIIFlow##  , knlTrmGetIFlow##  , setiiflow         , tdb_iflow
+ DCHARENT  IRATE   , DECV, ,  4, msgioutrate        , knlTrmGet4Byte##  , setirate          , tdb_ioutr
+ DCHARENT  IOUTRATE, DECV, ,  4, msgiinrate         , knlTrmGet4Byte##  , setirate          , tdb_ioutr
+ DCHARENT  IINRATE , DECV, ,  4, msgirate           , knlTrmGet4Byte##  , knlRtnZero##      , tdb_ioutr
+ DCHARENT  IDBITS  , DECV, ,  1, msgidbits          , getdbits          , setdbits          , tdb_icsize
+ DCHARENT  ISBITS  , DECV, ,  1, msgisbits          , getsbits          , setsbits          , tdb_icsize
+ DCHARENT  IPARITY , TEXT, ,  8, msgiparity         , getparity         , setparity         , tdb_ipar
+ DCHARENT  IMODEM  , TEXT, ,  4, msgimodem          , getmodem          , setmodem          , tdb_imodem
+ DCHARENT  OUTFLOW , TEXT, ,  8, knlTrmMsgOFlow##   , knlTrmGetOFlow##  , setoflow          , tdb_flow
+ DCHARENT  INFLOW  , TEXT, ,  8, knlTrmMsgIFlow##   , knlTrmGetIFlow##  , setiflow          , tdb_flow
+ DCHARENT  RATE    , DECV, ,  4, msgrate            , knlTrmGet4Byte##  , setrate           , tdb_outr
+ DCHARENT  OUTRATE , DECV, ,  4, msgoutrate         , knlTrmGet4Byte##  , setrate           , tdb_outr
+ DCHARENT  INRATE  , DECV, ,  4, msginrate          , knlTrmGet4Byte##  , knlRtnZero##          , tdb_outr
+ DCHARENT  DBITS   , DECV, ,  1, msgdbits           , getdbits          , setdbits          , tdb_csize
+ DCHARENT  SBITS   , DECV, ,  1, msgsbits           , getsbits          , setsbits          , tdb_csize
+ DCHARENT  PARITY  , TEXT, ,  8, msgparity          , getparity         , setparity         , tdb_par
+ DCHARENT  MODEM   , TEXT, ,  4, msgmodem           , getmodem          , setmodem          , tdb_modem
+ DCHARENT  IOREG   , HEXV, ,  4, knlDcMsgIoReg##    , knlTrmGet4Byte##  , 0                 , tdb_bioreg
+ DCHARENT  INT     , DECV, ,  1, knlDcMsgInt##      , knlTrmGet1Byte##  , 0                 , tdb_intlvl
+ DCHARENT  STSREG  , HEXV, ,  4, msgstsreg          , getstsreg         , 0                 , 0
+ DCHARENT  PORT    , DECV, ,  1, msgport            , knlTrmGet1Byte##  , 0                 , tdb_scport
+ DCHARENT  INTRS   , DECV, ,  2, msgintrs           , knlTrmGet4Byte##  , 0                 , tdb_scintrsize
+ DCHARENT  INTRSL  , DECV, ,  2, msgintrsl          , knlTrmGet4Byte##  , knlTrmSet4Byte##  , tdb_scintrbsl
+ DCHARENT  INTRPL  , DECV, ,  2, msgintrpl          , knlTrmGet4Byte##  , knlTrmSet4Byte##  , tdb_scintrbpl
+ DCHARENT  INTRHELD, DECV, ,  4, msgintrheld        , knlTrmGet4Byte##  , knlTrmSet4Byte##  , tdb_scintrheld
+ DCHARENT  INTRLOST, DECV, ,  4, msgintrlost        , knlTrmGet4Byte##  , knlTrmSet4Byte##  , tdb_scintrlost
+ DCHARENT  INRBS   , DECV, ,  2, knlTrmMsgInRBS##   , knlTrmGet4Byte##  , 0                 , tdb_irsize
+ DCHARENT  INRBSL  , DECV, ,  2, knlTrmMsgInRBSL##  , knlTrmGet4Byte##  , knlTrmSet4Byte##  , tdb_irbsl
+ DCHARENT  INRBPL  , DECV, ,  2, knlTrmMsgInRBPL##  , knlTrmGet4Byte##  , knlTrmSet4Byte##  , tdb_irbpl
+ DCHARENT  INRBHELD, DECV, ,  4, knlTrmMsgInRBHeld##, knlTrmGet4Byte##  , knlTrmSet4Byte##  , tdb_irheld
+ DCHARENT  INRBLOST, DECV, ,  4, knlTrmMsgInRBLost##, knlTrmGet4Byte##  , knlTrmSet4Byte##  , tdb_irlost
+ DCHARENT  INLBS   , DECV, ,  2, knlTrmMsgInLBS##   , knlTrmGet4Byte##  , 0                 , tdb_ibsize
+ DCHARENT  OUTRS   , DECV, ,  2, msgoutrs           , knlTrmGet4Byte##  , 0                 , tdb_scoutrsize
+ DCHARENT  CHAROUT , DECV, ,  4, knlTrmMsgCharOut## , knlTrmGet4Byte##  , knlTrmSet4Byte##  , tdb_charout 
+ DCHARENT  CHARIN  , DECV, ,  4, knlTrmMsgCharIn##  , knlTrmGet4Byte##  , knlTrmSet4Byte##  , tdb_charin
+ DCHARENT  KBCHAR  , DECV, ,  4, knlTrmMsgKbChar##  , knlTrmGet4Byte##  , knlTrmSet4Byte##  , tdb_kbchar
+
+	CODE
+
+msgstsreg:  DCHARINFO  {Status IO register number}
+msgport:    DCHARINFO  {Port number on board}
+msgbrd:     DCHARINFO  {Baud rate detect type}
+msgirate:   DCHARINFO  {Initial baud rate}
+msgioutrate:DCHARINFO  {Initial output baud rate}
+msgiinrate: DCHARINFO  {Initial input baud rate (not used)}
+msgidbits:  DCHARINFO  {Initial number of data bits}
+msgisbits:  DCHARINFO  {Initial number of stop bits}
+msgiparity: DCHARINFO  {Initial parity handling}
+msgimodem:  DCHARINFO  {Initial modem control}
+msgrate:    DCHARINFO  {Current baud rate}
+msgoutrate: DCHARINFO  {Current output baud rate}
+msginrate:  DCHARINFO  {Current input baud rate (not used)}
+msgdbits:   DCHARINFO  {Current number of data bits}
+msgsbits:   DCHARINFO  {Current number of stop bits}
+msgparity:  DCHARINFO  {Current parity handling}
+msgmodem:   DCHARINFO  {Current modem control}
+msgintrs:   DCHARINFO  {Interrupt ring buffer size}
+msgintrsl:  DCHARINFO  {Interrupt ring buffer stop level}
+msgintrpl:  DCHARINFO  {Interrupt ring buffer panic level}
+msgintrheld:DCHARINFO  {Interrupt ring buffer held count}
+msgintrlost:DCHARINFO  {Interrupt ring buffer lost count}
+msgoutrs:   DCHARINFO  {Output ring buffer size}
+.PAGE
+	.SBTTL	initser - Serial port driver initialization routine
+
+	INITSUB	sercinit
+
+sercinit:
+	MOVL	EBX, #'SERC'		;Get terminal driver name
+	MOVL	EDX, #sercdsp		;Get offset of dispatch table
+	CALL	knlTrmNewDriver##	;Register this terminal driver
+	JC	4$.S
+	CLRL	EAX
+	CLRL	EDX
+	MOVL	ECX, #codetop
+4$:	RET
+
+	CODE
+.PAGE
+	.SBTTL	sercaddunit - Subroutine to add serial port unit
+
+;Subroutine to add serial port unit
+;	c(AL) = Major unit number
+;	c(AH) = Minor unit number
+;	CALL	sercaddunit
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+
+$$$=!0
+FRM sau_unit   , 4t	;Unit number
+FRM sau_introut, 4t	;Interrupt routine offset
+FRM sau_ioreg  , 4t	;Base IO register number
+FRM sau_stsreg , 4t	;Status IO register number
+FRM sau_port   , 4t	;Port on board
+FRM sau_int    , 4t	;Interrupt level
+FRM sau_bdb    , 4t	;Offset of BDB
+FRM sau_intrbs , 4t	;Interrupt ring buffer size
+FRM sau_inrbs  , 4t	;Input ring buffer size
+FRM sau_inlbs  , 4t	;Input line buffer size
+FRM sau_outrbs , 4t	;Output ring buffer size
+sau_SIZE=!$$$		;  lengths
+
+;Description block for addunitchar
+
+	DATA
+
+	.MOD	4
+sercaublk:
+ DCHARBGN  2, knlDCharValCom##
+ DCHARENT  UNIT  , DECV, , 4, 0, 0, retclc      , 0
+ DCHARENT  TYPE  , TEXT, , 4, 0, 0, retclc      , 0
+ DCHARENT  IOREG , HEXV, , 4, 0, 0, sercauioreg , 0
+ DCHARENT  STSREG, HEXV, , 4, 0, 0, sercaustsreg, 0
+ DCHARENT  PORT  , DECV, , 1, 0, 0, sercauport  , 0
+ DCHARENT  INT   , DECV, , 1, 0, 0, sercauint   , 0
+ DCHARENT  INTRS , DECV, , 2, 0, 0, sercauintrbs, 0
+ DCHARENT  INRBS , DECV, , 2, 0, 0, sercauinrbs , 0
+ DCHARENT  OUTRS , DECV, , 2, 0, 0, sercauoutrbs, 0
+ DCHARENT  INLBS , DECV, , 2, 0, 0, sercauinlbs , 0
+
+	CODE
+
+sercaddunit:
+	ENTER	sau_SIZE, 0		;Allocate our stack frame
+	MOVB	sau_unit.B[EBP], AL	;Store unit number
+	CLRL	EAX
+	DECL	EAX
+	MOVL	sau_ioreg.B[EBP], EAX	;Store illegal values for required
+	MOVL	sau_stsreg.B[EBP], EAX	;  items
+	MOVL	sau_int.B[EBP], EAX
+	MOVL	sau_port.B[EBP], EAX
+	MOVL	sau_intrbs.B[EBP], #IIRSIZE ;Store default buffer sizes
+	MOVL	sau_inrbs.B[EBP], #IRSIZE
+	MOVL	sau_inlbs.B[EBP], #IBSIZE
+	MOVL	sau_outrbs.B[EBP], #ORSIZE
+	MOVL	EBX, #sercaublk		;Point to our description block
+	MOVB	AL, #0			;Fail if bad name
+	CALL	knlAddUnitChar##
+	JC	6$.S			;If error
+	MOVL	EAX, sau_ioreg.B[EBP]	;Did we get all of the required values?
+	ORL	EAX, sau_stsreg.B[EBP]
+	ORL	EAX, sau_int.B[EBP]
+	ORL	EAX, sau_port.B[EBP]
+	JS	10$.S			;No - fail
+	MOVL	EDX, sau_ioreg.B[EBP]	;Yes
+	ADDL	EDX, #3.B		;Now check to see if physical interface
+	MOVB	AL, #5			;  exists
+	OUTB	[DX]			;Point to the line control register
+	JMP	$+2.S			;See if we can change it
+	INB	[DX]
+	CMPB	AL, #5
+	JNE	4$.S
+	MOVB	AL, #3
+	OUTB	[DX]
+	JMP	$+2.S
+	INB	[DX]
+	CMPB	AL, #3
+	JE	12$.S
+4$:	MOVL	EAX, #ER_PDNAV		;Fail if does not exist
+6$:	MOVL	EBX, #QSTS$DONE
+	CLRL	ECX
+	LEAVE
+	TOFORK
+	STC
+	RET
+
+;Here if a required parameter is missing
+
+10$:	MOVL	EAX, #ER_CHARM
+	JMP	6$.S
+
+11$:	CALL	knlGiveXRes##		;Give up the exec memory resource
+	MOVL	EAX, #ER_IINUM		;Return an illegal interrupt error
+	JMP	6$.S
+
+;Here if the interface exists
+
+12$:	CALL	knlGetXRes##		;Get exec memory resource
+	MOVL	EAX, sau_stsreg.B[EBP]	;Search all SERC BDBs to see if we
+;	MOVL	EDI, sau_int.B[EBP]	;  have already set up this board
+;	CMPL	EDI, #9.B
+;	JNE	13$.S
+;	DECL	EDI
+;13$:	NOTL	EDI
+;	ANDL	EDI, #1.B
+;	ANDL	EAX, #~1.B
+;	ORL	EAX, EDI
+	MOVL	EDI, sercfbdb
+	TESTL	EDI, EDI
+	JE	16$.S
+14$:	CMPL	bdb_stsreg.B[EDI], EAX	;This one?
+	JE	30$			;Yes
+	MOVL	EDI, [EDI]		;No - advance to next BDB
+	TESTL	EDI, EDI		;Any more?
+	JNE	14$.S			;Yes - continue
+16$:	MOVB	CL, sau_int.B[EBP]	;Get the interrupt number
+	CALL	knlChkIRqAvl##		;Check if the vector is available
+	JC	11$.S			;Vector already in use
+	MOVL	ECX, #SERCINTSZ		;Get space for interrupt code
+	CALL	knlGetXCode##
+	JC	20$.S
+	MOVL	sau_introut.B[EBP], EDI	;Remember where code is going
+	MOVL	ESI, #sercint		;Copy prototype interrupt routine
+	SHRL	ECX, #2
+	MOVB	gdtable+GS_CODEALS+5, #DT_RWDATA+PL_0 ;Enable alaised code space
+	PUSHL	#GS_CODEALS.B
+	POPL	ES
+	CLD
+	RMOVSL	[EDI], ES:[ESI]
+	MOVL	ECX, #bdb_SIZE		;Get space for the BDB
+	CALL	knlGetXMem##
+	JNC	22$.S
+18$:	CLRL	EBX
+	MOVL	ES, EBX
+	MOVB	gdtable+GS_CODEALS+5, BL ;Disable the allaised code space
+20$:	CALL	knlGiveXRes##		;Give up the exec memory resource
+	JMP	6$
+
+21$:	MOVL	EAX, #ER_PDADF
+	JMP	20$.S
+
+;Here with memory for the BDB
+
+22$:	MOVL	EAX, sercfbdb		;Link it in
+	TESTL	EAX, EAX
+	JNE	24$.S
+	MOVL	sercfbdb, EDI
+	MOVL	EBX, #sercoas		;Setup our once-a-second routine
+	PUSHL	EDI
+	CALL	knlSetupOAS##
+	POPL	EDI
+	JC	20$.S
+	JMP	26$
+
+24$:	MOVL	bdb_next.B[EAX], EDI
+26$:	MOVL	EBX, sau_introut.B[EBP]	;Fix up the interrupt code
+	PUSHL	#GS_CODEALS.B
+	POPL	ES
+	MOVL	ES:{fix1-sercint}+1.B[EBX], EDI
+	MOVL	EAX, EBX
+	SUBL	EAX, #sercint
+	SUBL	ES:{fix2-sercint}+1.B[EBX], EAX
+	CLRL	EAX
+	MOVL	ES, EAX
+	MOVB	gdtable+GS_CODEALS+5, AL ;Disable the allaised code space
+	MOVL	EBX, sau_stsreg.B[EBP]	;Get status port number
+$$$foo:
+; Following lines are only used for Digiboards, GTEK doesn't have the
+; funny status register addressing
+;	MOVL	EAX, sau_int.B[EBP]	;Get the interrupt number
+;	CMPL	EAX, #9.B
+;	JNE	27$.S
+;	DECL	EAX
+;27$:	NOTL	EAX
+;	ANDL	EAX, #1.B		;Even or odd interrupt?
+;	ANDL	EBX, #~1.B		;Clear the low bit
+;	ORL	EBX, EAX		;And correct the status register
+
+	MOVL	bdb_stsreg.B[EDI], EBX	;Store status port number
+	MOVL	EBX, #irqname+7
+	CLRL	EAX
+	MOVL	1.B[EBX], EAX
+	MOVL	5.B[EBX], EAX
+	MOVL	EAX, sau_stsreg.B[EBP]
+	CALL	knlPutHex4Nmbr##
+	MOVL	EDX, #irqname
+	MOVL	EBX, sau_introut.B[EBP]	;Get address of interrupt routine
+	MOVB	CL, sau_int.B[EBP]	;Get interrupt number
+	MOVB	bdb_intlvl.B[EDI], CL
+	MOVB	CH, #DT_INT+PL_0	;Set up our interrupt vector
+	CALL	knlSetIRq##
+28$:	JC	20$			;If error
+
+;Here with BDB already set up - set up TDB
+
+30$:	MOVL	EAX, sau_int.B[EBP]	;Get the IRQ number
+	CMPL	EAX, bdb_intlvl.B[EDI]	;Does it match?
+	JNE	11$			;No - fail with illegal interrupt
+	MOVL	EAX, sau_port.B[EBP]	;Yes
+	CMPL	bdb_tdb-4.B[EDI+EAX*4], #0.B ;Is this port already setup?
+	JNE	21$			;Yes - fail
+	MOVL	sau_bdb.B[EBP], EDI	;No
+	MOVL	ECX, sau_intrbs.B[EBP]	;Get total size for our TDB
+	ADDL	ECX, ECX
+	ADDL	ECX, #tdb_scSIZE
+	ADDL	ECX, sau_outrbs.B[EBP]
+	MOVB	DH, #0FFh		;No secondary unit number
+	MOVB	DL, sau_unit.B[EBP]	;Get primary unit number
+	MOVL	EAX, sau_inlbs.B[EBP]	;Get input line buffer and ring sizes
+	SHLL	EAX, #16t
+	MOVW	AX, sau_inrbs.B[EBP]
+	MOVL	EBX, #'SERC'		;Get type name
+	CALL	knlTrmMakeTdb##		;Make our TDB
+	JC	28$.S			;If error
+	CALL	knlGiveXRes##		;Give up the exec memory resource
+	MOVL	EAX, sau_bdb.B[EBP]	;Store offset of the BDB in the TDB
+	MOVL	tdb_scbdb.B[ESI], EAX
+	MOVB	tdb_ifdsp.B[ESI], #TID$QOUT ;Indicate can do queued output
+	MOVL	tdb_devchar.B[ESI], #sercdctbl ;Store offset of devchar table
+	MOVL	tdb_ddisp.B[ESI], #sercdsp ;Store offset of our dispatch table
+	MOVL	tdb_kdisp.B[ESI], #serckdsp ;Store offset of keyboard function
+					    ;  dispatch table
+	MOVL	tdb_fdisp.B[ESI], #serfork ;Store offset of fork routine
+	MOVL	EAX, sercltdb		;Link into our list of TDBs
+	MOVL	sercltdb, ESI
+	TESTL	EAX, EAX
+	JE	34$.S
+	MOVL	tdb_nexts.B[EAX], ESI
+	JMP	36$.S
+
+34$:	MOVL	sercftdb, ESI
+36$:	MOVL	EAX, sau_port.B[EBP]	;Store TDB offset in the BDB
+	MOVL	tdb_scport.B[ESI], EAX	;Store port number in TDB
+	MOVL	EDI, sau_bdb.B[EBP]	;Pick up offset of BDB
+	MOVL	bdb_tdb-4.B[EDI+EAX*4], ESI
+	MOVL	EAX, sau_outrbs.B[EBP]	;Store size of our output buffer
+	MOVL	tdb_scoutrsize.B[ESI], EAX
+	LEAL	EAX, tdb_scintring.B[ESI] ;Store offset of our output buffer
+	ADDL	EAX, sau_intrbs.B[EBP]
+	ADDL	EAX, sau_intrbs.B[EBP]
+	MOVL	tdb_scoutring.B[ESI], EAX
+	MOVL	EAX, sau_intrbs.B[EBP]	  ;Store size of the interrupt ring
+	MOVB	tdb_scintrsize.B[ESI], AL ;  buffer
+	MOVL	EDX, sau_ioreg.B[EBP]
+	MOVL	tdb_bioreg[ESI], EDX	;Store base IO registser number
+	INCL	EDX			;Point to interrupt enable regsiter
+	MOVB	AL, #07h		;Enable all but dataset interrupts
+	MOVB	tdb_scintenb.B[ESI], AL
+	OUTB	[DX]
+	JMP	$+2.S
+	ADDL	EDX, #P_COMMODMCON-P_COMINTENB.B ;Point to modem control reg
+	MOVB	AL, #0Ch		;Set all modem outputs and set master
+	OUTB	[DX]			;  interrupt enable bit
+	MOVB	tdb_scmdcon.B[ESI], AL	;Remember current state of these bits
+	MOVL	EAX, #TRMR_init		;Get baud rates
+	MOVL	tdb_iinpr[ESI], EAX	;Store idle baud rate
+	MOVL	tdb_ioutr.B[ESI], EAX
+	CALL	setbaudrate		;Set baud rate in the hardware
+	MOVB	tdb_icsize.B[ESI], #{TRMS_init<4}|TRMD_init
+	MOVB	tdb_csize.B[ESI], #{TRMS_init<4}|TRMD_init
+	MOVB	tdb_ipar.B[ESI], #TRMP_init
+	MOVB	tdb_par.B[ESI], #TRMP_init
+	CALL	setlhw			;Set line bits for the hardware
+	MOVL	EBX, sau_int.B[EBP]	;Get interrupt number
+	MOVB	tdb_intlvl.B[ESI], BL	;Remember it
+	PUSHL	#1.B			;Assume this will work
+	MOVL	ECX, #8			;Try to reset it up to 8 times!
+38$:	MOVL	EDX, tdb_bioreg[ESI]
+	INB	[DX]			;Read the input data register
+	JMP	$+2.S
+	ADDL	EDX, #P_COMLINESTS-P_COMRDATA.B ;Read the line status register
+	INB	[DX]
+	JMP	$+2.S
+	INCL	EDX			;Read the modem status register
+	INB	[DX]
+	JMP	$+2.S
+	ADDL	EDX, #P_COMINTID-P_COMMODMSTS.B ;Read the interrupt ID register
+	INB	[DX]
+	JMP	$+2.S
+	INB	[DX]			;Twice
+	TESTB	AL, #01			;Is the device idle?
+	JNE	40$.S			;Yes
+	LOOP	ECX, 38$		;No - try again if should
+	MOVL	[ESP], #0		;Can't make it idle - return 0
+40$:	MOVL	EAX, tdb_scintrsize.B[ESI] ;Calculate interrupt buffer stop
+	CMPL	EAX, #1024t		   ;  level
+	JBE	42$.S
+	MOVL	EAX, #512t
+42$:	SHRL	EAX, #2
+	MOVL	tdb_scintrbsl.B[ESI], EAX
+	SHRL	EAX, #2			;Calculate interrupt buffer panic level
+	MOVL	tdb_scintrbpl.B[ESI], EAX
+	MOVL	EAX, tdb_irsize[ESI]	;Calculate input buffer stop level
+	CMPL	EAX, #1024t
+	JBE	44$.S
+	MOVL	EAX, #512t
+44$:	SHRL	EAX, #2
+	MOVL	tdb_irbsl[ESI], EAX
+	SHRL	EAX, #2			;Calculate input buffer panic level
+	MOVL	tdb_irbpl[ESI], EAX
+	MOVL	ECX, sau_int.B[EBP]	;Enable our interrupt
+	CALL	knlEnableInt##
+	POPL	ECX			;Get our return value
+	CLRL	EAX
+	MOVL	EBX, #QSTS$DONE
+	LEAVE
+	TOFORK
+	RET
+.PAGE
+;Subroutine called by addunitchar for the "IOREG" characteristic
+
+sercauioreg:
+	CMPL	EAX, #100h		;Reasonable value?
+	JB	2$.S			;No
+	MOVL	sau_ioreg.B[EBP], EAX	;Yes - store value
+	JMP	6$.S
+
+;Subroutine called by addunitchar for the "STSREG" characteristic
+
+sercaustsreg:
+	CMPL	EAX, #100h		;Reasonable value?
+	JB	2$.S			;No
+	MOVL	sau_stsreg.B[EBP], EAX	;Yes - store value
+	JMP	6$.S
+
+;Subroutine called by addunitchar for the "PORT" characteristic
+
+sercauport:
+	TESTL	EAX, EAX
+	JE	8$.S
+	CMPL	EAX, #32t.B		;Reasonable value?
+	JA	8$.S			;No
+	MOVL	sau_port.B[EBP], EAX	;Yes - store value
+	CLC
+	RET
+
+;Subroutine called by addunitchar for the "INT" characteristic
+
+sercauint:
+	CMPL	EAX, #2.B		;See if valid interrupt level
+2$:	JB	badcharv		;Too small
+	JNE	4$.S			;Not level 2
+	MOVB	AL, #9			;Level 2 - change it to level 9
+4$:	MOVL	sau_int.B[EBP], EAX	;Store interrupt level
+	CMPL	EAX, #15t.B		;Too large?
+	JMP	8$.S
+ 
+;Subroutine called by addunitchar for the "OUTRBS" characteristic
+
+sercauoutrbs:
+	ANDB	AL, #0FCh		;Make sure even number of longs
+	MOVL	sau_outrbs.B[EBP], EAX
+6$:	CMPL	EAX, #1000h		;Is this a reasonable value?
+8$:	JAE	badcharv		;No - fail
+retclc:	CLC
+	RET
+
+;Subroutine called by addunitchar for the  "INTRBS" characteristic
+
+sercauintrbs:
+	ANDB	AL, #0FCh		;Make sure even number of longs
+	CMPL	EAX, #20t.B		;Is it too small?
+	JA	10$.S			;No
+	MOVB	AL, #20t		;Yes - use minimum
+10$:	MOVL	sau_intrbs.B[EBP], EAX
+	CMPL	EAX, #1000h		;Is it too large?
+	JMP	8$.S
+
+;Subroutine called by addunitchar for the "INRBS" characteristic
+
+sercauinrbs:
+	ANDB	AL, #0FCh		;Make sure even number of longs
+	CMPL	EAX, #20t.B		;Is it too small?
+	JA	12$.S			;No
+	MOVB	AL, #20t		;Yes - use minimum
+12$:	MOVL	sau_inrbs.B[EBP], EAX
+	JMP	6$.S
+
+;Subroutine called by addunitchar for the "INLBS" characteristic
+
+sercauinlbs:
+	ANDB	AL, #0FCh		;Make sure even number of longs
+	CMPL	EAX, #20t.B		;Is it too small?
+	JA	14$.S			;No
+	MOVB	AL, #20t		;Yes - use minimum
+14$:	MOVL	sau_inlbs.B[EBP], EAX
+	JMP	6$.S
+.PAGE
+;Here to get the value of the BRD characteristic
+
+getbrd:	CALL	knlGetTdb##
+	JC	4$.S
+	MOVZBL	EAX, tdb_auto.B[ESI]
+	CLRL	EDX
+	RET
+
+;Here to get the value of the RATE characteristic
+
+getrate:CALL	knlGetTdb##
+	JC	4$.S
+	MOVL	EAX, tdb_ioutr.B[ESI]
+	CLRL	EDX
+4$:	RET
+
+;Here to get the value of the DBITS characteristic
+
+getdbits:
+	CALL	knlGetTdb##
+	JC	4$.S
+	MOVZBL	EAX, [ESI+EBX]
+	ANDB	AL, #0Fh
+	CLRL	EDX
+	RET
+
+;Here to get the value of the SBITS characteristic
+
+getsbits:
+	CALL	knlGetTdb##
+	JC	8$.S
+	MOVZBL	EAX, [ESI+EBX]
+	SHRB	AL, #4
+	CLRL	EDX
+	RET
+
+;Here to get the value of the PARITY characteristic
+
+getparity:
+	CALL	knlGetTdb##
+	JC	8$.S
+	MOVZBL	EBX, [ESI+EBX]
+	ANDB	BL, #0Fh
+	MOVL	EAX, CS:parname+0-8[EBX*8]
+	MOVL	EDX, CS:parname+4-8[EBX*8]
+8$:	RET
+
+	.MOD	4
+parname:.LONG	'NONE', 0	;TRMP_NONE  = 1 - No parity bit
+	.LONG	'MARK', 0	;TRMP_MARK  = 2 - Mark parity
+	.LONG	'SPAC', 'E'	;TRMP_SPACE = 3 - Space parity
+	.LONG	'ODD' , 0	;TRMP_ODD   = 4 - Odd parity
+	.LONG	'EVEN', 0	;TRMP_EVEN  = 5 - Even parity
+PARNAMESZ=!{$-parname}/8
+
+;Here to get the value of the MODEM characteristic
+
+getmodem:
+	CALL	knlGetTdb##
+	JC	10$.S
+	MOVL	EAX, #'YES'		;Assume YES
+	TESTB	tdb_imodem.B[ESI], #TMC$DATASET
+	JNE	10$.S
+	MOVL	EAX, #'NO'
+10$:	CLRL	EDX
+	RET
+
+;Here to get the value of the STSREG characteristic
+
+getstsreg:
+	CALL	knlGetTdb##
+	JC	10$.S
+	MOVL	EAX, tdb_scbdb.B[ESI]	;Get offset of the BDB
+	MOVL	EAX, bdb_stsreg.B[EAX]	;Get register number
+	JMP	10$.S
+.PAGE
+;Here to set the value of the IOUTFLOW or OUTFLOW characteristic
+
+setoflow:
+	CALL	knlGetTdb##
+	JC	4$.S
+	PUSHL	EBX
+	MOVL	ECX, #knlTRMOFLOWTBLSZ##
+	MOVL	EBX, #knlTrmOFlowTbl##
+	CALL	knlGetDcVal2##
+	POPL	EBX
+	JC	4$.S
+	ANDB	[ESI+EBX], #0Fh
+	ORB	[ESI+EBX], AL		;Store new value
+	CMPL	EBX, #tdb_iflow.B	;Setting initial value?
+	JE	2$.S			;Yes - finished now
+	CALL	setinte			;No - make sure interrupt enables are
+2$:	CLC				;  right
+	RET
+					;  right
+
+;Here to set the value of the IINFLOW characteristic
+
+setiiflow:
+flowval:CALL	knlGetTdb##
+	JC	4$.S
+	PUSHL	EBX
+	MOVL	ECX, #knlTRMIFLOWTBLSZ##
+	MOVL	EBX, #knlTrmIFlowTbl##
+	CALL	knlGetDcVal2##
+	POPL	EBX
+	JC	4$.S
+	ANDB	[ESI+EBX], #0F0h
+	ORB	[ESI+EBX], AL		;Store new value
+4$:	RET
+
+;Here to set the value of the IINFLOW or INFLOW characteristic
+
+setiflow:
+	CALL	setiiflow
+	JC	4$.S
+	TESTB	AL, #TFC$IDTR		;Have DTR flow control?
+	JE	10$.S			;No
+	MOVL	EBX, #sersetdtr		;Yes - get function to set DTR
+	JMP	12$.S
+
+10$:	TESTB	AL, #TFC$IRTS		;Have RTS flow control?
+	JE	22$.S			;No - finished here
+	MOVL	EBX, #sersetrts		;Yes - get function to set RTS
+12$:	MOVB	AL, #0FF		;Assume not holding output
+	TESTB	tdb_stsout.B[ESI], #TSO$HOLDS|TSO$HOLDP ;Holding output now?
+	JE	18$.S			;No
+	NOTB	AL			;Yes	
+18$:	TESTB	tdb_flow.B[ESI], #TFC$IREV ;Is the flow control state reversed?
+	JE	20$.S			;No
+	NOTB	AL			;Yes
+20$:	CALLI	EBX			;Set or clear the modem control bit
+	CLC
+22$:	RET
+.PAGE
+;Here to set the value of the BRD characteristic
+
+setbrd:	CALL	knlGetTdb##
+	JC	2$.S
+	MOVB	tdb_auto.B[ESI], AL
+2$:	RET
+
+;Here to set the value of the RATE or OUTRATE characteristic
+
+setrate:CALL	knlGetTdb##
+	JC	2$.S
+	CALL	actrate			;Calculate actual rate
+setbaudrate:
+	MOVL	tdb_outr.B[ESI], EAX	;Store this as the current rate
+	MOVL	tdb_inpr.B[ESI], EAX
+	CMPL	EAX, #134t		;Did he say 134 baud?
+	JNE	4$.S			;No
+	MOVL	EAX, #857t		;Yes - make it 134.5!
+	JMP	6$.S
+
+4$:	MOVL	ECX, EAX		;Calculate rate divisor
+	SHRL	EAX, #1
+	ADDL	EAX, #115200t
+	CLRL	EDX
+	DIVL	ECX
+6$:	PUSHL	EAX			;Save divisor value
+	MOVL	EDX, tdb_bioreg[ESI]	;Point to the line control register
+	ADDL	EDX, #P_COMLINECON.B
+	MOVB	AL, tdb_sclncon.B[ESI]	;Enable access to the baud rate
+	ORB	AL, #80h		;  registers
+	CLI				;Can't have interrupts while have the
+	OUTB	[DX]			;  baud rate registers enabled
+	JMP	$+2.S
+	POPL	EAX			;Restore divisor value
+	ADDL	EDX, #P_COMBRLSB-P_COMLINECON.B ;Point to divisor LSB register
+	OUTB	[DX]			;Output LSB
+	JMP	$+2.S
+	MOVB	AL, AH			;Get high byte
+	INCL	EDX			;Point to divisor MSB register
+	OUTB	[DX]			;Output MSB
+	JMP	$+2.S				;Point to the line control
+	ADDL	EDX, #P_COMLINECON-P_COMBRMSB.B ;  register again
+	MOVB	AL, tdb_sclncon.B[ESI]	;Enable access to the data registers now
+	OUTB	[DX]
+	STI				;Interrupts are OK now
+	CLC
+	RET
+
+;Here to set the value of the IRATE or IOUTRATE characteristic
+
+setirate:
+	CALL	knlGetTdb##
+	JC	8$.S
+	CALL	actrate			;Calculate actual rate
+	MOVL	tdb_ioutr.B[ESI], EAX	;And store this as the initial rate
+	MOVL	tdb_iinpr[ESI], EAX
+	CLC
+8$:	RET
+.PAGE
+;Subroutine to calculate actual baud rate
+;	c{EAX} = Desired baud rate
+;	CALL	actrate
+;	c{EAX} = Actual baud rate
+
+actrate:CMPL	EAX, #2.B		;Must be at least 2!
+	JA	4$.S
+	MOVB	AL, #2
+4$:	CMPL	EAX, #134t		;Did he say 134 baud?
+	JE	8$.S			;Yes - leave it at that
+	MOVL	ECX, EAX		;No - calculate rate divisor
+	SHRL	EAX, #1
+	ADDL	EAX, #115200t
+	CLRL	EDX
+	DIVL	ECX
+	TESTL	EAX, EAX		;Make sure not zero
+	JNE	6$.S
+	INCL	EAX
+6$:	MOVL	ECX, EAX		;Now calculate actual baud rate that
+	MOVL	EAX, #115200t		;  this divisor will generate
+	CLRL	EDX
+	DIVL	ECX
+8$:	RET
+.PAGE
+;Here to set the value of the DBITS characteristic
+
+setdbits:
+	CALL	knlGetTdb##
+	JC	12$.S
+	CMPL	EAX, #8.B	;Make sure legal value (must be 5, 6, 7, or 8)
+	JA	badcharv.S
+	CMPL	EAX, #5.B
+	JB	badcharv.S
+	ANDB	[ESI+EBX], #0F0h
+	ORB	[ESI+EBX], AL	;Store new value
+	JMP	10$.S		;Continue
+
+badcharv:
+	MOVL	EAX, #ER_CHARV
+	STC
+	RET
+
+;Here to set the value of the SBITS characteristic
+
+setsbits:
+	CALL	knlGetTdb##
+	JC	12$.S
+	CMPL	EAX, #2.B	;Make sure legal value (must be 1 or 2)
+	JA	badcharv.S
+	TESTL	EAX, EAX
+	JE	badcharv.S
+	SHLB	AL, #4
+	ANDB	[ESI+EBX], #0Fh
+	ORB	[ESI+EBX], AL	;Store new value
+10$:	CMPL	EBX, #tdb_icsize.B ;Changing current value?
+	JNE	setlhw.S	;Yes - go do that
+12$:	RET
+
+;Here to set the value of the PARITY characteristic
+
+setparity:
+	CALL	knlGetTdb##
+	JC	12$.S
+	PUSHL	EBX
+	MOVL	ECX, #PARNAMESZ
+	MOVL	EBX, #parname
+	CALL	knlGetDcVal1##		;Search the keyword table
+	POPL	EBX
+	JC	12$.S			;If error
+	INCL	EAX
+	ANDB	[ESI+EBX], #0F0h
+	ORB	[ESI+EBX], AL		;Store new value
+	CMPL	EBX, #tdb_ipar.B 	;Changing current value?
+	JE	12$.S			;No - finished
+setlhw:	MOVB	AL, tdb_csize.B[ESI] 	;Yes - must update hardware state
+	ANDB	AL, #0Fh		;Get number of data bits
+	SUBB	AL, #5			;Get value for interface
+	TESTB	tdb_csize.B[ESI], #20h	;Want two stop bits?
+	JE	16$.S			;No
+	ORB	AL, #04h		;Yes
+16$:	MOVZBL	EBX, tdb_par.B[ESI]	;Get current parity value
+	ANDB	BL, #0Fh
+	ORB	AL, CS:parvalue-1[EBX]	;Add in the parity bits
+	MOVB	tdb_sclncon.B[ESI], AL	;Remember these bits
+	MOVL	EDX, tdb_bioreg[ESI]	;Point to the line control register
+	ADDL	EDX, #P_COMLINECON.B
+	OUTB	[DX]
+	RET
+
+parvalue:
+	.BYTE	00h		;TRMP_NONE  = 1 - No parity bit
+	.BYTE	28h		;TRMP_MARK  = 2 - Mark parity
+	.BYTE	38h		;TRMP_SPACE = 3 - Space parity
+	.BYTE	08h		;TRMP_ODD   = 4 - Odd parity
+	.BYTE	18h		;TRMP_EVEN  = 5 - Even parity
+
+;Here to set the value of the MODEM characteristic
+
+setmodem:
+	CALL	knlGetTdb##
+	JC	12$.S
+	ADDL	EBX, ESI
+	CALL	knlGetYesNo##
+	JC	12$.S
+	JE	20$.S
+	ANDB	[EBX], #{~TMC$DATASET}&0FFh
+	RET
+
+20$:	ORB	[EBX], #TMC$DATASET
+	RET
+
+notmapped:
+	CLRL	EAX			;Return 0 as mapped size
+	CLRL	EDX			;And 0 as offset
+	RET
+.PAGE
+	.SBTTL	Serial port interrupt routines
+
+;The following is a prototype for the interrupt service routine entry code
+;  - this code is copied for each unit by sercaddunit
+
+sercint:PUSHAL				;Save all registers
+	PUSHL	DS
+	PUSHL	ES
+	PUSHL	FS
+	PUSHL	GS
+	PUSHL	#GS_DATA.B		;Make our data addressable
+	POPL	DS
+fix1:	MOVL	EBX, #0			;Get offset of BDB for this device
+fix2:	JMP	intcom			;Go to the common routine
+SERCINTSZ=!$-sercint
+.PAGE
+	.SBTTL	sercintcom - Common interrupt routine
+
+intcom:	CLRL	EAX
+intchk:	MOVL	EDX, bdb_stsreg.B[EBX]	;Point to interrupt status register
+	CLRL	EAX
+	INB	[DX]			;Get interrupt status for odd interrupts
+	BSFL	EAX, EAX		;Get port number
+	JZ	intdone.S		;No actual interrupt - finished
+;	ANDB	AL, #1Fh		;Yes - make sure no junk
+	MOVL	EDI, bdb_tdb.B[EBX+EAX*4] ;Get offset of TDB for interface
+	TESTL	EDI, EDI		;Is this one set up?
+	JE	intdone.S		;No!
+	MOVL	EDX, tdb_bioreg[EDI]	;Get base IO register for serial port
+	ADDL	EDX, #P_COMINTID.B	;Point to interrupt ID register
+	INB	[DX]			;Get interrupt status
+	ANDB	AL, #7
+	JMPIL	CS:sercidsp[EAX*4]	;Dispatch on the interrupt
+
+;Interrupt dispatch table
+
+	.MOD	4
+sercidsp:
+	.LONG	mdmchg		;000 - Modem status change
+	.LONG	intchk		;001
+	.LONG	xmtdone		;010 - Xmit done
+	.LONG	intchk		;011
+	.LONG	inpavl		;100 - Input available
+	.LONG	intchk		;101
+	.LONG	inperr		;110 - Input error
+	.LONG	intchk		;111
+
+;Here when have no more interrupt conditions to service
+
+intdone:MOVB	AL, #INT_EOI		;Release interrupt controller
+	CLI
+	CMPB	bdb_intlvl.B[EBX], #7	;High interrupt?
+	JBE	20$.S			;No
+	OUTB	P_INC2P0		;Yes - release 2nd interrupt controller
+20$:	OUTB	P_INC1P0		;Always release 1st interrupt controller
+	JMP	knlDismissInt2##	;Check for scheduling and dismiss
+.PAGE
+;Here for input error interrupt
+
+inperr:	A2IOP	P_COMLINESTS-P_COMINTID	;Point to line status register
+	MOVB	AH, #FF_LINESTS		;Indicate have line status bits
+	JMP	2$.S			;Send line status bits to fork level
+
+;Here for input available interrupt
+
+inpavl:	SUBL	EDX, #2.B		;Point to data register
+	MOVB	AH, #FF_RDATA		;Indicate have received data
+2$:	INB	[DX]			;Get the data byte
+	MOVL	EBX, tdb_scintrsize.B[EDI] ;Room for more in the interrupt
+	CMPL	tdb_scintrcnt.B[EDI], EBX  ;  ring buffer?
+	JAE	10$.S			;No - forget it!
+toring:	MOVL	EBX, tdb_scintrput.B[EDI] ;Yes - get putter pointer
+	MOVW	tdb_scintring.B[EDI+EBX*2], AX ;Store code in ring
+	INCL	EBX			;Bump pointer
+	CMPL	EBX, tdb_scintrsize.B[EDI] ;Past end of ring?
+	JB	4$.S			;No
+	CLRL	EBX			;Yes - reset pointer
+4$:	MOVL	tdb_scintrput.B[EDI], EBX ;Update pointer
+	INCL	tdb_scintrcnt.B[EDI]	;Bump count
+	CALL	knlReqFork##		;Request fork
+6$:	MOVL	EAX, tdb_scintrsize.B[EDI] ;Is the interrupt ring past the stop
+	SUBL	EAX, tdb_scintrbsl.B[EDI]  ;  level?
+	JLE	nextint.S
+	CMPL	tdb_scintrcnt.B[EDI], EAX
+	JA	12$.S			;Yes
+nextint:MOVL	EBX, tdb_scbdb.B[EDI]	;No
+	JMP	intcom			;Continue
+
+;Here if the interrupt ring is full - discard the character
+
+10$:	INCL	tdb_scintrlost.B[EDI]	;Count the lost character
+	JMP	14$.S			;Continue
+
+;Here if interrupt ring is past the stop level - try to stop input if we can
+
+12$:	INCL	tdb_scintrheld.B[EDI]	;Count this
+14$:	TESTB	tdb_flow.B[EDI], #TFC$IDTR ;Is DTR flow control enabled?
+	JE	16$.S			;No
+	ANDB	tdb_scmdcon.B[EDI], #~CMMDC$DTR ;Yes - clear DTR
+	JMP	20$.S
+
+;Here DSR/DTR flow control is not enabled
+
+16$:	TESTB	tdb_flow.B[EDI], #TFC$IRTS ;Is RTS flow control enabled?
+	JE	22$.S			;No
+	MOVB	AL, #0			;Yes - assume should clear RTS
+	TESTB	tdb_flow.B[EDI], #TFC$IREV ;Is the sense reversed?
+	JE	18$.S			;No
+	ORB	tdb_scmdcon.B[EDI], #CMMDC$RTS ;Yes - set RTS
+	JMP	20$.S
+
+18$:	ANDB	tdb_scmdcon.B[EDI], #~CMMDC$RTS ;Yes - clear RTS
+20$:	MOVL	EDX, tdb_bioreg[EDI]
+	A2IOP	P_COMMODMCON		;Point to modem control reg
+	MOVB	AL, tdb_scmdcon.B[EDI]	;Set the hardware register
+	OUTB	[DX]
+	JMP	28$.S
+
+;Here if CTS/RTS flow control is not enabled
+
+22$:	TESTB	tdb_flow.B[EDI], #TFC$IXONXOFF ;Is XON/XOFF flow control
+					       ;  enabled?
+	JE	30$.S			;No - just quietly discard character!
+	TESTB	tdb_stsinp+1.B[EDI], #{TSI$INTHELD|TSI$IRBHELD}>8
+					;Is input held off now?
+	JE	24$.S			;No
+	MOVL	EAX, tdb_scintrsize.B[EDI] ;Yes - is the interrupt ring past the
+	SUBL	EAX, tdb_scintrbpl.B[EDI]  ;  panic level?
+	JLE	28$.S
+	CMPL	tdb_scintrcnt.B[EDI], EAX
+	JBE	28$.S			;No - nothing more needed yet
+24$:	TESTB	tdb_stsout.B[EDI], #TSO$OUTA ;Yes - is output active?
+	JE	26$.S			;No
+	TESTB	tdb_stsout+1.B[EDI], #TSO$OUTD>8 ;Yes - is output done?
+	JNE	26$.S			;Yes
+	ORB	tdb_stsout+1.B[EDI], #TSO$FRCXOFF>8 ;No - indicate need XOFF
+	JMP	28$.S				    ;  next
+
+;Here if output is not active - output XOFF now
+
+26$:	MOVB	AL, #XOF		;Get the XOFF character
+	MOVL	EDX, tdb_bioreg[EDI]	;Point to the data register
+	OUTB	[DX]			;Output the character
+	ORB	tdb_stsout.B[EDI], #TSO$OUTA
+	ANDB	tdb_stsout+1.B[EDI], #~{TSO$OUTD>8t}
+	MOVB	tdb_scouttoc.B[EDI], #2	;Start the output timer
+28$:	ORB	tdb_stsinp+1.B[EDI], #TSI$INTHELD>8 ;Indicate input held off
+30$:	JMP	nextint
+.PAGE
+;Here for xmit done interrupt
+
+xmtdone:ORB	tdb_stsout+1.B[EDI], #TSO$OUTD>8 ;Indicate output is done
+2$:	CALL	knlReqFork##		;Request fork
+	JMP	nextint			;Continue
+
+;Here for modem status change interrupt
+
+mdmchg:	A2IOP	P_COMMODMSTS-P_COMINTID	;Point to modem status register
+	MOVB	AH, #FF_MODMSTS		;Indicate have modem status bits
+	INB	[DX]			;Get the modem status byte
+	MOVL	EBX, tdb_scintrsize.B[EDI] ;Room for more in the interrupt
+	CMPL	tdb_scintrcnt.B[EDI], EBX  ;  ring buffer?
+	JB	6$.S			;Yes - store data
+
+;Here if interrupt ring is full.  We always want to report the current modem
+;  status to fork level, so instead of discarding this item, we remove the
+;  last item from the ring and always store this one.
+
+	INCL	tdb_scintrlost.B[EDI]	;Count the lost character
+	DECL	tdb_scintrput.B[EDI]	;Remove the last item from the ring
+	JNS	4$.S
+	DECL	EBX
+	MOVL	tdb_scintrput.B[EDI], EBX
+4$:	DECL	tdb_scintrcnt.B[EDI]
+6$:	MOVL	EBX, tdb_scintrput.B[EDI] ;Get putter pointer
+	MOVW	tdb_scintring.B[EDI+EBX*2], AX ;Store code in ring
+	INCL	EBX			;Bump pointer
+	CMPL	EBX, tdb_scintrsize.B[EDI] ;Past end of ring?
+	JB	8$.S			;No
+	CLRL	EBX			;Yes - reset pointer
+8$:	MOVL	tdb_scintrput.B[EDI], EBX ;Update pointer
+	INCL	tdb_scintrcnt.B[EDI]	;Bump count
+	JMP	2$.S
+.PAGE
+	.SBTTL	serfork - Serial port fork routine
+
+;Here at fork level for serial port
+
+serfork:MOVL	ESI, EDI		;Get TDB offset in right register
+2$:	CMPB	tdb_scintrcnt.B[ESI], #0 ;Anything in the interrupt ring?
+	JE	6$.S			;No - nothing more to do here
+	MOVZBL	EDX, tdb_scintrtak.B[ESI] ;Yes - get taker pointer
+	MOVZWL	EAX, tdb_scintring.B[ESI+EDX*2] ;Get data
+	INCL	EDX			;Bump pointer
+	CMPB	DL, tdb_scintrsize.B[ESI] ;Past end of ring?
+	JB	4$.S			;No
+	CLRL	EDX			;Yes
+4$:	MOVB	tdb_scintrtak.B[ESI], DL
+	DECB	tdb_scintrcnt.B[ESI]	;Reduce ring count
+	MOVZBL	EBX, AH			;Get function
+	CALLI	CS:forkdsp[EBX]		;Dispatch on the function
+	TESTB	tdb_stsinp+1.B[ESI], #TSI$INTHELD>8 ;Is input held off now?
+	JE	2$.S			;No
+	MOVL	EAX, tdb_scintrsize.B[ESI] ;Is the interrupt ring buffer more
+	SHRL	EAX, #2			   ;  than 1/4 full?
+	CMPL	tdb_scintrcnt.B[ESI], EAX
+	JA	2$.S			;Yes
+	ANDB	tdb_stsinp+1.B[ESI], #~{TSI$INTHELD>8} ;No - indicate not held
+	TESTB	tdb_stsinp+1.B[ESI], #TSI$IRBHELD>8 ;Is the input ring buffer
+						    ;  held too?
+	JNE	2$.S			;Yes
+	ORB	tdb_stsout+1.B[ESI], #TSO$FRCXON>8 ;No - indicate need XON
+	BTSL	tdb_stsout.B[ESI], #TSO%OUTA ;Is output active?
+	JNE	2$.S			;Yes
+	ORB	tdb_stsout+1.B[ESI], #TSO$OUTD>8 ;No - fake up output done
+	JMP	2$.S
+
+;Here with all input stuff handled
+
+6$:	TESTB	tdb_stsout+1.B[ESI], #TSO$OUTD>8 ;Is output done?
+	JNE	seroutrdy.S		;Yes - go handle that
+	RET				;No - nothing needed here
+
+;Fork level function dispatch table
+
+	.MOD	4
+forkdsp:.LONG	frkrdata	;FF_RDATA   = 0 - Received data
+	.LONG	frklinsts	;FF_LINESTS = 4 - Line status report
+	.LONG	frkmodsts	;FF_MODMSTS = 8 - Modem status report
+
+	.SBTTL	frkrdata - Received data
+
+;Here at fork level for received data
+
+frkrdata:
+	BTSL	EAX, #31t		;Set bit to indicate ASCII value
+	JMP	knlTrmInp##		;Process the input character
+.PAGE
+	.SBTTL	frklinsts - Line status report
+
+;Here at fork level for line status report
+
+frklinsts:
+	TESTB	AL, #10h		;Did we have a break?
+	JE	ret004.S		;No - ignore the rest of this
+	JMP	knlTrmBreak##		;Yes - report it
+
+	.SBTTL	frkmodsts - Modem status report
+
+;Here at fork level for modem status report
+
+frkmodsts:
+	TESTB	AL, #04h		;Do we have ring indicate?
+	JE	4$.S			;No
+	PUSHL	EAX			;Yes
+	CALL	knlTrmRing##		;Report it
+	POPL	EAX
+4$:	TESTB	AL, #08h		;Has carrier detect changed state?
+	JE	10$.S			;No
+	PUSHL	EAX			;Yes
+	TESTB	AL, #80h		;Do we have carrier now?
+	JE	6$.S			;No
+	CALL	knlTrmCarDet##		;Yes
+	JMP	8$.S
+
+6$:	CALL	knlTrmCarLoss##
+8$:	POPL	EAX
+10$:	TESTB	AL, #02h		;Has DSR changed state?
+	JE	16$.S			;No
+	PUSHL	EAX			;Yes
+	TESTB	AL, #20h		;Is DSR on now?
+	JE	12$.S			;No
+	CALL	knlTrmDsrOn##		;Yes
+	JMP	14$.S
+
+12$:	CALL	knlTrmDsrOff##
+14$:	POPL	EAX
+16$:	TESTB	AL, #01h		;Has CTS changed state?
+	JE	ret004.S		;No
+	TESTB	AL, #10h		;Is CTS on now?
+	JE	knlTrmCtsOff##		;No
+	JMP	knlTrmCtsOn##		;Yes
+.PAGE
+	.SBTTL	seroutrdy - Subroutine to process output ready interrupt
+
+;Here if TSO$OUTD is not set when get here.  The only way this can happen if
+;  for the interrupt level code to clear it after the test in serfork!  This
+;  can happen if we decide to output an X-OFF character after an output done
+;  interrupt but before the fork routine executes.  This is unlikely, but
+;  possible!
+
+2$:	STI				;Just enable interrupts and ignore this
+ret004:	RET
+
+;Subroutine to process output ready interrupt from terminal
+
+seroutrdy:
+	CLI				;No interrupts here
+	TESTB	tdb_stsout+1.B[ESI], #TSO$OUTD>8 ;Is output still done?
+	JE	2$.S			;No!
+	ANDB	tdb_stsout+1.B[ESI], #~{TSO$OUTD>8} ;Yes - but not now
+	STI				;Interrupts are OK now
+	TESTB	tdb_stsout.B[ESI], #TSO$OUTA ;Is output still active?
+	JE	12$.S			;No - no more output wanted
+serresume:				;Yes - need immediate XOFF or XON?
+	TESTB	tdb_stsout+1.B[ESI], #{TSO$FRCXOFF|TSO$FRCXON}>8
+	JNE	16$			;Yes
+	TESTB	tdb_stsout.B[ESI], #TSO$HOLDS|TSO$HOLDP
+					;No - should we hold output?
+	JNE	22$			;Yes
+	TESTB	tdb_flow.B[ESI], #TFC$ODSR|TFC$OCTS
+					;Using DSR or CTS flow control?
+	JE	6$.S			;No
+	MOVB	AH, #20			;Yes - assume using DSR
+	TESTB	tdb_flow.B[ESI], #TFC$OCTS ;Right?
+	JE	4$.S			;Yes
+	MOVB	AH, #10			;No - using CTS
+4$:	MOVL	EDX, tdb_bioreg[ESI]	;Read the modem status register
+	A2IOP	P_COMMODMSTS
+	INB	[DX]
+	TESTB	AL, AH			;Is the bit set?
+	JE	20$.S			;No - hold output
+6$:	CMPL	tdb_outrcnt[ESI], #0.B	;Have anything to output now?
+	JNE	7$.S			;Yes
+	JMP	knlTrmDoEcho##		;No - go see if need to echo now
+
+7$:	MOVL	EBX, tdb_scoutrtak.B[ESI] ;Get taker pointer
+	MOVL	EAX, tdb_scoutring.B[ESI]
+	MOVB	AL, [EAX+EBX]		;Get character
+	INCL	EBX			;Bump pointer
+	CMPL	EBX, tdb_scoutrsize.B[ESI] ;At end of ring?
+	JB	8$.S			;No
+	CLRL	EBX			;Yes
+8$:	MOVL	tdb_scoutrtak.B[ESI], EBX
+	DECL	tdb_outrcnt[ESI]
+10$:	MOVL	EDX, tdb_bioreg[ESI]	;Point to the data register
+	OUTB	[DX]			;Output the character
+	ORB	tdb_stsout.B[ESI], #TSO$OUTA
+	MOVB	tdb_scouttoc.B[ESI], #2	;Start the output timer
+	INCL	tdb_charout[ESI]	;Count the character
+12$:	TESTB	tdb_stsout+1.B[ESI], #TSO$FLOUT>8 ;Are we flushing output?
+	JNE	14$.S			;Yes - don't wake up unless empty
+	CMPL	tdb_outrcnt[ESI], #12t.B  ;Is output buffer almost empty?
+	JBE	knlTrmOutDone##		;Yes - see if should wake up someone
+	RET				;No
+
+14$:	CMPL	tdb_outrcnt[ESI], #0.B	;Is output buffer empty?
+	JE	knlTrmOutDone##		;Yes - go wake up someone
+	RET
+
+;Here if need immediate XOFF output
+
+16$:	MOVB	AL, #XOF		;Assume need XOFF character
+	TESTB	tdb_stsout+1.B[ESI], #TSO$FRCXON>8 ;Right?
+	JE	18$.S			;Yes
+	MOVB	AL, #XON		;No - need XON
+18$:	ANDB	tdb_stsout+1.B[ESI], #~{{TSO$FRCXOFF|TSO$FRCXON}>8}
+	JMP	10$.S			;Output the character
+
+;Here if should hold output
+
+20$:	ORB	tdb_stsout.B[ESI], #TSO$HOLDS
+22$:	ANDB	tdb_stsout.B[ESI], #~{TSO$OUTA}&0FFh
+	MOVB	tdb_scouttoc.B[EDI], #0	;Stop the output timer
+	RET				;Output not active now
+.PAGE
+	.SBTTL	tf_open - seropen - Open device
+
+;Here for the tf_open dispatch - Open device - this routine sets the baud rate
+;  to the initial value and sets up the DTR and RTS modem control outputs as
+;  follows:
+;    RTS: reverse RTS flow control: CLEAR
+;         otherwise:                SET
+;    DTR: reverse DTR flow control: CLEAR
+;         full modem control:       CLEAR
+;         otherwise:                SET
+;	c{ESI} = Offset of TDB
+;	CALL	seropen
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+
+seropen:CALL	seridle			;Make sure set to idle state
+	BTL	SS:xffCmd##, #O%PHYS	;Are we open for physical I/O?
+	JC	setinte.S		;Yes - skip ctl lines
+	MOVB	AL, #0FFh		;Assume should set RTS
+	TESTB	tdb_flow.B[ESI], #TFC$IRTS ;RTS flow control?
+	JE	2$.S			;No - always set RTS
+	TESTB	tdb_flow.B[ESI], #TFC$IREV ;Is it reversed?
+	JE	2$.S			;No
+	NOTB	AL			;Yes
+2$:	CALL	sersetrts
+	MOVB	AL, #0			;Assume should clear DTR
+	TESTB	tdb_modem.B[ESI], #TMC$FMODEM ;Full modem control?
+	JNE	6$.S			;Yes - clear DTR
+	TESTB	tdb_flow.B[ESI], #TFC$IDTR ;No - DTR input flow control?
+	JE	4$.S			;No - set DTR
+	TESTB	tdb_flow.B[ESI], #TFC$IREV ;Yes - is it reversed
+	JNE	6$.S			;Yes - clear DTR
+4$:	NOTB	AL			;No - set DTR
+6$:	CALL	sersetdtr
+setinte:MOVB	tdb_scintenb.B[ESI], #07h ;Assume no dataset interrupts
+	TESTB	tdb_modem.B[ESI], #TMC$DATASET|TMC$FMODEM ;Modem control?
+	JNE	8$.S			;Yes - enable dataset interrupts
+	TESTB	tdb_flow.B[ESI], #TFC$ODSR|TFC$OCTS
+					;No - using dataset inputs for output
+					;  flow control?
+	JE	10$.S			;No
+8$:	MOVB	tdb_scintenb.B[ESI], #0Fh ;Yes - enable dataset interrupts
+10$:	MOVL	EDX, tdb_bioreg[ESI]	;Point to interrupt enable register
+	INCL	EDX
+	MOVB	AL, tdb_scintenb.B[ESI]
+	OUTB	[DX]			;Enable desired interrupts
+	RET
+.PAGE
+	.SBTTL	tf_idle - seridle - Set to idle state
+
+;Here for the tf_idle dispatch - Set to idle state
+;	c{ESI} = Offset of TDB
+;	CALL	seridle
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+
+seridle:
+	MOVB	AL, tdb_icsize.B[ESI]	;Set parameters to their idle values
+	MOVB	tdb_csize.B[ESI], AL
+	MOVB	AL, tdb_ipar.B[ESI]
+	MOVB	tdb_par.B[ESI], AL
+	MOVL	EAX, tdb_ioutr.B[ESI]
+	MOVL	tdb_outr.B[ESI], EAX
+	CALL	setbaudrate		;Set the hardware to match
+	MOVL	EAX, tdb_iinpr[ESI]
+	MOVL	tdb_inpr.B[ESI], EAX
+	CLRL	EAX
+	TESTB	tdb_stsmisc.B[ESI], #TSM$SESSION ;Are sessions enabled?
+	JE	4$.S			;No - take ctl lines down
+	MOVB	AL, #0FFh		;Yes - put ctl lines up
+4$:	PUSHL	EAX
+	CALL	sersetrts
+	POPL	EAX
+	TESTB	tdb_modem.B[ESI], #TMC$DATASET ;Is this a modem line?
+	JE	6$.S			;No
+	CLRL	EAX			;Yes - force DTR low!
+6$:	CALL	sersetdtr
+	JMP	setlhw			;And return
+.PAGE
+	.SBTTL	tf_outchr - serdoutchr - Output character at main program level
+
+;Here for the tf_outchr dispatch - Output character at main program level
+;	c(AL)  = Character to output
+;	c{ESI} = Offset of TDB
+;	CALL	serdoutchr
+;	c{EAX} = Error code
+;	c{ECX} = Number of bytes output
+;	c{EBX} = Status bits
+
+serdoutchr:
+	TESTB	tdb_stsout.B[ESI], #TSO$JUNK|TSO$JUNKX|TSO$HOLDS|TSO$HOLDP
+					;Should we junk or hold output?
+	JNE	6$.S			;Yes
+2$:	CALL	soutchr			;No - store character in output buffer
+	JC	10$.S
+4$:	CLRL	EAX			;Indicate output 1 character
+	MOVL	ECX, #1
+	MOVL	EBX, #QSTS$DONE
+ret006:	RET				;Finished
+
+;Here if should junk or hold character
+
+6$:	TESTB	tdb_stsout.B[ESI], #TSO$JUNK|TSO$JUNKX ;Holding output?
+	JNE	4$.S			;No
+10$:	CLRL	EAX			;Nothing output, indicate should
+	CLRL	ECX			;  wait
+	MOVL	EBX, #QSTS$WAIT
+	RET
+.PAGE
+	.SBTTL	tf_doutblk - serdoutblk - Output block at main program level
+
+;Here for the tf_doutblk dispatch - Output block at main program level
+;	c{ECX}    = Number of characters to output
+;	c{ES:EBX} = Address of block
+;	c{ESI}    = Offset of TDB
+;	CALL	serdoutblk
+;	c{EAX} = Error code
+;	c{ECX} = Number of bytes output
+;	c{EBX} = Status bits
+
+serdoutblk:
+	CLRL	EDX			;Initialize count
+2$:	FROMFORK
+	IFFAULT	outae
+	MOVB	AL, ES:[EBX]		;Get character
+	TOFORK
+	TESTB	tdb_stsout.B[ESI], #TSO$JUNK|TSO$JUNKX|TSO$HOLDS|TSO$HOLDP
+					;Are we junking or holding output?
+	JNE	6$.S			;Yes
+4$:	CALL	soutchr			;No - store character in output buffer
+	JC	outwt.S			;If no more room
+	INCL	EBX			;Bump pointer
+	INCL	EDX			;Bump count
+	LOOP	ECX, 2$			;Loop if more to output
+outdn:	MOVL	EBX, #QSTS$DONE
+outrtn:	MOVL	ECX, EDX		;Get count in right register
+	CLRL	EAX
+	RET				;Finished
+
+;Here if junking or holding output
+
+6$:	TESTB	tdb_stsout.B[ESI], #TSO$JUNK|TSO$JUNKX ;Holding output?
+	JE	outwt.S			;Yes
+8$:	ADDL	EDX, ECX		;No - report that everything was ouput
+	JMP	outdn.S
+
+;Here if should hold output
+
+outwt:	MOVL	EBX, #QSTS$WAIT		;Indicate should wait
+	JMP	outrtn.S
+
+	FAULTHDR
+outae:	MOVL	EAX, #ER_ADRER
+	MOVL	ECX, EDX
+	MOVL	EBX, #QSTS$DONE
+	RET
+.PAGE
+	.SBTTL	tf_outstr - serdoutstr - Output string at main program level
+
+;Here for the tf_outstr dispatch - Output string at main program level
+;	c{ES:EBX} = Address of string
+;	c{ESI}    = Offset of TDB
+;	CALL	serdoutstr
+;	c{EAX} = Error code
+;	c{ECX} = Number of bytes output
+;	c{EBX} = Status bits
+
+serdoutstr:
+	CLRL	EDX			;Initialize count
+2$:	FROMFORK
+	IFFAULT	outae
+	MOVB	AL, ES:[EBX]		;Get character
+	TOFORK
+	TESTB	AL, AL			;End?
+	JE	outdn.S			;Yes
+	TESTB	tdb_stsout.B[ESI], #TSO$JUNK|TSO$JUNKX|TSO$HOLDS|TSO$HOLDP
+					;No - junking or holding output?
+	JNE	8$.S			;Yes
+4$:	CALL	soutchr			;No - store character in output buffer
+	JC	outwt.S			;If must wait
+6$:	INCL	EBX			;Bump pointer
+	INCL	EDX			;Bump count
+	JMP	2$			;Continue
+
+;Here if junking or holding output (get here at fork level)
+
+8$:	TESTB	tdb_stsout.B[ESI], #TSO$JUNK|TSO$JUNKX ;Holding output?
+	JE	outwt.S			;Yes
+	JMP	6$.S			;No - must be junking output
+.PAGE
+	.SBTTL	tf_qoutblk - serqoutblk - Output block at fork level
+
+;Here for the tf_qoutblk dispatch - Output block at fork level
+;	c{ECX}    = Number of characters to output
+;	c{ES:EBX} = Address of block
+;	c{ESI}    = Offset of TDB
+;	CALL	serqoutblk
+;	c{EAX} = Error code
+;	c{ECX} = Amount output
+;	c{ESI} = Status bits
+
+serqoutblk:
+	CLRL	EDX			;Initialize count
+	ORB	tdb_stsout+1.B[ESI], #TSO$QOWAIT>8
+	TESTB	tdb_omode+3.B[ESI], #{TOM$PLP1|TOM$PLP2}>24t
+					;Want PLP packet output?
+	JNE	20$.S			;Yes
+2$:	TESTB	tdb_stsout.B[ESI], #TSO$JUNK|TSO$JUNKX|TSO$HOLDS|TSO$HOLDP
+					;Are we junking or holding output?
+	JNE	12$.S			;Yes
+	IFFAULT	knlRtnAdrEr##
+4$:	MOVB	AL, ES:[EBX]		;Get character
+	CALL	soutchr			;Store character in output buffer
+	JC	14$.S			;If no more room
+	INCL	EBX			;Bump pointer
+	INCL	EDX			;Bump count
+	LOOP	ECX, 4$			;Loop if more to output
+6$:	CLRL	EAX			;Return 0
+8$:	MOVL	ECX, EDX		;Get count in right register
+10$:	MOVL	EBX, #QSTS$DONE
+	ANDB	tdb_stsout+1.B[ESI], #~{TSO$QOWAIT>8}
+	RET				;Finished
+
+;Here if want to junk or hold output
+
+12$:	TESTB	tdb_stsout.B[ESI], #TSO$JUNK|TSO$JUNKX ;Holding output?
+	JE	14$.S			;Yes
+	ADDL	ECX, EDX		;No - just return and say we output
+	CLRL	EAX			;  everything
+	JMP	10$.S
+
+;Here if need to wait
+
+14$:	CALL	knlXfWaitNTO##		;Wait until have space
+	JNC	2$.S			;Go on if OK
+	JMP	8$.S			;If error
+
+18$:	POPL	ECX
+	JMP	8$.S
+
+;Here to output PLP packets
+
+20$:	MOVB	AL, #0F0h		;Get beginning of packet character
+	CALL	soutchrw		;Store it
+	JC	8$.S
+	IFFAULT	knlRtnAdrEr##
+22$:	MOVB	AL, ES:[EBX]		;Get character
+	CMPB	AL, #'S'-40h		;Might this be XON or XOFF?
+	JA	26$.S			;No
+	JE	24$.S			;If XOFF
+	CMPB	AL, #'Q'-40h		;XON?
+	JNE	30$.S			;No - its not special
+24$:	TESTB	tdb_omode+3.B[ESI], #TOM$PLP2>24t ;Should we prefix this?
+	JE	30$.S			;No
+	SUBB	AL, #13t		;Yes
+	JMP	28$.S
+
+26$:	CMPB	AL, #0F0h		;Special character?
+	JB	30$.S			;No
+	CMPB	AL, #0F2h		;Maybe
+	JA	30$.S			;No
+	SUBB	AL, #0EFh
+28$:	PUSHL	EAX			;Yes - save character
+	MOVB	AL, #0F2h		;Output prefix character
+	CALL	soutchrw
+	JC	18$.S
+	POPL	EAX			;Get code
+30$:	CALL	soutchrw		;Output it
+	JC	8$.S
+	INCL	EBX			;Bump pointer
+	INCL	EDX			;Bump count
+	LOOP	ECX, 22$		;Loop if more to output
+	MOVB	AL, #0F1h		;Get end of packet character
+	CALL	soutchrw		;Output it
+	JNC	6$.S			;If OK
+	JMP	8$.S			;If error
+.PAGE
+
+soutchrw:
+	CALL	soutchr			;Output character
+	JNC	6$.S			;If OK
+	PUSHL	EAX			;Need to wait - save character
+	CALL	knlXfWaitNTO##		;Wait
+	JC	4$.S			;If error while waiting
+	POPL	EAX			;OK - restore character
+	JMP	soutchrw.S		;Try again
+
+;Here if error
+
+4$:	ADDL	ESP, #4t.B		;Discard character
+	STC				;Indicate error
+6$:	RET
+.PAGE
+	.SBTTL	tf_qoutstr - serqoutstr - Output string at fork level
+
+;Here for the tf_outstrf dispatch - Output string at fork level
+;	c{ES:EBX} = Address of string
+;	c{ESI}    = Offset of TDB
+;	CALL	serqoutstr
+;	c{EAX} = Error code
+;	c{ECX} = Amount output
+;	c{ESI} = Status bits
+
+serqoutstr:
+	CLRL	ECX			;Initialize count
+	ORB	tdb_stsout+1.B[ESI], #TSO$QOWAIT>8
+	IFFAULT	knlRtnAdrEr##
+2$:	MOVB	AL, ES:[EBX]		;Get character
+	CMPB	AL, #0			;Finished?
+	JE	8$.S			;Yes
+	TESTB	tdb_stsout.B[ESI], #TSO$JUNK|TSO$JUNKX ;Are we junking output?
+	JNE	6$.S			;Yes
+	TESTB	tdb_stsout.B[ESI], #TSO$HOLDS|TSO$HOLDP ;Are we holding output?
+	JNE	14$.S			;Yes
+	CALL	soutchr			;No - store character in output buffer
+	JC	14$.S			;If no more room
+6$:	INCL	EBX			;Bump pointer
+	INCL	ECX			;Bump count
+	JMP	2$.S			;Continue
+
+;Here when finished
+
+8$:	CLRL	EAX			;Return 0
+10$:	MOVL	EBX, #QSTS$DONE
+	ANDB	tdb_stsout+1.B[ESI], #~{TSO$QOWAIT>8}
+	RET				;Finished
+
+;Here if need to wait
+
+14$:	CALL	knlXfWaitNTO##
+	JNC	2$.S			;Go on if OK
+	JMP	10$.S			;If error
+.PAGE
+	.SBTTL	tf_clrout - serclrout - Clear output ring buffer
+
+;Here for the tf_clrout dispatch - Clear output ring buffer
+
+serclrout:
+	CLRL	EAX
+	MOVL	tdb_scoutrput[ESI], EAX	;Reset putter and taker pointers
+	MOVL	tdb_scoutrtak[ESI], EAX
+	MOVL	tdb_outrcnt[ESI], EAX	;Clear the count
+	RET
+.PAGE
+	.SBTTL	soutchr - Subroutine to store character in output ring
+
+;Subroutine to store character in output ring - may only be called at fork level
+;	c(AL) = Character
+;	c{ESI} = Offset of TDB
+;	CALL	soutchr
+;	C:set = Must wait, no output done
+;	C:clr = Normal
+;  All registers are preserved
+
+soutchr:PUSHL	EDX
+	MOVL	EDX, tdb_scoutrsize.B[ESI] ;Room for more now?
+	SUBL	EDX, #3.B
+	CMPL	tdb_outrcnt[ESI], EDX
+	JA	8$.S			;No
+	MOVL	EDX, tdb_scoutrput.B[ESI] ;Get putter pointer
+	PUSHL	ECX
+	MOVL	ECX, tdb_scoutring.B[ESI]
+	MOVB	[ECX+EDX], AL		;Store character in ring
+	POPL	ECX
+	INCL	EDX			;Bump pointer
+	CMPL	EDX, tdb_scoutrsize.B[ESI]
+	JB	2$.S
+	CLRL	EDX
+2$:	MOVL	tdb_scoutrput.B[ESI], EDX
+	INCL	tdb_outrcnt[ESI]	;Bump count
+	POPL	EDX
+	TESTB	tdb_stsout.B[ESI], #TSO$OUTA ;Is output active now?
+	JNE	4$.S			;Yes
+	ORB	tdb_stsout.B[ESI], #TSO$OUTA ;No - indicate output is active now
+	PUSHAL
+	PUSHL	ES
+	CALL	serresume		;Start output
+	POPL	ES
+	POPAL
+4$:	CLC				;Indicate character stored
+	RET				;And return
+
+;Here if must wait
+
+8$:	POPL	EDX
+	STC				;Indicate must wait
+ret008:	RET				;And return
+.PAGE
+	.SBTTL	sechchr - Subroutine to echo character
+
+;Subroutine to echo character - may only be called at fork level
+;	c(AL) = Character
+;	c{ESI} = Offset of TDB
+;	CALL	serechchr
+;	C:set = Should stop echoing
+;	C:clr = Can continue echoing if need to
+
+serechchr:
+	MOVL	EDX, tdb_scoutrsize.B[ESI] ;Room for more now?
+	SUBL	EDX, #3.B
+	CMPL	tdb_outrcnt[ESI], EDX
+	JA	4$.S			;No
+	MOVL	EDX, tdb_scoutrput.B[ESI] ;Yes - get putter pointer
+	MOVL	ECX, tdb_scoutring.B[ESI]
+	MOVB	[ECX+EDX], AL		;Store character in ring
+	INCL	EDX			;Bump pointer
+	CMPL	EDX, tdb_scoutrsize.B[ESI] ;At end of ring?
+	JB	2$.S			;No
+	CLRL	EDX			;Yes
+2$:	MOVL	tdb_scoutrput.B[ESI], EDX ;Store updated putter pointer
+	INCL	tdb_outrcnt[ESI]	;Bump count
+	MOVL	EDX, tdb_scoutrsize.B[ESI] ;See if still have room
+	SUBL	EDX, #4.B
+	CMPL	tdb_outrcnt[ESI], EDX
+4$:	CMC
+	RET
+.PAGE
+	.SBTTL	tf_dspmode - serdspmode - Get or set display mode
+
+;Here for the tf_dspmode dispatch - Get or set display mode
+;	c{EAX}    = Display mode bits
+;	c{ES:EBX} = Address of data block
+;	CALL	serdspmode
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  c{EAX} = Current display mode
+
+serdspmode:
+	CMPB	AL, #0FFh		;Setting to "serial port" mode?
+	JE	4$.S			;Yes - thats OK
+	TESTB	AL, AL			;No - just want current mode?
+	JNE	knlBadValue##		;No - fail
+4$:	BTL	EAX, #DM%RTNDATA	;Want values returned?
+	JNC	6$.S			;No
+	CLRL	EAX			;Yes - zero stuff we don't support
+	IFFAULT	knlRtnAdrEr##		;Clear dm_textres, dm_prifont, and
+	MOVL	ES:[EBX], EAX		;  dm_secfont
+	IFFAULT	knlRtnAdrEr##
+	MOVL	ES:dm_disptype.B[EBX], EAX
+	MOVL	ES:dm_horiz.B[EBX], EAX
+	MOVL	ES:dm_vert.B[EBX], EAX
+	MOVL	ES:dm_columns.B[EBX], #80t ;THESE SHOULD BE DYNAMIC!!!!!
+	MOVL	ES:dm_rows.B[EBX], #24t
+6$:	MOVL	EAX, #0FFh		;Yes - indicate "serial port" mode
+	RET				;Thats all
+.PAGE
+	.SBTTL	tf_setdtr - sersetdtr - Set or clear the DTR output
+
+;Here for the tf_setdtr dispatch - Set or clear the DTR modem control output
+;	c(AL)  = New state for bit
+;	c{ESI} = Offset of TDB
+;	CALL	sersetdtr
+
+sersetdtr:
+	CMPB	AL, #0			;Want to set the bit?
+	JNE	2$.S			;Yes
+	ANDB	tdb_scmdcon.B[ESI], #~CMMDC$DTR ;No - clear the bit
+	JMP	4$.S
+
+2$:	ORB	tdb_scmdcon.B[ESI], #CMMDC$DTR ;Set the bit
+4$:	MOVL	EDX, tdb_bioreg[ESI]
+	ADDL	EDX, #P_COMMODMCON.B	;Point to modem control reg
+	MOVB	AL, tdb_scmdcon.B[ESI]	;Set the hardware register
+	OUTB	[DX]
+	RET
+
+	.SBTTL	tf_setrts - sersetrts - Set or clear the RTS output
+
+;Here for the tf_setrts dispatch - Set or clear the RTS modem control output
+;	c(AL)  = New state for bit
+;	c{ESI} = Offset of TDB
+;	CALL	sersetrts
+
+sersetrts:
+	CMPB	AL, #0			;Want to set the bit?
+	JNE	6$.S			;Yes
+	ANDB	tdb_scmdcon.B[ESI], #~CMMDC$RTS ;No - clear the bit
+	JMP	4$.S
+
+6$:	ORB	tdb_scmdcon.B[ESI], #CMMDC$RTS ;Set the bit
+	JMP	4$.S
+.PAGE	
+	.SBTTL	tf_getdsb - sergetdsb - Get data set bits
+
+;Here for the tf_getdsb dispatch - Get data set bits
+;	c{ESI} = Offset of TDB
+;	CALL	sergetdsb
+;	c(AL) = Current data set bits:
+;		  Bit 4 = CTS
+;		  Bit 5 = DTR
+
+sergetdsb:
+	MOVL	EDX, tdb_bioreg[ESI]	;Get the current modem bits
+	ADDL	EDX, #P_COMMODMSTS.B
+	CLRL	EAX
+	INB	[DX]
+	RET
+.PAGE
+	.SBTTL	tf_finout - serfinout - Ensure that output is complete
+
+;Here for the tf_finout dispatch - Ensure that output is complete
+;	c{ESI} = Offset of TDB
+;	CALL	serfinout
+
+serfinout:
+	MOVL	EAX, #300t*XT_MILLISEC	;Wait for about 1/3 second while the
+	JMP	knlXfTimeWait##		;  UART empties out!
+.PAGE
+	.SBTTL	seroad - Once-a-second routine
+
+;Once-a-second routine
+
+sercoas:MOVL	ESI, sercftdb		;Point to our first TDB
+2$:	CMPB	tdb_scouttoc.B[ESI], #0	;Are we timing output?
+	JE	6$.S			;No
+	DECB	tdb_scouttoc.B[ESI]	;Yes - count it down
+	JNE	6$.S			;If not timed-out
+	INCL	tdb_schungcnt.B[ESI]	;Timed-out - count it
+	TOFORK				;Fake up an output done interrupt
+	CALL	seroutrdy
+	MOVL	EDX, tdb_bioreg[ESI]	;Point to interrupt enable register
+	INCL	EDX
+	MOVB	AL, tdb_scintenb.B[ESI]	;Make sure interrupts are enabled
+	OUTB	[DX]
+	FROMFORK
+6$:	TESTB	tdb_stsout.B[ESI], #TSO$HOLDS|TSO$HOLDP
+					;Are we holding output now?
+	JE	14$.S			;No
+	TESTB	tdb_flow.B[ESI], #TFC$OCTS|TFC$ODSR
+					;Yes - using hardware flow control?
+	JE	14$.S			;No
+	MOVB	AH, #10h		;Assume using CTS
+	TESTB	tdb_flow.B[ESI], #TFC$OCTS ;Right?
+	JNE	8$.S			;Yes
+	MOVB	AH, #20h		;No - using DTR
+8$:	MOVL	EDX, tdb_bioreg[ESI]	;Get the current modem bits
+	ADDL	EDX, #P_COMMODMSTS.B
+	TOFORK
+	INB	[DX]
+	TESTB	tdb_flow.B[ESI], #TFC$OREV ;Is the sense reversed?
+	JE	10$.S			;No
+	NOTB	AL			;Yes
+10$:	TESTB	AL, AH			;Is the bit still clear?
+	JE	12$.S			;Yes
+	ANDB	tdb_stsout.B[ESI], #~{TSO$HOLDS|TSO$HOLDP} ;No - restart output
+	CALL	serresume
+12$:	FROMFORK
+14$:	MOVL	ESI, tdb_nexts.B[ESI]	;Advance to next TDB
+	TESTL	ESI, ESI		;Any more?
+	JNE	2$			;Yes - continue
+	RET				;No - finished
+.PAGE
+	.SBTTL	Data
+
+	DATA
+
+	.MOD	4
+sercftdb:.LONG	0		;Offset of first serial interface TDB
+sercltdb:.LONG	0		;Offset of last serial interface TDB
+sercfbdb:.LONG	0		;Offset of first board data block (BDB)
+irqname: .LONG	'TRMs', 'erc', 0, 0
+
+	LKEEND

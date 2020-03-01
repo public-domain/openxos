@@ -1,0 +1,3448 @@
+	.TITLE	USRDPMI - XOS user mode kernel DPMI routines
+
+;++++
+; This software is in the public domain.  It may be freely copied and used
+; for whatever purpose you see fit, including commerical uses.  Anyone
+; modifying this software may claim ownership of the modifications, but not
+; the complete derived code.  It would be appreciated if the authors were
+; told what this software is being used for, but this is not a requirement.
+
+;   THIS SOFTWARE IS PROVIDED BY THE AUTHORS "AS IS" AND ANY EXPRESS OR
+;   IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
+;   OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+;   IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+;   INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+;   BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS
+;   OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+;   ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR
+;   TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
+;   USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+;----
+
+	.PROC	80486
+	.INCLUD	XOSINC:\XMAC\XOS.PAR
+	.INCLUD	XOSINC:\XMAC\XOSX.PAR
+	.INCLUD	XOSINC:\XMAC\XOSDOS.PAR
+	.INCLUD	XOSINC:\XMAC\XOSDPMI.PAR
+	.INCLUD	XOSINC:\XMAC\XOSERR.PAR
+	.INCLUD	SVCDEF.INC
+	.INCLUD	PROT.INC
+
+	VUSERCODE
+	.STK16
+
+;Subroutine to switch to protected mode (this is real mode code)
+;	c(AX) = Flag bits:
+;		  Bit  0   : 0 = 16 bit, 1 = 32 bit
+;		  BIts 1-15: Reserved, should be zero
+;	c[ES] = Real mode selector for the DPMI host data area
+;	CALLF	dpmisetup
+;	C:set = Error (still in real mode)
+;	  c[AX] = DPMI error code
+;	C:clr = Normal (now in protected mode)
+;	  c[CS] = 16-bit selector with base of real mode CS and 64KB limit
+;	  c[SS] = Selector with base of real mode SS and 64KB limit
+;	  c[DS] = Selector with base of real mode DS and 64KB limit
+;	  c[ES] = Selector for program's PSP with 256 byte limit
+;	  c[FS] = 0
+;	  c[GS] = 0
+
+dpmisetup::
+	PUSHL	EAX
+	PUSHL	EBX
+	PUSHW	DI			;First clear the host data area
+	PUSHW	CX
+	CLRW	DI
+	MOVW	CX, #hda_SIZE/2
+	CLD
+	CLRW	AX
+	RSTOSW	[DI]
+	POPW	CX
+	POPW	DI
+	MOVZWL	EBX, SP
+	PUSHW	FS			;Save FS and GS on the original stack
+	PUSHW	GS			;  so can restore them if have error
+	PUSHW	SS
+	POPW	FS
+	PUSHW	ES			;Switch to the new real mode stack
+	POPW	SS			;  (FS:BX points to the original stack)
+	MOVL	ESP, #hda_rstk-30h
+	MOVW	SS:hda_rstk-4h, FS	;Store original SS
+	MOVW	AX, FS:0Ah.B[BX]	;Store CS
+	MOVW	SS:hda_rstk-14h, AX
+	MOVZWL	EAX, FS:8h.B[BX]	;Store EIP
+	MOVL	SS:hda_rstk-18h, EAX
+	MOVW	SS:hda_rstk-1Ch, DS	;Store DS
+	MOVL	EAX, FS:4h.B[BX]	;Store saved EAX
+	MOVL	SS:hda_rstk-2Ch, EAX
+	MOVL	EAX, FS:[BX]		;Store saved EBX
+	MOVL	SS:hda_rstk-30h, EAX
+	ADDW	BX, #0Ch.B		;Adjust the caller's stack pointer
+	MOVL	SS:hda_rstk-8h, EBX	;Store original SP
+	MOVL	SS:hda_magic, #'DPMI'	;Store the magic number
+	MOVL	SS:hda_rguard, #'RGRD'	;And store the stack guard values
+	MOVL	SS:hda_iguard, #'IGRD'
+	MOVW	SS:hda_isp, #DPMIISTKSZ	;Initialize the internal stack pointer
+	CLRW	AX
+	MOVW	GS, AX			;Point to the PSP
+	MOVW	FS, GS:dda_curpsp
+	MOVW	SS:hda_rstk-20h, FS
+	MOVW	AX, FS:psp_env		;Store environment selector
+	MOVW	SS:hda_rstk-24h, AX
+	PUSHL	SS:hda_rstk-2Ch		;Stack caller's EAX value
+	PUSHW	SS			;Stack address of data block
+	PUSHW	#hda_rstk-28h
+	CALLF	realDpmiSetup#		;Set up the initial protected mode
+	TESTW	AX, AX			;  segments
+	JS	8$			;If error
+	MOVL	EDX, GS:dda_dpmihda	;Do we have a current DPMI client?
+	TESTL	EDX, EDX
+	JE	4$.S			;No - go on
+	CMPB	GS:dda_dpmiactive, #0	;Yes - is it active now?
+	JE	2$.S			;No
+	MOVL	EAX, GS:dda_dpmilckpESP	;Yes - save its state
+	MOVL	GS:hda_lckpESP.B[EDX], EAX
+	MOVL	EAX, GS:dda_dpmilckpSS
+	MOVL	GS:hda_lckpSS.B[EDX], EAX
+	MOVL	EAX, GS:dda_dpmicurpESP
+	MOVL	GS:hda_curpESP.B[EDX], EAX
+	MOVL	EAX, GS:dda_dpmicurpSS
+	MOVL	GS:hda_curpSS.B[EDX], EAX
+	MOVL	EAX, GS:dda_dpmilckrSSSP
+	MOVL	GS:hda_lckrSSSP.B[EDX], EAX
+	MOVL	EAX, GS:dda_dpmicurrSSSP
+	MOVL	GS:hda_currSSSP.B[EDX], EAX
+	MOVB	AL, GS:dda_dpmitype
+	MOVB	GS:hda_type.B[EDX], AL
+	MOVB	AL, GS:dda_dpmilckpsflg
+	MOVB	GS:hda_lckpsflg.B[EDX], AL
+2$:	MOVW	SS:hda_prev, DX		;Link our HDA to the list
+4$:	INCB	GS:dda_dpminum		;Bump the DPMI client number
+	MOVB	AL, GS:dda_dpminum	;Store it in our HDA
+	MOVB	SS:hda_num, AL
+	MOVW	GS:dda_dpmihda, SS
+	MOVB	AL, #DPMIT_16B		;Assume want 16 bit client
+	TESTB	SS:hda_rstk-2Ch, #01h	;Right?
+	JE	6$.S			;Yes
+	INCW	AX			;No - want 32 bit client
+6$:	MOVB	SS:hda_type, AL		;Store DPMI client type
+	MOVB	GS:dda_dpmitype, AL
+	MOVB	SS:dda_dpmilckpsflg, #0	;Not using locked protected mode stack
+	MOVW	AX, SS:hda_rstk-28h	;Store address of the protected mode
+	MOVW	SS:hda_lckpSS, AX	;  locked stack
+	MOVW	GS:dda_dpmilckpSS, AX
+	MOVW	SS:hda_curpSS, AX
+	MOVW	GS:dda_dpmicurpSS, AX
+	MOVL	EAX, #1000
+	MOVL	SS:hda_lckpESP, EAX
+	MOVL	GS:dda_dpmilckpESP, EAX
+	MOVL	SS:hda_curpESP, EAX
+	MOVL	GS:dda_dpmicurpESP, EAX
+	MOVW	SS:hda_lckrSSSP+0, #hda_rstk ;Set the real mode stack pointer
+	MOVW	SS:hda_currSSSP+0, #hda_rstk
+	MOVW	GS:dda_dpmilckrSSSP+0, #hda_rstk
+	MOVW	GS:dda_dpmicurrSSSP+0, #hda_rstk
+	MOVW	SS:hda_lckrSSSP+2, SS
+	MOVW	SS:hda_currSSSP+2, SS
+	MOVW	GS:dda_dpmilckrSSSP+2, SS
+	MOVW	GS:dda_dpmicurrSSSP+2, SS
+	MOVW	AX, SS:hda_rstk-24h	;Get the protected environment selector
+	MOVW	FS:psp_env, AX		;Update the environment pointer
+	MOVB	FS:psp_protflg, #1	;Indicate have protected mode selectors
+	MOVW	SS:hda_rstk-24h, #0	;Store 0 for FS and GS
+	MOVW	SS:hda_rstk-28h, #0
+	MOVL	SS:hda_rstk-0Ch, #0
+	MOVL	SS:hda_rstk-10h, #200h
+	MOVB	GS:dda_dpmiactive, #1	;Indicate DPMI is active
+	POPL	EBX			;Restore EBX
+	POPL	EAX			;Restore EAX
+	CALLF	realSchDismiss#		;"Return" to protected mode
+
+;Here if error doing set up
+;	c[FS] = Old SS value
+;	c[BX] = Old SP value - 4
+
+8$:	PUSHW	FS			;Restore the original stack
+	IFFCALL	badusrstk#
+	POPW	SS
+	LEAW	SP, -16t.B[BX]
+	POPW	GS			;Restore GS and FS
+	POPW	FS
+	POPL	EBX			;Restore EBX
+	POPL	EAX			;Restore EAX
+	MOVW	AX, #DPMIER_NODESC	;Get error code
+	STC				;Indicate error
+	RETF				;Return
+.PAGE
+	.SBTTL	callrealrtn - Real mode return routine for functions 03xx
+
+;Real mode return routine for functions 03xx - this code is executed when the
+;  user's real mode routine executes its RET or IRET
+
+callrealrtn:
+	PUSHL	EAX			;Save registers we need
+	PUSHL	EBX
+	PUSHW	BP
+	PUSHFW				;Get the FR value
+	POPW	AX
+	ORW	AX, #3002h		;Make sure the always 1 bits are set
+	PUSHW	GS			;Save the segment registers
+	PUSHW	FS
+	PUSHW	DS
+	PUSHW	ES
+	PUSHW	AX			;Save the corrected FR value
+	MOVW	BP, SP
+	PUSHW	DX
+	PUSHL	#8.B			;Disable signals
+	CALLF	realSchSetLevel#
+	CLRW	AX
+	MOVW	DS, AX			;Make low memory addressable
+	MOVW	ES, dda_dpmihda
+	MOVW	BX, ES:hda_isp		;Get pointer for the internal DPMI
+	ADDW	BX, #hda_istkbgn	;  stack
+	PUSHL	ES:dis_datasel.B[BX]	;Copy his segment registers and FR
+	PUSHL	ES:dis_dataofs.B[BX]	;  to his register structure (which
+	PUSHW	SS			;  is in protected mode memory)
+	PUSHW	BP
+	PUSHL	#10t.B
+	CALLF	realMemCopy2PM#
+	POPW	DX
+	ADDW	SP, #10t.B
+	PUSHL	ES:dis_pSS.B[BX]	;Stack his protected mode stack pointer
+	PUSHL	ES:dis_pESP.B[BX]
+	CLRL	EAX			;Get EFR value !!!!!!!!
+	PUSHL	EAX			;Put the next two longs of the XOS
+	PUSHL	EAX			;  signal stack frame on the stack
+	MOVL	EAX, ES:dis_rSSSP.B[BX]	;Update his real mode stack pointer
+	MOVL	dda_dpmicurrSSSP, EAX
+	TESTB	ES:dis_type.B[BX], #DISIT$CLSTK ;Are we leaving the real mode
+						;  locked stack?
+	JE	6$.S			;No
+	MOVB	dda_dpmilckrsflg, #0	;Yes - indicate that
+6$:	ADDW	ES:hda_isp, #dis_SIZE.B ;Remove space from the DPMI stack
+	MOVL	EBX, 12t.B[BP]		;Restore registers we used
+	MOVL	EAX, 16t.B[BP]
+	MOVW	BP, 10t.B[BP]
+	PUSHL	#GS_USERCODE|03h	;Construct the rest of the XOS
+	PUSHL	#callrealdone		;  signal stack frame
+	PUSHL	#GS_REAL32|03h
+	PUSHL	#0.B
+	PUSHL	#0.B
+	PUSHL	#0.B
+	CALLF	realSchDismiss#		;Return to protected mode
+
+;Here if the internal DPMI stack frame is invalid
+
+10$:	HLT
+.PAGE
+	.SBTTL	realrawmsw - Routine to do raw mode switch in real mode
+
+;Routine to do raw mode switch in real mode - this routine is called directly
+;  by user programs which obtain its address using INT 31h function 0306h.
+;	c[AX]    = DS value for protected mode
+;	c[CX]    = ES value for protected mode
+;	c[DX]    = SS value for protected mode
+;	c{(E)BX} = (E)SP value for protected mode
+;	c[SI]    = CS value for protected mode
+;	c[(E)DI] = (E)IP value for protected mode
+;	JMPF	realrawmsw
+;  EBP is preserved across the mode switch.  All other registers are set to 0.
+
+realrawmsw:
+	PUSHL	#0.B			;Store GS value
+	PUSHL	#0.B			;Store FS value
+	PUSHL	EAX			;Store DS value
+	PUSHL	ECX			;Store ES value
+	PUSHL	EDX			;Store SS value
+	PUSHL	EBX			;Store ESP value
+	PUSHL	#01000000h		;Store EFR value
+	PUSHL	ESI			;Store CS value
+	PUSHL	EDI			;Store EIP value
+	CLRL	EAX			;Clear other registers
+	CLRL	EBX
+	CLRL	ECX
+	CLRL	EDX
+	CLRL	EDI
+	CLRL	ESI
+	CALLF	realSchIRet#		;Switch modes
+.PAGE
+	.SBTTL	rcallback - Real mode callback routines
+
+;Here for real mode callbacks.  The real mode selector for the data block for
+;  the callback has already been pushed on the stack when get here.
+
+rcallback:
+	MOVZWL	ESP, SP
+	PUSHFW
+	CLI				;No interrupts now
+	PUSHW	DS
+	PUSHW	#0.B
+	POPW	DS
+	POPW	cbda_DS
+	POPW	cbda_FR
+	POPW	cbda_data
+	MOVW	cbda_ES, ES
+	MOVW	cbda_GS, GS
+	MOVW	cbda_FS, FS
+	MOVW	cbda_SS, SS
+	MOVW	cbda_SP, SP
+	MOVL	cbda_EDI, EDI
+	MOVL	cbda_EDX, EDX
+	MOVL	cbda_EAX, EAX	
+	CLRW	AX
+	MOVW	SS, AX
+	MOVW	SP, #cbda_stack
+	MOVL	EDI, #rcbentry32	;Assume 32-bit client
+	CMPB	dda_dpmitype, #DPMIT_32B ;Right
+	JE	2$.S			;Yes
+	ADDL	EDI, #rcbentry16-rcbentry32.B ;No
+2$:	MOVB	dda_dpmilckpsflg, #1	;Indicate using locked stack now
+	MOVL	EAX, dda_dpmilckpESP
+	MOVW	DX, dda_dpmilckpSS
+	MOVW	DS, cbda_data		;Get selector for the callback data
+	PUSHL	EDX
+	PUSHL	EAX
+	PUSHL	#0
+	PUSHL	#800000h
+	PUSHL	#GS_USERCODE|03h
+	PUSHL	EDI
+	PUSHL	#GS_REAL32|03h.B
+	PUSHL	rcb_regs+4
+	MOVZWL	EAX, rcb_SS
+	PUSHL	EAX
+	PUSHL	#0.B
+	MOVL	EDI, rcb_regs+0
+	MOVL	EAX, rcb_addr+0		;Get address of the protected mode
+	MOVW	DX, rcb_addr+4		;  routine to call
+	CALLF	realSchDismiss#		;Switch to protected mode
+.PAGE
+	USERCODE
+	.STK32
+
+	.SBTTL	usvcdpmisetup - Initial DPMI entry
+
+;Here for the svcDpmiSetup SVC in protected mode.  This SVC is executed (in
+;  real mode) by the real mode DPMI entry routine.  Control is than transfered
+;  here in protected mode.  This routine should NEVER be called directly from
+;  protected mode!  This SVC is intended for initialization of the DPMI host
+;  only.  It should not be executed at any other time.  It allocates the
+;  selectors required to map the user's current real mode segments and stores
+;  than in the segment register array.
+;	long   flags;		// Flag bits:
+;				//   Bit     0: Set if 32-bit application
+;				//   Bits 1-15: Not used, should be 0
+;	long   select;		// Selector for host data area
+;	struct regs *regs;	// Address of segment register array
+;	rtn = svcDpmiSetup(flags, selector);
+;  Value returned is 0 if normal or a negative error code if error
+
+;  Format of the segment register array:
+;	struct regs
+;	{   long userGS;	// GS value (size = 1000h, maps locked
+;				//   protected mode stack)
+;	    long userFS;	// FS value (size = 10000h)
+;	    long userES;	// ES value (size = 100h)
+;	    long userDS;	// DS value (size = 10000h)
+;	    long xxx1;		// Not used
+;	    long userCS;	// CS value (size = 10000h)
+;	    long xxx2;		// Not used
+;	    long xxx3;		// Not used
+;	    long xxx4;		// Not used
+;	    long userSS;	// SS value (size = 10000h)
+;	};
+;  Note that this array places the segment register values in the correct
+;  relative positions for an XOS software signal stack frame with no
+;  signal data.  The unused locations are not modified by this SVC.
+
+$$$=!0
+BLK userGS , 4t
+BLK userFS , 4t
+BLK userES , 4t
+BLK userDS , 4t
+BLK userEIP, 4t
+BLK userCS , 4t
+BLK userEFR, 4t
+BLK userx  , 4t
+BLK userESP, 4t
+BLK userSS , 4t
+
+$$$=!40t
+BLK arg_array , 4t	;Address of segment register array
+BLK arg_flags , 4t	;Flag bits
+
+$$$=!0
+FRM dsu_sel, 8t
+FRM dsu_stk, 4t
+FRM dsu_dta, 4t
+FRM dsu_x  , 4t
+FRM dsu_GS , 4t
+FRM dsu_FS , 4t
+FRM dsu_ES , 4t
+FRM dsu_DS , 4t
+FRM dsu_SS , 4t
+FRM dsu_CS , 4t
+dsu_SIZE=!$$$
+
+	.MOD	4
+usvcdpmisetup::
+	PUSHAL				;Save registers
+	MOVL	EBP, ESP
+	PUSHL	#GS_REAL32|03.B
+	POPL	DS
+	SUBL	ESP, #dsu_SIZE.B
+	CLRL	EAX
+	MOVL	dsu_stk.B[EBP], EAX
+	MOVL	dsu_dta.B[EBP], EAX
+	MOVL	dsu_x.B[EBP], EAX
+	MOVL	dsu_GS.B[EBP], EAX
+	MOVL	dsu_FS.B[EBP], EAX
+	MOVL	dsu_ES.B[EBP], EAX
+	MOVL	dsu_DS.B[EBP], EAX
+	MOVL	dsu_SS.B[EBP], EAX
+	MOVL	dsu_CS.B[EBP], EAX
+	MOVZWL	EAX, arg_array+0.B[EBP]	;Get offset of the selector array
+	MOVZWL	ESI, arg_array+2.B[EBP]
+	SHLL	ESI, #4
+	ADDL	ESI, EAX
+	LEAL	EBX, userCS.B[ESI]	;Allocate selector for the code segment
+	MOVL	EDI, #00FBh
+	CALL	allocsel2
+	JC	6$.S
+	MOVL	dsu_CS.B[EBP], EAX
+	LEAL	EBX, userDS.B[ESI]	;Allocate selector for the data segment
+	PUSHL	[EBX]
+	CALL	allocsel
+	POPL	EDX
+	JC	6$.S
+	MOVL	dsu_DS.B[EBP], EAX
+	LEAL	EBX, userSS.B[ESI]	;Is the stack segment the same as the	CMPW	[EBX], DX		;  data segment?
+	CMPL	[EBX], EDX		;  data segment?
+	JNE	2$.S			;No
+	MOVL	EAX, userDS.B[ESI]	;Yes - use same selector
+	MOVL	[EBX], EAX
+	JMP	4$.S
+
+;Here if stack segment is different from the data segment
+
+2$:	CALL	allocsel		;Allocate stack segment selector
+	JC	6$.S			;If error
+	MOVL	dsu_SS.B[EBP], EAX
+4$:	LEAL	EBX, userES.B[ESI]
+	MOVL	EDI, #00F3h		;Allocate data selector for ES (which
+	MOVL	ECX, #100h-1		;  gets a 100h byte size)
+	CALL	allocsel4
+6$:	JC	10$.S
+	MOVL	dsu_ES.B[EBP], EAX
+	LEAL	EBX, userFS.B[ESI]	;Allocate data selector for FS (which
+	CMPW	[EBX], #0.B		;  may be null)
+	JE	8$.S
+	CALL	allocsel
+	JC	10$.S
+	MOVL	dsu_FS.B[EBP], EAX
+8$:	PUSHL	#0.B			;Get memory for the protected mode
+	PUSHL	#1.B			;  locked stack
+	PUSHL	#PG$READ|PG$WRITE	;Get normal read/write pages
+	PUSHL	dda_dpminum
+	CALLF	svcMemBlkAlloc#
+	TESTL	EAX, EAX
+	JS	22$			;If error
+	MOVL	dsu_stk.B[EBP], EAX
+	MOVL	EDX, EAX
+	SHLL	EDX, #12t		;Change to linear address
+	MOVL	EDI, #40F3h
+	MOVL	ECX, #0FFFh
+	LEAL	EBX, userGS.B[ESI]	;Allocate data selector for GS
+	CALL	allocsel6
+10$:	JC	22$
+	MOVL	EDX, EAX
+	SHLL	EDX, #12t		;Change to linear address
+	MOVL	EDI, #40F3h
+	MOVL	ECX, #0FFFh
+	LEAL	EBX, userx.B[ESI]	;Allocate data selector for GS
+	CALL	allocsel6
+	JC	10$.S
+	MOVL	dsu_GS.B[EBP], EAX
+	MOVL	EAX, dda_curpsp		;Is the DTAA segment the same as the
+	CMPW	dda_dtaa+2, AX		;  PSP segment?
+	JNE	14$.S			;No
+	MOVZWL	EAX, dda_dtaa+0		;Yes - use the same selector!
+	MOVL	dxd_protdtaa+0, EAX
+	MOVL	EAX, dsu_ES.B[EBP]
+	MOVL	dxd_protdtaa+4, EAX
+	JMP	16$.S
+
+;Here if the DTA segment is not the same as the PSP segment - allocate a
+;  new selector to map the DTA
+
+14$:	MOVL	EDI, #40F3h
+	MOVL	ECX, #0FFFFh
+	MOVZWL	EDX, dda_dtaa+2		;Get linear address
+	SHLL	EDX, #4t
+	MOVL	EBX, #dxd_protdtaa+4
+	CALL	allocsel6
+	JC	22$.S
+	MOVL	dsu_dta.B[EBP], EAX
+	MOVZWL	EAX, dda_dtaa+0
+	MOVL	dxd_protdtaa+0, EAX
+
+;Here with all necessary resources allocated
+
+16$:	CMPB	dda_dpminum, #0		;Is this the bottom client?
+	JNE	20$.S			;No - don't initialize the vectors
+	MOVL	EAX, #VT_HWT32<8t	;Yes - assume setting up a 32-bit client
+	TESTB	arg_flags.B[EBP], #01h	;Right?
+	JNE	18$.S			;Yes
+	MOVB	AH, #VT_HWT16		;No - its 16-bit
+18$:	PUSHL	EAX			;Initialize the vectors
+	CALLF	svcSchInitVector#
+20$:	ADDL	ESP, #dsu_SIZE.B
+	MOVL	28t.B[ESP], EAX
+	POPAL
+	RETF	8t
+
+;Here if error
+
+22$:	PUSHL	EAX			;Save error code
+	CMPL	dsu_stk.B[EBP], #0.B	;Have any stack memory allocated?
+	JE	24$.S			;No
+	PUSHL	dsu_stk.B[EBP]		;Yes - give up the memory
+	PUSHL	#0.B
+	PUSHL	#0.B
+	PUSHL	dda_dpminum
+	CALLF	svcMemBlkChange#
+24$:	CMPL	dsu_dta.B[EBP], #0.B
+	JE	26$.S
+	PUSHL	dsu_dta.B[EBP]
+	CALLF	svcMemDescFree#
+26$:	CMPL	dsu_x.B[EBP], #0.B
+	JE	27$.S
+	PUSHL	dsu_x.B[EBP]
+	CALLF	svcMemDescFree#
+27$:	CMPL	dsu_GS.B[EBP], #0.B
+	JE	28$.S
+	PUSHL	dsu_GS.B[EBP]
+	CALLF	svcMemDescFree#
+28$:	CMPL	dsu_FS.B[EBP], #0.B
+	JE	30$.S
+	PUSHL	dsu_FS.B[EBP]
+	CALLF	svcMemDescFree#
+30$:	CMPL	dsu_ES.B[EBP], #0.B
+	JE	32$.S
+	PUSHL	dsu_ES.B[EBP]
+	CALLF	svcMemDescFree#
+32$:	CMPL	dsu_SS.B[EBP], #0.B
+	JE	34$.S
+	PUSHL	userSS.B[EBP]
+	CALLF	svcMemDescFree#
+34$:	CMPL	dsu_DS.B[EBP], #0.B
+	JE	36$.S
+	PUSHL	dsu_DS.B[EBP]
+	CALLF	svcMemDescFree#
+36$:	CMPL	dsu_CS.B[EBP], #0.B
+	JE	38$.S
+	PUSHL	dsu_CS.B[EBP]
+	CALLF	svcMemDescFree#
+38$:	POPL	EAX			;Restore error code
+	JMP	20$
+.PAGE
+;Subroutine to allocate selector
+;	c{EBX} = Offset of place to store selector
+;	c{ECX} = Limit value for segment
+;	c{EDX} = Linear address
+;	c{EDI} = Access bits for segment
+;	CALL	allocsel6
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  c{EAX} = Selector allocated
+
+allocsel:
+	MOVL	EDI, #40F3h
+allocsel2:
+	MOVL	ECX, #0FFFFh
+allocsel4:
+	MOVZWL	EDX, [EBX]		;Get linear address
+	SHLL	EDX, #4t
+allocsel6:
+	CMPB	arg_flags.B[EBP], #0	;Setting up a 16-bit client?
+	JNE	2$.S			;No
+	BTZL	EDI, #14t		;Yes - all selectors are 16-bit
+2$:	PUSHL	#80000088h		;Allocate a selector
+	PUSHL	#1.B
+	MOVZBL	EAX, dda_dpminum
+	SHLL	EAX, #2t
+	ORB	AL, #SK_DPMIA.B
+	PUSHL	EAX
+	CALLF	svcMemDescAlloc#
+	TESTL	EAX, EAX
+	JS	6$.S			;If error
+	MOVL	[EBX], EAX		;OK - store protected mode selector
+	RORL	EDX, #16t		;Store high 16 bits of linear address
+	MOVB	dsu_sel+st_baseh.B[EBP], DH
+	MOVB	dsu_sel+st_base+2.B[EBP], DL
+	MOVW	DX, CX			;Store low 16 bits of linear address
+	MOVL	dsu_sel.B[EBP], EDX	;  and of segment size
+	MOVW	dsu_sel+st_atrb.B[EBP], DI ;Store the access bits
+	LEAL	EDX, dsu_sel.B[EBP]
+	PUSHL	EAX
+	PUSHL	EAX			;Stack the selector value
+	PUSHL	SS			;Stack address of the buffer which
+	PUSHL	EDX			;  contains the descriptor
+	CALLF	svcMemDescWrite#	;Write the descriptor
+	TESTL	EAX, EAX
+	JNS	8$.S			;If OK
+	PUSHL	EAX			;If error
+	PUSHL	[ESI]
+	CALLF	svcMemDescFree#		;Give up the selector we just got
+	POPL	EAX
+	POPL	EDX			;Discard selector value
+6$:	STC
+	RET
+
+;Here if OK
+
+8$:	POPL	EAX			;Restore selector
+	RET
+.PAGE
+	.SBTTL	dpmiterm - Subroutine to terminate a DPMI client
+
+;Subroutine to terminate a DPMI client.  When we get here we are almost
+;  certainly using a stack which we are about to deallocate!  Since we
+;  disable signals first thing, we don't really need much stack space for
+;  this.  We switch to a small (about 200 bytes) stack at the end of the
+;  XOS protected mode stack.  We create a dummy DOS call stack frame
+;  which contains the caller's EAX value and our return offset, (which are
+;  the only things we need).  The contents of the remainder of the stack
+;  frame is undefined!
+
+dpmiterm::
+	PUSHL	#08h			;No signals now
+	CALLF	svcSchSetLevel#
+	POPL	EDX			;Get our return address
+	MOVL	EAX, dff_EAX.B[EBP]	;Get the caller's EAX value
+	PUSHL	#GS_REAL32|03h
+	POPL	SS
+	MOVL	ESP, #rmda_stack-1000h+200t
+	MOVL	EBP, ESP
+	MOVL	dff_EAX.B[EBP], EAX
+	PUSHL	EDX
+	MOVL	ECX, dda_dpminum	;Get the DPMI client number
+	ORL	ECX, #03000000h		;Give up all DPMI selectors allocated by
+	PUSHL	ECX			;  this client (this cannot fail!)
+	CALLF	svcMemRmvMult#
+	PUSHL	ECX			;Free up all linear memory blocks
+	CALLF	svcMemBlkFree#		;  allocated by this client
+	TESTL	EAX, EAX		;Did it work?
+	JS	8$.S			;No - bail out now! (Must have a page
+					;  locked for IO by someone!)
+	MOVL	EBX, dda_dpmihda	;Point to the current HDA
+	SHLL	EBX, #4t
+	MOVB	AL, hda_num.B[EBX]	;Get the client number
+	CMPB	AL, dda_dpminum		;Is it right?
+	JNE	6$.S			;No - big problem!
+	DECB	dda_dpminum		;Yes - reduce the client number
+	MOVL	EDX, hda_prev.B[EBX]	;Unlink our HDA
+	MOVL	dda_dpmihda, EDX
+	TESTL	EDX, EDX		;Have a previous client?
+	JE	2$.S			;No
+	MOVL	EAX, hda_lckpESP.B[EDX]	;Update the shadowed data
+	MOVL	dda_dpmilckpESP, EAX
+	MOVL	EAX, hda_lckpSS.B[EDX]
+	MOVL	dda_dpmilckpSS, EAX
+	MOVL	EAX, hda_curpESP.B[EDX]
+	MOVL	dda_dpmicurpESP, EAX
+	MOVL	EAX, hda_curpSS.B[EDX]
+	MOVL	dda_dpmicurpSS, EAX
+	MOVL	EAX, hda_currSSSP.B[EDX]
+	MOVL	dda_dpmicurrSSSP, EAX
+	MOVB	AL, hda_type.B[EDX]
+	JMP	4$.S
+
+;Here if this was the last DPMI client
+
+2$:	CLRL	EAX
+	MOVL	dda_dpmilckpESP, EAX
+	MOVL	dda_dpmilckpSS, EAX
+	MOVL	dda_dpmicurpESP, EAX
+	MOVL	dda_dpmicurpSS, EAX
+	MOVL	dda_dpmicurrSSSP, EAX
+	MOVB	dda_dpmiactive, AL	;Indicate DPMI not active
+4$:	MOVB	dda_dpmitype, AL
+	RET				;Finished here
+
+;Here if have a serious problem terminating the DPMI client
+
+6$:	MOVL	EAX, #ER_DPMIC
+8$:	ANDL	EAX, #0FFFFFFh
+	ORL	EAX, #TC_DPMI<24t
+	PUSHL	EAX
+	CLRL	EAX
+	PUSHL	EAX
+	PUSHL	EAX
+	PUSHL	EAX
+	PUSHL	EAX
+	PUSHL	EAX
+	PUSHL	EAX
+	PUSHL	EAX
+	CALLF	svcSchKillX#		;Kill the process
+.PAGE
+	.SBTTL	DPMI exception return routines
+
+;Here when returning from a 16-bit v0.9 exception or a v1.0 exception using the
+; v0.9 part of the stack frame which restores the user stack
+
+dpmi16oretrs::
+	SUBL	ESP, #8t.B		;Allocate additional stack space
+	PUSHL	EAX			;Free up a register
+	MOVZWL	EAX, 14t.B[ESP]		;Convert the 16-bit stack frame to a
+	MOVL	4.B[ESP], EAX		;  32-bit stack frame
+	MOVZWL	EAX, 16t.B[ESP]
+	MOVL	8.B[ESP], EAX
+	MOVZWL	EAX, 18t.B[ESP]
+	ORL	EAX, #0A000000h		;Indicate should restore SS:ESP and
+					;  clear dda_dpmilckpsflg
+	JMP	4$.S
+
+;Here when returning from a 16-bit v0.9 exception
+
+dpmi16oret::
+	SUBL	ESP, #8t.B		;Allocate additional stack space
+	PUSHL	EAX			;Free up a register
+	MOVZWL	EAX, 14t.B[ESP]		;Convert the 16-bit stack frame to a
+	MOVL	4.B[ESP], EAX		;  32-bit stack frame
+	MOVZWL	EAX, 16t.B[ESP]
+	MOVL	8.B[ESP], EAX
+	MOVZWL	EAX, 18t.B[ESP]
+	BTSL	EAX, #25t		;Indicate to restore SS:ESP
+4$:	MOVL	12t.B[ESP], EAX
+	MOVZWL	EAX, 20t.B[ESP]
+	MOVL	16t.B[ESP], EAX
+	MOVZWL	EAX, 22t.B[ESP]
+	MOVL	20t.B[ESP], EAX
+	POPL	EAX			;Restore EAX
+	CALLF	svcSchIRet#		;Return
+
+dpmi16oretRS==!dpmi16oretrs-dpmi16oret
+
+;Here when returning from a 32-bit v0.9 exception or a v1.0 exception using the
+;  v0.9 part of the stack frame which restores the user stack
+
+
+dpmi32oretrs::
+	ADDL	ESP, #4t.B		;Discard the error code
+ret02rs:ANDB	11t.B[ESP], #~07h	;Restore interrupt enable, don't restore
+					;  segment registers
+	ORB	11t.B[ESP], #0Ah	;Restore SS:ESP and clear
+					;  dda_dpmilckpsflg
+	CALLF	svcSchIRet#		;Return
+
+;Here when returning from a 32-bit v0.9 exception
+
+dpmi32oret::
+	ADDL	ESP, #4t.B		;Discard the error code
+ret02:	ANDB	11t.B[ESP], #~07h	;Restore interrupt enable, don't restore
+					;  segment registers
+	ORB	11t.B[ESP], #02h	;Restore SS:ESP
+	CALLF	svcSchIRet#		;Return
+
+dpmi32oretRS==!dpmi32oretrs-dpmi32oret
+.PAGE
+;Here when returning from a 16-bit v1.0 exception which restores the user stack
+;  using the v1.0 part of the stack frame
+
+dpmi16nretrs::
+	ADDL	ESP, #4t.B		;Discard the extra item
+	JMP	dpmi32nretrs.S		;Continue
+
+;Here when returning from a 16-bit v1.0 exception using the v1.0 part of the
+;  stack frame
+
+dpmi16nret::
+	ADDL	ESP, #4t.B		;Discard the extra item
+	JMP	dpmi32nret.S		;Continue
+
+dpmi16nretRS==!dpmi16nretrs-dpmi16nret
+
+;Here when returning from a 16-bit v1.0 exception using the v0.9 part of the
+;  stack frame - this is almost like returning from a v0.9 exception except
+;  that we must remove the v1.0 junk from the stack!
+
+dpmi16nreto::
+	PUSHL	EAX			;Free up a register
+	MOVZWL	EAX, 6t.B[ESP]		;Convert the 16-bit stack frame to a
+	MOVL	72.B[ESP], EAX		;  32-bit stack frame in the right
+	MOVZWL	EAX, 8t.B[ESP]		;  place
+	MOVL	76.B[ESP], EAX
+	MOVZWL	EAX, 10t.B[ESP]
+	BTSL	EAX, #25t		;Indicate to restore SS:ESP
+	MOVL	80t.B[ESP], EAX
+	MOVZWL	EAX, 12t.B[ESP]
+	MOVL	84t.B[ESP], EAX
+	MOVZWL	EAX, 14t.B[ESP]
+	MOVL	88t.B[ESP], EAX
+	POPL	EAX			;Restore EAX
+	ADDL	ESP, #72t.B		;Adjust the stack pointer
+	CALLF	svcSchIRet#		;Return
+
+;Here when returning from a 32-bit v1.0 exception which restores the user stack
+;  using the v1.0 part of the stack frame
+
+dpmi32nretrs::
+	PUSHL	EAX			;Save a register
+	MOVL	ES, 28t.B[ESP]		;Restore the segment registers
+	MOVL	DS, 32t.B[ESP]
+	MOVL	FS, 36t.B[ESP]
+	MOVL	GS, 40t.B[ESP]
+	MOVL	EAX, 24t.B[ESP]		;Move the CS:EIP, EFR, and SS:ESP
+	MOVL	48t.B[ESP], EAX		;  values to the right place
+	MOVL	EAX, 20t.B[ESP]
+	MOVL	44t.B[ESP], EAX
+	MOVL	EAX, 16t.B[ESP]
+	MOVL	40t.B[ESP], EAX
+	MOVL	EAX, 12t.B[ESP]
+	MOVL	36t.B[ESP], EAX
+	MOVL	EAX, 8t.B[ESP]
+	MOVL	32t.B[ESP], EAX
+	POPL	EAX			;Restore EAX
+	ADDL	ESP, #28t.B		;Adjust the stack pointer
+	JMP	ret02rs			;Continue
+
+;Here when returning from a 32-bit v1.0 exception using the v1.0 part of the
+;  stack frame
+
+dpmi32nret::
+	PUSHL	EAX			;Save a register
+	MOVL	ES, 28t.B[ESP]		;Restore the segment registers
+	MOVL	DS, 32t.B[ESP]
+	MOVL	FS, 36t.B[ESP]
+	MOVL	GS, 40t.B[ESP]
+	MOVL	EAX, 24t.B[ESP]		;Move the CS:EIP, EFR, and SS:ESP
+	MOVL	48t.B[ESP], EAX		;  values to the right place
+	MOVL	EAX, 20t.B[ESP]
+	MOVL	44t.B[ESP], EAX
+	MOVL	EAX, 16t.B[ESP]
+	MOVL	40t.B[ESP], EAX
+	MOVL	EAX, 12t.B[ESP]
+	MOVL	36t.B[ESP], EAX
+	MOVL	EAX, 8t.B[ESP]
+	MOVL	32t.B[ESP], EAX
+	POPL	EAX			;Restore EAX
+	ADDL	ESP, #28t.B		;Adjust the stack pointer
+	JMP	ret02			;Continue
+
+dpmi32nretRS==!dpmi32nretrs-dpmi32nret
+
+;Here when returning from a 32-bit v1.0 exception using the v0.9 part of the
+;  stack frame
+
+dpmi32nreto::
+	PUSHL	EAX			;Save a register
+	MOVL	EAX, 56t.B[ESP]		;Move the CS:EIP, EFR, and SS:ESP
+	MOVL	80t.B[ESP], EAX		;  values to the right place
+	MOVL	EAX, 52t.B[ESP]
+	MOVL	76t.B[ESP], EAX
+	MOVL	EAX, 48t.B[ESP]
+	MOVL	72t.B[ESP], EAX
+	MOVL	EAX, 44t.B[ESP]
+	MOVL	68t.B[ESP], EAX
+	MOVL	EAX, 40t.B[ESP]
+	MOVL	64t.B[ESP], EAX
+	POPL	EAX			;Restore EAX
+	ADDL	ESP, #60t.B		;Adjust the stack pointer
+	JMP	ret02			;Continue
+.PAGE
+	.SBTTL	rcbentry - Common entry to protected mode for real mode callbacks
+
+;Common entry to protected mode for real mode callbacks.  When get here,
+;  registers are set up as follows:
+;	c{DX:EAX} = Address of protected mode routine to call
+;	c{ES:EDI} = Address of real mode register data structure
+;	c[FS]     = Protected-mode selector for real-mode stack (not set up)
+;	c{ESI}    = Real-mode address for real-mode stack
+;	c{EBX}    = Real mode value
+;	c{ECX}    = Real mode value
+;	c{EBP}    = Real mode value
+
+rcbentry16:
+	PUSHW	#0.B
+	PUSHW	CS
+	PUSHW	#rcbexit16
+	JMP	2$.S
+
+rcbentry32:
+	PUSHL	#0.B			;First, put the return frame on the
+	PUSHL	CS			;  stack
+	PUSHL	#rcbexit32
+2$:	PUSHL	EDX			;Save address of the routine to call
+	PUSHL	EAX
+	PUSHL	#40F300h		;Set up the FS descriptor to map the
+	PUSHL	#0FFFFFFFFh.B		;  real mode stack (this uses 8 bytes
+	MOVZWL	EAX, cbda_SS		;  on the stack as a buffer to hold
+	SHLL	EAX, #4t		;  the descriptor contents)
+	MOVW	2.B[ESP], AX
+	SHRL	EAX, #16t
+	MOVB	4.B[ESP], AL
+	MOVL	EAX, ESP
+	PUSHL	FS
+	PUSHL	SS
+	PUSHL	EAX
+	CALLF	svcMemDescWrite#
+	ADDL	ESP, #8t.B		;Give up the descriptor buffer
+	MOVL	EAX, cbda_EAX		;Copy real mode register values from
+	MOVL	ES:rds_EAX.B[EDI], EAX	;  the holding area to the real-mode
+	MOVL	EAX, cbda_EDX		;  register data structure
+	MOVL	ES:rds_EDX.B[EDI], EAX
+	MOVL	EAX, cbda_EDI
+	MOVL	ES:[EDI], EAX
+	MOVW	AX, cbda_FR
+	MOVW	ES:rds_FR.B[EDI], AX
+	MOVW	AX, cbda_SS
+	MOVW	ES:rds_SS.B[EDI], AX
+	MOVL	EAX, cbda_ES
+	MOVL	ES:rds_ES.B[EDI], EAX
+	MOVL	EAX, cbda_FS
+	MOVL	ES:rds_FS.B[EDI], EAX
+	MOVL	ES:rds_ESI.B[EDI], ESI
+	MOVL	ES:rds_EBX.B[EDI], EBX	;Store the other real-mode registers
+	MOVL	ES:rds_ECX.B[EDI], ECX
+	MOVL	ES:rds_EBP.B[EDI], EBP
+	MOVZWL	ESI, cbda_SP
+	MOVW	ES:rds_SP.B[EDI], SI
+	PUSHL	FS
+	POPL	DS
+	CLRL	EAX
+	MOVL	FS, EAX
+	MOVL	ES:rds_xxx.B[EDI], EAX
+	MOVL	EAX, [ESI]		;Also store the real-mode return address
+	MOVW	ES:rds_IP.B[EDI], AX	;  (the spec does not require this, but
+	SHRL	EAX, #16t		;  it seems like a good idea)
+	MOVW	ES:rds_CS.B[EDI], AX
+	RETF				;Go to the user's routine
+.PAGE
+	.SBTTL	rcbexit - Common exit routine for real-mode callbacks
+
+;Common exit routine for real-mode callbacks
+;	c{ES:EDI} = Address of real-mode register data structure
+
+rcbexit16:
+	MOVZWL	EDI, DI
+rcbexit32:
+	MOVZWL	EAX, ES:rds_SS.B[EDI]
+	PUSHL	EAX
+	MOVZWL	EAX, ES:rds_SP.B[EDI]
+	PUSHL	EAX
+	PUSHL	#0.B
+	MOVZWL	EAX, ES:rds_FR.B[EDI]
+	ORL	EAX, #820000h
+	PUSHL	EAX
+	MOVZWL	EAX, ES:rds_CS.B[EDI]
+	PUSHL	EAX
+	MOVZWL	EAX, ES:rds_IP.B[EDI]
+	PUSHL	EAX
+	MOVZWL	EAX, ES:rds_DS.B[EDI]
+	PUSHL	EAX
+	MOVZWL	EAX, ES:rds_ES.B[EDI]
+	PUSHL	EAX
+	MOVZWL	EAX, ES:rds_FS.B[EDI]
+	PUSHL	EAX
+	MOVZWL	EAX, ES:rds_GS.B[EDI]
+	PUSHL	EAX
+	MOVL	ESI, ES:rds_ESI.B[EDI]
+	MOVL	EBP, ES:rds_EBP.B[EDI]
+	MOVL	EBX, ES:rds_EBX.B[EDI]
+	MOVL	EDX, ES:rds_EDX.B[EDI]
+	MOVL	ECX, ES:rds_ECX.B[EDI]
+	MOVL	EAX, ES:rds_EAX.B[EDI]
+	MOVL	EDI, ES:[EDI]
+	CALLF	svcSchDismiss#
+.PAGE
+	.SBTTL	pint16v2F - 16-bit routine to handle INT 2Fh in protected-mode
+
+pint16v2F::
+	CALL	doint2F
+	IRETW
+
+	.SBTTL	pint32v2F - 32-bit routine to handle INT 2Fh in protected-mode
+
+pint32v2F::
+	CALL	doint2F
+	IRETL
+
+;Subroutine to do the work for INT 2F
+
+doint2F:CMPW	AX, #1000h		;Is this the SHARE installation check?
+	JE	2$.S			;Yes
+	CMPW	AX, #1680h		;No - is this for DPMI?
+	JB	4$.S			;No - ignore it!
+	CMPW	AX, #168Ah		;Maybe
+	JA	4$.S			;No
+	PUSHL	EAX			;Yes
+	MOVZBL	EAX, AL			;Get just the subfunction
+	JMPIL	CS:int2Fdsp-80h*4[EAX*4]
+
+	.MOD	4
+int2Fdsp:
+	.LONG	release		;1680 - Release current time slice
+	.LONG	badint2F	;1681
+	.LONG	badint2F	;1682
+	.LONG	badint2F	;1683
+	.LONG	badint2F	;1684
+	.LONG	badint2F	;1685
+	.LONG	getcpumode	;1686 - Get CPU mode
+	.LONG	badint2F	;1687
+	.LONG	badint2F	;1688
+	.LONG	badint2F	;1689
+	.LONG	getvendor	;168A - Get vendor-specific API entry point
+
+;Here for SHARE installation check
+
+2$:	MOVB	AL, #0FFh		;Always indicate SHARE is installed
+	RET
+
+;Here for illegal INT2F function - just return without changing anything
+
+badint2F:
+	POPL	EAX
+4$:	RET
+
+;Here for INT 2Fh function 1680h - Release current time slice.  For now, we
+;  don't do anything with this, but we will soon!!
+
+release:POPL	EAX
+	MOVB	AL, #0			;Indicate this worked
+	RET
+
+;Here for INT 2Fh function 1686h - Get CPU mode
+
+getcpumode:
+	POPL	EAX
+	MOVB	AL, #0			;Indicate protected mode
+	RET
+.PAGE
+;Here for INT 2Fh function 188Ah - Get vendor specific API entry point
+
+getvendor:
+	POPL	EAX
+	PUSHAL
+	MOVL	EDI, #vendtbl		;Point to our table
+	MOVL	ECX, #2			;Get size of our table
+4$:	MOVL	EBX, ESI		;Set up the pointers
+	MOVL	EDX, CS:[EDI]
+6$:	MOVB	AL, [EBX]		;Compare strings
+	INCL	EBX
+	CMPB	AL, CS:[EDX]
+	JNE	8$.S			;If not a match
+	INCL	EDX
+	CMPB	AL, #0
+	JNE	6$.S			;Continue if need to check more
+	CALLI	CS:4.B[EDI]		;Match - call routine for entry
+	MOVL	[ESP], EAX
+	PUSHL	CS			;Get segment of entry
+	POPL	ES
+	MOVB	28t.B[ESP], #0		;Return AL = 0
+	POPAL
+	RET
+
+;Here if this one does not match
+
+8$:	ADDL	EDI, #8.B		;Bump table pointer
+	LOOP	ECX, 4$			;Continue if more to check
+	POPAL				;Not found - return with AL unchanged
+	RET
+
+	.MOD	4
+vendtbl:.LONG	strmsdos  , havemsdos
+	.LONG	strvirtual, havevirtual
+
+strmsdos:  .ASCIZ "MS-DOS"
+strvirtual:.ASCIZ "VIRTUAL SUPPORT"
+
+havemsdos:
+	MOVL	EAX, #entmsdos
+	RET
+
+havevirtual:
+	PUSHL	#GS_REAL32.B
+	POPL	ES
+	MOVL	EAX, ES:dda_dpmihda
+	SHLL	EAX, #4t
+	MOVB	ES:hda_virt.B[EAX], #1
+	MOVL	EAX, #entvirtual
+	RET
+
+entmsdos::
+	HLT
+
+entvirtual::
+	HLT
+.PAGE
+	.SBTTL	INT 31 protected mode handler
+
+;Default protected mode INT 31 handler.
+
+	PROTINT	31
+
+pintv31:MOVZBL	EAX, dff_EAX+1.B[EBP]	;Get primary function
+	CMPL	EAX, #NUMFUNC.B		;Legal function?
+	JAE	badfunc.S		;No
+	MOVL	EBX, CS:functbl[EAX*4]	;Yes - get offset of secondary function
+					;  table
+	MOVB	AL, dff_EAX+0.B[EBP]	;Get secondary function
+	CMPL	EAX, CS:-4.B[EBX]	;Legal function?
+	JAE	badfunc.S		;No
+	JMPIL	CS:[EBX+EAX*4]		;Yes - dispatch to routine for function
+
+;Here for functions which fail with an DPMIER_SYSINTEG error
+
+failsysinteg:
+	MOVL	EAX, #DPMIER_SYSINTEG
+	JMP	strerr.S
+
+badfunc:MOVL	EAX, #DPMIER_BADFUNC
+strerr:	MOVW	dff_EAX.B[EBP], AX
+	ORB	dff_EFR.B[EBP], #01h	;Set his C bit
+	MOVL	ESP, EBP
+	POPAL				;Restore general registers
+	CALLF	svcSchDismiss#		;Return to user
+.PAGE
+;Table of secondary function table offsets
+
+	.MOD	4
+functbl:.LONG	ldtfunc		;00 - LDT management functions
+	.LONG	dosmfunc	;01 - DOS memory management functions
+	.LONG	intfunc02	;02 - Interrupt management functions
+	.LONG	transfunc	;03 - Translation functions
+	.LONG	miscfunc	;04 - Miscellaneous functions
+	.LONG	extmfunc	;05 - Extended memory management functions
+	.LONG	pagefunc06	;06 - Page management functions
+	.LONG	pagefunc07	;07 - Page management functions
+	.LONG	physfunc	;08 - Physical memory management functions
+	.LONG	intfunc09	;09 - Interrupt management functions
+	.LONG	vendfunc	;0A - Vendor specific functions
+	.LONG	debugfunc	;0B - Debug support functions
+	.LONG	respfunc	;0C - Resident program functions
+	.LONG	sharefunc	;0D - Shared memory management functions
+	.LONG	coprocfunc	;0E - Miscellaneous functions
+NUMFUNC=!{$-functbl}/4
+
+;Dispatch table for the LDT management functions (high byte = 00)
+
+	.LONG	NUMLDTFUNC
+ldtfunc:.LONG	allocdesc	;0000 - Allocate LDT descriptor
+	.LONG	givedesc	;0001 - Free LDT descriptor
+	.LONG	mapreal		;0002 - Map real mode segment to descriptor
+	.LONG	getselinc	;0003 - Get selector increment value
+	.LONG	badfunc		;0004 - Not used
+	.LONG	badfunc		;0005 - Not used
+	.LONG	getsegbase	;0006 - Get segment base address
+	.LONG	setsegbase	;0007 - Set segment base address
+	.LONG	setseglimit	;0008 - Set segment limit
+	.LONG	setrights	;0009 - Set descriptor access rights
+	.LONG	createalias	;000A - Create alias descriptor
+	.LONG	readdesc	;000B - Get descriptor
+	.LONG	setdesc		;000C - Set descriptor
+	.LONG	allocspecdesc	;000D - Allocate specific LDT descriptor
+	.LONG	readmultdesc	;000E - Get multiple descriptors
+	.LONG	setmultdesc	;000F - Set multiple descriptors
+NUMLDTFUNC=!{$-ldtfunc}/4
+.PAGE
+;Dispatch table for the DOS memory management functions (high byte = 01)
+
+	.LONG	NUMDOSMFUNC
+dosmfunc:
+	.LONG	allocdosmem	;0100 - Allocate DOS memory block
+	.LONG	givedosmem	;0101 - Free DOS memory block
+	.LONG	chngdosmem	;0102 - Change size of DOS memory block
+NUMDOSMFUNC=!{$-dosmfunc}/4
+
+;Dispatch table for the interrupt management functions (high byte = 02)
+
+	.LONG	NUMINTFUNC02
+intfunc02:
+	.LONG	getrmivect	;0200 - Get real mode interrupt vector
+	.LONG	setrmivect	;0201 - Set real mode interrupt vector
+	.LONG	getxxvectpm	;0202 - Get processor exception handler vector
+	.LONG	setexcpvect	;0203 - Set processor exception handler vector
+	.LONG	getpmivect	;0204 - Get protected mode interrupt vector
+	.LONG	setpmivect	;0205 - Set protected mode interrupt vector
+	.LONG	badfunc		;0206 - Not used
+	.LONG	badfunc		;0207 - Not used
+	.LONG	badfunc		;0208 - Not used
+	.LONG	badfunc		;0209 - Not used
+	.LONG	badfunc		;020A - Not used
+	.LONG	badfunc		;020B - Not used
+	.LONG	badfunc		;020C - Not used
+	.LONG	badfunc		;020D - Not used
+	.LONG	badfunc		;020E - Not used
+	.LONG	badfunc		;020F - Not used
+	.LONG	getxxvectpm	;0210 - Get extended processor exception handler
+				;	  vector in protected mode
+	.LONG	getxxvectrm	;0211 - Get extended processor exception handler
+				;	  vector in real mode
+	.LONG	setxxvectpm	;0212 - Set extended processor exception handler
+				;	  vector in protected mode
+	.LONG	setxxvectrm	;0213 - Set extended processor exception handler
+				;	  vector in real mode
+NUMINTFUNC02=!{$-intfunc02}/4
+.PAGE
+;Dispatch table for the translation management functions (high byte = 03)
+
+	.LONG	NUMTRANSFUNC
+transfunc:
+	.LONG	simrmint	;0300 - Simulate real mode interrupt
+	.LONG	callrealfr	;0301 - Call real mode procedure with far return
+				;	  frame
+	.LONG	callrealir	;0302 - Call real mode procedure with interrupt
+				;	  return frame
+	.LONG	allocrcba	;0303 - Allocate real mode callback address
+	.LONG	freercba	;0304 - Free real mode callback address
+	.LONG	getssraddr	;0305 - Get state save/restore addresses
+	.LONG	getrawaddr	;0306 - Get raw CPU mode switch addresses
+NUMTRANSFUNC=!{$-transfunc}/4
+
+;Dispatch table for the miscellaneous functions (high byte = 04)
+
+	.LONG	NUMMISCFUNC
+miscfunc:
+	.LONG	getdpmiver	;0400 - Get DPMI version
+	.LONG	getdpmicap	;0401 - Get DPMI capabilities
+NUMMISCFUNC=!{$-miscfunc}/4
+
+;Dispatch table for the extended memory management functions (high byte = 05)
+
+	.LONG	NUMEXTMFUNC
+extmfunc:
+	.LONG	getfminfo	;0500 - Get free memory information
+	.LONG	allocmem	;0501 - Allocate memory block
+	.LONG	freemem		;0502 - Free memory block
+	.LONG	chngmem		;0503 - Change size of memory block
+	.LONG	allocblk	;0504 - Allocate linear memory block
+	.LONG	chngblk		;0505 - Change size of linear memory block
+	.LONG	getpgattr	;0506 - Get page attributes
+	.LONG	setpgattr	;0507 - Set page attributes
+	.LONG	badfunc		;0508 - Map device in memory block
+	.LONG	badfunc		;0509 - Map conventional memory in memory block
+	.LONG	getmemszbase	;050A - Get memory block size and base
+	.LONG	getmeminfo	;050B - Get memory information
+NUMEXTMFUNC=!{$-extmfunc}/4
+.PAGE
+;Dispatch table for the page management functions (high byte = 06)
+
+	.LONG	NUMPAGEFUNC06
+pagefunc06:
+	.LONG	dpmiretcc	;0600 - Lock linear region
+	.LONG	dpmiretcc	;0601 - Unlock linear region
+	.LONG	dpmiretcc	;0602 - Mark real mode region as pageable
+	.LONG	dpmiretcc	;0603 - Relock real mode region
+	.LONG	getpgsz		;0604 - Get page size
+NUMPAGEFUNC06=!{$-pagefunc06}/4
+
+;Dispatch table for the page management functions (high byte = 07)
+
+	.LONG	NUMPAGEFUNC07
+pagefunc07:
+	.LONG	badfunc		;0700 - Not used
+	.LONG	badfunc		;0701 - Not used
+	.LONG	dpmiretcc	;0702 - Mark page as demand paging candidate
+	.LONG	dpmiretcc	;0703 - Discard page contents
+NUMPAGEFUNC07=!{$-pagefunc07}/4
+
+;Dispatch table for the physical memory management functions (high byte = 08)
+
+	.LONG	NUMPHYSFUNC
+physfunc:
+	.LONG	failsysinteg	;0800 - Allocate physical address mapping
+	.LONG	failsysinteg	;0801 - Free physical address mapping
+NUMPHYSFUNC=!{$-physfunc}/4
+
+;Dispatch table for the interrupt management functions (high byte = 09)
+
+	.LONG	NUMINTFUNC09
+intfunc09:
+	.LONG	disvis		;0900 - Get and disable virtual interrupt state
+	.LONG	enbvis		;0901 - Get and enable virtual interrupt state
+	.LONG	getvis		;0902 - Get virtual interrupt state
+NUMINTFUNC09=!{$-intfunc09}/4
+
+;Dispatch table for the vendor specific functions (high byte = 0A)
+
+	.LONG	NUMVENDFUNC
+vendfunc:
+	.LONG	badfuncx	;0A00 - Get vendor-specific API entry point
+NUMVENDFUNC=!{$-vendfunc}/4
+.PAGE
+;Dispatch table for the debug support functions (high byte = 0B)
+
+	.LONG	NUMDEBUGFUNC
+debugfunc:
+	.LONG	setwp		;0B00 - Set debug watchpoint
+	.LONG	clrwp		;0B01 - Clear debug watchpoint
+	.LONG	getwp		;0B02 - Get state of debug watchpoint
+	.LONG	resetwp		;0B03 - Reset debug watchpoint
+NUMDEBUGFUNC=!{$-debugfunc}/4
+
+;Dispatch table for the resident program management functions (high byte = 0C)
+
+	.LONG	NUMRESPFUNC
+respfunc:
+	.LONG	instcallback	;0C00 - Install resident service provider
+				;	  callback
+	.LONG	termsr		;0C01 - Terminate and stay resident
+NUMRESPFUNC=!{$-respfunc}/4
+
+;Dispatch table for the shared memory management functions (high byte = 0D)
+
+	.LONG	NUMSHAREFUNC
+sharefunc:
+	.LONG	allocshared	;0D00 - Allocate shared memory
+	.LONG	freeshared	;0D01 - Free shared memory
+	.LONG	getsershared	;0D02 - Get serialization on shared memory
+	.LONG	freesershared	;0D03 - Free serialization on shared memory
+NUMSHAREFUNC=!{$-sharefunc}/4
+
+;Dispatch table for the coprocessor management functions (high byte = 0E)
+
+	.LONG	NUMCOPROCFUNC
+coprocfunc:
+	.LONG	getcpstatus	;0E00 - Get coprocessor status
+	.LONG	setcpemul	;0E01 - Set coporcessor emulation
+NUMCOPROCFUNC=!{$-coprocfunc}/4
+.PAGE
+
+badfuncx::
+	JMP	badfunc
+
+	.SBTTL	allocdesc (0000) Allocate LDT descriptors
+
+;Here for function 0000h - Allocate LDT descriptors
+;	c[AX] = 0000h
+;	c[CX] = Number of descriptors to allocate
+;	INT	31h
+;	C:set = Error
+;	  c[AX] = DPMI error code
+;	C:clr = Normal
+;	  c[AX] = Base selector
+
+allocdesc:
+	PUSHL	#80000088h
+	MOVZWL	EAX, CX			;Get number desired
+	PUSHL	EAX
+	JMP	2$.S
+
+	.SBTTL	allocspecdesc (000D) Allocate specific LDT descriptor
+
+;Here for function 000Dh - Allocate specific LDT descriptor
+;	c[AX] = 000Dh
+;	c[BX] = Selector
+;	INT	31h
+;	C:set = Error
+;	  c[AX] = DPMI error code
+;	C:clr = Normal
+
+allocspecdesc:
+	MOVZWL	EAX, dff_EBX.B[EBP]	;Get desireed selector (make sure bit
+	PUSHL	EAX			;  31 is 0)
+	PUSHL	#1.B			;Get 1 selector
+2$:	MOVZBL	EAX, dda_dpminum
+	SHLL	EAX, #2t
+	ORB	AL, #SK_DPMIA.B
+	PUSHL	EAX
+	CALLF	svcMemDescAlloc#
+	TESTL	EAX, EAX
+	JS	nodesc.S
+	MOVW	dff_EAX.B[EBP], AX
+dpmiretcc:
+	ANDB	dff_EFR.B[EBP], #~01h	;Clear his C bit
+	MOVL	ESP, EBP
+	POPAL				;Restore general registers
+	CALLF	svcSchDismiss#		;Return to user
+
+;Here if cannot allocate the requested descriptors
+
+nodesc:	MOVL	EAX, #DPMIER_NODESC
+	JMP	strerr
+
+	.SBTTL	givedesc (0001) Free LDT descriptor
+
+;Here for function 0001h - Free LDT descriptor
+;	c[AX] = 0001h
+;	c[BX] = Selector for the descriptor to give up
+;	INT	31h
+;	C:set = Error
+;	  c[AX] = DPMI error code
+;	C:clr = Normal
+
+givedesc:
+	PUSHL	dff_EBX.B[EBP]		;Get descriptor
+	CALLF	svcMemDescFree#
+	TESTL	EAX, EAX
+	JS	dpmierr
+	MOVL	EAX, dff_EBX.B[EBP]
+	CLRL	EDX
+	CMPW	dff_DS.B[EBP], AX
+	JNE	4$.S
+	MOVL	dff_DS.B[EBP], EDX
+4$:	CMPW	dff_ES.B[EBP], AX
+	JNE	6$.S
+	MOVL	dff_ES.B[EBP], EDX
+6$:	CMPW	dff_FS.B[EBP], AX
+	JNE	8$.S
+	MOVL	dff_FS.B[EBP], EDX
+8$:	CMPW	dff_GS.B[EBP], AX
+	JNE	dpmiretcc.S
+	MOVL	dff_GS.B[EBP], EDX
+	JMP	dpmiretcc.S
+.PAGE
+	.SBTTL	mapreal (0002) Map real mode segment to descriptor
+
+;Here for function 0002 - Map real mode segment to descriptor
+;	c[AX] = 0002h
+;	c[BX] = Real mode segment selector
+;	INT	31h
+;	C:set = Error
+;	  c[AX] = DPMI error code
+;	C:clr = Normal
+;	  c[AX] = Selector which maps real mode segment
+
+mapreal:MOVZWL	EDX, dff_EBX.B[EBP]	;Get selector
+	CALL	mapreals
+	JC	dpmierr
+	MOVW	dff_EAX.B[EBP], AX
+	JMP	dpmiretcc.S
+
+;Subroutine to map a real-mode segment address to a protected selector
+;	c{EDX} = Real-mode segment address
+;	CALL	mapreals
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  c{EAX} = Selector
+
+mapreals::
+	MOVZBL	EAX, dda_dpminum
+	SHLL	EAX, #2t
+	ORB	AL, #SK_DPMIS
+	PUSHL	EAX
+	SHLL	EDX, #4t		;Change to linear address
+	PUSHL	EDX			;Search for existing descriptor
+	CALLF	svcMemDescFind#
+	TESTL	EAX, EAX
+	JNS	6$.S			;Return descriptor if we found it
+	CMPL	EAX, #ER_SELNA		;Is the error "selector not allocated"?
+4$:	JNE	10$.S			;No - return the error
+	PUSHL	#80000088h		;Yes - Allocate a descriptor
+	PUSHL	#1.B
+	MOVZBL	EAX, dda_dpminum
+	SHLL	EAX, #2t
+	ORB	AL, #SK_DPMIS
+	PUSHL	EAX
+	CALLF	svcMemDescAlloc#
+	TESTL	EAX, EAX
+	JS	8$.S			;If error
+	MOVL	EBX, EAX		;Save the selector
+	SUBL	ESP, #8.B		;Allocate buffer for selector
+	RORL	EDX, #16t		;Store high 16 bits of linear address
+	MOVB	st_baseh.B[ESP], DH
+	MOVB	st_base+2.B[ESP], DL
+	MOVW	DX, #0FFFFh		;Store low 16 bits of linear address
+	MOVL	[ESP], EDX		;  and low 16 bits of segment size
+	MOVW	st_atrb.B[ESP], #00F3h	;Store the access bits
+	MOVL	EDX, ESP
+	PUSHL	EAX			;Stack the selector value
+	PUSHL	SS			;Stack address of the buffer which
+	PUSHL	EDX			;  contains the descriptor
+	CALLF	svcMemDescWrite#	;Write the descriptor
+	ADDL	ESP, #8.B		;Remove buffer from the stack
+	TESTL	EAX, EAX
+	JS	10$.S			;If error
+	MOVL	EAX, EBX		;OK - restore the descriptor
+6$:	RET				;Finished
+
+8$:	MOVL	EAX, #ER_SELNA
+10$:	STC
+	RET
+.PAGE
+	.SBTTL	getselinc (0003) Get selector increment value
+
+;Here for function 0003 - Get selector increment value
+;	c[AX] = 0003h
+;	INT	31h
+;	C:clr always
+;	c[AX] = Selector increment value (always = 8)
+
+getselinc:
+	MOVW	dff_EAX.B[EBP], #8t
+	JMP	dpmiretcc
+
+	.SBTTL	getsegbase (0006) Get segment base address
+
+;Here for function 0006 - Get segment base address
+;	c[AX] = 0006h
+;	c[BX] = Selector
+;	INT	31h
+;	C:set = Error
+;	  c[AX] = DPMI error code
+;	C:clr = Normal
+;	  c{CX:DX} = 32-bit linear base address of segment
+
+$$$=!0
+FRM gsb_sel, 8t
+gsb_SIZE=!$$$
+
+getsegbase:
+	SUBL	ESP, #gsb_SIZE.B
+	PUSHL	dff_EBX.B[EBP]
+	PUSHL	SS
+	LEAL	EAX, gsb_sel.B[EBP]
+	PUSHL	EAX
+	CALLF	svcMemDescRead#
+	MOVB	CH, gsb_sel+st_baseh.B[EBP]
+	MOVB	CL, gsb_sel+st_base+2.B[EBP]
+	MOVW	DX, gsb_sel+st_base+0.B[EBP]		
+	TESTL	EAX, EAX
+	JS	dpmierr
+	MOVW	dff_EDX.B[EBP], DX
+	MOVW	dff_ECX.B[EBP], CX
+	JMP	dpmiretcc
+.PAGE
+	.SBTTL	setsegbase (0007) Set segment base address
+
+;Here for function 0007 - Set segment base address
+;	c[AX]    = 0007h
+;	c[BX]    = Selector
+;	c{CX:DX} = 32-bit linear base address of segment
+;	INT	31h
+;	C:set = Error
+;	  c[AX] = DPMI error code
+;	C:clr = Normal
+
+setsegbase:
+	MOVL	ECX, #SDF_BASE
+	JMP	2$.S
+
+	.SBTTL	setseglimit (0008) Set segment limit
+
+;Here for function 0008h - Set segment limit
+;	c[AX]    = 0008h
+;	c[BX]    = Selector
+;	c{CX:DX} = 32-bit segment limit (segment length - 1)
+;	INT	31h
+;	C:set = Error
+;	  c[AX] = DPMI error code
+;	C:clr = Normal
+
+setseglimit:
+	MOVL	ECX, #SDF_LIMIT
+2$:	MOVL	EDX, dff_ECX-2.B[EBP]	;Get limit value for segment
+	MOVW	DX, dff_EDX.B[EBP]
+	JMP	4$.S
+
+	.SBTTL	setrights (0009) Set descriptor access rights
+
+;Here for function 0009h - Set descriptor access rights
+;	c[AX] = 0009h
+;	c[BX] = Selector
+;	c(CL) = Access rights/type byte
+;	c(CH) = 80386 extended access rights/type byte
+;	INT	31h
+;	C:set = Error
+;	  c[AX] = DPMI error code
+;	C:clr = Normal
+
+setrights:
+	MOVZWL	EDX, CX
+	MOVL	ECX, #SDF_ACCESS
+4$:	MOVZWL	EAX, dff_EBX.B[EBP]	;Get selector
+	PUSHL	EAX
+	PUSHL	ECX
+	PUSHL	EDX
+	CALLF	svcMemDescSet#
+	JMP	chkerr.S
+.PAGE
+	.SBTTL	createalias (000A) Create alias descriptor
+
+;Here for function 000Ah - Create alias descriptor
+;	c[AX] = 000Ah
+;	c[BX] = Selector
+;	INT	31h
+;	C:set = Error
+;	  c[AX] = DPMI error code
+;	C:clr = Normal
+;	  c[AX] = Data selector
+
+$$$=!0
+FRM cad_desc, 8t
+cad_SIZE=!$$$
+
+createalias:
+	SUBL	ESP, #cad_SIZE.B
+	PUSHL	dff_EBX.B[EBP]		;Get contents of the given descriptor
+	PUSHL	SS
+	LEAL	EDX, cad_desc.B[EBP]
+	PUSHL	EDX
+	CALLF	svcMemDescRead#
+	TESTL	EAX, EAX
+	JS	4$.S
+	PUSHL	#80000088h		;Allocate another descriptor
+	PUSHL	#1.B
+	MOVZBL	EAX, dda_dpminum
+	SHLL	EAX, #2t
+	ORB	AL, #SK_DPMIA
+	PUSHL	EAX
+	CALLF	svcMemDescAlloc#
+	TESTL	EAX, EAX
+	JS	4$.S
+	MOVW	dff_EAX.B[EBP], AX
+	ANDB	cad_desc+st_atrb+0.B[EBP], #~0Ch ;Change it to a writable,
+	ORB	cad_desc+st_atrb+0.B[EBP], #02h  ;  expand up, data segment
+	PUSHL	EAX
+	PUSHL	SS
+	PUSHL	EDX
+	CALLF	svcMemDescWrite#
+chkerr:	TESTL	EAX, EAX
+4$:	JS	dpmierr
+	JMP	dpmiretcc
+.PAGE
+	.SBTTL	readdesc - (000B) Read descriptor
+
+;Here for function 000Bh - Read descriptor
+;	c[AX]       = 000Bh
+;	c[BX]       = Selector
+;	c{ES:(E)DI} = Address of 8 byte buffer to receive descriptor
+;	INT	31h
+;	C:set = Error
+;	  c[AX] = DPMI error code
+;	C:clr = Normal
+
+readdesc:
+	CMPB	dda_dpmitype, #DPMIT_32B
+	JE	2$.S
+	MOVZWL	EDI, DI
+2$:	PUSHL	dff_EBX.B[EBP]
+	PUSHL	dff_ES.B[EBP]
+	PUSHL	EDI
+	CALLF	svcMemDescRead#
+	JMP	chkerr.S
+
+	.SBTTL	readmultdesc (000E) Read multiple descriptors
+
+;Here for function 000Eh - Read multiple descriptors
+;	c[AX]       = 000Eh
+;	c[CX]       = Number of descriptors to copy
+;	c{ES:{E}DI} = Address of buffer
+;	INT	31h
+;	C:set = Error
+;	  c[AX] = DPMI error code
+;	  c[CX] = Number of descriptors copied
+;	C:clr = Normal
+
+readmultdesc:
+	MOVZWL	ECX, CX
+	MOVL	ES, dff_ES.B[EBP]
+	CMPB	dda_dpmitype, #DPMIT_32B
+	JE	4$.S
+	MOVZWL	EDI, DI
+4$:	CLRL	EAX
+	MOVW	dff_ECX.B[EBP], AX
+	MOVZWL	EAX, ES:[EDI]		;Get descriptor
+	PUSHL	EAX
+	PUSHL	ES
+	LEAL	EAX, 2.B[EDI]
+	PUSHL	EAX
+	CALLF	svcMemDescRead#
+	TESTL	EAX, EAX
+	JS	14$.S			;If error
+	INCL	dff_ECX.B[EBP]		;OK - bump count of number done
+	ADDL	EDI, #10t.B		;Bump pointer
+	LOOP	ECX, 2$			;Continue if more to do
+	JMP	12$.S
+
+	.SBTTL	setdesc (000C) Set descriptor
+
+;Here for function 000Ch - Set descriptor
+;	c[AX]       = 000Ch
+;	c[BX]       = Selector
+;	c{ES:{E}DI} = Address of 8 byte buffer containing descriptor
+;	INT	31h
+;	C:set = Error
+;	  c[AX] = DPMI error code
+;	C:clr = Normal
+
+setdesc:CMPB	dda_dpmitype, #DPMIT_32B
+	JE	6$.S
+	MOVZWL	EDI, DI
+6$:	PUSHL	dff_EBX.B[EBP]
+	PUSHL	dff_ES.B[EBP]
+	PUSHL	EDI
+	CALLF	svcMemDescWrite#
+	JMP	chkerr.S
+
+	.SBTTL	setmultdesc (000F) Set multiple descriptors
+
+;Here for function 000Fh - Set multiple descriptors
+;	c[AX]       = 000Fh
+;	c[CX]       = Number of descriptors to copy
+;	c{ES:{E}DI} = Address of buffer
+;	INT	31h
+;	C:set = Error
+;	  c[AX] = DPMI error code
+;	  c[CX] = Number of descriptors copied
+;	C:clr = Normal
+
+setmultdesc:
+	MOVZWL	ECX, CX
+	MOVL	ES, dff_ES.B[EBP]
+	CMPB	dda_dpmitype, #DPMIT_32B
+	JE	8$.S
+	MOVZWL	EDI, DI
+8$:	CLRL	EAX
+	MOVW	dff_ECX.B[EBP], AX
+10$:	MOVZWL	EAX, ES:[EDI]		;Get descriptor
+	PUSHL	EAX
+	PUSHL	dff_ES.B[EBP]
+	LEAL	EAX, 2.B[EDI]
+	PUSHL	EAX
+	CALLF	svcMemDescWrite#
+	TESTL	EAX, EAX
+	JS	14$.S			;If error
+	INCL	dff_ECX.B[EBP]		;OK - bump count of number done
+	ADDL	EDI, #10t.B		;Bump pointer
+	LOOP	ECX, 10$		;Continue if more to do
+12$:	CLRL	EAX
+14$:	JMP	dpmiretcc
+.PAGE
+	.SBTTL	allocdosmem (0100) Allocate DOS memory block
+
+;Here for function 0100h - Allocate DOS memory block
+;	c[AX] = 0100h
+;	c[BX] = Number of paragraphs to allocate
+;	INT	31h
+;	C:set = Error
+;	  c[AX] = DPMI error code
+;	  c[BX] = Size of largest available block (in paragraphs)
+;	C:clr = Normal
+;	  c[AX] = Real mode selector for allocated block
+;	  c[DX] = First protected mode selector for allocated block
+
+$$$=!0
+FRM adm_sel, 8t
+adm_SIZE=!$$$
+
+allocdosmem:
+
+;First, allocate the DOS memory block (we do this first since its faster than
+;  allocating the descriptors and thus less time is wasted if the second step
+;  fails).
+
+	MOVZWL	EBX, dff_EBX.B[EBP]	;Get amount to allocate
+	CALL	ugetmem#		;Allocate memory if can
+	JNC	4$.S			;Go on if OK
+	MOVW	dff_EBX.B[EBP], CX	;Return amount available
+	JMP	doserr#			;Go return error code
+
+;Here with the DOS memory block allocated
+
+4$:	MOVL	EAX, EDI		;Get real mode selector
+	SHRL	EAX, #4t
+	MOVW	dff_EAX.B[EBP], AX	;Give it to the caller
+	MOVL	ESI, EDI
+	MOVL	EDI, #0FFFFFFFFh
+	CLRL	EDX
+	MOVZWL	ECX, -13t.B[ESI]
+	SHLL	ECX, #4t
+	CLRL	EBX
+	CALL	dpmisetupsegs
+	JC	8$.S			;If error
+	MOVW	dff_EDX.B[EBP], BX	;Give him the protected mode selector
+	JMP	dpmiretcc
+
+;Here if error allocating or setting up the selector
+
+8$:	PUSHL	EAX
+	MOVL	ESI,EDI
+	SHRL	ESI, #4t
+	CLRL	EBX
+	CALL	umodm1#			;Give up the DOS memory
+	POPL	EAX
+
+;Here if error if want to convert the system error code to a DPMI error code
+
+dpmierr:MOVL	EDI, #syserrtbl
+	PUSHL	CS
+	POPL	ES
+	MOVL	ECX, #NUMERRS
+	CLD
+	RNSCASW	[EDI]
+	JE	10$.S
+badval:	MOVL	EAX, #DPMIER_BADVALUE
+	JMP	strerr
+
+10$:	MOVZWL	EAX, CS:{dpmitbl-syserrtbl}-2[EDI]
+	JMP	strerr
+.PAGE
+	.SBTTL	givedosmem (0101) Free DOS memory block
+
+;Here for function 0101h - Free DOS memory block
+;	c[AX] = 0101h
+;	c[DX] = Protected mode selector for block to be freed
+;	INT	31h
+;	C:set = Error
+;	  c[AX] = DPMI error code
+;	C:clr = Normal
+
+$$$=!0
+FRM gdm_sel, 8t
+gdm_SIZE=!$$$
+
+givedosmem:
+	CLRL	EBX
+	JMP	4$.S
+
+	.SBTTL	chngdosmem (0102) Change size of DOS memory block
+
+;Here for function 0102h - Change size of DOS memory block
+;	c[AX] = 0102h
+;	c[BX] = New block size in paragraphs
+;	c[DX] = Protected mode selector for block to modify
+;	INT	31h
+;	C:set = Error
+;	  c[AX] = DPMI error code
+;	  c[BX] = Maximum possible block size (paragraphs)
+;	C:clr = Normal
+
+$$$=!0
+FRM cdm_sel, 8t
+cdm_SIZE=!$$$
+
+chngdosmem:
+	MOVZWL	EBX, dff_EBX.B[EBP]	;Get new size for the memory block
+4$:	SUBL	ESP, #gdm_SIZE.B
+	PUSHL	dff_EDX.B[EBP]		;Get protected mode selector
+	PUSHL	SS			;Read the corresponding descriptor
+	LEAL	EAX, gdm_sel.B[EBP]
+	PUSHL	EAX
+	CALLF	svcMemDescRead#
+	TESTL	EAX, EAX
+	JS	dpmierr			;If error
+	MOVB	AL, gdm_sel+st_base+2.B[EBP] ;Get segment base
+	MOVB	AH, gdm_sel+st_baseh.B[EBP]
+	SHLL	EAX, #16t
+	MOVW	AX, gdm_sel+st_base.B[EBP]
+	ADDL	ESP, #gdm_SIZE.B
+	PUSHL	EAX
+	MOVZWL	EDX, -13t.B[EAX]	;Get current size of the block
+	SHLL	EDX, #4
+	SHRL	EAX, #4t		;Change to real mode selector value
+	MOVL	ESI, EAX
+	PUSHL	EBX			;Save new size
+	CALL	umodm1#
+	POPL	ECX
+	POPL	EDI
+	JC	8$.S			;If error
+	MOVL	ESI, EDI
+	SHLL	ECX, #4t		;Change new size to bytes
+	MOVZWL	EBX, dff_EDX.B[EBP]	;Get the selector
+	CALL	dpmisetupsegs		;Give up the selectors
+	JNC	dpmiretcc		;If OK
+
+;Here if error giving up a selector - this probably means that the user has
+;  been fiddling with the DOS allocation directly - since this is a serious
+;  problem which may indicate that memory allocation is very badly confused,
+;  we report it as a DOS error 7 (memory control blocks damaged) which is about
+;  as serious as you can get!
+
+dosmcbd:MOVL	EAX, #ER_MAERR
+8$:	JMP	doserr#
+.PAGE
+	.SBTTL	dpmisetupsegs - Subroutine to set up or change memory segments
+
+;Subroutines to set up or change memory segments.  This subroutine is used to
+;  allocate or deallocate and intialize segments as needed to access a block
+;  of linear memory.  It is assumed that the caller has already changed the
+;  size of the linear memory block.
+;	c{EDX} = Old size of memory block
+;	c{ECX} = New size of memory block
+;	c{EBX} = First selector
+;	c{EDI} = Old base linear address
+;	c{ESI} = New base linear address
+;	CALL	dpmisetupsegs
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  c{EBX} = First selector
+
+$$$=!0
+FRM sus_oldsize , 4t
+FRM sus_newsize , 4t
+FRM sus_oldbase , 4t
+FRM sus_newbase , 4t
+FRM sus_selector, 4t
+FRM sus_buffer  , 8t
+sus_SIZE=!$$$
+
+dpmisetupsegs::
+	ENTER	sus_SIZE, 0
+	MOVL	sus_oldsize.B[EBP], EDX	;Store arguments
+	MOVL	sus_newsize.B[EBP], ECX
+	MOVL	sus_selector.B[EBP], EBX
+	MOVL	sus_oldbase.B[EBP], EDI
+	MOVL	sus_newbase.B[EBP], ESI
+	TESTL	ECX, ECX		;Giving up the memory block?
+	JNE	10$.S			;No
+
+;Here if giving up the memory block
+
+	CMPB	dda_dpmitype, #DPMIT_32B ;32-bit client?
+	JNE	4$.S			;No
+
+;Here if giving up a memory block for a 32-bit client
+
+	PUSHL	EBX			;All we need to do is free up the
+	CALLF	svcMemDescFree#		;  single descriptor
+2$:	BTL	EAX, #31t
+	LEAVE
+	RET
+
+;Here if giving up a memory block for a 16-bit client
+
+4$:	ADDL	EDX, #0FFFFh		;Calculate number of selectors used
+	SHRL	EDX, #16t
+6$:	PUSHL	EBX			;Give up a selector
+	CALLF	svcMemDescFree#
+	TESTL	EAX, EAX
+	JS	2$.S
+	DECL	EDX			;Continue if more to give up
+	JNE	6$.S
+8$:	LEAVE
+	RET
+
+;Here if not giving up a memory block
+
+10$:	CMPL	ECX, EDX		;Increasing size of the block?
+	JE	6$.S
+	JA	14$.S			;Yes
+
+;Here if decreasing the size of a memory block
+
+	CMPB	dda_dpmitype, #DPMIT_32B ;32-bit client?
+	JE	22$			;Yes
+
+;Here if decreasing the size of a memory block for a 16-bit client - in this
+;  case we must give up excess selectors (if any) and change the limit value
+;  for the last remainding selector (if necessary)
+
+	LEAL	EAX, 0FFFFh[EDX]	;Calculate current number of descritors
+	SHRL	EAX, #16t
+	PUSHL	ECX
+	ADDL	ECX, #0FFFFh		;Calculate new number of descritors
+	SHRL	ECX, #16t
+	SUBL	ECX, EAX		;Yes
+	NEGL	ECX
+	SHLL	EAX, #3t		;Calculate first descriptor to give up
+	ADDL	EBX, EAX
+	MOVL	EDX, EBX
+	JREGZ	ECX, 13$
+12$:	PUSHL	EDX
+	CALLF	svcMemDescFree#
+	TESTL	EAX, EAX
+	JS	2$.S
+	ADDL	EDX, #8t.B
+	LOOP	ECX, 12$
+13$:	SUBL	EBX, #8t.B		;Get last descriptor we kept
+	JS	8$.S			;If we gave them all up
+	MOVL	ECX, #1
+	JMP	34$
+
+;Here if increasing the size of a memory block
+
+14$:	TESTL	EDX, EDX		;Are we creating a new block?
+	JNE	20$.S			;No
+	PUSHL	ECX			;Yes
+	CMPB	dda_dpmitype, #DPMIT_32B ;32-bit client?
+	JNE	16$.S			;No
+
+;Here if creating a new memory block for a 32-bit client - we need to allocate
+;  a single selector
+
+	MOVL	ECX, #1			;Get number of selectors needed
+	MOVL	EDI, #0FFFFFFFFh	;Get maximum segment size
+	JMP	18$.S			;Continue
+
+;Here if creating a new memory block for a 16-bit client - we need to allocate
+;  as many selectors as needed to span the block
+
+16$:	ADDL	ECX, #0FFFFh		;Calculate number of selectors needed
+	SHRL	ECX, #16t
+	MOVL	EDI, #10000h		;Get maximum segment size
+18$:	PUSHL	#80000088h
+	PUSHL	ECX
+	MOVZBL	EAX, dda_dpminum
+	SHLL	EAX, #2t
+	ORB	AL, #SK_DPMID
+	PUSHL	EAX
+	CALLF	svcMemDescAlloc#
+	TESTL	EAX, EAX
+	JS	19$.S			;If error
+	MOVL	sus_selector.B[EBP], EAX ;Save first selector
+	MOVL	EBX, EAX
+	MOVL	ESI, sus_newbase.B[EBP]
+	MOVL	EDI, #10000h
+	JMP	34$			;Go set up the descriptors
+
+;Here if error
+
+19$:	STC
+	LEAVE
+	RET
+
+;Here if increasing the size of an existing memory block
+
+20$:	CMPB	dda_dpmitype, #DPMIT_32B ;32-bit client?
+	JNE	24$.S			;No
+
+;Here if changing the size of an existing memory block for a 32-bit client - in
+;  this case all we need to do is change the limit value for the descriptor
+
+22$:	MOVL	EDI, #0FFFFFFFFh
+	JMP	28$.S
+
+;Here if increasing the size of an existing memory block for a 16-bit client
+;  - we may have to allocate and set up additional descriptors
+
+24$:	LEAL	EAX, 0FFFFh[EDX]	;Calculate current number of descritors
+	SHRL	EAX, #16t
+	PUSHL	ECX
+	ADDL	ECX, #0FFFFh		;Calculate new number of descritors
+	SHRL	ECX, #16t
+	CMPL	ECX, EAX		;Need more descriptors?
+	JBE	26$.S			;No
+	SUBL	ECX, EAX		;Yes
+	SHLL	EAX, #3t		;Calculate first descriptor needed
+	ADDL	EBX, EAX
+	PUSHL	EBX			;Allocate the additional descritors
+	PUSHL	ECX
+	MOVZBL	EAX, dda_dpminum
+	SHLL	EAX, #2t
+	ORB	AL, #SK_DPMID
+	PUSHL	EAX
+	CALLF	svcMemDescAlloc#
+	TESTL	EAX, EAX
+	JS	40$			;If error
+26$:	MOVL	EDI, #10000h
+
+;Here with excess selectors deallocated or additional selectors allocated
+;	c{EDI} = Maximum segment size
+
+28$:	MOVL	EBX, sus_selector.B[EBP]
+	MOVL	EAX, sus_newsize.B[EBP]	;Calculate number of segments
+	CLRL	EDX
+	DIVL	EDI
+	TESTL	EDX, EDX
+	JE	30$.S
+	INCL	EAX
+30$:	MOVL	ECX, EAX
+	MOVL	ESI, sus_newbase.B[EBP]	;Did the base linear address change?
+	CMPL	ESI, sus_oldbase.B[EBP]
+	JNE	34$.S			;Yes - change all descriptors
+	CMPL	ECX, #1.B		;Only have 1 segment?
+	JE	34$.S			;Yes
+	MOVL	EAX, sus_newsize.B[EBP]
+	ADDL	EAX, #0FFFFh
+	SHRL	EAX, #16t
+	MOVL	EDX, sus_oldsize.B[EBP]
+	ADDL	EDX, #0FFFFh
+	SHRL	EDX, #16t
+	SUBL	EAX, EDX
+	JA	32$.S
+	CLRL	EAX
+32$:	INCL	EAX
+	DECL	EDX			;Get first selector to change (relative)
+	MOVL	ESI, EDX		;Calculate corresponding linear address
+	SHLL	ESI, #16t
+	ADDL	ESI, sus_newbase.B[EBP]
+	SHLL	EDX, #3t		;Get actual first selector to change
+	ADDL	EBX, EDX
+
+;	c{EBX} = First selector to change
+;	c{ECX} = Number of selectors to change
+;	c{ESI} = Linear address for first selector
+;	c{EDI} = Maximum segment size
+
+34$:	MOVL	EDX, sus_newsize.B[EBP]	;Calculate amount of space left
+	ADDL	EDX, sus_newbase.B[EBP]
+	SUBL	EDX, ESI
+	MOVL	sus_buffer+4.B[EBP], #0000F300h
+36$:	MOVL	EAX, ESI		;Store linear address in descriptor
+	MOVW	sus_buffer+2.B[EBP], AX	;  buffer
+	SHRL	EAX, #16t
+	MOVB	sus_buffer+4.B[EBP], AL
+	MOVB	sus_buffer+7.B[EBP], AH
+	MOVL	EAX, EDX		;Get amount left to use
+	CMPL	EAX, #10000h		;Too big?
+	JBE	38$.S			;No - use it
+	MOVL	EAX, #10000h		;Yes - just use 64KB
+38$:	SUBL	EDX, EAX
+	DECL	EAX			;Change to limit value
+	MOVW	sus_buffer+0.B[EBP], AX	;Store limit in descriptor buffer
+	PUSHL	EBX
+	PUSHL	SS
+	LEAL	EAX, sus_buffer.B[EBP]
+	PUSHL	EAX
+	CALLF	svcMemDescWrite#	;Update the descriptor
+	TESTL	EAX, EAX
+	JS	40$.S			;If error
+	ADDL	ESI, #10000h
+	ADDL	EBX, #8t.B
+	LOOP 	ECX, 36$		;Continue if more to change
+	MOVL	EBX, sus_selector.B[EBP] ;Get first selector to return
+	LEAVE				;Finished
+	RET
+
+;Here if error
+
+40$:	STC
+	LEAVE
+	RET
+.PAGE
+	.SBTTL	getrmivect (0200) Get real mode interrupt vector
+
+;Here for function 0200h - Get real mode interrupt vector
+;	c[AX] = 0200h
+;	c(BL) = Interrupt number
+;	INT	31h
+;	C:clr always
+;	c[CX:DX] = Address of real mode interrupt handler
+
+$$$=!0
+FRM vect_value, 8t
+vect_SIZE=!$$$
+
+getrmivect:
+	MOVZBL	EAX, dff_EBX.B[EBP]
+	MOVB	AH, #02h
+	JMP	2$.S
+
+	.SBTTL	getxxvectrm (0211) Get extended processor exception handler/rm
+
+;Here for function 0211h - Get extended processor exception handler vector in
+;  real mode
+
+getxxvectrm:
+	MOVZBL	EAX, dff_EBX.B[EBP]	;Get exception number
+	CMPL	EAX, #1Fh		;Valid?
+	JA	badval			;No - fail
+	ADDL	EAX, #120h
+2$:	SUBL	ESP, #vect_SIZE.B
+	PUSHL	EAX
+	PUSHL	SS
+	LEAL	EAX, vect_value.B[EBP]
+	PUSHL	EAX
+	CALLF	svcSchGetVector#
+	MOVL	EAX, vect_value+0.B[EBP] ;Get value of vector
+	MOVW	dff_EDX.B[EBP], AX
+	SHRL	EAX, #16t
+	MOVW	dff_ECX.B[EBP], AX
+	JMP	dpmiretcc
+
+	.SBTTL	setrmivect (0201) Set real mode interrupt vector
+
+;Here for function 0201h - Set real mode interrupt vector
+;	c[AX]    = 0201h
+;	c(BL)    = Interrupt number
+;	c[CX:DX] = Real mode address for vector
+;	INT	31h
+;	C:clr always
+
+setrmivect:
+	MOVZBL	EAX, dff_EBX+0.B[EBP]
+	MOVB	AH, #02h
+	PUSHL	EAX			;Stack the vector number
+	PUSHL	#VT_HWT16<8t		;Stack the vector type
+	PUSHL	#0.B
+	SHLL	ECX, #16t
+	MOVW	CX, dff_EDX.B[EBP]
+	PUSHL	ECX
+	JMP	6$.S
+
+	.SBTTL	setxxvectrm (0213) Set extended processor exception handler/rm
+
+;Here for function 0213h - Set extended processor exception handler vector in
+;  real mode
+;	c[AX]     = 0213h
+;	c(BL)     = Exception number
+;	c{CX:EDX} = Protected mode address for vector
+
+setxxvectrm:
+	MOVZBL	EAX, dff_EBX+0.B[EBP]	;Get exception number
+	CMPL	EAX, #1Fh		;Valid?
+	JA	badval			;No - fail
+	ADDL	EAX, #120h
+	PUSHL	EAX			;Stack vector number
+	MOVL	EAX, #VT_DPMI32N<8t	;Assume have a 32-bit client
+	MOVL	EDX, dff_EDX.B[EBP]
+	CMPB	dda_dpmitype, #DPMIT_32B ;Right?
+	JE	5$.S			;Yes
+	MOVB	AH, #VT_DPMI16N		;No
+	MOVZWL	EDX, DX
+5$:	PUSHL	EAX			;Stack the vector type
+	PUSHL	ECX			;Stack selector for vector
+	PUSHL	EDX			;Stack offset for vector
+6$:	CALLF	svcSchSetVector#
+	JMP	chkerr
+.PAGE
+	.SBTTL	getpmivect (0204) Get protected mode interrupt vector
+
+;Here for function 0204h - Get protected mode interrupt vector
+;	c[AX] = 0204h
+;	c(BL) = Interrupt number
+;	INT	31h
+;	C:clr always
+;	c{CX:(E)DX} = Address of protected mode interrupt handler
+
+getpmivect:
+	MOVZBL	EAX, dff_EBX+0.B[EBP]
+	JMP	2$.S
+
+	.SBTTL	getxxvectpm (0202 and 0210) Get (extended) processor exception handler/pm
+
+;Here for functions 0202h and 0210h - Get (extended) processor exception handler
+;  vector in protected mode
+;	c[AX] = 0202h or 0210h
+;	c(BL) = Interrupt number
+;	INT	31h
+;	C:clr always
+;	c{CX:(E)DX} = Address of protected mode interrupt handler
+
+getxxvectpm:
+	MOVZBL	EAX, dff_EBX+0.B[EBP]	;Get exception number
+	CMPL	EAX, #1Fh.B		;Valid value?
+	JA	badval			;No - fail
+	MOVB	AH, #01			;Yes
+2$:	SUBL	ESP, #vect_SIZE.B	;Allocate stack space
+	PUSHL	EAX
+	PUSHL	SS
+	LEAL	EAX, vect_value.B[EBP]
+	PUSHL	EAX
+	CALLF	svcSchGetVector#	;Get current vector contents
+	TESTL	EAX, EAX
+	JS	badval			;If error
+	MOVL	EDX, vect_value+0.B[EBP] ;Give the caller the value
+	CMPB	dda_dpmitype, #DPMIT_32B
+	JE	4$.S
+	MOVW	dff_EDX.B[EBP], DX
+	JMP	6$.S
+
+4$:	MOVL	dff_EDX.B[EBP], EDX
+6$:	MOVL	EAX, vect_value+4.B[EBP]
+	MOVW	dff_ECX.B[EBP], AX
+	JMP	dpmiretcc
+.PAGE
+	.SBTTL	setpmivect (0205) Set protected mode interrupt vector
+
+;Here for function 0205h - Set protected mode interrupt vector
+;	c[AX]       = 0205h
+;	c(BL)       = Interrupt number
+;	c{CX:(E)DX} = Address of protected mode interrupt handler
+;	INT	31h
+;	C:clr always
+
+setpmivect:
+	MOVZBL	EAX, dff_EBX+0.B[EBP]
+	MOVL	EDX, #VT_HWT32<8t
+	JMP	4$.S
+
+	.SBTTL	setexcpvect (0203) Set processor exception handler vector
+
+;Here for function 0203h - Set processor exception handler vector
+;	c[AX]       = 0203h
+;	c(BL)       = Exception number (0-1Fh)
+;	c{CX:(E)DX} = Address of protected mode interrupt handler
+;	INT	31h
+;	C:clr always
+
+setexcpvect:
+	MOVL	EAX, dda_dpmihda
+	SHLL	EAX, #4t
+	MOVL	EDX, #VT_DPMI32O<8t	;Assume virtual support not requested
+	CMPB	hda_virt.B[EAX], #0	;Right?
+	JE	2$.S			;Yes
+	MOVL	EDX, #VT_DPMI32N<8t	;No
+	JMP	2$.S
+
+	.SBTTL	setxxvectpm (0212) Set extended processor exception handler/pm
+
+;Here for function 0212h - Set extended processor exception handler vector in
+;  protected mode
+;	c[AX]       = 0212h
+;	c(BL)       = Exception number (0-1Fh)
+;	c{CX:(E)DX} = Address of protected mode interrupt handler
+;	INT	31h
+;	C:clr always
+
+setxxvectpm:
+	MOVL	EDX, #VT_DPMI32N<8t
+2$:	MOVZBL	EAX, dff_EBX+0.B[EBP]
+	CMPL	EAX, #1Fh.B
+	JA	badval
+	MOVB	AH, #01h
+4$:	MOVL	EDI, dff_EDX.B[EBP]	;Get the vector address offset
+	CMPB	dda_dpmitype, #DPMIT_32B ;Have a 32-bit client?
+	JE	6$.S			;Yes
+	DECB	DH			;No
+	MOVZWL	EDI, DI
+6$:	PUSHL	EAX			;Stack the vector number
+	PUSHL	EDX			;Stack the vector type
+	PUSHL	ECX			;Stack his vector address selector
+	PUSHL	EDI			;Stack the offset
+	CALLF	svcSchSetVector#	;Set the vector
+	JMP	chkerr
+.PAGE
+	.SBTTL	simrmint (0300) Simulate real mode interrupt
+
+;Here for function 0300h - Simulate real mode interrupt
+;	c[AX]       = 0300h
+;	c(BL)       = Interrupt number
+;	c(BH)       = Flag bits:
+;			All bits reserved, must be 0
+;	c[CX]       = Number of words to copy from protected mode to real mode
+;			stack
+;	c{ES:(E)DI} = Address of real mode register data structure
+;	INT	31h
+;	C:set = Error
+;	  c[AX] = DPMI error code
+;	C:clr = Normal
+
+simrmint:
+	MOVB	AL, #-1			;Indicate simulate interrupt call
+	JMP	callcom.S		;Continue
+
+	.SBTTL	callrealfr (0301) Call real mode procedure with far return frame
+
+;Here for function 0301h - Call real mode procedure with far return frame
+;	c[AX]       = 0301h
+;	c(BH)       = Flag bits:
+;			All bits reserved, must be 0
+;	c[CX]       = Number of words to copy from protected mode to real mode
+;			stack
+;	c{ES:(E)DI} = Address of real mode register data structure
+;	INT	31h
+;	C:set = Error
+;	  c[AX] = DPMI error code
+;	C:clr = Normal
+
+callrealfr:
+	MOVB	AL, #0			;Indicate need far return frame
+	JMP	callcom.S
+
+2$:	MOVL	EAX, #DPMIER_NOPHYMEM
+	JMP	strerr
+
+	.SBTTL	callrealir (0302) Call real mode procedure with interrupt return frame
+
+;Here for function 0302h - Call real mode procedure with interrupt frame
+;	c[AX]       = 0302h
+;	c(BH)       = Flag bits:
+;			All bits reserved, must be 0
+;	c[CX]       = Number of words to copy from protected mode to real mode
+;			stack
+;	c{ES:(E)DI} = Address of real mode register data structure
+;	INT	31h
+;	C:set = Error
+;	  c[AX] = DPMI error code
+;	C:clr = Normal
+
+callrealir:
+	MOVB	AL, #1			;Indicate need interrupt return frame
+
+;Since this is a managed mode switch, it places an entry on the internal
+;  DPMI stack.  This entry consists of 2 or 3 32-bit stack items as follows:
+;	1st item: Bits  0- 7 = 1 - Indicates a real mode CALL/INT using the
+;				     the internal stack (20 stack bytes)
+;			     = 2 - Indicates a real mode CALL/INT using a user
+;				     stack (16 stack bytes)
+;		  Bits  8-15 = Number of stack bytes (16 or 20)
+;		  Bits 16-31 = Protected mode SS value
+;	2nd item: Bits  0-31 = Protected mode ESP value
+;	3rd item: Bits  0-15 = Protected selector for register structure
+;		  Bits 16-31 = 0 (Reserved)
+;	4th item: Bits  0-31 = Protected offset for register structure
+;	5rd item: Bits  0-15 = Initial real mode SP value
+;		  Bits 16-31 = Initial real mode SS value
+
+$$$=!0
+FRM cr_SSSP, 4t		;Real mode SS:SP
+FRM cr_type, 1t		;Frame type
+FRM        , 3t
+FRM cr_regs, 4t
+cr_SIZE==!$$$
+
+callcom:SUBL	ESP, #cr_SIZE.B
+	MOVB	cr_type.B[EBP], AL
+	CMPB	dda_dpmitype, #DPMIT_32B
+	JE	4$.S
+	MOVZWL	EDI, DI
+4$:	MOVL	cr_regs.B[EBP], EDI
+	MOVL	EDX, dda_dpmihda	;Point to our DPMI data area
+	SHLL	EDX, #4t
+	SUBL	hda_isp.B[EDX], #dis_SIZE.B ;Allocate space on the DPMI stack
+	JS	2$.S			;If stack overflow
+	LEAL	ESI, hda_istkbgn[EDX]	;OK - get pointer to the DPMI stack
+	ADDL	ESI, hda_isp.B[EDX]
+	MOVL	dis_dataofs.B[ESI], EDI	;Store address of his register data
+	MOVW	dis_datasel.B[ESI], ES	;  structure on the DPMI stack
+	LEAL	EAX, cr_SIZE.B[ESP]	;Store our current protected mode
+	MOVL	dis_pESP.B[ESI], EAX	;  stack pointer
+	MOVW	dis_pSS.B[ESI], SS
+	MOVB	CL, #DISIT$PROT
+	MOVL	EAX, ES:rds_SP.B[EDI]	;Get his new real mode stack pointer
+	MOVL	EDI, dda_dpmicurrSSSP	;Get the current real mode stack pointer
+	MOVL	dis_rSSSP.B[ESI], EDI	;Save it on the DPMI stack
+	TESTL	EAX, EAX		;Did he specify a stack poiner?
+	JNE	6$.S			;Yes
+	CMPB	dda_dpmilckrsflg, #0	;No - are we now using the locked real
+					;  mode stack?
+	JNE	8$.S			;Yes - continue using it
+	MOVL	EDI, dda_dpmilckrSSSP	;No - switch to the locked stack
+	MOVB	CL, #DISIT$PROT|DISIT$CLSTK
+	JMP	8$.S
+
+;Here if caller specified a real mode stack pointer
+
+6$:	MOVL	EDI, EAX
+8$:	SUBW	DI, #4t.B
+	MOVL	cr_SSSP.B[EBP], EDI
+	MOVL	EAX, EDI		;Get offset for accessing his real
+	SHRL	EAX, #12t		;  mode stack
+	ANDB	AL, #0F0h
+	ANDL	EDI, #0FFFFh
+	LEAL	EDI, 2.B[EDI+EAX]
+	MOVB	dis_type.B[ESI], CL	;Store mode switch type bits
+	PUSHL	DS
+	POPL	ES
+	STD
+	MOVZWL	EAX, dff_ECX.B[EBP]	;Get number of words to copy
+	MOVL	ECX, EAX
+	ADDL	EAX, EAX		;Times 2
+	JE	10$.S			;If nothing to copy
+	SUBW	cr_SSSP.B[EBP], AX	;Adjust his stack pointer
+	PUSHL	ESI
+	LGSL	ESI, dff_ESP.B[EBP]
+	LEAL	ESI, -2.B[ESI+EAX]
+	RMOVSW	[EDI], GS:[ESI]		;Copy the parameters
+	POPL	ESI
+10$:	CMPB	cr_type.B[EBP], #0	;Need to save an FR value?
+	JE	12$.S			;No
+	CLRL	EAX			;Yes
+	SUBW	cr_SSSP.B[EBP], #2t.B
+	STOSW	[EDI]
+12$:	MOVL	-2.B[EDI], #{0ED00h<16t}+callrealrtn
+					;Put address of the real mode return
+					;  routine on the stack as the return
+					;  CS:PC value
+	MOVL	EDI, cr_regs.B[EBP]	;Point to his real mode register values
+	MOVL	ES, dff_ES.B[EBP]
+	MOVL	dda_dpmicurpESP, ESP	;Save our protected mode stack pointer
+	MOVL	dda_dpmicurpSS, SS
+
+;We have finished with his real mode stack - now we set up an XOS signal
+;  stack frame to use to switch to real mode
+
+	MOVB	CL, cr_type.B[EBP]
+	MOVZWL	EAX, cr_SSSP+0.B[EBP]	;Get the real mode stack pointer
+	MOVZWL	EDX, cr_SSSP+2.B[EBP]
+	ADDL	ESP, #cr_SIZE.B
+	PUSHL	EDX			;Stack real mode SS
+	PUSHL	EAX			;Stack real mode SP
+	PUSHL	#0.B			;Stack dummy INT number and item count
+	MOVL	EAX, #820000h
+	MOVW	AX, ES:rds_FR.B[EDI]
+	PUSHL	EAX			;Stack EFR value
+	CMPB	CL, #0			;Is this an INT type call?
+	JGE	16$.S			;No
+	MOVZBL	EBX, dff_EBX.B[EBP]	;Yes - get INT number
+	MOVZWL	EDX, 2[EBX*4]		;Get real mode CS:IP for INT
+	MOVZWL	EAX, 0[EBX*4]
+	JMP	18$.S
+
+16$:	MOVZWL	EDX, ES:rds_CS.B[EDI]
+	MOVZWL	EAX, ES:rds_IP.B[EDI]
+18$:	PUSHL	EDX			;Stack real mode CS
+	PUSHL	EAX			;Stack real mode IP
+	MOVZWL	EAX, ES:rds_DS.B[EDI]
+	PUSHL	EAX			;Stack real mode DS
+	MOVZWL	EAX, ES:rds_ES.B[EDI]
+	PUSHL	EAX			;Stack real mode ES
+	MOVZWL	EAX, ES:rds_FS.B[EDI]
+	PUSHL	EAX			;Stack real mode FS
+	MOVZWL	EAX, ES:rds_GS.B[EDI]
+	PUSHL	EAX			;Stack real mode GS
+	MOVL	EAX, ES:rds_EAX.B[EDI]	;Load the general registers for
+	MOVL	ECX, ES:rds_ECX.B[EDI]	;  real mode
+	MOVL	EDX, ES:rds_EDX.B[EDI]
+	MOVL	EBX, ES:rds_EBX.B[EDI]
+	MOVL	EBP, ES:rds_EBP.B[EDI]
+	MOVL	ESI, ES:rds_ESI.B[EDI]
+	MOVL	EDI, ES:[EDI]
+	CALLF	svcSchDismiss#		;Switch to real mode
+
+;Here when the real mode user routine returns (note that the real mode
+;  routine has already updated the segment register values in the user's
+;  data structure - see code at callrealrtn for the real mode part of this)
+
+callrealdone::
+	PUSHL	EDI			;Save the real mode register values
+	MOVL	EDI, 4+dff_EDI.B[ESP]
+	CMPB	dda_dpmitype, #DPMIT_32B
+	JE	20$.S
+	MOVZWL	EDI, DI
+20$:	MOVL	ES, 4+dff_ES.B[ESP]
+	POPL	ES:[EDI]
+	MOVL	ES:rds_ESI.B[EDI], ESI
+	MOVL	ES:rds_EBP.B[EDI], EBP
+	MOVL	ES:rds_EBX.B[EDI], EBX
+	MOVL	ES:rds_EDX.B[EDI], EDX
+	MOVL	ES:rds_ECX.B[EDI], ECX
+	MOVL	ES:rds_EAX.B[EDI], EAX
+	MOVL	EBP, ESP		;Restore EBP
+	ANDB	dff_EFR.B[EBP], #~01h	;Clear his C bit
+	POPAL				;Restore general registers
+	CALLF	svcSchDismiss#		;Return to user
+.PAGE
+	.SBTTL	protrawmsw - Routine to do raw mode switch in protected mode
+
+;Routine to do raw mode switch in proteced mode - this routine is called
+;  directly by user programs which obtain its address using INT 31h function
+;  0306h.
+;	c[AX] = DS value for real mode
+;	c[CX] = ES value for real mode
+;	c[DX] = SS value for real mode
+;	c[BX] = SP value for real mode
+;	c[SI] = CS value for real mode
+;	c[DI] = IP value for real mode
+;	JMPF	protrawmsw
+;  EBP is preserved across the mode switch.  All other registers are set to 0.
+
+protrawmsw:
+	PUSHL	#0.B			;Store GS value
+	PUSHL	#0.B			;Store FS value
+	PUSHL	EAX			;Store DS value
+	PUSHL	ECX			;Store ES value
+	PUSHL	EDX			;Store SS value
+	MOVZWL	EAX, BX			;Store SP value
+	PUSHL	EAX			;Store EFR value (real mode, do not
+	PUSHL	#01020000h		;  change signal level)
+	PUSHL	ESI			;Store CS value
+	MOVZWL	EAX, DI			;Store IP value
+	PUSHL	EAX
+	CLRL	EAX			;Clear other registers
+	CLRL	EBX
+	CLRL	ECX
+	CLRL	EDX
+	CLRL	EDI
+	CLRL	ESI
+	CALLF	svcSchIRet#		;Switch modes
+.PAGE
+	.SBTTL	allocrcba (0303) Allocate real mode callback address
+
+;Here for function 0303h - Allocate real mode callback address
+;	c[AX]       = 0303h
+;	c{DS:(E)SI} = Address of protected mode procedure to call
+;	c{ES:(E)DI} = Address of real mode register data structure
+;	INT	31h
+;	C:set = Error
+;	  c[AX] = DPMI error code
+;	C:clr = Normal
+;	  c{CX,DX} = Real mode address of callback routine
+
+allocrcba:
+	MOVL	EDX, dda_dpmihda	;Get offset of the host data area
+	SHLL	EDX, #4t
+	LEAL	EBX, hda_rcbdat.B[EDX]	;Point to start of the callback data
+	MOVL	ECX, #RCBNUM		;Get number of callbacks
+4$:	CMPL	rcb_code.B[EBX], #0.B	;Is this one in use?
+	JE	6$.S			;No - go use it
+	ADDL	EBX, #rcb_SIZE.B	;Yes - bump pointer
+	LOOP	ECX, 4$			;Continue if more to check
+	MOVL	EAX, #DPMIER_NOCALLBK	;Fail if none available
+	JMP	strerr
+
+;Here with a callback slot we can use
+
+6$:	PUSHL	#80000088h
+	PUSHL	#1.B			;Allocate 1 selector
+	MOVZBL	EAX, dda_dpminum
+	SHLL	EAX, #2t
+	ORB	AL, #SK_DPMIA.B
+	PUSHL	EAX
+	CALLF	svcMemDescAlloc#
+	TESTL	EAX, EAX
+	JS	nodesc			;If can't get a selector
+	MOVW	rcb_SS.B[EBX], AX	;Store the selector for the callback
+	MOVB	rcb_code+0.B[EBX], #68h ;Store the entry code
+	MOVL	EAX, EBX
+	SHRL	EAX, #4t
+	MOVW	rcb_code+1.B[EBX], AX
+	MOVB	rcb_code+3.B[EBX], #0EAh
+	MOVL	rcb_code+4.B[EBX], #0ED000000h+rcallback
+	CMPB	dda_dpmitype, #DPMIT_32B
+	JE	8$.S
+	MOVZWL	EDI, DI
+	MOVZWL	ESI, SI
+8$:	MOVL	rcb_addr+0.B[EBX], ESI	;Store address of the routine to call
+	MOVL	EAX, dff_DS.B[EBP]
+	MOVW	rcb_addr+4.B[EBX], AX
+	MOVL	rcb_regs+0.B[EBX], EDI	;Store address of the register data
+	MOVL	EAX, dff_ES.B[EBP]	;  structure
+	MOVW	rcb_regs+4.B[EBX], AX
+	SUBL	EBX, EDX		;Return the real mode address for the
+	MOVW	dff_EDX.B[EBP], BX	;  callback
+	SHRL	EDX, #4t
+	MOVW	dff_ECX.B[EBP], DX
+	JMP	dpmiretcc
+.PAGE
+	.SBTTL	freercba (0304) Free real mode callback address
+
+;Here for function 0304h - Free real mode callback address
+;	c[AX]    = 0304h
+;	c{CX,DX} = Real mode address of callback routine
+;	INT	31h
+;	C:set = Error
+;	  c[AX] = DPMI error code
+;	C:clr = Normal
+
+freercba:
+	MOVL	EBX, dda_dpmihda	;Get real mode selector for the host
+					;  data area
+	CMPW	BX, CX			;Did he give us a valid selector?
+	JNE	4$.S			;No
+	SHLL	EBX, #4t		;Yes
+	MOVZWL	EAX, dff_EDX.B[EBP]	;Valid offset?
+	TESTB	AL, #0Fh
+	JNE	4$.S			;No
+	CMPL	EAX, #hda_rcbdat.B	;Maybe
+	JB	4$.S			;No
+	CMPL	EAX, #hda_rcbdat+RCBNUM*rcb_SIZE ;Maybe
+	JAE	4$.S			;No
+	ADDL	EBX, EAX		;Yes - point to the callback data
+	CMPB	[EBX], #68h		;Is it in use?
+	JNE	4$.S			;No
+	MOVZWL	EAX, rcb_SS.B[EBX]	;Yes - get the stack selector
+	PUSHL	EAX
+	CALLF	svcMemDescFree#		;Give up the selector
+	TESTL	EAX, EAX		;This should not fail unless the host
+	JS	4$.S			;  data area has been corrupted
+	CLRL	EAX
+	MOVL	[EBX], EAX		;Indicate callback no in use now
+	JMP	dpmiretcc		;Thats all
+
+;Here if have a bad callback address
+
+4$:	MOVL	EAX, #DPMIER_BADCBK
+	JMP	strerr
+.PAGE
+	.SBTTL	getssraddr (0305) Get state save/restore addresses
+
+;Here for function 0305h - Get state save/restore addresses
+
+getssraddr:
+	MOVW	dff_EAX.B[EBP], #24h	   ;We don't have (or need) a
+	MOVW	dff_ECX.B[EBP], #realnull# ;  save/restore routine!
+	MOVW	dff_EBX.B[EBP], #0ED00h	;Return addresses of null routines
+	MOVW	dff_ESI.B[EBP], #GS_USERCODE|03h
+	CMPB	dda_dpmitype, #DPMIT_32B
+	JNE	2$.S			;No
+	MOVL	dff_EDI.B[EBP], #protnull32# ;Yes
+	JMP	dpmiretcc
+
+;Here if have a 16-bit client
+
+2$:	MOVW	dff_EDI.B[EBP], #protnull16#
+	JMP	dpmiretcc
+
+	.SBTTL	getrawaddr - Get raw CPU mode switch addresses
+
+;Here for function 0306h - Get raw CPU mode switch addresses
+
+getrawaddr:
+	MOVW	dff_EBX.B[EBP], #0ED00h	    ;Return real mode raw mode switch
+	MOVW	dff_ECX.B[EBP], #realrawmsw ;  address
+	MOVW	dff_ESI.B[EBP], #GS_USERCODE|03h ;Return proteced mode raw mode
+	MOVL	dff_EDI.B[EBP], #protrawmsw	 ;  switch address
+	JMP	dpmiretcc
+.PAGE
+	.SBTTL	getdpmiver (0400) Get DPMI version
+
+;Here for function 0400h - Get DPMI version
+;	c[AX] = 0400h
+;	INT	31h
+;	C:clr always
+;	c(AL) = DPMI minor version as a binary number
+;	c(AH) = DPMI major version as a binary number
+;	c[BX] = Flag bits:
+;		  01h = 0 - Host is 16-bit DPMI implementation
+;		      = 1 - Host is 32-bit DPMI implementation
+;		  02h = 0 - CPU returned to V86 mode for reflected interrupts
+;		      = 1 - CPU returned to real mode for reflected interrupts
+;		  04h = 0 - Virtual memory not supported
+;		      = 1 - Virtual memory supported
+;	c(CL) = Processor type
+;		  03h = 80386
+;		  04h = 80486
+;	c(DL) = Virtual slave PIC base interrupt
+;	c(DH) = Virtual master PIC base interrupt
+
+getdpmiver:
+	MOVW	dff_EAX.B[EBP], #005Ah	;Store version number (0.9)
+	MOVW	dff_EBX.B[EBP], #05h
+
+;CODE HERE TO GET PROCESSOR TYPE
+
+	MOVB	AL, #3			;Assume 80386
+;;;;;;;	CMPB	proctype#, #PROC_486SX	;Right?
+;;;;;;;	JB	2$.S			;Yes
+;;;;;;;	INCL	EAX			;No - its a 80486
+2$:	MOVB	dff_ECX+0.B[EBP], AL
+
+	MOVW	dff_EDX.B[EBP], #0870h
+	JMP	dpmiretcc
+
+	.SBTTL	getdpmicap (0401) Get DPMI capabilities
+
+;Here for function 0401h - Get DPMI capabilities
+;	c[AX]       = 0401h
+;	c{ES:(E)DI} = Address of 128 byte buffer filled in by host as follows:
+;			Offset  Length  Contents
+;			  0	  1	Host major version number
+;			  1	  1	Host minor version number
+;			  2	1-126	ASCIZ string identifying host vendor
+;	INT	31h
+;	C:clr always
+;	c[AX] = Capabilities flags:
+;		  Bit 0 = 0 - Paged accessed/dirty capability not supported
+;			= 1 - Paged accessed/dirty capability supported
+;		  Bit 1 = 0 - Exceptions restartability capability not supported
+;			= 1 - Exceptions restartability capability supported
+;		  Bit 2 = 0 - Device mapping capability not supported
+;			= 1 - Device mapping capability supported
+;		  Bit 3 = 0 - Conventional memory mapping capability not
+;				supported
+;			= 1 - Conventional memory mapping capability supported
+;		  Bit 4 = 0 - Demand zero-fill capability not supported
+;			= 1 - Demand zero-fill capability supported
+;		  Bit 5 = 0 - Write-protect client capability not supported
+;			= 1 - Write-protect client capability supported
+;		  Bit 6 = 0 - Write-protect host capability not supported
+;			= 1 - Write-protect host capability supported
+;	c[CX] = 0
+;	c[DX] = 0
+
+getdpmicap:
+	MOVW	dff_EAX.B[EBP], #0071h
+	MOVL	ES, dff_ES.B[EBP]
+	CMPB	dda_dpmitype, #DPMIT_32B
+	JE	4$.S
+	MOVZWL	EDI, DI
+4$:	MOVL	ESI, #dpmistr
+	MOVL	ECX, #DPMISTR/4
+	CLD
+	RMOVSL	[EDI], CS:[ESI]
+	CLRL	EAX
+	MOVW	dff_ECX.B[EBP], AX
+	MOVW	dff_EDX.B[EBP], AX
+	JMP	dpmiretcc
+
+	.MOD	4
+dpmistr:.BYTE	1t, 3t
+	.ASCIZ	"XOS"
+	.MOD	4
+DPMISTR=!$-dpmistr
+.PAGE
+	.SBTTL	getfminfo (0500) Get free memory information
+
+;Here for function 0500h - Get free memory information
+;	c[AX]     = 0500h
+;	c{ES:EDI} = Address of block to receive data
+;	INT	31h
+;	C:clr always
+
+;Format of the data block returned: (all items are 4 bytes)
+;  Offset    Use
+;    0h   Largest available free block (bytes)
+;    4h   Maximum unlocked page allocation (pages)
+;    8h   Maximum locked page allocatin (pages)
+;   0Ch   Linear address space size (pags)
+;   10h   Total number of unlocked pages
+;   14h   Total number of free pages
+;   18h   Total number of physical pages
+;   1Ch   Free linear address space in pages
+;   20h   Size of paging file/partition in pages
+;   24h   Reserved, contains 0FFFFFFFFh
+;   28h   Reserved, contains 0FFFFFFFFh
+;   2Ch   Reserved, contains 0FFFFFFFFh
+
+	 .MOD	4
+procchar:
+	DEVCHAR	PAR$GET|REP_DECV, 4, LALARGE
+lalarge: .LONG	0
+	DEVCHAR	PAR$GET|REP_DECV, 4, LAINUSE
+lainuse: .LONG	0
+	DEVCHAR	PAR$GET|REP_DECV, 4, PMINUSE
+pminuse: .LONG	0
+	DEVCHAR	PAR$GET|REP_DECV, 4, PMLIMIT
+pmlimit: .LONG	0
+	 .BYTE	0
+	 .MOD	4
+syschar: DEVCHAR PAR$GET|REP_DECV, 4, USERMEM
+usermem: .LONG	0
+	 DEVCHAR PAR$GET|REP_DECV, 4, AVAILMEM
+availmem:.LONG	0
+	DEVCHAR	PAR$GET|REP_DECV, 4, PMLIMIT
+pmsyslmt:.LONG	0
+	 .BYTE	0
+CHARSIZE=!$-procchar
+
+$$$=0
+FRM gfmi_char, {{CHARSIZE+3}&0FFFFFFFCh}
+gfmi_SIZE=!$$$
+
+getfminfo:
+	SUBL	ESP, #gfmi_SIZE.B
+	MOVL	ESI, #procchar
+	LEAL	EDI, gfmi_char.B[EBP]
+	MOVL	EDX, EDI
+	PUSHL	SS
+	POPL	ES
+	MOVL	ECX, #{CHARSIZE+3}/4
+	CLD
+	RMOVSL	[EDI], CS:[ESI]
+	PUSHL	CS
+	PUSHL	#procname
+	PUSHL	SS
+	PUSHL	EDX
+	CALLF	svcIoClsChar#
+	PUSHL	CS
+	PUSHL	#sysname
+	PUSHL	SS
+	ADDL	EDX, #syschar-procchar.B
+	PUSHL	EDX
+	CALLF	svcIoClsChar#
+	CLD
+	MOVL	EDI, dff_EDI.B[EBP]	;Get address of user's buffer
+	CMPB	dda_dpmitype, #DPMIT_32B
+	JE	2$.S
+	MOVZWL	EDI, DI
+2$:	MOVL	ES, dff_ES.B[EBP]
+	CMPL	gfmi_char+{pmlimit-procchar}.B[EBP], #0.B
+	JNE	4$.S
+	DECL	gfmi_char+{pmlimit-procchar}.B[EBP]
+4$:	CMPL	gfmi_char+{pmsyslmt-procchar}.B[EBP], #0.B
+	JNE	6$.S
+	DECL	gfmi_char+{pmsyslmt-procchar}.B[EBP]
+6$:	MOVL	EDX, gfmi_char+{pmlimit-procchar}.B[EBP] ;Get our memory limit
+	CMPL	EDX, gfmi_char+{pmsyslmt-procchar}.B[EBP]
+	JBE	8$.S
+	MOVL	EDX, gfmi_char+{pmsyslmt-procchar}.B[EBP]
+8$:	MOVL	ECX, EDX
+	SUBL	EDX, gfmi_char+{pminuse-procchar}.B[EBP] ;Get amount left on
+	JAE	10$.S					 ;  our memory limit
+	CLRL	EDX
+10$:	CMPL	EDX, gfmi_char+{availmem-procchar}.B[EBP]
+					;Bigger than actual amount available?
+	JBE	12$.S			;No
+	MOVL	EDX, gfmi_char+{availmem-procchar}.B[EBP]
+					;Yes - use actual amount
+12$:	MOVL	EAX, gfmi_char+{lalarge-procchar}.B[EBP]
+					;Get largest linear address block
+	CMPL	EAX, EDX		;Larger than amount available to us?
+	JBE	14$.S			;No
+	MOVL	EAX, EDX		;Yes
+14$:	SHLL	EAX, #10t		;Change to number of bytes
+	STOSL	[EDI]			;00h - Size of largest free block in
+	SHRL	EAX, #12t		;  bytes
+	STOSL	[EDI]			;04h - Size of largest free block in
+					;  pages
+	STOSL	[EDI]			;08h - Size of largest lockable free
+	MOVL	EAX, #la_system>12t	;  block in pages
+	STOSL	[EDI]			;0Ch - Total linear address space size
+	CLRL	EAX
+	STOSL	[EDI]			;10h - Number of unlocked pages
+	MOVL	EAX, EDX
+	SHRL	EAX, #2
+	STOSL	[EDI]			;14h - Number of available pages
+	MOVL	EAX, ECX
+	SHRL	EAX, #2
+	STOSL	[EDI]			;18h - Total number of pages in system
+	MOVL	EAX, #la_system>10t
+	SUBL	EAX, EDX
+	STOSL	[EDI]			;1Ch - Number of free linear pages
+	CLRL	EAX
+	STOSL	[EDI]			;20h - Size of paging file in pages
+	MOVL	ECX, #3t
+	DECL	EAX
+	RSTOSL	[EDI]			;24h - 26h - Reserved
+	JMP	dpmiretcc
+
+procname::.ASCIZ "PROCESS:"
+sysname:: .ASCIZ "SYSTEM:"
+.PAGE
+	.SBTTL	allocmem (0501) Allocate memory block
+
+;Here for function 0501h - Allocate memory block
+;	c[AX]    = 0501h
+;	c{BX,CX} = Size of block to allocate in bytes
+;	INT	31h
+;	C:set = Error
+;	  c[AX] = DPMI error code
+;	C:clr = Normal
+;	  c{BX,CX} = Linear address of allocated memory block
+;	  c{SI:DI} = Memory block handle
+
+allocmem:
+	MOVL	EAX, dff_EBX-2.B[EBP]	;Get desired size
+	MOVW	AX, dff_ECX.B[EBP]
+	TESTL	EAX, EAX
+	JE	badvl2.S		;Fail if size is 0
+	ADDL	EAX, #0FFFh		;Change to number of pages
+	SHRL	EAX, #12t
+	PUSHL	#0.B			;Get memory anywhere
+	PUSHL	EAX
+	PUSHL	#PG$READ|PG$WRITE	;Get normal read/write pages
+	PUSHL	dda_dpminum
+	CALLF	svcMemBlkAlloc#
+	JMP	chngm2.S
+.PAGE
+	.SBTTL	freemem (0502) Free memory block
+
+;Here for function 0502h - Free memory block
+;	c[AX] = 0502h
+;	c{SI,DI} = Handle for block
+;	INT	31h
+;	C:set = Error
+;	  c[AX] = DPMI error code
+;	C:clr = Normal
+
+freemem:MOVL	EDX, dff_ESI.B[EBP]
+	SHLL	EDX, #16t
+	MOVW	DX, dff_EDI.B[EBP]
+	PUSHL	EDX
+	PUSHL	#0.B
+	PUSHL	#0.B
+	PUSHL	dda_dpminum
+	CALLF	svcMemBlkChange#
+	JMP	chkerr
+.PAGE
+	.SBTTL	chngmem (0503) Change size of memory block
+
+;Here for function 0503h - Change size of memory block
+;	c[AX] = 0503h
+;	c{BX,CX} = New size of block in bytes
+;	c{SI,DI} = Memory block handle
+;	INT	31h
+;	C:set = Error
+;	  c[AX] = DPMI error code
+;	C:clr = Normal
+;	  c{BX,CX} = Linear address of allocated memory block
+;	  c{SI:DI} = Memory block handle
+
+chngmem:MOVL	EAX, dff_EBX-2.B[EBP]	;Get desired size
+	MOVW	AX, CX
+	TESTL	EAX, EAX
+badvl2:	JE	badval			;Fail if size is 0
+	ADDL	EAX, #0FFFh		;Change to number of pages
+	SHRL	EAX, #12t
+	SHLL	ESI, #16t		;Get linear address space page number
+	MOVW	SI, DI			;  (which is the handle)
+	PUSHL	ESI
+	PUSHL	EAX
+	PUSHL	#PG$READ|PG$WRITE.B
+	PUSHL	dda_dpminum
+	CALLF	svcMemBlkChange#
+chngm2:	TESTL	EAX, EAX
+	JS	dpmierr
+	MOVW	dff_EDI.B[EBP], AX	;Store page number as handle
+	RORL	EAX, #16t
+	MOVW	dff_ESI.B[EBP], AX
+	RORL	EAX, #4t		;Change page number to offset
+	MOVW	dff_ECX.B[EBP], AX	;Give him the value
+	SHRL	EAX, #16t
+	MOVW	dff_EBX.B[EBP], AX
+	JMP	dpmiretcc
+.PAGE
+	.SBTTL	allocblk (0504) Allocate linear memory block
+
+;Here for function 0504h - Allocate linear memory block
+;	c[AX]  = 0504h
+;	c{EBX} = Desired linear address for block
+;	c{ECX} = Size of block in bytes
+;	c{EDX} = Flag bits
+;	INT	31h
+;	C:set = Error
+;	  c[AX] = DPMI error code
+;	C:clr = Normal
+;	  c{EBX} = Linear address of allocated memory block
+;	  c{ESI} = Memory block handle
+
+allocblk:
+	TESTB	DL, #1			;Want virtual allocation?
+	MOVL	EDX, #PG$READ|PG$WRITE
+	JNE	2$.S			;No
+	ORB	DL, #PG$VIRTUAL
+2$:	MOVL	EBX, dff_EBX.B[EBP]
+	TESTL	ECX, ECX
+	JE	badval			;Fail if size is 0
+	ADDL	ECX, #0FFFh		;Change to number of pages
+	SHRL	ECX, #12t
+	PUSHL	EBX
+	PUSHL	ECX
+	PUSHL	EDX
+	PUSHL	dda_dpminum
+	CALLF	svcMemBlkAlloc#
+	JMP	alloc2.S
+
+	.SBTTL	chngblk (0505) Change size of linear memory block
+
+;Here for function 0505h - Change size of linear memory block
+;	c[AX]  = 0505h
+;	c{ECX} = Size of block in bytes
+;	c{EDX} = Flag bits
+;	c{ESI} = Memory block handle
+;	INT	31h
+;	C:set = Error
+;	  c[AX] = DPMI error code
+;	C:clr = Normal
+;	  c{EBX} = Linear address of allocated memory block
+;	  c{ESI} = Memory block handle
+
+
+chngblk:
+	MOVL	EDX, #PG$READ|PG$WRITE
+	TESTB	dff_EDX.B[EBP], #1	;Want virtual allocation?
+	JNE	4$.S			;No
+	ORB	DL, #PG$VIRTUAL
+4$:	MOVL	EBX, dff_ESI.B[EBP]	;Get handle
+	SHLL	EBX, #12t		;Change to byte offset
+	TESTL	ECX, ECX
+	JE	badval			;Fail if size is 0
+	ADDL	ECX, #0FFFh		;Change to number of pages
+	SHRL	ECX, #12t
+	PUSHL	EBX
+	PUSHL	ECX
+	PUSHL	EDX
+	PUSHL	dda_dpminum
+	CALLF	svcMemBlkChange#
+alloc2:	TESTL	EAX, EAX
+	JS	dpmierr
+	MOVL	dff_ESI.B[EBP], EAX	;Give him the "handle" (really the
+					;  page number)
+	SHLL	EAX, #12t		;Change page number to offset
+	MOVL	dff_EBX.B[EBP], EAX	;Give him the offset
+	JMP	dpmiretcc
+.PAGE
+	.SBTTL	getpgattr (0506) Get page attributes
+
+;Here for function 0506h - Get page attributes
+;	c[AX]     = 0506h
+;	c{ECX}    = Number of pages
+;	c{EBX}    = Byte offset within memory block of pages to modify
+;	c{ESI}    = Memory block handle
+;	c{ES:EDX} = Address of buffer to receive page attributes
+;	INT	31h
+;	C:set = Error
+;	  c[AX] = DPMI error code
+;	C:clr = Normal
+
+;Page attributes are stored in one word (16 bits) per page as follows:
+;	Bits 0-2: Page type: 0 = Uncommitted page
+;			     1 = Committed page
+;			     2 = Mapped page
+;	Bit    3: Page is writable if set
+;	Bit    4: Accessed/dirty bits available if set
+;	Bit    5: Accessed bit, set means accessed
+;	Bit    6: Dirty bit, set means dirty
+
+getpgattr:
+	TESTL	ECX, ECX
+	JE	10$.S			;If nothing to do
+	MOVL	EDI, dff_EDX.B[EBP]	;Get offset of bits array
+	MOVL	EBX, dff_EBX.B[EBP]	;Get byte offset in memory block
+	SHRL	EBX, #12t		;Change to page offset
+4$:	PUSHL	ESI
+	PUSHL	EBX
+	PUSHL	#0.B
+	PUSHL	#0.B
+	PUSHL	dda_dpminum
+	CALLF	svcMemBlkType#		;Change the page type
+	TESTL	EAX, EAX
+	JS	dpmierr			;If error
+	MOVL	ES, dff_ES.B[EBP]	;Get selector for caller's buffer
+	CLRL	EDX			;Assume uncommitted, read only
+	TESTB	AL, #PG$VIRTUAL		;Really uncommitted?
+	JNE	6$.S			;Yes	
+	INCL	EDX			;No
+6$:	TESTB	AL, #PG$WRITE		;Is it writable?
+	JE	8$.S			;No
+	ORB	DL, #08h		;Yes
+8$:	MOVW	ES:[EDI], DX		;Store the bits in his buffer
+	ADDL	EDI, #2.B
+	INCL	EBX			;Increment the page number
+	LOOP	ECX, 4$			;Continue if more to do
+10$:	JMP	dpmiretcc		;Finished
+.PAGE
+	.SBTTL	setpgattr (0507) Set page attributes
+
+;Her for function 0507h - Set page attributes
+;	c[AX]     = 0507h
+;	c{ECX}    = Number of pages
+;	c{EBX}    = Byte offset within memory block of pages to modify
+;	c{ESI}    = Memory block handle
+;	c{ES:EDX} = Address of buffer containing page attributes
+;	INT	31h
+;	C:set = Error
+;	  c[AX]  = DPMI error code
+;	  c{ECX} = Number of pages changed
+;	C:clr = Normal
+
+;Page attributes are stored in one word (16 bits) per page as follows:
+;	Bits 0-2: Page type: 0 = Make page uncommitted
+;			     1 = Make page committed
+;			     3 = Don't change page type
+;	Bit    3: Page is writable if set
+;	Bit    4: Set accessed/dirty bits if set (not supported)
+;	Bit    5: Value for accessed bit, set means accessed (not supported)
+;	Bit    6: Value for dirty bit, set means dirty (not supported)
+
+setpgattr:
+	MOVL	ES, dff_ES.B[EBP]	;Get selector for bits array
+	MOVL	EBX, dff_EBX.B[EBP]	;Get byte offset in memory block
+	SHRL	EBX, #12t		;Change to page offset
+	CLRL	EAX
+	JREGZ	ECX, 8$			;If nothing to do
+	MOVL	dff_ECX.B[EBP], EAX	;Clear his ECX
+2$:	CLRL	EDI
+	MOVB	AL, ES:[EDX]		;Get some bits
+4$:	INCL	EDI
+	DECL	ECX			;Need more?
+	JE	6$.S			;No
+	CMPB	ES:[EDX+EDI*2], AL	;Yes - same bits for next page?
+	JE	4$.S
+
+;Here if we don't need any more pages or if we have different bits
+
+6$:	ANDL	EAX, #0Fh.B		;Translate the page bits
+	MOVB	AL, CS:pgbits[EAX]
+	CMPB	AL, #0FFh		;Valid value?
+	JE	10$.S			;No - fail
+	PUSHL	ESI
+	PUSHL	EBX
+	PUSHL	EDI
+	PUSHL	EAX
+	PUSHL	dda_dpminum
+	CALLF	svcMemBlkType#		;Change the page type
+	TESTL	EAX, EAX
+	JS	dpmierr			;If error
+	ADDL	dff_ECX.B[EBP], EAX	;OK - add into total and bump pointers
+	LEAL	EDX, [EDX+EAX*2]
+	ADDL	EBX, EAX
+	TESTL	ECX, ECX		;More to do?
+	JNE	2$.S			;Yes - continue
+8$:	JMP	dpmiretcc		;No - finished
+
+;Here if have illegal page bits
+
+10$:	MOVL	EAX, #DPMIER_BADVALUE
+	JMP	strerr
+
+pgbits:	.BYTE PG$READ|PG$VIRTUAL	 ;0 - Read only uncommitted page
+	.BYTE PG$READ			 ;1 - Read only committed page
+	.BYTE 0FFh			 ;2 - Illegal
+	.BYTE PG$READ|PG$DNCVIR		 ;3 - Read only (only modify attribute)
+	.BYTE 0FFh			 ;4 - Illegal
+	.BYTE 0FFh			 ;5 - Illegal
+	.BYTE 0FFh			 ;6 - Illegal
+	.BYTE 0FFh			 ;7 - Illegal
+	.BYTE PG$READ|PG$WRITE|PG$VIRTUAL;8 - Read only uncommitted page
+	.BYTE PG$READ|PG$WRITE		 ;9 - Read only committed page
+	.BYTE 0FFh			 ;A - Illegal
+	.BYTE PG$READ|PG$WRITE|PG$DNCVIR ;B - Read only (only modify attribute)
+	.BYTE 0FFh			 ;C - Illegal
+	.BYTE 0FFh			 ;D - Illegal
+	.BYTE 0FFh			 ;E - Illegal
+	.BYTE 0FFh			 ;F - Illegal
+.PAGE
+	.SBTTL	getmemszbase (050A) Get memory block size and base
+
+;Here for function 050Ah - Get memory block size and base
+;	c[AX]    = 050Ah
+;	c{SI,DI} = Memory block handle
+;	INT	31h
+;	C:set = Error
+;	  c[AX] = DPMI error code
+;	C:clr = Normal
+;	  c{BX,CX} = Base linear address of memory block
+;	  c{SI:DI} = Size of memory block in bytes
+
+getmemszbase:
+	SHLL	ESI, #16t
+	MOVW	SI, DI
+	PUSHL	ESI
+	PUSHL	#-1.B
+	PUSHL	#0.B
+	PUSHL	dda_dpminum
+	CALLF	svcMemBlkChange#
+	TESTL	EAX, EAX
+	JS	dpmierr
+	SHLL	ESI, #12t
+	MOVW	dff_ECX.B[EBP], SI
+	SHRL	ESI, #16t
+	MOVW	dff_EBX.B[EBP], SI
+	MOVW	dff_EDI.B[EBP], AX
+	SHRL	ESI, #16t
+	MOVW	dff_ESI.B[EBP], AX
+	JMP	dpmiretcc
+.PAGE
+	.SBTTL	getmeminfo (050B) Get memory information
+
+;Here for function 050Bh - Get memory information
+
+getmeminfo:
+	HLT
+	NOP
+
+	CMPB	dda_dpmitype, #DPMIT_32B
+	JE	2$.S
+	MOVZWL	EDI, DI
+2$:	CLD
+;;;;;;;	MOVL	EAX, knlMemUser#
+	SHLL	EAX, #12t
+					;00h - Number of bytes of physical
+	STOSL	[EDI]			;  memory
+;;;;;;;	MOVL	EAX, SS:pda_dpmipages#
+	SHLL	EAX, #12t
+					;04h - Number of DPMI bytes allocated
+	STOSL	[EDI]
+	MOVL	EAX, knlMemAvail#
+	SHLL	EAX, #12t
+					;08h - Number of available bytes
+	STOSL	[EDI]
+;;;;;;;	MOVL	EAX, SS:pda_dpmipages#
+					;0Ch - Total allocated bytes for this
+	STOSL	[EDI]			;  virtual machine
+					;10h - Total available bytes for this
+	STOSL	[EDI]			;  virtual machine
+					;14h - Total allocated bytes for this
+	STOSL	[EDI]			;  client
+					;18h - Total available bytes for this
+	STOSL	[EDI]			;  client
+	CLRL	EAX
+					;1Ch - Total locked bytes for this
+	STOSL	[EDI]			;  client
+					;20h - Maximum locked bytes for this
+	STOSL	[EDI]			;  client
+	MOVL	EAX, #la_system
+					;24h - Highest linear address available
+	STOSL	[EDI]			;  for this client
+;;;;;;;	CALL	getmaxblock
+					;28h - Size in bytes of largest
+	STOSL	[EDI]			;  available free memory block
+	MOVL	EAX, #1000h
+					;2Ch - Size of minimum allocation unit
+	STOSL	[EDI]			;  in bytes
+					;30h - Size of allocation alignment
+	STOSL	[EDI]			;  unit in bytes
+	MOVL	ECX, #19t
+	CLRL	EAX
+					;34h - 7Ch - Reserved
+	RSTOSL	[EDI]
+	JMP	dpmiretcc
+.PAGE
+	.SBTTL	getpgsz (0604) Get page size
+
+;Here for function 0604h - Get page size
+;	c[AX] = 0604h
+;	INT	31h
+;	C:clr always
+;	c{BX:CX} = Page size in bytes
+
+getpgsz:MOVW	dff_ECX.B[EBP], #1000h
+	CLRL	EAX
+	MOVW	dff_EBX.B[EBP], AX
+	JMP	dpmiretcc
+.PAGE
+	.SBTTL	disvis (0900) Get and disable virtual interrupt state
+
+;Here for function 0900h - Get and disable virtual interrupt state
+;	c[AX] = 0900h
+;	INT	31h
+;	C:clr always
+;	c(AL) = 0 if virtual interrupts were disabled
+;	      = 1 if virtual interrupts were enabled
+
+disvis:	PUSHL	#14h.B
+	JMP	4$.S
+
+	.SBTTL	enbvis (0901) Get and enable virtual interrupt state
+
+;Here for function 0901h - Get and enable virtual interrupt state
+;	c[AX] = 0900h
+;	INT	31h
+;	C:clr always
+;	c(AL) = 0 if virtual interrupts were disabled
+;	      = 1 if virtual interrupts were enabled
+
+enbvis:	PUSHL	#10h.B
+	JMP	4$.S
+
+	.SBTTL	getvis (0902) Get virtual interrupt state
+
+;Here for function 0902h - Get virtual interrupt state
+;	c[AX] = 0900h
+;	INT	31h
+;	C:clr always
+;	c(AL) = 0 if virtual interrupts were disabled
+;	      = 1 if virtual interrupts were enabled
+
+getvis:	PUSHL	#70h.B
+4$:	CALLF	svcSchSetLevel#
+	CMPB	AL, #04h
+	SETB	dff_EAX.B[EBP]
+	JMP	dpmiretcc
+.PAGE
+	.SBTTL	setwp (0B00) Set debug watchpoint
+
+;Here for function 0B00h - Set debug watchpoint
+;	c[AX]    = 0B00h
+;	c{BX,CX} = Linear address for watchpoint
+;	c(DL)    = Size of watchpoint
+;	c(DH)    = Type of watchpoint
+;		     0 = Execute
+;		     1 = Write
+;		     2 = Read/write
+;	INT	31h
+;	C:clr = Normal
+;	  c[BX] = Watchpoint handle
+;	C:set = Error
+;	  c[AX] = DPMI error code
+
+setwp:	JMP	badfunc
+
+	.SBTTL	clrwp (0B01) Clear debug watchpoint
+
+;Here for function 0B01h - Clear debug watchpoint
+;	c[AX] = 0B01h
+;	c[BX] = Watchpoint handle
+;	INT	31h
+;	C:clr = Normal
+;	C:set = Error
+;	  c[AX] = DPMI error code
+
+clrwp:	JMP	badfunc
+
+	.SBTTL	getwp (0B02) Get state of debug watchpoint
+
+;Here for function 0B02h - Get state of debug watchpoint
+;	c[AX] = 0B02h
+;	c[BX] = Watchpoint handle
+;	INT	31h
+;	C:clr = Normal
+;	  c[AX] = Watchpoint state:
+;		    0 = Watchpoint has not been encountered
+;		    1 = Watchpoint has been encountered
+;	C:set = Error
+;	  c[AX] = DPMI error code
+
+getwp:	JMP	badfunc
+
+	.SBTTL	resetwp (0B03) Reset debug watchpoint
+
+;Here for function 0B03h - Reset debug watchpoint
+;	c[AX] = 0B03h
+;	c[BX] = Watchpoint handle
+;	INT	31h
+;	C:clr = Normal
+;	C:set = Error
+;	  c[AX] = DPMI error code
+
+resetwp:JMP	badfunc
+.PAGE
+	.SBTTL	instcallback (0C00) Install resident service provider callback
+
+;Here for function 0C00h - Install resident service provider callback
+
+instcallback:
+	JMP	badfunc
+
+	.SBTTL	termsr (0C01) Terminate and stay resident
+
+;Here for function 0C01h - Terminate and stay resident
+
+termsr:	JMP	badfunc
+.PAGE
+	.SBTTL	allocshared (0D00) Allocate shared memory
+
+;Here for function 0D00h - Allocate shared memory
+
+allocshared:
+	JMP	badfunc
+
+	.SBTTL	freeshared (0D01) Free shared memory
+
+;Here for function 0D01h - Free shared memory
+
+freeshared:
+	JMP	badfunc
+
+	.SBTTL	getsershared (0D02) Get serialization on shared memory
+
+;Here for function 0D02h - Get serialization on shared memory
+
+getsershared:
+	JMP	badfunc
+
+	.SBTTL	freesershared (0D03) Free serialization on shared memory
+
+;Here for function 0D03h - Free serialization on shared memory
+
+freesershared:
+	JMP	badfunc
+.PAGE
+	.SBTTL	getcpstatus (0E00) Get coprocessor status
+
+;Here for function 0E00h - Get coprocessor status
+
+getcpstatus:
+	JMP	badfunc
+
+	.SBTTL	setcpemul (0E01) Set coprocessor emulation
+
+;Here for function 0E01h - Set coprocessor emulation
+
+setcpemul:
+	JMP	badfunc
+.PAGE
+	.MACRO	ERRS
+	EE	SELNA, NODESC
+	EE	LASNA, NOLINMEM
+	EE	MACFT, NOLINMEM
+	EE	NEMA , NOPHYMEM
+	EE	VALUE, BADVALUE
+	EE	BDSEL, BADSEL
+	EE	BDLA , BADLADDR
+	.ENDM
+
+	.MACRO	EE  sys, dpmi
+	.WORD	ER_'sys
+	.ENDM
+
+	.MOD	2
+syserrtbl:
+	ERRS
+NUMERRS=!{$-syserrtbl}/2
+
+	.MACRO	EE  sys, dpmi
+	.WORD	DPMIER_'dpmi
+	.ENDM
+
+dpmitbl:ERRS
+
+
+	END

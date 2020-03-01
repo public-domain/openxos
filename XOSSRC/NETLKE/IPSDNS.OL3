@@ -1,0 +1,1426 @@
+	.TITLE	IPSDNS - Domain Name Resolver for Allegro
+	.SBTTL	Copyright (c) 1991-1994, Saguaro Software, Ltd.
+
+	.PROC	80486
+	.INCLUD	ALGINC:\AMAC\ALLEGRO.PAR
+	.INCLUD	ALGINC:\AMAC\ALLEGROX.PAR
+	.INCLUD	ALGINC:\AMAC\ALGERR.PAR
+	.INCLUD	ALGINC:\AMAC\ALGTIME.PAR
+	.INCLUD	ALGINC:\AMAC\ALGNET.PAR
+	.INCLUD	ALGINC:\AMAC\ALGXNET.PAR
+	.INCLUD	ALGINC:\AMAC\ALGXIPS.PAR
+	.INCLUD	ALGINC:\AMAC\ALGLKE.PAR
+	.INCLUD	ALGINC:\AMAC\ALGXLKE.PAR
+
+	LKECONT
+
+;Define offsets in the DNS name block (DNB):
+
+$$$=!0
+BLK dnb_error  , 4t
+BLK dnb_szindx , 1t		;Size index for this block
+BLK dnb_bits   , 1t
+BLK dnb_timer  , 2t		;Time-to-live counter (1 minute ticks)
+BLK dnb_waitxff, 2t
+BLK dnb_waitcnt, 2t
+
+BLK dnb_hash   , 4t		;Offset of next block in hash list
+BLK dnb_next   , 4t		;Offset of next block in usage list
+BLK dnb_prev   , 4t		;Offset of previous block in usage list
+
+BLK dnb_dcnb   , 4t		;Offset of DCNB
+BLK dnb_dmxb   , 4t		;Offset of DMXB
+BLK dnb_hsindx , 1t		;Hash index for this block
+BLK            , 1t
+BLK dnb_dnlen  , 1t		;Length of domain name
+BLK            , 1t
+BLK dnb_ipa1   , 4t		;First IP address
+BLK dnb_ipa2   , 4t		;Second IP address
+BLK dnb_ipa3   , 4t		;Third IP address
+BLK dnb_ipa4   , 4t		;Fourth IP address
+BLK dnb_length , 4t		;Length of the domain name
+BLK dnb_dname  , 0t		;Domain name
+
+;Define offsets in the DNS CNAME data block (DCNB)
+
+$$$=!0
+BLK dcnb_error  , 4t
+BLK dcnb_szindx , 1t
+BLK dcnb_bits   , 1t
+BLK dcnb_timer  , 2t		;Time-to-live counter (1 minute ticks)
+
+BLK dcnb_length , 1t		;Length of canonical name
+BLK dcnb_cname  , 0t
+
+;Define offsets in the DNS MX data block (DMXB)
+
+$$$=!0
+BLK dmxb_error  , 4t
+BLK dmxb_szindx , 1t
+BLK dmxb_bits   , 1t
+BLK dmxb_timer  , 2t		;Time-to-live counter (1 minute ticks)
+BLK dmxb_nummx  , 4t		;Number of mail exchange names
+BLK dmxb_len1   , 1t		;Length of first mail exchange name
+BLK dmxb_len2   , 1t		;Length of second mail exchange name
+BLK dmxb_len3   , 1t		;Length of third mail exchange name
+BLK dmxb_len4   , 1t		;Length of fourth mail exchange name
+BLK dmxb_mxname , 0t		;First mail exchange name
+
+;Define bits for dnb_bits, dcnb_bits, and dmxb_bits
+
+DB$IPVALID=!40h			;IP addresses are valid
+DB$CNVALID=!20h			;CNAME information is valid
+DB$MXVALID=!10h			;MX information is valid
+DB$DELETED=!02h			;Block should not be cached
+DB$PENDING=!01h			;Block is being filled by the server
+
+$$$=!0
+FRM dn_count  , 4t
+FRM dn_buffer , 8t
+FRM dn_rtnbfr , 8t
+FRM dn_cnlimit, 4t
+FRM dn_amount , 4t
+FRM dn_index  , 4t		;Hash index
+FRM           , 3t
+FRM dn_req    , 1t		;Bits from first byte of buffer
+FRM dn_mxpnt  , 4t
+FRM dn_mxcnt  , 4t
+FRM dn_value1 , 4t
+FRM dn_value2 , 4t
+FRM dn_value3 , 4t
+FRM dn_value4 , 4t
+FRM dn_dnlen  , 4t		;Length of the domain name
+FRM dn_num    , 4t
+FRM dn_bgnpnt , 4t
+FRM dn_total  , 4t
+FRM dn_errcode, 4t
+FRM dn_time2lv, 4t
+FRM dn_dname  , 258t		;Domain name
+FRM dn_reqreq , 1t
+FRM dn_reqtype, 1t
+dn_SIZE=!$$$
+
+	CODE
+
+	.SBTTL	dnsgetipa - Subroutine to get IP address given domain name
+
+;Subroutine to get IP address given domain name
+;	c{ECX} = Offset of second colon after domain name (on stack)
+;	c{EDX} = Offset of start of domain name (on stack)
+;	CALL	dnsgetipa
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  c{EBX} = IP address
+;	  c{EDX} = Offset of first character after domain name
+
+$$$=!0
+dnsgetipa::
+	MOVL	EAX, #ER_NNSNA
+	STC
+	RET
+
+	SUBL	ECX, EDX		;Calculate length of domain name
+	DECL	ECX
+
+	RET
+.PAGE
+	.SBTTL	dnsfindipa - (IPSSF_FINDIPA) Map domain name to IP address
+
+;Subroutine to process special device function IPSSF_FINDIPA = 1. - Map domain
+;  name to IP address.  Value returned is the number of IP addresses returned
+;  if normal or a negative error code if error.  Data is specified and returned
+;  in the buffer pointed to by qab_buffer1 with length specified in qab_count.
+;  When the function is called, the first byte of the buffer contains modifier
+;  bits as follows:
+
+;	Bits 7-4: Recursion level (should be 0 except for recursive DNS server
+;		    calls)
+;	Bits 3-2: Reserved, must be 0
+;	Bit    0: Use counted label format for domain name (otherwise use
+;		    period format)
+
+;  The remainder of the buffer contains the domain name in the specified
+;  format.  On return, the buffer contains a list of IP addresses (4 bytes
+;  each).  Up to 4 addresses can be returned.  Thus the buffer must be at
+;  least 16 bytes long.
+
+dnsfindipa::
+	MOVL	iorb_routine.B[ESI], #findipa1
+	JMP	2$.S
+
+	.SBTTL	dnsfindcname - (IPSSF_FINDCNAME) Map domain name to canonical name
+
+;Subroutine to process special device function IPSSF_FINDCNAME = 2. - Map domain
+;  name to canconical name.  Value returned is 1 if normal or a negative error
+;  code if error.  Data is specified and returned in the buffer pointed to by
+;  qab_buffer1 with length specified in qab_count.  When the function is called,
+;  the first byte of the buffer contains modifier bits as follows:
+
+;	Bits 7-4: Recursion level (should be 0 except for recursive DNS server
+;		    calls)
+;	Bits 3-2: Reserved, must be 0
+;	Bit    0: Use counted label format for domain name and canonical name
+;		    (otherwise use period format)
+
+;  The remainder of the buffer contains the domain name in the specified
+;  format.  On return, the buffer contains the canonical name in the specified
+;  format.  The name can be up to 255 bytes long, thus the buffer must be at
+;  least 255 bytes long.
+
+dnsfindcname::
+	MOVL	iorb_routine.B[ESI], #findcname1
+	JMP	2$.S
+
+	.SBTTL	dnsfindmail - (IPSSF_FINDMAIL) Map domain name to mail names
+
+;Subroutine to process special device function IPSSF_FINDMAIL = 2. - Map domain
+;  name to mail names.  Value returned is the number of names returned if
+;  normal or a negative error code if error.  Data is specified and returned
+;  in the buffer pointed to by qab_buffer1 with length specified in qab_count.
+;  When the function is called, the first byte of the buffer contains modifier
+;  bits as follows:
+
+;	Bits 7-4: Recursion level (should be 0 except for recursive DNS server
+;		    calls)
+;	Bits 3-2: Reserved, must be 0
+;	Bit    0: Use counted label format for domain name and canonical name
+;		    (otherwise use period format)
+
+;  The remainder of the buffer contains the domain name in the specified
+;  format.  On return, the buffer contains a list of mail names in the specified
+;  format.  Up to 4 names can be returned and each name can be up to 255 bytes
+;  long, thus the buffer must be at least 1020 bytes long.
+
+dnsfindmail::
+	MOVL	iorb_routine.B[ESI], #findmail1
+2$:	CALL	knlIoQabLock##		;Lock the QAB
+	JC	4$.S			;If error
+	CALL	knlIoReadLock##		;Lock the buffer pages
+	JC	4$.S			;If error
+	MOVB	iorb_queue.B[ESI], #dcb_outframe
+	JMP	knlXfQueue##		;Switch to extended fork context
+
+4$:	TOFORK
+	RET
+.PAGE
+;Here in extended fork context for the IPSSF_FINDIPA function
+
+findipa1:
+	ENTER	dn_SIZE, 0
+	CALL	setupxff		;Do common set up
+	JC	4$.S
+	CALL	findrecs
+	JC	4$.S
+	MOVL	ECX, EDX
+	CLRL	EAX
+2$:	LEAVE
+	MOVL	EBX, #QSTS$DONE
+	RET
+
+4$:	CLRL	ECX
+	JMP	2$.S
+
+.PAGE
+6$:	MOVL	EAX, #ER_NNMTD
+	STC
+8$:	RET
+
+;Subroutine to find the requested records and return IP addresses (this will
+;  call itself if using MX records)
+;	CALL	findrecs
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  c{EDX} = Number of addresses stored
+
+findrecs:
+	CALL	accessdnb		;Find the NDB for the domain name
+	JC	8$.S
+	TESTB	dn_req.B[EBP], #02h	;Want to use CNAME records?
+	JE	12$.S			;No
+	TESTB	dnb_bits.B[EBX], #DB$CNVALID ;Yes - do we have one now?
+	JNE	10$.S			;Yes
+	MOVB	AL, #DNSREQ_CNAME
+	CALL	reqinfo
+	JC	8$.S
+10$:	MOVL	EDX, dnb_dcnb.B[EBX]	;Do we really have a CNAME record?
+	ORL	EDX, EDX
+	JE	12$.S			;No - no CNAME - go on
+	DECL	dn_cnlimit.B[EBP]	;Yes - can we do this again?
+	JS	6$.S			;No!
+	MOVZBL	ECX, dcnb_length.B[EDX]	;Yes - use this name now
+	MOVL	dn_dnlen.B[EBP], ECX
+	PUSHL	EDI
+	PUSHL	ESI
+	LEAL	ESI, dcnb_cname.B[EDX]
+	LEAL	EDI, dn_dname[EBP]
+	PUSHL	SS
+	POPL	ES
+	CLD
+	RMOVSB	[EDI], [ESI]
+	POPL	ESI
+	POPL	EDI
+	JMP	findrecs.S		;Continue
+
+;Here if are not using CNAME records or if we don't have any more
+
+12$:	TESTB	dn_req.B[EBX], #01h	;Want to use MX records?
+	JE	20$.S			;No
+	TESTB	dnb_bits.B[EBX], #DB$MXVALID ;Yes - do we have one?
+	JNE	14$.S			;Yes
+	MOVB	AL, #DNSREQ_MX
+	CALL	reqinfo
+	JC	8$.S
+14$:	MOVL	EDX, dnb_dmxb.B[EBX]	;Do we really have an MX record?
+	ORL	EDX, EDX
+	JE	20$.S			;No - just use the A record
+	MOVZBL	EAX, dmxb_nummx.B[EDX]	;Get number of MX names we have
+	MOVL	dn_mxcnt.B[EBP], EAX
+	LEAL	EAX, dmxb_mxname.B[EDX]	;Point to first MX name
+	MOVL	dn_mxpnt.B[EBP], EAX
+	MOVB	dn_req.B[EBP], #0	;Only look for A records now
+16$:	PUSHL	EDI
+	PUSHL	ESI
+	MOVL	ESI, dn_mxpnt.B[EBP]
+	LEAL	EDI, dn_dname[EBP]
+	PUSHL	DS
+	POPL	ES
+	MOVZBL	ECX, [ESI]
+	INCL	ESI
+	MOVL	dn_dnlen.B[EBP], ECX
+	ADDL	dn_mxpnt.B[EBP], ECX
+	INCL	dn_mxpnt.B[EBP]
+	CLD
+	RMOVSB	[EDI], [ESI]
+	CALL	findrecs
+	JC	18$.S
+	DECL	dn_mxcnt.B[EBP]		;More to do?
+	JNE	16$.S			;Yes - continue
+18$:	RET				;No - finished
+
+;Here if do not want to use the MX record or if do not have one
+
+20$:	TESTB	dnb_bits.B[EBX], #DB$IPVALID ;Found it - have IP addresses?
+	JNE	22$.S			;Yes
+	MOVB	AL, #DNSREQ_IPA
+	CALL	reqinfo
+	JC	28$.S
+
+$$$$dns1::
+
+22$:	PUSHL	EDI
+	PUSHL	ESI
+	CLRL	EDX
+	MOVL	ECX, #4t
+	LEAL	ESI, dnb_ipa1.B[EBX]
+	LESL	EDI, dn_rtnbfr.B[EBP]
+24$:	MOVL	EAX, [ESI]
+	TESTL	EAX, EAX
+	JE	26$.S
+	INCL	EDX
+	IFFAULT	30$
+26$:	MOVL	ES:[EDI], EAX
+	ADDL	ESI, #4t.B
+	ADDL	EDI, #4t.B
+	LOOP	ECX, 24$
+	POPL	ESI
+	POPL	EDI
+28$:	RET				;Finished
+
+30$:	POPL	EDI
+	POPL	ESI
+	JMP	knlRtnAdrEr##
+.PAGE
+
+
+;Here in extended fork context for the IPSSF_FINDCNAME function
+
+findcname1:
+	ENTER	dn_SIZE, 0
+	CLRL	EAX
+	MOVL	dn_amount.B[EBP], EAX
+	CALL	setupxff		;Do common set up
+	JC	8$.S
+	CALL	accessdnb		;Find the NDB for the domain name
+	JC	8$.S
+	TESTB	dnb_bits.B[EBX], #DB$CNVALID ;Yes - do we have a CNAME now?
+	JNE	4$.S			;Yes
+	MOVB	AL, #DNSREQ_CNAME
+	CALL	reqinfo
+	JC	8$.S
+4$:	CLRL	EAX
+	MOVL	ESI, dnb_dcnb.B[EBX]	;Do we really have a CNAME record?
+	ORL	ESI, ESI
+	JE	8$.S			;No - no CNAME - go on
+	MOVZBL	ECX, dcnb_length.B[ESI]
+	MOVL	dn_amount.B[EBP], ECX
+	ADDL	ESI, #dcnb_cname.B
+	PUSHL	EDI
+	LESL	EDI, dn_rtnbfr.B[EBP]
+	CLD
+	MOVB	ES:[EDI], CL
+	INCL	EDI
+	IFFAULT	popediadrer
+	RMOVSB	[EDI], [ESI]
+	POPL	EDI
+8$:	MOVL	ECX, dn_amount.B[EBP]
+	MOVL	EBX, #QSTS$DONE
+	RET
+.PAGE
+;Here in extended fork context for the IPSSF_FINDMAIL function
+
+findmail1:
+	ENTER	dn_SIZE, 0
+	CLRL	EAX
+	MOVL	dn_amount.B[EBP], EAX
+	CALL	setupxff		;Do common set up
+	JC	8$.S
+2$:	CALL	accessdnb		;Find the NDB for the domain name
+	JC	8$.S
+	TESTB	dn_req.B[EBP], #02h	;Want to use CNAME records?
+	JE	10$.S			;No
+	TESTB	dnb_bits.B[EBX], #DB$CNVALID ;Yes - do we have one now?
+	JNE	4$.S			;Yes
+	MOVB	AL, #DNSREQ_CNAME
+	CALL	reqinfo
+	JC	8$.S
+4$:	MOVL	EDX, dnb_dcnb.B[EBX]	;Do we really have a CNAME record?
+	ORL	EDX, EDX
+	JE	10$.S			;No - no CNAME - go on
+	DECL	dn_cnlimit.B[EBP]	;Yes - can we do this again?
+	JS	6$.S			;No!
+	MOVZBL	ECX, dcnb_length.B[EDX]	;Yes - use this name now
+	MOVL	dn_dnlen.B[EBP], ECX
+	PUSHL	EDI
+	PUSHL	ESI
+	LEAL	ESI, dcnb_cname.B[EDX]
+	LEAL	EDI, dn_dname[EBP]
+	PUSHL	SS
+	POPL	ES
+	CLD
+	RMOVSB	[EDI], [ESI]
+	POPL	ESI
+	POPL	EDI
+	JMP	2$.S			;Continue
+
+6$:	MOVL	EAX, #ER_NNMTD
+8$:	CLRL	ECX
+	MOVL	EBX, #QSTS$DONE
+	RET
+
+;Here if are not using CNAME records or if we don't have any more
+
+10$:	TESTB	dnb_bits.B[EBX], #DB$MXVALID ;Yes - do we have an MX record now?
+	JNE	12$.S			;Yes
+	MOVB	AL, #DNSREQ_MX
+	CALL	reqinfo
+	JC	8$.S
+12$:	CLRL	EAX
+	MOVL	ESI, dnb_dmxb.B[EBX]	;Do we really have an MX record?
+	ORL	ESI, ESI
+	JE	20$.S			;No - no mail names - go on
+	MOVL	EAX, dmxb_nummx.B[ESI]	;Get number of mail names
+	MOVL	dn_num.B[EBP], EAX
+	LEAL	EDX, dmxb_len1.B[ESI]
+	MOVL	dn_amount.B[EBP], EAX
+	ADDL	ESI, #dmxb_mxname.B
+	PUSHL	EDI
+	LESL	EDI, dn_rtnbfr.B[EBP]
+	CLD
+14$:	MOVZBL	ECX, [EDX]
+	INCL	EDX
+	INCL	dn_amount.B[EBP]
+	IFFAULT	popediadrer
+	MOVB	ES:[EDI], CL
+	INCL	EDI
+	IFFAULT	popediadrer
+	RMOVSB	[EDI], [ESI]
+	DECL	dn_num.B[EBP]
+	JNE	14$.S
+	POPL	EDI
+20$:	MOVL	ECX, dn_amount.B[EBP]
+	MOVL	EBX, #QSTS$DONE
+	RET
+.PAGE
+
+	.SBTTL	dnsinitdb - (IPSSF_INITDB) Initialize DNS database
+
+;Subroutine to process special device function IPSSF_INITDB = 8. - Initialize
+;  DMS database. Value returned is 0 if normal or a negative error code.  This
+;  function initializes the DNS kernel database.  If a DNS database exists, it
+;  is not changed but the IPM destination name is changed.  The buffer pointed
+;  to by qab_buffer1 contains the maximum number of DNS entires allowed in the
+;  first 4 bytes followed by the IPM destination name (up to 31 characters).
+;	c{ESI} = Offset of IORB
+
+$$$=!0
+FRM is_buffer, 8t
+FRM is_length, 4t
+is_SIZE=!$$$
+
+dnsinitdb::
+	ENTER	is_SIZE, 0
+	MOVL	EAX, iorb_buffer1+0.B[ESI]
+	MOVL	is_buffer+0.B[EBP], EAX
+	MOVL	EAX, iorb_buffer1+4.B[ESI]
+	MOVL	is_buffer+4.B[EBP], EAX
+	MOVL	EAX, iorb_count.B[ESI]
+	CALL	knlGiveQel##
+	TOFORK
+	CMPL	EAX, #1t.B
+	JB	2$.S
+	CMPL	EAX, #31t.B
+	JBE	4$.S
+2$:	MOVL	EAX, #ER_VALUE
+	JMP	10$.S
+
+4$:	MOVL	is_length.B[EBP], EAX
+	MOVL	EBX, dcb_ipsndb.B[EDI]	;Get offset of the NDB
+	CMPL	ndb_dnhash.B[EBX], #0.B	;Have a database now?
+	JNE	6$.S			;Yes - leave it alone!
+	MOVL	ECX, #XMBX_1024		;Get and clear a 1024 byte buffer
+	CALL	knlGetXmbClr##
+	JC	10$.S			;If error
+	MOVL	ndb_dnhash.B[EBX], ESI	;OK - store offset of hash table
+6$:	MOVL	ECX, is_length.B[EBP]	;Get length of the caller's buffer
+	SUBL	ECX, #4t.B		;It must contain at least 5 bytes
+	JLE	2$.S
+	IFFAULT	knlQAdrErr0Lv##
+	LFSL	ESI,is_buffer.B[EBP]	;Get address of the buffer
+	IFFAULT	knlQAdrErr0Lv##
+	MOVL	EDX, FS:[ESI]		;Get maximum number of DNS entries
+	ADDL	ESI, #4t.B		;Point to the IPM destination name
+	PUSHL	EDI
+	LEAL	EDI, ndb_dnsdst.B[EBX]	;Copy IPM destination name to the NDB
+	PUSHL	DS
+	POPL	ES
+	CLD
+	IFFAULT	popediadrer
+	RMOVSB	[EDI], FS:[ESI]
+	CLRL	EAX			;Return 0
+	MOVB	[EDI], AL
+	POPL	EDI
+	CMPL	EDX, #32t.B		;Is the maximum number of entries too
+					;  small?
+	JA	8$.S			;No
+	MOVB	DL, #32t.B		;Yes - make it the minimum we can use
+8$:	MOVL	ndb_dnmax.B[EBX], EDX	;Store maximum number of entries
+10$:	LEAVE
+	CLRL	ECX
+	MOVL	EBX, #QSTS$DONE
+	RET
+
+	FAULTHDR
+popediadrer:
+	POPL	EDI
+	JMP	knlQAdrErr0Lv##
+.PAGE
+	.SBTTL	dnscleardb - (IPSSF_CLRDB) Clear the DNS database
+
+;Subroutine to process special device function IPSSF_CLRDB = 9. - Clear the
+;  DNS database. Value returned is 0 if normal or a negative error code if
+;  error.  This function removes the DNS kernel database.  If the DNS database
+;  does not exist, it does nothing.  It has no parameters.
+;	c{ESI} = Offset of IORB
+
+dnscleardb::
+	CALL	knlGiveQel##
+	TOFORK
+	MOVL	ESI, dcb_ipsndb.B[EDI]	;Get offset of the NDB
+	CMPL	ndb_dnhash.B[ESI], #0.B	;Have a database now?
+	JE	16$.S			;No - nothing to do here
+	MOVL	EDX, ndb_dnhash.B[ESI]	;Point to the hash table
+	PUSHL	#256t
+4$:	MOVL	EBX, [EDX]		;Get first block in next chain
+6$:	ORL	EBX, EBX		;Another block?
+	JE	12$.S			;No
+	PUSHL	[EBX]			;Yes - save offset of next block in
+	MOVZBL	ECX, dnb_szindx.B[EBX]	;  hash list
+	CALL	removednb		;Give up this block
+	POPL	EBX
+	JMP	6$.S			;Continue
+
+;Here with all blocks in the hash chain given up
+
+12$:	ADDL	EDX, #4t.B		;Bump hash table pointer
+	DECL	[ESP]			;More to do?
+	JNE	4$.S			;Yes
+	POPL	EAX			;No - fix up the stack
+	MOVL	EBX, ESI
+	MOVL	ESI, ndb_dnhash.B[ESI]	;Give up the hash table buffer
+	CLRL	EAX
+	MOVL	[EBX], EAX
+	MOVL	ECX, #XMBX_1024
+	CALL	knlGiveXmb##
+16$:	CLRL	EAX
+	RET
+.PAGE
+	.SBTTL	dnsaddipa - (IPSSF_ADDIPA) Add IP address entry to cache
+
+;Subroutine to process special device function IPSSF_ADDIPA = 10. - Add IP
+;  address entry to cache.  Value returned is 0 if normal or a negative
+;  error code if error.  Data is specified in the buffer pointed to by
+;  qab_buffer1 with length specified in qab_count.  Buffer must be at least
+;  23 bytes long.
+
+;  Format of the data is as follows:
+;   Size    Description
+;     4   Error code
+;     4   Time to live (seconds)
+;     4   First IP address
+;     4   Second IP address
+;     4   Third IP address
+;     4   Fourth IP address
+;     n   Domain name (counted label format)
+
+dnsaddipa::
+	TOFORK
+	ENTER	dn_SIZE, 0
+	CALL	setupadd		;Do common set up
+	JC	addfin.S		;If error
+	MOVL	EAX, dn_value1.B[EBP]	;Store the IP addresses
+	MOVL	dnb_ipa1.B[EBX], EAX
+	MOVL	EAX, dn_value2.B[EBP]
+	MOVL	dnb_ipa2.B[EBX], EAX
+	MOVL	EAX, dn_value3.B[EBP]
+	MOVL	dnb_ipa3.B[EBX], EAX
+	MOVL	EAX, dn_value4.B[EBP]
+	MOVL	dnb_ipa4.B[EBX], EAX
+	CMPW	dnb_waitcnt.B[EBX], #0.B
+	JE	adddone.S
+	MOVW	ES, dnb_waitxff.B[EBX]	;Get first waiter
+4$:	MOVZWL	EAX, ES:xffWaitList##	;Save next waiter
+	CMPB	ES:xffWaitBufr##, #DNSREQ_IPA ;Waiting for an address?
+	JNE	6$.S			;No
+	PUSHL	EAX			;Yes
+	CLRL	EAX
+	CALL	knlResumeXf##		;Wake him up
+	POPL	EAX			;Restore next waiter
+6$:	MOVL	ES, EAX
+	ORL	EAX, EAX		;More?
+	JNE	4$.S			;Yes - continue
+adddone:CLRL	EAX
+addfin:	LEAVE
+	CLRL	ECX
+	MOVL	EBX, #QSTS$DONE
+	RET
+.PAGE
+	.SBTTL	dnsaddcname - (IPSSF_ADDCNAME) Add canonical name entry to cache
+
+;Subroutine to process special device function IPSSF_ADDCNAME = 11. - Add
+;  canonical name entry to cache.  Value returned is 0 if normal or a
+;  negative error code if error.  Data is specified in the buffer pointed to
+;  by qab_buffer1 with length specified in qab_count.
+
+;  Format of the data is as follows:
+;   Size    Description
+;     4   Error code
+;     4   Time to live (seconds)
+;     4   Offset of canonical name buffer
+;    12   Reserved, must be 0
+;     n   Domain name (counted label format)
+
+;  The canonical name is stored in a block as follows:
+;   Size    Description
+;     n   Cononical name (counted label format)
+
+dnsaddcname::
+	TOFORK
+	ENTER	dn_SIZE, 0
+	CALL	setupadd		;Do common set up
+	JC	2$.S
+	JNE	6$.S
+	CALL	removednb
+	CLRL	EAX
+2$:	JMP	addfin
+
+4$:	MOVL	EAX, #ER_VALUE
+	JMP	2$.S
+
+;Here with the time-to-live value set up
+
+6$:	DECL	ECX
+	JE	4$.S
+	MOVL	dn_count.B[EBP], ECX
+	IFFAULT	knlQAdrErr0Lv##
+	CMPB	ES:[EDX], #1		;Must have 1 CNAME name
+	JNE	4$.S
+	DECL	dn_count.B[EBP]		;Have another byte?
+	JS	4$.S			;No - fail
+	IFFAULT	knlQAdrErr0Lv##		;Yes - get length of name
+	MOVB	AL, ES:[EDX]
+	ORL	EAX, EAX		;Is it 0?
+	JE	4$.S			;Yes - fail
+	SUBL	dn_count.B[EBP], EAX	;No - is it all there?
+	JS	4$.S			;No - fail
+	MOVL	dn_total.B[EBP], EAX	;Yes - save it
+	MOVL	dn_bgnpnt.B[EBP], EDX
+
+	IFFAULT	knlQAdrErr0Lv##		;Make sure we can read the last byte
+	MOVB	AL, ES:-1.B[EDX+EAX]
+	CMPL	dnb_dmxb.B[EBX], #0.B	;Do we have an DCNB now?
+	JE	12$.S			;No
+	PUSHL	ESI			;Yes - give it up
+	MOVL	ESI, dnb_dcnb.B[EBX]
+	MOVZBL	ECX, dcnb_szindx.B[ESI]
+	CALL	knlGiveXmb##
+	POPL	ESI
+	CLRL	EAX
+	MOVL	dnb_dcnb.B[EBX], EAX
+12$:	PUSHL	EBX
+	MOVL	EDX, dn_total.B[EBP]	;Get space needed
+	ADDL	EDX, #dcnb_cname.B
+	CALL	knlGetIndex##
+14$:	JC	addfin
+	PUSHL	ESI
+	CALL	knlGetXmb##		;Get a block for the DMXB
+	MOVL	EBX, ESI
+	POPL	ESI
+	JC	14$.S			;If error
+	CLRL	EAX
+	MOVL	[EBX], EAX		;Initialize the DMXB header
+	MOVL	dcnb_szindx.B[EBX], ECX
+	MOVL	ESI, dn_bgnpnt.B[EBP]
+	MOVL	FS, dn_buffer+4.B[EBP]	;Set up to store the name
+	PUSHL	EBX
+	ADDL	EBX, #dcnb_cname.B
+	MOVZBL	ECX, FS:[ESI]		;Get length of name
+	MOVB	dcnb_length.B[EBX], CL	;Store it in the DCNB header
+	INCL	EDX
+	CALL	copyname		;Copy the name
+	POPL	EDX			;Restore offset of the DCNB
+	POPL	EBX			;Restore offset of the DNB
+	MOVL	dnb_dcnb.B[EBX], EDX	;Store offset of the DCNB in the DNB
+	CMPW	dnb_waitcnt.B[EBX], #0.B
+	JE	22$.S
+	MOVW	ES, dnb_waitxff.B[EBX]	;Get first waiter
+18$:	MOVZWL	EAX, ES:xffWaitList##	;Save next waiter
+	CMPB	ES:xffWaitBufr##, #DNSREQ_CNAME ;Waiting for a CNAME name?
+	JNE	20$.S			;No
+	PUSHL	EAX			;Yes
+	CLRL	EAX
+	CALL	knlResumeXf##		;Wake him up
+	POPL	EAX			;Restore next waiter
+20$:	MOVL	ES, EAX
+	ORL	EAX, EAX		;More?
+	JNE	18$.S			;Yes - continue
+22$:	JMP	adddone			;Go finish up
+.PAGE
+	.SBTTL	dnsaddmail - (IPSSF_ADDMAIL) Add mail name(s) entry to cache
+
+;Subroutine to process special device function IPSSF_ADDMAIL = 12. - Add mail
+;  name(s) entry to cache.  Value returned is 0 if normal or a negative
+;  error code if error.  Data is specified in the buffer pointed to by
+;  qab_buffer1 with length specified in qab_count.
+
+;  Format of the data is as follows:
+;   Size    Description
+;     4   Error code
+;     4   Time to live (seconds)
+;     4   Offset of first mail name data
+;     4   Offset of second mail name data
+;     4   Offset of third mail name name
+;     4   Offset of fourth mail name data
+;     n   Domain name (counted label format)
+
+;  Each main name is stored in a block as follows:
+;   Size    Description
+;     4   Preference value
+;     n   Main name (counted label format)
+
+dnsaddmail::
+	TOFORK
+	ENTER	dn_SIZE, 0
+	CALL	setupadd		;Do common set up
+	JC	2$.S
+	JNE	6$.S
+	CALL	removednb
+	CLRL	EAX
+2$:	JMP	addfin
+
+4$:	MOVL	EAX, #ER_VALUE
+	JMP	2$.S
+
+;Here with the time-to-live value set up
+
+6$:	DECL	ECX
+	JE	4$.S
+	MOVL	dn_count.B[EBP], ECX
+	IFFAULT	knlQAdrErr0Lv##
+	MOVZBL	ECX, ES:[EDX]		;Get number of mail names provided
+	INCL	EDX
+	JREGZ	ECX, 4$			;Can't be 0!
+	CMPL	ECX, #4t.B		;More than 4?
+	JBE	8$.S			;No
+	MOVL	ECX, #4t		;Yes - just use the first 4
+8$:	MOVL	dn_num.B[EBP], ECX
+	MOVL	dn_bgnpnt.B[EBP], EDX
+	CLRL	EAX
+	MOVL	dn_total.B[EBP], EAX
+10$:	DECL	dn_count.B[EBP]		;Have another byte?
+	JS	4$.S			;No - fail
+	IFFAULT	knlQAdrErr0Lv##		;Yes - get length of next name
+	MOVB	AL, ES:[EDX]
+	ORL	EAX, EAX		;Is it 0?
+	JE	4$.S			;Yes - fail
+	SUBL	dn_count.B[EBP], EAX	;No - is it all there?
+	JS	4$.S			;No - fail
+	ADDL	dn_total.B[EBP], EAX	;Yes - add it in
+	LEAL	EDX, 1.B[EDX+EAX]
+	LOOP	ECX, 10$		;Continue if more names
+	MOVL	EAX, dn_bgnpnt.B[EBP]	;Make sure we can read the last byte
+	ADDL	EAX, dn_total.B[EBP]
+	IFFAULT	knlQAdrErr0Lv##
+	MOVB	AL, ES:-1.B[EAX]
+	CMPL	dnb_dmxb.B[EBX], #0.B	;Do we have an DMXB now?
+	JE	12$.S			;No
+	PUSHL	ESI			;Yes - give it up
+	MOVL	ESI, dnb_dmxb.B[EBX]
+	MOVZBL	ECX, dmxb_szindx.B[ESI]
+	CALL	knlGiveXmb##
+	POPL	ESI
+	CLRL	EAX
+	MOVL	dnb_dmxb.B[EBX], EAX
+12$:	PUSHL	EBX
+	MOVL	EDX, dn_total.B[EBP]	;Get space needed
+	ADDL	EDX, #dmxb_mxname.B
+	CALL	knlGetIndex##
+14$:	JC	addfin
+	PUSHL	ESI
+	CALL	knlGetXmb##		;Get a block for the DMXB
+	MOVL	EBX, ESI
+	POPL	ESI
+	JC	14$.S			;If error
+	CLRL	EAX
+	MOVL	[EBX], EAX		;Initialize the DMXB header
+	MOVL	dmxb_szindx.B[EBX], ECX
+	MOVL	dmxb_len1.B[EBX], EAX
+	MOVL	EAX, dn_num.B[EBP]
+	MOVL	dmxb_nummx.B[EBX], EAX	;Store number of mail names
+	MOVL	ESI, dn_bgnpnt.B[EBP]
+	MOVL	FS, dn_buffer+4.B[EBP]	;Set up to store the name
+	LEAL	EDX, dmxb_len1.B[EBX]
+	PUSHL	EBX
+	ADDL	EBX, #dmxb_mxname.B
+16$:	MOVZBL	ECX, FS:[ESI]		;Get length of name
+	MOVB	[EDX], CL		;Store it in the DMXB header
+	INCL	EDX
+	CALL	copyname		;Copy the name
+	DECL	dn_num.B[EBP]		;More to do?
+	JNE	16$.S			;Yes - continue
+	POPL	EDX			;No - restore offset of the DMXB
+	POPL	EBX			;Restore offset of the DNB
+	MOVL	dnb_dmxb.B[EBX], EDX	;Store offset of the DMXB in the DNB
+	CMPW	dnb_waitcnt.B[EBX], #0.B
+	JE	22$.S
+	MOVW	ES, dnb_waitxff.B[EBX]	;Get first waiter
+18$:	MOVZWL	EAX, ES:xffWaitList##	;Save next waiter
+	CMPB	ES:xffWaitBufr##, #DNSREQ_MX ;Waiting for mail names?
+	JNE	20$.S			;No
+	PUSHL	EAX			;Yes
+	CLRL	EAX
+	CALL	knlResumeXf##		;Wake him up
+	POPL	EAX			;Restore next waiter
+20$:	MOVL	ES, EAX
+	ORL	EAX, EAX		;More?
+	JNE	18$.S			;Yes - continue
+22$:	JMP	adddone			;Go finish up
+.PAGE
+;Subroutine to copy MX or CNAME name from the caller's buffer to our data block
+;	c{EBX}    = Offset of place to store name
+;	c{ECX}    = Value from count byte
+;	c{ES:ESI} = Address of count byte for name in caller's buffer
+
+copyname:
+	INCL	ESI
+	MOVB	AL, ES:[ESI]
+	CMPB	AL, #'a'
+	JB	4$.S
+	CMPB	AL, #'A'
+	JA	4$.S
+	ADDB	AL, #'A'-'a'
+4$:	MOVB	[EBX], AL
+	INCL	EBX
+	LOOP	ECX, copyname
+	RET
+.PAGE
+	.SBTTL	dnsrmvipa - (IPSSF_RMVIPA) Remove IP address entry from database
+
+;Subroutine to process special device function IPSSF_RMVIPA = 13. - Remove
+;  IP address entry from database.  Value returned is 0 if normal or a negative
+;  error code if error.  Data is specified in the buffer pointed to by
+;  qab_buffer1 with length specified in qab_count.  Format of the data is as
+;  follows:
+;   Size    Description
+;     1   Length of domain name (n)
+;     n   Domain name (xxx.xxx.xxx)
+
+dnsrmvipa::
+
+	.SBTTL	dnsrmvcname - (IPSSF_RMVCNAME) Remove canonical name entry from database
+
+;Subroutine to process special device function IPSSF_RMVCNAME = 14. - Remove
+;  canonical name entry from database.  Value returned is 0 if normal or a
+;  negative error code if error.  Data is specified in the buffer pointed to
+;  by qab_buffer1 with length specified in qab_count.  Format of the data is
+;  as follows:
+;   Size    Description
+;     1   Length of domain name (n)
+;     n   Domain name (xxx.xxx.xxx)
+
+dnsrmvcname::
+
+	.SBTTL	dnsrmvmail - (IPSSF_RMVMAIL) Remove mail name entry from database
+
+;Subroutine to process special device function IPSSF_RMVMAIL = 15. - Remove
+;  mail name entry from database.  Value returned is 0 if normal or a negative
+;  error code if error.  Data is specified in the buffer pointed to by
+;  qab_buffer1 with length specified in qab_count.  Format of the data is as
+;  follows:
+;   Size    Description
+;     1   Length of domain name (n)
+;     n   Domain name (xxx.xxx.xxx)
+
+dnsrmvmail::
+
+.PAGE
+;Subroutine to do common set up for function which add data to the cache
+;	CALL	setupadd
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  Z:set = Block should be deleted immediately
+;	  Z:clr = Block should be used
+
+setupadd:
+	CALL	setupiorb
+	JC	4$.S
+	CALL	accessdnb
+	JC	4$.S
+	DECL	ECX
+	JE	knlBadValue##
+	IFFAULT	knlRtnAdrEr##
+	LESL	EDX, dn_buffer.B[EBP]
+	IFFAULT	knlRtnAdrEr##
+
+	MOVB	dnb_bits.B[EBX], #0	;Clear bits for the block
+
+
+
+
+	MOVL	EAX, dn_time2lv.B[EBP]	;Get the time-to-live value
+	ADDL	EDX, #4t.B
+	TESTL	EAX, EAX		;Is it 0?
+	JE	6$.S			;Yes
+	ADDL	EAX, #59t.B		;No - get minutes (round up)
+	PUSHL	EDX
+	CLRL	EDX
+	DIVL	lit60
+	POPL	EDX
+	CMPL	EAX, #2			;Less than 2?
+	JAE	2$.S			;No
+	MOVB	AL, #2			;Yes - make it 2
+2$:	MOVW	dnb_timer.B[EBX], AX	;Store timer value
+	TESTL	EAX, EAX		;Clear C and Z
+4$:	RET
+
+;Here if have a 0 time-to-live value
+
+6$:	CMPW	dnb_waitcnt.B[EBX], #0.B ;Anyone waiting for this?
+	JE	4$.S			;No - don't save the block
+	ORB	dnb_bits.B[EBX], #DB$DELETED ;Yes - indicate not cached
+	MOVW	dnb_timer.B[EBX], #2	;Make the time short
+ret040:	RET				;Return with Z clear
+.PAGE
+;Subroutine to do set up for routines which execute in extended fork context
+;  and which take the domain name from the buffer specified by qab_buffer1.
+;	c{EDI} = Offset of IPS DCB
+;	CALL	setupxff
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+
+setupxff:
+	LESL	EBX, SS:xffBuffer1##	;Save our parameters in our stack
+	MOVL	dn_buffer+0.B[EBP], EBX	   ;  frame
+	MOVL	dn_buffer+4.B[EBP], ES
+	MOVL	dn_rtnbfr+0.B[EBP], EBX
+	MOVL	dn_rtnbfr+4.B[EBP], ES
+	MOVL	ECX, SS:xffCount##
+	DECL	ECX
+	JS	18$.S
+	MOVL	dn_count.B[EBP], ECX
+	MOVL	ESI, dcb_ipsndb.B[EDI]	;Get offset of the NDB
+	CLRL	EAX
+	MOVL	dn_amount.B[EBP], EAX
+	MOVL	dn_cnlimit.B[EBP], #6t
+	LEAL	EDX, dn_dname[EBP]
+	MOVB	AL, ES:[EBX]		;Get the request bits
+	INCL	EBX
+	MOVB	dn_req.B[EBP], AL	;Is the domain name in counted label
+	TESTB	AL, #01h		;Is the domain name in counted label
+					;  format?
+	JNE	copydn			;Yes - this is easy
+	PUSHL	EDI			;No - must convert the format
+	PUSHL	ESI
+	MOVL	ESI, #255t
+8$:	MOVL	EDI, EDX		;Remember where the current count goes
+	INCL	EDX
+	IFFAULT	30$
+10$:	MOVB	AL, ES:[EBX]		;Get next byte
+	INCL	EBX
+	CMPB	AL, #0			;End of name?
+	JE	12$.S			;Yes
+	CMPB	AL, #'.'		;No - end of label?
+	JE	14$.S			;Yes
+	DECL	ESI			;No - room for another byte?
+	JS	16$.S			;No - fail
+	MOVB	SS:[EDX], AL		;Yes - store character
+	INCL	EDX
+	LOOP	ECX, 10$		;Continue if more
+12$:	CLRL	ECX
+14$:	MOVL	EAX, EDX		;Get length of the label
+	DECL	EAX
+	SUBL	EAX, EDI
+	JG	20$.S			;Go on if not null label
+	TESTL	ECX, ECX		;Null label - is it at the end?
+	JE	22$.S			;Yes - ignore it
+16$:	POPL	EDI			;No - fail
+	POPL	ESI
+18$:	JMP	knlBadValue##
+
+;Here at end of label
+
+20$:	CMPL	EAX, #63t.B		;Is label too long?
+	JA	16$.S			;Yes - fail
+	DECL	ESI			;No - room for another byte?
+	JS	16$.S			;No - fail
+	MOVB	SS:[EDI], AL		;Yes - store length
+	TESTL	ECX, ECX		;Finished?
+	JNE	8$.S			;No - continue
+22$:	POPL	ESI
+	POPL	EDI
+	MOVB	SS:[EDX], #0		;Store a final null
+	SUBL	EDX, #dn_dname-1
+	SUBL	EDX, EBP
+	CMPL	EDX, #255t
+	JA	18$.S
+	MOVL	dn_dnlen.B[EBP], EDX
+	CLC
+	RET
+
+	FAULTHDR
+30$:	POPL	EDI
+	POPL	ESI
+	JMP	knlRtnAdrEr##
+.PAGE
+;Here if no DNS cache has been set up
+
+2$:	MOVL	EAX, #ER_NNSNA
+	STC
+	RET
+
+;Subroutine to do set up for routines which execute at main program level and
+;  which take the domain name from the buffer specified by qab_buffer1.
+;	c{ESI} = Offset of IORB
+;	c{EDI} = Offset of IPS DCB
+;	CALL	setupiorb
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+
+setupiorb:
+	CMPL	ndb_dnhash.B[ESI], #0.B	;Do we have a DNS cache set up?
+	JE	2$.S			;No - fail!
+	IFFAULT	knlRtnAdrEr##
+	LESL	EBX, iorb_buffer1.B[ESI] ;Save our parameters in our stack
+	MOVL	dn_buffer+0.B[EBP], EBX	 ;  frame
+	MOVL	dn_buffer+4.B[EBP], ES
+	MOVL	EAX, iorb_count.B[ESI]	;Get length of buffer
+	SUBL	EAX, #24t.B		;Minus size of header
+	JLE	2$.S			;If buffer is too small
+	MOVL	dn_count.B[EBP], EAX
+	CALL	knlGiveQel##		;Give up the IORB
+	MOVL	ESI, dcb_ipsndb.B[EDI]	;Get offset of the NDB
+	IFFAULT	knlRtnAdrEr##
+	LESL	EBX, dn_buffer.B[EBP]
+	IFFAULT	knlRtnAdrEr##
+	MOVL	EAX, ES:[EBX]		;Get error code
+	MOVL	dn_errcode.B[EBP], EAX
+	IFFAULT	knlRtnAdrEr##
+	MOVL	EAX, ES:4t.B[EBX]	;Get time-to-live value
+	MOVL	dn_time2lv.B[EBP], EAX
+	MOVL	EAX, ES:8t.B[EBX]	;Get the 4 values/offsets
+	MOVL	dn_value1.B[EBP], EAX
+	MOVL	EAX, ES:12t.B[EBX]
+	MOVL	dn_value2.B[EBP], EAX
+	MOVL	EAX, ES:16t.B[EBX]
+	MOVL	dn_value3.B[EBP], EAX
+	MOVL	EAX, ES:20t.B[EBX]
+	MOVL	dn_value4.B[EBP], EAX
+	ADDL	EBX, #24t.B		;Point to start of the domain name
+	LEAL	EDX, dn_dname[EBP]
+copydn:	CMPL	dn_count.B[EBP], #255t	;Is the buffer bigger than the maximum
+					;  size for a domain name?
+	JBE	4$.S			;No
+	MOVL	dn_count.B[EBP], #255t	;Yes - only allow the maximum
+4$:	DECL	dn_count.B[EBP]		;Have another byte?
+	JS	10$.S			;No - fail
+	IFFAULT	knlRtnAdrEr##		;Yes
+	MOVZBL	ECX, ES:[EBX]		;Get the label size
+	MOVB	SS:[EDX], CL
+	INCL	EDX
+	JREGZ	ECX, 8$			;If end of name
+	CMPL	ECX, #63t.B		;Too big?
+	JA	10$.S			;Yes - fail
+	SUBL	dn_count.B[EBP], ECX	;No - reduce amount left
+	JLE	10$.S			;If not all there
+	INCL	EBX
+	IFFAULT	knlRtnAdrEr##
+6$:	MOVB	AL, ES:[EBX]
+	INCL	EBX
+	MOVB	SS:[EDX], AL
+	INCL	EDX
+	LOOP	ECX, 6$
+	JMP	4$.S
+
+;Here at end of domain name
+
+8$:	SUBL	EDX, EBP
+	SUBL	EDX, #dn_dname
+	MOVL	dn_dnlen.B[EBP], EDX
+	RET
+
+;Here if have a bad format domain name
+
+10$:	JMP	knlBadValue##
+.PAGE
+;Subroutine to find a domain name block if it exists or to create it if not
+;	c{ESI}    = Offset of NDB
+;	CALL	accessdnb
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  c{EBX} = Offset of domain name block
+
+accessdnb:
+	CALL	finddnb			;Find the DNB if it exists
+	JC	14$.S			;If error
+	JNE	makednb.S		;Not found, make a new DNB
+	MOVL	EAX, dnb_next.B[EBX]	;Found it - remove the DNB from the
+	MOVL	EDX, dnb_prev.B[EBX]	;  access list
+	ORL	EAX, EAX
+	JNE	2$.S
+	MOVL	ndb_dntail.B[ESI], EDX
+	JMP	4$.S
+
+2$:	MOVL	dnb_prev.B[EAX], EDX
+4$:	ORL	EDX, EDX
+	JNE	6$.S
+	MOVL	ndb_dnhead.B[ESI], EAX
+	JMP	8$.S
+
+6$:	MOVL	dnb_next.B[EDX], EAX	;Put it back in the access list at
+8$:	MOVL	EAX, ndb_dnhead.B[ESI]	;  the head of the list
+	MOVL	dnb_next.B[EBX], EAX
+	ORL	EAX, EAX
+	JNE	10$.S
+	MOVL	ndb_dntail.B[ESI], EBX
+	JMP	12$.S
+
+10$:	MOVL	dnb_prev.B[EAX], EBX
+	CLRL	EAX
+12$:	MOVL	dnb_prev.B[EBX], EAX
+14$:	RET
+.PAGE
+;Subroutine to create a domain name block
+;	CALL	makednb
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  c{EBX} = Offset of DNB
+
+makednb:MOVL	EAX, ndb_dncnt.B[ESI]	;Can we add another block?
+	CMPL	EAX, ndb_dnmax.B[ESI]
+	JB	4$.S			;Yes
+	MOVL	EBX, ndb_dntail.B[ESI]	;No - get last block from the access
+	MOVL	EAX, dnb_prev.B[EBX]	;  list
+	MOVL	ndb_dntail.B[ESI], EAX
+	MOVL	dnb_next.B[EAX], #0
+	CALL	removednb		;Give it up
+4$:	MOVL	EDX, dn_dnlen.B[EBP]	;Allocate a buffer for the block
+	ADDL	EDX, #dnb_dname.B
+	CALL	knlGetIndex##
+	JC	ret060.S
+	PUSHL	ESI
+	CALL	knlGetXmb##
+	MOVL	EBX, ESI
+	POPL	ESI
+	JC	ret060.S
+	MOVB	dnb_szindx.B[EBX], CL	;Initialize the block
+	CLRL	EAX
+	MOVB	dnb_bits.B[EBX], AL
+	MOVL	dnb_dmxb.B[EBX], EAX
+	MOVL	dnb_dcnb.B[EBX], EAX
+	MOVL	dnb_waitxff.B[EBX], EAX
+	MOVL	ECX, dn_dnlen.B[EBP]
+	MOVB	dnb_dnlen.B[EBX], CL
+	PUSHL	EDI
+	PUSHL	ESI
+	LEAL	ESI, dn_dname[EBP]	;Copy domain name to the block
+	LEAL	EDI, dnb_dname.B[EBX]
+	PUSHL	DS
+	POPL	ES
+	CLD
+	RMOVSB	[EDI], SS:[ESI]
+	POPL	ESI
+	POPL	EDI
+	MOVL	EDX, dn_index.B[EBP]
+	MOVB	dnb_hsindx.B[EBX], DL
+	MOVL	ECX, ndb_dnhash.B[ESI]	;Put the block on its hash list
+	MOVL	EAX, [ECX+EDX*4]
+	MOVL	[ECX+EDX*4], EBX
+	MOVL	dnb_hash.B[EBX], EAX
+	MOVL	EAX, ndb_dnhead.B[ESI]	;Put the block on the head of its
+	MOVL	dnb_next.B[EBX], EAX	;  access list
+	MOVL	dnb_prev.B[EBX], #0
+	MOVL	ndb_dnhead.B[ESI], EBX
+	TESTL	EAX, EAX
+	JE	8$.S
+	MOVL	dnb_prev.B[EAX], EBX
+	RET
+
+8$:	MOVL	ndb_dntail.B[ESI], EBX
+ret060:	RET
+.PAGE
+;Subroutine to find a domain name block in the database
+;	c{ESI}    = Offset of NDB
+;	CALL	finddnb
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  Z:clr = Not found
+;	  Z:set = Found
+;	    c{EBX} = Offset of domain name block
+
+finddnb:PUSHL	EDI
+	PUSHL	ESI
+	LEAL	EBX, dn_dname[EBP]
+	MOVL	ECX, dn_dnlen.B[EBP]
+	CLRL	EAX			;Calculate hash index for name
+2$:	ROLB	AL, #1
+	XORB	AL, SS:[EBX]
+	INCL	EBX
+	LOOP	ECX, 2$
+	MOVL	dn_index.B[EBP], EAX	;Save hash index
+	SHLL	EAX, #2t
+	ADDL	EAX, ndb_dnhash.B[ESI]
+	MOVL	EBX, [EAX]		;Get first block in hash chain
+	TESTL	EBX, EBX
+	JE	12$.S			;Not there if hash chain is null
+4$:	MOVL	ECX, dn_dnlen.B[EBP]
+	CMPB	dnb_dnlen.B[EBX], CL	;Same length?
+	JNE	10$.S			;No - can't be this one
+	LEAL	EDI, dn_dname[EBP]	;Yes - compare data
+	LEAL	ESI, dnb_dname.B[EBX]
+6$:	MOVB	AL, SS:[EDI]		;Compare characters
+	XORB	AL, [ESI]
+	JE	8$.S			;If same
+	CMPB	AL, #20h		;Different - is only difference the
+					;  case bit?
+	JNE	10$.S			;No
+	MOVB	AL, [ESI]		;Yes - alpha character?
+	ANDB	AL, #~20h
+	CMPB	AL, #'A'
+	JB	10$.S			;No
+	CMPB	AL, #'Z'		;Maybe
+	JA	10$.S			;No
+8$:	INCL	EDI			;Same character - continue checking
+	INCL	ESI
+	LOOP	ECX, 6$
+	CLRL	EAX			;Found it - set Z
+	POPL	ESI
+	POPL	EDI
+	RET
+
+;Here if this is not the block we want
+
+10$:	MOVL	EBX, dnb_next.B[EBX]	;Advance to next block
+	TESTL	EBX, EBX		;Have another block?
+	JNE	4$.S			;Yes - continue
+12$:	INCL	EBX			;No - clear Z
+	POPL	ESI
+	POPL	EDI
+	RET
+.PAGE
+;Subroutine to remove a domain name block
+;	c{EBX} = Offset of DNB
+;	CALL	removednb
+
+removednb:
+	CMPL	dnb_dcnb.B[EBX], #0.B	;Do we have a DCNB?
+	JE	2$.S			;No
+	PUSHL	EBX			;Yes - delete it if we can
+	MOVL	EBX, dnb_dcnb.B[EBX]
+	CALL	removedxxb
+	POPL	EBX
+	JE	2$.S
+	MOVL	dnb_dcnb.B[EBX], #0
+2$:	CMPL	dnb_dmxb.B[EBX], #0.B	;Do we have a DMXB?
+	JE	4$.S			;No
+	PUSHL	EBX			;Yes - delete it if we can
+	MOVL	EBX, dnb_dmxb.B[EBX]
+	CALL	removedxxb
+	POPL	EBX
+	JE	4$.S
+	MOVL	dnb_dmxb.B[EBX], #0
+4$:	MOVZWL	EAX, dnb_waitcnt.B[EBX]	;Can we delete the DNB now?
+	ORL	EAX, dnb_dcnb.B[EBX]
+	ORL	EAX, dnb_dmxb.B[EBX]
+	JE	10$.S			;Yes
+
+;Here if can delete the DNB now
+
+10$:	MOVZBL	EAX, dnb_hsindx.B[EBX]	;Find predicessor in the hash list
+	SHLL	EAX, #2t		;  for this block
+	ADDL	EAX, ndb_dnhash.B[ESI]
+12$:	CMPL	[EAX], EBX
+	JE	16$.S
+	MOVL	EAX, [EAX]
+	TESTL	EAX, EAX
+	JNE	12$.S
+14$:	CRASH	BDNH			;[Bad Domain Name Hash list]
+
+16$:	MOVL	ECX, [EBX]		;Remove block from its hash list
+	MOVL	[EAX], ECX
+
+removedxxb:
+	CMPW	dnb_waitcnt.B[EBX], #0.B ;Anyone waiting for this block?
+	JNE	20$.S			;Yes
+	MOVZBL	ECX, dnb_szindx.B[EBX]	;No
+	CALL	knlGiveXmb##		;Give up the block
+	TESTL	ESP, ESP		;Indicate block given up
+	RET
+
+wakeall:CMPW	dnb_waitcnt.B[EBX], #0.B
+	JNE	22$.S
+	RET
+
+;Here if someone is waiting for this block - we must defer giving it up
+
+20$:	ORB	dnb_bits.B[EBX], #DB$DELETED ;Indicate block is deleted
+22$:	MOVW	ES, dnb_waitxff.B[EBX]	;Get first waiter
+24$:	MOVZWL	EAX, ES:xffWaitList##	;Save next waiter
+	PUSHL	EAX
+	CLRL	EAX
+	CALL	knlResumeXf##		;Wake him up
+	POPL	EAX			;Restore next waiter
+	MOVL	ES, EAX
+	ORL	EAX, EAX		;More?
+	JNE	24$.S			;Yes - continue
+	RET				;No - return with Z set
+.PAGE
+;Subroutine to send request to the DNS name resolver/server
+;	c(AL)  = Request type
+;	c{EBX} = Offset of DNB
+;	c{ESI} = Offset of NDB
+;	CALL	reqinfo
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+
+reqinfo:MOVB	dn_reqtype[EBP], #MT_IPSDNS
+	MOVB	dn_reqreq[EBP], AL
+	MOVB	SS:xffWaitBufr##, AL
+	MOVL	ECX, dn_dnlen.B[EBP]
+	ADDL	ECX, #2t.B
+	PUSHL	EBX
+	PUSHL	ESI
+	LEAL	EBX, ndb_dnsdst.B[ESI]
+	PUSHL	DS
+	POPL	ES
+	LEAL	ESI, dn_reqtype[EBP]
+	PUSHL	SS
+	POPL	FS
+	MOVL	EDX, #ipmsrc
+	PUSHL	CS
+	POPL	GS
+	CALL	knlIpmSendMsg##
+	POPL	ESI
+	POPL	EBX
+	JC	ret080.S
+	MOVZWL	EAX, dnb_waitxff.B[EBX]
+	MOVL	SS:xffWaitList##, EAX
+	MOVW	dnb_waitxff.B[EBX], SS
+	INCW	dnb_waitcnt.B[EBX]
+	MOVL	EAX, #XT_SECOND*15t
+
+	MOVL	EAX, #-1
+
+	CALL	knlXfWait##
+	DECL	dnb_waitcnt.B[EBX]
+ret080:	RET
+
+ipmsrc:	.ASCIZ	"^SYS^IPS^DNS"
+.PAGE
+	.SBTTL	dnsoas - DNS once-a-second routine
+
+dnsoas::DECL	oascnt			;Time for us to do anything here?
+	JNS	ret080.S		;No
+	MOVL	oascnt, #59t		;Yes
+	MOVL	ESI, firstndb#		;Get offset of first NDB in system
+	TESTL	ESI, ESI
+	JE	ret080.S		;If none
+4$:	TOFORK
+	MOVL	EDI, ndb_dnhead.B[ESI]	;Get offset of first DNS DNB
+	TESTL	EDI, EDI
+	JE	14$.S			;If none
+6$:	MOVL	EBX, dnb_dcnb.B[EDI]	;Do we have a DCNB?
+	TESTL	EBX, EBX
+	JE	8$.S			;No
+	TESTB	dcnb_bits.B[EBX], #DB$DELETED ;Yes - already deleted?
+	JNE	8$.S			;Yes
+	DECW	dcnb_timer.B[EBX]	;No - has it timed out?
+	JNS	8$.S			;No
+	CALL	removedxxb		;Yes - remove it
+	JE	8$.S
+	MOVL	dnb_dcnb.B[EDI], #0
+8$:	MOVL	EBX, dnb_dmxb.B[EDI]	;Do we have a DMXB?
+	TESTL	EBX, EBX
+	JE	10$.S			;No
+	TESTB	dmxb_bits.B[EBX], #DB$DELETED ;Yes - already deleted?
+	JNE	10$.S			;Yes
+	DECW	dmxb_timer.B[EBX]	;No - has it timed out?
+	JNS	10$.S			;No
+	CALL	removedxxb		;Yes - remove it
+	JE	10$.S
+	MOVL	dnb_dmxb.B[EDI], #0
+10$:	MOVL	EBX, EDI
+	PUSHL	dnb_next.B[EBX]
+	TESTB	dnb_bits.B[EBX], #DB$DELETED ;Deleted?
+	JNE	12$.S			;Yes
+	DECW	dnb_timer.B[EBX]	;No - has it timed out?
+	JNS	12$.S			;No
+	CALL	removednb		;Yes - remove it
+12$:	POPL	EDI
+	TESTL	EDI, EDI
+	JNE	6$.S
+14$:	FROMFORK
+	MOVL	ESI, [ESI]		;No - advance to next NDB
+	TESTL	ESI, ESI		;More?
+	JNE	4$			;Yes - continue
+	RET				;No - all done here
+.PAGE
+	.SBTTL	Data
+
+xcodetop::
+
+	DATA
+
+oascnt: .LONG	0
+lit60:	.LONG	60t
+
+xdatatop::
+
+	LKEEND

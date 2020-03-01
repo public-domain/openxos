@@ -1,0 +1,722 @@
+	.TITLE	BOOTBOOTP - BOOTP routines XOS boot server
+
+;++++
+; This software is in the public domain.  It may be freely copied and used
+; for whatever purpose you see fit, including commerical uses.  Anyone
+; modifying this software may claim ownership of the modifications, but not
+; the complete derived code.  It would be appreciated if the authors were
+; told what this software is being used for, but this is not a requirement.
+
+;   THIS SOFTWARE IS PROVIDED BY THE AUTHORS "AS IS" AND ANY EXPRESS OR
+;   IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
+;   OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+;   IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+;   INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+;   BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS
+;   OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+;   ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR
+;   TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
+;   USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+;----
+
+	.PROC	80386
+
+	.INCLUD	XOSINC:\XMAC\STDIO.PAR
+	.INCLUD	XOSINC:\XMAC\XOS.PAR
+	.INCLUD	XOSINC:\XMAC\XOSERR.PAR
+	.INCLUD	XOSINC:\XMAC\XOSNET.PAR
+	.INCLUD	BOOTSRV.PAR
+
+	.STDSEGS
+
+;WARNING:  THIS VERSION DOES NOT CORRECTLY SUPPORT USE OF MORE THAN ONE
+;	   CONNECTION TO A SINGLE NETWORK!
+
+BOOTPBFRSIZE=!320t
+
+;Define offsets in the BOOTP data block
+
+$$$=!0
+BLK bdb_qab    , qab_SIZE	;Input QAB
+BLK bdb_next   , 4t		;Offset of next BDB
+BLK bdb_ipaddr , 4t		;Our IP address
+BLK bdb_submask, 4t		;IP sub-net mask
+BLK bdb_table  , 4t		;Offset of address table
+BLK bdb_size   , 4t		;Number of entries in the data table
+BLK bdb_udpname, 12t
+BLK bdb_inparms, 32t		;Parameters for UDP input
+BLK bdb_buffer , BOOTPBFRSIZE	;Data buffer
+bdb_SIZE=!$$$
+
+;Define offsets in an address table entry (ATE)
+
+$$$=!0
+BLK ate_firstnte, 4t
+BLK ate_hwaddr  , 8t
+BLK ate_ipaddr  , 4t
+ate_SIZE=!$$$
+
+;Define offsets in a name table entry (NTE)
+
+$$$=!0
+BLK nte_next    , 4t		;Offset of next NTE for same ATE
+BLK nte_sipaddr , 4t		;Server IP address
+BLK nte_gipaddr , 4t		;Gateway IP address
+BLK nte_namelen , 1t		;Length of name string
+BLK nte_deflen  , 1t		;Length of def string
+BLK nte_name    , 0t		;Name string
+
+	.PSECT	_OTEXT_p
+
+	.SBTTL	fncbootpdev - Subroutine to process BOOTPDEV keyword for procarg
+
+;Subroutine process the BOOTPDEV keyword for procarg
+;	result = fncbootpdev(arg_spec *arg);
+;  result = TRUE if OK, FALSE if error
+
+fncbootpdev::
+	PUSHL	ESI
+	PUSHL	EDI
+	PUSHL	#IV_BOOTPINPUT.B	;Set the BOOTP input done vector
+	PUSHL	#84h+{VT_XOSS<8t}
+	PUSHL	CS
+	PUSHL	#bootpinputdone
+	CALLF	svcSchSetVector#
+	MOVL	EBX, #sivfmsg#		;If error
+	TESTL	EAX, EAX
+	JS	fail2#
+	MOVL	EAX, #bdb_SIZE		;Allocate memory for a BDB
+	CALL	getimem#
+	MOVL	ECX, #bdb_SIZE/4	;Clear the BDB
+	CLRL	EAX
+	PUSHL	EDI
+	CLD
+	RSTOSL	[EDI]
+	POPL	EDI
+	MOVW	[EDI], #QFNC_INBLOCK	;Store input function
+	LEAL	EAX, bdb_buffer.B[EDI]	;Store address of input buffer
+	MOVL	bdb_qab+qab_buffer1+0.B[EDI], EAX
+	MOVL	bdb_qab+qab_buffer1+4.B[EDI], DS
+	MOVL	bdb_qab+qab_count.B[EDI], #BOOTPBFRSIZE ;Store input count
+	LEAL	EAX, bdb_inparms.B[EDI]	       ;Store offset of the input
+	MOVL	bdb_qab+qab_parm+0.B[EDI], EAX ;  parameter list
+	MOVL	bdb_qab+qab_parm+4.B[EDI], DS
+	PUSHL	EDI			;Set up the parameter list for input
+	MOVL	ESI, #inparms
+	MOVL	EDI, EAX
+	MOVL	ECX, #{INPPSIZE+3}/4
+	RMOVSL	[EDI], [ESI]
+	POPL	EDI
+	MOVB	bdb_qab+qab_vector.B[EDI], #IV_BOOTPINPUT
+	MOVL	EAX, firstbdb		;Link the BDB into the list of BDBs
+	MOVL	bdb_next.B[EDI], EAX
+	MOVL	firstbdb, EDI
+	MOVL	ESI, 12t.B[ESP]		;Get offset of argument data structure
+	MOVL	EBX, #openparms		;Get offset of parameter list to use
+	CALL	opendev#		;Open the device
+	CMPL	openclass, #'UDP'	;Is it really a UDP device?
+	JNE	12$			;No - fail
+	MOVL	bdb_qab+qab_handle.B[EDI], EAX ;Yes - store device handle
+	MOVL	EAX, udpname+0		;Copy the device name to the BDB
+	MOVL	bdb_udpname+0.B[EDI], EAX
+	MOVL	EAX, udpname+2
+	MOVL	bdb_udpname+2.B[EDI], EAX
+	MOVL	EAX, udpname+4
+	MOVL	bdb_udpname+4.B[EDI], EAX
+	LEAL	EBX, bdb_buffer+4.B[EDI] ;Get name of the unlying IPS device
+	MOVL	-4.B[EBX], #'_IPS'
+	MOVL	ESI, #udpname+3
+	CLD
+4$:	LODSB	[ESI]
+	CMPB	AL, #':'
+	JE	6$.S
+	MOVB	[EBX], AL
+	INCL	EBX
+	JMP	4$.S
+
+6$:	CMPB	-1.B[EBX], #'A'		;Did it end with a letter?
+	JAE	8$.S			;Yes
+	MOVB	[EBX], #'A'		;No - add A to the end
+	INCL	EBX
+8$:	MOVB	[EBX], AL
+	PUSHL	#O$PHYS
+	PUSHL	DS
+	LEAL	EAX, bdb_buffer.B[EDI]
+	PUSHL	EAX
+	PUSHL	#0.B
+	PUSHL	#0.B
+	CALLF	svcIoOpen#		;Open the IPS device
+	TESTL	EAX, EAX
+	JS	14$.S
+	MOVL	ncharqab+qab_handle, EAX
+	PUSHL	DS			;Get sub-net mask for IP
+	PUSHL	#ncharqab
+	CALLF	svcIoQueue#
+	TESTL	EAX, EAX
+	JS	16$.S
+	MOVL	EAX, ncharqab+qab_error
+	TESTL	EAX, EAX
+	JS	22$.S
+	MOVL	EAX, submask		;OK - save the sub-net mask
+	MOVL	bdb_submask.B[EDI], EAX
+	CALL	bootpproc		;Read the data file and set up our table
+	JC	22$.S			;If error
+	PUSHL	DS			;Queue the initial UDP input
+	PUSHL	EDI
+	CALLF	svcIoQueue#
+	TESTL	EAX, EAX
+	JS	18$.S			;If error
+	MOVL	EDI, #initmsg		;All finished with the unit - tell the
+	MOVL	ECX, #INITMSGSIZE	;  user about this
+	CALL	response#
+	CLRL	EAX			;Return TRUE
+	INCL	EAX
+	POPL	EDI
+	POPL	ESI
+	RET
+
+;Here if device is not a UDP device
+
+12$:	MOVL	EBX, #notudpmsg
+	MOVL	EDX, #notudpdev
+	CLRL	EAX
+	JMP	20$.S
+
+;Here if cannot open the device
+
+14$:	MOVL	EBX, #cnoimsg
+	MOVL	EDX, #cnoidev
+	JMP	20$.S
+
+;Here if cannot get device characterisitcs for the device
+
+16$:	MOVL	EBX, #cngsnmsg
+	MOVL	EDX, #cngsndev
+	JMP	20$.S
+
+;Here if cannot queue initial UDP input
+
+18$:	MOVL	EBX, #csiomsg
+	MOVL	EDX, #csiodev
+20$:	MOVL	ECX, bdb_udpname+0.B[EDI]
+	MOVL	[EDX], ECX
+	MOVL	ECX, bdb_udpname+4.B[EDI]
+	MOVL	4.B[EDX], ECX
+	MOVL	ECX, bdb_udpname+8.B[EDI]
+	MOVL	8.B[EDX], ECX
+22$:	JMP	fail2#
+
+	.PSECT	_TEXT_p
+.PAGE
+	.SBTTL	bootpinputdone - Software interrupt routine for BOOTP input available
+
+;Here if have error on input
+
+inerr:	NOP				;NEED TO DO SOMETHING GOOD HERE!!!
+
+;Here when finished with input
+
+indism:	POPAL				;Restore registers
+	CALLF	svcSchDismiss#		;And dismiss
+
+;Software interrupt routine for BOOTP input available
+
+bootpinputdone:
+	PUSHAL				;Save registers
+	MOVL	EDI, 64t.B[ESP]
+inloop:	TESTB	bdb_qab+qab_status+1.B[EDI], #QSTS$DONE>8 ;Have any input now?
+	JE	indism.S		;No
+	CMPL	bdb_qab+qab_error.B[EDI], #0.B ;Yes - have error on the input?
+	JS	inerr.S			;Yes - go handle that
+	CMPL	bdb_qab+qab_amount.B[EDI], #300t ;Is the packet long enough?
+	JB	10$.S			;No - discard the packet
+	LEAL	EBX, bdb_buffer.B[EDI]	;Point to start of data
+	CMPB	[EBX], #1		;Is this a request?
+	JNE	10$.S			;No
+	MOVZBL	EAX, 2.B[EBX]		;Get the hardware address length
+	MOVL	ECX, #8			;Calculate number of bytes less than 8
+	SUBL	ECX, EAX
+	JL	10$.S			;Ignore packet if too big
+	JE	2$.S
+	PUSHL	EDI			;Make sure unused bytes are 0
+	LEAL	EDI, bootp_chwaddr.B[EBX+EAX]
+	CLRL	EAX
+	CLD
+	RSTOSB	[EDI]
+	POPL	EDI
+2$:	MOVL	EAX, bootp_chwaddr+0.B[EBX] ;Get sender's hardware address
+	MOVL	EDX, bootp_chwaddr+4.B[EBX]
+	MOVL	ECX, bdb_size.B[EDI]	;Get number of entries in the table
+	MOVL	ESI, bdb_table.B[EDI]	;Point to the address table
+	TESTL	ESI, ESI		;Do we have a table?
+	JE	10$.S			;No - forget it!
+4$:	CMPL	ate_hwaddr+0t.B[ESI], EAX ;Compare to table entry
+	JNE	6$.S
+	CMPL	ate_hwaddr+4t.B[ESI], EDX
+	JE	fndit.S			;If found it
+6$:	ADDL	ESI, #ate_SIZE.B	;Bump pointer
+	LOOP	ECX, 4$			;Continue if more to check
+10$:	JMP	indone			;Not found - forget it!
+
+;Here with table entry for the hardware address
+
+fndit:	PUSHL	EDI
+	LEAL	EDI, bootp_filename.B[EBX] ;Find length of the boot file name
+	MOVL	ECX, #128t
+	CLRL	EAX
+	RNSCASB	[EDI]
+	POPL	EDI
+	MOVB	AL, #127t
+	JE	12$.S
+	INCL	EAX
+12$:	SUBL	EAX, ECX
+
+
+	MOVL	EDX, ate_firstnte.B[ESI] ;Point to first name table entry
+14$:	TESTL	EDX, EDX
+	JE	10$.S
+	CMPB	nte_namelen.B[EDX], #0	;Does this one match everything?
+	JE	20$.S			;Yes
+	CMPB	nte_namelen.B[EDX], AL	;No - can it be this one?
+	JNE	16$.S			;No
+	PUSHL	EDI			;Yes - compare the strings
+	PUSHL	ESI
+	LEAL	EDI, bootp_filename.B[EBX]
+	LEAL	ESI, nte_name.B[EDX]
+	MOVL	ECX, EAX
+	RECMPSB	[EDI], [ESI]
+	POPL	ESI
+	POPL	EDI
+	JE	20$.S
+16$:	MOVL	EDX, [EDX]		;Advance to next name entry
+	JMP	14$.S			;Continue
+	
+;Here with matching name table entry
+
+20$:	MOVL	EAX, nte_sipaddr.B[EDX]	;Store server IP address
+	MOVL	bootp_sipaddr.B[EBX], EAX
+	MOVL	EAX, nte_gipaddr.B[EDX]	;Store router IP address
+	MOVL	bootp_gipaddr.B[EBX], EAX
+	MOVL	EAX, ate_ipaddr.B[ESI]	;Get corresponding IP address
+	MOVL	bootp_yipaddr.B[EBX], EAX ;Store it as "your IP address"
+	MOVB	[EBX], #2		;Change message type to "reply"
+	MOVB	bootp_hops.B[EBX], #0	;Clear the hops field
+	PUSHL	ESI
+	PUSHL	EDI
+	MOVZBL	ECX, nte_deflen.B[EDX]
+	MOVZBL	EAX, nte_namelen.B[EDX]	;Store boot file name
+	LEAL	ESI, nte_name.B[EDX+EAX]
+	LEAL	EDI, bootp_filename.B[EBX]
+	MOVL	EAX, #128t
+	SUBL	EAX, ECX
+	CLD
+	RMOVSB	[EDI], [ESI]
+	MOVL	ECX, EAX		;Clear the rest of the boot file
+	CLRL	EAX			;  name field
+	RSTOSB	[EDI]
+	MOVL	EAX, #63538263h		;Store vendor area magic number
+	STOSL	[EDI]
+	MOVL	EBX, EDI
+	POPL	EDI
+	POPL	ESI
+	CMPL	bdb_submask.B[EDI], #0.B ;Do we have a sub-net mask?
+	JE	22$.S			;No
+	MOVW	[EBX], #0401h		;Store header for sub-net mask item
+	MOVL	EAX, bdb_submask.B[EDI]	;Yes - store sub-net mask value
+	MOVL	2t.B[EBX], EAX
+	ADDL	EBX, #6t.B
+22$:	MOVB	[EBX], #0FFh		;Store end of list indicator
+	MOVL	EAX, bdb_inparms+ipaddr.B[EDI]
+	TESTL	EAX, EAX
+	JNE	23$.S
+	DECL	EAX
+23$:	MOVL	rmtnode, EAX
+	MOVL	EAX, bdb_inparms+udpport.B[EDI]
+	MOVL	rmtport, EAX
+	PUSHL	bdb_qab+qab_handle.B[EDI] ;Send the reply packet
+	PUSHL	DS
+	LEAL	EAX, bdb_buffer[EDI]
+	PUSHL	EAX
+	PUSHL	#300t
+	PUSHL	DS
+	PUSHL	#outparms
+	CALLF	svcIoOutBlockP#
+	TESTL	EAX, EAX
+	JS	26$.S			;If error
+indone:	MOVB	bdb_qab+qab_vector.B[EDI], #0
+	PUSHL	DS
+	PUSHL	EDI
+	CALLF	svcIoQueue#
+	TESTL	EAX, EAX
+	JS	24$.S
+	MOVB	bdb_qab+qab_vector.B[EDI], #IV_BOOTPINPUT
+	JMP	inloop
+
+;Here if error queueing input
+
+24$:	NOP				;NEED TO LOG THIS AND DELAY A SHORT
+	JMP	indism			; TIME AND TRY AGAIN!
+
+;Here if error sending the BOOTP reply
+
+26$:	NOP				;NEED TO LOG THIS!
+	JMP	indone.S
+.PAGE
+	.SBTTL	bootpproc - Subroutine to process the BOOTP data file
+
+;Subroutine to process the BOOTP data file
+;	c{EDI} = Offset of the BOOTP data block
+;	CALL	bootpproc
+;	C:set = Error
+;	  c{EBX} = Offset of 1st message string
+;	  c{EAX} = Error code or offset of 2nd message string
+;	C:clr = Normal
+
+bootpproc:
+	ENTER	read_SIZE, 0
+	MOVL	ESI, #bootpdata#	;Open the data file
+	CALL	opendata#
+	JC	6$.S
+	MOVL	read_stream.B[EBP], EAX	;Save the stream pointer
+	MOVL	EAX, bdb_table.B[EBP]	;Do we have an address table now?
+	TESTL	EAX, EAX
+	JE	2$.S			;No
+	MOVL	bdb_table.B[EBP], #0	;Yes
+	PUSHL	EAX			;Give it up
+	CALL	free#
+	POPL	EAX
+
+;Here with file open and previous table (if any) given up - first we read the
+;  file to see how much we need to allocate for our tables
+
+2$:	CLRL	EAX			;Clear the count
+	MOVL	read_count.B[EBP], EAX
+	MOVL	read_space.B[EBP], EAX
+	MOVL	EAX, #readacount
+	MOVL	EDX, #readdignore
+	MOVL	ECX, #readncount
+	LEAL	EBX, bdb_buffer.B[EDI]
+	LEAL	ESI, bdb_udpname.B[EDI]
+	CALL	readdata#
+	JC	6$.S
+	MOVL	EAX, read_space.B[EBP]	;Allocate space for the tables
+	TESTL	EAX, EAX
+	JNE	4$.S
+	MOVL	EAX, bdb_udpname+0.B[EDI]
+	MOVL	ndefdev+0, EAX
+	MOVL	EAX, bdb_udpname+4.B[EDI]
+	MOVL	ndefdev+4, EAX
+	MOVL	EAX, bdb_udpname+8.B[EDI]
+	MOVL	ndefdev+8, EAX
+	MOVL	EBX, #ndefmsg
+	CLRL	EAX
+	JMP	14$.S
+
+4$:	CALL	getmem#
+6$:	JC	10$.S
+	MOVL	bdb_table.B[EDI], EAX
+	MOVL	read_pnt1.B[EBP], EAX
+	ADDL	read_space.B[EBP], EAX
+	MOVL	EAX, read_count.B[EBP]
+	MOVL	bdb_size.B[EDI], EAX
+	IMULL	EAX, #ate_SIZE.B
+	ADDL	EAX, bdb_table.B[EDI]
+	MOVL	read_pnt2.B[EBP], EAX
+	PUSHL	#0.B			;Set back to beginning of file
+	PUSHL	#0.B
+	PUSHL	read_stream.B[EBP]
+	CALL	fseek#
+	ADDL	ESP, #12t.B
+	MOVL	EBX, #errdfmsg#
+	TESTL	EAX, EAX
+	JS	12$.S			;If error
+	MOVL	EAX, #readaread
+	MOVL	EDX, #readdignore
+	MOVL	ECX, #readnread
+	LEAL	EBX, bdb_buffer.B[EDI]
+	LEAL	ESI, bdb_udpname.B[EDI]
+	CALL	readdata#		;Read file again and store data
+	JC	10$.S			;If error
+	PUSHL	read_stream.B[EBP]	;OK - close the file
+	CALL	fclose#
+	POPL	ECX
+	CLRL	EAX
+10$:	LEAVE
+	RET
+
+;Here if have error return from a C run-time function
+
+12$:	MOVL	EAX, errno#		;Get error code
+14$:	STC				;Indicate error
+	LEAVE
+	RET
+.PAGE
+	.SBTTL	readdignore - Subroutine called by readdata for D line
+
+;Subroutine called by readdata for a D line
+;	c{EAX} = Protocol value
+;	CALL	readdignore
+;	C:set = Error
+;	  c{EBX} = Offset of 1st message string
+;	  c{EAX} = Error code or offset of 2nd message string
+;	C:clr = Normal
+
+readdignore:
+	CLC
+	RET
+.PAGE
+	.SBTTL	readacount - Subroutine called by readdata during first pass for A lines
+
+;Subroutine called by readdata during the first pass for A lines
+;	CALL	readacount
+;	C:clr always
+
+readacount:
+	INCL	read_count.B[EBP]
+	ADDL	read_space.B[EBP], #ate_SIZE.B
+ret080:	RET
+.PAGE
+	.SBTTL	readaread - Subroutine called by readdata during second pass for A lines
+
+;Subroutine called by readdata during the second pass for A lines
+;	CALL	readaread
+
+readaread:
+	DECL	read_count.B[EBP]	;Count the line
+	JS	8$.S			;If more than pass 1!
+	LEAL	ESI, bdb_buffer+1.B[EDI] ;Point to start of data on line
+	MOVL	ECX, #6t		;Get hardware address
+	CALL	getaddress#
+	JC	ret080.S
+	MOVL	EBX, read_pnt1.B[EBP]
+	MOVL	EAX, read_value+0.B[EBP] ;Store the hardware address
+	MOVL	ate_hwaddr+0.B[EBX], EAX
+	MOVL	EAX, read_value+4.B[EBP]
+	MOVL	ate_hwaddr+4.B[EBX], EAX
+	MOVL	ECX, #4t		;Get IP address
+	CALL	getaddress#
+	JC	ret080.S
+	MOVL	EBX, read_pnt1.B[EBP]	;Store the IP address
+	MOVL	EAX, read_value.B[EBP]
+	MOVL	ate_ipaddr.B[EBX], EAX	
+	MOVL	read_pnt3.B[EBP], EBX	;Store offset of pointer for linking
+	ADDL	read_pnt1.B[EBP], #ate_SIZE.B
+	CLRL	EAX			;Clear the pointer in case no NTEs
+	MOVL	[EBX], EAX
+	JMP	checkeol#		;Check for end of line
+
+;Here if have more A lines during pass 2 than during pass 1 (should not be
+;  possible!)
+
+8$:	MOVL	EBX, #phermsg#
+	CLRL	EAX
+	STC
+	RET
+.PAGE
+	.SBTTL	readncount - Subroutine called by readdata during first pass for N lines
+
+;Subroutine called by readdata during the first pass for N lines - this routine
+;  determines the length of the ATE which will be built from this line during
+;  the second pass.
+;	CALL	readncount
+
+readncount:
+	ADDL	read_space.B[EBP], #nte_name.B ;Add in length of fixed part
+	CALL	addstr			;Add in the length of the given name
+	JC	ret080.S
+	MOVL	ECX, #4t		;Skip the server IP address
+	CALL	getaddress#
+	JC	ret080.S
+	MOVL	ECX, #4t		;Skip the gateway IP address
+	CALL	getaddress#
+	JC	ret080.S
+	CALL	addstr			;Add in the length of the defined name
+	JC	ret080.S
+	ADDL	read_space.B[EBP], #03.B
+	ANDL	read_space.B[EBP], #0FFFFFFFCh.B
+	JMP	checkeol#
+.PAGE
+	.SBTTL	readnread - Subroutine called by readdata during second pass for N lines
+
+;Subroutine called by readdata during the second pass for N lines - this
+;  routines builds an NTE from the data in the line
+;	CALL	readnread
+
+readnread:
+	MOVL	EBX, read_pnt2.B[EBP]	;Point to the new NTE
+	CMPL	read_space.B[EBP], EBX	;Have we used too much space?
+	JBE	6$.S			;Yes!
+	MOVL	EAX, read_pnt3.B[EBP]	;No - link to the previous block
+	MOVL	[EAX], EBX
+	MOVL	read_pnt3.B[EBP], EBX
+	CLRL	EAX			;Clear our forward pointer in case this
+	MOVL	[EBX], EAX		;  is the last NTE
+	PUSHL	EDI
+	LEAL	EDI, nte_name.B[EBX]	;Point to place to put name
+	CALL	copystr			;Store the name
+	MOVB	nte_namelen.B[EBX], CL	;Store length of the name
+	MOVL	ECX, #4
+	CALL	getaddress#		;Get the server IP address
+	JC	4$.S			;If error
+	MOVL	EAX, read_value.B[EBP]
+	MOVL	nte_sipaddr.B[EBX], EAX
+	MOVL	ECX, #4
+	CALL	getaddress#		;Get the gateway IP address
+	JC	4$.S			;If error
+	MOVL	EAX, read_value.B[EBP]
+	MOVL	nte_gipaddr.B[EBX], EAX
+	CALL	copystr			;Store the defined name
+	MOVB	nte_deflen.B[EBX], CL	;Store length of the defined name
+	ADDL	EDI, #3.B
+	ANDL	EDI, #0FFFFFFFCh.B
+	CMPL	read_space.B[EBP], EDI	;Have we used too much space?
+	JB	6$.S			;Yes!
+	MOVL	read_pnt2.B[EBP], EDI	;No - update pointer
+4$:	POPL	EDI
+	RET
+
+;Here if we have used more space than we thought we needed
+
+6$:	MOVL	EBX, #phermsg#
+	CLRL	EAX
+	POPL	EDI
+	STC
+	RET
+.PAGE
+	.SBTTL	addstr - Subroutine to add in length of string in the data file
+
+;Subtroutine to add in length of a string in the data file
+;	CALL	addstr
+
+addstr:	CALL	skipws#			;Skip any leading whitespace
+	CLRL	ECX
+4$:	INCL	ECX
+	LODSB	[ESI]
+	CMPB	AL, #' '
+	JA	4$.S
+	ADDL	read_space.B[EBP], ECX
+	CLC
+ret020:	RET
+.PAGE
+	.SBTTL	copystr - Subroutine to copy string from data file
+
+;Subroutine to copy string from data file
+;	c{ESI} = Pointer to data file buffer
+;	c{EDI] = Offset of place to put string
+;	CALL	copystr
+;	c(CL) = Length of string
+
+copystr:CALL	skipws#			;Skip leading whitespace
+	CLRL	ECX
+	LODSB	[ESI]
+	CMPB	AL, #'#'		;Null name?
+	JNE	4$.S			;No
+	LODSB	[ESI]			;Maybe
+	CMPB	AL, #' '
+	JE	8$.S			;Yes
+	CMPB	AL, #';'
+	JE	8$.S
+4$:	CMPB	AL, #' '
+	JBE	8$.S
+	CMPB	AL, #';'
+	JE	8$.S
+	STOSB	[EDI]
+	INCL	ECX
+	LODSB	[ESI]
+	JMP	4$.S
+
+;Here at end of name
+
+8$:	DECL	ESI			;Point to stopper character
+	RET
+.PAGE
+	.SBTTL	Data
+
+	.PSECT	_DATA_p
+
+ndefmsg: .ASCII "No matching device entry found in the BOOTP data file for _"
+ndefdev: .BLKB  12t
+
+	 .MOD  4
+firstbdb:.LONG 0		;Offset of first BDB
+
+	  .MOD   4
+inparms:  .BYTE  PAR$GET|REP_HEXV, 4t
+	  .WORD  IOPAR_NETRMTNETAR
+ipaddr=!$-inparms
+	  .LONG  0
+	  .BYTE  PAR$GET|REP_HEXV, 4t
+	  .WORD  IOPAR_NETRMTPORTR
+udpport=!$-inparms
+	  .LONG  0
+	  .BYTE  PAR$SET|REP_DECV, 4t
+	  .WORD  IOPAR_TIMEOUT
+timeout=!$-inparms
+	  .LONG  -1
+	  .BYTE  0
+INPPSIZE=!$-inparms
+
+	  .MOD   4
+outparms: .BYTE  PAR$SET|REP_HEXV, 4t
+	  .WORD  IOPAR_NETRMTNETAS
+rmtnode:  .LONG  0
+	  .BYTE  PAR$SET|REP_HEXV, 4t
+	  .WORD  IOPAR_NETRMTPORTS
+rmtport:  .LONG  0
+	  .BYTE  0
+
+	.SBTTL	Once-only data
+
+	.PSECT	_ODATA_p
+
+;;;;udperrmsg:.ASCII "Cannot open UDP device for BOOTP: _"
+;;;;udperdev: .BLKB  12t
+notudpmsg:.ASCII "Device is not a UDP device: _"
+notudpdev:.BLKB  12t
+csiomsg:  .ASCII "Cannot queue initial UDP input request for BOOTP device _"
+csiodev:  .BLKB  12t
+cnoimsg:  .ASCII "Cannot open IPS device corresponding to BOOTP device _"
+cnoidev:  .BLKB  12t
+cngsnmsg: .ASCII "Cannot obtain sub-net mask for BOOTP device _"
+cngsndev: .BLKB  12t
+initmsg:  .ASCII {MT_INTRMDMSG}"% BOOTSRV: BOOTP server initialized for _"
+udpname:  .BLKB  12t
+INITMSGSIZE=!$-initmsg
+
+	  .MOD   4
+openparms:.BYTE	 PAR$GET|REP_TEXT, 8 ;Parameters for initial open of devices
+	  .WORD	 IOPAR_CLASS
+openclass:.BLKB  8t
+	  .BYTE  PAR$SET|REP_HEXV, 4
+	  .WORD	 IOPAR_FILOPTN
+	  .LONG  FO$XOSNAME|FO$NOPREFIX
+	  .BYTE  PAR$GET|REP_STR, 0
+	  .WORD  IOPAR_FILSPEC
+	  .LONG  udpname, !udpname
+	  .WORD  12t, 0
+	  .BYTE  PAR$SET|REP_HEXV, 2
+	  .WORD  IOPAR_NETLCLPORT
+	  .WORD  UDPP_BOOTPS
+	  .BYTE  0
+
+	  .MOD   4
+nchars:   .BYTE  PAR$GET|REP_HEXV, 4t
+	  .LONG  'SUBM', 'ASK'
+submask:  .LONG  0
+	  .BYTE  0
+
+	  .MOD   4
+ncharqab: .WORD  QFNC$WAIT|QFNC_DEVCHAR ;qab_func    = 0.  - Function
+	  .WORD  0		;qab_status  = 2.  - Returned status
+	  .LONG  0		;qab_error   = 4.  - Error code
+	  .LONG  0		;qab_amount  = 8.  - Amount transfered
+	  .LONG  0		;qab_handle  = 12. - Device handle
+	  .BYTE  0		;qab_vector  = 16. - Vector for interrupt
+	  .BYTE  0, 0, 0	;Reserved
+	  .LONG  DCF_VALUES	;qab_option  = 20. - Option bits
+	  .LONG  0		;qab_count   = 24. - Amount to transfer
+	  .LONG  0, 0		;qab_buffer1 = 28. - Pointer to data buffer
+	  .LONG  nchars, !nchars;qab_buffer2 = 36.
+	  .LONG  0, 0		;qab_parm    = 44. - Pointer to parameter list
+
+	.END

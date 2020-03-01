@@ -1,0 +1,602 @@
+	.TITLE	ONCELCD - Minimum console device driver for LCD display
+
+;++++
+; This software is in the public domain.  It may be freely copied and used
+; for whatever purpose you see fit, including commerical uses.  Anyone
+; modifying this software may claim ownership of the modifications, but not
+; the complete derived code.  It would be appreciated if the authors were
+; told what this software is being used for, but this is not a requirement.
+
+;   THIS SOFTWARE IS PROVIDED BY THE AUTHORS "AS IS" AND ANY EXPRESS OR
+;   IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
+;   OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+;   IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+;   INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+;   BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS
+;   OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+;   ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR
+;   TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
+;   USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+;----
+
+;This module is the initial resident console driver for the T6963C based LCD
+;  displays.  It provides a minimum level of console support during system
+;  startup.  It must be superceeded by a full console driver for the LCD
+;  display.  Since this module is loaded entirely in the once-only  psect, it
+;  will go away completely at the end of the once-only phase.  This driver is
+;  implemented as a complete stand-alone device.  It does not use any of the
+;  console driver routines.  This driver operates the display in text mode
+;  using a 6x8 character cell with the internal character generator.  It is
+;  assumed that the real mode routines have already set up the display and no
+;  set up is done here.  The only control characters supported are CR and LF.
+;  All other characters are displayed.  There is no support for display
+;  attributes.  Minimul support for a matrix keypad is provied.  It is
+;  limited to detecting that the "." key has been pressed.   No real keypad
+;  input is done.  All keys except "." are ignored, "." causes a LF character
+;  to be input.  This is intended to provide the absolute minimum support
+;  required for the once-only code only!  Keypad input is not scheduled.
+;  When a program asks for keyboard input, this driver will wait in a CPU
+;  loop in exec mode (main program level, interrupts and forks are allowed)
+;  until a key is pressed!!
+
+	.PROC	80486
+	.INCLUD	XOSINC:\XMAC\XOS.PAR
+	.INCLUD	XOSINC:\XMAC\XOSX.PAR
+	.INCLUD	XOSINC:\XMAC\XOSERR.PAR
+	.INCLUD	XOSINC:\XMAC\XOSTRM.PAR
+	.INCLUD	XOSINC:\XMAC\XOSXTRM.PAR
+	.INCLUD	XOSINC:\XMAC\XOSDOS.PAR
+	.INCLUD	XOSINC:\XMAC\PCAT.PAR
+	.INCLUD	XOSINC:\XMAC\XOSXT6963C.PAR
+
+;Define LCD configuration
+
+LCD_WIDTH =!40t			;Display width (charcters)
+LCD_HEIGHT=!8t			;Display height (character lines)
+
+
+;Define LCD interface regsiters
+
+P_LCDDATA=!0358h
+P_LCDCMD =!0359h
+P_LCDCFG =!1358h
+
+;Define offsets in the OOCD DCB
+
+$$$=!4
+BLK dcb_oocdline , 4t		;Current line number
+BLK dcb_oocdcol  , 4t		;Current column number
+BLK dcb_oocdkbsts, 1t		;Keyboard status
+BLK              , 3t
+BLK dcb_oocdkbput, 4t		;Keyboard ring buffer putter pointer
+BLK dcb_oocdkbtak, 4t		;Keyboard ring buffer taker pointer
+BLK dcb_oocdkbcnt, 4t		;Keyboard ring buffer count
+BLK dcb_oocdkbend, 4t		;Offset of end of keyboard ring buffer
+BLK dcb_oocdkbbfr, 50t		;Keyboard ring buffer
+dcb_oocdSIZE=!$$$
+
+;Define values for dcb_oocdkbsts
+
+OOCDKB$CTL=!02h			;Control key is pressed
+OOCDKB$ALT=!01h			;Alt key is pressed
+
+$$$=oocddata
+GBK oocddcb, dcb_oocdSIZE
+BLK oocdccb, ccb_SIZE
+
+	ONCE
+
+;SVC dispatch table for OOCD device
+
+oocddsp:.LONG	knlRtnZero#	;sd_mount	=  0. - Mount
+	.LONG	knlRtnZero#	;sd_cleardev	=  4. - Clear device
+	.LONG	knlRtnZero#	;sd_cleardcb	=  8. - Clear DCB
+	.LONG	knlRtnZero#	;sd_commit	= 12. - Commit data to disk
+	.LONG	knlRtnZero#	;sd_transold    = 16. - Transfer device/old
+	.LONG	knlRtnZero#	;sd_transnew    = 20. - Transfer device/new
+	.LONG	knlRtnZero#	;sd_opena	= 24. - Open additional
+	.LONG	knlRtnZero#	;sd_open1	= 28. - Open device/file
+	.LONG	knlRtnZero#	;sd_devparm     = 32. - Device parameters
+	.LONG	knlIFnDev#	;sd_delete	= 36. - Delete file
+	.LONG	knlIFnDev#	;sd_rename	= 40. - Rename file
+	.LONG	oocdinpblk	;sd_inblock	= 44. - Input block
+	.LONG	oocdoutblk	;sd_outblock	= 48. - Output block
+	.LONG	knlIllOut#	;sd_outblockq	= 52. - Output block (XFF)
+	.LONG	oocdoutstr	;sd_outstring	= 56. - Output string
+	.LONG	knlRtnZero#	;sd_getiosts	= 60. - Get input/output status
+	.LONG	knlIFnDevGQ#	;sd_special     = 64. - Special device function
+	.LONG	oocdclose	;sd_close	= 68. - Close file
+	.LONG	knlNullLabel#	;sd_getlabel    = 72. - Get device label
+	.LONG	knlNullQioGQ#	;sd_commitfunc	= 76. - Commit data to disk
+	.LONG	knlInfoNone#	;sd_devinfo     = 80. - Get device info
+
+
+	.LONG	PARMIOMAX
+oocdioparms::
+	.LONG	oocdiogenparms	;IOPAR_xxxxxx = 00xx - Generic IO parameters
+	.LONG	knlNullFilParms#;IOPAR_FILxxx = 01xx - File system IO parameters
+	.LONG	knlNullTrmParms#;IOPAR_TRMxxx = 02xx - Terminal IO parameters
+PARMIOMAX=!{$-oocdioparms}/4
+
+	.LONG	PARMIOGENMAX	;Size of table
+oocdiogenparms:
+	.LONG	0
+	.LONG	knlIoxFilOptn#	;IOPAR_FILOPTN     = 0001h
+	.LONG	knlIoxFilSpec#	;IOPAR_FILSPEC     = 0002h
+	.LONG	knlIopDevSts#	;IOPAR_DEVSTS      = 0003h
+	.LONG	knlIopUnitNum#	;IOPAR_UNITNUM     = 0004h
+	.LONG	knlIopGlbId#	;IOPAR_GLBID       = 0005h
+	.LONG	0		;IOPAR_DELAY       = 0006h
+	.LONG	0		;IOPAR_TIMEOUT	   = 0007h
+	.LONG	0		;IOPAR_INPSTS      = 0008h
+	.LONG	0		;IOPAR_OUTSTS	   = 0009h
+	.LONG	0		;IOPAR_INPQLMT	   = 000Ah
+	.LONG	0		;IOPAR_OUTQLMT	   = 000Bh
+	.LONG	0		;IOPAR_SIVECT1     = 000Ch
+	.LONG	0		;IOPAR_SIVECT2     = 000Dh
+	.LONG	0		;IOPAR_SIDATA      = 000Eh
+	.LONG	knlIopNumOpen#	;IOPAR_NUMOPEN     = 000Fh
+	.LONG	0		;IOPAR_BUFRLMT	   = 0010h
+PARMIOGENMAX=!{$-oocdiogenparms}/4
+.PAGE
+	.SBTTL	oocdinit - Once-only console device initialization routine
+
+;Once-only console device initialization routine
+;	c(AL) = Initial cursor column
+;	c(AH) = Initial cursor line
+;	CALL	oocdinit
+
+oocdinit::
+	PUSHL	EAX			;Save cursor position
+	MOVL	EDI, #oocdchk		;Install our class
+	CLRL	EBX
+	MOVL	EAX, #'OOCD'
+	CLRL	EDX
+	CLRL	ECX
+	MOVL	ESI, #oocdccb
+	CALL	knlNewClass#
+	JC	4$.S
+	MOVL	EDI, #oocddcb		;Set up our single DCB
+	MOVL	dcb_name+0.B[EDI], #'OOCD'
+	MOVL	dcb_name+4.B[EDI], #'0'
+	MOVL	dcb_dsp.B[EDI],#DS$PHYS|DS$CONTROL|DS$UNBFRD|DS$DUPLEX|-
+			DS$DIN|DS$DOUT
+	MOVL	dcb_sdisp.B[EDI], #oocddsp
+	DECL	dcb_fnext.B[EDI]
+	MOVL	ESI, #oocdccb
+	CALL	knlLinkDcb#
+	JC	4$.S
+	POPL	EAX			;Restore cursor position
+	MOVB	dcb_oocdcol.B[EDI], AL
+	MOVB	dcb_oocdline.B[EDI], AH
+	RET
+
+;Here if error setting up the device (this should not happen!)
+
+4$:	CRASH	CICD
+.PAGE
+	.SBTTL	oocdchk - Device check routine for OOCD device
+
+;Device check routine for OOCD class device
+;	c{SS:EBX} = Address of device name (16 bytes)
+;	CALL	oocdchk
+;	C:set = Error (match found)
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  Z:set = Match found
+;	    c{EDI} = Offset of DCB
+;	  Z:clr = Not found
+;  EBX and ESI are preserved
+
+oocdchk:CMPL	SS:[EBX], #'OOCD'	;Is this OOCD0?
+	JNE	2$.S			;No
+	CMPB	SS:4.B[EBX], #'0'.B	;Maybe
+	JNE	2$.S			;No
+	MOVL	EDI, #oocddcb		;Yes - point to our DCB
+	RET				;Return with Z set
+
+;Here if not OORD0, return with Z and C clear
+
+2$:	CLC
+	RET
+.PAGE
+	.SBTTL	sd_close - Close device
+
+;Here for the close entry
+;	c{EDI} = Offset of DCB
+;	c{ESI} = Offset of IORB
+;	CALL	oocdclose
+
+oocdclose:
+	CMPL	dcb_opencnt.B[EDI], #1.B ;Is this the last close?
+	JNE	4$.S			;No
+	PUSHL	ESI			;Yes
+	MOVZWL	EAX, dcb_id.B[EDI]	;Give up the DCB's global ID
+	CALL	knlGiveDcbId#
+	MOVL	ESI, #oocdccb		;Remove the device class
+	CALL	knlRmvClass#
+	POPL	ESI
+4$:	JMP	knlNullClose#
+
+.PAGE
+	.SBTTL	sd_inpblock - Input block
+
+;Here for the input block entry
+;	c{EDI} = Offset of DCB
+;	c{ESI} = Offset of IORB
+;	CALL	oocdinpblk
+;	C:set = Error
+;	  c{EAX} = Error code
+;	  c{EBX} = Status bits
+;	  c{ECX} = Amount output
+;	C:clr = Normal
+;	  c{EBX} = Status bits
+;	  c{ECX} = Amount output
+
+oocdinpblk:
+	PUSHL	iorb_count.B[ESI]
+	PUSHL	iorb_buffer1+4.B[ESI]
+	PUSHL	iorb_buffer1+0.B[ESI]
+	PUSHL	iorb_parm+4.B[ESI]
+	PUSHL	iorb_parm+0.B[ESI]
+	CALL	knlGiveIorb#
+	POPL	EDX
+	POPL	EAX
+	TESTL	EDX, EDX
+	JE	2$.S
+	MOVL	FS, EAX
+	MOVL	EBX, #oocdioparms	;Process the parameters
+	MOVL	ECX, #knlComDPParms#
+	CALL	knlProcDevParm#
+	JC	14$.S
+2$:	POPL	EBX
+	POPL	EAX
+	POPL	ECX
+	JREGZ	ECX, 10$
+	MOVL	ES, EAX
+
+	CRASH	KEY?
+
+	MOVB	ES:[EBX], #LF		;Yes - give him a LF!
+	MOVL	ECX, #1
+10$:	CLRL	EAX
+12$:	MOVL	EBX, #QSTS$DONE
+	TOFORK
+	RET
+
+14$:	POPL	ECX
+	POPL	ECX
+	CLRL	ECX
+	JMP	12$.S
+.PAGE
+	.SBTTL	sd_outstring - Output string
+
+;Here for the output string entry
+;	c{EDI} = Offset of DCB
+;	c{ESI} = Offset of IORB
+;	CALL	oocdoutstr
+;	C:set = Error
+;	  c{EAX} = Error code
+;	  c{EBX} = Status bits
+;	  c{ECX} = Amount output
+;	C:clr = Normal
+;	  c{EBX} = Status bits
+;	  c{ECX} = Amount output
+
+oocdoutstr:
+	CALL	knlIoStringLock#	;Lock the string (we don't really need
+	JC	10$.S			;  to lock it, but this is a convient
+					;  way to get the length of the string!
+					;Fall into the outblock routine
+
+	.SBTTL	sd_outblock - Output block
+
+;Here for the output block entry (note that if a count of -1 is specified, no
+;  output is done and the current cursor position is returned in qab_amount
+;  as column + line*256)
+;	c{EDI} = Offset of DCB
+;	c{ESI} = Offset of IORB
+;	c{ECX} = IO command bits
+;	CALL	oocdoutblk
+;	C:set = Error
+;	  c{EAX} = Error code
+;	  c{EBX} = Status bits
+;	  c{ECX} = Amount output
+;	C:clr = Normal
+;	  c{EBX} = Status bits
+;	  c{ECX} = Amount output
+
+oocdoutblk:
+	PUSHL	iorb_count.B[ESI]
+	PUSHL	iorb_buffer1+4.B[ESI]
+	PUSHL	iorb_buffer1+0.B[ESI]
+	PUSHL	iorb_parm+4.B[ESI]
+	PUSHL	iorb_parm+0.B[ESI]
+	CALL	knlGiveIorb#
+	POPL	EDX
+	POPL	EAX
+	TESTL	EDX, EDX
+	JE	2$.S
+	MOVL	FS, EAX
+	MOVL	EBX, #oocdioparms	;Process the parameters
+	MOVL	ECX, #knlComDPParms#
+	CALL	knlProcDevParm#
+	JC	12$.S
+2$:	POPL	EBX
+	POPL	EAX
+	POPL	ECX
+	JREGZ	ECX, 6$
+	CMPL	ECX, #-1.B
+	JE	14$.S
+	MOVL	FS, EAX
+	PUSHL	#GS_DISPLAY.B
+	POPL	ES
+	PUSHL	ECX
+4$:	MOVB	AL, FS:[EBX]
+	INCL	EBX
+	CALL	oocddispchr
+	LOOP	ECX, 4$
+	POPL	ECX
+6$:	CLRL	EAX
+8$:	MOVL	EBX, #QSTS$DONE
+10$:	TOFORK
+	RET
+
+12$:	POPL	ECX
+	POPL	ECX
+	CLRL	ECX
+	JMP	8$.S
+
+;Here if count is -1 - just return the cursor position
+
+14$:	MOVL	ECX, dcb_oocdcol.B[EDI]
+	MOVB	CH, dcb_oocdline.B[EDI]
+	JMP	6$.S
+.PAGE
+oocddispchr::
+	PUSHL	EBX
+	PUSHL	ECX
+	CMPB	AL, #CR
+	JE	chrcr.S
+	CMPB	AL, #LF
+	JE	chrlf.S
+	CMPL	dcb_oocdcol.B[EDI], #LCD_WIDTH.B
+	JB	6$.S
+	PUSHL	EAX
+	MOVB	dcb_oocdcol.B[EDI], #0
+	MOVB	AL, #LF
+	CALL	oocddispchr
+	POPL	EAX
+6$:	MOVL	EBX, dcb_oocdline.B[EDI] ;Get vertical position in page
+	IMULL	EBX, #LCD_WIDTH.B
+	ADDL	EBX, dcb_oocdcol.B[EDI]	;Add in position in line
+	PUSHL	EAX			;Save character
+	MOVL	EDX, #P_LCDDATA
+	MOVB	AH, BL			;Set the data pointer
+	CALL	writedata
+	MOVB	AH, BH
+	CALL	writedata
+	MOVB	AH, #CMD_ADDRESS
+	CALL	writecmd
+	POPL	EAX			;Restore character
+	SUBB	AL, #20h
+	MOVB	AH, AL			;Give the character to the display
+	CALL	writedata
+	MOVB	AH, #CMD_WRITE
+	CALL	writecmd
+	INCL	dcb_oocdcol.B[EDI]	;Bump position on line
+	CMPL	dcb_oocdcol.B[EDI], #LCD_WIDTH.B
+	JB	16$.S
+	MOVB	dcb_oocdcol.B[EDI], #0
+	JMP	chrlf.S
+
+;Here on CR
+
+chrcr:	MOVB	dcb_oocdcol.B[EDI], #0
+	JMP	16$.S
+
+;Here on LF
+
+chrlf:	CMPB	dcb_oocdline.B[EDI], #LCD_HEIGHT-1
+	JB	14$.S
+	CALL	dispscroll1
+	JMP	16$.S
+
+14$:	INCB	dcb_oocdline.B[EDI]
+16$:	MOVL	EDX, #P_LCDDATA
+	MOVB	AH, dcb_oocdcol.B[EDI]
+	CALL	writedata
+	MOVB	AH, dcb_oocdline.B[EDI]
+	CALL	writedata
+	MOVB	AH, #CMD_CURPOS
+	CALL	writecmd
+	CLC				;Make sure C is clear
+	POPL	ECX			;Restore registers
+	POPL	EBX
+	RET				;And return
+.PAGE
+;Subroutine to scroll the display by one line
+;	CALL	dispscroll1
+
+$$$=!0
+FRM ds_dcnt1  , 4t
+FRM ds_dcnt2  , 4t
+FRM ds_lpnt   , 4t
+FRM ds_linebfr, LCD_WIDTH+4t
+ds_SIZE=!$$$
+
+dispscroll1:
+	ENTER	ds_SIZE, 0
+	MOVL	EDX, #P_LCDDATA
+	MOVL	ds_dcnt2.B[EBP], #LCD_HEIGHT-1
+	MOVL	ds_lpnt.B[EBP], #0
+2$:	MOVL	EAX, ds_lpnt.B[EBP]
+	ADDL	EAX, #LCD_WIDTH.B
+	PUSHL	EAX
+	MOVB	AH, AL
+	CALL	writedata
+	POPL	EAX
+	CALL	writedata
+	MOVB	AH, #CMD_ADDRESS
+	CALL	writecmd
+	MOVB	AH, #CMD_AUTOREAD	;Start auto-read
+	CALL	writecmd
+	LEAL	ESI, ds_linebfr.B[EBP]
+	MOVL	ds_dcnt1.B[EBP], #LCD_WIDTH
+4$:	INCL	EDX			;Point to the status register
+	MOVL	ECX, #1500t
+6$:	INB	[DX]			;Wait until display is ready
+	TESTB	AL, #04h
+	LOOPE	ECX, 6$
+	JE	baddisp
+	DECW	DX			;Point to the data register
+	INB	[DX]
+	MOVB	SS:[ESI], AL
+	INCL	ESI
+	DECL	ds_dcnt1.B[EBP]
+	JNE	4$.S
+	INCL	EDX			;Point to the status register
+	MOVL	ECX, #1500t
+8$:	INB	[DX]			;Wait until display is ready
+	TESTB	AL, #04h
+	LOOPE	ECX, 8$
+	JE	baddisp
+	DECL	EDX			;Point to the data register
+	MOVB	AH, #CMD_AUTOEND	;Terminate auto-read mode
+	CALL	writecmd
+	MOVB	AH, ds_lpnt+0.B[EBP]
+	CALL	writedata
+	MOVB	AH, ds_lpnt+1.B[EBP]
+	CALL	writedata
+	MOVB	AH, #CMD_ADDRESS
+	CALL	writecmd
+	MOVB	AH, #CMD_AUTOWRT	;Start auto-write
+	CALL	writecmd
+	LEAL	ESI, ds_linebfr.B[EBP]
+	MOVL	ds_dcnt1.B[EBP], #LCD_WIDTH
+10$:	INCL	EDX			;Point to the status register
+	MOVL	ECX, #1500t
+12$:	INB	[DX]			;Wait until display is ready
+	TESTB	AL, #08h
+	LOOPE	ECX, 12$
+	JE	baddisp
+	DECL	EDX			;Point to the data register
+	MOVB	AL, SS:[ESI]
+	OUTB	[DX]
+	INCL	ESI
+	DECL	ds_dcnt1.B[EBP]
+	JNE	10$.S
+	INCL	EDX			;Point to the status register
+	MOVL	ECX, #1500t
+14$:	INB	[DX]			;Wait until display is ready
+	TESTB	AL, #08h
+	LOOPE	ECX, 14$
+	JE	baddisp
+	DECL	EDX			;Point to the data register
+	MOVB	AH, #CMD_AUTOEND	;Terminate auto-write mode
+	CALL	writecmd
+	ADDL	ds_lpnt.B[EBP], #LCD_WIDTH
+	DECL	ds_dcnt2.B[EBP]
+	JNE	2$
+
+;Here with N - 1 lines moved up one line - now fill the last line with blanks
+
+	MOVB	AH, ds_lpnt+0.B[EBP]
+	CALL	writedata
+	MOVB	AH, ds_lpnt+1.B[EBP]
+	CALL	writedata
+	MOVB	AH, #CMD_ADDRESS
+	CALL	writecmd
+	MOVB	AH, #CMD_AUTOWRT	;Start auto-write
+	CALL	writecmd
+	MOVL	ds_dcnt1.B[EBP], #LCD_WIDTH
+16$:	INCL	EDX			;Point to the status register
+	MOVL	ECX, #1500t
+18$:	INB	[DX]			;Wait until display is ready
+	TESTB	AL, #08h
+	LOOPE	ECX, 18$
+	JE	baddisp
+	DECL	EDX			;Point to the data register
+	MOVB	AL, #0
+	OUTB	[DX]
+	DECL	ds_dcnt1.B[EBP]
+	JNE	16$.S
+	INCL	EDX			;Point to the status register
+	MOVL	ECX, #1500t
+20$:	INB	[DX]			;Wait until display is ready
+	TESTB	AL, #08h
+	LOOPE	ECX, 20$
+	JE	baddisp
+	DECL	EDX			;Point to the data register
+	MOVB	AH, #CMD_AUTOEND	;Terminate auto-write mode
+	CALL	writecmd
+	LEAVE
+	RET
+.PAGE
+	.SBTTL	writedata - Subroutine to output data byte to display
+
+;Subrouitne to output a data byte to the display controller
+;	c(AH) = Value to output
+;	c[DX] = Data register
+;	CALL	writedata
+;	DX and AH unchanged
+
+writedata:
+	INCL	EDX			;Point to commmand/status register
+	MOVL	ECX, #1500h		;Don't do this too much
+4$:	INB	[DX]			;Get status
+	NOTB	AL
+	TESTB	AL, #03h
+	LOOPNE	ECX, 4$			;Wait if not ready
+	JNE	baddisp.S
+	DECL	EDX			;Point to the data register
+	MOVB	AL, AH			;Get the value
+	OUTB	[DX]			;Output it
+	RET
+
+	.SBTTL	readdata - Subroutine to input data byte from display
+
+;Subrouitne to input a data byte from the display controller
+;	c[DX] = Data register
+;	CALL	readdata
+;	DX unchanged
+;	c(AL) = Value read
+
+readdata:
+	INCL	EDX			;Point to commmand/status register
+	MOVL	ECX, #1500h		;Don't do this too much
+6$:	INB	[DX]			;Get status
+	NOTB	AL
+	TESTB	AL, #03h
+	LOOPNE	ECX, 6$			;Wait if not ready
+	JNE	baddisp.S
+	DECL	EDX			;Point to the data register
+	INB	[DX]			;Input the byte
+	RET
+
+;Here if display controller did not come ready
+
+baddisp:CRASH	xxxx
+
+	.SBTTL	writecmd - Subroutine to output command byte to display
+
+;Subrouitne to output a command byte to the display controller
+;	c(AH)  = Value to output
+;	c{EDX} = Data register
+;	CALL	writecmd
+;	EDX and AH unchanged
+
+writecmd:
+	INCL	EDX			;Point to command/status register
+	MOVL	ECX, #1500h		;Dont do this too much
+10$:	INB	[DX]			;Get status
+	NOTB	AL
+	TESTB	AL, #03h
+	LOOPNE	ECX, 10$		;Wait if not ready
+	JNE	baddisp.S
+	MOVB	AL, AH			;Get the value
+	OUTB	[DX]			;Output it as a command
+	DECL	EDX			;Point to the data register
+	RET
+
+	END

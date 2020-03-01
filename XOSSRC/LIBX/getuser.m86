@@ -1,0 +1,768 @@
+	.TITLE	verifyuser - Function to verify XOS user
+
+;++++
+; This software is in the public domain.  It may be freely copied and used
+; for whatever purpose you see fit, including commerical uses.  Anyone
+; modifying this software may claim ownership of the modifications, but not
+; the complete derived code.  It would be appreciated if the authors were
+; told what this software is being used for, but this is not a requirement.
+
+;   THIS SOFTWARE IS PROVIDED BY THE AUTHORS "AS IS" AND ANY EXPRESS OR
+;   IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
+;   OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+;   IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+;   INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+;   BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS
+;   OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+;   ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR
+;   TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
+;   USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+;----
+
+	.PROC	80386
+
+	.INCLUD	XOSINC:\XMAC\STDIO.PAR
+	.INCLUD	XOSINC:\XMAC\CTYPE.PAR
+	.INCLUD	XOSINC:\XMAC\XOS.PAR
+	.INCLUD	XOSINC:\XMAC\XOSERR.PAR
+	.INCLUD	XOSINC:\XMAC\XOSTIME.PAR
+	.INCLUD	XOSINC:\XMAC\XOSUDF.PAR
+	.INCLUD	XOSINC:\XMAC\XOSUDFUTIL.PAR
+	.INCLUD	XOSINC:\XMAC\XOSGETUSER.PAR
+
+	.STDSEGS
+
+UDRECSIZE=!2048t
+
+;Define flag bits for the user request message
+
+BITS1=!URQ1$DIRLIST|URQ1$HISTORY|URQ1$USEREXP|URQ1$PSWDEXP|URQ1$AVLCPU
+BITS1=!BITS1|URQ1$INLCPU|URQ1$AVLMEM|URQ1$INLMEM|URQ1$AVLPRIV|URQ1$INLPRIV
+BITS1=!BITS1|URQ1$HOMEDIR|URQ1$PROGRAM|URQ1$USERDESC|URQ1$PASSWORD
+BITS1=!BITS1|URQ1$USERNAME|URQ1$UPDHIST|URQ1$KEYUID
+
+BITS2=!URQ2$PHONE|URQ2$COUNTRY|URQ2$ADDRESS|URQ2$COMPANY|URQ2$MAILNAME
+BITS2=!BITS2|URQ2$USERID|URQ2$AVLSECT|URQ2$INLSECT|URQ2$ACCESS|URQ2$CRDTCARD
+BITS2=!BITS2|URQ2$BILLING|URQ2$XOSPROG|URQ2$XOSDIR
+
+	.PSECT	_DATA_p
+
+errbfr:	.BLKB	100t
+
+	.PSECT	_TEXT_p
+
+	.SBTTL	verifyuser - Function to verify an XOS user
+
+;Function to verify an XOS user
+;	char  *username;	// User name
+;	char  *access;		// Access class name
+;	ulong  bits1;		// Request bits
+;	ulong  bits2;		// Request bits
+;	int    device;		// TRUE if want UDF device left open
+;	struct usrdata *usrdata;// Structure to receive user data
+;	char  *buffer;
+;	int    size;
+;	int verifyuser(username, access, bits1, bits2, usrdata, buffer, size);
+;  Value returned: TRUE if OK, FALSE if error
+
+arg_username=!16t
+arg_access  =!20t
+arg_bits1   =!24t
+arg_bits2   =!28t
+arg_device  =!32t
+arg_usrdata =!36t
+arg_buffer  =!40t
+arg_size    =!44t
+
+$$$=!0
+FRM vu_msgsize  , 4t
+FRM vu_msgleft  , 4t
+FRM vu_recleft  , 4t
+FRM vu_ascpnt   , 4t		;Offset of the access class list string
+FRM vu_acslen   , 4t		;Length of the access class list string
+FRM vu_hvaccess , 1t		;Non-zero if have seen access class data
+FRM             , 3t
+FRM vu_grpname  , 20t
+FRM vu_buffer   , 16t		;Password message buffer
+FRM vu_key      , 8t		;Password key buffer
+FRM vu_gdffile  , 4t
+FRM vu_gdfbufr  , 80t
+FRM vu_udpparms , 16t
+FRM vu_udpoparms, 20t
+FRM vu_udpiparms, 28t
+FRM vu_req      , 100t
+vu_SIZE=!$$$
+
+;Note the buffer provided by the caller is used as follows:
+;   Offset =  0 (18 bytes)       Group name
+;   Offset = 18 (18 bytes)       User name
+;   Offset = 36 (rest of buffer) UDF server response message buffer
+
+	.ENTRY	verifyuser
+verifyuser:
+	PUSHL	EDI
+	PUSHL	ESI
+	ENTER	vu_SIZE, 0
+	MOVL	ESI, arg_usrdata.B[EBP] ;Get offset of the user data structure
+	MOVL	EDI, ESI		;Clear it
+	PUSHL	DS
+	POPL	ES
+	MOVL	ECX, #ud_SIZE/4
+	CLD
+	CLRL	EAX
+	RSTOSL	[EDI]
+	MOVL	vu_acslen.B[EBP], EAX
+	MOVB	vu_hvaccess.B[EBP], AL
+	PUSHL	arg_buffer.B[EBP]
+	PUSHL	arg_username.B[EBP]
+	CALL	getgroup#
+	ADDL	ESP, #8t.B
+	TESTL	EAX, EAX
+	JS	baduser
+	MOVL	EBX, arg_buffer.B[EBP]
+	MOVL	EAX, gd_addr.B[EBX]
+	MOVL	ud_udfaddr[ESI], EAX
+	MOVL	EAX, gd_port.B[EBX]
+	MOVL	ud_udfport[ESI], EAX
+	MOVZBL	EAX, [EBX]
+	MOVL	ud_grouplen.B[ESI], EAX
+	MOVB	AL, 18t.B[EBX]
+	MOVL	ud_userlen.B[ESI], EAX
+	INCL	EBX
+	MOVL	ud_grouppnt.B[ESI], EBX
+	ADDL	EBX, #18t.B
+	MOVL	ud_userpnt.B[ESI], EBX
+	LEAL	EBX, vu_udpparms[EBP]
+	MOVB	[EBX], #0
+	PUSHL	#O$IN|O$OUT.B		;Open the UDP device
+	PUSHL	DS
+	MOVL	EAX, arg_buffer.B[EBP]
+	ADDL	EAX, #gd_udpdev.B
+	PUSHL	EAX
+	PUSHL	DS
+	PUSHL	EBX
+	CALLF	svcIoOpen##
+	TESTL	EAX, EAX
+	JS	openerr			;If can't open it
+	MOVL	ud_udfhandle[ESI], EAX
+
+;Here with the UDP device open - now construct the message to the user server
+
+	MOVL	vu_req+0[EBP], #12340161h
+	CALLF	svcSysGetPid##
+	MOVL	vu_req+4[EBP], EAX
+	MOVL	EAX, arg_bits1.B[EBP]
+	ANDL	EAX, #BITS1
+	XCHGB	AL, AH
+	RORL	EAX, #16t
+	XCHGB	AL, AH
+	MOVL	vu_req+8[EBP], EAX
+	MOVL	EAX, arg_bits2.B[EBP]
+	ANDL	EAX, #BITS2
+	MOVL	EBX, arg_access.B[EBP]	;Did he specify an access class?
+	TESTL	EBX, EBX
+	JE	6$.S			;No
+	CMPB	[EBX], #0		;Maybe
+	JE	6$.S			;No
+	ORB	AL, #URQ2$ACCESS	;Yes - get the access class data
+6$:	XCHGB	AL, AH
+	RORL	EAX, #16t
+	XCHGB	AL, AH
+	MOVL	vu_req+12t[EBP], EAX
+	LEAL	EDI, vu_req+16t[EBP]
+	MOVL	ECX, ud_grouplen.B[ESI]
+	MOVL	EBX, ud_grouppnt.B[ESI]
+	CALL	storestr
+	MOVL	ECX, ud_userlen.B[ESI]
+	MOVL	EBX, ud_userpnt.B[ESI]
+	CALL	storestr
+	MOVL	ECX, EDI		;Get length of the message
+	SUBL	ECX, #vu_req
+	SUBL	ECX, EBP
+	ADDL	arg_buffer.B[EBP], #36t.B
+	SUBL	arg_size.B[EBP], #36t.B
+	PUSHL	arg_size.B[EBP]
+	PUSHL	arg_buffer.B[EBP]
+	PUSHL	ECX
+	LEAL	EAX, vu_req[EBP]
+	PUSHL	EAX
+	PUSHL	ud_udfport[ESI]
+	PUSHL	ud_udfaddr[ESI]
+	PUSHL	ud_udfhandle[ESI]
+	CALL	reqresp#		;Send request and get response
+	SUBL	ESP, #28t.B
+	TESTL	EAX, EAX
+	JS	10$.S
+	MOVL	EDI, arg_buffer.B[EBP]
+	MOVB	DL, 1[EDI]
+	CMPB	DL, #UDFM_OK		;Good response?
+	JE	good.S			;Yes
+	CMPB	DL, #UDFM_NOTFND
+	JE	baduser
+	MOVL	EDI, #unxmsg
+	JMP	error1
+
+;Here if error returned by reqresp
+
+10$:	MOVL	EBX, #udfemsg
+	MOVL	ud_error1[ESI], EBX
+	PUSHL	EAX
+	PUSHL	#03h.B
+	PUSHL	DS
+	LEAL	EAX, ud_error2[ESI]
+	PUSHL	EAX
+	CALLF	svcSysErrMsg##
+	JMP	fail
+.PAGE
+;Here with a good response from the server
+
+good:	SUBL	EAX, #16t.B		;Account for message header
+	JS	4$.S
+	MOVL	vu_msgleft.B[EBP], EAX	;Store message data length
+	TESTB	10t.B[EDI], #URS1$ACTIVE>8t ;Active user?
+	JE	baduser			;No
+	ADDL	EDI, #16t.B		;Yes - point to start of data in message
+msglp:	CMPL	vu_msgleft.B[EBP], #0.B ;At end of the message?
+	JE	msgdone.S		;Yes
+	SUBL	vu_msgleft.B[EBP], #2	;No - account for record header
+	JS	4$.S
+	MOVZBL	EDX, [EDI]		;Get record type
+	INCL	EDI
+	MOVZBL	EAX, [EDI]		;Get length
+	INCL	EDI
+	TESTB	AL, #80h		;Need a second byte?
+	JE	2$.S			;No
+	DECL	vu_msgleft.B[EBP]	;Yes - get it
+	JS	4$.S
+	ANDB	AL, #7Fh
+	MOVB	AH, AL
+	MOVB	AL, [EDI]
+	INCL	EDI
+2$:	SUBL	vu_msgleft.B[EBP], EAX	;Does it all fit?
+4$:	JS	recserr			;No!
+	MOVL	vu_recleft.B[EBP], EAX	;Yes
+	CMPB	DL, #RECMAX		;Valid record type?
+	JA	recnx2			;No
+	JMPIL	recdsp[EDX*4]		;Yes - dispatch on the record type
+.PAGE
+;Here when finished processing the response message
+
+msgdone:MOVL	EBX, arg_access.B[EBP]	;Did he specify an access class?
+	TESTL	EBX, EBX
+	JE	10$.S			;No - go on
+	CMPB	[EBX], #0		;Maybe
+	JE	10$.S			;No
+	CMPB	vu_hvaccess.B[EBP], #0	;Yes - did we get access class data?
+	JNE	10$.S			;Yes
+	CMPL	[EBX], #'MDMA'		;No - is his access class MDMA?
+	JNE	8$.S			;No
+	CMPB	4.B[EBX], #0		;Maybe
+	JE	10$.S			;Yes - OK
+8$:	MOVL	EDI, #acsemsg		;No - fail!
+	JMP	error1
+
+;Here if his access class is OK
+
+10$:	LEAL	EBX, ud_userlen.B[ESI]
+	CALL	putnull
+	LEAL	EBX, ud_desclen.B[ESI]
+	CALL	putnull
+	LEAL	EBX, ud_proglen.B[ESI]
+	CALL	putnull
+	LEAL	EBX, ud_dirlen.B[ESI]
+	CALL	putnull
+	LEAL	EBX, ud_apvlen.B[ESI]
+	CALL	putnull
+	LEAL	EBX, ud_ipvlen.B[ESI]
+	CALL	putnull
+	LEAL	EBX, ud_asclen[ESI]
+	CALL	putnull
+	LEAL	EBX, ud_isclen[ESI]
+	CALL	putnull
+	LEAL	EBX, ud_usridlen[ESI]
+	CALL	putnull
+	LEAL	EBX, ud_mlnmlen[ESI]
+	CALL	putnull
+	LEAL	EBX, ud_complen[ESI]
+	CALL	putnull
+	LEAL	EBX, ud_addr1len[ESI]
+	CALL	putnull
+	LEAL	EBX, ud_addr2len[ESI]
+	CALL	putnull
+	LEAL	EBX, ud_addr3len[ESI]
+	CALL	putnull
+	LEAL	EBX, ud_addr4len[ESI]
+	CALL	putnull
+	LEAL	EBX, ud_citylen[ESI]
+	CALL	putnull
+	LEAL	EBX, ud_statelen[ESI]
+	CALL	putnull
+	LEAL	EBX, ud_ziplen[ESI]
+	CALL	putnull
+	LEAL	EBX, ud_cntrylen[ESI]
+	CALL	putnull
+	LEAL	EBX, ud_phonelen[ESI]
+	CALL	putnull
+	PUSHL	#1.B
+alldone:CMPL	ud_udfhandle[ESI], #0.B	;Do we have a UDP device open?
+	JE	12$.S			;No
+	CMPL	arg_device.B[EBP], #0.B	;Yes - should we leave it open?
+	JNE	12$.S			;Yes
+	PUSHL	ud_udfhandle[ESI]	;No - close it
+	PUSHL	#0.B
+	CALLF	svcIoClose##
+	CLRL	EAX
+	MOVL	ud_udfhandle[ESI], EAX
+12$:	POPL	EAX			;Get return value
+	LEAVE
+	POPL	ESI
+	POPL	EDI
+	RET
+.PAGE
+;Record type dispatch table
+
+	.MOD	4
+recdsp:	.LONG	msgdone		;	      =  0 - End of data
+	.LONG	rusername	;UDF_USERNAME =  1 - User name
+	.LONG	rpassword	;UDF_PASSWORD =  2 - Password
+	.LONG	ruserdesc	;UDF_USERDESC =  3 - User description
+	.LONG	rprogram	;UDF_PROGRAM  =  4 - Initial program
+	.LONG	rhomdir		;UDF_HOMEDIR  =  5 - Home directory
+	.LONG	ravlpriv	;UDF_AVLPRIV  =  6 - Available privileges
+	.LONG	rinlpriv	;UDF_INLPRIV  =  7 - Initial active privileges
+	.LONG	ralwmem		;UDF_AVLMEM   =  8 - Available memory limits
+	.LONG	rinlmem		;UDF_INLMEM   =  9 - Initial memory limits
+	.LONG	ralwcpu		;UDF_AVLCPU   = 10 - Available CPU limits
+	.LONG	rinlcpu		;UDF_INLCPU   = 11 - Initial CPU limits
+	.LONG	rpswdexp	;UDF_PSWDEXP  = 12 - Password expiration
+	.LONG	ruserexp	;UDF_USEREXP  = 13 - User expiration
+	.LONG	rflags		;UDF_USERFLGS = 14 - User flags
+	.LONG	rhistory	;UDF_HISTORY  = 15 - Login history
+	.LONG	rdirlist	;UDF_DIRLIST  = 16 - Directory listing status
+	.LONG	raccess		;UDF_ACCESS   = 17 - Access class list
+	.LONG	ravlsect	;UDF_AVLSECT  = 18 - Available sections
+	.LONG	rinlsect	;UDF_INLSECT  = 19 - Initial active sections
+	.LONG	rxosprog	;UDF_XOSPROG  = 20 - XOS program
+	.LONG	rxosdir		;UDF_XOSDIR   = 21 - XOS directory
+	.LONG	recnx2		;	      = 22 - Illegal
+	.LONG	recnx2		;	      = 23 - Illegal
+	.LONG	rbilling	;UDF_BILLING  = 24 - Billing information
+	.LONG	rcrdtcard	;UDF_CRDTCARD = 25 - Credit card information
+	.LONG	recnx2		;	      = 26 - Illegal
+	.LONG	recnx2		;	      = 27 - Illegal
+	.LONG	recnx2		;	      = 28 - Illegal
+	.LONG	recnx2		;	      = 29 - Illegal
+	.LONG	recnx2		;	      = 30 - Illegal
+	.LONG	recnx2		;	      = 31 - Illegal
+	.LONG	ruserid		;UDF_USERID   = 32 - User ID
+	.LONG	rmailname	;UDF_MAILNAME = 33 - Mailing name
+	.LONG	rcompany	;UDF_COMPANY  = 34 - Company name
+    	.LONG	raddr1		;UDF_ADDR1    = 35 - Address - line 1
+	.LONG	raddr2		;UDF_ADDR2    = 36 - Address - line 2
+	.LONG	raddr3		;UDF_ADDR3    = 37 - Address - line 3
+	.LONG	raddr4		;UDF_ADDR4    = 38 - Address - line 4
+	.LONG	rcity		;UDF_CITY     = 39 - City
+	.LONG	rstate		;UDF_STATE    = 40 - State
+	.LONG	rzip		;UDF_ZIP      = 41 - Postal (ZIP) code
+	.LONG	rcountry	;UDF_COUNTRY  = 42 - Country
+	.LONG	rphone		;UDF_PHONE    = 43 - Phone number
+RECMAX=!{$-recdsp}/4-1
+.PAGE
+;Here if cannot allocate memory
+
+memerr:	MOVL	EDI, #mememsg
+	JMP	4$.S
+
+baduser:MOVL	EDI, #vubdumsg
+	CLRL	EBX
+	JMP	20$.S
+
+;Here if have error opening the UDP device
+
+openerr:MOVL	EDI, #openmsg
+4$:	PUSHL	EAX
+	PUSHL	#03h.B
+	PUSHL	DS
+	MOVL	EBX, #errbfr
+	PUSHL	EBX
+	CALLF	svcSysErrMsg##
+	JMP	20$.S
+
+;Here if user name is too long
+
+usrnerr:MOVL	EDI, #usrnmsg
+	JMP	error1.S
+
+;Here if group name is too long
+
+grpnerr:MOVL	EDI, #grpnmsg
+error1:	CLRL	EBX
+	JMP	20$.S
+
+;Here if a response record is too short
+
+recserr:MOVL	EBX, #recsmsg
+	MOVL	EDI, #udffmsg
+
+;	c{EDI} = Offset of first error string
+;	c{EBX} = Offset of second error string
+
+20$:	MOVL	ud_error1[ESI], EDI
+	TESTL	EBX, EBX
+	JE	fail.S
+	PUSHL	EBX
+	LEAL	EAX, ud_error2[ESI]
+	PUSHL	EAX
+	CALL	strcpy#
+	ADDL	ESP, #8t.B
+fail:	PUSHL	#0.B
+	JMP	alldone
+
+mememsg:.ASCIZ	"Error allocating memory"
+
+usrnmsg:.ASCIZ	"User name is too long"
+grpnmsg:.ASCIZ	"Group name is too long"
+vubdumsg::
+	.ASCIZ	"Invalid user name or password"
+unxmsg:	.ASCIZ	"Unexpected response from user server"
+
+dfltgrp:.ASCII	"USER"
+nullstr:.BYTE	0
+.PAGE
+
+recnxt:	MOVL	EAX, vu_recleft.B[EBP]
+recnx2:	ADDL	EDI, EAX
+	JMP	msglp
+
+;Here for a UDF_USERNAME record - User name
+
+rusername:
+	LEAL	EBX, ud_userlen.B[ESI]
+	JMP	rstring.S
+
+;Here for a UDF_PASSWORD record - Password
+
+rpassword:
+	CMPL	vu_recleft.B[EBP], #40t.B ;Have at least 40 bytes?
+	JB	baduser			;No - fail!
+	LEAL	EBX, ud_pswdlen.B[ESI]
+	JMP	rstring.S
+.PAGE
+;Here for a user description record
+
+ruserdesc:
+	LEAL	EBX, ud_desclen.B[ESI]
+	JMP	rstring.S
+
+;Here for an initial program record
+
+rprogram:
+	LEAL	EBX, ud_proglen.B[ESI]
+	JMP	rstring.S
+
+;Here for a home directory record
+
+rhomdir:
+	LEAL	EBX, ud_dirlen.B[ESI]
+rstring:MOVL	EAX, vu_recleft.B[EBP]
+	MOVL	[EBX], EAX
+	MOVL	4.B[EBX], EDI
+	JMP	recnx2.S
+.PAGE
+;Here for a UDF_AVLPRIV item - Available privileges
+
+ravlpriv:
+	LEAL	EBX, ud_apvlen.B[ESI]
+	JMP	rstring.S
+
+;Here for a UDF_INLPRIV item - Initial active privileges
+
+rinlpriv:
+	LEAL	EBX, ud_ipvlen.B[ESI]
+	JMP	rstring.S
+
+;Here for a UDF_AVLSECT item - Available sections
+
+ravlsect:
+	LEAL	EBX, ud_asclen[ESI]
+	JMP	rstring.S
+
+;Here for a UDF_INLSECT item - Initial active sections
+
+rinlsect:
+	LEAL	EBX, ud_isclen[ESI]
+	JMP	rstring.S
+
+;Here for a UDF_ACCESS item - Access class
+
+raccess:MOVL	EBX, arg_access.B[EBP]	;Did he specify an access class?
+	TESTL	EBX, EBX
+	JE	recnxt.S		;No
+	CMPB	[EBX], #0		;Maybe
+	JE	recnxt.S		;No - ignore this!
+	MOVB	vu_hvaccess.B[EBP], #1	;Remember we have seen this
+	PUSHL	EBX			;Yes - make sure its all upper case
+	CALL	strupr#
+	POPL	ECX
+	MOVL	EDX, EDI
+	MOVL	ECX, vu_recleft.B[EBP]
+2$:	JREGZ	ECX, 18$		;If end of list
+4$:	MOVL	EBX, arg_access.B[EBP]
+6$:	MOVB	AL, [EDX]		;Get next character
+	INCL	EDX
+	TESTB	AL, #80h		;End of item?
+	JNE	14$.S			;Yes
+	CMPB	[EBX], AL		;No - does it match?
+	JNE	8$.S			;No
+	INCL	EBX			;Yes - continue checking
+	LOOP	ECX, 6$
+	JMP	12$.S
+
+;Here if the character does not match
+
+8$:	DECL	ECX
+10$:	INCL	EDX
+	TESTB	-1.B[EDX], #80		;Last character?
+	LOOPE	ECX, 10$
+	JNE	2$.S			;Found end - continue
+12$:	JMP	recserr
+
+;Here with final character in a class name
+
+14$:	ANDB	AL, #7F
+	CMPB	[EBX], AL		;Does it match?
+	JNE	16$.S			;No
+	CMPB	1.B[EBX], #0		;Yes - end?
+	JE	recnxt			;Yes - we found it!
+16$:	LOOP	ECX, 4$
+18$:	MOVL	EDI, #acsemsg
+	JMP	error1
+.PAGE
+;Here for a UDF_AVLMEM item - Available memory limits
+;	WSAVAIL - Available working set limit value
+;	TMAVAIL - Available total memory limit value
+;	PMAVAIL - Available protected mode memory limit value
+;	RMAVAIL - Available real mode memory limit value
+;	OMAVAIL - Available overhead memory limit value
+
+ralwmem:
+	LEAL	EBX, ud_wsavail.B[ESI]
+	JMP	4$.S
+
+;Here for a UDF_INLMEM item - Initial memory limits
+;  This block contains 0 to 5 variable length values:	
+;	WSLIMIT - Active working set limit value
+;	TMLIMIT - Active total memory limit value
+;	PMLIMIT - Active protected mode memory limit value
+;	RMLIMIT - Active real mode memory limit value
+;	OMLIMIT - Active overhead memory limit value
+
+rinlmem:
+	LEAL	EBX, ud_wslimit.B[ESI]
+4$:	MOVL	ECX, #5t
+	CALL	getrecvarval		;Get value
+	JC	recserr
+	MOVL	[EBX], EAX
+	CMPL	vu_recleft.B[EBP], #0.B
+	JE	6$.S
+	ADDL	EBX, #4t.B
+	LOOP	ECX, 4$
+6$:	JMP	recnxt
+
+;Here for a UDF_AVLCPU item - Available CPU limits
+
+ralwcpu:
+	JMP	recnxt
+
+;Here for a UDF_INLCPU item - Initial CPU limits
+
+rinlcpu:
+	JMP	recnxt
+
+;Here for a UDF_PSWDEXP item - Password expiration
+
+rpswdexp:
+	JMP	recnxt
+
+;Here for a UDF_USEREXP item - User expriation
+
+ruserexp:
+	JMP	recnxt
+
+;Here for a UDF_FLAGS item - User flags
+
+rflags:
+	JMP	recnxt
+
+;Here for a UDF_HISTORY item - Login history
+
+rhistory:
+	JMP	recnxt
+
+;Here for a UDF_DIRLIST item - User directory listing status
+
+rdirlist:
+	JMP	recnxt
+
+;Here for a UDF_XOSPROG item - XOS program
+
+rxosprog:
+	LEAL	EBX, ud_xosproglen[ESI]
+	JMP	rstring
+
+;Here for a UDF_ALRDIR item - XOS directory
+
+rxosdir:
+	LEAL	EBX, ud_xosdirlen[ESI]
+	JMP	rstring
+
+;Here for a UDF_BILLING item - Billing information
+
+rbilling:
+	LEAL	EBX, ud_billinglen[ESI]
+	JMP	rstring
+
+;Here for a UDF_CRDTCARD item - Credit card intormation
+
+rcrdtcard:
+	LEAL	EBX, ud_crdtcardlen[ESI]
+	JMP	rstring
+
+;Here for a UDF_USERID item - User ID
+
+ruserid:LEAL	EBX, ud_usridlen[ESI]
+	JMP	rstring
+
+;Here for a UDF_MAILNAME item - Mailing name
+
+rmailname:
+	LEAL	EBX, ud_mlnmlen[ESI]
+	JMP	rstring
+
+;Here for a UDF_COMPANY item - Company name
+
+rcompany:
+	LEAL	EBX, ud_complen[ESI]
+	JMP	rstring
+
+;Here for a UDF_ADDR1 item - Address line 1
+
+raddr1:	LEAL	EBX, ud_addr1len[ESI]
+	JMP	rstring
+
+;Here for a UDF_ADDR2 item - Address line 2
+
+raddr2:	LEAL	EBX, ud_addr2len[ESI]
+	JMP	rstring
+
+;Here for a UDF_ADDR3 item - Address line 3
+
+raddr3:	LEAL	EBX, ud_addr3len[ESI]
+	JMP	rstring
+
+;Here for a UDF_ADDR4 item - Address line 4
+
+raddr4:	LEAL	EBX, ud_addr4len[ESI]
+	JMP	rstring
+
+;Here for a UDF_CITY item - City
+
+rcity:	LEAL	EBX, ud_citylen[ESI]
+	JMP	rstring
+
+;Here for a UDF_STATE item - State
+
+rstate:	LEAL	EBX, ud_statelen[ESI]
+	JMP	rstring
+
+;Here for a UDF_ZIP item - Postal (ZIP) code
+
+rzip:	LEAL	EBX, ud_ziplen[ESI]
+	JMP	rstring
+
+;Here for a UDF_COUNTRY item - Country
+
+rcountry:
+	LEAL	EBX, ud_cntrylen[ESI]
+	JMP	rstring
+
+;Here for a UDF_PHONE item - Phone number
+
+rphone:	LEAL	EBX, ud_phonelen[ESI]
+	JMP	rstring
+.PAGE
+;Subroutine to get variable length value from a record in the response
+;  message
+;	c{EDI} = Offset of next byte
+;	CALL	getrecvarval
+;	C:set = Error
+;	C:clr = Normal
+;	  c{EAX} = Value
+
+getrecvarval:
+	DECL	vu_recleft.B[EBP]
+	JS	6$.S
+	MOVZBL	EAX, [EDI]		;Get byte
+	INCL	EDI
+	BTZL	EAX, #7t		;Is it an 8-bit value?
+	JNC	4$.S			;Yes
+	MOVB	AH, AL			;No
+	DECL	vu_recleft.B[EBP]
+	JS	6$.S
+	MOVB	AL, [EDI]
+	INCL	EDI
+	BTZL	EAX, #14t		;Is it a 16-bit value?
+	JNC	4$.S			;Yes
+	SHLL	EAX, #8t		;No
+	DECL	vu_recleft.B[EBP]
+	JS	6$.S
+	MOVB	AL, [EDI]
+	INCL	EDI
+	BTZL	EAX, #21t		;Is it a 24-bit value?
+	JNC	4$.S			;Yes
+	SHLL	EAX, #8t		;No
+	DECL	vu_recleft.B[EBP]
+	JS	6$.S
+	MOVB	AL, [EDI]
+	INCL	EDI
+	ANDL	EAX, #1FFFFFFFh
+4$:	RET
+
+;Here if the record is too small for the value
+
+6$:	STC
+	RET
+.PAGE
+;Subroutine to store string in the request message
+;	c{EBX} = Offset of string to store
+;	c{ECX} = Length of string to store
+;	c{EDI} = Offset of message buffer
+
+storestr:
+	MOVB	[EDI], CL		;Store count
+	INCL	EDI
+	JREGZ	ECX, 4$
+2$:	MOVB	AL, [EBX]
+	INCL	EBX
+	MOVB	[EDI], AL
+	INCL	EDI
+	LOOP	ECX, 2$
+4$:	RET
+.PAGE
+;	c{EBX} = Offset of length value
+;	CALL	putnull
+
+putnull:MOVL	EAX, [EBX]
+	TESTL	EAX, EAX
+	JE	4$.S
+	ADDL	EAX, 4.B[EBX]
+	MOVB	[EAX], #0
+4$:	RET
+.PAGE
+acsemsg:.ASCIZ	"Access is not allowed"
+openmsg:.ASCIZ	"Error opening UDP device"
+udfemsg:.ASCIZ	"Error obtaining information from UDF server"
+recsmsg:.ASCIZ	"Record is too short"
+udffmsg:.ASCIZ	"Illegal format in UDF server response"
+
+	.END

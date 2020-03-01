@@ -1,0 +1,552 @@
+	.TITLE	PCNCLS3 - Pseudo-console device class driver for XOS
+
+;++++
+; This software is in the public domain.  It may be freely copied and used
+; for whatever purpose you see fit, including commerical uses.  Anyone
+; modifying this software may claim ownership of the modifications, but not
+; the complete derived code.  It would be appreciated if the authors were
+; told what this software is being used for, but this is not a requirement.
+
+;   THIS SOFTWARE IS PROVIDED BY THE AUTHORS "AS IS" AND ANY EXPRESS OR
+;   IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
+;   OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+;   IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+;   INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+;   BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS
+;   OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+;   ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR
+;   TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
+;   USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+;----
+
+	.PROC	80486
+	.INCLUD	XOSINC:\XMAC\XOS.PAR
+	.INCLUD	XOSINC:\XMAC\XOSX.PAR
+	.INCLUD	XOSINC:\XMAC\XOSERR.PAR
+	.INCLUD	XOSINC:\XMAC\XOSTRM.PAR
+	.INCLUD	XOSINC:\XMAC\XOSXTRM.PAR
+	.INCLUD	XOSINC:\XMAC\XOSDOS.PAR
+	.INCLUD	XOSINC:\XMAC\PCAT.PAR
+	.INCLUD	XOSINC:\XMAC\XOSLKE.PAR
+	.INCLUD	XOSINC:\XMAC\XOSXLKE.PAR
+	.INCLUD	XOSINC:\XMAC\XOSDDSP.PAR
+	.INCLUD	PCNCLS.PAR
+
+	LKECONT
+	CODE
+
+	.SBTTL	ldtxcs - Function to load text mode font
+
+;Subroutine to load a display font
+;	c(AL)     = Font:
+;		      0 = Load custom font
+;		      1 = Load standard 8x8 font
+;		      2 = Load standard 8x14 font
+;		      3 = Load standard 8x16 font
+;		      5 = Load standard 9x8 font
+;		      6 = Load standard 9x14 font
+;		      7 = Load standard 9x16 font
+;	c(AH)     = Bits 2-0 = Table number
+;		    Bits 6-3 = Not used, must be 0
+;		    Bit  7: 0 = Do not change display set up
+;			    1 = Adjust display set up to match font
+;	c{ES:EDI} = Address of custom font table (if c(AL) = 0)
+;	c{ECX}    = Number of characters to load
+;	c{EDX}    = First character to load
+;	c(BL)     = Bytes per character (if c(AL) = 0)
+;	c{ESI}    = Offset of terminal TDB
+;	CALL	pcnloadfont
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+
+2$:	MOVL	EAX, #ER_VALUE
+	STC
+	RET
+
+pcnloadfont::
+	REQUIREFORK
+	CMPB	dcb_pcnbufslot-dcb_pcntdb[ESI], #0 ;Have a screen buffer?
+	JE	knlIFnDev##		;No - illegal function
+	TESTL	EAX, EAX		;Yes - want to load standard font?
+	JE	knlIFnDev##		;No - this is illegal too!
+	CMPL	ECX, #256t		;Yes - want to load entire font?
+	JNE	2$.S			;No - fail!
+	TESTL	EDX, EDX		;Maybe
+	JNE	2$.S			;No
+	MOVL	EDX, EAX		;Yes - remember function
+	PUSHL	EAX
+	MOVB	AL, #0			;Send prefix
+	CALL	putdsplist#
+	MOVB	AL, #DDSF_LDFONT
+	TESTB	1.B[ESP], #80h		;Want to change parameters?
+	JE	4$.S			;No
+	INCL	EAX			;Yes - fix up the function value
+4$:	CALL	putdsplist#		;Send function
+	MOVB	AL, 1.B[ESP]		;Send block number
+	ANDB	AL, #7Fh
+	CALL	putdsplist#
+	POPL	EAX			;Send font number
+	CALL	putdsplist#
+	ORB	dcb_pcnsts1-dcb_pcntdb[ESI], #PCNS1$FONTWT
+					;Indicate waiting for font set response
+6$:	MOVL	EAX, ESI		;Use offset of the TDB as the wait
+	CALL	knlSetWait##		;  index
+	PUSHL	SS
+	POPL	ES
+	MOVB	AL, #knlQX_DW2##	;Requeue to an IO wait queue
+	CALL	knlWRequeue##
+	FROMFORK			;Call the scheduler (this is an
+	CALLF	schedule		;  uninterruptable wait!)
+	TOFORK
+	TESTB	dcb_pcnsts1-dcb_pcntdb[ESI], #PCNS1$FONTWT ;Finished?
+	JE	8$.S			;Yes
+	TESTB	SS:pdaStatus1##, #P1$KILL ;No - is the process being killed?
+	JE	6$.S			;No - keep waiting
+	MOVL	EAX, #ER_ABORT		;Yes - return abort error
+	JMP	14$.S
+
+;Here with response
+
+8$:	CALL	xosconDosChk##		;Is this terminal for a DOS process?
+	JE	10$.S			;No
+	MOVL	EAX, tdb_columns[ESI]	;Yes - get screen width
+	MOVW	GS:pdaRMPage0##+bda_vvidwidth, AX
+	MOVZBL	EBX, tdb_rows[ESI]	;Get screen height
+	IMULL	EAX, EBX		;Calculate buffer size
+	ADDL	EAX, #0FFh
+	MOVB	AL, #0			;Round up
+	MOVW	GS:pdaRMPage0##+bda_vvidblen, AX ;Store it
+	DECL	EBX			;Also store rows - 1
+	MOVB	GS:pdaRMPage0##+bda_vrows, BL
+	MOVB	AL, tdb_charch[ESI]	;Get character cell height
+	MOVB	GS:pdaRMPage0##+bda_vpoints, AL
+10$:	CLRL	EAX
+14$:	RET
+.PAGE
+;Subroutine to set font size and tables
+;	c{ECX} = Font table for first 256 characters
+;	c{EDX} = Font table for second 256 characters
+;	CALL	pcnselfont
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+
+pcnselfont::				;THIS IS NOT CURRENTLY SUPPORTED!
+	RET
+.PAGE
+	.SBTTL	pcnchratr - Subroutine to display character and attribute
+
+;Subroutine to display character and attribute at cursor position
+;	c(AL)  = Character
+;	c(AH)  = Attribute byte
+;	c{EBX} = Page number
+;	c(DL)  = Horizontal position
+;	c(DH)  = Vertical position
+;	c{ESI} = Offset of terminal TDB
+;	CALL	pcnchratr
+
+pcnchratr::
+	REQUIREFORK
+	CMPB	dcb_pcnbufslot-dcb_pcntdb[ESI], #0 ;Have a display buffer now?
+	JE	knlIFnDev##		;No
+	PUSHL	EDX			;Yes - save position
+	MOVL	ECX, tdb_pgsize[ESI]	;Get page size
+	IMULL	ECX, EBX		;Times page number
+	MOVZBL	EDX, DH			;Get vertical position in page
+	IMULL	EDX, tdb_columns[ESI]
+	ADDL	EDX, EDX
+	ADDL	ECX, EDX
+	POPL	EDX			;Restore position
+	MOVZBL	EDX, DL			;Add in position in line
+	ADDL	EDX, EDX
+	ADDL	ECX, EDX
+	MOVW	ES, dcb_pcnbufsel-dcb_pcntdb[ESI] ;Get selector for exec buffer
+	MOVW	ES:[ECX], AX		;Put character and attribute in display
+					;  buffer
+	TESTB	dcb_pcnsts1-dcb_pcntdb[ESI], #PCNS1$MAPPED ;In mapped mode?
+	JNE	4$.S			;Yes
+	ADDL	ECX, dcb_pcnbufshdw-dcb_pcntdb[ESI] ;No - add in offset of
+						      ;  shadow buffer
+	MOVW	ES:[ECX], AX		;Put character and attribute in shadow
+					;  bufer
+4$:	RET				;Finished
+.PAGE
+	.SBTTL	pcnchr - Subroutine to display character
+
+;Subroutine to display character at cursor position
+;	c(AL)  = Character
+;	c{EBX} = Page number
+;	c(DL)  = Horizontal position
+;	c(DH)  = Vertical position
+;	c{ESI} = Offset of terminal TDB
+;	CALL	pcnchr
+
+pcnchr::PUSHL	EDX			;Save position
+	MOVL	ECX, tdb_pgsize[ESI]	;Get page size
+	IMULL	ECX, EBX		;Times page number
+	MOVZBL	EDX, DH			;Get vertical position in page
+	IMULL	EDX, tdb_columns[ESI]
+	ADDL	EDX, EDX
+	ADDL	ECX, EDX
+	POPL	EDX			;Restore position
+	MOVZBL	EDX, DL			;Add in position in line
+	ADDL	EDX, EDX
+	ADDL	ECX, EDX			    ;Get selector for exec
+	MOVW	ES, dcb_pcnbufsel-dcb_pcntdb[ESI] ;  buffer
+	MOVB	ES:[ECX], AL		;Put character in display buffer
+	TESTB	dcb_pcnsts1-dcb_pcntdb[ESI], #PCNS1$MAPPED ;In mapped mode?
+	JNE	ret002.S		;Yes
+	ADDL	ECX, dcb_pcnbufshdw-dcb_pcntdb[ESI] ;No - add in offset of
+						      ;  shadow buffer
+	MOVB	ES:[ECX], AL		;Put character in shadow bufer
+ret002:	RET				;Finished
+.PAGE
+	.SBTTL	pcnscroll - Function to scroll window (INT 10, func. 06 & 07)
+
+;Function to scroll window (INT 10, functions 06 & 07)
+;	c(AL)  = Function (0 = up, 1= down, 2= right, 3 = left)
+;	c(BL)  = Page number
+;	c(BH)  = Number of lines to scroll (positive is down, negative is up)
+;	c(CL)  = X coordinate, upper left corner of window
+;	c(CH)  = Y coordinate, upper left corner of window
+;	c(DL)  = X coordinate, lower right corner of window
+;	c(DH)  = Y coordinate, lower right corner of window
+;	c{ESI} = Offset of TDB
+;	CALL	pcnscroll
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  c{EAX} = 0
+
+$$$=!0
+FRM  sc_func   , 1t	;Function
+FRM            , 3t
+FRM  sc_length , 4t	;Length of line to scroll (in bytes)
+FRM  sc_fline  , 4t	;First line in window
+FRM  sc_distcl , 4t	;Distance to scroll in character lines
+FRM  sc_height , 4t	;Height of window
+FRM  sc_fill   , 4t	;Fill colors
+FRM  sc_offset , 4t	;Screen offset
+FRM  sc_incr   , 4t	;Address increment for scroll
+FRM  sc_pagenum, 4t	;Display page number
+sc_SIZE=!$$$
+
+pcnscroll::
+	REQUIREFORK
+	CMPB	dcb_pcnbufslot-dcb_pcntdb[ESI], #0 ;Have a display buffer now?
+	JNE	2$.S			;Yes
+	TESTB	dcb_pcnsts1-dcb_pcntdb[ESI], #PCNS1$LCLSCR ;No - local only?
+	JNE	ret002.S		;Yes - ignore this
+	JMP	knlIFnDev##		;No - fail
+
+;Here if have a display buffer allocated
+
+2$:	CMPB	DL, tdb_columns[ESI]	;Yes - make sure window coordinates are
+	JB	4$.S			;  valid
+	MOVB	DL, tdb_columns[ESI]
+	DECL	EDX
+4$:	CMPB	DH, tdb_rows[ESI]
+	JB	6$.S
+	MOVB	DH, tdb_rows[ESI]
+	DECB	DH
+6$:	CMPB	CL, DL
+	JBE	8$.S
+	MOVB	CL, DL
+8$:	CMPB	CH, DH
+	JBE	10$.S
+	MOVB	CH, DH
+10$:	ENTER	sc_SIZE, 0
+	PUSHL	EDI
+	CMPB	BH, #0			;Want to clear the window?
+	JNE	11$.S			;No
+	MOVB	AL, #1			;Yes - use correct function for this
+11$:	MOVB	sc_func.B[EBP], AL	;Store function
+	MOVXBL	EAX, BH			;Store distance to scroll
+	MOVL	sc_distcl.B[EBP], EAX
+	MOVZBL	EAX, CH			;Store first line in window
+	MOVL	sc_fline.B[EBP], EAX
+	MOVZBL	EDI, DH			;Store height of window
+	SUBL	EDI, EAX
+	INCL	EDI
+	MOVL	sc_height.B[EBP], EDI
+	MOVZBL	EBX, BL			;Get page number
+	CMPB	BL, #8t.B		;Valid page number?
+	JB	12$.S			;Yes
+	MOVB	BL, #0			;No - use page 0!
+12$:	MOVL	sc_pagenum.B[EBP], EBX	;In mapped or local only mode?
+	TESTB	dcb_pcnsts1-dcb_pcntdb[ESI], #PCNS1$MAPPED|PCNS1$LCLSCR
+	JNE	16$.S			;Yes - don't send message to server
+	MOVB	AL, #0			;No - send message
+	CALL	putdsplist#
+	MOVB	AL, sc_func.b[EBP]
+	ADDB	AL, #DDSF_SWCUP
+	MOVB	AH, sc_pagenum.B[EBP]	;For current page?
+	CMPB	AH, tdb_dsppage[ESI]
+	JE	14$.S			;Yes
+	ADDB	AL, #DDSF_SWAUP-DDSF_SWCUP ;No - use right function
+14$:	CALL	putdsplist#
+	MOVB	AL, sc_distcl.B[EBP]
+	CALL	putdsplist#
+	MOVB	AL, tdb_tattrfil[ESI]
+	CALL	putdsplist#
+	MOVB	AL, CL
+	CALL	putdsplist#
+	MOVB	AL, CH
+	CALL	putdsplist#
+	MOVB	AL, DL
+	CALL	putdsplist#
+	MOVB	AL, DH
+	CALL	putdsplist#
+	MOVB	AL, sc_pagenum.B[EBP]	;For current page?
+	CMPB	AL, tdb_dsppage[ESI]
+	JE	16$.S			;Yes
+	CALL	putdsplist#		;No - output page number
+16$:	MOVL	EBX, sc_pagenum.B[EBP]
+	IMULL	EBX, tdb_pgsize[ESI]	;Get offset in display buffer
+	MOVZBL	ECX, CL			;Get distance to left side of window
+	MOVL	EAX, ECX
+	ADDL	ECX, ECX		;Change to bytes
+	ADDL	EBX, ECX		;Add into offset
+	MOVL	sc_offset.B[EBP], EBX
+	CMPB	DL, tdb_columns[ESI]	;Too far right?
+	JB	18$.S			;No
+	MOVB	DL, tdb_columns[ESI]	;Yes
+	DECB	DL
+18$:	MOVZBL	ECX, DL			;Get distance to right side of window
+	SUBL	ECX, EAX		;Calculate width of window
+	INCL	ECX
+	ADDL	ECX, ECX		;Change to bytes
+	MOVL	sc_length.B[EBP], ECX
+	MOVB	AH, tdb_tattrfil[ESI]	;Construct fill pattern
+	MOVB	AL, #' '
+	MOVL	EBX, EAX
+	SHLL	EAX, #16t
+	MOVW	AX, BX
+	MOVL	sc_fill.B[EBP], EAX
+	MOVW	ES, dcb_pcnbufsel-dcb_pcntdb[ESI]
+	CLD
+	PUSHL	ESI
+	MOVZBL	EAX, sc_func.B[EBP]	;Dispatch on the function
+	JMPIL	scrtdsp[EAX*4]
+
+	DATA
+
+scrtdsp:.LONG	scrtup		; 0 = Up
+	.LONG	scrtdown	; 1 = Down
+	.LONG	scrtright	; 2 = Right
+	.LONG	scrtleft	; 3 = Left
+
+	CODE
+.PAGE
+;Here to scroll up
+
+scrtup:	MOVL	EDX, sc_height.B[EBP]
+	CMPL	EDX, sc_distcl.B[EBP]	;Too much?
+	JBE	scrtclr			;Yes - just clear the window
+	SUBL	EDX, sc_distcl.B[EBP]	;Calculate number of lines to move
+	MOVL	ECX, tdb_columns[ESI]	;Get and save amount to increment
+	ADDL	ECX, ECX		;  pointers
+	MOVL	sc_incr.B[EBP], ECX
+	MOVL	EAX, sc_fline.B[EBP]
+	MOVL	EBX, EAX
+	ADDL	EAX, sc_distcl.B[EBP]
+	IMULL	EAX, ECX
+	ADDL	EAX, sc_offset.B[EBP]
+	IMULL	EBX, ECX
+	ADDL	EBX, sc_offset.B[EBP]
+20$:	MOVL	ESI, EAX		;Get address of source line
+	MOVL	EDI, EBX		;Get address of destination line
+	MOVL	ECX, sc_length.B[EBP]	;Get length of line
+	SHRL	ECX, #2			;Change to number of longs (round down)
+	RMOVSL	[EDI], ES:[ESI]		;Move longs
+	MOVL	ECX, sc_length.B[EBP]	;Move any bytes left over
+	ANDL	ECX, #03h.B
+	MOVSB	[EDI], ES:[ESI]
+	MOVL	ESI, [ESP]
+	TESTB	dcb_pcnsts1-dcb_pcntdb[ESI], #PCNS1$MAPPED ;In mapped mode?
+	JNE	22$.S			;Yes - don't change shadow buffer
+	MOVL	EDI, dcb_pcnbufshdw-dcb_pcntdb[ESI] ;Get address of destination
+	MOVL	ESI, EDI			    ;  and source lines
+	ADDL	EDI, EBX
+	ADDL	ESI, EAX
+	MOVL	ECX, sc_length.B[EBP]	;Get length of line
+	SHRL	ECX, #2			;Change to number of longs (round down)
+	RMOVSL	[EDI], ES:[ESI]		;Move longs
+	MOVL	ECX, sc_length.B[EBP]	;Move any bytes left over
+	ANDL	ECX, #03h.B
+	MOVSB	[EDI], ES:[ESI]
+22$:	ADDL	EAX, sc_incr.B[EBP]	;Bump pointers
+	ADDL	EBX, sc_incr.B[EBP]
+	DECL	EDX			;More to move?
+	JNE	20$.S			;Yes - continue
+	MOVL	EAX, sc_fill.B[EBP]	;No - get fill pattern
+	MOVL	EDX, sc_distcl.B[EBP]	;Get amount to clear
+24$:	MOVL	EDI, EBX		;Get address of line to clear
+	MOVL	ECX, sc_length.B[EBP]
+	SHRL	ECX, #2			;Change to number of longs (round down)
+	RSTOSL	[EDI]			;Store longs
+	MOVL	ECX, sc_length.B[EBP]
+	ANDL	ECX, #03h.B
+	STOSB	[EDI]
+	MOVL	ESI, [ESP]
+	TESTB	dcb_pcnsts1-dcb_pcntdb[ESI], #PCNS1$MAPPED ;In mapped mode?
+	JNE	26$.S			;Yes - don't change shadow buffer
+	MOVL	EDI, dcb_pcnbufshdw-dcb_pcntdb[ESI] ;Get address of destination
+	ADDL	EDI, EBX			    ;  line
+	MOVL	ECX, sc_length.B[EBP]	;Get length of line
+	SHRL	ECX, #2			;Change to number of longs (round down)
+	RSTOSL	[EDI]			;Store longs
+	MOVL	ECX, sc_length.B[EBP]
+	ANDL	ECX, #03h.B
+	STOSB	[EDI]
+26$:	ADDL	EBX, sc_incr.B[EBP]
+	DECL	EDX
+	JNE	24$.S
+	POPL	ESI
+	POPL	EDI
+	LEAVE
+	RET
+.PAGE
+;Here to scroll down
+
+scrtdown:
+	MOVL	EDX, sc_height.B[EBP]
+	CMPL	EDX, sc_distcl.B[EBP]	;Too much?
+	JA	4$.S			;No
+scrtclr:MOVL	sc_distcl.B[EBP], #0	;Yes - just clear the window
+	MOVL	EDX, sc_height.B[EBP]
+4$:	SUBL	EDX, sc_distcl.B[EBP]	;Calculate number of lines to move
+	MOVL	EAX, sc_fline.B[EBP]	;Calculate first destination line
+	DECL	EAX
+	MOVL	EBX, EAX
+	ADDL	EBX, sc_height.B[EBP]
+	MOVL	ECX, tdb_columns[ESI]
+	ADDL	ECX, ECX
+	MOVL	sc_incr.B[EBP], ECX
+	IMULL	EBX, ECX
+	ADDL	EBX, sc_offset.B[EBP]
+	CMPL	sc_distcl.B[EBP], #0.B	;Anything to move at all?
+	JE	10$.S			;No
+	ADDL	EAX, EDX		;Yes - calculate first source line
+	IMULL	EAX, ECX
+	ADDL	EAX, sc_offset.B[EBP]
+6$:	MOVL	ESI, EAX		;Get address of source line
+	MOVL	EDI, EBX		;Get address of destination line
+	MOVL	ECX, sc_length.B[EBP]	;Get length of line
+	SHRL	ECX, #2			;Change to number of longs (round down)
+	RMOVSL	[EDI], ES:[ESI]		;Move longs
+	MOVL	ECX, sc_length.B[EBP]	;Move any bytes left over
+	ANDL	ECX, #03h.B
+	MOVSB	[EDI], ES:[ESI]
+	MOVL	ESI, [ESP]
+	TESTB	dcb_pcnsts1-dcb_pcntdb[ESI], #PCNS1$MAPPED ;In mapped mode?
+	JNE	8$.S			;Yes - don't change shadow buffer
+	MOVL	EDI, dcb_pcnbufshdw-dcb_pcntdb[ESI] ;Get address of destination
+	MOVL	ESI, EDI			    ;  and source lines
+	ADDL	EDI, EBX
+	ADDL	ESI, EAX
+	MOVL	ECX, sc_length.B[EBP]	;Get length of line
+	SHRL	ECX, #2			;Change to number of longs (round down)
+	RMOVSL	[EDI], ES:[ESI]		;Move longs
+	MOVL	ECX, sc_length.B[EBP]	;Move any bytes left over
+	ANDL	ECX, #03h.B
+	MOVSB	[EDI], ES:[ESI]
+8$:	SUBL	EAX, sc_incr.B[EBP]	;Bump pointers
+	SUBL	EBX, sc_incr.B[EBP]
+	DECL	EDX			;More to move?
+	JNE	6$.S			;Yes - continue
+10$:	MOVL	EAX, sc_fill.B[EBP]	;Get fill pattern
+	MOVL	EDX, sc_distcl.B[EBP]	;Get amount to clear
+	TESTL	EDX, EDX		;Clearing entire window?
+	JNE	14$.S			;No
+	MOVL	EDX, sc_height.B[EBP]	;Yes - get height of window
+14$:	MOVL	EDI, EBX		;Get address of line to clear
+	MOVL	ECX, sc_length.B[EBP]
+	SHRL	ECX, #2			;Change to number of longs (round down)
+	RSTOSL	[EDI]			;Store longs
+	MOVL	ECX, sc_length.B[EBP]
+	ANDL	ECX, #03h.B
+	STOSB	[EDI]
+	MOVL	ESI, [ESP]
+	TESTB	dcb_pcnsts1-dcb_pcntdb[ESI], #PCNS1$MAPPED ;In mapped mode?
+	JNE	16$.S			;Yes - don't change shadow buffer
+	MOVL	EDI, dcb_pcnbufshdw-dcb_pcntdb[ESI] ;Get address of destination
+	ADDL	EDI, EBX			    ;  line
+	MOVL	ECX, sc_length.B[EBP]	;Get length of line
+	SHRL	ECX, #2			;Change to number of longs (round down)
+	RSTOSL	[EDI]			;Store longs
+	MOVL	ECX, sc_length.B[EBP]
+	ANDL	ECX, #03h.B
+	STOSB	[EDI]
+16$:	SUBL	EBX, sc_incr.B[EBP]
+	DECL	EDX
+	JNE	14$.S
+	POPL	ESI
+	POPL	EDI
+	LEAVE
+	RET
+.PAGE
+;Here to scroll left
+
+scrtleft:
+	MOVL	EDX, sc_length.B[EBP]
+	MOVL	EAX, sc_distcl.B[EBP]	;Too much?
+	ADDL	EAX, EAX
+	CMPL	EDX, EAX
+	JBE	scrtclr			;Yes
+	MOVL	sc_distcl.B[EBP], EAX	;No
+	SUBL	EDX, EAX		;Calculate number of bytes to move
+	MOVL	EAX, sc_fline.B[EBP]
+	IMULL	EBX, EAX, #160t
+	ADDL	EBX, sc_offset.B[EBP]
+4$:	MOVL	ESI, EBX		;Set up pointers to move data left
+	MOVL	EDI, ESI
+	ADDL	ESI, sc_distcl.B[EBP]
+	MOVL	ECX, EDX
+	CLD
+	SHRL	ECX, #1
+	RMOVSW	[EDI], ES:[ESI]		;Move the line left
+	MOVL	EAX, sc_fill.B[EBP]	;Get fill pattern
+	MOVL	ECX, sc_distcl.B[EBP]	;Get amount to fill
+	SHRL	ECX, #1
+	RSTOSW	[EDI]			;Store fill pattern
+	DECL	sc_height.B[EBP]	;More lines to move?
+	JNE	4$.S			;Yes - continue
+	POPL	ESI			;No - finished
+	LEAVE
+	RET
+.PAGE
+;Here to scroll right
+
+scrtright:
+	MOVL	EDX, sc_length.B[EBP]
+	MOVL	EAX, sc_distcl.B[EBP]	;Too much?
+	ADDL	EAX, EAX
+	CMPL	EDX, EAX
+	JBE	scrtclr			;Yes
+	MOVL	sc_distcl.B[EBP], EAX	;No
+	SUBL	EDX, EAX		;Calculate number of bytes to move
+	MOVL	EAX, sc_fline.B[EBP]
+	IMULL	EBX, EAX, #160t
+	ADDL	EBX, sc_offset.B[EBP]
+	ADDL	EBX, sc_length.B[EBP]
+	SUBL	EBX, #2t.B
+4$:	MOVL	ESI, EBX		;Set up pointers to move data right
+	MOVL	EDI, ESI
+	SUBL	ESI, sc_distcl.B[EBP]
+	MOVL	ECX, EDX
+	STD
+	SHRL	ECX, #1
+	RMOVSW	[EDI], ES:[ESI]		;Move the line right
+	MOVL	EAX, sc_fill.B[EBP]	;Get fill pattern
+	MOVL	ECX, sc_distcl.B[EBP]	;Get amount to fill
+	SHRL	ECX, #1
+	RSTOSW	[EDI]			;Store fill pattern
+	DECL	sc_height.B[EBP]	;More lines to move?
+	JNE	4$.S			;Yes - continue
+	POPL	ESI			;No - finished
+	LEAVE
+	RET
+
+	END

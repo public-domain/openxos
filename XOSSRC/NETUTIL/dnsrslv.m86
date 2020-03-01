@@ -1,0 +1,2240 @@
+	.TITLE	DNSRSLV - DNS resolver for XOS
+
+;++++
+; This software is in the public domain.  It may be freely copied and used
+; for whatever purpose you see fit, including commerical uses.  Anyone
+; modifying this software may claim ownership of the modifications, but not
+; the complete derived code.  It would be appreciated if the authors were
+; told what this software is being used for, but this is not a requirement.
+
+;   THIS SOFTWARE IS PROVIDED BY THE AUTHORS "AS IS" AND ANY EXPRESS OR
+;   IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
+;   OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+;   IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+;   INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+;   BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS
+;   OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+;   ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR
+;   TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
+;   USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+;----
+
+	.PROC	80386
+
+	.INCLUD	XOSINC:\XMAC\STDIO.PAR
+	.INCLUD	XOSINC:\XMAC\CTYPE.PAR
+	.INCLUD	XOSINC:\XMAC\PROCARG.PAR
+	.INCLUD	XOSINC:\XMAC\XOS.PAR
+	.INCLUD	XOSINC:\XMAC\XOSERR.PAR
+	.INCLUD	XOSINC:\XMAC\XOSTIME.PAR
+	.INCLUD	XOSINC:\XMAC\XOSTRM.PAR
+	.INCLUD	XOSINC:\XMAC\XOSNET.PAR
+	.INCLUD	XOSINC:\XMAC\XOSTHREADS.PAR
+
+	.STDSEGS
+
+MAJVER ==!2t		;Major version number
+MINVER ==!0t		;Minor version number
+EDITNUM==!0t		;Edit number
+
+TIME_RETRY=!5t
+
+;This program is the XOS DNS resolver.  It is initialized as a symbiont
+;  with the following command:
+
+;	SYMBIONT DNSRSLV UNIT=n
+;	  Where:
+;		UNIT     = Unit number (default = 1)
+
+;Each copy of DNSRSLV running on a system must have a unique unit number.
+
+;Description of data structures used:
+
+;  The server can support up to 31 server instances.  Each instance is
+;  associated with a UDP unit/remote port number pair and can provide DNS
+;  name lookup for a single network.  For each instance an IDB is allocated
+;  as described below and contains all data needed to operate the instance.
+;  Each IDB has a 16MB address space available for allocating its RDBs (request
+;  data blocks).  Each RDB occupies 8KB.  This consists of a 4KB guard area
+;  and a 4KB data area which includes the TDB for the thread.  The first RDB
+;  is allocated 16KB above the IDB.
+
+;  Format of the IDB:
+;	Offset  Size       Description
+;	000000   4KB   Stack, TDB, and additional data for the UDP thread
+;	001000   4KB   Not allocated
+;	002000   4KB   Stack and TDB for IPM thread
+;	003000   4KB   Not allocated
+;	004000   4KB   Stack and TDB for timer thread
+;  Each instance is allocated 32KB of address space for its TDBs and other
+;  data.  The offset of the IDB is the same as that of the UPD thread's TDB.
+
+;Define configuration constants
+
+INSTMAX   =!31t		;Maximum instance number
+THDSTKSIZE=!800h
+TMRSTKSIZE=!800h
+IDBBASE   =!100000h	;Base offset for first IDB
+DFLTPORT  =!53t		;Default UDP port number
+UDPSIZE   =!600t
+IPMSIZE   =!400t
+OUTSIZE   =!512t
+
+;Define offsets in the IDBs (Instance Data Blocks)
+
+$$$=!0
+BLK idb_ipmtdb  , tdb_SIZE
+BLK idb_udpname , 12t		;UDP device name
+BLK idb_port    , 4t		;UDP port number
+BLK idb_instance, 4t		;Instance number
+BLK idb_next    , 4t		;Offset of next IDB
+BLK idb_msgid   , 4t		;Message ID value
+BLK idb_maximum , 4t		;Maximum number of DNS cache entries
+BLK idb_requests, 4t		;Maximum number of active requests
+BLK idb_numreq  , 4t		;Current number of active requests
+BLK idb_ipshndl , 4t		;IPS device handle
+BLK idb_ipmhndl , 4t		;IPM device handle
+BLK idb_rdbcnt  , 4t		;Number of in-use RDBs for instance
+BLK idb_rdbfree , 4t		;RDB free list pointer
+BLK idb_udphndl , 4t
+BLK idb_srvipa1 , 4t		;First DNS server IPA address
+BLK idb_srvipa2 , 4t		;Second DNS server IPA address
+BLK idb_srvipa3 , 4t		;Third DNS server IPA address
+BLK idb_srvipa4 , 4t		;Fourth DNS server IPA address
+BLK idb_ipmparms, 24t
+BLK idb_ipmsrc  , 16t
+BLK idb_ipmbufr , IPMSIZE	;IPM input buffer
+BLK idb_udpbufr , UDPSIZE	;UDP input buffer
+BLK idb_rdblist , 
+
+;Define offsets in the RDBs (Request Data Blocks)
+
+$$$=!0
+BLK rdb_tdb    , tdb_SIZE
+BLK rdb_idb    , 4t
+BLK rdb_udphndl, 4t		;UDP device handle
+BLK rdb_type   , 4t		;Request type and class
+BLK rdb_retry  , 4t		;Retry counter
+BLK rdb_timer  , 4t		;Retry timer
+BLK rdb_cursrv , 4t
+BLK rdb_srvipa1, 4t
+BLK rdb_srvipa2, 4t
+BLK rdb_srvipa3, 4t
+BLK rdb_srvipa4, 4t
+BLK rdb_srvlist, 4t
+BLK rdb_length , 4t		;Length of DNS message
+BLK rdb_dnlen  , 1t		;Length of domain name
+BLK rdb_haveans, 1t		;Non-zero if have answer for request
+BLK rdb_wakeup , 1t		;Non-zero if need to wake up waiters
+BLK rdb_recur  , 1t		;Server recursion level
+BLK rdb_dnhead , 4t
+BLK rdb_dntail , 4t
+BLK rdb_nshead , 4t
+BLK rdb_nstail , 4t
+BLK rdb_reqlen , 4t
+BLK rdb_reqt2lv, 2t
+BLK rdb_reqerrc, 2t
+BLK rdb_reqname, 256t
+
+BLK rdb_message, 272t		;DNS message
+BLK rdb_rspbufr, UDPSIZE	;UDP input buffer
+rdb_SIZE=!$$$
+
+$$$=!0
+BLK dn_next  , 4t
+BLK dn_length, 4t
+BLK dn_ipa   , 4t
+BLK dn_mx    , 4t
+BLK dn_ptr   , 4t
+BLK dn_pntr  , 4t
+BLK dn_name  , 0t
+
+$$$=!0
+BLK a_next   , 4t
+BLK a_time2lv, 4t
+BLK a_resv   , 4t
+BLK a_length , 4t
+BLK a_ipa    , 4t
+
+$$$=!0
+BLK ns_next  , 4t
+BLK ns_length, 4t
+BLK ns_bits  , 1t
+BLK ns_name  , 0t
+
+$$$=!0
+BLK mx_next   , 4t
+BLK mx_time2lv, 4t
+BLK mx_pref   , 4t
+BLK mx_length , 4t
+BLK mx_name   , 4t
+
+$$$=!0
+BLK ptr_next   , 4t
+BLK ptr_time2lv, 4t
+BLK ptr_resv   , 4t
+BLK ptr_length , 4t
+BLK ptr_name   , 4t
+.PAGE
+	.PSECT	_DATA_p
+
+kwadd:   .ASCIZ "ADD"
+kwremove:.ASCIZ "REMOVE"
+kwrem:	 .ASCIZ "REM"
+kwstatus:.ASCIZ "STATUS"
+kwsta:	 .ASCIZ "STA"
+kwmaxi:  .ASCIZ "MAXIMUM"
+kwmax:   .ASCIZ "MAX"
+kwrequ:  .ASCIZ "REQUESTS"
+kwreq:   .ASCIZ "REQ"
+kwport:  .ASCIZ "PORT"
+kwpor:	 .ASCIZ "POR"
+kwdevice:.ASCIZ "DEVICE"
+kwdev:   .ASCIZ "DEV"
+kwipa1:  .ASCIZ "IPA1"
+kwipa2:  .ASCIZ "IPA2"
+kwipa3:  .ASCIZ "IPA3"
+kwipa4:  .ASCIZ "IPA4"
+kwinst:  .ASCIZ "INSTANCE"
+kwins:   .ASCIZ "INS"
+
+srvCmdWord::
+	.LONG	kwadd   , 0, 0, srvFncCommand#, cmdadd
+	.LONG	kwremove, 0, 0, srvFncCommand#, cmdremove
+	.LONG	kwrem   , 0, 0, srvFncCommand#, cmdremove
+	.LONG	kwstatus, 0, 0, srvFncCommand#, cmdstatus
+	.LONG	kwsta   , 0, 0, srvFncCommand#, cmdstatus
+	.LONG	0
+
+keywordadd:
+	.LONG	kwmaxi  , ASF$VALREQ|ASF$NVAL , 0, fncaddmax  , 0
+	.LONG	kwmax   , ASF$VALREQ|ASF$NVAL , 0, fncaddmax  , 0
+	.LONG	kwrequ  , ASF$VALREQ|ASF$NVAL , 0, fncaddreq  , 0
+	.LONG	kwreq   , ASF$VALREQ|ASF$NVAL , 0, fncaddreq  , 0
+	.LONG	kwport  , ASF$VALREQ|ASF$NVAL , 0, fncaddport , 0
+	.LONG	kwpor   , ASF$VALREQ|ASF$NVAL , 0, fncaddport , 0
+	.LONG	kwdevice, ASF$VALREQ|ASF$LSVAL, 0, fncadddev  , 0
+	.LONG	kwdev   , ASF$VALREQ|ASF$LSVAL, 0, fncadddev  , 0
+	.LONG	kwipa1  , ASF$VALREQ|ASF$NVAL , 0, fncaddipa  , 0t
+	.LONG	kwipa2  , ASF$VALREQ|ASF$NVAL , 0, fncaddipa  , 4t
+	.LONG	kwipa3  , ASF$VALREQ|ASF$NVAL , 0, fncaddipa  , 8t
+	.LONG	kwipa4  , ASF$VALREQ|ASF$NVAL , 0, fncaddipa  , 12t
+keyword:.LONG	kwinst  , ASF$VALREQ|ASF$NVAL , 0, fncinstance, 0
+	.LONG	kwins   , ASF$VALREQ|ASF$NVAL , 0, fncinstance, 0
+	.LONG	0
+
+cmddata:.BLKB	tdb_SIZE
+	.LONG	0
+.PAGE
+	.SBTTL	Start of program
+
+	.PSECT	_TEXT_p
+
+mainalt::
+	PUSHL	#EDITNUM
+	PUSHL	#MINVER.B
+	PUSHL	#MAJVER.B
+	PUSHL	#50t.B
+	PUSHL	#70.B
+	PUSHL	#cmddata
+	MOVL	EAX, 28t.B[ESP]
+	PUSHL	EAX
+	CALL	srvInitialize#
+	ADDL	ESP, #28t.B
+	RET
+
+srvSetup1::
+	RET
+
+srvSetup2::
+	RET
+
+	.SBTTL	srvSetupCmd - Subroutine to set up for command processing
+
+;Subroutine to set up for command processing
+;	CALL	srvSetupCmd
+
+srvSetupCmd::
+	CLRL	EAX
+	MOVL	instance, EAX
+	RET
+
+srvFinishCmd::
+	RET
+
+srvMessage::
+	RET
+.PAGE
+	.SBTTL	fncaddmax - Function to process the MAXIMUM keyword for ADD command
+
+;Function to process the MAXIMUM keyword for the ADD command - this specifies
+;  the maximum number of DNS cache entries allowed
+
+fncaddmax:
+	MOVL	EBX, 4.B[ESP]		;Get offset of the argument data
+	MOVL	EAX, argdata_value.B[EBX] ;Get value
+	MOVL	maximum, EAX		;Store it
+	JMP	rtnone2.S
+
+	.SBTTL	fncaddreq - Function to process the REQUESTS keyword for ADD command
+
+;Function to process the REQUESTS keyword for the ADD command - this specifies
+;  the maximum number of simultaneous requests the instance can process
+
+fncaddreq:
+	MOVL	EBX, 4.B[ESP]		;Get offset of the argument data
+	MOVL	EAX, argdata_value.B[EBX] ;Get value
+	CMPL	EAX, #16t.B
+	JA	4$.S
+	MOVB	AL, #16t
+4$:	CMPL	EAX, #1024t
+	JB	6$.S
+	MOVL	EAX, #1024t
+6$:	MOVL	requests, EAX		;Store it
+	JMP	rtnone2.S
+.PAGE
+	.SBTTL	fncaddport - Function to process the PORT keyword for ADD command
+
+;Function to process the PORT keyword for the ADD command - this specifies the
+;  UDP port to use for receiving accounting updates
+
+fncaddport:
+	MOVL	EBX, 4.B[ESP]		;Get offset of the argument data
+	MOVL	EAX, argdata_value.B[EBX] ;Get value
+	MOVL	port, EAX		;Store it
+rtnone2:CLRL	EAX
+	INCL	EAX
+	RET
+.PAGE
+	.SBTTL	fncadddev - Function to process the DEVICE keyword for ADD command
+
+;Function to process the DEVICE keyword for the ADD command - this specifies
+;  the name of a UDP device to use
+
+fncadddev:
+	PUSHL	ESI
+	PUSHL	EDI
+	MOVL	EBX, #udpname
+	CMPB	[EBX], #0
+	JNE	10$.S
+	MOVL	EDX, 12t.B[ESP]		;Get offset of argument data structure
+	MOVL	EDX, argdata_value.B[EDX] ;Get offset of name string
+	MOVL	ECX, #8t
+2$:	MOVB	AL, [EDX]		;Get name character
+	CMPB	AL, #0			;End?
+	JE	14$.S			;Yes
+	INCL	EDX			;No
+	CMPB	AL, #'a'		;Lower case?
+	JB	4$.S			;No
+	ADDB	AL, #'A'-'a'		;Yes - change to upper case
+4$:	MOVB	[EBX], AL		;Store in buffer
+	INCL	EBX
+	CMPB	AL, #':'		;Colon?
+	JE	12$.S			;Yes
+	LOOP	ECX, 2$			;No - loop if can take more
+6$:	MOVL	ESI, #bdspmsg		;Bad name
+8$:	PUSHL	#0.B
+	PUSHL	ESI
+	PUSHL	#0.B
+	CALL	srvCmdErrorResp#
+	ADDL	ESP, #12t.B
+	CLRL	EAX
+	POPL	EDI
+	POPL	ESI
+	RET	
+
+;Here if more than one device specified
+
+10$:	MOVL	ESI, #mltdvmsg
+	JMP	8$.S
+
+;Here with colon in name
+
+12$:	CMPB	[EDX], #0		;Is it the last character?
+	JNE	6$.S			;No - bad name
+	JMP	16$.S
+
+;Here with end of name (no colon seen)
+
+14$:	MOVW	[EBX], #':'		;Store colon and null
+16$:	POPL	EDI
+	POPL	ESI
+	JMP	rtnone2.S
+.PAGE
+	.SBTTL	fncaddipa - Function to process the IPAn keywords for ADD command
+
+;Function to process the IPAn keywords for the ADD command - these specify IP
+;  addresses for the base DNS servers
+
+fncaddipa:
+	MOVL	EBX, 4.B[ESP]		;Get offset of the argument data
+	MOVL	EDX, argdata_data.B[EBX] ;Get data (offset for value)
+	MOVL	EAX, argdata_value.B[EBX] ;Get value
+	MOVL	srvipa[EDX], EAX
+	JMP	rtnone4.S
+.PAGE
+	.SBTTL	fncinstance - Function to process the INSTANCE keyword
+
+;Function to process the INSTANCE keyword - this specifies the instance number
+
+fncinstance:
+	MOVL	EBX, 4.B[ESP]		;Get offset of the argument data
+	MOVL	EAX, argdata_value.B[EBX] ;Get value
+	TESTL	EAX, EAX
+	JE	10$.S
+	CMPL	EAX, #INSTMAX.B		;Valid?
+	JA	10$.S			;No
+	MOVL	instance, EAX		;Yes - store it
+rtnone4:CLRL	EAX
+	INCL	EAX
+	RET
+
+;Here if the instance number is not valid
+
+10$:	PUSHL	ESI
+	PUSHL	EDI
+	MOVL	ESI, #bdimsg
+12$:	PUSHL	#0.B
+	PUSHL	ESI
+	PUSHL	EAX
+	CALL	srvCmdErrorResp#
+	ADDL	ESP, #12t.B
+	POPL	EDI
+	POPL	ESI
+	CLRL	EAX
+	RET
+.PAGE
+	.SBTTL	cmdadd - Subroutine to process the ADD command
+
+;Subroutine to process the ADD command
+
+cmdadd:	MOVL	EAX, 4t.B[ESP]
+	MOVL	cmdpntr, EAX
+	MOVL	maximum, #128t
+	MOVL	requests, #64t
+	CLRL	EAX
+	MOVB	udpname, AL
+	MOVL	udphndl, EAX
+	MOVL	ipmhndl, EAX
+	MOVL	ipshndl, EAX
+	MOVL	havethd, EAX
+	MOVL	port, #DFLTPORT
+	PUSHL	EAX			;No default extension for indirect file
+	PUSHL	EAX			;No next line function
+	PUSHL	#srvCmdError#		;Error function
+	PUSHL	EAX			;Function called for non-keyword args
+	PUSHL	#keywordadd		;Offset of keyword table
+	PUSHL	EAX			;Offset of option table
+	PUSHL	#PAF$INDIRECT|PAF$EATQUOTE ;Flag bits
+	PUSHL	#cmdpntr		;Offset of arg string pointer
+	CALL	procarg#		;Process arguments
+	ADDL	ESP, #32t.B
+	TESTL	EAX, EAX
+	JE	2$.S
+	CALL	banner
+	MOVL	EAX, instance		;Get instance
+	TESTL	EAX, EAX
+	JE	3$.S			;If not specified
+	BTL	instx, EAX		;Is the instance defined now?
+	JNC	4$.S			;No - go on
+	PUSHL	instance		;Yes - complain and fail
+	PUSHL	#iiufmt
+	PUSHL	#msgbufr
+	CALL	sprintf#
+	PUSHL	srvMsgDst#
+	PUSHL	#0.B
+	PUSHL	#msgbufr
+	PUSHL	#0.B
+	CALL	srvCmdErrorResp#
+	ADDL	ESP, #28t.B
+2$:	RET
+
+;Here if no instance specified
+
+3$:	PUSHL	#noismsg
+	CALL	srvCmdResponse#
+	POPL	ECX
+	RET
+
+;Here if specified instance does not now exist
+
+4$:	MOVL	ESI, #nodvmsg
+	CMPB	udpname, #0		;Was a UDP name specified?
+	JNE	6$.S			;Yes
+	PUSHL	srvMsgDst#
+	PUSHL	#0.B			;No - fail
+	PUSHL	ESI
+	PUSHL	#0.B
+	CALL	srvCmdErrorResp#
+	ADDL	ESP, #16t.B
+	RET
+
+;Here if have UDP port and device specified
+
+6$:	PUSHL	instance		;Construct the IPM name
+	PUSHL	srvUnitNum#
+	PUSHL	#fmtipm
+	PUSHL	#msgbufr
+	CALL	sprintf#
+	ADDL	ESP, #16t.B
+	MOVL	ipmlen, EAX
+	PUSHL	#O$IN|O$OUT		;Open our IPM device
+	PUSHL	DS
+	PUSHL	#msgbufr
+	PUSHL	#0.B
+	PUSHL	#0.B
+	CALLF	svcIoOpen##
+	MOVL	EBX, #oermsg
+	TESTL	EAX, EAX
+10$:	JS	setuperr		;If error
+	MOVL	ipmhndl, EAX
+	PUSHL	#O$IN|O$OUT		;Check the UDP device and make sure
+	PUSHL	DS			;  it really is a UDP device
+	PUSHL	#udpname
+	PUSHL	DS
+	PUSHL	#openparms
+	CALLF	svcIoOpen##
+	MOVL	EBX, #oeumsg
+	TESTL	EAX, EAX
+	JS	10$.S			;If error
+	MOVL	udphndl, EAX		;Save handle for the UDP device
+	MOVL	EBX, #nrermsg
+	CMPL	devclass+0, #'UDP'	;Is this really a UDP device?
+	JNE	setuperr		;No - fail!
+.PAGE
+;Here if have a UDP device
+
+haveudp:PUSHL	udphndl			;Get the name of the corresponding
+	PUSHL	DS			;  IPS device
+	PUSHL	#ipsnchars
+	CALLF	svcIoDevChar##
+	MOVL	EBX, #unemsg
+	TESTL	EAX, EAX
+	JS	6$.S
+	MOVL	EBX, #ipsnam
+	MOVL	EDX, #ipsname+1		;Copy the name, prepend _ and append :
+2$:	MOVB	AL, [EBX]
+	INCL	EBX
+	CMPB	AL, #0
+	JE	4$.S
+	MOVB	[EDX], AL
+	INCL	EDX
+	JMP	2$.S
+
+4$:	MOVW	[EDX], #':'
+	PUSHL	#O$IN|O$OUT		;Open the IPS device
+	PUSHL	DS
+	PUSHL	#ipsname
+	PUSHL	#0.B
+	PUSHL	#0.B
+	CALLF	svcIoOpen##
+	MOVL	EBX, #oeimsg
+	TESTL	EAX, EAX
+	JS	6$.S			;If error
+	MOVL	ipshndl, EAX		;Store IPS device handle
+	PUSHL	EAX
+	MOVL	EAX, maximum		;Store maximum number of cache entries
+	MOVL	msgbufr+1, EAX		;  at the beginning of the buffer
+	PUSHL	#8t.B
+	PUSHL	DS
+	PUSHL	#msgbufr+1
+	MOVL	EAX, ipmlen
+	DECL	EAX
+	PUSHL	EAX
+	PUSHL	DS
+	PUSHL	#sdfparms
+	CALLF	svcIoSpecial##
+	MOVL	EBX, #seimsg
+	TESTL	EAX, EAX
+6$:	JS	16$.S
+	CMPL	zonefile, #0.B		;Are we a server?
+	JNE	8$.S			;Yes
+	PUSHL	udphndl			;No - close the UDP device
+	PUSHL	#0.B
+	CALLF	svcIoClose##
+	CLRL	EAX
+	MOVL	udphndl, EAX
+8$:	MOVL	ESI, instance
+	SHLL	ESI, #24t
+	ADDL	ESI, #THDSTKSIZE
+	PUSHL	ESI			;Offset for the TDB
+	PUSHL	#THDSTKSIZE		;Stack size
+	MOVL	EAX, requests
+	LEAL	EAX, idb_rdblist+2[EAX*2]
+	PUSHL	EAX
+	PUSHL	#ipmthread		;Main function for thread
+	PUSHL	#0.B			;Arguments for main function
+	PUSHL	#0.B
+	CALLF	thdCtlCreate#		;Create the IPM thread
+	MOVL	EBX, #tdimsg
+	TESTL	EAX, EAX
+16$:	JS	18$.S			;If error
+	INCB	havethd+0		;OK - indicate thread created
+	MOVL	EAX, instance
+	BTSL	instx, EAX
+	MOVL	idb_instance[ESI], EAX	;Store the instance number
+	MOVL	EAX, lastidb		;Link into our list of IDBs
+	MOVL	idb_next[EAX], ESI
+	MOVL	lastidb, ESI
+	MOVL	EAX, udpname+0		;Store the UDP name
+	MOVL	idb_udpname+0.B[ESI], EAX
+	MOVL	EAX, udpname+4
+	MOVL	idb_udpname+4.B[ESI], EAX
+	MOVL	EAX, udpname+8
+	MOVL	idb_udpname+8.B[ESI], EAX
+	MOVL	EAX, port
+	MOVL	idb_port.B[ESI], EAX
+	MOVL	EAX, maximum
+	MOVL	idb_maximum.B[ESI], EAX
+	MOVL	ECX, requests
+	MOVL	idb_requests.B[ESI], ECX
+	DECL	ECX
+	LEAL	EBX, idb_rdblist-2[ESI]
+	MOVL	EAX, #2
+18$:	MOVW	[EBX+EAX*2], AX		;Set up the RDB free list
+	INCL	EAX
+	LOOP	ECX, 18$
+
+	MOVL	idb_rdbfree.B[ESI], #1
+	MOVL	EAX, srvipa+0t
+	MOVL	idb_srvipa1[ESI], EAX
+	MOVL	EAX, srvipa+4t
+	MOVL	idb_srvipa2[ESI], EAX
+	MOVL	EAX, srvipa+8t
+	MOVL	idb_srvipa3[ESI], EAX
+	MOVL	EAX, srvipa+12t
+	MOVL	idb_srvipa4[ESI], EAX
+	MOVL	EAX, ipshndl
+	MOVL	idb_ipshndl.B[ESI], EAX
+	MOVL	EAX, ipmhndl
+	MOVL	idb_ipmhndl.B[ESI], EAX
+	MOVL	idb_ipmparms+0t[ESI], #PAR$GET|REP_STR|{IOPAR_MSGRMTADDRR<16t}
+	LEAL	EAX, idb_ipmsrc[ESI]
+	MOVL	idb_ipmparms+4t[ESI], EAX
+	MOVL	idb_ipmparms+8t[ESI], DS
+	MOVL	idb_ipmparms+12t[ESI], #100010h
+	MOVB	idb_ipmparms+16t[ESI], #0
+	PUSHL	#1.B			;Get current date and time
+	PUSHL	DS
+	PUSHL	#msgbufr
+	CALLF	svcSysDateTime##
+	MOVZWL	EAX, msgbufr+2		;Get high order 16 bits of the time as
+	MOVL	idb_msgid.B[ESI], EAX	;  the initial message ID
+	PUSHL	idb_port.B[ESI]
+	PUSHL	#udpname
+	PUSHL	idb_instance.B[ESI]
+	PUSHL	#okfmt
+	PUSHL	#msgbufr
+	CALL	sprintf#
+	PUSHL	srvMsgDst#
+	PUSHL	#msgbufr
+	CALL	srvCmdResponse#
+	ADDL	ESP, #28t.B
+ret002:	RET
+.PAGE
+;Here if error while setting up the instance
+;	c{EAX} = XOS error code
+;	c{EBX} = Offset of message string
+
+setuperr:
+	CMPL	ipshndl, #0
+	JE	4$.S
+	PUSHL	EAX
+	PUSHL	ipshndl
+	PUSHL	#0.B
+	CALLF	svcIoClose##
+	POPL	EAX
+4$:	CMPL	udphndl, #0
+	JE	6$.S
+	PUSHL	EAX
+	PUSHL	udphndl
+	PUSHL	#0.B
+	CALLF	svcIoClose##
+	POPL	EAX
+6$:	CMPL	ipmhndl, #0
+	JE	12$.S
+	PUSHL	EAX
+	PUSHL	ipmhndl
+	PUSHL	#0.B
+	CALLF	svcIoClose##
+	POPL	EAX
+12$:	CMPB	havethd+0, #0
+	JE	14$.S
+	MOVL	ESI, instance
+	SHLL	ESI, #24t
+	ADDL	ESI, #THDSTKSIZE
+	PUSHL	EAX
+	PUSHL	ESI
+	CALLF	thdCtlKill#
+	POPL	EAX
+14$:	PUSHL	srvMsgDst#
+	PUSHL	#0.B
+	PUSHL	EBX
+	PUSHL	EAX
+	CALL	srvCmdErrorResp#
+	ADDL	ESP, #16t.B
+	RET
+.PAGE
+	.SBTTL	cmdremove - Subroutine to process the REMOVE command
+
+;Subroutine to process the REMOVE command
+
+cmdremove:
+	MOVL	EAX, 4t.B[ESP]
+	MOVL	EDI, #keyword
+	CALL	requireinst
+	JC	10$.S
+	PUSHL	srvMsgDst#
+	PUSHL	#rmvmsg
+	CALL	srvCmdResponse#
+	ADDL	ESP, #8t.B
+10$:	RET
+.PAGE
+	.SBTTL	cmdstatus - Subroutine to process the STATUS command
+
+;Subroutine to process the STATUS command
+
+cmdstatus:
+	PUSHL	srvMsgDst#
+	PUSHL	#stsmsg
+	CALL	srvCmdResponse#
+	ADDL	ESP, #8t.B
+	RET
+.PAGE
+	.SBTTL	requireinst
+
+;Subroutine to do initial command processing when an instance must be specified
+;	c{EAX} = Offset of command tail
+;	c{EDI} = Offset of command keyword table
+;	CALL	requireinst
+;	C:set = Error (complete response already sent)
+;	C:clr = Normal
+;	  c{ESI} = Offset of IDB for instance
+
+requireinst:
+	MOVL	cmdpntr, EAX
+	PUSHL	#0.B			;No default extension for indirect file
+	PUSHL	#0.B			;No next line function
+	PUSHL	#srvCmdError#		;Error function
+	PUSHL	#0.B			;Function called for non-keyword args
+	PUSHL	EDI			;Offset of keyword table
+	PUSHL	#0.B			;Offset of option table
+	PUSHL	#PAF$INDIRECT|PAF$EATQUOTE ;Flag bits
+	PUSHL	#cmdpntr		;Offset of arg string pointer
+	CALL	procarg#		;Process arguments
+	ADDL	ESP, #32t.B
+	TESTL	EAX, EAX
+	JE	6$.S
+	CALL	banner
+	MOVL	ESI, instance		;Was an instance specified?
+	TESTL	ESI, ESI
+	JE	2$.S			;No - fail
+	BTL	instx, ESI		;Yes - does the instance exist?
+	JNC	8$.S			;No - fail
+	SHLL	ESI, #13t		;Yes - get offset of the IDB
+	ADDL	ESI, #IDBBASE+THDSTKSIZE
+	RET
+
+;Here if no instance specified
+
+2$:	PUSHL	#noismsg
+4$:	CALL	srvCmdResponse#
+	ADDL	ESP, #4t.B
+6$:	STC
+	RET
+
+8$:	PUSHL	#noixmsg
+	JMP	4$.S
+
+banner::SUBL	ESP, #100t
+	MOVL	EDI, ESP
+	MOVL	EAX, #banfmt1
+	CMPL	instance, #0.B
+	JE	10$.S
+	ADDL	EAX, #banfmt2-banfmt1.B
+	PUSHL	instance
+10$:	PUSHL	srvUnitNum#
+	PUSHL	EAX
+	PUSHL	EDI
+	CALL	sprintf#
+	PUSHL	EDI
+	CALL	srvCmdResponse#
+	LEAL	ESP, 100t.B[EDI]
+	RET
+.PAGE
+message::
+	CLRL	EAX
+	INCL	EAX
+	RET
+.PAGE
+	.SBTTL	ipmthread - Main thread function for the IPM thread
+
+;The IPM thread reads and processes IPM datagrams.  Each has the following
+;  format:
+;    Size    Description
+;     1   Datagram type = MT_IPSDNS = 40.
+;     1	    Bits 7-4: Server recursion level
+;	    Bits 3-0: Request type: 1 = get A record(s), 2 = get CNAME record,
+;			3 = get MX record(s)
+;     n   Domain name
+
+ipmthread:
+	MOVL	ESI, thdData#		;Get offset of the IDB
+	SUBL	ESI, #idb_ipmtdb
+ipmloop:PUSHL	idb_ipmhndl.B[ESI]	;Get a datagram
+	PUSHL	DS
+	LEAL	EAX, idb_ipmbufr[ESI]
+	PUSHL	EAX
+	PUSHL	#IPMSIZE
+	PUSHL	DS
+	LEAL	EAX, idb_ipmparms[ESI]
+	PUSHL	EAX
+	CALLF	thdIoInBlockP#
+	TESTL	EAX, EAX		;Error?
+	JS	10$.S			;Yes
+	MOVL	ECX, EAX		;No - get length of message
+	SUBL	ECX, #2t.B		;Minus the header
+	JLE	ipmloop.S		;Ignore it if no data
+	CMPW	idb_ipmparms+14t[ESI], #12t.B
+	JNE	ipmloop.S
+	CMPL	idb_ipmsrc+0t[ESI], #'^SYS'
+	JNE	ipmloop.S
+	CMPL	idb_ipmsrc+4t[ESI], #'^IPS'
+	JNE	ipmloop.S
+	CMPL	idb_ipmsrc+8t[ESI], #'^DNS'
+	JNE	ipmloop.S
+	CMPB	idb_ipmbufr+0[ESI], #MT_IPSDNS
+	JNE	ipmloop.S
+	LEAL	EBX, idb_ipmbufr+2[ESI]
+	MOVZBL	EAX, -1.B[EBX]		;Get request type
+	MOVL	EDX, EAX
+	ANDL	EDX, #0Fh.B
+	CMPL	EDX, #4t.B		;Valid?
+	JA	8$.S			;No
+	TESTL	EDX, EDX		;Maybe
+	JNE	reqok.S			;Yes - go on
+8$:	JMP	ipmloop
+
+;Here if have error doing IPM input
+
+10$:	HLT
+.PAGE
+reqok:	PUSHL	EAX			;Save request type
+	MOVL	EDI, idb_rdbfree.B[ESI]
+	TESTL	EDI, EDI
+	JE	10$
+	MOVZWL	EAX, idb_rdblist[ESI+EDI*2]
+	MOVL	idb_rdbfree.B[ESI], EAX
+	MOVW	idb_rdblist[ESI+EDI*2], #0FFFFh
+	INCL	EDI			;Get offset of the RDB
+	SHLL	EDI, #13t
+	ADDL	EDI, ESI
+	PUSHL	EDI			;Offset for the TDB
+	PUSHL	#THDSTKSIZE		;Stack size
+	PUSHL	#rdb_SIZE
+	PUSHL	#reqthread		;Main function for thread
+	PUSHL	#0.B			;Arguments for main function
+	PUSHL	#0.B
+	CALLF	thdCtlCreate#		;Create the request thread
+	TESTL	EAX, EAX
+	POPL	EDX			;Restore request type
+	JS	14$			;If error creating thread
+	INCL	idb_rdbcnt.B[ESI]
+	MOVB	rdb_recur.B[EDI], DL	;Store recursion level
+	ANDB	DL, #0Fh
+	MOVL	rdb_type.B[EDI], EDX	;Store request type
+	MOVL	rdb_idb.B[EDI], ESI	;Store offset of IDB in the RDB
+	MOVL	rdb_reqlen[EDI], ECX
+	PUSHL	ECX
+	PUSHL	EDI
+	PUSHL	ESI
+	MOVL	ESI, EBX		;Store domain name
+	ADDL	EDI, #rdb_reqname
+	PUSHL	DS
+	POPL	ES
+	CLD
+	RMOVSB	[EDI], [ESI]
+	MOVL	EDX, EDI
+	POPL	ESI
+	POPL	EDI
+	POPL	ECX
+	MOVL	EAX, EBX
+	CALL	storeques
+	JMP	ipmloop			;Continue
+
+;Here if we cannot handle another request
+
+10$:	PUSHL	#0.B
+	PUSHL	#tmrmsg
+	JMP	16$.S
+
+;Here if error creating a response thread
+
+14$:	SUBL	EDI, ESI		;Get RDB slot number
+	SHRL	EDI, #13t
+	DECL	EDI
+	MOVL	EDX, idb_rdbfree.B[ESI]	;Put this RDB back on the RDB free list
+	MOVW	idb_rdblist[ESI+EDI*2], DX
+	MOVL	idb_rdbfree.B[ESI], EDI
+	PUSHL	EAX
+	PUSHL	#ectmsg
+16$:	CALL	srvLogSysLog#
+	JMP	ipmloop
+
+tmrmsg:	.ASCIZ	"Too many name resolver requests"
+ectmsg:	.ASCIZ	"Error creating request thread"
+.PAGE
+	.SBTTL	udpthread - Main thread function for the UDP thread
+
+udpthread:
+	MOVL	ESI, thdData#		;Get offset of the IDB (which is the
+					;  same as the offset of the TDB)
+udploop:PUSHL	idb_udphndl[ESI]	;Get a datagram
+	PUSHL	DS
+	LEAL	EAX, idb_udpbufr[ESI]
+	PUSHL	EAX
+	PUSHL	#UDPSIZE
+	CALLF	thdIoInBlock#
+	TESTL	EAX, EAX		;Error?
+	JS	18$			;Yes
+	MOVL	dnslen, EAX		;No
+	CMPL	EAX, #12t.B
+	JLE	udploop.S		;Ignore it if no data
+	LEAL	EBX, idb_udpbufr[ESI]
+	ADDL	EAX, EBX		;Store offset of top of message + 1
+	MOVL	msgtop, EAX
+
+	HLT
+
+;Here if error on UDP input
+
+18$:	PUSHL	#erupmsg		;Yes - complain
+	PUSHL	EAX
+	CALL	srvLogSysLog#
+	ADDL	ESP, #8t.B
+	JMP	udploop
+.PAGE
+	.SBTTL	reqthread - Main thread function for the request thread
+
+reqthread:
+	MOVL	EDI, thdData#		;Get offset of the RDB
+	MOVL	ESI, rdb_idb.B[EDI]	;Get offset of the IDB
+	PUSHL	#O$IN|O$OUT.B		;Open a UDP device
+	PUSHL	DS
+	LEAL	EAX, idb_udpname.B[ESI]
+	PUSHL	EAX
+	PUSHL	#0.B
+	PUSHL	#0.B
+	CALLF	thdIoOpen#
+	TESTL	EAX, EAX
+	JS	noname			;If error
+	MOVL	rdb_udphndl.B[EDI], EAX	;OK - save UPD handle
+	MOVW	rdb_message+dns_parm[EDI], #0000h ;No recursion
+	MOVL	rdb_message+dns_numques[EDI], #0100h ;Indicate 1 question only
+	MOVL	rdb_message+dns_numauth[EDI], #0
+	MOVL	EAX, idb_srvipa1[ESI]	;Initialize the server list
+	MOVL	rdb_srvipa1.B[EDI], EAX
+	MOVL	EAX, idb_srvipa2[ESI]
+	MOVL	rdb_srvipa2.B[EDI], EAX
+	MOVL	EAX, idb_srvipa3[ESI]
+	MOVL	rdb_srvipa3.B[EDI], EAX
+	MOVL	EAX, idb_srvipa4[ESI]
+	MOVL	rdb_srvipa4.B[EDI], EAX
+doreq:	CMPB	srvDebugLevel#, #1	;Should we log this?
+	JB	1$.S			;No
+	LEAL	EBX, rdb_reqname[EDI]	;Yes
+	CALL	convdname		;Convert the name to period format
+	PUSHL	#valbufr
+	MOVZBL	EAX, rdb_recur.B[EDI]
+	PUSHL	EAX
+	PUSHL	#reqfmt
+	PUSHL	#dbgbufr
+	CALL	sprintf#
+	ADDL	ESP, #16t.B
+	CALL	debugoutb
+1$:	MOVL	rdb_retry.B[EDI], #5t	;Initialize retry counter
+	MOVL	rdb_timer.B[EDI], #TIME_RETRY ;Initialize retry timer
+	CLRL	EAX
+	MOVL	rdb_cursrv.B[EDI], EAX
+	MOVL	EAX, idb_msgid.B[ESI]	;Store message ID value
+	MOVW	rdb_message+dns_msgid[EDI], AX
+	INCL	idb_msgid.B[ESI]
+sendrq2:MOVL	EAX, rdb_cursrv.B[EDI]	;Get current position in the server list
+	CMPL	EAX, #3t		;Past end?
+	JA	2$.S			;Yes
+	MOVL	EAX, rdb_srvipa1.B[EDI+EAX*4] ;No - get IP address
+	TESTL	EAX, EAX		;Do we an IP address
+	JNE	12$			;Yes - use it
+	MOVL	EBX, rdb_srvlist.B[EDI]	;No - do we have another server name?
+	TESTL	EBX, EBX
+	JNE	4$.S			;Yes - get its IP address
+2$:	CMPL	rdb_cursrv.B[EDI], #0	;Have any servers left to use?
+	JE	8$			;No - fail
+	DECL	rdb_retry.B[EDI]	;Can we do this again?
+	JS	8$			;No - fail
+	CLRL	EDX			;Yes - start over with the first server
+	MOVL	rdb_cursrv.B[EDI], EDX
+	JMP	sendrq2.S		;Send the request again
+
+;Here with the domain name for a server to use - get its IP address
+
+4$:	ADDB	rdb_recur.B[EDI], #10h	;Bump the server recursion level
+	CMPB	rdb_recur.B[EDI], #50h	;Too high?
+	JAE	8$			;Yes - fail!
+	CMPB	srvDebugLevel#, #1	;Should we log this?
+	JB	5$.S			;No
+	PUSHL	EBX			;Yes
+	ADDL	EBX, #ns_name.B
+	CALL	convdname
+	PUSHL	#valbufr
+	PUSHL	#svnfmt
+	PUSHL	#dbgbufr
+	CALL	sprintf#
+	ADDL	ESP, #12t.B
+	CALL	debugoutb
+	POPL	EBX
+5$:	PUSHL	idb_ipshndl.B[ESI]
+	PUSHL	#IPSSF_FINDIPA.B
+	PUSHL	DS
+	LEAL	EAX, ns_bits.B[EBX]
+	MOVB	DL, rdb_recur.B[EDI]
+	ANDB	DL, #0F0h
+	ORB	DL, #01h
+	MOVB	[EAX], DL
+	PUSHL	EAX
+	MOVL	EAX, ns_length.B[EBX]
+	INCL	EAX
+	PUSHL	EAX
+	PUSHL	DS
+	PUSHL	#sdfparms
+	CALLF	thdIoSpecial#
+	TESTL	EAX, EAX
+	JS	6$.S
+	CMPB	srvDebugLevel#, #1	;Should we log this?
+	JB	55$.S			;No
+	PUSHL	EBX			;Yes
+	MOVZBL	EDX, ns_bits+4.B[EBX]
+	PUSHL	EDX
+	MOVB	DL, ns_bits+3.B[EBX]
+	PUSHL	EDX
+	MOVB	DL, ns_bits+2.B[EBX]
+	PUSHL	EDX
+	MOVB	DL, ns_bits+1.B[EBX]
+	PUSHL	EDX
+	PUSHL	EAX
+	PUSHL	#svifmt
+	PUSHL	#dbgbufr
+	CALL	sprintf#
+	ADDL	ESP, #28t.B
+	CALL	debugoutb
+	POPL	EBX
+55$:	MOVL	EAX, ns_bits+1.B[EBX]	;Get first IP address for server
+	MOVL	EDX, rdb_cursrv.B[EDI]
+	MOVL	rdb_srvipa1.B[EDI+EDX*4], EAX ;Put it in our server list
+6$:	MOVL	EAX, ns_next.B[EBX]	;Remove this block from the server
+	MOVL	rdb_srvlist.B[EDI], EAX	;  list
+	CALL	giveblock
+	JMP	sendrq2			;And continue
+
+;Here if we have tried enough
+
+8$:	MOVL	EAX, #ER_NNSNA
+10$:	JMP	noname
+
+;Here with the IP address of the next server to try
+
+12$:	MOVL	sendipa, EAX
+	CMPB	srvDebugLevel#, #1	;Should we log this?
+	JB	14$.S			;No
+	PUSHL	EBX			;Yes
+	PUSHL	EDX
+	MOVZBL	EAX, sendipa+3
+	PUSHL	EAX
+	MOVB	AL, sendipa+2
+	PUSHL	EAX
+	MOVB	AL, sendipa+1
+	PUSHL	EAX
+	MOVB	AL, sendipa+0
+	PUSHL	EAX
+	PUSHL	#sndfmt
+	PUSHL	#dbgbufr
+	CALL	sprintf#
+	ADDL	ESP, #24t.B
+	CALL	debugoutb
+	POPL	EDX
+	POPL	EBX
+14$:	MOVL	EAX, idb_port.B[ESI]	;Get the UDP port for the server
+	MOVL	sendport, EAX
+	PUSHL	rdb_udphndl.B[EDI]	;Send the message
+	PUSHL	DS
+	LEAL	EAX, rdb_message[EDI]
+	PUSHL	EAX
+	PUSHL	rdb_length.B[EDI]
+	PUSHL	DS
+	PUSHL	#sendparms
+	CALLF	thdIoOutBlockP#
+	TESTL	EAX, EAX
+	JS	10$.S			;If error
+getresp:PUSHL	rdb_udphndl.B[EDI]
+	PUSHL	DS
+	LEAL	EBX, rdb_rspbufr[EDI]
+	PUSHL	EBX
+	PUSHL	#UDPSIZE
+	PUSHL	DS
+	PUSHL	#respparms
+	CALLF	thdIoInBlockP#
+	TESTL	EAX, EAX
+	JNS	haveresp.S
+	CMPL	EAX, #ER_NORSP
+	JNE	10$
+	INCL	rdb_cursrv.B[EDI]	;Increment position in server list
+	JMP	sendrq2			;Keep trying
+.PAGE
+;Here with a response
+
+haveresp:
+	CMPB	srvDebugLevel#, #1	;Should we log this?
+	JB	1$.S			;No
+	CALL	dumpresp		;Yes
+1$:	CMPL	EAX, #17t.B		;Is the message long enough?
+	JB	getresp.S		;No - ignore it
+	TESTB	rdb_rspbufr+dns_parm[EDI], #80h	;Yes - is it a response?
+	JE	getresp.S		;No - ignore it
+	CMPW	rdb_rspbufr+dns_numques[EDI], #0100h ;Yes - have exactly one
+						     ;  question?
+	JNE	getresp.S		;No - ignore it!
+	LEAL	EAX, rdb_rspbufr[EDI+EAX] ;Yes - get offset of first byte past
+	MOVL	msgtop, EAX		  ;  end of message
+	MOVZWL	EAX, rdb_rspbufr+dns_msgid[EDI]	;Get ID value from the message
+	CMPW	rdb_message+dns_msgid[EDI], AX ;Is it right?
+2$:	JNE	getresp.S		;No
+	LEAL	EDX, rdb_rspbufr+dns_ques[EDI] ;Yes
+	CALL	getrespdname		;Get the domain name from the question
+	JC	getresp			;Ignore message if error in domain name
+	MOVZBL	ECX, rdb_type.B[EDI]	;Is the request type and class right?
+	CMPL	reqtbl-4[ECX*4], EAX
+	JNE	2$.S			;No
+	MOVB	CL, namelen		;Yes - is the name in the question the
+	CMPB	rdb_dnlen.B[EDI], CL	;  one we asked about?
+	JNE	2$.S			;No
+	PUSHL	EDI			;Maybe
+	PUSHL	ESI
+	ADDL	EDI, #rdb_message+dns_ques
+	PUSHL	DS
+	POPL	ES
+	MOVL	ESI, #namebufr
+	CLD
+	RECMPSB	[EDI], [ESI]
+	POPL	ESI
+	POPL	EDI
+	JNE	2$.S			;No
+	MOVB	AL, rdb_rspbufr+dns_parm+1[EDI] ;Yes - get the response code
+	ANDL	EAX, #0Fh.B
+	JNE	14$			;If error
+	MOVZWL	EAX, rdb_rspbufr+dns_numans[EDI] ;Get total number of responses
+	XCHGB	AL, AH
+	MOVZWL	ECX, rdb_rspbufr+dns_numauth[EDI]
+	XCHGB	CL, CH
+	ADDL	EAX, ECX
+	MOVZWL	ECX, rdb_rspbufr+dns_numadd[EDI]
+	XCHGB	CL, CH
+	ADDL	EAX, ECX
+	JE	12$			;If no responses
+	CMPL	EAX, #32t.B		;Ignore message if too many responses!
+	JA	badsrv
+	MOVL	numresp, EAX
+6$:	CALL	getrespdname		;Get domain name, type, and class
+	JC	badsrv			;If error
+	MOVL	resptype, EAX
+	CMPW	resptype+2, #0100h	;Is the class "Internet"?
+	JNE	badsrv			;No - ignore the message
+	ADDL	EDX, #6t.B
+	CMPL	msgtop, EDX
+	JB	badsrv
+	MOVL	EAX, -6t.B[EDX]		;Get the time-to-live value
+	XCHGB	AL, AH
+	RORL	EAX, #16t
+	XCHGB	AL, AH
+	CMPL	EAX, #172800t		;Is it too big?
+	JB	8$.S			;No
+	MOVL	EAX, #172800t		;Yes - reduce it
+8$:	ADDL	EAX, #63t.B		;Change to 64 second ticks
+	SHRL	EAX, #6t
+	MOVL	time2lv, EAX
+	MOVZWL	EAX, -2t.B[EDX]		;Get the data length
+	XCHGB	AL, AH
+	MOVL	datalen, EAX
+	ADDL	EAX, EDX		;Is the data all there?
+	CMPL	msgtop, EAX
+	JB	badsrv			;No
+	MOVL	EAX, resptype		;Yes - get the response type
+	CMPW	AX, #0100h		;Is it an A record?
+	JE	arecord			;Yes
+	CMPW	AX, #0200h		;No - is in an NS record?
+	JE	nsrecord		;Yes
+	CMPW	AX, #0500h		;No - is it a CNAME record?
+	JE	cnamerecord		;Yes
+	CMPW	AX, #0C00h		;No - is it a PTR record?
+	JE	ptrrecord		;yES
+	CMPW	AX, #0F00h		;No - is it an MX record?
+	JE	mxrecord		;Yes
+skpresp:ADDL	EDX, datalen		;No - skip the response
+nxtresp:DECL	numresp			;Have any more responses?
+	JNE	6$			;Yes
+	CMPL	numused, #0.B		;No - did we find any usable responses?
+	JNE	parsed			;Yes
+12$:	TESTB	rdb_rspbufr+dns_parm+0[EDI], #04h ;No - is the answer
+						  ;  authoritative?
+	JE	badsrv.S		;No
+	MOVL	rdb_reqt2lv[EDI], #nullname ;Yes - store a null value with a
+	MOVZBL	EAX, rdb_type.B[EDI]	    ;  short time-to-live
+	MOVB	AL, sdftbl-1[EAX]
+	PUSHL	idb_ipshndl.B[ESI]
+	PUSHL	EAX
+	PUSHL	DS
+	LEAL	EAX, rdb_reqt2lv[EDI]
+	PUSHL	EAX
+	MOVL	EAX, rdb_reqlen[EDI]
+	ADDL	EAX, #4.B
+	PUSHL	EAX
+	PUSHL	DS
+	PUSHL	#sdfparms
+	CALLF	svcIoSpecial##
+	TESTL	EAX, EAX
+	JNS	giverdb
+
+	NOP
+
+	JMP	giverdb
+
+;Here have illegal format in the response
+
+badresp:MOVL	EAX, #ER_NNSRS
+
+;Here if error indicated in the response
+
+14$:	CMPL	EAX, #3t.B		;Is the error name not found?
+	JNE	badsrv.S		;No - ignore the message and mark this
+					;  server as not usable
+	TESTB	rdb_rspbufr+dns_parm+0[EDI], #04h ;Yes - is the answer
+						  ;  authoritative?
+	JE	badsrv.S		;No
+	MOVL	EAX, #ER_NNNDF		;Yes - return network name not defined
+	JMP	noname			;  error
+
+;Here if non-termial error reported by the server - mark this server as not
+;  usable and continue trying to find the domain name we want
+
+badsrv:	HLT
+.PAGE
+;Here for an A record response - This record maps a domain name to an IP
+;  address.  First we check and see if we already have a DN record block for
+;  this domain name.  If not, we create one.  Then we check to see if we
+;  already have this IP address, if not we add an A record block for the
+;  address.
+
+arecord:CMPL	datalen, #4t.B		;Data length must be 4
+	JNE	skpresp
+	CALL	getdnblock		;Get a DN block for the domain name
+	JC	10$.S
+	MOVL	EAX, [EDX]		;Get IP address
+	LEAL	ECX, dn_ipa.B[EBX]	;Point to pointer to first IP address
+					;  block
+4$:	MOVL	EBX, [ECX]		;Get offset of next IP address block
+	TESTL	EBX, EBX
+	JE	6$.S
+	CMPL	EAX, a_ipa.B[EBX]	;This one?
+	JE	8$.S			;Yes - we already have it
+	MOVL	ECX, EBX		;No - advance to next block
+	JMP	4$.S
+
+;Here if don't have an IP address block for this address
+
+6$:	MOVL	EAX, #a_ipa+4		;Allocate an IP address block
+	CALL	getblock
+	JC	10$.S			;If error
+	MOVL	EAX, time2lv		;OK - set up the block
+	MOVL	a_time2lv.B[EBX], EAX
+	CLRL	EAX
+	MOVL	a_resv.B[EBX], EAX
+	MOVL	[EBX], EAX
+	MOVL	a_length.B[EBX], #4
+	MOVL	EAX, [EDX]
+	MOVL	a_ipa.B[EBX], EAX
+	MOVL	[ECX], EBX		;Link block to end of list
+8$:	INCL	numused
+	JMP	skpresp
+
+;Here if error allocating the A record block
+
+10$:	HLT
+.PAGE
+;Here for an NS record response - this record provides the domain name for a
+;  server that might know about the requested domain name.  We build a list
+;  of all of the NS records in case we need them.
+
+nsrecord:
+	CALL	getrespvalue		;Get the domain name for the server
+	JC	badresp
+	MOVL	EAX, vallen		;Get space needed
+	ADDL	EAX, #ns_name.B
+	CALL	getblock
+	JC	10$.S
+	MOVL	ECX, vallen		;Store length of domain name
+	MOVL	ns_length.B[EBX], ECX
+	MOVB	ns_bits.B[EBX], #0
+	PUSHL	EDI			;Copy the domain the the NS record
+	PUSHL	ESI			;  block
+	MOVL	ESI, #valbufr
+	LEAL	EDI, ns_name.B[EBX]
+	PUSHL	DS
+	POPL	ES
+	CLD
+	RMOVSB	[EDI], [ESI]
+	POPL	ESI
+	POPL	EDI
+	MOVL	EAX, rdb_nstail[EDI]	;Link the new block into the NS
+	TESTL	EAX, EAX		;  record list
+	JE	6$.S
+	MOVL	[EAX], EBX
+	JMP	8$.S
+
+6$:	MOVL	rdb_nshead[EDI], EBX
+8$:	MOVL	rdb_nstail[EDI], EBX
+	MOVL	[EBX], #0
+	INCL	numused
+	JMP	nxtresp
+
+;Here if error allocating the NS record block
+
+10$:	HLT
+.PAGE
+;Here for a CNAME record response - This record maps a domain name to another
+;  domain name which is equivalent.  We do not keep a list of CNAME values
+;  but just use the CNAME value to update the name we are looking for unless
+;  we are asking for a CNAME record, in which case we terminate on the first
+;  one we find that matches our request.
+
+cnamerecord:
+	CALL	getrespvalue		;Get the canonical name
+	JC	badresp
+	PUSHL	idb_ipshndl.B[ESI]	;Store it in the cache
+	PUSHL	#IPSSF_ADDCNAME
+	PUSHL	DS
+	PUSHL	#cnargs
+	PUSHL	#264t
+	PUSHL	DS
+	PUSHL	#sdfparms
+	CALLF	svcIoSpecial##
+	TESTL	EAX, EAX
+	JNS	2$.S
+
+	NOP		;;;;;;;;;
+
+2$:	MOVL	ECX, namelen		;Yes - is this for the domain we are
+	CMPB	CL, rdb_dnlen.B[EDI]	;  asking about?
+	JNE	8$.S			;No
+	PUSHL	EBX			;Maybe
+	PUSHL	EDX
+	MOVL	EBX, #namebufr
+	LEAL	EDX, rdb_message+dns_ques[EDI]
+	CALL	comparedn
+	POPL	EDX
+	POPL	EBX
+	JNE	8$.S			;No
+	CMPB	rdb_type.B[EDI], #DNSREQ_CNAME ;Yes - are we looking for a CNAME
+					       ;  record?
+	JNE	4$.S			;No
+	MOVB	rdb_haveans.B[EDI], #1	;Yes - remember that
+	RET				;Ignore the rest of the response!
+
+;Here if we are not looking for a CNAME record - Use this canonical name from
+;  now on and remember we have found a match so will wake up our original
+;  requestor.
+
+4$:	MOVB	rdb_wakeup.B[EDI], #1
+	MOVL	ECX, vallen
+	MOVL	EAX, #valbufr
+	CALL	storeques
+8$:	JMP	nxtresp			;Continue
+.PAGE
+;Here for a PTR record response - this record maps a domain name (which
+;  usually specifies a IP address in DNS "funny format" to another domain name
+;  which specifies the corresponding host.
+
+ptrrecord:
+	CMPL	datalen, #2t.B		;Data length must be at least 2
+	JB	badresp
+	CMPL	datalen, #257t		;And cannot be greater than 255
+	JA	badresp
+	CALL	getrespvalue		;Get the pointer name
+	JC	badresp
+	PUSHL	EDX
+	CALL	getdnblock		;Get a DN block for the domain name
+	JC	10$.S
+	LEAL	EDX, dn_ptr.B[EBX]	;Point to pointer to first pointer
+					;  name block
+4$:	MOVL	EBX, [EDX]		;Get offset of next pointer name block
+	TESTL	EBX, EBX
+	JE	8$.S
+	MOVL	ECX, vallen		;Same length?
+	CMPL	ECX, ptr_length.B[EBX]
+	JNE	6$.S			;No
+	PUSHL	EBX			;Yes - is it the same name?
+	PUSHL	EDX
+	ADDL	EBX, #ptr_name.B
+	MOVL	EDX, #valbufr
+	CALL	comparedn
+	POPL	EDX
+	POPL	EBX
+	JE	12$.S			;Yes - we already have it
+6$:	MOVL	EDX, EBX		;No - advance to next block
+	JMP	4$.S
+
+;Here if don't have a pointer name block for this pointer name
+
+8$:	MOVL	EAX, vallen		;Allocate a pointer name block
+	ADDL	EAX, #ptr_name.B
+	CALL	getblock
+10$:	JC	14$.S			;If error
+	MOVL	EAX, time2lv		;OK - set up the block
+	MOVL	ptr_time2lv.B[EBX], EAX
+	CLRL	EAX
+	MOVL	ptr_resv.B[EBX], EAX
+	MOVL	[EBX], EAX
+	MOVL	ECX, vallen		;Store the mail name
+	MOVL	ptr_length.B[EBX], ECX
+	PUSHL	EDI
+	PUSHL	ESI
+	MOVL	ESI, #valbufr
+	LEAL	EDI, ptr_name.B[EBX]
+	PUSHL	DS
+	POPL	ES
+	CLD
+	RMOVSB	[EDI], [ESI]
+	POPL	ESI
+	POPL	EDI
+	MOVL	[EDX], EBX		;Link block to end of list
+12$:	POPL	EDX
+	INCL	numused
+	JMP	nxtresp
+
+;Here if error allocating the pointer name block
+
+14$:	POPL	EDX
+	HLT
+.page
+;Here for an MX record response - this record maps a domain name to another
+;  domain name which specifies a host which will accept mail for the requested
+;  domain name.
+
+mxrecord:
+	CMPL	datalen, #4t.B		;Data length must be at least 4
+	JB	badresp
+	CMPL	datalen, #257t		;And cannot be greater than 257
+	JA	badresp
+	MOVZWL	EAX, [EDX]		;Get the preference value
+	XCHGB	AL, AH
+	MOVL	pref, EAX
+	ADDL	EDX, #2t.B
+	SUBL	datalen, #2t.B
+	CALL	getrespvalue		;Get the mail name
+	JC	badresp
+	PUSHL	EDX
+	CALL	getdnblock		;Get a DN block for the domain name
+	JC	10$.S
+	LEAL	EDX, dn_mx.B[EBX]	;Point to pointer to first mail name
+					;  block
+4$:	MOVL	EBX, [EDX]		;Get offset of next mail name block
+	TESTL	EBX, EBX
+	JE	8$.S
+	MOVL	ECX, vallen		;Same length?
+	CMPL	ECX, mx_length.B[EBX]
+	JNE	6$.S			;No
+	PUSHL	EBX			;Yes - is it the same name?
+	PUSHL	EDX
+	ADDL	EBX, #mx_name.B
+	MOVL	EDX, #valbufr
+	CALL	comparedn
+	POPL	EDX
+	POPL	EBX
+	JE	12$.S			;Yes - we already have it
+6$:	MOVL	EDX, EBX		;No - advance to next block
+	JMP	4$.S
+
+;Here if don't have a mail name block for this mail name
+
+8$:	MOVL	EAX, vallen		;Allocate a mail name block
+	ADDL	EAX, #mx_name.B
+	CALL	getblock
+10$:	JC	14$.S			;If error
+	MOVL	EAX, time2lv		;OK - set up the block
+	MOVL	mx_time2lv.B[EBX], EAX
+	MOVL	EAX, pref
+	MOVL	mx_pref.B[EBX], EAX
+	CLRL	EAX
+	MOVL	[EBX], EAX
+	MOVL	ECX, vallen		;Store the mail name
+	MOVL	mx_length.B[EBX], ECX
+	PUSHL	EDI
+	PUSHL	ESI
+	MOVL	ESI, #valbufr
+	LEAL	EDI, mx_name.B[EBX]
+	PUSHL	DS
+	POPL	ES
+	CLD
+	RMOVSB	[EDI], [ESI]
+	POPL	ESI
+	POPL	EDI
+	MOVL	[EDX], EBX		;Link block to end of list
+12$:	POPL	EDX
+	INCL	numused
+	JMP	nxtresp
+
+;Here if error allocating the mail name block
+
+14$:	POPL	EDX
+	HLT
+.PAGE
+;Here with the response parsed.  Any CNAME records we found have been
+;  completely processed.  All other records have been copied to blocks
+;  on the DN record list or the NS record list.  We first cache all of the
+;  A and MX records we have received.  (We do not cache NS records.)
+
+parsed:	MOVL	EBX, rdb_dnhead[EDI]
+	TESTL	EBX, EBX
+	JE	20$
+2$:	CMPL	dn_ipa.B[EBX], #0.B	;Have any IP addresses defined?
+	JE	4$.S			;No
+	MOVL	EDX, dn_ipa.B[EBX]	;Yes - store them in the cache
+	MOVL	EAX, #IPSSF_ADDIPA
+	CALL	addtocache
+4$:	CMPL	dn_mx.B[EBX], #0.B	;Have any MX names defined?
+	JE	6$.S			;No
+	MOVL	EDX, dn_mx.B[EBX]	;Yes - store them in the cache
+	MOVL	EAX, #IPSSF_ADDMAIL
+	CALL	addtocache
+6$:	CMPL	dn_ptr.B[EBX], #0.B	;Have any PTR names defined?
+	JE	8$.S			;No
+	MOVL	EDX, dn_ptr.B[EBX]	;Yes - store them in the cache
+	MOVL	EAX, #IPSSF_ADDPTR
+	CALL	addtocache
+8$:	CMPB	rdb_haveans.B[EDI], #0	;Do we have an answer yet?
+	JNE	16$.S			;Yes - don't need to check this one
+	CMPB	rdb_type.B[EDI], #DNSREQ_A ;No - are we looking for an A record?
+	JNE	10$.S			;No
+	CMPL	dn_ipa.B[EBX], #0.B	;Yes - have any IP addresses
+	JNE	14$.S			;Yes
+	JMP	16$.S			;No
+
+10$:	CMPB	rdb_type.B[EDI], #DNSREQ_MX ;No - are we looking for an MX
+					    ;  record?
+	JNE	12$.S			;No
+	CMPL	dn_mx.B[EBX], #0.B	;Yes - have any MX records
+	JNE	14$.S
+	JMP	16$.S			;No
+
+12$:	CMPB	rdb_type.B[EDI], #DNSREQ_PTR ;Are we looking for a PTR record?
+	JNE	16$.S			;No
+	CMPL	dn_ptr.B[EBX], #0.B	;Yes - have any PTR records
+	JE	16$.S			;No
+14$:	MOVL	ECX, dn_length.B[EBX]	;Yes - is this the one we want?
+	CMPB	CL, rdb_dnlen.B[EDI]
+	JNE	16$.S			;No
+	PUSHL	EBX			;Maybe
+	ADDL	EBX, #dn_name.B
+	LEAL	EDX, rdb_message+dns_ques[EDI]
+	CALL	comparedn
+	POPL	EBX
+	JNE	16$.S			;No
+	MOVB	rdb_haveans.B[EDI], #1	;Yes - remember that
+16$:	MOVL	EBX, [EBX]
+	TESTL	EBX, EBX
+	JNE	2$
+	CMPB	rdb_haveans.B[EDI], #0	;Did we find our answer?
+	JE	20$.S			;No
+	CMPB	rdb_wakeup.B[EDI], #0	;Yes - was answer indirect (that is, did
+					;  we find a canonical name when looking
+					;  for an IP address)?
+	JE	18$.S			;No - all finished now
+	PUSHL	idb_ipshndl.B[ESI]	;Yes - we need to wake up the waiters
+	PUSHL	#IPSSF_WAKEIPA		;  here
+	PUSHL	DS
+	LEAL	EAX, rdb_reqname[EDI]
+	PUSHL	EAX
+	PUSHL	rdb_reqlen[EDI]
+	PUSHL	DS
+	PUSHL	#sdfparms
+	CALLF	svcIoSpecial##
+	TESTL	EAX, EAX
+	JNS	18$.S
+
+	NOP
+
+18$:	JMP	giverdb.S
+
+;Here if name was not found
+
+20$:	MOVL	EBX, rdb_nshead[EDI]	;Did we get any NS records?
+	TESTL	EBX, EBX
+	JNE	noans.S			;Yes
+	MOVL	EAX, #ER_NNNDF		;No - return name not defined error
+noname:	CLRL	EDX			;Assume error is name not defined
+	CMPL	EAX, #ER_NNNDF		;Right?
+	JE	22$.S			;Yes
+	INCL	EDX			;No
+22$:	MOVW	rdb_reqerrc[EDI], DX	;Store error code
+	MOVW	rdb_reqt2lv[EDI], #2	;Store time-to-live value (2 minutes)
+	PUSHL	idb_ipshndl.B[ESI]
+	PUSHL	#IPSSF_ERROR.B
+	PUSHL	DS
+	LEAL	EAX, rdb_reqt2lv[EDI]
+	PUSHL	EAX
+	MOVL	EAX, rdb_reqlen[EDI]
+	ADDL	EAX, #rdb_reqname-rdb_reqt2lv.B
+	PUSHL	EAX
+	PUSHL	DS
+	PUSHL	#sdfparms
+	CALLF	svcIoSpecial##
+	TESTL	EAX, EAX
+	JNS	giverdb.S
+
+	NOP
+
+giverdb:CMPL	rdb_udphndl.B[EDI], #0.B ;Is a UDP device open?
+	JE	24$.S			;No
+	PUSHL	rdb_udphndl.B[EDI]	;Yes - close it
+	PUSHL	#0.B
+	CALLF	thdIoClose#
+24$:	CALL	rmvrec			;Remove the record blocks
+	SUBL	EDI, ESI		;Get RDB slot number
+	SHRL	EDI, #13t
+	DECL	EDI
+	MOVL	EAX, idb_rdbfree.B[ESI]	;Put this RDB on the RDB free list
+	MOVW	idb_rdblist[ESI+EDI*2], AX
+	MOVL	idb_rdbfree.B[ESI], EDI
+	DECL	idb_rdbcnt.B[ESI]	;Decrease number of RDBs in use by this
+					;  instance
+	CALLF	thdCtlTerminate#	;Terminate the thread (this does not
+					;  return!)
+.PAGE
+;Here if we did not get the answer we need but did get at least one NS
+;  record.  We rebuild our server list from the NS records and do it all
+;  again!
+
+noans:	MOVL	rdb_srvlist.B[EDI], EBX
+	CLRL	EAX
+	MOVL	rdb_srvipa1.B[EDI], EAX
+	MOVL	rdb_srvipa2.B[EDI], EAX
+	MOVL	rdb_srvipa3.B[EDI], EAX
+	MOVL	rdb_srvipa4.B[EDI], EAX
+	MOVL	rdb_cursrv.B[EDI], EAX
+	MOVL	rdb_nshead[EDI], EAX
+	MOVL	rdb_nstail[EDI], EAX
+	CALL	rmvrec2
+	JMP	doreq
+.PAGE
+;Subroutine to find or allocate a DN block for a domain name
+;	c{EDI} = Offset of RDB
+;	c{ESI} = Offset of IDB
+;	CALL	getdnblock
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  c{EBX} = Offset of DN block
+
+getdnblock:
+	CMPL	rdb_dnhead[EDI], #0.B	;Have any DN blocks now?
+	JE	6$.S			;No - go on
+	MOVL	EBX, rdb_dnhead[EDI]	;Yes - see if we already have this one
+2$:	MOVL	ECX, dn_length.B[EBX]
+	CMPL	ECX, namelen
+	JNE	4$.S
+	PUSHL	EBX
+	PUSHL	EDX
+	ADDL	EBX, #dn_name.B
+	MOVL	EDX, #namebufr
+	CALL	comparedn
+	POPL	EDX
+	POPL	EBX
+	JE	12$.S			;If same - we found it
+4$:	MOVL	EBX, [EBX]		;Not this one - get next
+	TESTL	EBX, EBX
+	JNE	2$.S			;Continue if more to check
+6$:	MOVL	EAX, namelen		;Get space needed
+	ADDL	EAX, #dn_name.B
+	CALL	getblock
+	JC	12$.S			;If error
+	CLRL	EAX
+	MOVL	dn_ipa.B[EBX], EAX
+	MOVL	dn_mx.B[EBX], EAX
+	MOVL	dn_ptr.B[EBX], EAX
+	MOVL	ECX, namelen		;Store length of domain name
+	MOVL	dn_length.B[EBX], ECX
+	PUSHL	EDI			;Store the domain name
+	PUSHL	ESI
+	MOVL	ESI, #namebufr
+	LEAL	EDI, dn_name.B[EBX]
+	PUSHL	DS
+	POPL	ES
+	CLD
+	RMOVSB	[EDI], [ESI]
+	POPL	ESI
+	POPL	EDI
+	MOVL	EAX, rdb_dntail[EDI]	;Link the new block into the DN list
+	TESTL	EAX, EAX
+	JE	8$.S
+	MOVL	[EAX], EBX
+	JMP	10$.S
+
+8$:	MOVL	rdb_dnhead[EDI], EBX
+10$:	MOVL	rdb_dntail[EDI], EBX
+	MOVL	[EBX], #0
+12$:	RET
+.PAGE
+;Subroutine to store domain name in the question part of the DNS request
+;	c{EAX} = Offset of domain name
+;	c{ECX} = Length of domain name
+;	CALL	storeques
+
+storeques:
+	MOVB	rdb_dnlen.B[EDI], CL
+	PUSHL	EDI
+	PUSHL	ESI
+	MOVL	ESI, EAX		;Store domain name
+	ADDL	EDI, #rdb_message+dns_ques
+	PUSHL	DS
+	POPL	ES
+	CLD
+	RMOVSB	[EDI], [ESI]
+	MOVL	ECX, EDI
+	POPL	ESI
+	POPL	EDI
+	MOVL	EAX, rdb_type.B[EDI]	;Get the internal request type
+	MOVL	EAX, reqtbl-4[EAX*4]	;Get corresponding DNS value
+	MOVL	[ECX], EAX		;Store in message
+	SUBL	ECX, #rdb_message-4	;Calculate length of message
+	SUBL	ECX, EDI
+	MOVL	rdb_length.B[EDI], ECX
+	RET
+.PAGE
+
+getrespvalue:
+	MOVL	EBX, #valbufr
+	MOVL	nametop, #valbufr+256t
+	CALL	getrspd
+	JC	4$.S
+	SUBL	EBX, #valbufr-1
+	MOVL	vallen, EBX
+4$:	RET
+
+;Subroutine to get a domain name from a response message
+;	c{EDX} = Offset of first byte of name
+;	CALL	getrespdname
+;	C:set = Error
+;	C:clr = Normal
+;	  c{EAX} = Type and class values
+;	  c{EDX} = Offset of first byte after name, type, and class
+
+getrespdname:
+	MOVL	EBX, #namebufr
+	MOVL	nametop, #namebufr+256t
+	CALL	getrspd
+	JC	4$.S
+	SUBL	EBX, #namebufr-1
+	MOVL	namelen, EBX
+	ADDL	EDX, #4t.B
+	CMPL	msgtop, EDX
+	JB	10$.S
+	MOVL	EAX, -4.B[EDX]
+	RET
+
+getrspd:CMPL	msgtop, EDX		;Beyond end of message?
+	JBE	10$.S			;Yes - fail
+	MOVZBL	ECX, [EDX]		;No - get count
+	INCL	EDX
+	TESTB	CL, #0C0h		;Is this a pointer?
+	JNE	8$.S			;Yes
+	CMPL	EBX, nametop		;No - is the name too long?
+	JAE	10$.S			;Yes - fail
+	MOVB	[EBX], CL		;No - store count in name buffer
+	TESTL	ECX, ECX		;End of domain name?
+	JE	4$.S			;Yes
+	INCL	EBX			;No
+6$:	CMPL	msgtop, EDX		;Beyond end of message?
+	JBE	10$.S			;Yes - fail
+	MOVB	AL, [EDX]		;No - get character
+	INCL	EDX
+	CMPL	EBX, nametop		;Is the name too long?
+	JAE	10$.S			;Yes - fail
+	MOVB	[EBX], AL		;No - store character in name buffer
+	INCL	EBX
+	LOOP	ECX, 6$			;Continue if more in label
+	JMP	getrspd.S		;Start another label
+
+;Here if have a pointer
+
+8$:	MOVZBL	EAX, CL			;Make sure valid pointer
+	ANDB	AL, #0C0h
+	CMPB	AL, #0C0h
+	JNE	10$.S			;If error
+	ANDB	CL, #3Fh
+	MOVB	AH, CL
+	CMPL	msgtop, EDX
+	JBE	10$.S
+	MOVB	AL, [EDX]
+	INCL	EDX
+	PUSHL	EDX
+	LEAL	EDX, rdb_rspbufr[EDI+EAX]
+	CALL	getrspd
+	POPL	EDX
+	RET
+
+;Here if error (bad format message)
+
+10$:	STC
+	RET
+.PAGE
+;Subroutine to add data to the cache
+;	c{EAX} = Function
+;	c{EBX} = Offset of DN record block
+;	c{EDX} = Offset of first A or MX record block
+;	CALL	addtocache
+
+addtocache:
+	MOVL	dn_pntr.B[EBX], EDX
+	PUSHL	idb_ipshndl.B[ESI]
+	PUSHL	EAX
+	PUSHL	DS
+	LEAL	EAX, dn_pntr.B[EBX]
+	PUSHL	EAX
+	MOVL	EAX, dn_length.B[EBX]
+	ADDL	EAX, #dn_name-dn_pntr.B
+	PUSHL	EAX
+	PUSHL	DS
+	PUSHL	#sdfparms
+	CALLF	svcIoSpecial##
+	TESTL	EAX, EAX
+	JNS	12$.S
+
+	NOP
+
+12$:	RET
+.PAGE
+;Subroutine to do case-insensitive compare of domain names
+;	c{EBX} = Offset of first domain name string
+;	c{ECX} = Length of both domain names
+;	c{EDX} = Offset of second domain name string
+;	CALL	comparedn
+;	Z:set = Names are the same
+;	Z:clr = Names are different
+
+comparedn:
+	MOVB	AL, [EBX]
+	XORB	AL, [EDX]
+	JNE	6$.S
+2$:	INCL	EBX
+	INCL	EDX
+	LOOP	ECX, comparedn
+	CLRL	EAX			;Same - return with Z set
+4$:	RET
+
+;Here if bytes are not identical
+
+6$:	TESTB	AL, #~20h		;Is only difference the case bit?
+	JNE	4$.S			;No - not same
+	MOVB	AL, [EBX]		;Yes - is it a letter?
+	ANDB	AL, #~20h
+	CMPB	AL, 'A'
+	JB	4$.S			;No
+	CMPB	AL, 'Z'			;Maybe
+	JBE	2$.S			;Yes - continue checking
+	RET				;No
+.PAGE
+;Subroutine to give up all record blocks
+;	CALL	rmvrec
+
+rmvrec:	MOVL	EBX, rdb_nshead[EDI]	;Have any NS record blocks?
+	TESTL	EBX, EBX
+	JE	rmvrec2.S		;No
+2$:	PUSHL	[EBX]			;Yes - give them up
+	CALL	giveblock
+	POPL	EBX
+	TESTL	EBX, EBX
+	JNE	2$.S
+	CLRL	EAX
+	MOVL	rdb_nshead[EDI], EAX
+	MOVL	rdb_nstail[EDI], EAX
+rmvrec2:MOVL	EBX, rdb_dnhead.B[EDI]	;Have any DN record blocks?
+	TESTL	EBX, EBX
+	JE	14$.S			;No
+4$:	CMPL	dn_ipa.B[EBX], #0.B	;Have any A blocks?
+	JE	8$.S			;No
+	PUSHL	EBX			;Yes - give them up
+	MOVL	EBX, dn_ipa.B[EBX]
+6$:	PUSHL	[EBX]
+	CALL	giveblock
+	POPL	EBX
+	TESTL	EBX, EBX
+	JNE	6$.S	
+	POPL	EBX
+8$:	CMPL	dn_mx.B[EBX], #0.B	;Have any MX blocks?
+	JE	12$.S			;No
+	PUSHL	EBX			;Yes - give them up
+	MOVL	EBX, dn_mx.B[EBX]
+10$:	PUSHL	[EBX]
+	CALL	giveblock
+	POPL	EBX
+	TESTL	EBX, EBX
+	JNE	10$.S	
+	POPL	EBX
+12$:	PUSHL	[EBX]			;Give up the DN blocks
+	CALL	giveblock
+	POPL	EBX
+	TESTL	EBX, EBX
+	JNE	12$.S
+	CLRL	EAX
+	MOVL	rdb_dnhead[EDI], EAX
+	MOVL	rdb_dntail[EDI], EAX
+14$:	RET
+.PAGE
+;Subroutine to allocate a record block
+;	c{EAX} = Size for block
+;	CALL	getblock
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  c{EBX} = Offset of block allocated
+
+getblock:
+	PUSHL	ECX
+	PUSHL	EDX
+	PUSHL	EAX
+	CALL	malloc#
+	ADDL	ESP, #4t.B
+	TESTL	EAX, EAX
+	JE	4$.S
+	MOVL	EBX, EAX
+	POPL	EDX
+	POPL	ECX
+	RET
+
+;Here if error
+
+4$:	MOVL	EAX, errno#
+	NEGL	EAX
+	STC
+	RET
+
+;Subroutine to give up a record block
+;	c{EBX} = Offset of block
+;	CALL	giveblock
+
+giveblock:
+	PUSHL	EBX
+	CALL	free#
+	POPL	EAX
+	RET
+.PAGE
+	.SBTTL	Debug routines
+
+;Subroutine to convert domain name to period format for debug logging
+
+convdname:
+	MOVL	EDX, #valbufr
+	CMPB	[EBX], #0
+	JNE	2$.S
+	MOVL	[EDX], #'** r'
+	MOVL	4.B[EDX], #'oot '
+	MOVL	8.B[EDX], #'**'
+	RET
+
+2$:	MOVZBL	ECX, [EBX]
+	JREGZ	ECX, 6$
+	INCL	EBX
+4$:	MOVB	AL, [EBX]
+	INCL	EBX
+	MOVB	[EDX], AL
+	INCL	EDX
+	LOOP	ECX, 4$
+	MOVB	[EDX], #'.'
+	INCL	EDX
+	JMP	2$.S
+
+6$:	MOVB	-1.B[EDX], #0
+	RET
+.PAGE
+;Subroutine to dump a message for debug logging
+
+dumpresp::
+	PUSHAL
+	MOVL	dmpcnt1, EAX
+	PUSHL	EAX
+	PUSHL	#dmpfmt1
+	PUSHL	#dbgbufr
+	CALL	sprintf#
+	ADDL	ESP, #12t.B
+	CALL	debugoutb
+	ADDL	EDI, #rdb_rspbufr
+	MOVL	dmpcnt2, #16t
+	MOVL	ESI, #dmpbfr
+	PUSHL	#_stdout#
+	PUSHL	#dmpbgn
+	CALL	fputs#
+	ADDL	ESP, #8t.B
+4$:	MOVZBL	EAX, [EDI]
+	INCL	EDI
+	PUSHL	EAX
+	CMPB	AL, #20h
+	JB	6$.S
+	CMPB	AL, #7Eh
+	JB	8$.S
+6$:	MOVB	AL, #'.'
+8$:	MOVB	[ESI], AL
+	INCL	ESI
+	PUSHL	#dmpfmt2
+	PUSHL	srvDebugStream#
+	CALL	fprintf#
+	ADDL	ESP, #12t.B
+	DECL	dmpcnt2
+	JNE	10$.S
+	MOVL	dmpcnt2, #16t
+	MOVB	[ESI], #0
+	MOVL	ESI, #dmpbfr
+	PUSHL	#dmpbfr
+	PUSHL	#dmpfmt3
+	PUSHL	srvDebugStream#
+	CALL	fprintf#
+	ADDL	ESP, #12t.B
+10$:	DECL	dmpcnt1
+	JNE	4$.S
+	MOVB	[ESI], #0
+	PUSHL	#dmpnull
+	MOVL	EAX, dmpcnt2
+	PUSHL	EAX
+	PUSHL	#dmpbfr
+	PUSHL	#dmpnull
+	IMULL	EAX, #3t.B
+	PUSHL	EAX
+	PUSHL	#dmpfmt4
+	PUSHL	srvDebugStream#
+	CALL	fprintf#
+	ADDL	ESP, #28t.B
+	POPAL
+	RET
+
+dmpfmt1:.ASCIZ	"Response: %d"
+dmpfmt2:.ASCIZ	" %02.2X"
+dmpfmt3:.ASCII  "  |%s|"{LF}
+dmpbgn:	.ASCIZ	"   "
+dmpfmt4:.ASCII	"%*s  |%s%*s|"{LF}
+dmpnull:.BYTE	0
+.PAGE
+;Subroutine to output a debug log message with a time-stamp
+;	c{EBX} = Offset of message buffer
+;	CALL	debugout
+
+debugoutb:
+	MOVL	EBX, #dbgbufr
+debugout:
+	PUSHL	EBX
+	PUSHL	#1.B
+	PUSHL	DS
+	PUSHL	#dbgcdt
+	CALLF	svcSysDateTime##
+	PUSHL	#dbgcdt
+	PUSHL	#fmtcdt
+	PUSHL	#bfrcdt
+	CALL	sdt2str#
+	ADDL	ESP, #12t.B
+	PUSHL	#bfrcdt
+	PUSHL	#fmtdbg
+	PUSHL	srvDebugStream#
+	CALL	fprintf#
+	ADDL	ESP, #16t.B
+	RET
+
+fmtcdt:	.ASCIZ	"%h:%m:%s.%3f"
+fmtdbg:	.ASCIZ	"%s  %s"{LF}
+.PAGE
+	.SBTTL	Data
+
+	.MACRO	BAN MAJVER, MINVER, EDITNUM
+	.ASCII	{MT_INTRMDMSG}"ACCTSRV: Version MAJVER"".""MINVER"".""EDITNUM"
+	.ENDM
+banfmt1:BAN	>MAJVER, >MINVER, >EDITNUM	
+	.ASCIZ	", Unit %d"
+banfmt2:BAN	>MAJVER, >MINVER, >EDITNUM	
+	.ASCIZ	", Unit %d, Instance %d"
+noismsg:.ASCIZ	{MT_FINALERR}"? DNSRSLV: No instance specified"
+noixmsg:.ASCIZ	{MT_FINALERR}"? DNSRSLV: Specified instance does not exist"
+bdimsg:	.ASCIZ	"Invalid instance number"
+iiufmt:	.ASCIZ	"Instance %d already exists"
+oermsg:	.ASCIZ	"Error opening IPM device"
+oeumsg: .ASCIZ	"Error opening UDP device"
+seimsg: .ASCIZ	"Error initializing DNS database"
+unemsg:	.ASCIZ	"Error getting IPS device name"
+oeimsg:	.ASCIZ	"Error opening corresponding IPS device"
+nrermsg:.ASCIZ	"Device specified for the UDP device is not a UDP device"
+okfmt:	.ASCII	{MT_FINALMSG}"DNSRSLV: Instance %d created using device %s, "
+	.ASCIZ	"port %d"
+nodvmsg:.ASCIZ	"No device specified for ADD command"
+upemsg: .ASCIZ	"Error setting local UDP port"
+
+erupmsg:.ASCIZ	"Error receiving UDP DNS packet"
+esupmsg:.ASCIZ	"Error sending UDP DNS request"
+
+tdimsg:	.ASCIZ	"Error creating thread for instance"
+rmvmsg:	.ASCIZ	{MT_FINALERR}"? ACCTSRV: REMOVE command not implemented yet!"
+stsmsg:	.ASCIZ	{MT_FINALERR}"? ACCTSRV: STATUS command not implemented yet!"
+fmtipm:	.ASCIZ	"_IPM:SYS^DNSRSLV^%d^%d"
+
+
+svnfmt:	.ASCIZ	"Resolving address for server: %s"
+svifmt: .ASCIZ	"Server IP address: (%d) %d.%d.%d.%d"
+sndfmt: .ASCIZ	"Sending req to: %d.%d.%d.%d"
+reqfmt:	.ASCIZ	"Request: (%02.2X) %s"
+
+srvname::
+prgname::.ASCIZ "DNSRSLV"
+mltdvmsg:.ASCIZ "More than one device specified"
+bdspmsg: .ASCIZ "Bad format device name specified"
+
+	.MOD	4
+reqtbl:	.LONG	01000100h	;DNSREQ_A     = 1 - IP address request
+	.LONG	01000500h	;DNSREQ_CNAME = 2 - CNAME request
+	.LONG	01000F00h	;DNSREQ_MX    = 3 - MX request
+	.LONG	01000C00h	;DNSREQ_PTR   = 4 - PTR request
+
+sdftbl:	.BYTE	IPSSF_ADDIPA	;DNSREQ_A     = 1 - IP address request
+	.BYTE	IPSSF_ADDCNAME	;DNSREQ_CNAME = 2 - CNAME request
+	.BYTE	IPSSF_ADDMAIL	;DNSREQ_MX    = 3 - MX request
+	.BYTE	IPSSF_ADDPTR	;DNSREQ_PTR   = 4 - PTR request
+
+errtbl:	.LONG	ER_NNSRS	;     Illegal network name server response
+				;	format
+	.LONG	ER_NNSRQ	; 1 = Illegal network name server request
+				;	format
+	.LONG	ER_NNSER	; 2 = Network name server error
+	.LONG	ER_NNNDF	; 3 = Network name not defined
+	.LONG	ER_NNSNC	; 4 = Network name server not capable
+	.LONG	ER_NNSRF	; 5 = Network name server refused request
+
+	.PSECT	_DATA_p
+
+	 .MOD	4
+
+instance:.LONG	0
+cmdpntr: .LONG	0, 0
+instx:	 .LONG	0		;Instance existance bit table
+firstidb:.LONG  0		;Offset of first IDB
+lastidb: .LONG  firstidb-idb_next
+udphndl: .LONG  0
+udpname: .BLKB  20t
+ipmhndl: .LONG  0
+ipshndl: .LONG  0
+ipsname: .BYTE  '_'
+	 .BLKB  19t
+ipmlen:  .LONG  0
+maximum: .LONG  0
+requests:.LONG  0
+port:    .LONG  0
+zonefile:.LONG  0
+srvipa:	 .LONG  0, 0, 0, 0
+havethd: .LONG  0
+dnslen:  .LONG  0
+msgtop:  .LONG  0
+nametop: .LONG  0
+pref:    .LONG  0
+datalen: .LONG  0
+numresp: .LONG  0
+numused: .LONG  0
+resptype:.LONG  0
+namelen: .LONG  0
+
+cnargs:  .LONG  cnvalue
+namebufr:.BLKB  256t
+
+nullname:.LONG	0
+	 .LONG  2
+	 .LONG  0
+	 .LONG  0
+
+cnvalue: .LONG  0
+time2lv: .LONG  0
+	 .LONG  0
+vallen:  .LONG  0
+valbufr: .BLKB  256t
+
+	.MOD	4
+phyname:.BLKB	32t
+
+	.MOD	4
+openparms:
+	.BYTE	PAR$GET|REP_TEXT, 8 ;Parameters for initial check of RCP
+	.WORD	IOPAR_CLASS	    ;   device
+devclass:
+	.BLKB	8t
+	.BYTE	PAR$SET|REP_HEXV, 4
+	.WORD	IOPAR_FILOPTN
+	.LONG	FO$XOSNAME
+	.BYTE	PAR$GET|REP_STR, 0
+	.WORD	IOPAR_FILSPEC
+	.LONG	phyname
+	.LONG	!phyname
+	.WORD	12t
+phylength:
+	.WORD	0
+	.BYTE	0
+
+	.MOD	4
+ipsnchars:
+	.BYTE	PAR$GET|REP_TEXT, 16t
+	.ASCII	"IPSDEV"{0, 0}
+ipsnam:	.BLKB	16t
+	.BYTE	0
+
+	.MOD	4
+sdfparms:
+	.BYTE	PAR$SET|REP_TEXT, 4
+	.WORD	IOPAR_CLASS
+	.ASCII	"IPS"{0}
+	.BYTE	0	
+
+	.MOD	4
+filespec:.BLKB	514t
+
+	.MOD	4
+sendparms:
+	.BYTE	PAR$SET|REP_HEXV, 4
+	.WORD	IOPAR_NETRMTNETAS
+sendipa:.LONG	0
+	.BYTE	PAR$SET|REP_HEXV, 4
+	.WORD	IOPAR_NETRMTPORTS
+sendport:
+	.LONG	0
+	.BYTE	PAR$SET|REP_HEXV, 4
+	.WORD	IOPAR_TIMEOUT
+	.LONG	2*XT_SECOND
+	.BYTE	0
+
+	.MOD	4
+respparms:
+	.BYTE	PAR$SET|REP_HEXV, 4
+	.WORD	IOPAR_TIMEOUT
+	.LONG	4*XT_SECOND
+	.BYTE	0
+
+	.MOD	4
+udpbufr:.BLKB	16t
+msgbufr:.BLKB	160t
+dbgbufr:.BLKB	100t		;Debug message buffer
+bfrcdt: .BLKB   20t
+dbgcdt: .BLKL   2t
+
+dmpcnt1:.LONG	0
+dmpcnt2:.LONG	0
+dmpbfr:	.BLKB	20t
+
+
+	.END

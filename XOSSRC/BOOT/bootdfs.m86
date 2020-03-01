@@ -1,0 +1,924 @@
+	.TITLE	BOOTDFS
+
+;++++
+; This software is in the public domain.  It may be freely copied and used
+; for whatever purpose you see fit, including commerical uses.  Anyone
+; modifying this software may claim ownership of the modifications, but not
+; the complete derived code.  It would be appreciated if the authors were
+; told what this software is being used for, but this is not a requirement.
+
+;   THIS SOFTWARE IS PROVIDED BY THE AUTHORS "AS IS" AND ANY EXPRESS OR
+;   IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
+;   OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+;   IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+;   INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+;   BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS
+;   OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+;   ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR
+;   TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
+;   USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+;----
+
+	.INCLUD	XOSINC:\XMAC\XOS.PAR
+	.INCLUD	XOSINC:\XMAC\XOSX.PAR
+	.INCLUD	XOSINC:\XMAC\XOSRUN.PAR
+	.INCLUD	XOSINC:\XMAC\XOSXDISK.PAR
+	.INCLUD	XOSINC:\XMAC\XOSXDFS.PAR
+	.INCLUD	BOOT.PAR
+
+	.PROC	80386
+	.STK16
+
+	.SEG	fat_s, DATA, READ, WRITE, 16BIT
+	.MSECT	fat_m, fat_s, ADDR=0h
+	.PSECT	fat_p, fat_m
+
+;This module provides read-only access to a DOS file system.  Both 12-bit and
+;  16-bit FATs are supported.  It resides at the top of base memory and is
+;  accessed using INT 0B1h with a function in AH.
+
+; SEARCH:	c(AH)    = 1
+;		c(AL)    = Attribute byte for search
+;		c[ES:SI] = Address of name string
+;	The current open directory is searched for the file or directory
+;	specified and that file or directory is opened.  Directory trees must
+;	be searched one level at a time.  A null name string opens the root
+;	directory.
+
+; READ:		c(AH)    = 2
+;		c[ES:SI] = Address of buffer
+;		c[CX]    = Number of bytes to read
+
+; SEEK:		c(AH)  = 3
+;		c(AL)  = Mode, 0 = absolute, 1 = relative
+;		c{EDX} = New position in file
+
+; ERRMSG:	c(AH)    = 4
+;		c(AL)    = Error code
+;		c[ES:BX] = Address of buffer
+
+;  Note that this is a VERY simple API.  Only ONE file may be open at a time
+;  and there is no close function.  Different files can be opened sequentially.
+;  These functions are intended to provide the services needed for the XOS
+;  bootstrap and the ALLEGRO real-mode once-only routines.  This routine is loaded
+;  as part of the bootstrap but it remains in memory for use by the ALLEGRO real-
+;  mode once-only code.  It is overwritten by the protected mode once-only
+;  routine.  As much of the initialization (such as reading partition tables
+;  and boot blocks) is done by the bootstrap itself so that this does not take
+;  up space during once-only time.
+
+$$$=!endcommon
+BLK namebfr , 12t	;Buffer for name being searched for
+BLK dkfbyte , 4t	;Current position in file (bytes in file)
+BLK dkfpos  , 4t	;Position in file (block on disk)
+BLK dkfamnt , 4t	;Amount available at current position (blocks)
+BLK dkfbpos , 4t	;Position of beginning of file (block on disk)
+BLK dkfbamnt, 4t	;Amount available at beginning of file (blocks)
+BLK dkfclus , 4t	;Last cluster in current piece of file
+BLK dkfsize , 4t	;Size of file (bytes)
+BLK dkfbblk , 4t	;Block in file in buffer
+BLK curfat  , 4t
+
+DFSDATAWORDS==!{$$$+1}/2
+DFSDATAPAGES==!{$$$+15t}/16t
+
+reg_FR =!40t
+reg_CS =!38t
+reg_IP =!36t
+reg_EAX=!32t
+reg_ECX=!28t
+reg_EDX=!24t
+reg_EBX=!20t
+reg_ESP=!16t
+reg_EBP=!12t
+reg_ESI=!8t
+reg_EDI=!4t
+reg_ES =!2t
+reg_DS =!0t
+
+	.SBTTL	entry - Main entry point
+
+dfscode::!
+
+;The following code is moved to the top of memory such that the offset of the
+;  first location following in its segment is 0
+
+entry:	PUSHAL				;Save all registers
+	PUSHW	ES
+	PUSHW	DS
+	MOVW	BP, SP			;Set up a stack frame
+	ANDB	reg_FR.B[BP], #~01
+selfix==!$+1
+	PUSHW	#0			;This is set when the code is copied
+	POPW	DS
+	CMPB	AH, #4
+	JBE	2$.S
+	CLRW	AX
+2$:	MOVB	BL, AH
+	MOVB	BH, #0
+	ADDW	BX, BX
+	CALLI	CS:dsptbl[BX]
+	JNC	4$.S
+	ORB	reg_FR.B[BP], #01
+	MOVW	reg_EAX.B[BP], AX
+4$:	POPW	DS
+	POPW	ES
+	POPAL
+	IRET
+
+	.MOD	2
+dsptbl:	.WORD	badfunc		;	   = 0 - Illegal
+	.WORD	search		;BF_SEARCH = 1 - Search directory
+	.WORD	read		;BF_READ   = 2 - Read data
+	.WORD	seek		;BF_SEEK   = 3 - Set position for read
+	.WORD	errmsg		;BF_ERRMSG = 4 - Get error message
+
+badfunc:MOVW	AX, #BER_FUNC
+	STC
+	RET
+.PAGE
+	.SBTTL	search - Function to search for file in directory
+
+;Function to search for file in directory
+;	c(AL)    = Attributes for search
+;	c(AH)    = BF_SEARCH
+;	c[ES:SI] = Address of name string
+;	INT	0B1h
+;	C:set = Error (not found)
+;	  c[AX] = Error code
+;	C:clr = Normal
+;	  c{EAX} = Length of file
+
+search:	CMPB	ES:[SI], #0		;Want to open root directory?
+	JNE	2$.S			;No - go on
+	MOVL	curfat, #-1		;Yes - force re-read of FATs
+	MOVL	EAX, rootpos
+	CMPB	fattype, #32t		;Have 32-bit FATs?	
+	JE	22$			;Yes - go open the 32-bit root
+	MOVL	dkfpos, EAX		;No
+	MOVW	AX, rootblks
+	MOVW	dkfamnt, AX
+	CLC
+	RET
+
+;Here if not opening the root directory - first set up the name of the
+;  file in the same format used in the directories
+
+2$:	MOVW	DI, #namebfr		;Point to buffer to hold name
+	MOVL	EAX, #'    '		;Initialize the buffer to spaces
+	MOVL	[DI], EAX
+	MOVL	4.B[DI], EAX
+	MOVL	8.B[DI], EAX
+	MOVB	AL, reg_EAX+0.B[BP]	;Put in the attribute byte
+	ANDB	AL, #7Fh
+	MOVB	11t.B[DI], AL
+	MOVW	CX, #8			;Name can be up to 8 characters
+4$:	MOVB	AL, ES:[SI]		;Get name character
+	CMPB	AL, #0			;End?
+	JE	nxdblk.S		;Yes
+	INCW	SI			;No
+	CMPB	AL, #'.'		;Start of extension?
+	JE	8$.S			;Yes
+	DECW	CX			;No - room for more?
+	JS	6$.S			;No - fail
+	MOVB	[DI], AL		;Yes - store character
+	INCW	DI			;Bump pointer
+	JMP	4$.S			;Continue
+
+;Here if have bad file specification
+
+6$:	MOVW	AX, #BER_BDFSPC
+	STC
+	RET
+
+;Here at start of extension
+
+8$:	MOVW	DI, #namebfr+8		;Point to place to put extension
+	MOVW	CX, #3			;Extension can be up to 3 characters
+10$:	MOVB	AL, ES:[SI]		;Get character
+	CMPB	AL, #0			;End
+	JE	nxdblk.S		;Yes
+	CMPB	AL, #'.'		;No - period?
+	JE	6$.S			;Yes - fail
+	INCW	SI			;OK - bump pointer
+	DECW	CX			;Room for more?
+	JS	6$.S			;No - fail
+	MOVB	[DI], AL		;Yes - store character
+	INCW	DI			;Bump pointer
+	JMP	10$.S			;Continue
+
+;Here at end of file specification
+
+nxdblk:	PUSHW	DS
+	POPW	ES
+	MOVW	BX, #buffer
+	MOVW	CX, #1
+	CALL	readblks		;Read next block in directory
+	JNC	16$.S			;Go on if OK
+	CMPB	AL, #BER_EOF		;Error - end of file?
+	JNE	14$.S
+12$:	MOVW	AX, #BER_FDNFND		;Yes - change to file or directory
+14$:	STC				;  not found
+	RET
+
+;Here with good read of the next directory block
+
+16$:	MOVW	BX, #buffer		;Initialize offset in block
+	MOVW	CX, #16t		;Get number of entries left
+nxdent:	CMPB	[BX], #0		;Is this the end of the directory?
+	JE	12$.S			;Yes
+	CMPB	[BX], #0E5h		;No - is this slot in use?
+	JE	advent.S		;No - go on
+	ANDB	de_attrib.B[BX], #10h	;Remove all attributes except DIR
+	MOVW	DI, #namebfr
+	PUSHW	DS
+	POPW	ES
+	MOVW	SI, BX
+	CLD
+	PUSHW	CX
+	MOVW	CX, #6
+	RECMPSW	[DI], [SI]
+	POPW	CX
+	JE	found.S			;If this is it
+advent:	ADDW	BX, #32t.B		;Bump to next entry
+	DECW	CX			;More to check?
+	JNE	nxdent.S		;Yes - continue with this block
+	JMP	nxdblk.S		;No - go get next block
+
+;Here with file found
+
+found:	MOVL	EAX, de_size.B[BX]	;Store size of file
+	MOVL	dkfsize, EAX
+	MOVL	reg_EAX.B[BP], EAX	;Also return it in EAX
+	CLRL	EAX
+	CMPB	fattype, #32t		;Have 32-bit FATs?
+	JNE	20$.S			;No
+	MOVW	AX, de_pntrhi.B[BX]	;Yes - get high 16 bits of cluster
+	SHLL	EAX, #16t
+20$:	MOVW	AX, de_pntr.B[BX]	;Get low 16 bits of cluster number
+22$:	CALL	setupread		;Setup to access this piece of the file
+	MOVL	EAX, dkfpos		;Remember beginning of file
+	MOVL	dkfbpos, EAX
+	MOVW	AX, dkfamnt
+	MOVW	dkfbamnt, AX
+	MOVL	dkfbyte, #0		;Reset relative position in file
+	MOVW	dkfbblk, #0FFFFh	;Nothing in buffer now
+	CLC				;Indicate success
+	RET				;All done
+.PAGE
+	.SBTTL	read - Function to read bytes from the disk
+
+;Function to read bytes from the disk
+;	c(AH)    = BF_READ
+;	c[CX]    = Number of bytes to read
+;	c[ES:SI] = Address of buffer
+;	INT	0B1h
+;	C:set = Error
+;	  c[AX] = Error code
+;	C:clr = Normal
+
+$$$=!2
+FRX rby_ttlleft, 2
+FRX rby_left   , 2
+FRX rby_xfraddr, 4
+rby_SIZE=!$$$
+
+read:	CMPL	dkfsize, #0.B		;Do we know the file size?
+	JE	2$.S			;No - go on
+	MOVZWL	EAX, CX			;Yes - make sure not going past EOF
+	ADDL	EAX, dkfbyte
+	CMPL	EAX, dkfsize
+	JBE	2$.S			;OK
+	MOVW	AX, #BER_EOF		;EOF
+	STC
+	RET
+
+;Here if have enough left in file to satisfy this request
+
+2$:	SUBW	SP, #rby_SIZE-2.B
+	MOVW	rby_ttlleft.B[BP], CX	;Store amount wanted
+	MOVW	rby_xfraddr+0.B[BP], SI	;Store address
+	MOVW	rby_xfraddr+2.B[BP], ES
+	MOVW	AX, dkfbyte+0		;Get amount needed to get to end of
+	ANDW	AX, #1FFh		;  current block
+	JE	6$.S			;If at end of block now
+	MOVW	CX, #512t
+	SUBW	CX, AX
+	CMPW	CX, rby_ttlleft.B[BP]	;Do we want this much?
+	JBE	4$.S			;Yes
+	MOVW	CX, rby_ttlleft.B[BP]	;No
+4$:	JREGZ	CX, 6$
+	CALL	readbfrd		;Do buffered read for this amount
+	JC	12$.S			;If error
+6$:	CMPW	rby_ttlleft.B[BP], #512t ;Have 1 or more blocks to read now?
+	JB	8$.S			;No
+	MOVW	AX, rby_ttlleft.B[BP]	;Yes - get number of blocks to read
+	LESW	BX, rby_xfraddr.B[BP]	;Get address
+	ANDW	AX, #0FE00h
+	ADDW	rby_xfraddr+0.B[BP], AX
+	SUBW	rby_ttlleft.B[BP], AX
+	ADDW	dkfbyte+0, AX
+	ADCW	dkfbyte+2, #0.B
+	SHRW	AX, #9
+	MOVW	CX, AX
+	CALL	readblks
+	JC	12$.S			;If error
+8$:	MOVW	CX, rby_ttlleft.B[BP]
+	JREGZ	CX, 10$
+	CALL	readbfrd
+	JC	12$.S			;If error
+10$:	ADDW	SP, #rby_SIZE-2.B
+	RET
+
+;Here if error
+
+12$:	ADDW	SP, #rby_SIZE-2.B
+	STC
+ret004:	RET
+.PAGE
+	.SBTTL	seek - Function to set position for next read
+
+;Function to set position for next call to readbytes
+;	c(AL)  = Mode: 0 = absolute, 1 = relative
+;	c(AH)  = BF_SEEK
+;	c{EDX} = Byte position in file
+;	INT	0B1h
+;	C:set = Error
+;	  c[AX] = Error code
+;	C:clr = Normal
+
+seek:	CMPB	reg_EAX+0.B[BP], #0	;Want absolute position?
+	JNE	2$.S			;Yes
+	SUBL	EDX, dkfbyte		;Yes - get amount to skip
+2$:	TESTL	EDX, EDX		;Anything to do?
+	JE	ret004.S		;No - finished
+	JNS	4$.S			;Go on if advancing
+	ADDL	EDX, dkfbyte		;Backing up - restore absolute position
+	PUSHL	dkfbpos			;Position to beginning of file
+	POPL	dkfpos
+	PUSHW	dkfbamnt
+	POPW	dkfamnt
+	MOVL	dkfbyte, #0
+	MOVW	dkfbblk, #0FFFFh
+4$:	PUSHL	EDX
+	MOVL	EAX, EDX
+	MOVW	CX, dkfbyte		;Get whole blocks to advance
+	ANDL	ECX, #1FFh
+	ADDL	EAX, ECX
+	MOVL	ECX, #512t
+	CLRL	EDX
+	DIVL	ECX
+6$:	TESTL	EAX, EAX		;Are we there?
+	JE	10$.S			;Yes
+	CMPL	EAX, dkfamnt		;No - need to advance beyond this group?
+	JB	8$.S			;No
+	MOVL	ECX, dkfamnt		;Yes - advance to end of group
+	ADDL	dkfpos, ECX
+	SUBL	EAX, dkfamnt
+	MOVL	dkfamnt, #0
+	PUSHL	EAX
+	MOVL	EAX, dkfclus		;Get last cluster read
+	TESTL	EAX, EAX		;Anything left?
+	JE	14$.S			;No - fail
+	PUSHW	SI
+	PUSHW	DI
+	CALL	getnextclus		;Yes - get next cluster in file
+	JC	12$.S			;If error
+	CALL	setupread		;Setup to read this piece
+	POPW	DI
+	POPW	SI
+	POPL	EAX
+	JMP	6$.S
+
+;Here to advance within the current group
+
+8$:	SUBW	dkfamnt, AX
+	ADDW	dkfpos, AX
+10$:	POPL	EAX
+	ADDL	dkfbyte, EAX
+	RET
+
+;Here if error reading the FATs
+
+12$:	POPW	DI
+	POPW	SI
+	POPL	EDX
+	POPL	EDX
+	RET
+
+;Here if have unexpected end of chain
+
+14$:	POPL	EAX
+	POPL	EAX
+	MOVW	AX, #BER_EOF
+	STC
+	RET
+.PAGE
+	.SBTTL	errmsg - Function to get error message text
+
+;Function to get error message text
+;	c(AL)    = Error code
+;	c(AH)    = BF_ERRMSG
+;	c[ES:BX] = Address of buffer to receive message
+;	INT	0B1h
+;	C:set = Error
+;	  c[AX] = Error code
+;	C:clr = Normal
+
+errmsg:	MOVB	BL, reg_EAX+0.B[BP]	;Get error code
+	CMPB	BL, #UNKNOWN		;Do we know about it?
+	JBE	2$.S			;Yes
+	MOVB	BL, #UNKNOWN		;No
+2$:	MOVB	BH, #0
+	ADDW	BX, BX
+	MOVW	SI, CS:msgtbl[BX]	;Get offset of corresponding message
+	MOVW	DI, reg_EBX+0.B[BP]	;Get address of his buffer
+	MOVW	ES, reg_ES.B[BP]
+	CLD
+4$:	LODSB	CS:[SI]			;Copy the message to buffer
+	STOSB	[DI]
+	CMPB	AL, #0
+	JNE	4$.S
+	RET
+.PAGE
+	.SBTTL	readblks - Subroutine to read blocks from file
+
+;Subroutine to read blocks from file
+;	c[ES:BX] = Address for read
+;	c[CX]    = Number of blocks to read
+;	CALL	readblks
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+
+$$$=!0
+FRM rbk_ttlleft, 2
+FRM rbk_left   , 2
+FRM rbk_xfraddr, 4
+FRM rbk_track  , 2
+FRM rbk_sector , 2
+FRM rbk_head   , 2
+rbk_SIZE=!$$$
+
+2$:	MOVW	AX, #BER_EOF
+	STC
+4$:	LEAVE
+	RET
+
+readblks:
+	ENTER	rbk_SIZE
+	MOVW	rbk_ttlleft.B[BP], CX	;Store total sectors left to read
+	MOVW	rbk_xfraddr+0.B[BP], BX	;Store transfer address
+	MOVW	rbk_xfraddr+2.B[BP], ES
+8$:	MOVW	AX, dkfamnt		;Get amount available at current
+					;  position in file
+	ORW	AX, AX			;Anything there at all?
+	JNE	10$.S			;Yes - go get it
+	MOVL	EAX, dkfclus		;No - get last cluster read
+	ORW	AX, AX			;Anything left?
+	JE	2$.S			;No - return EOF
+	CALL	getnextclus		;Yes - get next cluster in file
+	JC	4$.S			;If error
+	CALL	setupread		;Setup to read this piece
+	MOVW	AX, dkfamnt
+10$:	CMPW	AX, rbk_ttlleft.B[BP]	;More than we want here?
+	JBE	12$.S			;No
+	MOVW	AX, rbk_ttlleft.B[BP]	;Yes
+12$:	SUBW	rbk_ttlleft.B[BP], AX	;Reduce total amount left
+	SUBW	dkfamnt, AX		;And amount available
+	MOVW	rbk_left.B[BP], AX	;Store as amount left in this part
+14$:	MOVL	EAX, dkfpos		;Get sector number - 1
+	CLRL	EDX
+	DIVL	numsect
+	MOVW	rbk_sector.B[BP], DX	;Save sector number - 1
+	CLRL	EDX
+	DIVL	numhead			;Get head and cylinder numbers
+	MOVW	rbk_head.B[BP], DX	;Save head number
+	MOVW	rbk_track.B[BP], AX	;Save cyliner number
+	MOVW	AX, numsect		;Get sectors left on track
+	SUBW	AX, rbk_sector.B[BP]
+	CMPW	AX, rbk_left.B[BP]	;Want this many?
+	JBE	16$.S			;Yes
+	MOVW	AX, rbk_left.B[BP]	;No
+16$:	SUBW	rbk_left.B[BP], AX	;Reduce amount to get
+	MOVZWL	EAX, AX
+	ADDL	dkfpos, EAX		;Bump position on disk
+	MOVW	BX, rbk_xfraddr+0.B[BP]
+	MOVW	ES, rbk_xfraddr+2.B[BP]
+	SHLW	AX, #9
+	ADDW	rbk_xfraddr+0.B[BP], AX
+	SHRW	AX, #9
+	MOVW	CX, rbk_track.B[BP]
+	MOVB	AH, rbk_sector.B[BP]
+	INCB	AH
+	MOVB	DH, rbk_head.B[BP]
+	CALL	readdisk		;Read the disk
+	JC	20$.S			;If error
+	CMPW	rbk_left.B[BP], #0.B	;Any more to get here?
+	JNE	14$.S			;Yes - continue
+	CMPW	rbk_ttlleft.B[BP], #0.B	;No - need any more?
+	JNE	8$			;Yes
+20$:	LEAVE				;No - finished
+	RET
+.PAGE
+readbfrd:
+	ANDL	ECX, #0FFFFh		;Anything to do here?
+	JE	14$.S			;No
+	MOVL	EAX, dkfbyte		;Yes - get current block
+	CLRL	EDX
+	ADDL	dkfbyte, ECX
+	SUBW	rby_ttlleft.B[BP], CX
+	MOVL	EBX, #512t
+	DIVL	EBX
+	CMPL	EAX, dkfbblk		;Is this block in the buffer now?
+	JE	12$.S			;Yes
+	MOVL	dkfbblk, EAX		;No
+	PUSHW	CX			;Read it
+	PUSHW	DX
+	MOVW	CX, #1
+	MOVW	BX, #buffer
+	PUSHW	DS
+	POPW	ES
+	CALL	readblks
+	POPW	DX
+	POPW	CX
+	JC	14$.S			;If error
+12$:	MOVW	SI, #buffer
+	ADDW	SI, DX
+	LESW	DI, rby_xfraddr.B[BP]
+	ADDW	rby_xfraddr.B[BP], CX
+	CLD
+	RMOVSB	[DI], [SI]
+	CLC
+14$:	RET
+.PAGE
+	.SBTTL	getnextclus - Subroutine to get next cluster in file
+
+;Subroutine to get next cluster in file
+;	c{EAX} = Current cluster
+;	CALL	getnextclus
+;	C:set = Error
+;	  c[AX] = Error code
+;	C:clr = Normal
+;	  c{EAX} = Next cluster
+
+getnextclus:
+	CLRL	EDX			;Get FAT group needed
+	MOVL	ECX, #384t		;Assume 32-bit FATs
+	CMPB	fattype, #32t		;RIght
+	JE	2$.S			;Yes
+	MOVL	ECX, #768t		;No - assume 16-bit FATs
+	CMPB	fattype, #16t		;Right?
+	JE	2$.S			;Yes
+	MOVL	ECX, #1024t		;No - have 12 bit FATS
+2$:	DIVL	ECX
+	PUSHW	DX
+	CMPL	curfat, EAX		;Is this FAT group in memory now?
+	JE	4$.S			;Yes - go on
+	MOVL	curfat, EAX		;No - but it will be now
+	PUSHL	dkfpos			;Save file state
+	PUSHW	dkfamnt
+	IMULL	EAX, #3.B		;Get block on disk to read
+	ADDL	EAX, firstfat
+	MOVL	dkfpos, EAX
+	MOVW	CX, #3			;Read 3 blocks
+	MOVW	dkfamnt, CX
+	MOVW	BX, #fatbufr
+	PUSHW	DS
+	POPW	ES
+	CALL	readblks
+	JC	16$.S
+	POPW	dkfamnt			;Restore file state
+	POPL	dkfpos
+4$:	POPW	BX			;Restore cluster in group
+	CMPB	fattype, #12t		;Have 12-bit FATs?
+	JE	8$.S			;Yes
+	CMPB	fattype, #16t		;NO - have 16-bit FATs?
+	JE	6$.S
+
+;Here if have 32-bit FATs
+
+	SHLW	BX, #2
+	MOVL	EAX, fatbufr[BX]	;Get entry
+	CMPL	EAX, #0FFFFFF8h
+	JMP	14$.S
+
+;Here if have 16-bit FATs
+
+6$:	ADDW	BX, BX
+	MOVZWL	EAX, fatbufr[BX]	;Get entry
+	CMPW	AX, #0FFFFFFF8h.B
+	JMP	14$.S
+
+;Here if have 12-bit FATs
+
+8$:	IMULW	BX, #3.B		;Times 1.5
+	SHRW	BX, #1
+	MOVZWL	EAX, fatbufr[BX]
+	JC	10$.S
+	ANDW	AX, #0FFFh
+	JMP	12$.S
+
+10$:	SHRW	AX, #4t
+12$:	CMPW	AX, #0FF8h
+14$:	JAE	18$.S			;If end of file
+	CLC				;If have another cluster
+16$:	RET
+
+;Here if end of file
+
+18$:	MOVW	AX, #BER_EOF		;If EOF
+	STC
+ret008:	RET
+.PAGE
+	.SBTTL	setupread - Subroutine to setup to read next piece of file
+
+;Subroutine to setup to read next piece of file
+;	c{EAX} = Next cluster in file
+;	CALL	setupread
+
+setupread:
+	MOVW	dkfamnt, #0
+	TESTL	EAX, EAX		;At end of file now?
+	JE	ret008.S		;Yes
+	PUSHL	EAX			;No - get block on disk
+	SUBL	EAX, #2.B
+	MULL	clustsz			;Change to block
+	ADDL	EAX, firstblk
+	MOVL	dkfpos, EAX
+	POPL	EAX
+2$:	MOVL	dkfclus, EAX		;Store cluster
+	MOVW	BX, clustsz		;Increase amount available here
+	ADDW	dkfamnt, BX
+	CALL	getnextclus		;Get next cluster in file
+	JC	ret008.S		;Finished if no more
+	DECL	EAX			;Is this one contiguous?
+	CMPL	dkfclus, EAX
+	JNE	ret008.S		;No - finished here
+	INCL	EAX			;Yes - continue
+	JMP	2$.S
+.PAGE
+;Subroutine to read disk blocks - this routine handles requests that cross
+;  cylinder boundries
+;	c(AL)    = Number of sectors
+;	c(AH)    = Sector
+;	c[CX]    = Cylinder
+;	c(DH)    = Head
+;	c[ES:BX] = Address of buffer
+;	CALL	readdisk
+;	C:set = Error
+;	  c[AX] = Error code
+;	C:clr = Normal
+
+$$$=!0
+FRM rdk_buffer, 4t		;Buffer address
+FRM rdk_count , 1t		;Sectors to transfer
+FRM rdk_left  , 1t		;Sectors left
+FRM rdk_cyln  , 2t		;Cylinder number
+FRM rdk_sect  , 1t		;Sector number
+FRM rdk_head  , 1t		;Head number
+rdk_SIZE=!$$$
+
+
+readdisk:
+	ENTER	rdk_SIZE, 0
+	MOVB	rdk_count.B[BP], AL	;Store number of sectors
+	MOVB	rdk_left.B[BP], AL
+	MOVB	rdk_sect.B[BP], AH	;Store beginning sector number
+	MOVW	rdk_cyln.B[BP], CX	;Store cylinder number
+	MOVB	rdk_head.B[BP], DH	;Store head number
+	MOVW	rdk_buffer+0.B[BP], BX	;Store address of buffer
+	MOVW	rdk_buffer+2.B[BP], ES
+	PUSHAL
+	PUSHW	ES
+2$:	CMPB	rdk_count.B[BP], #1	;Just want 1 sector?
+	JE	4$.S			;Yes - just go read it
+	MOVB	AL, numsect		;Calculate number of sectors available
+	SUBB	AL, rdk_sect.B[BP]	;  here
+	INCB	AL
+	CMPB	AL, rdk_left.B[BP]	;Do we need this many?
+	JB	6$.S			;Yes
+4$:	MOVB	AL, rdk_left.B[BP]	;No - just read as much as we need
+6$:	MOVB	rdk_count.B[BP], AL
+	MOVZWL	EAX, rdk_buffer+0.B[BP]	;Get physical offset for the transfer
+	MOVZWL	EDX, rdk_buffer+2.B[BP]
+	SHLL	EDX, #4t
+	ADDL	EAX, EDX
+	MOVZBL	ECX, rdk_count.B[BP]	;Get number of bytes to read
+	SHLL	ECX, #9t
+	ADDL	ECX, EAX		;Get last address transfered
+	XORL	ECX, EAX		;Does it cross a 64KB boundry
+	TESTL	ECX, #0FFFF0000h
+	JE	12$.S			;No - go on
+	LEAL	ECX, 0FFFFh[EAX]	;Yes - see how much we can do before
+	ANDL	ECX, #0FFFF0000h	;  the boundry
+	SUBL	ECX, EAX
+	SHRL	ECX, #9t
+	JNE	10$.S			;If can transfer anything before the
+					;  boundry
+	MOVW	BX, #buffer		;Transfer the offending sector into
+	PUSHW	DS			;  our buffer
+	POPW	ES
+	MOVB	AL, #1
+	MOVB	AH, rdk_sect.B[BP]
+	MOVW	CX, rdk_cyln.B[BP]
+	MOVB	DH, rdk_head.B[BP]
+	CALL	readsects
+	JC	18$.S			;If error
+	MOVW	CX, #256t		;OK - copy data from our buffer to
+	LESW	DI, rdk_buffer.B[BP]	;  the caller's buffer
+	MOVW	SI, #buffer
+	CLD
+	RMOVSW	[DI], [SI]
+	JMP	14$.S
+
+;Here if can transfer one or more sectors without crossing a 64KB boundry
+
+10$:	MOVB	rdk_count.B[BP], CL
+12$:	LESW	BX, rdk_buffer.B[BP]	;Get address of caller's buffer
+	MOVB	AL, rdk_count.B[BP]
+	MOVB	AH, rdk_sect.B[BP]
+	MOVW	CX, rdk_cyln.B[BP]
+	MOVB	DH, rdk_head.B[BP]
+	CALL	readsects
+	JC	18$.S			;If error
+14$:	SUBB	rdk_left.B[BP], AL	;Reduce amount remaining
+	JLE	16$.S			;If finished
+	ADDB	rdk_sect.B[BP], AL	;More to do - increase sector number
+	MOVB	AH, #0			;Increase buffer offset
+	SHLW	AX, #9
+	ADDW	rdk_buffer+0.B[BP], AX
+	MOVB	AL, rdk_sect.B[BP]	;Past end of track?
+	CMPB	AL, numsect
+	JBE	15$.S			;No - continue
+	MOVB	rdk_sect.B[BP], #1	;Yes - reset sector number
+	INCB	rdk_head.B[BP]		;Increment head number
+	MOVB	AL, rdk_head.B[BP]
+	CMPB	AL, numhead		;Too large?
+	JB	15$.S			;No
+	MOVB	rdk_head.B[BP], #0	;Yes - reset head number
+	INCW	rdk_cyln.B[BP]		;Bump cylinder number
+15$:	JMP	2$			;Continue
+
+;Here when finished
+
+16$:	CLC
+18$:	POPW	ES
+	POPAL
+	LEAVE
+	RET
+.PAGE
+;Subroutine to read disk sectors - the requested transfer must NOT cross a
+;  track boundry or a 64KB memory boundry
+;	c(AL) = Number of sectors to read
+;	c(AH) = Sector number
+;	c[CX] = Cylinder number
+;	c(DH) = Head number
+;	CALL	readsects
+;	C:set = Error
+;	C:clr = Normal
+;	  c(AL) = Number of sectors read
+
+$$$=!0
+FRM rst_buffer, 4t
+FRM rst_count , 1t
+FRM rst_retry , 1t
+FRM rst_cyln  , 2t
+FRM rst_head  , 1t
+FRM rst_sect  , 1t
+rst_SIZE=!$$$
+
+readsects:
+	ENTER	rst_SIZE, 0
+	MOVB	rst_count.B[BP], AL
+	MOVB	rst_retry.B[BP], #6
+	MOVB	rst_head.B[BP], DH
+	MOVB	rst_sect.B[BP], AH
+	MOVW	rst_cyln.B[BP], CX
+	MOVW	rst_buffer+0.B[BP], BX
+	MOVW	rst_buffer+2.B[BP], ES
+2$:	MOVW	CX, rst_cyln.B[BP]
+	MOVB	AH, rst_sect.B[BP]
+	MOVB	DH, rst_head.B[BP]
+	SHLB	CH, #6
+	ORB	AH, CH
+	MOVB	CH, CL
+	MOVB	CL, AH
+	MOVB	DL, devunit
+	MOVB	AL, rst_count.B[BP]
+	MOVB	AH, #2
+	LESW	BX, rst_buffer.B[BP]
+	INT	13h
+	JNC	10$.S			;If OK
+	DECB	rst_retry.B[BP]		;Error - should we try again?
+	JE	4$.S			;No - fail!
+	MOVB	DL, devunit		;Yes - do a reset
+	MOVB	AH, #0
+	INT	13h
+	JMP	2$.S			;And try again
+
+;Here if have retried as much as we should - return the failure
+
+4$:	MOVB	AL, AH
+	PUSHW	DS
+	POPW	ES
+	MOVW	DI, #errtbl
+	MOVW	CX, #NUMERR
+	CLD
+	RNSCASB	[DI]
+	JNE	6$.S
+	MOVB	AL, codetbl-errtbl-1[DI]
+	JMP	8$
+
+6$:	MOVB	AL, #BER_ERROR
+8$:	MOVB	AH, #0
+	STC
+	LEAVE
+	RET
+
+10$:	MOVB	AL, rst_count.B[BP]
+	LEAVE
+	RET
+
+	.MACRO	ERR
+	EX  01h , BER_FUNC
+	EX  02h , BER_AMNF
+	EX  04h , BER_SECTNF
+	EX  05h , BER_RSTERR
+	EX  08h , BER_DMAOVR
+	EX  09h , BER_BNDYERR
+	EX  0Ah , BER_BADSECT
+	EX  0Bh , BER_BADCYLN
+	EX  0Dh , BER_INVSECT
+	EX  0Eh , BER_INVDATA
+	EX  0Fh , BER_DMAERR
+	EX  10h , BER_DATAERR
+	EX  20h , BER_CONERR
+	EX  40h , BER_SEEKERR
+	EX  80h , BER_NORESP
+	EX  0CCh, BER_WRTFLT
+	.ENDM
+
+	.MACRO	EX num, code
+	.BYTE	num
+	.ENDM
+
+errtbl:	ERR
+NUMERR=!$-errtbl
+
+	.MACRO	EX num, code
+	.BYTE	code
+	.ENDM
+
+codetbl:ERR
+
+msgNOERR:  .ASCIZ  "No error indicated"
+msgEOF:    .ASCIZ  "End of file"
+msgERROR:  .ASCIZ  "Unspecified general error"
+msgFUNC:   .ASCIZ  "Invalid function"
+msgAMNF:   .ASCIZ  "Address mark not found"
+msgSECTNF: .ASCIZ  "Sector not found"
+msgRSTERR: .ASCIZ  "Disk reset error"
+msgDMAOVR: .ASCIZ  "DMA overrun"
+msgBNDYERR:.ASCIZ  "Data boundry error"
+msgBADSECT:.ASCIZ  "Bad sector"
+msgBADCYLN:.ASCIZ  "Bad cylinder"
+msgINVSECT:.ASCIZ  "Invalid sector"
+msgINVDATA:.ASCIZ  "Invalid data on media"
+msgDMAERR: .ASCIZ  "DMA error"
+msgDATAERR:.ASCIZ  "Data error"
+msgCONERR: .ASCIZ  "Controller error"
+msgSEEKERR:.ASCIZ  "Seek error"
+msgNORESP: .ASCIZ  "No response"
+msgWRTFLT: .ASCIZ  "Write fault"
+msgBDFSPC: .ASCIZ  "Bad file specification"
+msgFDNFND: .ASCIZ  "Directory or file not found"
+msgunknown:.ASCIZ  "Unknown error reported"
+
+	.MOD	2
+msgtbl:	.WORD	msgNOERR		;No error indicated
+	.WORD	msgEOF			;End of file
+	.WORD	msgERROR		;Unspecified general error
+	.WORD	msgFUNC			;Invalid function
+	.WORD	msgAMNF			;Address mark not found
+	.WORD	msgSECTNF		;Sector not found
+	.WORD	msgRSTERR		;Reset error
+	.WORD	msgDMAOVR		;DMA overrun
+	.WORD	msgBNDYERR		;Data boundry error
+	.WORD	msgBADSECT		;Bad sector
+	.WORD	msgBADCYLN		;Bad cylinder
+	.WORD	msgINVSECT		;Invalid sector
+	.WORD	msgINVDATA		;Invalid data on media
+	.WORD	msgDMAERR		;DMA error
+	.WORD	msgDATAERR		;Data error
+	.WORD	msgCONERR		;Controller error
+	.WORD	msgSEEKERR		;Seek error
+	.WORD	msgNORESP		;No response
+	.WORD	msgWRTFLT		;Write fault
+	.WORD	msgBDFSPC		;Bad file specification
+	.WORD	msgFDNFND		;File or directory not found
+	.WORD	msgunknown		;Unknown error code
+UNKNOWN=!{$-msgtbl}/2-1
+
+DFSCODEWORDS==!{$-dfscode+1}/2
+DFSCODEPAGES==!{$-dfscode+15t}/16t

@@ -1,0 +1,1099 @@
+	.TITLE	GECKOC
+
+;++++
+; This software is in the public domain.  It may be freely copied and used
+; for whatever purpose you see fit, including commerical uses.  Anyone
+; modifying this software may claim ownership of the modifications, but not
+; the complete derived code.  It would be appreciated if the authors were
+; told what this software is being used for, but this is not a requirement.
+
+;   THIS SOFTWARE IS PROVIDED BY THE AUTHORS "AS IS" AND ANY EXPRESS OR
+;   IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
+;   OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+;   IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+;   INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+;   BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS
+;   OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+;   ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR
+;   TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
+;   USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+;----
+
+	.PROC	80386
+	.INCLUD XOSINC:\XMAC\DEFINES.PAR
+	.INCLUD	XOSINC:\XMAC\XOS.PAR
+	.INCLUD XOSINC:\XMAC\XOSERR.PAR
+	.INCLUD	XOSINC:\XMAC\XOSTRM.PAR
+	.INCLUD XOSINC:\XMAC\CLIBX.PAR
+	.INCLUD XOSINC:\XMAC\PROCARG.PAR
+
+	.STDSEGS
+
+MAJVER =!1t
+MINVER =!0t
+EDITNUM=!0t
+
+_VER =!1t
+_EDIT=!0t
+
+;This module implements a remote client program which communicates with
+;  exec-mode GECKO over a serial connection.  This initial version only
+;  off-loads a little of the display management.  All command processing
+;  is still done by exec-mode GECKO.
+
+	.PSECT	_DATA_p
+
+scrnbufr==!0F0000h	;Offset to use for screen buffer
+
+VECT_SERINP=!70t
+VECT_CONINP=!71t
+
+;Define FLAG bit values
+
+FLAG$N  =!4000h		;Nested task flag
+FLAG$O  =!0800h		;Overflow flag
+FLAG$D  =!0400h		;Direction flag
+FLAG$I  =!0200h		;Interrupt flag
+FLAG$T  =!0100h		;Trap flag
+FLAG$S  =!0080h		;Sign flag
+FLAG$Z  =!0040h		;Zero flag
+FLAG$A  =!0010h		;Half-carry (auxillary carry) flag bit
+FLAG$P  =!0004h		;Parity flag
+FLAG$C  =!0001h		;Carry flag bit
+FLAG$ALL=!4FD5h		;All flag bits
+
+;Define offsets in the flag symbol table
+
+fst_sym0=!0t		;Symbol for value = 0
+fst_sym1=!2t		;Symbol for value = 1
+fst_sym2=!4t		;Symbol for value = 2
+fst_sym3=!6t		;Symbol for value = 3
+fst_sym4=!8t		;Symbol for value = 4
+fst_sym5=!10t		;Symbol for value = 5
+fst_sym6=!12t		;Symbol for value = 6
+fst_sym7=!14t		;Symbol for value = 7
+fst_pos =!16t		;Amount to shift field to get value
+fst_mask=!18t		;Mask for field
+fst_ENSZ=!22t		;Size of table entry
+
+VRTLIN =!0B3h		;Character to use as vertical line in dump output
+BRDATR =!07h		;Attribute byte for border
+INVBRD =!70h
+TXTATR =!02h		;Attribute byte for normal text
+INVATR =!20h		;Attribute byte for inverse text
+ERRATR =!0Ch		;Attribute byte for error message text
+
+CCHR =!' '+TXTATR*100h	;Character + attributes to clear screen
+VBCHR=!0B3h+BRDATR*100h	;Character + attributes for vertical border
+HBCHR=!0CDh+BRDATR*100h	;Character + attributes for horizontal border
+
+;Define the procarg table
+
+optword:.LONG	sques , 0                   , 0, dohelp  , 0
+	.LONG	sh    , 0                   , 0, dohelp  , 0
+	.LONG	shel  , 0                   , 0, dohelp  , 0
+	.LONG	shelp , 0                   , 0, dohelp  , 0
+	.LONG	slin  , ASF$VALREQ|ASF$NVAL , 0, fnclines, 0
+	.LONG	slines, ASF$VALREQ|ASF$NVAL , 0, fnclines, 0
+	.LONG	spor  , ASF$VALREQ|ASF$LSVAL, 0, fncport , 0
+	.LONG	sport , ASF$VALREQ|ASF$LSVAL, 0, fncport , 0
+
+;Option name strings for procarg
+
+sques:	.ASCIZ  "?"
+sh:	.ASCIZ  "H"
+shel:	.ASCIZ  "HEL"
+shelp:	.ASCIZ  "HELP"
+slin:	.ASCIZ  "LIN"
+slines:	.ASCIZ  "LINES"
+spor:	.ASCIZ  "POR"
+sport:	.ASCIZ  "PORT"
+
+	.SBTTL	Start of program
+
+	.PSECT	_TEXT_p
+
+mainalt::
+	CLRL	EAX
+	PUSHL	EAX			;Search for our environment string
+	PUSHL	DS
+	PUSHL	#envname
+	PUSHL	EAX
+	PUSHL	EAX
+	PUSHL	DS
+	PUSHL	#blkbufr
+	PUSHL	#512t
+	PUSHL	EAX
+	PUSHL	EAX
+	CALLF	svcSysFindEnv##
+	ORL	EAX, EAX
+	JS	4$.S			;If not found
+	CLRL	EAX			;Found it - process value as arguments
+	PUSHL	EAX			;No default extension for indirect file
+	PUSHL	EAX			;No next line function
+	PUSHL	EAX			;Error function
+	PUSHL	EAX			;No function for non-keyword args
+	PUSHL	EAX			;Offset of keyword table
+	PUSHL	#optword		;Offset of option table
+	PUSHL	#PAF$INDIRECT|PAF$EATQUOTE ;Flag bits
+	PUSHL	#envpntr		;Offset of arg string pointer
+	CALL	procarg#		;Process arguments
+	ADDL	ESP, #32t.B
+4$:	MOVL	ESI, 4.B[ESP]		;Get offset of argument msect
+	PUSHL	ESI
+	CALL	getfarg#		;Get offset of first argument
+	POPL	ECX
+	MOVL	argpntr, EAX		;Store it for procarg
+	CLRL	EAX
+	PUSHL	EAX			;No default extension for indirect file
+	PUSHL	EAX			;No next line function
+	PUSHL	EAX			;Error function
+	PUSHL	EAX			;No non-keyword args
+	PUSHL	EAX			;Offset of keyword table
+	PUSHL	#optword		;Offset of option table
+	PUSHL	#PAF$INDIRECT|PAF$EATQUOTE ;Flag bits
+	PUSHL	#argpntr		;Offset of arg string pointer
+	CALL	procarg#		;Process arguments
+	ADDL	ESP, #32t.B
+	PUSHL	DS			;Give up the argument data
+	PUSHL	ESI
+	PUSHL	#0.B
+	PUSHL	#0.B
+	CALLF	svcMemChange##
+.PAGE
+;Do our general set up before we set up the display - this makes in easier
+;  to report errors here
+
+	PUSHL	#8.B
+	CALLF	svcSchSetLevel##
+	PUSHL	#VECT_SERINP.B		;Set the serial port input done vector
+	PUSHL	#84h+{VT_XOSS<8}
+	PUSHL	CS
+	PUSHL	#serinpdone
+	CALLF	svcSchSetVector#
+	MOVL	EDX, ermvect
+	TESTL	EAX, EAX
+	JS	2$.S
+	PUSHL	#VECT_CONINP.B		;Set the console input done vector
+	PUSHL	#84h+{VT_XOSS<8}
+	PUSHL	CS
+	PUSHL	#coninpdone
+	CALLF	svcSchSetVector#
+	TESTL	EAX, EAX
+	JS	2$.S
+	PUSHL	#VECT_CNTC		;Set the control-C vector
+	PUSHL	#84h+{VT_XOSS<8}
+	PUSHL	CS
+	PUSHL	#cntrlc
+	CALLF	svcSchSetVector#
+	TESTL	EAX, EAX
+	JS	2$.S
+	PUSHL	#O$IN|O$OUT.B
+	PUSHL	DS
+	PUSHL	#serport
+	PUSHL	#0.B
+	PUSHL	#0.B
+	CALLF	svcIoOpen##
+	MOVL	EDX, #ermsopn
+	TESTL	EAX, EAX
+	JS	2$.S
+	MOVL	sinpqab+qab_handle, EAX
+	PUSHL	EAX
+	PUSHL	#0.B
+	PUSHL	#0.B
+	PUSHL	#0.B
+	PUSHL	DS
+	PUSHL	#serparm
+	CALLF	svcIoInBlockP##
+	MOVL	EDX, #ermspms
+	TESTL	EAX, EAX
+2$:	JS	error2.S
+	PUSHL	DS			;Start initial serial port input
+	PUSHL	#sinpqab
+	CALLF	svcIoQueue##
+
+	PUSHL	DS			;Start initial console input
+	PUSHL	#cinpqab
+	CALLF	svcIoQueue##
+
+
+;Now initialize the display
+
+	MOVL	EDI, #trmdata
+	PUSHL	#DH_STDTRM.B		;Get current terminal data
+	PUSHL	#DM$RTNDATA
+	PUSHL	DS
+	PUSHL	EDI
+	CALLF	svcTrmDspMode##
+	ORL	EAX, EAX		;Error?
+	JNS	4$.S			;No - go on
+trmerr:	MOVL	EDX, #scnerr
+error2:	CALL	trmout			;Display it
+	MOVL	EDX, #msger2		;Display rest of message
+	CALL	trmout
+errdone:PUSHL	#1.B			;Terminate the program
+	CALLF	svcSchExit##
+
+
+4$:	PUSHL	EDI
+	MOVL	ESI, EDI		;Copy terminal data in case error
+	MOVL	EDI, #trmsave
+	PUSHL	DS
+	POPL	ES
+	MOVL	ECX, #dm_SIZE/4
+	CLD
+	RMOVSL	[EDI], [ESI]
+	POPL	EDI
+	CMPL	numline, #0.B		;Did he specify the number of lines?
+	JE	12$.S			;No - go on
+	MOVL	EAX, numline		;Yes
+	MOVL	dm_rows.B[EDI], EAX
+	CLRL	EAX
+	MOVL	dm_horiz.B[EDI], EAX
+	MOVL	dm_vert.B[EDI], EAX
+	PUSHL	#DH_STDTRM.B		;Set current terminal data
+	PUSHL	#DM$RTNDATA|DM$USEDATA|DM_TEXT
+	PUSHL	DS
+	PUSHL	EDI
+	CALLF	svcTrmDspMode##
+	ORL	EAX, EAX		;Error?
+10$:	JS	trmerr			;Yes
+12$:	MOVL	EAX, dm_columns.B[EDI]
+	MOVL	swidth, EAX
+	MOVL	EAX, dm_rows.B[EDI]
+	MOVL	sheight, EAX
+	SUBL	EAX, #7t.B
+	MOVL	dheight, EAX
+	PUSHL	#DH_STDTRM.B		;Get terminal screen buffer
+	PUSHL	DS
+	PUSHL	#scrnbufr
+	MOVL	EAX, swidth
+	IMULL	EAX, sheight
+	ADDL	EAX, EAX
+	PUSHL	EAX
+	PUSHL	#0.B
+	CALLF	svcTrmMapScrn##
+	ORL	EAX, EAX
+	JS	10$.S
+	PUSHL	#DH_STDTRM.B		;Update terminal state
+	PUSHL	#0.B
+	PUSHL	#0.B
+	PUSHL	#0.B
+	PUSHL	DS
+	PUSHL	#trmparm
+	CALLF	svcIoInBlockP##
+	ORL	EAX, EAX
+	JS	10$.S
+	MOVL	EDI, #scrnbufr		;Fill the screen buffer with spaces
+	MOVL	ECX, swidth
+	IMULL	ECX, sheight
+	SHRL	ECX, #1
+	MOVL	EAX, #{{{TXTATR<8}+' '}<16t}+{TXTATR<8}+' '
+	CLD
+	PUSHL	DS
+	POPL	ES
+	RSTOSL	[EDI]
+	MOVL	EDI, #scrnbufr		;Set up our frame
+	MOVL	ESI, #lblmsg		;Top line
+	MOVL	EDX, #LBLSIZE
+	CALL	mline
+	MOVL	EDI, #scrnbufr+160t*5	;Middle line
+	CALL	fline
+	MOVL	EDI, sheight		;Bottom line
+	DECL	EDI
+	IMULL	EDI, #160t
+	ADDL	EDI, #scrnbufr
+	MOVL	ESI, #cprmsg
+	MOVL	EDX, #CPRSIZE
+	CALL	mline
+	MOVL	EDI, #scrnbufr+158t	;Left and right sides
+	MOVL	ECX, sheight
+	DECL	ECX
+	MOVL	EAX, #VBCHR+VBCHR*10000h
+8$:	STOSL	[EDI]
+	ADDL	EDI, #156t
+	LOOP	ECX, 8$
+	MOVW	scrnbufr+0, #0D5h+BRDATR*100h ;Corners
+	MOVW	scrnbufr+158t, #0B8h+BRDATR*100h
+	MOVW	scrnbufr+800t, #0C6h+BRDATR*100h
+	MOVW	scrnbufr+958t, #0B5h+BRDATR*100h
+	MOVW	-158t[EDI], #0D4h+BRDATR*100h
+	MOVW	[EDI], #0BEh+BRDATR*100h
+
+	CALL	setcur
+
+	MOVB	AH, #TXTATR
+	MOVL	EBX, #labels
+	MOVL	EDI, #scrnbufr+172t
+	CALL	rlbls
+	MOVL	EDI, #scrnbufr+332t
+	CALL	rlbls
+	MOVL	EDI, #scrnbufr+492t
+	CALL	rlbls
+	MOVL	EDI, #scrnbufr+652t
+	CALL	rlbls
+	CALL	clrregs
+
+;Here with all set up complete
+
+	PUSHL	#0.B			;Enable all signals
+	CALLF	svcSchSetLevel##
+	PUSHL	#0.B			;Wait for a signal
+	PUSHL	#0.B
+	PUSHL	#-1.B
+	CALLF	svcSchSuspend##
+	HLT
+.PAGE
+;Function to display help text
+
+dohelp:	PUSHL	#DH_STDTRM.B		;Display the initial part
+	PUSHL	DS
+	PUSHL	#hlptxt1
+	PUSHL	#0.B
+	CALLF	svcIoOutString##
+	MOVL	EBX, #hmlin		;Display /LINES line
+	MOVL	EDX, numline
+	CALL	helpnum
+	MOVL	EBX, #hmsport		;Display /PORT line
+	MOVL	EDX, #serport
+	CALL	helptxt
+	PUSHL	#0.B
+	CALLF	svcSchExit##
+
+helpnum:PUSHL	EDX
+	PUSHL	EBX
+	MOVL	EAX, #fmtnum
+	ORL	EDX, EDX
+	JNE	4$.S
+	ADDL	EAX, #fmtdft-fmtnum
+4$:	PUSHL	EAX
+6$:	PUSHL	#blkbufr
+	CALL	sprintf#
+	ADDL	ESP, #16t.B
+	PUSHL	#DH_STDTRM.B
+	PUSHL	DS
+	PUSHL	#blkbufr
+	PUSHL	#0.B
+	CALLF	svcIoOutString##
+	RET
+
+helptxt:PUSHL	EDX
+	PUSHL	EBX
+	MOVL	EAX, #fmttxt
+	JMP	4$.S
+.PAGE
+;Function called by procarg for the LINES option
+
+fnclines:
+	MOVL	EBX, 4.B[ESP]		;Point to argument data
+	MOVL	EAX, argdata_value.B[EBX] ;Save the value
+	MOVL	numline, EAX
+rtntrue:MOVL	EAX, #1
+	RET
+
+;Function called by procarg for the PORT options
+
+fncport:
+	MOVL	EBX, 4.B[ESP]		;Point to argument data
+	CMPL	argdata_length.B[EBX], #18t.B ;Too long?
+	JA	14$.S
+	MOVB	AH, #0			;No colon to begin with
+	MOVL	EBX, argdata_value.B[EBX] ;Point to string
+	MOVL	EDX, #serport
+4$:	MOVB	AL, [EBX]
+	INCL	EBX
+	CMPB	AL, #0
+	JE	10$.S
+	CMPB	AL, #':'
+	JE	8$.S
+	CMPB	AL, #'a'
+	JB	6$.S
+	SUBB	AL, #'a'-'A'
+6$:	MOVB	[EDX], AL
+	INCL	EDX
+	JMP	4$.S
+
+;Here if have colon
+
+8$:	CMPB	[EBX], #0		;At end?
+	JNE	14$.S			;No
+
+;Here at end of string
+
+10$:	MOVW	[EDX], #':'		;Put colon and null at end
+	JMP	rtntrue.S
+
+;Here if the port name is invalid
+
+14$:	MOVL	EDX, #badpnm
+	JMP	error2
+.PAGE
+;Serial input done signal routine
+
+serinpdone:
+	PUSHAL
+	MOVL	ESI, #serinpbuf
+2$:	DECL	sinpqab+qab_amount
+	JS	4$.S
+	MOVB	AL, [ESI]
+	INCL	ESI
+	CALL	putchr
+	JMP	2$.S
+
+4$:	PUSHL	DS
+	PUSHL	#sinpqab
+	CALLF	svcIoQueue##
+	POPAL
+	CALLF	svcSchDismiss##
+
+;Console input done signal routine
+
+coninpdone:
+	PUSHAL
+	MOVL	ESI, #coninpbuf
+6$:	DECL	cinpqab+qab_amount
+	JS	20$
+	MOVZBL	EAX, [ESI]
+	INCL	ESI
+	MOVL	EDX, consta
+	JMPIL	CS:contbl[EDX*4]
+
+	.MOD	4
+contbl:	.LONG	connrm		;0 - Normal character
+	.LONG	consp1
+	.LONG	consp2
+	.LONG	consp3
+
+connrm:	CMPB	AL, #0		;Prefix byte?
+	JE	coninc.S	;Yes
+	CMPB	AL, #3		;Control-C?
+	JE	concc.S		;Yes
+	PUSHL	sinpqab+qab_handle ;No - just output the character
+	PUSHL	EAX
+	CALLF	svcIoOutSingle##
+	JMP	6$.S
+
+cntrlc:	CALLF	svcSchCtlCDone##
+concc:	PUSHL	#DH_STDTRM
+	PUSHL	CS
+	PUSHL	#clrstr
+	PUSHL	#0.B
+	CALLF	svcIoOutString##
+
+	PUSHL	#0.B
+	CALLF	svcSchExit##
+
+consp1:	MOVB	spcstr+1, AL
+coninc:	INCL	consta
+	JMP	6$.S
+
+consp2:	MOVB	conbits, AL
+	JMP	coninc.S
+
+consp3:	CMPB	spcstr+1, #12t
+	JA	10$.S
+	JE	12$.S
+	MOVB	AL, conbits
+	MOVB	AH, AL
+	SHLB	AL, #4
+	ORB	AL, AH
+	ANDB	AL, #70
+	ADDB	AL, AL
+	ORB	spcstr+1, AL
+	PUSHL	sinpqab+qab_handle
+	PUSHL	DS
+	PUSHL	#spcstr
+	PUSHL	#2.B
+	CALLF	svcIoOutBlock##
+10$:	MOVB	consta, #0
+	JMP	6$
+
+12$:	CALL	sendreset
+	JMP	10$.S
+
+20$:	PUSHL	DS
+	PUSHL	#cinpqab
+	CALLF	svcIoQueue##
+	POPAL
+	CALLF	svcSchDismiss##
+
+
+sendreset:
+	MOVB	AL, dheight
+	SUBB	AL, #2t
+	MOVB	rststr+2, AL
+	PUSHL	sinpqab+qab_handle
+	PUSHL	DS
+	PUSHL	#rststr
+	PUSHL	#3.B
+	CALLF	svcIoOutBlock##
+	RET
+.PAGE
+;Subroutine to output string to terminal
+;	c{EDX} = Offset of string
+;	CALL	trmout
+
+trmout:	PUSHL	#DH_STDERR.B
+	PUSHL	DS
+	PUSHL	EDX
+	PUSHL	#0.B
+	CALLF	svcIoOutString##
+	RET
+.PAGE
+	.SBTTL	mline - Subroutine to display message in frame border
+
+;Subroutine to display message in frame border
+;	c[EDX] = Length of message (number of words)
+;	c[EDI] = Offset for place to start border in screen save buffer
+;	c[ESI] = Offset for message string in code segment (includes
+;		   attribute bytes)
+;	CALL	mline
+
+mline:	CALL	fline			;Put border line in buffer
+	SUBL	EDI, #80t		;Calculate address for message
+	SUBL	EDI, EDX
+	ANDL	EDI, #0FFFFFFFEh.B	;Make sure word address
+	MOVL	ECX, EDX
+	RMOVSW	[EDI], CS:[ESI]		;Put message in buffer
+	RET				;Finished
+
+	.SBTTL	fline - Subroutine to store horizontal border line in screen save buffer
+
+;Subroutine to store horizontal border line in the screen buffer
+;	c[DI] = Offset for place to start border in screen save buffer
+;	CALL	fline
+
+fline:	MOVL	ECX, #40t		;Border is 80 characters
+	MOVL	EAX, #HBCHR+HBCHR*10000h ;Get attribute byte and character
+	RSTOSL	[EDI]			;Put border in buffer
+4$:	RET				;Thats all
+
+;Subroutine to store register labels in the screen buffer
+;	c(AH)  = Attribute byte
+;	c{EBX} = Offset of string to store
+;	c{EDI} = Offset of line in buffer
+
+rlbls:	MOVB	AL, [EBX]
+	INCL	EBX
+	CMPB	AL, #0
+	JE	4$.S
+	STOSW	[EDI]
+	JMP	rlbls.S
+.PAGE
+clrregs:CLRL	EDX
+	MOVL	EBX, #15t
+	CLRL	EAX
+	MOVL	regval, EAX
+2$:	MOVL	EAX, EDX
+	CALL	dispreg
+	INCL	EDX
+	DECL	EBX
+	JNE	2$.S
+
+;Subroutine to output flag mnemonics
+;	CALL	dispflags
+
+dispflags:
+	MOVL	EDI, #scrnbufr+696t
+	MOVL	ESI, #flgtbl		;Point to the flag table
+	MOVL	EDX, #FLGTSZ		;Get number of entries
+4$:	MOVW	[EDI], #' '+{TXTATR<8}
+	ADDL	EDI, #2t.B
+	MOVL	EBX, regval
+	ANDL	EBX, CS:fst_mask.B[ESI]
+	MOVB	CL, CS:fst_pos.B[ESI]	;Get amount to shift
+	SHRL	EBX, CL
+	MOVB	AL, CS:1.B[ESI+EBX*2]	;Get second byte
+	MOVB	AH, #TXTATR
+	SHLL	EAX, #16t
+	MOVB	AL, CS:[ESI+EBX*2]	;Get first byte
+	MOVB	AH, #TXTATR
+	MOVL	[EDI], EAX
+	ADDL	EDI, #4t
+	ADDL	ESI, #fst_ENSZ.B
+	DECL	EDX			;More?
+	JNE	4$.S			;Yes - continue
+	RET				;Yes - all done
+
+;Subroutine to display register value in the register area of the screen
+;	c{EAX} = Register index
+;	CALL	dispreg
+
+dispreg:MOVL	EDI, regofs[EAX*4]
+	MOVL	EAX, regval
+	BTZL	EDI, #31t		;Want 16-bit value?
+	JC	6$.S
+	PUSHL	EAX
+	SHRL	EAX, #16t
+	CALL	6$
+	POPL	EAX
+6$:	MOVL	ECX, #4t
+8$:	ROLW	AX, #4t
+	PUSHL	EAX
+	ANDB	AL, #0Fh
+	CMPB	AL, #9
+	JBE	10$.S
+	ADDB	AL, #'A'-'9'-1
+10$:	ADDB	AL, #'0'
+	MOVB	AH, #TXTATR
+	MOVW	[EDI], AX
+	ADDL	EDI, #2t.B
+	POPL	EAX
+	LOOP	ECX, 8$
+	RET
+.PAGE
+;Subroutine to display a character in the scrolled area
+;	c(AL) = Character to display
+;	CALL	putchr
+
+putchr:	MOVL	EDX, chrsta
+	JMPIL	CS:statbl[EDX*4]
+
+	.MOD	4
+
+statbl:	.LONG	putnrm		; 0 - Normal
+	.LONG	putimg		; 1 - Image character
+	.LONG	putrgb3		; 2 - Byte 3 of register value (high byte)
+	.LONG	putrgb2		; 3 - Byte 2 of register value
+	.LONG	putrgb1		; 4 - Byte 1 of register value
+	.LONG	putrgb0		; 5 - Byte 0 of register value (low byte)
+	.LONG	putrgx		; 6 - Register index
+
+putnrm:	CMPB	AL, #0Dh
+	JA	chrnrm.S
+	MOVZBL	EAX, AL
+	JMPIL	CS:chrtbl[EAX*4]
+
+	.MOD	4
+chrtbl:	.LONG	ret004		; 0 = Ignored
+	.LONG	chrerr		; 1 = Set color for error message
+	.LONG	chrtxt		; 2 = Set color for normal text
+	.LONG	chrinv		; 3 = Inverse text
+	.LONG	chrclr		; 4 = Clear line
+	.LONG	sendreset	; 5 = Reset
+	.LONG	chrnrm		; 6
+	.LONG	chrimg		; 7 = Image character
+	.LONG	chrbsp		; 8 = Back-space character
+	.LONG	chrht		; 9 = HT
+	.LONG	chrlf		; A = LF
+	.LONG	reg16v		; B = 16-bit register value
+	.LONG	reg32v		; C = 32-bit register value
+	.LONG	chrcr		; D = CR
+
+;Here if image character
+
+putimg:	MOVB	chrsta, #0
+
+;Here if not special low character
+
+chrnrm:	CMPL	curchar, #78t.B
+	JB	4$.S
+	MOVL	curchar, #0
+	PUSHL	EAX
+	CALL	chrlf
+	POPL	EAX
+4$:	MOVL	EBX, curline
+	IMULL	EBX, #160t
+	MOVL	EDX, curchar
+	ADDL	EDX, EDX
+	ADDL	EBX, EDX
+	MOVB	AH, curatr
+	MOVW	scrnbufr+962t[EBX], AX
+	INCL	curchar
+setcur:	PUSHL	#DH_STDTRM.B
+	PUSHL	#-1.B
+	MOVL	EAX, curchar
+	CMPL	EAX, #78t.B
+	JAE	8$.S
+	INCL	EAX
+8$:	PUSHL	EAX
+	MOVL	EAX, curline
+	ADDL	EAX, #6t.B
+	PUSHL	EAX
+	CALLF	svcTrmCurPos##
+ret004:	RET
+
+;Here for CR character
+
+chrcr:	MOVL	curchar, #0
+	JMP	setcur.S
+
+;Here for BS character
+
+chrbsp:	DECL	curchar
+	JNS	setcur.S
+	CMPL	curline, #0.B
+	JE	10$.S
+	MOVL	curchar, #77t
+	DECL	curline
+	JMP	setcur.S
+
+10$:	MOVL	curchar, #0
+	JMP	setcur.S
+
+;Here for LF character
+
+chrlf:	INCL	curline
+	MOVL	EAX, curline		;At bottom of scrolling area?
+	CMPL	EAX, dheight
+	JB	setcur.S
+	PUSHL	EDI
+	PUSHL	ESI
+	MOVL	EDI, #scrnbufr+960t
+	MOVL	ESI, #scrnbufr+1120t
+	MOVL	ECX, dheight
+	DECL	ECX
+	IMULL	ECX, #40t.B
+	PUSHL	DS
+	POPL	ES
+	CLD
+	RMOVSL	[EDI], [ESI]
+	MOVB	AH, curatr
+	MOVB	AL, #' '
+	SHLL	EAX, #16t
+	MOVW	AX, #{BRDATR<8}+0B3h
+	STOSL	[EDI]
+	PUSHL	EAX
+	MOVB	AH, curatr
+	MOVB	AL, #' '
+	MOVL	ECX, #38t
+	RSTOSL	[EDI]
+	POPL	EAX
+	RORL	EAX, #16t
+	STOSL	[EDI]
+	POPL	ESI
+	POPL	EDI
+	DECL	curline
+	RET
+
+;Here for HT character
+
+chrht::	MOVB	AL, #' '
+	CALL	chrnrm
+	TESTB	curchar, #07h
+	JNE	chrht.S
+	RET
+.PAGE
+;Here to set color for error messages
+
+chrerr:	MOVB	curatr, #ERRATR
+	RET
+
+;Here to set color for normal text
+
+
+chrtxt:	MOVB	curatr, #TXTATR
+	RET
+
+;Here to set to display inverse text
+
+
+chrinv:	MOVB	curatr, #INVATR
+	RET
+
+;Here to clear the current line
+
+chrclr:	PUSHL	EDI
+	MOVL	EDI, curline
+	IMULL	EDI, #160t
+	ADDL	EDI, #scrnbufr+962t
+	PUSHL	DS
+	POPL	ES
+	CLD
+	MOVB	AH, curatr
+	MOVB	AL, #' '
+	SHLL	EAX, #16t
+	MOVB	AH, curatr
+	MOVB	AL, #' '
+	MOVL	ECX, #39t
+	RSTOSL	[EDI]
+	MOVL	curchar, #0
+	POPL	EDI
+	JMP	setcur
+
+;Here to output image character (used to display the low special codes)
+
+chrimg:	RET
+
+;Here to display 16-bit register value, this is followed by a 2-byte 16-bit
+;  register value (high order byte first), followed by a 1-byte register index
+
+reg16v:	MOVL	regval, #0
+	MOVB	chrsta, #4
+	RET
+
+;Here to display 32-bit register value, this is followed by a 4-byte 32-bit
+;  register value (high order byte first), followed by a 1-byte register index
+
+reg32v:	MOVB	chrsta, #2
+	RET
+.PAGE
+;Here for byte 3 of register value (high byte)
+
+putrgb3:MOVB	regval+3, AL
+	INCL	chrsta
+	RET
+
+;Here for byte 2 of register value
+
+putrgb2:MOVB	regval+2, AL
+	INCL	chrsta
+	RET
+
+;Here for byte 1 of register value
+
+putrgb1:MOVB	regval+1, AL
+	INCL	chrsta
+	RET
+
+;Here for byte 0 of register value (low byte)
+
+putrgb0:MOVB	regval+0, AL
+	INCL	chrsta
+	RET
+
+putrgx:	CMPB	AL, #15t
+	JA	6$.S
+	JE	8$.S
+	CALL	dispreg
+6$:	MOVB	chrsta, #0
+	RET
+
+8$:	CALL	dispflags
+	JMP	6$.S
+.PAGE
+	.SBTTL	Data
+
+clrstr:	.ASCIZ	{1Bh}"[2J"
+
+	.PSECT	_DATA_p
+
+
+argpntr:.LONG	0, 0		;Argument pointer for procarg
+numline:.LONG	0		;Number of lines
+
+swidth:	.LONG	0		;Width of entire screen
+swidx2:	.LONG	0		;Width of entire screen times 2
+sheight:.LONG	0		;Height of entire screen
+dheight:.LONG	0		;Height of scrolling display area
+
+curline:.LONG	0
+curchar:.LONG	0
+
+prgname::.ASCIZ	"GECKOC"
+envname:.ASCIZ	"^XOS^GECKOC^OPT"
+badpnm:	.ASCIZ	"? GECKOC: Invalid terminal name specified"{CR,LF}
+ermvect:.ASCIZ	"? GECKOC: Error setting signal vector"{CR,LF}
+scnerr:	.ASCIZ	"? GECKOC: Cannot setup to use terminal screen"{CR,LF}
+ermsopn:.ASCIZ	"? GECKOC: Error opening serial port"{CR,LF}
+ermspms:.ASCII	"? GECKOC: Error setting serial port parameters"
+msger2:	.ASCIZ	{CR,LF}
+fmtdft:	.ASCIZ	"  %s (current screen value)"{CR,LF}
+fmtnum:	.ASCIZ	"  %s (%d)"{CR,LF}
+fmttxt:	.ASCIZ	"  %s (%s)"{CR,LF}
+
+	.MACRO	& SCNMSG  attr, string
+	.IRPC	&& qq,{string}
+	.BYTE	'qq', attr
+	.ENDR
+	.ENDM
+
+	.RADIX	10t
+	.IRP	maj, >MAJVER
+	.IRP	min, >MINVER
+	.IRP	& edit, >EDITNUM
+lblmsg:	SCNMSG	INVBRD, { GECKO (serial client) v&maj.&min.&edit }
+	.ENDR
+	.ENDR
+	.ENDR
+LBLSIZE=!{$-lblmsg}/2
+	.RADIX	16t
+
+cprmsg:	SCNMSG	BRDATR, {1}
+	SCNMSG	INVBRD, {Help}
+	SCNMSG	BRDATR, { 2}
+	SCNMSG	INVBRD, {SwScrn}
+	SCNMSG	BRDATR, { 4}
+	SCNMSG	INVBRD, {ExmEIP}
+	SCNMSG	BRDATR, { 5}
+	SCNMSG	INVBRD, {ExmPrev}
+	SCNMSG	BRDATR, { 6}
+	SCNMSG	INVBRD, {ExmSame}
+	SCNMSG	BRDATR, { 7}
+	SCNMSG	INVBRD, {ExmNext}
+	SCNMSG	BRDATR, { 8}
+	SCNMSG	INVBRD, {Step}
+	SCNMSG	BRDATR, { 9}
+	SCNMSG	INVBRD, {Trace}
+	SCNMSG	BRDATR, {10}
+	SCNMSG	INVBRD, {Go}
+CPRSIZE=!{$-cprmsg}/2
+
+
+
+	.MACRO	VERGECKOC  maj, min, edit
+	.ASCII	"GECKOC - Version maj'.'min'.'edit"
+	.ENDM
+
+
+hlptxt1:VERGECKOC >MAJVER, >MINVER, >EDITNUM
+	.ASCII	{CR,LF,CR,LF}"Command syntax is:"{CR,LF}
+	.ASCII	"  GECKOC {/option=value ...}"{CR,LF}
+	.ASCII	{CR,LF}
+	.ASCII	"Valid options are:"{CR,LF}
+	.ASCII	"  ?        = Display this text"{CR,LF}
+	.ASCIZ	"  H{EL{P}} = Display this text"{CR,LF}
+hmlin:	.ASCIZ	"LIN{ES}  = Number of screen lines"
+hmsport:.ASCIZ	"POR{T}   = Name of serial port to use"
+
+labels:	.ASCII	"EAX{ 00000000     EBX{ 00000000     "
+	.ASCIZ	"ECX{ 00000000     EDX{ 00000000"
+	.ASCII	"ESP{ 00000000     EBP{ 00000000     "
+	.ASCIZ	"EDI{ 00000000     ESI{ 00000000"
+	.ASCII	"CS[ 0000    SS[ 0000    DS[ 0000    "
+	.ASCIZ	"ES[ 0000    FS[ 0000    GS[ 0000"
+	.ASCIZ	"EIP{ 00000000     EFR{"
+
+curatr:	.BYTE	TXTATR
+
+	.MOD	4
+
+cinpqab:.WORD	QFNC_INBLOCK	;qab_func    = 0.  - Function
+	.WORD	0		;qab_status  = 2.  - Returned status
+	.LONG	0		;qab_error   = 4.  - Error code
+	.LONG	0		;qab_amount  = 8.  - Amount transfered
+	.LONG	DH_STDTRM	;qab_handle  = 12. - Device handle
+	.WORD	VECT_CONINP	;qab_vector  = 16. - Vector for interrupt
+	.BYTE	0, 0		;Reserved
+	.LONG	0		;qab_option  = 20. - Option bits
+	.LONG	100t		;qab_count   = 24. - Amount to transfer
+	.LONG	coninpbuf	;qab_buffer1 = 28. - Pointer to data buffer
+	.LONG	!coninpbuf
+	.LONG	0, 0		;qab_buffer2 = 36.
+	.LONG	0, 0		;qab_parm    = 44. - Pointer to parameter list
+
+sinpqab:.WORD	QFNC_INBLOCK	;qab_func    = 0.  - Function
+	.WORD	0		;qab_status  = 2.  - Returned status
+	.LONG	0		;qab_error   = 4.  - Error code
+	.LONG	0		;qab_amount  = 8.  - Amount transfered
+	.LONG	0		;qab_handle  = 12. - Device handle
+	.WORD	VECT_SERINP	;qab_vector  = 16. - Vector for interrupt
+	.BYTE	0, 0		;Reserved
+	.LONG	0		;qab_option  = 20. - Option bits
+	.LONG	100t		;qab_count   = 24. - Amount to transfer
+	.LONG	serinpbuf	;qab_buffer1 = 28. - Pointer to data buffer
+	.LONG	!serinpbuf
+	.LONG	0, 0		;qab_buffer2 = 36.
+	.LONG	0, 0		;qab_parm    = 44. - Pointer to parameter list
+
+serparm:.BYTE	PAR$SET|REP_HEXV, 4
+	.WORD	IOPAR_TRMCINPMODE
+	.LONG	0FFFFFFFFh
+	.BYTE	PAR$SET|REP_HEXV, 4
+	.WORD	IOPAR_TRMSINPMODE
+	.LONG	TIM$IMAGE
+	.BYTE	PAR$SET|REP_HEXV, 4
+	.WORD	IOPAR_TRMCOUTMODE
+	.LONG	0FFFFFFFFh
+	.BYTE	PAR$SET|REP_HEXV, 4
+	.WORD	IOPAR_TRMSOUTMODE
+	.LONG	TOM$IMAGE
+	.BYTE	0
+
+coninpbuf:
+	.BLKB	100t
+
+serinpbuf:
+	.BLKB	100t
+
+;Table which gives screen buffer offsets for register values
+
+SB=!80000000h
+
+regofs:	.LONG	scrnbufr+182t, scrnbufr+218t, scrnbufr+254t, scrnbufr+290t
+	.LONG	scrnbufr+342t, scrnbufr+378t, scrnbufr+414t, scrnbufr+450t
+	.LONG	scrnbufr+500t+SB, scrnbufr+524t+SB, scrnbufr+548t+SB
+	.LONG	scrnbufr+572t+SB, scrnbufr+596t+SB, scrnbufr+620t+SB
+	.LONG	scrnbufr+662t
+
+	.MACRO	FLGS  s0, s1, s2, s3, s4, s5, s6, s7, pos, mask
+	.ASCII	"s0"
+	.ASCII	"s1"
+  .IF NB {s2}
+	.ASCII	"s2"
+  .IFF
+	.BYTE	0, 0
+  .ENDC
+  .IF NB {s3}
+	.ASCII	"s3"
+  .IFF
+	.BYTE	0, 0
+  .ENDC
+  .IF NB {s4}
+	.ASCII	"s4"
+  .IFF
+	.BYTE	0, 0
+  .ENDC
+  .IF NB {s5}
+	.ASCII	"s5"
+  .IFF
+	.BYTE	0, 0
+  .ENDC
+  .IF NB {s6}
+	.ASCII	"s6"
+  .IFF
+	.BYTE	0, 0
+  .ENDC
+  .IF NB {s7}
+	.ASCII	"s7"
+  .IFF
+	.BYTE	0, 0
+  .ENDC
+	.BYTE	pos't
+	.BYTE	0
+	.LONG	mask'h
+	.ENDM
+
+	.MOD	4
+flgtbl:	FLGS	vm, VM,   ,   ,   ,   ,   ,   , 17, 00020000
+	FLGS	rf, RF,   ,   ,   ,   ,   ,   , 16, 00010000
+	FLGS	nt, NT,   ,   ,   ,   ,   ,   , 14, 00004000
+	FLGS	P0, P1, P2, P3,   ,   ,   ,   , 12, 00003000
+	FLGS	ov, OV,   ,   ,   ,   ,   ,   , 11, 00000800
+	FLGS	UP, DN,   ,   ,   ,   ,   ,   , 10, 00000400
+	FLGS	ei, IE,   ,   ,   ,   ,   ,   ,  9, 00000200
+	FLGS	tp, TP,   ,   ,   ,   ,   ,   ,  8, 00000100
+	FLGS	sn, SN,   ,   ,   ,   ,   ,   ,  7, 00000080
+	FLGS	zr, ZR,   ,   ,   ,   ,   ,   ,  6, 00000040
+	FLGS	ac, AC,   ,   ,   ,   ,   ,   ,  4, 00000010
+	FLGS	pe, PE,   ,   ,   ,   ,   ,   ,  2, 00000004
+	FLGS	cy, CY,   ,   ,   ,   ,   ,   ,  0, 00000001
+FLGTSZ=!{$-flgtbl}/fst_ENSZ
+
+	.MOD	4
+trmdata:.BLKB	dm_SIZE		;Data block for svcTrmDspMode system call
+trmsave:.BLKB	dm_SIZE		;Data block for saving initial terminal set-up
+
+	.MOD	4
+trmparm:.BYTE	PAR$SET|REP_HEXV, 4
+	.WORD	IOPAR_TRMCINPMODE
+	.LONG	0FFFFFFFFh
+	.BYTE	PAR$SET|REP_HEXV, 4
+	.WORD	IOPAR_TRMSINPMODE
+	.LONG	TIM$IMAGE
+	.BYTE	0
+
+serport:.ASCII	"TRM1:"
+	.BLKB	15t
+
+spcstr:	.BLKB	2
+conbits:.BYTE	0
+rststr:	.BYTE	0, 20h, 0
+
+	.MOD	4
+blkbufr:.BLKB	512t		;Block buffer
+
+envpntr:.LONG	blkbufr, 0	;Array used by procarg
+regval:	.LONG	0
+chrsta:	.LONG	0
+consta:	.LONG	0

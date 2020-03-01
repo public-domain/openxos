@@ -1,0 +1,1850 @@
+	.TITLE	PCNCLS1 - Pseudo-console device class driver for XOS
+
+;++++
+; This software is in the public domain.  It may be freely copied and used
+; for whatever purpose you see fit, including commerical uses.  Anyone
+; modifying this software may claim ownership of the modifications, but not
+; the complete derived code.  It would be appreciated if the authors were
+; told what this software is being used for, but this is not a requirement.
+
+;   THIS SOFTWARE IS PROVIDED BY THE AUTHORS "AS IS" AND ANY EXPRESS OR
+;   IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
+;   OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+;   IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+;   INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+;   BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS
+;   OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+;   ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR
+;   TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
+;   USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+;----
+
+	.PROC	80486
+	.INCLUD	XOSINC:\XMAC\XOS.PAR
+	.INCLUD	XOSINC:\XMAC\XOSX.PAR
+	.INCLUD	XOSINC:\XMAC\XOSERR.PAR
+	.INCLUD	XOSINC:\XMAC\XOSTIME.PAR
+	.INCLUD	XOSINC:\XMAC\XOSTRM.PAR
+	.INCLUD	XOSINC:\XMAC\XOSXTRM.PAR
+	.INCLUD	XOSINC:\XMAC\XOSLKE.PAR
+	.INCLUD	XOSINC:\XMAC\XOSXLKE.PAR
+	.INCLUD	XOSINC:\XMAC\XOSDDSP.PAR
+	.INCLUD	PCNCLS.PAR
+
+;This class driver implements a pseudo-console device which, with the
+;  cooperation of a server process, emulates a text-mode only VGA display
+;  and console keyboard.
+
+;  The client side device is implemented as a low level terminal driver (type
+;  PCN) which very closely emulates the actual VGA and console keyboard device
+;  interfaces, including all display and keyboard BIOS functions, direct access
+;  to the display buffer, direct access to the keyboard controller IO ports, and
+;  use of the keyboard hardware interrupt.  The initial version supports display
+;  mode changes (text modes only) and screen format and font changes using the
+;  INT 10 BIOS functions.  It does NOT support screen format or font changes
+;  made doing direct writes to the display controller registers or direct writes
+;  to the character generator pages.
+
+;  The server side interface is special to this device.  It mainly uses the
+;  special device function and asynchronous interrupts for interaction with the
+;  server program.  The server program MUST be specially written to use this
+;  device.
+
+MAJV   =!1t
+MINV   =!1t
+EDITNUM=!2t
+
+;1.1.1 - 5-Dec-94
+;	Fixed problem in srvcdcb, was raising to fork level when already at
+;	fork level.
+;1.1.2 - 18-Mar-96
+;	Fixed server close routine so it detaches the client terminal.
+
+	LKEHEAD	PCNCLS, MAJV, MINV, EDITNUM, LKETYPE_CLASS
+
+	CODE
+
+	.SBTTL	SVC dispatch table for PCN server side devices
+
+;SVC dispatch table for PCN server side devices
+
+srvdsp:	.LONG	knlRtnZero##	;sd_mount	=  0. - Mount
+	.LONG	knlRtnZero##	;sd_cleardev	=  4. - Clear device
+	.LONG	srvcdcb		;sd_cleardcb	=  8. - Clear DCB
+	.LONG	knlRtnZero##	;sd_commit	= 12. - Commit data to disk
+	.LONG	knlRtnZero##	;sd_transold    = 16. - Transfer device/old
+	.LONG	knlRtnZero##	;sd_transnew    = 20. - Transfer device/new
+	.LONG	srvdevparm	;sd_opena	= 24. - Open additional
+	.LONG	srvopen1	;sd_open1	= 28. - Open device/file
+	.LONG	srvdevparm	;sd_devparm     = 32. - Device parameters
+	.LONG	knlIFnDev##	;sd_delete	= 36. - Delete file
+	.LONG	knlIFnDev##	;sd_rename	= 40. - Rename file
+	.LONG	srvinpblk	;sd_inblock	= 44. - Input block
+	.LONG	srvoutblk	;sd_outblock	= 48. - Output block
+	.LONG	knlIFnDev##	;sd_outblockq	= 52. - Output block (XFF)
+	.LONG	knlIFnDevGQ##	;sd_outstring	= 56. - Output string
+	.LONG	knlRtnMOne##	;sd_getiosts	= 60. - Get input/output status
+	.LONG	srvspecial	;sd_special     = 64. - Special device function
+	.LONG	srvclose	;sd_close	= 68. - Close file
+	.LONG	knlNullLabel##	;sd_label       = 72. - Get device label
+	.LONG	knlNullQioGQ##	;sd_commitfunc	= 76. - Commit data to disk
+	.LONG	knlInfoNone##	;sd_devinfo     = 80. - Get device info
+SRVDSPSZ=!{$-srvdsp}/4
+
+;Class function dispatch table for PCN class server devices
+
+	.LONG	SRVCLSFMX
+srvcls::.LONG	pcnaddunit	;CF_ADDUNIT = 1. - Add unit
+	.LONG	pcnunitinfo	;CF_PUNITS  = 2. - Get information about
+				;		     physical units
+	.LONG	knlIFnDev##	;CF_AUNITS  = 3. - Get information about active
+				;		     units
+SRVCLSFMX=!{$-srvcls}/4
+.PAGE
+;Class characteristics tables for the PCN device class
+
+	DATA
+
+	.MOD	4
+pcncctbl:
+ DCHARBGN  1, knlDCharValCom##
+ DCHARENT  NUMBER , DECV, , 4, msgnumber , knlGetSysVal##, 0             , pcndcbnum
+ DCHARENT  MAXIMUM, DECV, , 4, msgmaximum, knlGetSysVal##, knlSetSysVal##, pcndcbmax
+ DCHARENT  LIMIT  , DECV, , 4, msglimit  , knlGetSysVal##, knlSetSysVal##, pcndcblmt
+
+	CODE
+
+msgnumber: DCHARINFO  {Number of in use PCN devices}
+msgmaximum:DCHARINFO  {Maximum number of in use PCN devices}
+msglimit:  DCHARINFO  {Maximum number of PCN devices allowed}
+.PAGE
+;Device characteristics tables for the PCN server side devices
+
+	DATA
+
+	.MOD	4
+srvdctbl:
+ DCHARBGN  2, knlDCharValCom##
+ DCHARENT  CLASS   , TEXT, ,  8, knlDcMsgClass##   , knlDcGetClass##, knlDcSetClass##, 0
+ DCHARENT  SESSION , TEXT, ,  4, knlTrmMsgSession##, pcngetsession  , pcnsetsession  , 0
+ DCHARENT  MSGDST  , STR , , 16, knlTrmMsgMsgDst## , pcngetmsgdst   , pcnsetmsgdst   , tdb_msgdst
+ DCHARENT  PROGRAM , STR , , 16, knlTrmMsgProgram##, pcngetprogram  , pcnsetprogram  , tdb_program
+ DCHARENT  ACCESS  , TEXT, ,  4, knlDcMsgAccess##  , pcngetaccess   , pcnsetaccess   , tdb_access
+ DCHARENT  PASSWORD, STR , , 12, knlTrmMsgPWrd##   , pcngetpwrd     , pcnsetpwrd     , tdb_password
+ DCHARENT  INRBS   , DECV, ,  2, knlTrmMsgInRBS##  , pcngetinrbs    , pcnsetinrbs    , tdb_irsize
+ DCHARENT  INLBS   , DECV, ,  2, knlTrmMsgInLBS##  , pcngetinlbs    , pcnsetinlbs    , tdb_ibsize
+
+	CODE
+.PAGE
+;Device parameter table for PCN server IO operations
+
+	.MOD	4
+	.LONG	PARMMAX
+srvioparms:
+	.LONG	srviogenparms	 ;IOPAR_xxxxxx = 00xx - Generic IO parameters
+	.LONG	knlNullFilParms##;IOPAR_FILxxx = 01xx - File system IO
+				 ;			  parameters
+	.LONG	knlNullTrmParms##;IOPAR_TRMxxx = 02xx - Terminal IO parameters
+PARMMAX=!{$-srvioparms}/4
+
+	.LONG	PARMGENMAX	;Size of table
+srviogenparms:
+	.LONG	0		;		   = 0000h
+	.LONG	knlIopFilOptn##	;IOPAR_FILOPTN     = 0001h
+	.LONG	knlIopFilSpec##	;IOPAR_FILSPEC     = 0002h
+	.LONG	knlIopDevSts##	;IOPAR_DEVSTS      = 0003h
+	.LONG	knlIopUnitNum##	;IOPAR_UNITNUM     = 0004h
+	.LONG	knlIopGlbId##	;IOPAR_GLBID       = 0005h
+	.LONG	knlIopDelay##	;IOPAR_DELAY       = 0006h
+	.LONG	knlIopTimeOut##	;IOPAR_TIMEOUT     = 0007h
+	.LONG	0		;IOPAR_INPSTS	   = 0008h
+	.LONG	0		;IOPAR_OUTSTS	   = 0009h
+	.LONG	knlIopInpQLmt##	;IOPAR_INPQLMT	   = 000Ah
+	.LONG	knlIopOutQLmt##	;IOPAR_OUTQLMT	   = 000Bh
+	.LONG	srvhuvect	;IOPAR_SIGVECT1    = 000Ch
+	.LONG	srvmmdvect	;IOPAR_SIGVECT2    = 000Dh
+	.LONG	srvintdata	;IOPAR_SIGDATA     = 000Eh
+	.LONG	knlIopNumOpen##	;IOPAR_NUMOPEN     = 000Fh
+	.LONG	0		;IOPAR_BUFRLMT	   = 0010h
+PARMGENMAX=!{$-srviogenparms}/4
+.PAGE
+	.SBTTL	pcninit - Initialization routine for PCN class devices
+
+	INITSUB	pcninit
+
+;The command for installing PCNCLS is:
+;	LKELOAD PCNCLS
+
+pcninit:MOVL	EDI, #pcnchk		;Install the PCN class
+	MOVL	EBX, #srvcls		;Offset of class function dispatch table
+	MOVL	ECX, #pcncctbl
+	MOVL	EAX, #'PCN'
+	CLRL	EDX
+	MOVL	ESI, #pcnccb
+	CALL	knlNewClass##
+	JC	10$.S
+	MOVL	EBX, #pcnoat		;Set up our once-a-tick routine
+	CALL	knlSetupOAT##
+	MOVL	ECX, #xcodetop#
+	CLRL	EDX
+	CLRL	EAX
+10$:	MOVL	EBX, #QSTS$DONE
+	RET
+
+	CODE
+.PAGE
+	.SBTTL	pcnaddunit - Subroutine to add PCN "unit"
+
+;Subroutine to add PCN "unit"
+;	c{ESI} = Offset of IORB
+;	CALL	pcnaddunit
+;	c{EAX} = Error code
+;	c{EBX} = Status bits
+;	c{ECX} = Item count
+
+$$$=!0
+FRM pcnau_unit  , 4	;Unit number
+pcnau_SIZE=!$$$
+
+	DATA
+
+	.MOD	4
+pcnaublk:				;Parameter description block for
+ DCHARBGN  3, knlDCharValCom##		;  adduparms
+ DCHARENT  UNIT, DECV, , 1, 0, 0, pcnauunit, 0
+
+	CODE
+
+pcnaddunit:
+	ENTER	pcnau_SIZE, 0		;Allocate our stack frame
+	MOVL	pcnau_unit.B[EBP], #-1	;Store illegal value for unit number
+	IFFAULT	4$
+	LFSL	EDX, iorb_buffer2.B[ESI]
+	CALL	knlGiveQel##		;Give up the IORB
+	MOVL	EBX, #pcnaublk		;Process the characteristics
+	MOVB	AL, #0			;Fail on bad names
+	CALL	knlAddUnitChar##
+	JC	2$.S			;If error
+	CMPL	pcnau_unit.B[EBP], #0	;Make sure TCP device and unit number
+	JNS	6$.S			;  are specified
+	MOVL	EAX, #ER_CHARM
+2$:	MOVL	EBX, #QSTS$DONE
+	CLRL	ECX
+	LEAVE
+	TOFORK
+	RET
+		
+;Here if address error with the IORB
+
+	FAULTHDR
+4$:	CALL	knlGiveQel##
+	MOVL	EAX, #ER_ADRER
+	JMP	2$.S
+
+;Here if have all required characteristics - now see if this unit is already
+;  defined
+
+6$:	MOVL	EAX, pcnau_unit.B[EBP]
+	MOVL	EDI, pcnccb+ccb_dcbhead
+8$:	TESTL	EDI, EDI
+	JE	16$.S
+	CMPW	dcb_sunit.B[EDI], #0.B
+	JNE	10$.S
+	CMPW	dcb_punit.B[EDI], AX
+	JE	12$.S
+	JA	16$.S
+10$:	MOVL	EDI, dcb_next.B[EDI]
+	JMP	8$.S
+
+;Here if unit is already defined
+
+12$:	MOVL	EAX, #ER_DUADF
+	JMP	2$.S
+
+;Here if error with the exec memory resource
+
+14$:	CALL	knlGiveXRes##
+	JMP	2$.S
+
+;Here if unit is not defined
+
+16$:	CALL	knlGetXRes##		;Get exec memory resource
+	MOVL	EBX, #DS$MLTUSER
+	MOVL	ECX, #dcb_cSIZE+dcb_pcnxSIZE
+	MOVL	EDI, #srvdsp
+	CALL	knlMakeDcb##		;Create a partial PCN DCB
+	JC	14$.S			;If error
+	CALL	knlGiveXRes##		;Give up the exec memory resource
+	MOVL	dcb_name+0[EDI], #'PCN'	;Store name and unit number in the DCB
+	LEAL	EBX, dcb_name+3.B[EDI]
+	MOVL	EAX, pcnau_unit.B[EBP]
+	MOVB	dcb_punit.B[EDI], AL
+	CALL	knlPutDecNmbr##
+	MOVL	ESI, #pcnccb		;Link DCB into list for class
+	CALL	knlLinkDcb##
+	MOVL	dcb_devchar.B[EDI], #srvdctbl
+	MOVW	dcb_pcn0irsize.B[EDI], #PCNIRSIZE ;Store default buffer sizes
+	MOVW	dcb_pcn0ibsize.B[EDI], #PCNIBSIZE
+	MOVL	dcb_pcn0program+0.B[EDI], #'SHEL' ;Assume do not want login
+	MOVB	dcb_pcn0program+4.B[EDI], #'L'
+	BTL	knlSysDescp##, #SYSD%LOGIN ;Right?
+	JNC	18$.S			;Yes
+	MOVL	dcb_pcn0program+0.B[EDI], #'LOGI' ;No
+	MOVB	dcb_pcn0program+4.B[EDI], #'N'
+18$:	MOVL	dcb_pcn0msgdst+0.B[EDI], #'INIT'
+	CLRL	EAX
+	JMP	2$
+.PAGE
+;Subroutine called by adduparms for the "UNIT" parameter
+
+pcnauunit:
+	CMPL	EAX, #100t.B		;Valid value?
+	JAE	4$.S
+	MOVL	pcnau_unit.B[EBP], EAX
+retclc:	CLC
+	RET
+
+4$:	MOVL	EAX, #ER_CHARV
+	STC
+	RET
+.PAGE
+	.SBTTL	dskunitinfo - PCN class get phyical unit information function
+
+;Here for the get physical unit information class function (CL_PUNITS) for the
+;  PCN class
+;	c{EBX} = Offset of CCB
+;	c{ESI} = Offset of IORB
+;	CALL	pcnunitinfo
+;	c{EAX} = Error code
+;	c{EBX} = Status bits
+;	c{ECX} = Item count
+;  A zero count (iorb_count) requests that the number of units only be returned
+;    in qab_amount.  A non-zero count indicates that a buffer is available for
+;    that many unit names (8 characters each, null padded).
+
+pcnunitinfo:
+	CRASH	????
+.PAGE
+	.SBTTL	pcngetinrbs - Get value of INRBS device parameter
+
+pcngetinrbs:
+	LEAL	EBX, dcb_pcn0irsize.B[EDI] ;Assume sub-unit 0
+	CMPW	dcb_sunit.B[EDI], #0.B	;Right?
+	JE	2$.S			;Yes
+	LEAL	EBX, tdb_irsize+dcb_pcntdb[EDI] ;No
+	JMP	2$.S
+
+	.SBTTL	pcngetinlbs - Get value of INLBS device parameter
+
+pcngetinlbs:
+	LEAL	EBX, dcb_pcn0ibsize.B[EDI] ;Assume sub-unit 0
+	CMPW	dcb_sunit.B[EDI], #0.B	;Right?
+	JE	2$.S			;Yes
+	LEAL	EBX, tdb_ibsize+dcb_pcntdb[EDI] ;No
+2$:	MOVZWL	EAX, [EBX]
+	RET
+.PAGE
+	.SBTTL	pcngetsession - Get value of SESSION device parameter
+
+pcngetsession:
+	MOVL	EAX, #'YES'
+	CMPW	dcb_sunit.B[EDI], #0.B	;Sub-unit 0?
+	JNE	2$.S			;No
+	TESTB	dcb_pcnsts1.B[EDI], #PCNS1$SESSION ;Yes
+	JMP	4$.S
+
+2$:	TESTB	tdb_stsmisc+dcb_pcntdb[EDI], #TSM$SESSION
+4$:	JNE	6$.S
+	MOVL	EAX, #'NO'
+6$:	RET
+.PAGE
+	.SBTTL	pcngetpwrd - Get value of PASSWORD device parameter
+
+pcngetpwrd:
+	LEAL	EDX, dcb_pcn0pswrd.B[EDI] ;Assume sub-unit 0
+	CMPW	dcb_sunit.B[EDI], #0.B	;Right?
+	JE	2$.S			;Yes
+	LEAL	EDX, tdb_password+dcb_pcntdb[EDI] ;No
+2$:	JMP	knlGetSysStr##
+
+	.SBTTL	pcngetaccess - Get value of ACCESS device parameter
+
+pcngetaccess:
+	LEAL	EAX, dcb_pcn0access.B[EDI] ;Assume sub-unit 0
+	CMPW	dcb_sunit.B[EDI], #0.B	;Right?
+	JE	4$.S			;Yes
+	LEAL	EAX, tdb_access+dcb_pcntdb[EDI] ;No
+4$:	MOVL	EAX, [EAX]
+	RET
+
+	.SBTTL	pcngetprogram - Get value of PROGRAM device parameter
+
+pcngetprogram:
+	LEAL	EDX, dcb_pcn0program.B[EDI] ;Assume sub-unit 0
+	CMPW	dcb_sunit.B[EDI], #0.B	;Right?
+	JE	2$.S			;Yes
+	LEAL	EDX, tdb_program+dcb_pcntdb[EDI] ;No
+	JMP	2$.S
+
+pcngetmsgdst:
+	LEAL	EDX, dcb_pcn0msgdst.B[EDI] ;Assume sub-unit 0
+	CMPW	dcb_sunit.B[EDI], #0.B	;Right?
+	JE	2$.S			;Yes
+	LEAL	EDX, tdb_msgdst+dcb_pcntdb[EDI] ;No
+	JMP	2$.S
+.PAGE
+	.SBTTL	pcnsetinrbs - Set value of INRBS device parameter
+
+pcnsetinrbs:
+	CMPW	dcb_sunit.B[EDI], #0.B	;Sub-unit 0?
+	JE	4$.S			;Yes
+2$:	MOVL	EAX, #ER_PARMF		;No - fail
+	STC
+	RET
+
+4$:	LEAL	EBX, dcb_pcn0irsize.B[EDI]
+	JMP	6$.S
+
+	.SBTTL	pcnsetinlbs - Set value of INLBS device parameter
+
+pcnsetinlbs:
+	CMPW	dcb_sunit.B[EDI], #0.B	;Sub-unit 0?
+	JNE	2$.S			;No
+	LEAL	EBX, dcb_pcn0ibsize.B[EDI]
+6$:	CMPL	EAX, #50t.B		;Too small?
+	JA	8$.S			;No
+	MOVL	EAX, #50t		;Yes - make it the minimum
+8$:	CMPL	EAX, #500t		;Too big?
+	JB	10$.S			;No
+	MOVL	EAX, #500t		;Yes - make it the maximum
+10$:	MOVW	[EBX], AX
+	CLC
+	RET
+.PAGE
+	.SBTTL	pcnsetsession - Set value of SESSION device parameter
+
+pcnsetsession:
+	CALL	knlGetYesNo##
+	JC	4$.S			;If error
+	JNE	6$.S			;If 'NO'
+	CMPW	dcb_sunit.B[EDI], #0.B	;'Yes' - Sub-unit 0?
+	JE	2$.S			;Yes
+	ORB	tdb_stsmisc+dcb_pcntdb[EDI], #TSM$SESSION ;No
+	RET
+
+;Here if YES for sub-unit 0
+
+2$:	ORB	dcb_pcnsts1.B[EDI], #PCNS1$SESSION
+4$:	RET
+
+;Here if 'NO'
+
+6$:	CMPW	dcb_sunit.B[EDI], #0.B	;Sub-unit 0?
+	JE	8$.S			;Yes
+	ANDB	tdb_stsmisc+dcb_pcntdb[EDI], #~TSM$SESSION ;No
+	RET
+
+;Here if 'NO' for sub-unit 0
+
+8$:	ANDB	dcb_pcnsts1.B[EDI], #~PCNS1$SESSION
+	RET
+.PAGE
+	.SBTTL	pcnsetpwrd - Set value of PASSWORD device parameter
+
+pcnsetpwrd:
+	LEAL	EDX, dcb_pcn0pswrd.B[EDI] ;Assume sub-unit 0
+	CMPW	dcb_sunit.B[EDI], #0.B	;Right?
+	JE	2$.S			;Yes
+	LEAL	EDX, tdb_password+dcb_pcntdb[EDI] ;No
+2$:	JMP	knlSetSysStr##
+
+	.SBTTL	pcnsetaccess - Set value of ACCESS device parameter
+
+pcnsetaccess:
+	LEAL	EBX, dcb_pcn0access.B[EDI] ;Assume sub-unit 0
+	CMPW	dcb_sunit.B[EDI], #0.B	;Right?
+	JE	4$.S			;Yes
+	LEAL	EBX, tdb_access+dcb_pcntdb[EDI] ;No
+4$:	JMP	knlSetAccess##
+
+	.SBTTL	pcnsetprogram - Set value of PROGRAM device parameter
+
+pcnsetprogram:
+	LEAL	EDX, dcb_pcn0program.B[EDI] ;Assume sub-unit 0
+	CMPW	dcb_sunit.B[EDI], #0.B	;Right
+	JE	2$.S			;Yes
+	LEAL	EDX, tdb_program+dcb_pcntdb[EDI] ;No
+	JMP	2$.S
+
+	.SBTTL	pcnsetmsgdst - Set value of MSGDST device parameter
+
+pcnsetmsgdst:
+	LEAL	EDX, dcb_pcn0msgdst.B[EDI] ;Assume sub-unit 0
+	CMPW	dcb_sunit.B[EDI], #0.B	;Right
+	JE	2$.S			;Yes
+	LEAL	EDX, tdb_msgdst+dcb_pcntdb[EDI] ;No
+	JMP	2$.S
+.PAGE
+	.SBTTL	pcnchk - Device check routine for PCN class devices
+
+;Device check routine for PCN class devices
+;	c{SS:EBX} = Address of device name (16 bytes)
+;	CALL	pcnchk
+;	C:set = Error (match found)
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  Z:set = Match found
+;	    c{EDI} = Offset of DCB
+;	  Z:clr = Not found
+;  EBX and ESI are preserved
+
+;PCN names are of the form PCNn or PCNnPm where n is the primary unit number
+;  and m is the secondary unit number.  When the PCNn format is used and
+;  raw or physical IO is specified, the partial DCB for the primary unit is
+;  returned.  This DCB does not allow any IO and is useful only for getting
+;  and setting device characteristics.  If raw or physical IO is not
+;  specified, a full DCB is created and a new name of the form PCNnPm is
+;  assigned.  This is the normal method of creating a new instance of a
+;  PCN device for use by a server.  If the PCNnPm form is specified, the
+;  full DCB of that name will be returned if it exists, but a new DCB will
+;  not be created.
+
+$$$=!0
+FRM chk_dcb0 , 4t		;Offset of sub-unit 0 DCB
+FRM chk_sunit, 4t		;Sub-unit number
+chk_SIZE=!$$$
+
+pcnchk:	MOVL	EAX, SS:[EBX]
+	ANDL	EAX, #0FFFFFFh
+	CMPL	EAX, #'PCN'		;Is this PCN*?
+	JNE	8$.S			;No
+	MOVL	EDI, pcnccb+ccb_dcbhead	;Yes - see if we have this one
+	TESTL	EDI, EDI
+	JE	6$.S			;If none
+2$:	MOVL	EAX, dcb_name+0.B[EDI]	;This one?
+	CMPL	SS:[EBX], EAX
+	JNE	4$.S			;No
+	MOVL	EAX, dcb_name+4.B[EDI]
+	CMPL	SS:4.B[EBX], EAX
+	JNE	4$.S			;No
+	MOVL	EAX, dcb_name+8.B[EDI]
+	CMPL	SS:8.B[EBX], EAX
+	JNE	4$.S			;No
+	MOVL	EAX, dcb_name+12t.B[EDI]
+	CMPL	SS:12t.B[EBX], EAX
+	JE	10$.S			;Yes
+4$:	MOVL	EDI, dcb_next.B[EDI]	;Not this one - advance to next DCB
+	TESTL	EDI, EDI
+	JNE	2$.S			;Continue if more to check
+6$:	INCL	EDI			;Clear Z
+8$:	CLC
+	RET
+
+;Here if an existing DCB found
+
+10$:	CMPW	dcb_sunit.B[EDI], #0.B	;Is this a primary DCB?
+	JNE	12$.S			;No - just return itn
+	TESTL	SS:xffCmd##, #O$RAW|O$PHYS ;Yes - want a partial DCB?
+	JE	16$.S			;No - must create a DCB
+12$:	CLRL	EAX			;Yes - set Z
+ret002:	RET				;And return
+
+;Here if have too many PCN DCBs now
+
+14$:	MOVL	EAX, #ER_TMDVC		;Error = Too Many DVices open for class
+15$:	LEAVE
+	STC
+	RET
+
+;Here if need to create a new PCN DCB
+
+16$:	ENTER	chk_SIZE, 0
+	MOVL	EAX, pcndcbnum		;Can we have another one?
+	CMPL	EAX, pcndcblmt
+	JAE	14$.S			;No - fail
+	MOVL	chk_dcb0.B[EBP], EDI
+	MOVL	EAX, #1
+	MOVZBL	EDX, dcb_punit.B[EDI]	;Find a free secondary unit number
+18$:	MOVL	EDI, dcb_next.B[EDI]
+	TESTL	EDI, EDI
+	JE	20$.S
+	CMPB	dcb_punit.B[EDI], DL	;Still same primary unit?
+	JNE	20$.S			;No
+	CMPW	dcb_sunit.B[EDI], AX	;Yes - is this number available?
+	JNE	20$.S			;Yes
+	INCL	EAX			;No - try next
+	JMP	18$.S
+
+20$:	CMPL	EAX, #99t.B		;Make sure secondary number not too big
+	JA	14$.S
+	MOVL	chk_sunit.B[EBP], EAX	;Save secondary unit number to use
+	MOVL	EAX, chk_dcb0.B[EBP]
+	MOVZWL	EDX, dcb_pcn0irsize.B[EAX]
+	ADDW	DX, dcb_pcn0ibsize.B[EAX]
+	SHLL	EDX, #2t
+	ADDL	EDX, #dcb_pcnSIZE	;Get size index for a full DCB
+	CALL	knlGetIndex##
+	JC	15$.S
+	MOVL	EDI, #DS$DUPLEX|DS$QOUT|DS$QIN
+	PUSHL	#0.B
+	PUSHL	#0.B
+	PUSHL	#0.B
+	PUSHL	#'PCN'
+	MOVL	EBX, ESP
+	PUSHL	ECX
+	CALL	knlGetDymDcb##
+	POPL	ECX
+	JC	15$.S
+	ADDL	ESP, #16t.B
+	INCL	pcndcbnum
+	MOVB	dcb_pcndcbsizex.B[EDI], CL ;Store size index used
+	MOVL	EAX, pcndcbnum
+	CMPL	EAX, pcndcbmax
+	JB	24$.S
+	MOVL	pcndcbmax, EAX
+24$:	MOVL	dcb_sdisp.B[EDI], #srvdsp
+	MOVL	dcb_devchar.B[EDI], #srvdctbl
+	PUSHL	ESI
+	LEAL	ESI, dcb_pcntdb[EDI]
+	LEAL	EAX, tdb_pcniring[EDI]
+	MOVL	tdb_iring[ESI], EAX
+	MOVL	tdb_irtak[ESI], EAX
+	MOVL	tdb_irput[ESI], EAX
+	MOVL	EDX, chk_dcb0.B[EBP]
+	MOVZWL	ECX, dcb_pcn0irsize.B[EDX]
+	MOVL	tdb_irsize[ESI], ECX
+	LEAL	EAX, [EAX+ECX*4]
+	MOVL	tdb_ibufr[ESI], EAX
+	MOVZWL	EAX, dcb_pcn0ibsize.B[EDX]
+	MOVL	tdb_ibsize[ESI], EAX
+	MOVB	AL, dcb_punit.B[EDX]	;Store primary unit number
+	MOVB	dcb_punit.B[EDI], AL
+	MOVB	tdb_pnum.B[ESI], AL
+	LEAL	EBX, dcb_name+3.B[EDI]	;Put primary unit number in the device
+	CALL	knlPutDecNmbr##		;  name
+	MOVB	[EBX], #'P'
+	INCL	EBX
+	MOVL	EAX, chk_sunit.B[EBP]	;Store secondary unit number
+	MOVW	dcb_sunit.B[EDI], AX
+	MOVB	tdb_snum.B[ESI], AL	;Put secondary unit number in the device
+	CALL	knlPutDecNmbr##		;  name
+	TESTB	dcb_pcnsts1.B[EDX], #PCNS1$SESSION ;Should sessions be enabled?
+	JE	26$.S			;No
+	ORB	tdb_stsmisc.B[ESI], #TSM$SESSION ;Yes
+26$:	MOVL	EAX, dcb_pcn0pswrd+0.B[EDX] ;Store password
+	MOVL	tdb_password+0[ESI], EAX
+	MOVL	EAX, dcb_pcn0pswrd+4.B[EDX]
+	MOVL	tdb_password+4[ESI], EAX
+	MOVL	EAX, dcb_pcn0pswrd+8.B[EDX]
+	MOVL	tdb_password+8[ESI], EAX
+	MOVL	EAX, dcb_pcn0program+0.B[EDX] ;Store initial program name
+	MOVL	tdb_program+0[ESI], EAX
+	MOVL	EAX, dcb_pcn0program+4.B[EDX]
+	MOVL	tdb_program+4[ESI], EAX
+	MOVL	EAX, dcb_pcn0program+8.B[EDX]
+	MOVL	tdb_program+8[ESI], EAX
+	MOVL	EAX, dcb_pcn0program+12t.B[EDX]
+	MOVL	tdb_program+12t[ESI], EAX
+	MOVL	EAX, dcb_pcn0msgdst+0.B[EDX] ;Store initial message destination
+	MOVL	tdb_msgdst+0[ESI], EAX
+	MOVL	EAX, dcb_pcn0msgdst+4.B[EDX]
+	MOVL	tdb_msgdst+4[ESI], EAX
+	MOVL	EAX, dcb_pcn0msgdst+8.B[EDX]
+	MOVL	tdb_msgdst+8[ESI], EAX
+	MOVL	EAX, dcb_pcn0msgdst+12t.B[EDX]
+	MOVL	tdb_msgdst+12t[ESI], EAX
+	MOVL	EAX, dcb_pcn0access.B[EDX]
+	MOVL	tdb_access[ESI], EAX
+	PUSHL	ESI
+	MOVL	ESI, #pcnccb
+	CALL	knlLinkDcb##
+	POPL	ESI
+	MOVL	tdb_ddisp.B[ESI], #pcntrmdsp#
+	MOVL	tdb_kdisp.B[ESI], #pcnkeydsp#
+	MOVL	tdb_dspchr.B[ESI], #pcnchratr#
+	MOVL	tdb_escdsp.B[ESI], #xosconDspNrm## ;Set initial ESC mode
+						   ;  dispatch
+	MOVL	tdb_columns[ESI], #80t	;Set initial screen size values
+	MOVB	tdb_rows[ESI], #25t
+	MOVB	tdb_scnbtm[ESI], #25t
+	MOVB	tdb_scntop[ESI], #1t
+	MOVW	tdb_tattrval[ESI], #0707h ;Set initial text attribute values
+	MOVW	tdb_battrval[ESI], #0707h
+	MOVL	tdb_devchar.B[ESI], #pcndctbl#
+					;Store offset of device characteristics
+					;  table for terminal device
+	DECL	tdb_next.B[ESI]		;Indicate not in TDB list yet
+	MOVL	tdb_name+0.B[ESI], #'TRM' ;Put name in the TDB
+	MOVB	AL, dcb_name+3.B[EDI]
+	MOVB	tdb_name+3.B[ESI], AL
+	MOVL	EAX, dcb_name+4.B[EDI]
+	MOVL	tdb_name+4.B[ESI], EAX
+	MOVL	EAX, dcb_name+8.B[EDI]
+	MOVL	tdb_name+12t.B[ESI], EAX
+	MOVL	EAX, dcb_name+12t.B[EDI]
+	MOVL	tdb_name+12t.B[ESI], EAX
+	MOVB	AL, dcb_punit.B[EDI]
+	MOVB	tdb_pnum.B[ESI], AL
+	MOVB	AL, dcb_sunit.B[EDI]
+	MOVB	tdb_snum.B[ESI], AL
+	MOVL	tdb_typname.B[ESI], #'PCN' ;Store type name in the TDB
+	DECL	tdb_fnext.B[ESI]	;Indicate fork request not queued
+	POPL	ESI
+	DECL	dcb_pcnoatnext.B[EDI]	;Indicate not in the once-a-tick list
+	DECL	dcb_pcnoatprev.B[EDI]
+
+	CMPL	pcnoathead, EDI
+	JE	40$.S
+	CMPL	pcnoattail, EDI
+	JNE	42$.S
+40$:	CRASH	LIST
+42$:
+
+	LEAVE
+	CLRL	EAX			;Set Z, clear C
+ret004:	RET
+.PAGE
+	.SBTTL	sd_cleardcb - Give up DCB
+
+;Here for the give up DCB entry
+;	CALL	srvcdcb
+
+srvcdcb:CMPW	dcb_sunit.B[EDI], #0.B	;Do we have a TDB?
+	JE	ret004.S		;No - nothing needed here
+	PUSHL	ESI			;Yes
+	CMPL	tdb_next+dcb_pcntdb[EDI], #-1.B ;Is it linked yet?
+	JE	10$.S			;No
+	LEAL	ESI, dcb_pcntdb[EDI]	;Yes - point to the TDB
+	PUSHL	EDI
+	CALL	knlTrmHungUp##		;"Hang up" the terminal side of this
+	POPL	EDI
+	MOVL	EDX, #knlTrmFirstTdb##	;Find our TDB in the list of TDBs
+2$:	CMPL	[EDX], ESI
+	JE	6$.S
+	MOVL	EDX, [EDX]
+	TESTL	EDX, EDX
+	JE	4$.S
+	ADDL	EDX, #tdb_next.B
+	JMP	2$.S
+
+4$:	CRASH	BDTL			;[BaD TDB List]
+
+6$:	MOVL	EAX, tdb_next.B[ESI]	;Unlink this TDB
+	MOVL	[EDX], EAX
+	TESTL	EAX, EAX		;Was this the last one in the list?
+	JNE	10$.S			;No
+	LEAL	EAX, -tdb_next.B[EDX]	;Yes
+	CMPL	EDX, #knlTrmFirstTdb##	;Was it the only one?
+	JNE	8$.S			;No
+	CLRL	EAX
+8$:	MOVL	knlTrmLastTdb##, EAX
+10$:	MOVL	ESI, dcb_pcndsptak.B[EDI] ;Have a display list now?
+	TESTL	ESI, ESI
+	JE	24$.S			;No
+	CLRL	EAX			;Yes, put not for long!
+	MOVL	dcb_pcndsptak.B[EDI], EAX
+	MOVL	dcb_pcndspput.B[EDI], EAX
+	MOVL	dcb_pcndspcnt.B[EDI], EAX
+	ANDL	ESI, #0FFFFFFC0h.B	;Point to start of buffer
+14$:	PUSHL	[ESI]			;Save offset of next buffer
+	CALL	knlGiveQel##		;Give up this one
+	POPL	ESI
+
+	REQUIREFORK
+
+	TESTL	ESI, ESI
+	JNE	14$.S
+	MOVL	ECX, dcb_pcnoatprev.B[EDI] ;Remove this DCB from the
+	MOVL	EDX, dcb_pcnoatnext.B[EDI] ;  once-a-tick list
+	TESTL	ECX, ECX
+	JNE	16$.S
+	MOVL	pcnoathead, EDX
+	JMP	18$.S
+
+16$:	MOVL	dcb_pcnoatnext.B[ECX], EDX
+18$:	TESTL	EDX, EDX
+	JNE	20$.S
+	MOVL	pcnoattail, ECX
+	JMP	22$.S
+
+20$:	MOVL	dcb_pcnoatprev.B[EDX], ECX
+22$:	MOVL	dcb_pcnoatnext.B[EDI], #-1
+	MOVL	dcb_pcnoatprev.B[EDI], #-1
+
+24$:	CMPL	dcb_pcnoatnext.B[EDI], #-1.B
+	JE	25$.S
+	CRASH	OATL
+
+25$:
+
+	MOVL	ESI, dcb_pcnmapwake.B[EDI] ;Have a mapped mode wake block?
+	TESTL	ESI, ESI
+	JE	26$.S			;No
+	CALL	knlWakeRemove##		;Yes - give it up
+26$:	POPL	ESI
+	DECL	pcndcbnum
+	MOVZBL	ECX, dcb_pcndcbsizex.B[EDI] ;Get size index used
+	JMP	knlGiveDymDcb##		;Give up the DCB
+.PAGE
+	.SBTTL	srvhuvect - Routine to process IOPAR_SIGVECT1 parameter
+
+;Routine to process IOPAR_SIGVECT1 parameter - this sets the hang up interrupt
+;  number
+;	c{ES:EBX} = Address of value
+;	c{ECX}    = Length of the value
+;	CALL	srvhuvect
+
+	DPARMHDR  BOTH, HEXV
+srvhuvect:
+	LEAL	ESI, dcb_pcnhuvect.B[EDI]
+	JMP	2$.S
+
+	.SBTTL	srvmmdvect - Routine to process IOPAR_SIGVECT2 parameter
+
+;Routine to process IOPAR_SIGVECT2 parameter - this parameter is used to set
+;  the mapped mode done interrupt vector.  This interrupt occures when mapped
+;  mode is disabled.  It uses two interrupt data items; (1) the IOPAR_SIGDATA
+;  value, and (2) the mapped mode buffer page modified bits
+;	c{ES:EBX} = Address of value
+;	c{ECX}    = Length of the value
+;	CALL	srvmmdvect
+
+	DPARMHDR  BOTH, HEXV
+srvmmdvect:
+	LEAL	ESI, dcb_pcnmmdvect.B[EDI]
+2$:	TESTB	AH, #PAR$SET		;Want to set value?
+	JE	6$.S			;No
+	PUSHL	EAX			;Yes
+	CALL	knlGetParm##		;Get his value
+	JC	12$.S			;If error
+	CMPL	EAX, #100h		;Valid value?
+	JB	4$.S			;Yes
+	CMPL	EAX, #200h		;Maybe
+	JB	10$.S			;No
+	CMPL	EAX, #300h		;Maybe
+	JAE	10$.S			;No
+4$:	MOVW	[ESI], AX		;Yes - store new value
+	MOVW	AX, SS:xffPda##
+	MOVW	2.B[ESI], AX		;Store PDA selector for interrupt
+	POPL	EAX
+6$:	TESTB	AH, #PAR$GET		;Want value returned?
+	JE	14$.S			;No - finished here
+	MOVZWL	EAX, [ESI]		;Yes - get value
+	JMP	knlStrParm4##
+
+;Here if bad vector number
+
+10$:	MOVL	EAX, #ER_PARMV
+	STC
+12$:	POPL	EDX
+14$:	RET
+
+	.SBTTL	srvintdata - Routine to process IOPAR_SIGDATA parameter
+
+;Routine to process IOPAR_SIGDATA parameter
+;	c{ES:EBX} = Address of value
+;	c{ECX}    = Length of the value
+;	CALL	srvintdata
+
+	DPARMHDR  BOTH, HEXV
+srvintdata:
+	TESTB	AH, #PAR$SET		;Want to set value?
+	JE	20$.S			;No
+	PUSHL	EAX			;Yes
+	CALL	knlGetParm##		;Get his value
+	JC	12$.S			;If error
+	MOVL	dcb_pcnintdata.B[EDI], EAX ;OK - store new value
+	POPL	EAX
+20$:	TESTB	AH, #PAR$GET		;Want value returned?
+	JE	14$.S			;No - finished here
+	MOVL	EAX, dcb_pcnintdata.B[EDI] ;Yes - get value
+	JMP	knlStrParm4##
+.PAGE
+	.SBTTL	sd_open1 - Open device function
+
+;Here for the open device function entry
+;	c{SS:EDX} = Offset of name buffer
+;	c{EDI}    = Offset of DCB
+;	CALL	srvopen1
+;	C:set = Error
+;	  c{EAX} = Error code
+;	  c{ECX} = 0
+;	C:clr = Normal
+;	  c{EAX} = 0
+;	  c{ECX} = 1
+
+srvopen1:
+	CMPW	dcb_sunit.B[EDI], #0.B	;Have a TDB?
+	JE	10$.S			;No
+	LEAL	ESI, dcb_pcntdb[EDI]	;Yes
+	MOVL	EAX, knlTrmLastTdb##	;Link our TDB into the chain of TDBs
+	MOVL	knlTrmLastTdb##, ESI
+	TESTL	EAX, EAX
+	JE	2$.S
+	MOVL	tdb_next.B[EAX], ESI
+	JMP	4$.S
+
+2$:	MOVL	knlTrmFirstTdb##, ESI
+4$:	CLRL	EAX
+	MOVL	tdb_next.B[ESI], EAX
+10$:	CMPL	SS:xffParm##, #0.B	;Have any device parameters?
+	JE	12$.S			;No
+	MOVL	EBX, #srvioparms	;Yes - process the device parameters
+	MOVL	ECX, #knlComDPParms##
+	LFSL	EDX, SS:xffParm##
+	CALL	knlProcDevParm##
+	JC	14$.S			;If error
+12$:	CLRL	EAX			;OK
+	MOVL	ECX, #1
+14$:	RET
+.PAGE
+	.SBTTL	sd_devparm - Device parameter function
+
+;Here for the device parameter function entry
+;	c{SS:EDX} = Offset of name buffer
+;	c{EDI}    = Offset of DCB
+;	CALL	srvdevparm
+;	C:set = Error
+;	  c{EAX} = Error code
+;	  c{ECX} = 0
+;	C:clr = Normal
+;	  c{EAX} = 0
+;	  c{ECX} = 1
+
+srvdevparm:
+	TESTL	SS:xffCmd##, #O$PHYS|O$RAW ;Raw or physical IO?
+	JE	2$.S			;No - fail!
+	ANDB	SS:xffCmd##, #~{O$IN|O$OUT} ;No IO allowed
+	MOVL	ECX, #1
+	CLRL	EAX
+	RET
+
+2$:	CLRL	ECX
+	JMP	knlIFnDev##
+.PAGE
+	.SBTTL	sd_inblock - Input block
+
+;Here for the input block entry
+;	c{ESI} = Offset of IORB
+;	c{EDI} = Offset of DCB
+;	CALL	srvinpblk
+;	c{EAX} = Error code
+;	c{EBX} = Status bits
+;	c{ECX} = Amount transfered
+
+srvinpblk:
+	CALL	knlIoQabLock##		;Lock the QAB
+	JC	2$.S			;If error
+	CALL	knlIoReadLock##		;Lock the input buffer
+	JC	2$.S			;If error
+	MOVB	iorb_queue.B[ESI], #dcb_inpframe
+	MOVL	iorb_routine.B[ESI], #srvinpblk1
+	JMP	knlXfQueue##		;Switch to extended fork context
+
+2$:	TOFORK
+	RET
+
+;Here in extended fork context
+
+srvinpblk1:
+	CMPL	tdb_next+dcb_pcntdb[EDI], #-1.B ;Is the TDB linked?
+	JE	notlnkd.S		;No - can't do this!
+	MOVL	SS:xffTimeOut##, #-1
+	CMPL	SS:xffParm##, #0.B	;Have any device parameters?
+	JE	4$.S			;No
+	MOVL	EBX, #srvioparms	;Yes - process parameters
+	MOVL	ECX, #knlComDPParms##
+	LFSL	EDX, SS:xffParm##
+	CALL	knlProcDevParm##
+	JC	12$.S			;If error
+4$:	CLRL	ECX
+	CMPL	SS:xffCount##, #0.B	;Really want any input?
+	JE	10$.S			;No - finished now
+	LESL	EBX, SS:xffBuffer1##
+6$:	CALL	getdsplist		;Get a data byte
+	JE	16$.S			;If nothing available
+	MOVB	ES:[EBX], AL		;Store byte in the user's buffer
+	INCL	EBX
+	INCL	ECX
+	CMPL	ECX, SS:xffCount##	;Can we take more now?
+	JB	6$.S			;Yes
+8$:	MOVL	EAX, tdb_dcb+dcb_pcntdb[EDI] ;No
+	TESTL	EAX, EAX
+	JE	10$.S
+	CALL	knlEndWaitAll##
+10$:	CLRL	EAX
+12$:	MOVL	EBX, #QSTS$DONE
+	RET
+
+;Here if the TDB has not been linked to the TDB list yet
+
+notlnkd:CLRL	ECX
+	MOVL	EAX, #ER_IFDEV
+	JMP	12$.S
+
+;Here if no data is available
+
+16$:	TESTL	ECX, ECX		;Did we get anything at all?
+	JNE	8$.S			;Yes - return it
+	MOVL	EAX, SS:xffTimeOut##	;No - get time-out value
+	CALL	knlXfWait##		;Wait for data
+	JNC	6$.S			;Continue if OK
+	JMP	12$.S			;If error
+.PAGE
+	.SBTTL	sd_outblock - Output block
+
+;Here for the output block entry
+;	c{ESI} = Offset of IORB
+;	c{EDI} = Offset of DCB
+;	CALL	srvoutblk
+;	c{EAX} = Error code
+;	c{EBX} = Status bits
+;	c{ECX} = Amount transfered
+
+srvoutblk:
+	CALL	knlIoQabLock##		;Lock the QAB
+	JC	2$.S			;If error
+	CALL	knlIoWriteLock##	;Lock the output buffer
+	JC	2$.S			;If error
+	MOVB	iorb_queue.B[ESI], #dcb_outframe
+	MOVL	iorb_routine.B[ESI], #srvoutblk1
+	JMP	knlXfQueue##		;Switch to extended fork context
+
+2$:	TOFORK
+	RET
+
+;Here in extended fork context
+
+srvoutblk1:
+	CMPL	tdb_next+dcb_pcntdb[EDI], #-1.B ;Is the TDB linked?
+	JE	notlnkd.S		;No - can't do this!
+	MOVL	SS:xffTimeOut##, #-1
+	CMPL	SS:xffParm##, #0.B	;Have any device parameters?
+	JE	4$.S			;No
+	MOVL	EBX, #srvioparms	;Yes - process parameters
+	MOVL	ECX, #knlComDPParms##
+	LFSL	EDX, SS:xffParm##
+	CALL	knlProcDevParm##
+	JC	14$.S			;If error
+4$:	CLRL	ECX
+	CMPL	SS:xffCount##, #0.B	;Really want any output?
+	JE	12$.S			;No - finished now
+	LESL	EBX, SS:xffBuffer1##
+	LEAL	ESI, dcb_pcntdb[EDI]
+6$:	TESTB	tdb_keysts2+dcb_pcntdb[EDI], #KS2$KEYINT ;Are we holding a real
+							 ;  mode interrupt?
+	JE	8$.S			;No - go on
+	MOVW	dcb_pcnkidxff.B[EDI], SS ;Yes - wait until finished
+	MOVL	EAX, SS:xffTimeOut##
+	CALL	knlXfWait##
+	MOVW	dcb_pcnkidxff.B[EDI], #0
+	JNC	6$.S
+	JMP	14$.S
+
+8$:
+
+;NEED TO WAIT HERE IF KB BUFFER IS FULL!!!
+
+	INCL	ECX
+	MOVZBL	EAX, ES:[EBX]
+	INCL	EBX
+	TESTB	AL, AL
+	JNS	10$.S
+	XORL	EAX, #8080h
+10$:	PUSHL	ES
+	PUSHL	EBX
+	PUSHL	ECX
+	PUSHL	EDI
+	CLRL	EDI			;Clear EDI to make sure we don't try
+	CALL	xosconKbdInp##		;  to use it in the keyboard input
+	POPL	EDI			;  routine!
+	POPL	ECX
+	POPL	EBX
+	POPL	ES
+	DECL	SS:xffCount##
+	JNE	6$.S
+12$:	CLRL	EAX
+14$:	MOVL	EBX, #QSTS$DONE
+	RET
+.PAGE
+	.SBTTL	srvspecial - Special device function for PCN server devices
+
+;Here for the QFNC_SPECIAL queued IO function for PCN class devices - Do
+;  special device functions
+;  Value returned depends of function if normal or is negative error code
+;    if error
+
+srvspecial:
+	CMPL	iorb_parm.B[ESI], #0.B	;Have any device parameters?
+	JE	2$.S			;No
+	MOVL	EBX, #srvioparms	;Yes - process parameters
+	MOVL	ECX, #knlComDPParms##
+	IFFAULT	knlQAdrErr0##
+	LFSL	EDX, iorb_parm.B[ESI]
+	CALL	knlProcDevParm##
+	JC	4$.S
+2$:	MOVZBL	EAX, iorb_option.B[ESI]	;Get function
+	CMPL	EAX, #SRVSFMAX.B	;Legal function?
+	JAE	knlIFnDevGQ##		;No
+	CALLI	srvsfdsp[EAX*4]		;Yes - dispatch on the subfunction
+	MOVL	EBX, #QSTS$DONE
+4$:	TOFORK
+	RET
+
+;Dispatch table for special device functions for PCN devices
+
+	DATA
+
+	.MOD	4
+srvsfdsp:
+	.LONG	knlIFnDevGQ##	;	       = 0. - Illegal
+	.LONG	setupbuf	;PCSF_SETBUF   = 1. - Set up buffer memory
+	.LONG	modifybuf	;PCSF_MODBUF   = 2. - Modify buffer memory
+	.LONG	modeset		;PCSF_MODESET  = 3. - Mode set complete
+	.LONG	disptype	;PCSF_DISPTYPE = 4. - Set display type
+	.LONG	fontset		;PCSF_FONTSET  = 5. - Set font parameters
+	.LONG	streammd	;PCSF_STREAMMD = 6. - Set to stream mode
+SRVSFMAX=!{$-srvsfdsp}/4
+
+	CODE
+.PAGE
+;Here for special device function PCSF_SETBUF - set up screen buffer
+;	c{qab_buffer1} = Base address of msect (must be a private msect)
+;	c{qab_count}   = Number of pages to use (Must be 8, msect must be at
+;			 least 64KB)
+
+;  The display buffer is set up at the beginning of the msect using the
+;  indicated number of pages.  The shadow is set up immediately following
+;  the display buffer, also using the indicated number of pages.  The pages
+;  used can be either real or virtual but must be writable.  Note that once
+;  the buffer is set up, the pages used cannot be deallocated until the device
+;  is closed.  The buffer cannot be changed or deallocated except by closing
+;  the server side device.
+
+2$:	MOVL	EAX, #ER_CCMSS
+	STC
+	RET
+
+4$:	MOVL	EAX, #ER_NOMEM
+	STC
+6$:	RET
+
+8$:	MOVL	EAX, #ER_MACFT
+	STC
+	RET
+
+9$:	MOVL	EAX, #ER_VALUE
+	STC
+	RET
+
+10$:	MOVL	EAX, #ER_IFDEV
+	STC
+	RET
+
+11$:	MOVL	EAX, #ER_NEMA
+	STC
+	RET
+
+setupbuf:
+	CMPL	iorb_count.B[ESI], #8.B
+	JNE	9$.S
+	MOVL	EDX, iorb_buffer1+0.B[ESI] ;Get msect offset
+	MOVZWL	EBP, iorb_buffer1+4.B[ESI] ;Get msect selector
+	CALL	knlGiveIorb##		;Give up the IORB
+	CMPB	dcb_punit.B[EDI], #0	;Is this a partial DCB?
+	JE	10$.S			;Yes - fail
+	CMPB	dcb_pcnbufslot.B[EDI], #0 ;Do we have a process slot allocated?
+	JNE	10$.S			;No - another reason to fail!
+	CMPL	knlMemAvail##, #4t.B	;Yes - have at least 4 pages available?
+	JB	11$.S			;No - fail
+	PUSHL	EDI			;Yes
+	CALL	knlFindMsect##		;Find the msect
+	MOVL	EBX, EDI
+	POPL	EDI
+12$:	JC	6$.S			;If error
+	JNE	4$.S			;If msect does not exist
+	MOVL	ECX, #16t
+	CMPL	mdb_size.B[EBX], ECX	;Is it big enough?
+	JB	8$.S			;No - fail
+	TESTB	mdb_sts.B[EBX], #MSS$FIXED ;No - can we use it?
+	JNE	8$.S			;No
+	MOVL	EDX, mdb_la.B[EBX]	;Yes - check all of the pages we will
+	SHRL	EDX, #10t		;  use
+	ADDL	EDX, #pgtable		;Change to page table offset
+	MOVL	dcb_pcnbufumap.B[EDI], EDX
+14$:	MOVL	EAX, [EDX]		;Get page table entry
+	NOTL	EAX
+	TESTB	AL, #03h		;Is page allocated and writable?
+	JNE	8$			;No - fail
+	CALL	knlGetMTE##		;Yes - get memory table entry
+	JE	8$			;There must be one!
+	CMPB	3.B[EAX], #0		;Is paged locked for IO?
+	JNE	8$			;Yes - fail
+	MOVL	EAX, [EAX]		;No
+	SHRL	EAX, #20t
+	CMPB	AL, #MT_PUSER		;Is this a private user page?
+	JNE	8$			;No - fail
+	ADDL	EDX, #4t.B		;Yes
+	LOOP	ECX, 14$		;Continue if more to check
+	MOVL	dcb_pcnbufmdb.B[EDI], EBX ;Save MDB offset
+	CALL	knlFindProc##		;Find a free process slot
+	JC	12$.S			;If error
+	MOVL	ECX, EAX
+	MOVL	EDX, EBX
+	CALL	knlGetGSelector##	;Get a selector for the buffer
+	JC	12$.S			;If error
+	MOVW	knlProcTable##[ECX*2], #1;OK - indicate slot is in use
+	CMPL	ECX, knlProcHigh##	;Is this a new high?
+	JBE	16$.S			;No
+	MOVL	knlProcHigh##, ECX	;Yes - update value
+16$:	INCL	knlProcInUse##		;Bump number of "processes" in use
+	MOVB	dcb_pcnbufslot.B[EDI], CL ;Store the slot number
+	MOVW	dcb_pcnbufsel.B[EDI], BX ;Store the selector
+	MOVL	EAX, EDX
+	SHRL	EAX, #10t		;Get offset of first page table entry
+	ADDL	EAX, #pgtable
+	MOVL	dcb_pcnbufxmap.B[EDI], EAX
+	MOVL	ECX, #DT_RWDATA+PL_0+{DC_PG+DC_32}*100h+{16t-1}*10000h
+	CALL	knlSetGDesc##		;Set up the buffer selector
+	MOVL	EBX, dcb_pcnbufmdb.B[EDI] ;Restore MDB offset
+	ORB	mdb_sts.B[EBX], #MSS$FIXED ;Indicate fixed msect now
+	MOVL	mdb_fault.B[EBX], #pcnfault ;Store offset of our fault routine
+	MOVL	EDX, dcb_pcnbufumap.B[EDI]
+	MOVL	EAX, #8t		;Get number of pages to use
+	MOVL	ECX, EAX
+	SHLL	EAX, #12t
+	MOVL	dcb_pcnbufshdw.B[EDI], EAX ;Store offset of shadow buffer
+	PUSHL	EBX
+	LEAL	EBX, dcb_pcnbufpte.B[EDI] ;Get offset of our map entry table
+	PUSHL	EDI
+	MOVL	ESI, dcb_pcnbufumap.B[EDI] ;Set up the exec map to map the
+	MOVL	EDI, dcb_pcnbufxmap.B[EDI] ;  pages
+	PUSHL	DS
+	POPL	ES
+	CLD
+	PUSHL	ECX
+18$:	LODSL	[ESI]			;Get page table entry
+	PUSHL	EAX
+	CALL	knlGetMTE2##		;Get memory table entry
+	ANDB	2.B[EAX], #0Fh		;Change this to a locked private page
+	ORB	2.B[EAX], #MT_PLOCK<4t
+	POPL	EAX
+	MOVL	[EBX], EAX		;Store in our DCB
+	ANDB	AH, #0F1h		;Change to physical page entry
+	IFFAULT	24$
+20$:	STOSL	[EDI]			;Store in exec page table
+	ADDL	EBX, #4t.B
+	LOOP	ECX, 18$		;Continue if more to copy
+	POPL	ECX			;Restore count for shadow buffer pages
+22$:	LODSL	[ESI]			;Get page table entry
+	PUSHL	EAX
+	CALL	knlGetMTE2##		;Get memory table entry
+	ANDB	2.B[EAX], #01h		;Change this to a locked private,
+	ORB	2.B[EAX], #MT_PLOCK<4t	;  physical page
+	POPL	EAX
+	STOSL	[EDI]			;Store page table entry
+	LOOP	ECX, 22$		;Continue if more to copy
+	POPL	EDI			;Restore DCB offset
+	POPL	EBX			;Restore MDB offset
+	MOVL	mdb_remove.B[EBX], #2$	;Make the MDB unremoveable
+	ORB	mdb_sts.B[EBX], #MSS$FIXED
+	LEAL	ESI, dcb_pcntdb[EDI]
+	MOVL	mdb_devpnt.B[EBX], ESI	;Link MDB to the TDB
+	ORB	tdb_stsmisc.B[ESI], #TSM$MAPPED ;Indicate mapped console device
+	MOVL	ECX, #8t		;Return the buffer size
+	RET				;Finished
+
+;Here if have page fault trying to store into the map for the exec buffer
+;  - allocate a page table
+
+	FAULTHDR
+24$:	PUSHL	EBX
+	LEAL	EBX, -pgtable[EDI]	;Get page table offset in right register
+	CALL	knlGetPgTbl##		;Allocate a page table
+	POPL	EBX
+	JNC	20$.S			;Continue if OK
+	CRASH	CNAM			;[CanNot Allocate Memory]
+.PAGE
+;Here for special device function PCSF_MODBUF - modify screen buffer allocation
+;  - this function provides page-by-page control of the screen buffer
+;	c{qab_buffer1} = Address of buffer page list
+;	c{qab_count}   = Number of buffer page list entries
+;  Each buffer page list entry is consists of 4 bytes.  The low 3 bytes specify
+;  a page number relative to the start of the buffer.  The high byte specifies
+;  the new state for the page as follows:
+;	0 = Blocked
+;	1 = Read-only
+;	2 = Read/write
+
+modifybuf:
+	MOVL	EAX, #ER_NIYT
+	CLRL	EAX
+	RET
+.PAGE
+;Here for special device function PCSF_FONTSET - Font set complete
+;	c{qab_buffer1} = Address of data block containing font set values.
+
+;Format of the data block (each item is 4 bytes):
+;	Active fonts
+;	Number of text columns
+;	Number of text rows
+;	Number of horizontal pixels
+;	Number of vertical pixels
+
+fontset:TESTB	dcb_pcnsts1.B[EDI], #PCNS1$FONTWT ;Are we expecting this?
+	JE	knlIFnDev##		;No - fail!
+	PUSHL	iorb_buffer1+4.B[ESI] ;Yes - get address of his data block
+	PUSHL	iorb_buffer1+0.B[ESI]
+	CALL	knlGiveIorb##		;Give up the IORB
+	POPL	ESI
+	POPL	EDX
+	IFFAULT	knlQAdrErr0##
+	MOVL	ES, EDX
+	CLD
+	CALL	getdsppm		;Get display parameters
+	JC	6$.S
+	ANDB	dcb_pcnsts1.B[EDI], #~PCNS1$FONTWT ;Indicate have mode data
+	TOFORK
+	LEAL	EAX, dcb_pcntdb[EDI]	;Wait up any main program level waiters
+	CALL	knlEndWaitAll##
+	FROMFORK
+	CLRL	ECX
+6$:	RET
+.PAGE
+;Here for special device function PCSF_MODESET - Mode set complete
+;	c{qab_buffer1} = Address of data block containing mode set values.
+;			   This is the data block filled in the the
+;			   svcTrmDspMode system call preceeded by the long
+;			   value returned by that call.
+
+;Format of the data block (each item is 4 bytes):
+;	Mode bits
+;	Active fonts
+;	Number of text columns
+;	Number of text rows
+;	Number of horizontal pixels
+;	Number of vertical pixels
+;	Display type value
+
+modeset:TESTB	dcb_pcnsts1.B[EDI], #PCNS1$MODEWT ;Are we expecting this?
+	JE	knlIFnDev##		;No - fail!
+	PUSHL	iorb_buffer1+4.B[ESI] ;Yes - get address of his data block
+	PUSHL	iorb_buffer1+0.B[ESI]
+	CALL	knlGiveIorb##		;Give up the IORB
+	POPL	ESI
+	POPL	EDX
+	IFFAULT	knlQAdrErr0##
+	MOVL	ES, EDX
+	CLD
+	IFFAULT	knlQAdrErr0##
+	LODSL	ES:[ESI]		;Get mode bits
+	BTZL	EAX, #DM%RTNDATA	;Don't change the return data bit
+
+	ANDL	EAX, #~{DM$BIOSMODE|DM$USEDATA}
+;;;;;;	ANDL	tdb_dspmode+dcb_pcntdb[EDI], #DM$RTNDATA
+;;;;;;	ORL	tdb_dspmode+dcb_pcntdb[EDI], EAX
+	MOVL	tdb_pgsize+dcb_pcntdb[EDI], #1000h
+
+;;;;	MOVL	tdb_vaddr+dcb_pcntdb[EDI], #0A0000h ;Always funny color mode
+
+	MOVL	tdb_bioreg+dcb_pcntdb[EDI], #3D4h
+	CALL	getdsppm		;Get display parameters
+	JC	6$.S
+	IFFAULT	knlQAdrErr0##
+	LODSL	ES:[ESI]		;Get display type
+;;;;;;;	MOVL	tdb_disptype+dcb_pcntdb[EDI], EAX
+	ANDB	dcb_pcnsts1.B[EDI], #~PCNS1$MODEWT ;Indicate have mode data
+	TOFORK
+	LEAL	EAX, dcb_pcntdb[EDI]	;Wait up any main program level waiters
+	CALL	knlEndWaitAll##
+	FROMFORK
+	CLRL	ECX
+	RET
+
+;Here if error
+
+6$:	FROMFORK
+	STC
+	RET
+.PAGE
+;Subroutine to store display parameters - called by modeset and fontset routines
+
+getdsppm:
+	IFFAULT	knlQAdrErr0##
+	LODSL	ES:[ESI]		;Get fonts
+	SHRL	EAX, #16t
+;;;;;;	MOVB	tdb_prifont+dcb_pcntdb[EDI], AL
+;;;;;;	MOVB	tdb_secfont+dcb_pcntdb[EDI], AH
+	IFFAULT	knlQAdrErr0##
+	LODSL	ES:[ESI]		;Get number of text columns
+	MOVL	tdb_columns+dcb_pcntdb[EDI], EAX
+	IFFAULT	knlQAdrErr0##
+	LODSL	ES:[ESI]		;Get number of text rows
+	CMPL	EAX, #12t.B		;Number of rows too small?
+	JA	6$.S			;No
+	MOVB	AL, #12t		;Yes - make it the mimimum
+6$:	MOVB	tdb_rows+dcb_pcntdb[EDI], AL
+	MOVB	tdb_scnbtm+dcb_pcntdb[EDI], AL
+	MOVB	tdb_scntop+dcb_pcntdb[EDI], #1
+	MOVL	ECX, EAX
+	IFFAULT	knlQAdrErr0##
+	LODSL	ES:[ESI]		;Get number horizontal pixels
+	MOVL	tdb_horiz+dcb_pcntdb[EDI], EAX
+	IFFAULT	knlQAdrErr0##
+	LODSL	ES:[ESI]		;Get number vertical pixels
+	MOVL	tdb_vert+dcb_pcntdb[EDI], EAX
+	CLRL	EDX			;Calculate font height
+	DIVL	ECX
+	CMPL	EAX, #8t.B		;Too small?
+	JA	8$.S			;No
+	MOVB	AL, #8t			;Yes - make it the minimum
+8$:	CMPL	EAX, #32t.B		;Too big?
+	JB	10$.S			;No
+	MOVB	AL, #32t		;Yes - make it the maximum
+10$:	MOVB	tdb_charch+dcb_pcntdb[EDI], AL ;Store font height
+	CLC
+	RET
+.PAGE
+;Here for special device function PCSF_DISPTYPE - Set display type
+;	c{qab_count} = Display type value
+
+disptype:
+	MOVL	EAX, iorb_count.B[ESI]	;Get value
+	MOVL	tdb_disptype+dcb_pcntdb[EDI], EAX ;Store it in the TDB
+	CALL	knlGiveIorb##
+	CLRL	EAX
+	CLRL	ECX
+	RET
+.PAGE
+;Here for special device function PCSF_STREAMMD - Set to stream mode - this is
+;  normally called after a leaving mapped mode software interrupt to switch
+;  back to normal stream mode operation
+
+streammd:
+	CALL	knlGiveIorb##		;Give up the IORB
+	CLRL	ECX			;Clear ECX in case nothing to do
+	TESTB	dcb_pcnsts1.B[EDI], #PCNS1$MAPPED ;In mapped mode now?
+	JE	8$.S			;No - nothing needed here!
+	LEAL	ESI, dcb_pcntdb[EDI]	;Yes - get offset of our TDB
+	PUSHL	EDI
+	CALL	pcngetchngd#		;Update page changed bits
+	TOFORK
+	CALL	pcntostream#		;Set to stream mode
+	CALL	knlTrmOutDone##		;Wake up anyone who might be waiting
+	MOVL	EBX, #7			;Send any changed cursor position
+4$:	CALL	pcnsendcurpos#		;  values
+	DECL	EBX
+	JNS	4$.S
+	POPL	EDI
+	CMPL	dcb_pcndsptak.B[EDI], #0.B ;Have any data for the server?
+	JE	6$.S			;No
+	CMPW	dcb_inpframe.B[EDI], #0.B ;Someone waiting for input?
+	JE	6$.S			;No
+	CALL	knlResumeInput##	;Yes - wake him up
+6$:	MOVZBL	ECX, dcb_pcnpgchngd.B[EDI] ;Return page changed bits
+	MOVB	dcb_pcnpgchngd.B[EDI], #0
+	FROMFORK
+8$:	CLRL	EAX
+	RET
+.PAGE
+	.SBTTL	pcnfault - Page fault routine
+
+;Here on a page fault when referencing a buffer page.  This will be due to an
+;  attempt to write to a read-only buffer page which must mean that the PCN
+;  device was in stream mode.  We make all screen buffer pages read-write and
+;  switch to mapped mode.  We also start a timer to end mapped in a short time.
+;	c{EDI} = Offset of MDB
+
+pcnfault:
+	MOVL	ESI, mdb_devpnt.B[EDI]	;Get offset of the PCN TDB
+	TESTB	dcb_pcnsts1-dcb_pcntdb[ESI], #PCNS1$MAPPED ;In mapped mode now?
+	JNE	2$.S			;Yes - big problem!!
+pcntomapped::
+	CMPL	dcb_pcnmapwake-dcb_pcntdb[ESI], #0.B
+2$:	JNE	10$
+	MOVL	EDI, ESI		;Enter timer request to end mapped mode
+	MOVL	EBX, #endmapped
+	MOVL	EAX, #5t
+	TOFORK
+	CALL	knlWakeRequest##
+	JC	8$.S			;If error
+	MOVL	dcb_pcnmapwake-dcb_pcntdb[EDI], ESI ;OK
+	MOVL	ESI, EDI
+	CMPL	dcb_pcndsptak-dcb_pcntdb[ESI], #0.B ;Have any data for the
+						    ;  server?
+	JE	4$.S			;No
+	CMPW	dcb_inpframe-dcb_pcntdb[ESI], #0.B ;Someone waiting for input?
+	JE	4$.S			;No
+	LEAL	EDI, -dcb_pcntdb[ESI]	;Yes - point to our DCB
+	CALL	knlResumeInput##	;Wake him up
+4$:	FROMFORK
+	MOVZWL	ECX, dcb_pcnbufsel-dcb_pcntdb[ESI] ;Get selector
+	MOVB	BH, gdtable+st_baseh[ECX]  ;Get linear address for buffer
+	MOVB	BL, gdtable+st_base+2[ECX] ;  segment
+	SHLL	EBX, #16t
+	MOVW	BX, gdtable+st_base+0[ECX]
+	SHRL	EBX, #12t		;Get index table index
+	MOVL	ECX, #8t		;Get number of exec mapped pages
+6$:	ANDB	pgtable[EBX*4], #~40h	;Clear the dirty bit
+	INCL	EBX
+	LOOP	ECX, 6$
+	MOVL	ECX, #setmapped		;Change all of the maps to allow
+	CALL	xosconScanMs##		;  writes and clear the dirty bits
+	MOVB	dcb_pcnpgchngd-dcb_pcntdb[ESI], #0 ;Clear page changed bits
+	ORB	dcb_pcnsts1-dcb_pcntdb[ESI], #PCNS1$MAPPED
+					;Indicate in mapped mode now
+	RET				;Return with C clear to indicate we
+					;  should re-do the memory access
+
+;Here if can't enter wake request - just let the memory access fail
+
+8$:	FROMFORK
+	STC
+	RET
+
+10$:	CRASH	PCNM
+
+;Subroutine called by conScanMs for each memory map when setting to mapped mode
+;	c{EDX} = Offset of MDB for msect which maps display
+;	c{ESI} = Offset of TDB
+;	CALL	setmapped
+
+setmapped:
+	MOVL	ECX, mdb_size.B[EDX]	;Get number of buffer pages
+	MOVL	EBX, mdb_la.B[EDX]	;Get linear address for the msect
+	SHRL	EBX, #10t		;Change to page table offset
+	ADDL	EBX, #pgtable
+	PUSHL	EDX				   ;Get offset of first map
+	LEAL	EDX, dcb_pcnbufpte-dcb_pcntdb[ESI] ;  entry for buffer
+12$:	MOVL	EAX, [EDX]		;Get page table entry
+	ANDB	AL, #~40h		;Clear the dirty bit
+	MOVL	[EBX], EAX		;Store it in this map
+	ADDL	EDX, #4t.B
+	ADDL	EBX, #4t.B
+	LOOP	ECX, 12$
+	POPL	EDX
+ret010:	RET
+.PAGE
+	.SBTTL	endmapped - Subroutine to terminate mapped mode
+
+;Subroutine to terminate mapped mode.  This is usually called as a wake routine
+;  at scheduler level raised to device fork level.  It can also be called as
+;  a subroutine at main program level raised to device fork level.  We first
+;  switch to blocked mode, which means that any attempt to access the screen
+;  buffer (including display mode changes) will block until we leave blocked
+;  mode.  We also interrupt the server side program, giving it the page changed
+;  bits as interrupt data.  This allows the server side program to determine
+;  what  changes have been made to the display buffer and update the shadow
+;  buffer to match without interference from any client side programs.  When
+;  the server side program is finished with this, it will do a PCSF_UNBLOCK
+;  special device function to switch the device back to stream mode.
+;	c{EDI} = Offset of TDB
+;	CALL	endmapped
+;	C:clr always
+
+endmapped:
+	MOVL	ESI, EDI		;Get TDB offset in right register
+	LEAL	EDI, -dcb_pcntdb[ESI]	;Get offset of the PCN DCB
+	CLRL	EAX
+	MOVL	dcb_pcnmapwake.B[EDI], EAX
+	CALL	pcngetchngd#		;Get current page changed bits
+	MOVZBL	EAX, dcb_pcnmmdvect.B[EDI] ;Get vector number
+	TESTL	EAX, EAX
+	JE	6$.S			;If no interrupt wanted
+	CALL	knlGetQel##		;Get a QEL
+	JC	4$.S			;Forget it if error
+	MOVB	slb_szindx.B[ESI], #0
+	MOVB	BL, #SIGT_NORMAL
+	MOVB	BH, #1			;Only allow 1 outstanding interrupt
+	MOVL	ECX, #2			;We have 2 data items
+	MOVL	EDX, dcb_pcnintdata.B[EDI] ;Store the first data item
+	MOVL	slb_data+0.B[ESI], EDX
+	MOVZBL	EDX, dcb_pcnpgchngd.B[EDI] ;Second data item is the page
+	MOVL	slb_data+4.B[ESI], EDX	   ;  changed bits
+	MOVB	dcb_pcnpgchngd.B[EDI], #0 ;Clear the page changed bits
+	MOVW	ES, dcb_pcnmmdpda.B[EDI] ;Get PDA selector
+	CLRL	EDX
+	CALL	knlReqSignal##		;Request the interrupt
+4$:	CLC
+6$:	RET
+.PAGE
+	.SBTTL	sd_close - Close device
+
+;Here for the close device entry
+;	c{ECX} = Close option bits
+;	c{EDI} = Offset of DCB
+;	c{ESI} = Offset of device table entry
+;	CALL	srvclose
+;	C:set = Error
+;	C:clr = Normal
+
+srvclose:
+	PUSHL	#0.B
+	CMPL	iorb_parm.B[ESI], #0.B	;Have any device parameters?
+	JE	4$.S			;No
+	MOVL	EBX, #srvioparms	;Yes - process the device parameters
+	MOVL	ECX, #knlComDPParms##
+	LFSL	EDX, iorb_parm.B[ESI]
+	CALL	knlProcDevParm##
+	JNC	4$.S			;If OK
+	MOVL	[ESP], EAX		;Error - store error code
+4$:	CMPL	dcb_opencnt.B[EDI], #1.B ;Is this last close?
+	JNE	14$			;No
+	CMPW	dcb_sunit.B[EDI], #0.B	;Yes - have a TDB?
+	JE	14$			;No
+	CMPB	dcb_pcnbufslot.B[EDI], #0 ;Yes - do we have a buffer?
+	JE	10$.S			;No
+	PUSHL	ESI			;Yes
+	MOVZWL	EBX, dcb_pcnbufsel.B[EDI] ;Get buffer selector
+	MOVZBL	EDX, dcb_pcnbufslot.B[EDI] ;And get slot number
+	CALL	knlGiveProcSlot##	;Give up the process slot
+	LEAL	ESI, dcb_pcntdb[EDI]	;Get offset of the PDB
+	MOVL	ECX, #unmapbfr		;Make sure not mapped by anyone
+	CALL	xosconScanMs##
+	MOVB	dcb_pcnbufslot.B[EDI], #0
+	MOVL	EBX, dcb_pcnbufmdb.B[EDI]
+	MOVL	mdb_remove.B[EBX], #retclc ;Make the MDB removeable now
+	ANDB	mdb_sts.B[EBX], #~MSS$FIXED
+	MOVL	EDX, mdb_la.B[EBX]
+	SHRL	EDX, #10t
+	ADDL	EDX, #pgtable		;Change to page table offset
+	MOVL	ECX, #8t		;Get number of buffer pages
+6$:	CALL	knlGetMTE##		;Get memory table entry
+	ANDB	2.B[EAX], #0Fh		;Change this to a normal private page
+	ORB	2.B[EAX], #MT_PUSER<4t
+	ADDL	EDX, #4.B
+	LOOP	ECX, 6$			;Continue if more to change
+	MOVL	ECX, #8t		;Clear the exec mapping
+	ADDL	ECX, ECX
+	CLRL	EAX
+	PUSHL	DS
+	POPL	ES
+	CLD
+	PUSHL	EDI
+	MOVL	EDI, dcb_pcnbufxmap.B[EDI]
+	RSTOSL	[EDI]
+	POPL	EDI
+	POPL	ESI
+10$:	CMPL	dcb_pcntdb+tdb_dcb[EDI], #0.B ;Is a terminal device attached?
+	JE	14$.S			;No
+	PUSHL	ESI			;Yes - detach it
+	PUSHL	EDI
+	LEAL	ESI, dcb_pcntdb[EDI]
+	MOVL	EDI, [ESI]
+	MOVZWL	EBX, dcb_sesproc.B[EDI]	;Get session PDA
+	TESTL	EBX, EBX
+	JE	12$.S			;Just in case
+	MOVW	ES, knlProcTable#[EBX*2]
+	MOVL	ECX, ES:pdaHndlTbl##	;Point to his device table
+	CMPL	ES:DH_STDTRM*32t[ECX], EDI ;Is this the controlling terminal?
+	JNE	12$.S			;No - do nothing!
+	ANDB	tdb_stsinp.B[ESI], #~TSI$INACT ;Yes - kill current input
+	PUSHL	ESI			       ;  operation
+	TOFORK
+	CLRL	ECX			;Termination status = 0
+	MOVL	EAX, #VECT_HNGUP	;Hangup signal
+	CALL	knlIntrpProc##		;Signal or kill the process
+	FROMFORK
+	POPL	ESI
+12$:	CALL	knlTrmDetach##
+	POPL	EDI
+	POPL	ESI
+14$:	POPL	EAX			;Restore error code
+	TOFORK
+	JMP	knlCloseFin##		;Go finish up
+
+;Subroutine called by conScanMs for each mapped msect - this changes the msect
+;  to map non-existant memory
+;	c{EDX} = Offset of MDB
+;	c{ESI} = Offset of TDB
+;	CALL	unmapbfr
+
+unmapbfr:
+	PUSHL	EDI
+	MOVL	EDI, mdb_la.B[EDX]	;Get linear address of msect
+	MOVL	ECX, mdb_size.B[EDX]	;Get size of msect
+	SHRL	EDI, #10t		;Get index into page map
+	ADDL	EDI, #pgtable
+	MOVL	EAX, knlNonExMem##
+	ORB	AL, #67h
+	PUSHL	DS
+	POPL	ES
+	CLD
+	RSTOSL	[EDI]
+	POPL	EDI
+	MOVL	mdb_remove.B[EDX], #retclc
+	CLRL	EAX
+	MOVL	mdb_devpnt.B[EDX], EAX
+	RET
+.PAGE
+	.SBTTL	putdsplist - Put character into a display list
+
+;Subroutine to put a character into a display list - this is called by the
+;  client device to store display characters being sent to the server device
+;	c(AL)  = Character
+;	c{ESI} = Offset of terminal TDB
+;	CALL	putdsplist
+;  All registers are preserved
+
+putdsplist::
+	REQUIREFORK
+	PUSHL	EBX
+	MOVL	EBX, dcb_pcndspput-dcb_pcntdb[ESI]
+	TESTL	EBX, EBX		;Do we have a display list now?
+	JNE	10$.S			;Yes
+	LEAL	EBX, -dcb_pcntdb[ESI]	;No
+	CMPL	dcb_pcnoatnext.B[EBX], #-1.B ;In once-a-tick list now?
+	JNE	20$.S			;Yes - big problem
+	PUSHL	EDX
+	MOVL	EDX, pcnoattail		;No - is the once-a-tick list empty?
+	TESTL	EDX, EDX
+	JNE	2$.S			;No
+	MOVL	pcnoathead, EBX		;Yes
+	JMP	4$.S
+
+2$:	MOVL	dcb_pcnoatnext.B[EDX], EBX
+4$:	MOVL	dcb_pcnoatprev.B[EBX], EDX
+	MOVL	pcnoattail, EBX
+	CLRL	EDX
+	MOVL	dcb_pcnoatnext.B[EBX], EDX
+	POPL	EDX
+	PUSHL	ESI
+	CALL	knlGetQel##		;Get a chunk
+	MOVL	EBX, ESI
+	MOVL	[EBX], #0
+6$:	POPL	ESI
+	JC	14$.S			;If error
+	ADDL	EBX, #4.B
+	MOVL	dcb_pcndsptak-dcb_pcntdb[ESI], EBX ;Set up the list
+	JMP	12$.S			;Continue
+
+;Here if already have a display list
+
+10$:	TESTB	BL, #3Fh		;At end of a chunk?
+	JNE	12$.S			;No
+	SUBL	EBX, #40h.B		;Yes - point to start of chunk
+	PUSHL	ESI
+	CALL	knlGetQel##		;Get another chunk
+	JC	6$.S			;If error
+	MOVL	[EBX], ESI		;OK - link to previous chunk
+	MOVL	EBX, ESI
+	POPL	ESI
+	MOVL	[EBX], #0
+	ADDL	EBX, #4.B		;Point to first data byte
+12$:	MOVB	[EBX], AL		;Store character
+	INCL	EBX			;Bump pointer
+	MOVL	dcb_pcndspput-dcb_pcntdb[ESI], EBX
+	INCL	dcb_pcndspcnt-dcb_pcntdb[ESI]
+14$:	POPL	EBX
+	RET
+
+20$:	CRASH	AIOL			;[Already In Once-a-tick List]
+.PAGE
+	.SBTTL	getdsplist - Subroutine to get character from a display list
+
+;Subroutine to get a character from a display list - this is called by the
+;  server side device to get characters sent by the client side device
+;	CALL	getdsplist
+;	Z:set = Nothing available
+;	Z:clr = Have character
+;	  c(AL) = Character
+;  EBX, ECX, and ES are respected
+
+getdsplist:
+	REQUIREFORK
+	MOVL	ESI, dcb_pcndsptak.B[EDI] ;Get taker pointer
+	TESTL	ESI, ESI		;Have a list now?
+	JE	6$.S			;No - nothing there
+	MOVZBL	EAX, [ESI]		;Yes - get character
+	DECL	dcb_pcndspcnt.B[EDI]	;Reduce count
+	JE	10$.S			;If list is empty now
+	JS	8$.S			;Just to be safe, check this!
+	INCL	ESI			;Bump the pointer
+	TESTL	ESI, #03Fh		;At end of chunk?
+	JNE	4$.S			;No
+	SUBL	ESI, #40h.B		;Yes - point to beginning of chunk
+	PUSHL	[ESI]			;Save offset of next chunk
+	CALL	knlGiveQel##		;Give up this chunk
+	POPL	ESI			;Restore offset of next chunk
+	TESTL	ESI, ESI		;Have another one?
+	JE	8$.S			;No - big problem
+	ADDL	ESI, #4.B		;Yes - point to first data byte
+4$:	MOVL	dcb_pcndsptak.B[EDI], ESI ;Update taker pointer (Z is always
+6$:	RET				  ;  clear here)
+
+8$:	CRASH	BDDL			;[BaD Display List]
+
+;Here if display list is empty now
+
+10$:	ANDL	ESI, #0FFFFFFC0h.B	;Point to beginning of chunk
+	CMPL	[ESI], #0.B		;Have another chunk linked?
+	JNE	8$.S			;Yes - big problem!
+	CALL	knlGiveQel##		;No - give up the chunk
+	MOVL	ESI, dcb_pcnoatprev.B[EDI] ;Remove this DCB from the
+	MOVL	EDX, dcb_pcnoatnext.B[EDI] ;  once-a-tick list
+	TESTL	ESI, ESI
+	JNE	12$.S
+	MOVL	pcnoathead, EDX
+	JMP	14$.S
+
+12$:	MOVL	dcb_pcnoatnext.B[ESI], EDX
+14$:	TESTL	EDX, EDX
+	JNE	16$.S
+	MOVL	pcnoattail, ESI
+	JMP	18$.S
+
+16$:	MOVL	dcb_pcnoatprev.B[EDX], ESI
+18$:	MOVL	dcb_pcnoatnext.B[EDI], #-1
+	MOVL	dcb_pcnoatprev.B[EDI], #-1
+
+	CMPL	pcnoathead, EDI
+	JE	20$.S
+	CMPL	pcnoattail, EDI
+	JNE	22$.S
+20$:	CRASH	LIST
+22$:
+
+	PUSHL	EAX
+	PUSHL	EDI
+	LEAL	ESI, dcb_pcntdb[EDI]
+	CALL	knlTrmOutDone##
+	POPL	EDI
+	POPL	EAX
+	CLRL	ESI
+	MOVL	dcb_pcndspput.B[EDI], ESI
+	MOVL	dcb_pcndsptak.B[EDI], ESI
+	TESTL	ESP, ESP		;Clear Z
+	JMP	4$.S			;Go finish up
+.PAGE
+	.SBTTL	pcnoat - Once-a-tick routine
+
+;Once-a-tick routine
+
+pcnoat:	TOFORK
+	MOVL	EDI, pcnoathead
+	TESTL	EDI, EDI
+	JE	10$.S
+2$:	CMPL	dcb_pcndsptak.B[EDI], #0.B ;Have any data for the server?
+	JE	8$.S			;No
+	CMPW	dcb_inpframe.B[EDI], #0.B ;Is someone waiting for input?
+	JE	8$.S			;No
+	CALL	knlResumeInput##	;Yes - wake him up
+8$:	MOVL	EDI, dcb_pcnoatnext.B[EDI]
+	TESTL	EDI, EDI
+	JNE	2$.S
+10$:	FROMFORK
+	RET
+.PAGE
+	DATA
+
+	.MOD	4
+lit3::	   .LONG  3t
+lit128::   .LONG  128t
+pcnccb:    .BLKB  ccb_SIZE	;PCN CCB
+pcndcbnum: .LONG  0		;Number of in use PCN DCBs
+pcndcbmax: .LONG  0		;Maximum number of in use PCN DCBs
+pcndcblmt: .LONG  10000t	;Maximum number of PCN DCBs allowed
+pcnoathead:.LONG  0		;Once-a-tick list head pointer
+pcnoattail:.LONG  0		;Once-a-tick list tail pointer
+
+	LKEEND

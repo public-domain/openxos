@@ -1,0 +1,233 @@
+	.TITLE	DISKCHK - Transient LKE to see which disks exist
+
+;*--------------------------------------------------------------------------*
+;* DISKCHK.M86
+;*
+;* Written by: John R. Goltz
+;*
+;* Edit History:
+;* 1.0.0  20-Apr-99 JRG - Original version
+;*
+;*--------------------------------------------------------------------------*
+
+;++++
+; This software is in the public domain.  It may be freely copied and used
+; for whatever purpose you see fit, including commerical uses.  Anyone
+; modifying this software may claim ownership of the modifications, but not
+; the complete derived code.  It would be appreciated if the authors were
+; told what this software is being used for, but this is not a requirement.
+
+;   THIS SOFTWARE IS PROVIDED BY THE AUTHORS "AS IS" AND ANY EXPRESS OR
+;   IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
+;   OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+;   IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+;   INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+;   BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS
+;   OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+;   ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR
+;   TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
+;   USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+;----
+
+	.PROC	80486
+	.INCLUD	XOSINC:\XMAC\XOS.PAR
+	.INCLUD	XOSINC:\XMAC\XOSX.PAR
+	.INCLUD	XOSINC:\XMAC\XOSERR.PAR
+	.INCLUD	XOSINC:\XMAC\XOSTIME.PAR
+	.INCLUD	XOSINC:\XMAC\XOSLKE.PAR
+	.INCLUD	XOSINC:\XMAC\XOSXLKE.PAR
+	.INCLUD	SCSI.PAR
+
+MAJV   =!1t
+MINV   =!0t
+EDITNUM=!0t
+
+MSK$IDE0  =!01h
+MSK$IDE1  =!02h
+MSK$IDE2  =!04h
+MSK$IDE3  =!08h
+MSK$SCSIA0=!10h
+
+;This LKE is used to report which disks exist in the system before loading
+;  disk drivers
+
+	LKEHEAD	DISKCHK, MAJV, MINV, EDITNUM, LKETYPE_TRANS
+
+	.SBTTL	Initialization routine
+
+	INITSUB	diskchkinit
+
+diskchkinitblk:				;Characteristics description
+ DCHARBGN  2, knlDCharValCom##			;  block for initialization
+ DCHARENT  MASK  , HEXV, , 4, 0, 0     , valmask, 0
+ DCHARENT  RESULT, STR , , 0, 0, resstr, 0      , 0
+DATASIZE=!$-diskchkinitblk
+
+XMBINDEX DATAINDEX, DATASIZE
+
+;Initialization subroutine (since this is an init-only LKE, the initialization
+;  subroutine contains all the executable code in the LKE)
+;	c{FS:EDX} = Address of characteristics list
+;	CALL	diskchkinit
+;	C:set = Error code
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  c{ECX} = Offset of first code byte to not save
+;	  c{EDX} = Offset of first data byte to not save
+
+$$$=!0
+FRM dc_mask   , 4t
+FRM dc_data   , 4t
+dc_SIZE=!$$$
+
+diskchkinit::
+	ENTER	dc_SIZE, 0
+	CLRL	EAX
+	MOVL	dc_mask.B[EBP], EAX
+	MOVL	ECX, #DATAINDEX
+	CALL	knlGetXmb##
+	JC	10$.S
+	MOVL	dc_data.B[EBP], ESI
+	MOVL	EBX, ESI
+	CLD
+	MOVL	EDI, ESI
+	PUSHL	DS
+	POPL	ES
+	MOVL	ESI, #diskchkinitblk
+	MOVL	ECX, #{DATASIZE+3}/4
+	RMOVSL	[EDI], CS:[ESI]
+	TESTL	EDX, EDX		;Have a characteristics list?
+	JE	2$.S			;No
+	CALL	knlAddUnitChar##	;Yes - process the characteristics
+	JC	10$.S			;If error
+2$:	MOVL	EDX, #1F6h
+	MOVB	AL, #0A0h
+	MOVB	CL, #MSK$IDE0
+	CALL	checkide
+	MOVL	EDX, #1F6h
+	MOVB	AL, #0B0h
+	MOVB	CL, #MSK$IDE1
+	CALL	checkide
+	MOVL	EDX, #176h
+	MOVB	AL, #0A0h
+	MOVB	CL, #MSK$IDE2
+	CALL	checkide
+	MOVL	EDX, #176h
+	MOVB	AL, #0B0h
+	MOVB	CL, #MSK$IDE3
+	CALL	checkide
+	CALL	checkscsia
+	MOVL	ESI, dc_data.B[EBP]
+	MOVL	ECX, #DATAINDEX
+	CALL	knlGiveXmb##
+	MOVL	EAX, dc_mask.B[EBP]
+	CLC
+10$:	CLRL	EDX
+	MOVL	ECX, #codebeginDISKCHK
+	LEAVE
+	RET
+.PAGE
+;Subroutine to determine if an IDE disk exists
+;	c(AL)  = Drive select value
+;	c(CL)  = Mask bit
+;	c{EDX} = Base IO register
+;	CALL	checkide
+
+;There is a major problem with detecting the existance of an IDE slave unit.
+;  An ATAPI master unit without a slave unit is REQUIRED to shadow registers
+;  for the non-existant slave unit, giving the appearance that a slave unit
+;  exists!  According to the ATAPI spec, the only way to tell if there is
+;  a slave unit is to do a command to the slave unit and see if it is aborted.
+;  We have observed that not all current ATAPI units actually do this!  In
+;  fact, the newer units seem to tend not to.  Since this code is simply
+;  probing, there is no really safe way to issue a command here, thus this code
+;  may return a false positive in this situation.  The addunit operation done
+;  on this unit should indicate an aborted command error, which should be taken
+;  to mean the slave unit does not exist.
+
+checkide:
+	TESTB	dc_mask.B[EBP], CL	;Want to check this disk?
+	JE	6$.S			;No
+	OUTB	[DX]			;Select the drive
+	IOPAUSE
+	DECL	EDX			;Point to cylinder/count high byte
+	MOVB	AL, #55h		;Write a value
+	OUTB	[DX]
+	IOPAUSE
+	DECL	EDX			;Point to low byte
+	MOVB	AL, #82h		;Write a value
+	OUTB	[DX]
+	IOPAUSE
+	INCL	EDX
+	INB	[DX]
+	CMPB	AL, #55h
+	JNE	4$.S			;Not there
+	DECL	EDX			;Maybe there
+	INB	[DX]
+	CMPB	AL, #82h
+	JNE	4$.S			;Not there
+	ADDL	EDX, #3.B		;Now check the status register
+	INB	[DX]
+	TESTB	AL, #40h		;Is the drive ready?
+	JNE	6$.S			;Yes - assume its there (see comment
+					;  above)
+4$:	NOTB	CL			;Not there - clear the drive's bit
+	ANDB	dc_mask.B[EBP], CL
+6$:	RET
+.PAGE
+checkscsia:
+	TESTB	dc_mask.B[EBP], #MSK$SCSIA0
+	JE	6$.S
+	MOVL	EDX, #330h		;Point to the control/status register
+	MOVB	AL, #80h		;Try a hard reset
+	OUTB	[DX]
+	MOVL	EAX, #TICKSPERSEC/2	;Wait for 1/2 second
+	CALL	knlTimeWait##
+2$:	INB	[DX]			;Read the status register
+	CMPB	AL, #30h		;Is it right?
+	JNE	4$.S			;No - say not there
+	A2IOP	2			;Yes - read the interrupt flag
+	INB	[DX]			;  register
+	CMPB	AL, #0			;It must be 0
+	JNE	4$.S			;OK
+	A2IOP	-1			;Read the configuration information from
+	MOVB	AL, #0Bh		;  the interface (since we just reset it
+	OUTB	[DX]			;  here, it must be ready for a command
+	IOPAUSE				;  now!)
+	A2IOP	-1
+	CALL	scsibytein		;Get the DMA channel byte
+	JC	4$.S
+	CALL	scsibytein		;Get the interrupt number byte
+	JC	4$.S
+	CALL	scsibytein		;Get the host ID byte
+	JNC	6$.S
+4$:	ANDB	dc_mask.B[EBP], #~MSK$SCSIA0
+6$:	RET
+.PAGE
+scsibytein:
+	MOVL	ECX, #100t
+	IMULL	ECX, knlDelFactor##
+4$:	INB	[DX]			;Get status bits
+	IOPAUSE
+	TESTB	AL, #05h		;Ready or error?
+	LOOPE	ECX, 4$			;Loop if not
+	JE	6$.S			;If its not ready
+	TESTB	AL, #01h		;Error?
+	JNE	6$.S			;Yes
+	A2IOP	1			;No - point to the data register
+	CLRL	EAX
+	INB	[DX]			;Get the value
+	A2IOP	-1
+	CLC
+	RET
+
+;Here if error
+
+6$:	STC
+	RET
+.PAGE
+valmask:MOVL	dc_mask.B[EBP], EAX
+resstr:	CLC
+	RET
+
+	LKEEND

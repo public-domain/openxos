@@ -1,0 +1,782 @@
+	.TITLE	CLOCK
+
+;++++
+; This software is in the public domain.  It may be freely copied and used
+; for whatever purpose you see fit, including commerical uses.  Anyone
+; modifying this software may claim ownership of the modifications, but not
+; the complete derived code.  It would be appreciated if the authors were
+; told what this software is being used for, but this is not a requirement.
+
+;   THIS SOFTWARE IS PROVIDED BY THE AUTHORS "AS IS" AND ANY EXPRESS OR
+;   IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
+;   OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+;   IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+;   INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+;   BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS
+;   OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+;   ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR
+;   TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
+;   USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+;----
+
+	.PROC	80486
+	.INCLUD	XOSINC:\XMAC\XOS.PAR
+	.INCLUD	XOSINC:\XMAC\XOSX.PAR
+	.INCLUD	XOSINC:\XMAC\XOSDOS.PAR
+	.INCLUD	XOSINC:\XMAC\XOSERR.PAR
+	.INCLUD	XOSINC:\XMAC\PCAT.PAR
+
+	.SBTTL	datetimeinit - Subroutine to initialize date and time at startup
+
+	ONCE
+
+datetimeinit::
+	PUSHL	#6.B			;Don't do this too many times
+2$:	CALL	rtcdatetime		;Get the date and time
+	PUSHL	EAX
+	PUSHL	EDX
+	PUSHL	EBX
+	MOVB	AL, #0Ah		;Get the update bit
+	CALL	knlReadCmos#
+	TESTB	AL, #80			;Update active now?
+	JE	6$.S			;No - go on
+	ADDL	ESP, #12t.B		;Yes - discard value we just got	MOVL	ECX, #80000h
+4$:	MOVB	AL, #0Ah		;Wait until the update state goes away
+	CALL	knlReadCmos#
+	TESTB	AL, #80
+	JE	2$.S			;Then start over
+	LOOP	ECX, 4$
+	JMP	2$.S			;But don't wait forever!
+
+;Here with update state clear
+
+6$:	CALL	rtcdatetime		;Get the date and time again
+	POPL	ESI
+	POPL	ECX
+	POPL	EDI
+	CMPL	EAX, EDI		;Did we get the same value both times?
+	JNE	8$.S
+	CMPL	EDX, ECX
+	JNE	8$.S
+	CMPL	EBX, ESI
+	JE	10$.S			;Yes
+8$:	DECL	[ESP]			;No - can we try again?
+	JNE	2$.S			;Yes
+	CLRL	EAX			;No - make it 00:00 on 1-Jan-80
+	MOVL	EDX, #21h
+
+;Here with date and time value from the RTC
+
+10$:	POPL	ECX			;Fix up the stack
+	SHLL	EBX, #9t		;Construct DOS packed date
+	MOVB	BL, DL
+	MOVZBL	EDX, DH
+	SHLL	EDX, #5t
+	ORL	EBX, EDX
+	PUSHL	EBX			;Save date value
+	MULL	knlLitTPD#		;Change to ticks
+	DIVL	CS:olit86400.L
+	MOVL	knlTickCnt, EAX		;Store as system time of day
+	PUSHL	EAX
+	MULL	litCPT#			;Convert to timer ticks at midnite
+	NEGL	EDX
+	NEGL	EAX
+	SBBL	EDX, #0.B
+	MOVL	timemnite+0, EAX
+	MOVL	timemnite+4, EDX
+	POPL	EAX
+	MULL	litDTPD#		;Calculate DOS tick value
+	DIVL	knlLitTPD#
+	MOVL	dostcnt#, EAX		;And store that too
+	POPL	EAX			;Restore date value
+	CALL	knlDos2SysDate		;Get system format date
+	MOVL	knlSysDate, EAX		;Store it
+	CALL	knlSys2BdvDate		;Convert back to DOS format (this
+					;  ensures we have a legal value!)
+	SUBL	EAX, #380t<9		;Change year to offset from 1980
+	JNS	14$.S			;If OK
+	MOVL	EAX, #21h		;Before 1980 - make it 1-Jan-80!
+14$:	MOVL	knlDosDate, EAX
+	MOVL	yearday, EDX
+	RET
+.PAGE
+;Subroutine to get date and time from the RTC - we call this twice in a row
+;  to make sure we didn't run into an update cycle
+;	CALL	rtcdatetime
+;	c{EAX} = Time (seconds since midnite)
+;	c(DL)  = Day of month (1-31)
+;	c(DH)  = Month (1-12)
+;	c{EBX} = Year (offset from 1980)
+
+rtcdatetime:
+	MOVB	AL, #4h			;Get hours
+	CALL	readrtc
+	IMULL	EDX, EAX, #60t*60t
+	MOVB	AL, #2h			;Get minutes
+	CALL	readrtc
+	IMULL	EAX, #60t
+	ADDL	EDX, EAX
+	MOVB	AL, #0h			;Get seconds
+	CALL	readrtc
+	ADDL	EAX, EDX
+	CMPL	EAX, #86399t		;Make sure not too large
+	JB	2$.S
+	MOVL	EAX, #86399t
+2$:	PUSHL	EAX			;Save time value
+	MOVB	AL, #7h			;Get day of month
+	CALL	readrtc
+	TESTL	EAX, EAX		;Make sure not zero
+	JNE	4$.S
+	INCL	EAX
+4$:	MOVL	EDX, EAX	
+	MOVB	AL, #8h			;Get month
+	CALL	readrtc
+	TESTL	EAX, EAX		;Make sure not 0
+	JNE	6$.S
+	INCL	EAX
+6$:	CMPL	EAX, #12t.B		;Make sure not too big
+	JBE	7$.S
+	MOVB	AL, #12t
+7$:	MOVB	DH, AL
+	MOVB	AL, #9h			;Get year
+	CALL	readrtc
+	SUBL	EAX, #80t.B		;Get offset from 1980
+	JNS	8$.S
+	ADDL	EAX, #100t.B		;0 - 79 maps to 2000 - 2079
+8$:	MOVL	EBX, EAX
+	POPL	EAX			;Restore time value
+	RET
+.PAGE
+;Subroutine to get single binary value from the real time clock
+;	c(AL) = Address
+;	CALL	getrtc
+;	c{EAX} = Binary value
+
+readrtc:CALL	knlReadCmos#		;Get value from clock
+	MOVB	BL, AL
+	ANDB	BL, #0F			;Get low digit
+	SHRB	AL, #4			;Get high digit
+	MULB	CS:olit10
+	ADDB	AL, BL
+	MOVZBL	EAX, AL
+	RET
+
+olit10:	.LONG	10t
+olit86400:
+	.LONG	86400t
+
+	CODE
+.PAGE
+	.SBTTL	timer0int - Timer 0 interrupt service routine
+
+;Here on clock interrupt (IRQ0) 50 times per second (interrupts are disabled
+;  when get here)
+
+timer0int::
+	PUSHL	DS			;Save registers we need
+	PUSHL	ES
+	PUSHL	EAX
+	PUSHL	EDX
+	PUSHL	#GS_DATA.B		;Make our data addressable
+	POPL	DS
+	MOVB	AL, knlPort61#		;Clear PS/2 IRQ0 latch
+	ORB	AL, #80h
+	OUTB	P_SYSCONB
+	MOVB	AL, #INT_EOI		;Release the interrupt controller
+	OUTB	P_INC1P0
+	INCL	knlTickTtl		;Bump total tick count
+	ADDL	knlTimeTtl+0, #CNTSPERTICK ;Bump total time count
+	ADCL	knlTimeTtl+4, #0.B
+	INCL	knlTickCnt		;Bump daily tick count
+	CMPL	knlTickCnt, #TICKSPERDAY ;End of day?
+	JB	8$.S			;No
+	INCL	knlSysDate		;Yes - increment date
+	MOVL	EAX, knlSysDate		;Get corresponding DOS format date
+	CALL	knlSys2BdvDate
+	SUBL	EAX, #380t<9		;Change year to offset from 1980
+	JNS	2$.S			;If OK
+	CALL	knlSys2DosDate
+	JNC	2$.S
+	MOVL	EAX, #21h		;Before 1980 - make it 1-Jan-80!
+2$:	MOVL	knlDosDate, EAX
+	MOVL	yearday, EDX
+	MOVL	EAX, knlTimeTtl+0
+	MOVL	timemnite+0, EAX
+	MOVL	EAX, knlTimeTtl+4
+	MOVL	timemnite+4, EAX
+	CLRL	EAX			;Reset tick count
+	MOVL	knlTickCnt, EAX
+	JMP	10$.S
+
+8$:	MOVL	EAX, knlTickCnt		;Calculate DOS tick count
+	MULL	litDTPD#
+	DIVL	knlLitTPD#
+	CMPL	EAX, dostcnt#		;Has it changed?
+	JE	14$.S			;No
+10$:	MOVL	dostcnt#, EAX		;Yes - store new value
+	INCL	dostick#		;Indicate have a DOS tick
+
+;;;;;;;;;;
+
+	PUSHL	ES
+	MOVL	ES, knlCurPda#
+	TESTB	ES:pdaStatus1#, #P1$DOSSEG|P1$BIOSSEG 
+					;Does current process have a real mode
+					;  mode segment?
+	JE	12$.S			;No
+	MOVL	ES:pdaRMPage0#+bda_vtimer, EAX ;Yes - update his tick count
+12$:	POPL	ES
+14$:	MOVL	ES, knlProcTable#
+	CLRL	EAX
+	XCHGL	EAX, ES:pdaTss#+tss_EAX
+	MOVL	knlIdleCur#, EAX
+	MOVL	EDX, knlIdleAve#
+	SHRL	EAX, #4
+	SHRL	EDX, #4
+	SUBL	knlIdleAve#, EDX
+	ADDL	knlIdleAve#, EAX
+	INCL	ticked#			;Indicate clock has ticked
+
+	MOVL	EDX, firsttimer		;Get first routine to call here
+	TESTL	EDX, EDX
+	JE	18$.S
+16$:	PUSHL	[EDX]
+	CALLI	os_disp.B[EDX]
+	POPL	EDX
+	TESTL	EDX, EDX
+	JNE	16$.S
+18$:	POPL	EDX
+	POPL	EAX
+	POPL	ES
+	CMPL	ESP, #pdaURegEIP#-4	;No - are we returning to user mode?
+	JNE	20$.S			;No
+	POPL	DS			;Yes
+	CALLF	schedule		;Call the scheduler now
+	PUSHF
+	TESTB	1.B[ESP], #40h
+	JNE	22$.S
+	ADDL	ESP, #4.B
+	IRET				;Dismiss interrupt
+
+;Here if cannot schedule now - just dismiss this interrupt
+
+20$:	MOVB	knlSchedReq#, #1	;Indicate need to schedule as soon as
+					;  we can
+	POPL	DS			;Restore register
+	IRET				;Dismiss interrupt
+
+22$:	CRASH	NEST
+.PAGE
+	.SBTTL	getdelta - Subroutine to get delta time value
+
+;Subroutine to get delta time value
+;	CALL	getdelta
+;	c{EDX,EAX} = Value
+
+getdelta::
+	REQUIREFORK
+	CALL	knlGetTime		;Get current time
+	SUBL	EAX, deltatime+0	;Get time difference
+	SBBL	EDX, deltatime+4
+	JS	4$.S			;Just to be real safe!
+	ADDL	deltatime+0, EAX	;Update current time value
+	ADCL	deltatime+4, EDX
+	RET
+
+4$:	INCL	timeerr
+	CLRL	EAX
+	CLRL	EDX
+	RET
+.PAGE
+	.SBTTL	knlGetTime - Get clock counts since system loaded
+
+;Subroutine to get clock counts since system loaded
+;	CALL	knlGetTime
+;	c{EDX,EAX} = Counts
+;  All registers except EAX and EDX are preserved
+
+knlGetTime::
+	CLRL	EDX
+2$:	CLRL	EAX			;Latch counter 0
+	CLI				;No interrupts now
+	OUTB	P_TMRCWR
+	MOVB	AL, #0Ah		;Get interrupt request status
+	OUTB	P_INC1P0
+	IOPAUSE
+	INB	P_INC1P0
+	TESTB	AL, #1			;Is timer requesting an interrupt?
+	JNE	6$.S			;Yes - go try again
+	INB	P_TMRCNT0		;No - get low byte
+	IOPAUSE
+	MOVB	AH, AL
+	INB	P_TMRCNT0		;Get high byte
+	XCHGB	AH, AL			;Get bytes in right order
+	NEGL	EAX
+	ADDL	EAX, #CNTSPERTICK
+	JNS	4$.S
+	MOVL	EAX, #CNTSPERTICK
+	CLRL	EDX
+4$:	ADDL	EAX, knlTimeTtl+0	;Add in time value up to last interrupt
+	ADCL	EDX, knlTimeTtl+4
+	STI				;Interrupts are OK now
+	RET
+
+;Here if timer might have requested an interrupt after we latched it
+
+6$:	INB	P_TMRCNT0		;Read the clock to release the latch
+	IOPAUSE
+	INB	P_TMRCNT0		;Get high byte
+	STI				;Enable interrupts (timer should get
+	IOPAUSE				;  its interrupt immediately)
+	JMP	2$.S			;Go try again
+.PAGE
+	.SBTTL	knlSDelay - Subroutine to delay for a short time
+
+;Subroutine to delay for a short time
+;	c{ECX} = Count (1 count = about 10 us)
+;	CALL	knlSDelay
+
+knlSDelay::
+	IMULL	ECX, knlDelFactor
+2$:	NOP
+	LOOP	ECX, 2$
+	RET
+.PAGE
+	.SBTTL	knlDos2SysDate - Subroutine to convert date from DOS to system format
+
+;Subroutine to convert date from DOS to system format
+;	c{EAX} = DOS date value
+;	CALL	knlDos2SysDate
+;	c{EAX} = System date value (days since 1-Jan-1600)
+
+knlDos2SysDate::
+	ADDL	EAX, #380t<9		;Change year to offset from 1600
+knlBdv2SysDate::
+	PUSHL	ECX			;Save registers
+	PUSHL	EDX
+	PUSHL	EDI
+	PUSHL	ESI
+	PUSHL	EBP
+	CLRL	ECX			;Assume not leap year
+	MOVL	EBP, EAX		;Get day in month
+	ANDL	EBP, #1Fh.B
+	SHRL	EAX, #5			;Get month
+	MOVL	ESI, EAX
+	ANDL	ESI, #0Fh.B
+	SHRL	EAX, #4			;Get year (offset from 1600)
+	CLRL	EDX			;Get number of 400-year groups
+	DIVL	lit400#
+	IMULL	EDI, EAX, #146097t	;Get days to start of group
+	MOVL	EAX, EDX		;Get years within 400-year group
+	CMPL	EAX, #100t		;In first 100-year group?
+	JB	4$.S			;Yes
+	ADDL	EDI, #36525t		;No
+	SUBL	EAX, #100t.B
+	CLRL	EDX			;Get number of 100-year groups
+	DIVL	lit100#
+	IMULL	EAX, #36524t		;Get days to start of 100-year group
+	ADDL	EDI, EAX
+	MOVL	EAX, EDX		;Year within the 100-year group
+	CMPL	EAX, #4.B		;In first 4-year group?
+	JB	8$.S			;Yes
+	ADDL	EDI, #1460t		;No - compensate for first 4-year group
+	SUBL	EAX, #4.B		;  which does not have a leap-year
+4$:	CLRL	EDX
+	DIVL	lit4#			;Get number of 4-year groups
+	IMULL	EAX, #1461t		;Get days to start of 4-year group
+	ADDL	EDI, EAX
+	MOVL	EAX, EDX
+	TESTL	EAX, EAX		;First year in 4-year group?
+	JNE	6$.S			;No
+	INCL	ECX			;Yes - indicate leap-year
+	JMP	10$.S
+
+;Here if not first year in a 4-year group
+
+6$:	ADDL	EDI, #366t
+	DECL	EAX
+8$:	IMULL	EAX, #365t		;Get days to start of year
+	ADDL	EDI, EAX
+10$:	TESTL	ESI, ESI		;Month too small?
+	JNE	12$.S			;No
+	INCL	ESI			;Yes - assume JAN!
+12$:	CMPL	ESI, #12t.B		;Month too large?
+	JBE	14$.S			;No
+	MOVW	SI, #12t		;Yes - assume DEC!
+14$:	MOVZBL	EAX, length-2[ECX+ESI*2] ;Get maximum length of the month
+	TESTL	EBP, EBP		;Day too small?
+	JNE	16$.S			;No
+	INCL	EBP			;Yes - assume 1
+16$:	CMPL	EBP, EAX		;Day too large?
+	JBE	18$.S			;No
+	MOVL	EBP, EAX		;Yes - assume maximum
+18$:	SHLL	ECX, #2
+	ADDL	EDI, days-8[ECX+ESI*8] ;Get days to start of month
+	ADDL	EDI, EBP		;Get total days
+	DECL	EDI
+	MOVL	EAX, EDI
+	POPL	EBP			;Restore registers
+	POPL	ESI
+	POPL	EDI
+	POPL	EDX
+	POPL	ECX
+	RET				;Finished
+
+	DATA
+
+;Table which gives days in month
+
+length:	.BYTE	31t, 31t	;Jan
+	.BYTE	28t, 29t	;Feb
+	.BYTE	31t, 31t	;Mar
+	.BYTE	30t, 30t	;Apr
+	.BYTE	31t, 31t	;May
+	.BYTE	30t, 30t	;Jun
+	.BYTE	31t, 31t	;Jul
+	.BYTE	31t, 31t	;Aug
+	.BYTE	30t, 30t	;Sep
+	.BYTE	31t, 31t	;Oct
+	.BYTE	30t, 30t	;Nov
+	.BYTE	31t, 31t	;Dec
+
+;Table which gives days to start of month
+
+days:	.LONG	0t  , 0t	;Jan
+	.LONG	31t , 31t	;Feb
+	.LONG	59t , 60t	;Mar
+	.LONG	90t , 91t	;Apr
+	.LONG	120t, 121t	;May
+	.LONG	151t, 152t	;Jun
+	.LONG	181t, 182t	;Jul
+	.LONG	212t, 213t	;Aug
+	.LONG	243t, 244t	;Sep
+	.LONG	273t, 274t	;Oct
+	.LONG	304t, 305t	;Nov
+	.LONG	334t, 335t	;Dec
+
+	CODE
+.PAGE
+	.SBTTL	knlSys2DosDate - Subroutine to convert date from system to DOS format
+
+;Subroutine to convert date from system to DOS format
+;	c{EAX} = System date value
+;	CALL	knlSys2DosDate
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  c{EAX} = DOS date value
+
+knlSys2DosDate::
+	PUSHL	EDX
+	CALL	knlSys2BdvDate
+	SUBL	EAX, #380t<9		;Change year to offset from 1980
+	JNS	2$.S			;If OK
+	MOVL	EAX, #ER_VALUE		;Error!
+	STC
+2$:	POPL	EDX
+	RET
+
+;Subroutine to convert date from system to extended DOS format
+;	c{EAX} = System date value
+;	CALL	knlSys2DosDate
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+;	  c{EAX} = Extended DOS date value
+;	  c{EDX} = Day in year
+
+knlSys2BdvDate::
+	PUSHL	EBX			;Save registers we will use here
+	PUSHL	EDI
+	CLRL	EBX
+	CLRL	EDX			;Get number of 400-year groups since
+	DIVL	lit146097#		;  1600
+	IMULL	EDI, EAX, #400t		;Save number of years
+	MOVL	EAX, EDX		;In first 100-year group in the 400-year
+	CMPL	EAX, #36525t		;  group?
+	JL	4$.S			;Yes
+	DECL	EAX			;No - calculate 100 year group
+	CLRL	EDX
+	DIVL	lit36524#
+	IMULL	EAX, #100t.B		;Get years to start of 100 year group
+	ADDL	EDI, EAX		;Add it in
+	MOVL	EAX, EDX		;Get day in 100 year group
+	CMPL	EAX, #1460t		;In first 4 year group?
+	JB	10$.S			;Yes
+	SUBL	EAX, #1460t		;No - Adjust for non-leap century
+	ADDL	EDI, #4.B
+4$:	CLRL	EDX			;Calculate 4 year group
+	DIVL	lit1461#
+	SHLL	EAX, #2			;Get years to start of 4 year group
+	ADDL	EDI, EAX
+	MOVL	EAX, EDX
+	CMPL	EAX, #366t		;In first year of 4 year group?
+	JL	6$.S			;Yes
+	DECL	EAX			;No - adjust for leap year
+	JMP	10$.S
+
+6$:	MOVB	BL, #12t
+	CLRL	EDX
+	DIVL	lit366#
+	JMP	12$.S
+
+10$:	CLRL	EDX
+	DIVL	lit365#			;Get day in year
+12$:	ADDL	EDI, EAX		;Get total years
+	MOVL	EAX, EDX
+	PUSHL	EAX			;Save day in year
+	CLRL	EDX			;Get guess for month
+	DIVL	lit31#			;c{EAX} = month, c{EDX} = day
+	ADDB	DL, correct[EBX+EAX]	;Correct the day
+	CMPB	DL, mlength[EBX+EAX]	;Have we gone into the next month?
+	JBE	14$.S			;No
+	SUBB	DL, mlength[EBX+EAX]	;Yes - adjust the day
+	INCL	EAX			;And adjust the month
+14$:	MOVL	EBX, EAX
+	MOVL	EAX, EDI
+	SHLL	EAX, #4			;Combine day, month, and year
+	INCL	EBX
+	ORL	EAX, EBX
+	SHLL	EAX, #5
+	ORL	EAX, EDX
+	POPL	EDX			;Restore day in year
+	POPL	EDI			;Restore registers
+	POPL	EBX
+	RET				;All done
+
+	DATA
+
+correct:.BYTE	 1t,  1t,  4t,  4t,  5t,  5t,  6t,  6t,  6t,  7t,  7t,  8t
+	.BYTE	 1t,  1t,  3t,  3t,  4t,  4t,  5t,  5t,  5t,  6t,  6t,  7t
+	
+mlength:.BYTE	31t, 28t, 31t, 30t, 31t, 30t, 31t, 31t, 30t, 31t, 30t, 31t
+	.BYTE	31t, 29t, 31t, 30t, 31t, 30t, 31t, 31t, 30t, 31t, 30t, 31t
+
+	CODE
+.PAGE
+	.SBTTL	knlGetSysHRDtTm - Subroutine to get high resolution system format date and time
+
+;Subroutine to get current system format date and time
+;	CALL	knlGetSysHRDtTm
+;	c{EAX} = System format time of day
+;	c{EDX} = System format date
+
+knlGetSysHRDtTm::
+	PUSHL	knlSysDate		;Save the date
+	CALL	knlGetTime		;Get total clock ticks since loaded
+	SUBL	EAX, timemnite+0	;Minus ticks at midnite
+	SBBL	EDX, timemnite+4
+	SHRDL	EAX, EDX, #5		;Convert to fractional days
+	MULL	litAAA5C740#
+	SHLDL	EDX, EAX, #1
+	JNC	2$.S			;Did it overflow?
+	MOVL	EDX, #0FFFFFFFFh	;Yes - use the maximum value
+2$:	POPL	EAX			;Restore the original date
+	CMPL	EAX, knlSysDate		;Has it changed?
+	JNE	knlGetSysHRDtTm.S	;Yes - must have just passed midnite
+	XCHGL	EAX, EDX		;  - go try again
+	RET
+.PAGE
+	.SBTTL	knlGetSysDttm - Subroutine to get current system format date and time
+
+;Subroutine to get current system format date and time
+;	CALL	getsysdttm
+;	c{EAX} = System format time of day
+;	c{EDX} = System format date
+
+knlGetSysDtTm::
+	CLI
+	MOVL	EDX, knlSysDate		;Get current date
+	MOVL	EAX, knlTickCnt		;Get current time in ticks
+	STI				;Fall into knlTick2SysTime to convert to
+					;  system format
+
+	.SBTTL	knlTick2SysTime - Subroutine to convert tick count to system time format
+
+;Subroutine to convert tick count to system time format
+;	c{EAX} = Tick count
+;	CALL	knlTick2SysTime
+;	c{EAX} = Time in system format
+
+knlTick2SysTime::
+	PUSHL	EDX
+	MOVL	EDX, EAX
+	CLRL	EAX
+	DIVL	knlLitTPD#
+	POPL	EDX
+	RET
+
+	.SBTTL	clkcntsysdttm - Subroutine to convert clock count to system date and time
+
+;Subroutine to convert clock count (64 bits) to system date and time format (64
+;  bits)
+;	c{EDX,EAX} = Tick count (64 bits)
+;	CALL	clkcnt2sysdttm
+;	c{EAX} = Time of day in system format
+;	c{EDX} = Date in system format
+
+clkcnt2sysdttm::
+	PUSHL	EBX
+	PUSHL	EDI
+	PUSHL	ESI
+	PUSHL	EDX
+	PUSHL	EAX
+	MOVL	ECX, #0D647226Fh
+	MULL	ECX
+	MOVL	EBX, EDX
+	CLRL	EDI
+	CLRL	ESI
+	MOVL	EAX, 4.B[ESP]
+	MULL	ECX
+	ADDL	EBX, EAX
+	ADCL	EDI, EDX
+	MOVL	ECX, #0AAA5C5Fh
+	POPL	EAX
+	MULL	ECX
+	ADDL	EBX, EAX
+	ADCL	EDI, EDX
+	ADCL	ESI, #0.B
+	POPL	EAX
+	MULL	ECX
+	ADDL	EAX, EDI
+	ADCL	EDX, ESI
+	POPL	ESI
+	POPL	EDI
+	POPL	EBX
+	RET
+.PAGE
+	.SBTTL	knlTick2DosTime - Subroutine to convert tick count to DOS time format
+
+;Subroutine to convert tick count to DOS time format
+;	c{EAX} = Tick count
+;	CALL	knlTick2DosTime
+;	c{EAX} = Time in DOS format
+
+knlTick2DosTime::
+	PUSHL	EDX			;Save registers we need to use here
+	PUSHL	EBX
+	MULL	lit5D34553A#		;Get hours and fractional hours
+	SHRDL	EAX, EDX, #16t
+	SHRL	EDX, #16t
+	MOVL	EBX, EDX		;Save hours
+	MULL	lit60#			;Get minutes and fractional minutes
+	SHLL	EBX, #6			;Make room for minutes
+	ORL	EBX, EDX		;Merge in minutes
+	MULL	lit30#			;Get 2-seconds
+	SHLL	EBX, #5			;Make room for 2-seconds
+	ORL	EBX, EDX		;Merge in 2-seconds
+	MOVL	EAX, EBX
+	POPL	EBX			;Restore registers used here
+	POPL	EDX
+	RET
+.PAGE
+	.SBTTL	knlDisc2SysTime - Subroutine to convert time from discrete to system format
+
+;Subroutine to convert time from discrete to system format
+;	c{EAX} = Discrete time value (hours.minutes.seconds.hundreds)
+;	CALL	knlDisc2SysTime
+;	c{EAX} = System time value
+
+knlDisc2SysTime::
+	PUSHL	EBX
+	PUSHL	EDX
+	PUSHL	ESI
+	MOVL	EBX, EAX
+	MOVZBL	EAX, AL			;Get hundreds of seconds value
+	MULL	lit1F1#			;Times (2^32)/(24*60*60*100)
+	MOVL	ESI, EAX
+	MOVZBL	EAX, BH			;Get seconds
+	MULL	litC22E#		;Times (2^32)/(24*60*60)
+	ADDL	ESI, EAX
+	SHRL	EBX, #16t
+	MOVZBL	EAX, BL			;Get minutes value
+	MULL	lit2D82D8#		;Times (2^32)/(24*60)
+	ADDL	ESI, EAX
+	MOVZBL	EAX, BH			;Get hours value
+	JMP	4$.S			;Continue
+
+	.SBTTL	knlDos2SysTime - Subroutine to convert time from DOS to system format
+
+;Subroutine to convert time from DOS to system format
+;	c{EAX} = DOS time value
+;	CALL	knlDos2SysTime
+;	c{EAX} = System time value
+
+knlDos2SysTime::
+	PUSHL	EBX			;Save registers we will use
+	PUSHL	EDX
+	PUSHL	ESI
+	MOVL	EBX, EAX
+	ANDL	EAX, #1Fh.B		;Get seconds value
+	MULL	lit1845D#		;Times (2^32)/(24*60*30)
+	MOVL	ESI, EAX
+	SHRL	EBX, #5			;Get minutes value
+	MOVL	EAX, EBX
+	ANDL	EAX, #3Fh.B
+	MULL	lit2D82D8#		;Times (2^32)/(24*60)
+	ADDL	ESI, EAX
+	SHRL	EBX, #6			;Get hours value
+	MOVL	EAX, EBX
+4$:	MULL	litAAAAAAB#		;Times (2^32)/24
+	ADDL	EAX, ESI
+	POPL	ESI			;Restore registers
+	POPL	EDX
+	POPL	EBX
+	RET
+
+	.SBTTL	knlSys2DosTime - Subroutine to convert time from system to DOS format
+
+;Subroutine to convert time from system to DOS format
+;	c{EAX} = System time value
+;	CALL	knlSys2DosTime
+;	c{EAX} = DOS time value
+
+knlSys2DosTime::
+	PUSHL	EBX			;Save registers we will use
+	PUSHL	ECX
+	PUSHL	EDX
+	MOVL	ECX, #24t
+	MULL	ECX			;Get hours
+	MOVL	EBX, EDX
+	SHLL	EBX, #6
+	MOVB	CL, #60t		;Get minutes
+	MULL	ECX
+	ORL	EBX, EDX
+	SHLL	EBX, #5
+	MOVB	CL, #30t		;Get 2-seconds
+	MULL	ECX
+	ORL	EBX, EDX
+	MOVL	EAX, EBX
+	POPL	EDX			;Restore registers
+	POPL	ECX
+	POPL	EBX
+	RET
+.PAGE
+	.SBTTL	Data
+
+	DATA
+
+deltatime:    .LONG 0, 0	;Last time value for getdelta
+timeerr::     .LONG 0
+knlDelFactor::.LONG 1		;Delay factor for CPU loops
+knlTickTtl::  .LONG 0		;Number of clock ticks since system loaded
+knlTickCnt::  .LONG 0		;Number of clock ticks since midnite
+knlSysDate::  .LONG 0		;System format system date
+knlDosDate::  .LONG 0		;DOS format system date
+knlTimeTtl::  .LONG 0, 0	;Total time count (8254 ticks) since
+knlForkTime:: .LONG 0, 0	;Total fork time count
+timemnite::   .LONG 0, 0	;Time count (8254 ticks) at midnite
+timeused::    .LONG 0, 0	;Total time used by killed processes
+knlTimeSch::  .LONG 0, 0	;Total scheduler time
+yearday::     .LONG 0		;Current day of year
+timezone::    .LONG 0, 0	;Time zone offset (signed fractional days)
+dlststate::   .LONG 0		;Daylight savings time state
+dlstbgntime:: .LONG 0		;Daylight savings time beginning time (ticks)
+dlstbgnday::  .LONG 0		;Daylight savings time beginning day of year
+dlstendtime:: .LONG 0		;Daylight savings time ending time (ticks)
+dlstendday::  .LONG 0		;Daylight savings time ending day of year
+dlstoffset::  .LONG 0, 0	;Daylight savings time offset (signed days and
+				;  fractional days)
+firsttimer::  .LONG 0
+
+	END

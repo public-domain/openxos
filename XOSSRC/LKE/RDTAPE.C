@@ -1,0 +1,95 @@
+//++++
+// This software is in the public domain.  It may be freely copied and used
+// for whatever purpose you see fit, including commerical uses.  Anyone
+// modifying this software may claim ownership of the modifications, but not
+// the complete derived code.  It would be appreciated if the authors were
+// told what this software is being used for, but this is not a requirement.
+
+//   THIS SOFTWARE IS PROVIDED BY THE AUTHORS "AS IS" AND ANY EXPRESS OR
+//   IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
+//   OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+//   IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+//   INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+//   BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS
+//   OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+//   ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR
+//   TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
+//   USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+//----
+
+#include <STDIO.H>
+#include <STDLIB.H>
+#include <STRING.H>
+
+#include <XOSSTR.H>
+#include <XOS.H>
+#include <XOSERMSG.H>
+#include <XOSSVC.H>
+#include <XOSERR.H>
+
+#define SDF_TAPE_UNLOAD    1	// Unload tape
+#define SDF_TAPE_REWIND    2	// Rewind tape
+#define SDF_TAPE_FORMAT    3	// Format tape
+#define SDF_TAPE_RETEN     4	// Retension tape
+#define SDF_TAPE_WRITEFM   5	// Write filemarks
+#define SDF_TAPE_WRITESM   6	// Write setmarks
+#define SDF_TAPE_LOCK      7	// Lock/unlock tape mounting
+#define SDF_TAPE_ERASEGAP  8	// Erase gap
+#define SDF_TAPE_ERASEALL  9	// Erase gap
+#define SDF_TAPE_SKPREC   10	// Skip records
+#define SDF_TAPE_SKPFILE  11	// Skip filemarks
+#define SDF_TAPE_CONFILE  12	// Skip to consective filemarks
+#define SDF_TAPE_SKPSET   13	// Skip setmarks
+#define SDF_TAPE_CONSET   14	// Skip to consective setmarks
+#define SDF_TAPE_SKP2EOD  15	// Skip to end-of-data
+
+long  rtn;
+long  disk;
+long  tape;
+long  amount;
+char  prgname[] = "RDTAPE";
+char  tapename[] = "TAP1:";
+
+struct sdfp
+{   text8_parm class;
+    char       end;
+} sdfp =
+{   {PAR_SET|REP_TEXT, 8, IOPAR_CLASS, "TAPE"}
+};
+
+char buffer[32*1024];
+
+
+void main(
+    int   argc,
+    char *argv[])
+
+{
+    if (argc != 2)
+    {
+        fputs("? Command error, usage is:\n"
+              "    RDTAPE filespec\n"
+              "  Input is from TAP1:\n", stderr);
+        exit(1);
+    }
+
+    if ((tape = svcIoOpen(O_IN, tapename, NULL)) < 0)
+        femsg2(prgname, "Error opening tape device", tape, tapename);
+    if ((disk = svcIoOpen(O_OUT|O_CREATE|O_TRUNCA, argv[1], NULL)) < 0)
+        femsg2(prgname, "Error opening input file", disk, argv[1]);
+
+    if ((rtn = svcIoSpecial(tape, SDF_TAPE_REWIND, NULL, 0, &sdfp)) < 0)
+        femsg2(prgname, "Error rewinding tape", rtn, tapename);
+
+    for (;;)
+    {
+        if ((amount = svcIoInBlock(tape, buffer, 32*1024)) < 0)
+        {
+            if (amount != ER_EOF)
+                femsg2(prgname, "Error reading input tape", amount, tapename);
+            exit(0);
+        }
+        if ((rtn = svcIoOutBlock(disk, buffer, amount)) < 0)
+            femsg2(prgname, "Error reading tape", rtn, argv[1]);
+    }
+}

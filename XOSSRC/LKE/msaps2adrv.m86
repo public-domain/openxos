@@ -1,0 +1,661 @@
+	.TITLE	MSAPS2ADRV - PS/2 mouse driver
+
+;++++
+; This software is in the public domain.  It may be freely copied and used
+; for whatever purpose you see fit, including commerical uses.  Anyone
+; modifying this software may claim ownership of the modifications, but not
+; the complete derived code.  It would be appreciated if the authors were
+; told what this software is being used for, but this is not a requirement.
+
+;   THIS SOFTWARE IS PROVIDED BY THE AUTHORS "AS IS" AND ANY EXPRESS OR
+;   IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
+;   OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+;   IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+;   INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+;   BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS
+;   OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+;   ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR
+;   TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
+;   USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+;----
+
+	.PROC	80486
+	.INCLUD	XOSINC:\XMAC\XOS.PAR
+	.INCLUD	XOSINC:\XMAC\XOSX.PAR
+	.INCLUD	XOSINC:\XMAC\XOSTIME.PAR
+	.INCLUD	XOSINC:\XMAC\XOSERR.PAR
+	.INCLUD	XOSINC:\XMAC\XOSTRM.PAR
+	.INCLUD	XOSINC:\XMAC\XOSXTRM.PAR
+	.INCLUD	XOSINC:\XMAC\PCAT.PAR
+	.INCLUD	XOSINC:\XMAC\XOSLKE.PAR
+	.INCLUD	XOSINC:\XMAC\XOSXLKE.PAR
+	.INCLUD	XOSINC:\XMAC\XOSXMOUSEA.PAR
+
+MAJV   =!1t
+MINV   =!0t
+EDITNUM=!0t
+
+	LKEHEAD	MSAPADRV, MAJV, MINV, EDITNUM, LKETYPE_CLASS
+
+;Define values for dcb_msapastate
+
+;Define values for dcb_msapastate
+
+MSAPA_ACK   =!0t		;ACK next
+MSAPA_HEADER=!1t		;Header byte next
+MSAPA_BYTE1 =!2t		;Byte 1 next
+MSAPA_BYTE2 =!3t		;Byte 2 next
+MSAPA_BYTE3 =!4t		;Byte 3 next
+MSAPA_RESET1=!5t		;First reset response byte next
+MSAPA_RESET2=!6t		;Seonnd reset response byte next
+MSAPA_WHEEL =!7t		;ID byte after wheel setup next
+MSAPA_FVBUT =!8t		;ID byte after 5-button setup next
+MSAPA_TPID1 =!9t		;First touchpad byte for TP ID sequence
+MSAPA_TPID2 =!10t		;Second touchpad byte for TP ID sequence
+MSAPA_TPID3 =!11t		;Third touchpad byte for TP ID sequence
+MSAPA_TPMID1=!12t		;First touchpad byte for model ID sequence
+MSAPA_TPMID2=!13t		;Second touchpad byte for model ID sequence
+MSAPA_TPMID3=!14t		;Third touchpad byte for model ID sequence
+MSAPA_TPCAP1=!15t		;First touchpad byte for capabilities sequence
+MSAPA_TPCAP2=!16t		;Second touchpad byte for capabilities sequence
+MSAPA_TPCAP3=!17t		;Third touchpad byte for capabilities sequence
+
+;Define values for the dcb_msapauart byte (UART type)
+
+TRMU_8250 =!1t			;Old 8250
+TRMU_16450=!2t			;8250A/16450
+TRMU_16550=!3t			;16550 with 16 byte FIFO
+
+.IF EQ 1
+	;
+	; Use original definition
+	;
+	.MACRO IOPAUSEKBD
+	 IOPAUSE
+	.ENDM
+.IFF
+	.MACRO IOPAUSEKBD
+
+	pushl	ecx
+	movl	ecx, #1
+	call	knlSDelay##
+	popl	ecx
+
+	.ENDM
+.ENDC
+.PAGE
+	CODE
+
+	.SBTTL	Driver function dispatch table
+
+msapadsp:
+	.LONG	msapaaddunit	;MSAF_ADDUNIT = 0
+	.LONG	0		;MSAF_SEND    = 4
+.PAGE
+;Device characteristics for SERA mouse devices
+
+	DATA
+
+	.MOD	4
+msapadctbl:
+ DCHARBGN  1, knlDCharValCom##
+ DCHARENT  CLASS , TEXT, , 8, knlDcMsgClass##  , knlDcGetClass##, knlDcSetClass##  , 0
+ DCHARENT  TYPE  , TEXT, , 4, knlDcMsgType##   , knlDcGet4Byte##, 0                , dcb_type
+ DCHARENT  MTYPE , STR , ,16, xosmsaMTypeMsg## , dcgetmtype     , 0                , 0
+ DCHARENT  CONDEV, DECV, , 4, xosmsaConDevMsg##, knlDcGet4Byte##, xosmsaSetConDev##, dcb_msacondev
+
+	CODE
+.PAGE
+	.SBTTL	mssainit - Serial port mouse driver initialization routine
+
+	INITSUB	mssainit
+
+mssainit:
+	MOVL	EBX, #'PS2A'		;Get mouse driver name
+	MOVL	EDX, #msapadsp		;Get offset of dispatch table
+	CALL	xosmsaNewDriver##
+	JC	10$.S			;This should not fail!
+	MOVL	ECX, #codetop
+	CLRL	EDX
+	CLRL	EAX
+10$:	MOVL	EBX, #QSTS$DONE
+	RET
+
+	CODE
+.PAGE
+	.SBTTL	mssaaddunit - Subroutine to add mouse port unit
+
+;Subroutine to add mouse port unit
+;	c{EAX}    = Unit number
+;	c{FS:EDX} = Address of add-unit characteristics
+;	CALL	msapaaddunit
+;	C:set = Error
+;	  c{EAX} = Error code
+;	C:clr = Normal
+
+$$$=!0
+FRM mau_unit   , 4	;Unit number
+FRM mau_introut, 4	;Interrupt routine offset
+FRM mau_ioreg  , 4	;Base IO register number
+FRM mau_int    , 4	;Interrupt level
+mau_SIZE=!$$$
+
+;Description block for addunitchar
+
+	DATA
+
+	.MOD	4
+msapaaublk:
+ DCHARBGN  2, knlDCharValCom##
+ DCHARENT  TYPE , TEXT, , 4, 0, 0, knlRtnZero##, 0
+ DCHARENT  UNIT , DECV, , 4, 0, 0, knlRtnZero##, 0
+
+	CODE
+
+msapaaddunit:
+	CMPL	msapadcb, #0.B
+	JNE	12$
+	ENTER	mau_SIZE, 0		;Set up and initialize our stack frame
+	MOVL	mau_unit.B[EBP], EAX	;Save unit number for now
+	MOVL	EBX, #msapaaublk	;Point to our description block
+	MOVB	AL, #0			;Fail if bad name
+	CALL	knlAddUnitChar##
+	JC	16$			;If error
+
+;Here if the interface exists
+
+	MOVB	CL, #12t		;Get interrupt number
+	CALL	knlChkIRqAvl##		;See if the vector is available
+	JC	16$			;If not available
+	CALL	knlGetXRes##		;Get exec memory resource
+	MOVL	ECX, #dcb_msapaSIZE+dcb_cSIZE ;OK - create a DCB
+	MOVL	EBX, #msapadctbl
+	MOVL	EDX, mau_unit.B[EBP]
+	CALL	xosmsaMakeDcb##
+	JC	14$
+	MOVL	msapadcb, EDI
+	LEAL	EDX, dcb_name.B[EDI]	;Get device name
+	MOVL	EBX, #msapaint		;Get address of interrupt routine
+	MOVB	CL, #12t		;Get interrupt number
+	MOVB	CH, #DT_INT+PL_0	;Set up our interrupt vector
+	CALL	knlSetIRq##
+	CALL	knlGiveXRes##		;Give up the exec memory resource
+	MOVB	dcb_msapastate[EDI], #MSAPA_ACK ;Set initial input state
+	MOVL	ECX, #12t		;Enable our interrupt
+	CALL	knlEnableInt##
+	MOVB	DL, #0AD		;Disable the keyboard
+	CALL	putcmd
+	MOVB	DL,#20h			;Get the controller's command bits
+	CALL	putcmd
+	MOVL	ECX, #300t
+	CALL	knlSDelay##
+	INB	P_KEYDATA
+	PUSHL	EAX
+	MOVB	DL, #60h
+	CALL	putcmd
+	MOVL	ECX, #300t
+	CALL	knlSDelay##
+	POPL	EAX
+	ORB	AL, #02			;Enable mouse interrupts
+	ANDB	AL, #0DF		;Enable the mouse
+	OUTB	P_KEYDATA
+	MOVB	DL, #0AE		;Enable the keyboard
+	CALL	putcmd
+	MOVB	AL, #MSAPA_RESET1	;Send a reset command to the mouse
+	MOVL	EBX, #resetstr
+	MOVL	ECX, #1
+	CALL	putstring
+	CLRL	EAX
+	CLRL	ECX			;Get our return value
+	MOVL	EBX, #QSTS$DONE
+	LEAVE
+	TOFORK
+10$:	RET
+
+12$:	MOVL	EAX, #ER_PDADF
+	JMP	16$.S
+
+14$:	LEAVE
+16$:	TOFORK
+	STC
+	RET
+.PAGE
+dcgetmtype:
+	MOVZBL	EAX, dcb_msapawheel[EDI]
+	MOVL	EDX, CS:mtypename[EAX*4]
+	JMP	knlGetSysStr##
+
+	.MOD	4
+mtypename:
+	.LONG	txtnormal
+	.LONG	txt3bwheel
+	.LONG	txt5bwheel
+	.LONG	txttprel
+	.LONG	txttpabs
+	.LONG	txttpabsw
+.PAGE
+	.SBTTL	PS2 mouse interrupt routine
+
+msapaint:
+	PUSHAL				;Save general registers
+	PUSHL	DS			;Save segment regsiters
+	PUSHL	ES
+	PUSHL	FS
+	PUSHL	GS
+	PUSHL	#GS_DATA.B		;Make normal data addressable
+	POPL	DS
+	MOVL	EDI, msapadcb		;Get offset of the DHDB
+	MOVL	ECX, #10000h
+2$:	INB	P_KEYSTS		;Have anything from the keyboard?
+	IOPAUSEKBD
+	ANDB	AL, #21h
+	CMPB	AL, #21h
+	LOOPNE	ECX, 2$
+	JNE	10$.S			;No - false alarm!
+	INB	P_KEYDATA		;Get mouse data
+
+	MOVL	EBX, debugpnt
+	CMPL	EBX, #debugend
+	JAE	4$.S
+	MOVB	CL, dcb_msapastate[EDI]
+	MOVB	[EBX], CL
+	MOVB	1.B[EBX], AL
+	ADDL	debugpnt, #2.B
+4$:
+	IOPAUSEKBD
+	JMP	inpavl			;No - go process mouse data
+
+;Here if have interrupt without an input character - This sometimes happens on
+;  some machines after startup.  We read the input register anyway to make sure
+;  the state of the keyboard interface is OK and just discard what we get!
+
+10$:	INB	P_KEYDATA
+	IOPAUSEKBD
+	JMP	intdone
+.PAGE
+;Subroutine to output a string to the mouse
+;	c(AL)  = New state (set when output is complete)
+;	c{EBX} = Offset of string
+;	c{ECX} = Length of string
+;	CALL	putstring
+
+putstring:
+	MOVB	dcb_msapanewsta[EDI], AL
+	MOVB	AH, [EBX]		;Get first character
+	INCL	EBX
+	DECL	ECX
+	MOVL	dcb_msapaopnt[EDI], EBX
+	MOVB	dcb_msapaocnt[EDI], CL
+	MOVB	dcb_msapastate[EDI], #MSAPA_ACK
+					;Fall into putbyte for first character
+
+;Subroutine to output a byte to the mouse
+;	c(AH) = Byte to output
+;	CALL	putbyte
+
+putbyte:
+	PUSHL	EBX
+	MOVL	EBX, debugpnt
+	CMPL	EBX, #debugend
+	JAE	4$.S
+	MOVB	[EBX], #0FF
+	MOVB	1.B[EBX], AH
+	ADDL	debugpnt, #2.B
+4$:	POPL	EBX
+
+	MOVB	DL, #0D4h		;Indicate mouse data
+	CALL	putcmd
+	MOVL	ECX, #10000
+8$:	INB	P_KEYSTS
+	IOPAUSEKBD
+	TESTB	AL, #02
+	LOOPNE	ECX, 8$
+	MOVB	AL, AH
+	MOVB	dcb_msapabyte[EDI], AL
+	OUTB	P_KEYDATA		;Output the data byte
+	IOPAUSEKBD
+	RET
+
+;Subroutine to output a comand byte to the keyboard controller
+
+putcmd:	MOVL	ECX, #10000
+12$:	INB	P_KEYSTS
+	IOPAUSEKBD
+	TESTB	AL, #02
+	LOOPNE	ECX, 12$
+	MOVB	AL, DL
+	OUTB	P_KEYCMD
+;;;;	IOPAUSEKBD
+	RET
+.PAGE
+;Here for input available interrupt
+;	c(AL) = Mouse data byte
+
+inpavl:	MOVZBL	ECX, dcb_msapastate[EDI] ;No - get our state
+
+	MOVL	xxxdata, EAX
+	MOVL	xxxstate, ECX
+
+	JMPIL	statetbl[ECX*4]
+
+	DATA
+
+statetbl:
+	.LONG	inpack		;MSAPA_ACK    = 0 - Expecting ACK
+	.LONG	inpheader	;MSAPA_HEADER = 1 - Header byte next
+	.LONG	inpbyte1	;MSAPA_BYTE1  = 2 - Byte 1 next
+	.LONG	inpbyte2	;MSAPA_BYTE2  = 3 - Byte 2 next
+	.LONG	inpbyte3	;MSAPA_BYTE3  = 4 - Byte 2 next
+	.LONG	inpreset1	;MSAPA_RESET1 = 5 - First reset response byte
+	.LONG	inpreset2	;MSAPA_RESET2 = 6 - Second reset response byte
+	.LONG	inpwheel	;MSAPA_WHEEL  = 7 - ID byte after wheel setup
+	.LONG	inpfvbut	;MSAPA_FVBUT  = 8 - ID byte after 5-button setup
+	.LONG	inptpmode1	;MSAPA_TPID1  = 9
+	.LONG	inptpmode2	;MSAPA_TPID2  = 10
+	.LONG	inptphvid	;MSAPA_TPID3  = 11
+	.LONG	inptpmode1	;MSAPA_TPMID1 = 12
+	.LONG	inptpmode2	;MSAPA_TPMID2 = 13
+	.LONG	inptphvmid	;MSAPA_TPMID3 = 14
+	.LONG	inptpmode1x	;MSAPA_TPCAP1 = 15
+	.LONG	inptpmode2x	;MSAPA_TPCAP2 = 16
+	.LONG	inptphvcap	;MSAPA_TPCAP3 = 17
+
+	CODE
+
+;Here if expecting ACK next
+
+inpack:	CMPB	AL, #0FAh		;ACK?
+	JNE	2$.S			;No
+	CMPB	dcb_msapaocnt[EDI], #0	;Yes - have any data to send?
+	JE	4$.S			;No
+	MOVL	EBX, dcb_msapaopnt[EDI]	;Yes
+	DECL	dcb_msapaocnt[EDI]
+	INCL	dcb_msapaopnt[EDI]
+	MOVB	AH, [EBX]
+	CALL	putbyte
+	JMP	intdone			;Thats all
+
+2$:	CMPB	AL, #0FEh		;RESEND?
+	JNE	3$.S			;No - ignore it
+	MOVB	AH, dcb_msapabyte[EDI]	;Yes - resend the last byte
+	CALL	putbyte
+	JMP	intdone
+
+3$:
+;;;	INT3
+	JMP	intdone
+
+;Here when finished with output
+
+4$:	MOVB	AL, dcb_msapanewsta[EDI] ;Update the input state
+	MOVB	dcb_msapastate[EDI], AL
+	JMP	intdone
+
+.PAGE
+;Data is received in 3 byte packets.
+;	Byte      Description
+;	  0   Mouse header byte:
+;		7: Y value overflow
+;		6: X value overflow
+;		5: Y value sign
+;		4: X value sign
+;		3: Always 1
+;		2: Middle button status
+;		1: Right button status
+;		0: Left button status
+;	  1   X value
+;	  2   Y value
+
+;Here with a header byte
+
+inpheader:
+	MOVB	dcb_msapahbits[EDI], AL
+	MOVB	AH, AL
+	SHLB	AH, #6
+	ANDB	AH, #40h
+	MOVB	DL, AL
+	SHLB	DL, #3
+	ANDB	DL, #20h
+	SHLB	AL, #3
+	ANDB	AL, #10h
+	ORB	AL, AH
+	ORB	AL, DL
+	MOVB	dcb_msapaheader[EDI], AL
+	MOVB	dcb_msapastate[EDI], #MSAPA_BYTE1 ;Update state
+	MOVL	EAX, knlTickTtl##
+	MOVL	dcb_msapahdtcks[EDI], EAX
+	JMP	intdone			;Finished
+
+;Here with the first byte following the header byte - This byte contains the
+;  X magnitude
+
+inpbyte1:
+	CALL	checksync
+	JNE	inpheader.S
+	MOVZBL	EAX, AL
+	TESTB	dcb_msapahbits[EDI], #10h
+	JE	2$.S
+	ORL	EAX, #0FFFFFF00h
+2$:	MOVL	dcb_msapaxval[EDI], EAX
+	INCB	dcb_msapastate[EDI]
+	JMP	intdone
+
+;Here with the second byte following the header byte - This byte contains the
+;  low order 6 bits of the Y distance value.
+
+inpbyte2:
+	CALL	checksync
+	JNE	inpheader.S
+	MOVZBL	EAX, AL
+	TESTB	dcb_msapahbits[EDI], #20h
+	JE	4$.S
+	ORL	EAX, #0FFFFFF00h
+4$:	NEGL	EAX
+	MOVL	ECX, EAX
+	CLRL	EBX
+	CMPB	dcb_msapawheel[EDI], #0	;Is this a wheel mouse?
+	JE	10$.S			;No - this is the last byte
+	CMPB	dcb_msapawheel[EDI], #3
+	JGE	10$.S			;No
+	MOVL	dcb_msapayval[EDI], EAX	;Yes - save Y value
+	INCB	dcb_msapastate[EDI]
+	JMP	intdone.S
+
+inpbyte3:
+	CALL	checksync
+	JNE	inpheader
+	CMPB	dcb_msapawheel[EDI], #2	;Is this a 5-button mouse?
+	JNE	6$.S			;No
+	MOVB	AH, AL			;Yes - store the additional button
+	SHRB	AH, #2			;  bits
+	ANDB	AH, #0C0h
+	ORB	dcb_msapaheader[EDI], AH
+	ANDL	EAX, #0Fh.B		;Assume Z value is positive
+	TESTB	AL, #08h		;Right?
+	JE	8$.S			;Yes
+	ORL	EAX, #0FFFFFF00		;No - extend the sign bit
+	JMP	8$.S
+
+6$:	MOVXBL	EAX, AL			;Sign extend the 8-bit Z value
+8$:	MOVL	EBX, EAX
+	MOVL	ECX, dcb_msapayval[EDI]
+10$:	MOVL	EDX, dcb_msapaxval[EDI]
+	MOVZBL	EAX, dcb_msapaheader[EDI]
+	CALL	xosmsaStoreData##
+	MOVB	dcb_msapastate[EDI], #MSAPA_HEADER
+	CALL	knlReqFork##		;Request fork
+intdone:MOVB	AL, #INT_EOI		;Release interrupt controller
+	CLI
+	OUTB	P_INC2P0		;Release 2nd interrupt controller
+	OUTB	P_INC1P0		;Always release 1st interrupt controller
+	JMP	knlDismissInt2##	;Check for scheduling and dismiss
+.PAGE
+;Here with first reset response byte
+
+inpreset1:
+	CMPB	AL, #0AAh		;Is it correct?
+	JNE	intdone.S		;No
+	INCB	dcb_msapastate[EDI]	;Yes
+	JMP	intdone.S
+
+;Here with second reset response byte
+
+inpreset2:
+	CMPB	AL, #0			;Is it correct?
+	JNE	intdone.S		;No
+	MOVB	dcb_msaok.B[EDI], #1	;Yes - indicate operational
+	MOVB	AL, #MSAPA_WHEEL
+	MOVL	EBX, #wheelstr		;Send wheel string
+	MOVL	ECX, #7
+	CALL	putstring
+	JMP	intdone.S
+
+inpwheel::
+	CMPB	AL, #03			;Is this a wheel mouse?
+	JNE	8$.S			;No
+	MOVB	dcb_msapawheel[EDI], #1	;Yes
+	MOVB	AL, #MSAPA_FVBUT	;See if it's also a 5 button mouse
+	MOVL	EBX, #fvbutstr
+	MOVL	ECX, #7
+	CALL	putstring
+	JMP	intdone.S
+
+;Here if not a wheel mouse - see if it's a touchpad
+
+8$:	MOVB	AL, #MSAPA_TPID1
+	MOVL	EBX, #tpidstr
+	MOVL	ECX, #9
+	CALL	putstring
+	JMP	intdone.S
+
+inpfvbut::
+	CMPB	AL, #04			;Is this a five button mouse?
+	JNE	strtdone.S		;No
+	MOVB	dcb_msapawheel[EDI], #2	;Yes
+strtdone:
+	MOVB	AL, #MSAPA_HEADER
+	MOVL	EBX, #enablestr		;Send enable string
+	MOVL	ECX, #2
+	CALL	putstring
+	JMP	intdone
+
+;Here with first mode byte when checking for a touchpad
+
+inptpmode1:
+	MOVB	dcb_msapamode1[EDI], AL
+	JMP	12$.S
+
+;Here with second mode byte when checking for a touchpad
+
+inptpmode2:
+	MOVB	dcb_msapamode2[EDI], AL
+12$:	INCB	dcb_msapastate[EDI]
+	JMP	intdone
+
+
+
+;Here with first mode byte when checking for a touchpad
+
+inptpmode1x:
+	MOVB	dcb_msapamode1[EDI], AL
+	JMP	13$.S
+
+;Here with second mode byte when checking for a touchpad
+
+inptpmode2x:
+	MOVB	dcb_msapamode2[EDI], AL
+13$:	INCB	dcb_msapastate[EDI]
+	JMP	intdone
+
+
+
+;Here with third mode byte when checking for a touchpad
+
+inptphvid:
+	MOVB	dcb_msapamode3[EDI],AL
+	CMPB	dcb_msapamode2[EDI], #47h ;Is this a touchpad?
+	JNE	strtdone.S		;No
+	MOVB	dcb_msapawheel[EDI], #3	;Yes - get model ID bits
+	MOVB	AL, #MSAPA_TPMID1
+	MOVL	EBX, #tpmidstr
+	MOVL	ECX, #9
+	CALL	putstring
+	JMP	intdone
+
+;Here with the third mode byte when getting the touchpad model ID
+
+inptphvmid:
+	TESTB	AL, #80h		;Does this model support the new ABS
+					;  format?
+	JE	strtdone.S		;No - we will only use it in relative
+					;  mode
+
+;;;	MOVL	ECX, #1000t
+;;;	CALL	knlSDelay##
+
+	MOVB	dcb_msapawheel[EDI], #4	;Yes - get the capabilities bits
+
+;;;	JMP	strtdone
+
+	MOVB	AL, #MSAPA_TPCAP1	;  bits
+	MOVL	EBX, #tpcapstr
+	MOVL	ECX, #9
+	CALL	putstring
+	JMP	intdone
+
+;Here with the third mode byte when getting the touchpad capabilities
+
+inptphvcap:
+	TESTB	dcb_msapamode1[EDI], #80h ;Are these bits meaningful?
+	JE	strtdone		;No
+	MOVB	dcb_msapawheel[EDI], #5	;Yes - indicate "W" mode is supported
+	JMP	strtdone
+.PAGE
+;Subroutine to check packet sync. This checks the time since the header byte
+;  was received.  If it is too long (more than about 100MS) we assume this
+;  is the header for a new packet.
+;	CALL	checksync
+;	Z:set = Normal
+;	Z:clr = New packet
+
+checksync:
+	MOVL	EDX, knlTickTtl##
+	SUBL	EDX, dcb_msapahdtcks[EDI]
+	JS	2$.S
+	CMPL	EDX, #5t
+	JG	4$.S
+2$:	CLRL	EDX
+4$:	RET
+.PAGE
+	.SBTTL	Data
+
+	DATA
+
+	.MOD	4
+msapadcb:.LONG	0
+
+xxxdata::.LONG 0
+xxxstate::.LONG 0
+
+debugpnt:.LONG	debugbfr
+debugbfr:.BLKB	1000t
+debugend:.LONG	0F0F0F0Fh
+
+resetstr: .BYTE 0FFh
+enablestr:.BYTE	0EAh, 0F4h		;Set stream mode, enable
+wheelstr: .BYTE 0F3h, 200t, 0F3h, 100t, 0F3h, 80t, 0F2h
+fvbutstr: .BYTE 0F3h, 200t, 0F3h, 200t, 0F3h, 80t, 0F2h
+tpidstr:  .BYTE 0E8h, 0, 0E8h, 0, 0E8h, 0, 0E8h, 0, 0E9h
+tpmidstr: .BYTE 0E8h, 0, 0E8h, 0, 0E8h, 0, 0E8h, 3, 0E9h
+tpcapstr: .BYTE 0E8h, 0, 0E8h, 0, 0E8h, 0, 0E8h, 2, 0E9h
+
+txtnormal:  .ASCIZ "Normal"
+txt3bwheel: .ASCIZ "3 Button/Wheel"
+txt5bwheel: .ASCIZ "5 Button/Wheel"
+txttprel:   .ASCIZ "TP-Relative"
+txttpabs:   .ASCIZ "TP-Absolute"
+txttpabsw:  .ASCIZ "TP-Absolute/W"
+
+ackcnt:: .LONG	0
+
+	LKEEND
